@@ -28,6 +28,12 @@ internal sealed interface ExternalDocumentDecision {
     data class Rejected(val uri: Uri, val reason: String) : ExternalDocumentDecision
 }
 
+internal sealed interface ExternalDropUriDecision {
+    data class Allowed(val uri: Uri) : ExternalDropUriDecision
+    data class MissingGrant(val uri: Uri) : ExternalDropUriDecision
+    data class Rejected(val uri: Uri, val reason: String) : ExternalDropUriDecision
+}
+
 /**
  * Validates untrusted external document entry points (MainActivity incoming Intents)
  * before persisting permissions, resolving URIs, or reading document bytes.
@@ -267,7 +273,145 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
-    private fun verifyOpenedDescriptor(context: Context, uri: Uri, pfd: ParcelFileDescriptor) {
+    fun validateDroppedUri(
+        context: Context,
+        uri: Uri,
+        dragReadPermissionGranted: Boolean,
+    ): ExternalDropUriDecision {
+        return when (uri.scheme?.lowercase()) {
+            "content" -> {
+                if (uri.authority.isNullOrBlank()) {
+                    return ExternalDropUriDecision.Rejected(uri, "Missing content provider authority")
+                }
+                if (uri.authority.equals("${context.packageName}.share", ignoreCase = true)) {
+                    return ExternalDropUriDecision.Rejected(uri, "App-private share URIs cannot be dropped")
+                }
+                if (DocumentsContract.isTreeUri(uri)) {
+                    return ExternalDropUriDecision.Rejected(uri, "Tree URIs cannot be dropped as images")
+                }
+                if (!dragReadPermissionGranted || !hasDirectReadUriPermission(context, uri)) {
+                    return ExternalDropUriDecision.MissingGrant(uri)
+                }
+                ExternalDropUriDecision.Allowed(uri)
+            }
+            "file" -> {
+                if (!uri.authority.isNullOrEmpty() && !uri.authority.equals("localhost", ignoreCase = true)) {
+                    return ExternalDropUriDecision.Rejected(uri, "Remote file URIs are not supported")
+                }
+                val rawPath = uri.path
+                if (rawPath.isNullOrBlank() || '\u0000' in rawPath) {
+                    return ExternalDropUriDecision.Rejected(uri, "Invalid file path")
+                }
+                val check = runCatching { requireSafeExternalFile(context, File(rawPath)) }
+                if (check.isFailure) {
+                    return ExternalDropUriDecision.Rejected(
+                        uri,
+                        check.exceptionOrNull()?.message ?: "App-private paths cannot be opened externally",
+                    )
+                }
+                ExternalDropUriDecision.Allowed(uri)
+            }
+            else -> ExternalDropUriDecision.Rejected(uri, "Unsupported URI scheme")
+        }
+    }
+
+    fun openVerifiedDroppedInputStream(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+        dragReadPermissionGranted: Boolean,
+    ): InputStream {
+        return when (val decision = validateDroppedUri(context, uri, dragReadPermissionGranted)) {
+            is ExternalDropUriDecision.MissingGrant -> throw SecurityException("Dropped image read access was not granted")
+            is ExternalDropUriDecision.Rejected -> throw IllegalArgumentException(decision.reason)
+            is ExternalDropUriDecision.Allowed -> when (uri.scheme?.lowercase()) {
+                "content" -> {
+                    val pfd = resolver.openFileDescriptor(uri, "r")
+                        ?: throw SecurityException("Image permission is unavailable")
+                    try {
+                        verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = false)
+                        ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                    } catch (error: Throwable) {
+                        runCatching { pfd.close() }
+                        throw error
+                    }
+                }
+                "file" -> {
+                    val safeFile = requireSafeExternalFile(context, File(uri.path!!))
+                    val pfd = ParcelFileDescriptor.open(safeFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                    try {
+                        verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = false)
+                        ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                    } catch (error: Throwable) {
+                        runCatching { pfd.close() }
+                        throw error
+                    }
+                }
+                else -> throw IllegalArgumentException("Unsupported URI scheme")
+            }
+        }
+    }
+
+    fun validatePickedMediaUri(context: Context, uri: Uri) {
+        when (uri.scheme?.lowercase()) {
+            "content" -> {
+                require(!uri.authority.isNullOrBlank()) { "Unsupported image URI" }
+                require(!uri.authority.equals("${context.packageName}.share", ignoreCase = true)) { "Unsupported image URI" }
+                if (!hasDirectReadUriPermission(context, uri)) {
+                    throw SecurityException("Image permission is unavailable")
+                }
+            }
+            "file" -> {
+                require(uri.authority.isNullOrEmpty() || uri.authority.equals("localhost", ignoreCase = true)) {
+                    "Unsupported image URI"
+                }
+                val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
+                    ?: throw IllegalArgumentException("Unsupported image URI")
+                requireSafeExternalFile(context, File(rawPath))
+            }
+            else -> throw IllegalArgumentException("Unsupported image URI")
+        }
+    }
+
+    fun openVerifiedPickedMediaInputStream(
+        context: Context,
+        resolver: ContentResolver,
+        uri: Uri,
+    ): InputStream {
+        validatePickedMediaUri(context, uri)
+        return when (uri.scheme?.lowercase()) {
+            "content" -> {
+                val pfd = resolver.openFileDescriptor(uri, "r")
+                    ?: throw SecurityException("Image permission is unavailable")
+                try {
+                    verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = false)
+                    ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                } catch (error: Throwable) {
+                    runCatching { pfd.close() }
+                    throw error
+                }
+            }
+            "file" -> {
+                val safeFile = requireSafeExternalFile(context, File(uri.path!!))
+                val pfd = ParcelFileDescriptor.open(safeFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                try {
+                    verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = false)
+                    ParcelFileDescriptor.AutoCloseInputStream(pfd)
+                } catch (error: Throwable) {
+                    runCatching { pfd.close() }
+                    throw error
+                }
+            }
+            else -> throw IllegalArgumentException("Unsupported image URI")
+        }
+    }
+
+    private fun verifyOpenedDescriptor(
+        context: Context,
+        uri: Uri,
+        pfd: ParcelFileDescriptor,
+        allowGrantedShareFile: Boolean = true,
+    ) {
         val stat = runCatching { Os.fstat(pfd.fileDescriptor) }.getOrNull()
         if (stat != null && stat.st_mode != 0) {
             require(OsConstants.S_ISREG(stat.st_mode) || OsConstants.S_ISFIFO(stat.st_mode)) {
@@ -277,7 +421,7 @@ internal object ExternalDocumentEntryGuard {
         val fdPath = resolveDescriptorPath(pfd) ?: return
         if (!fdPath.startsWith("/")) return
         val cleanFdPath = fdPath.removeSuffix(" (deleted)")
-        if (isAllowedGrantedShareFile(context, uri, cleanFdPath)) return
+        if (allowGrantedShareFile && isAllowedGrantedShareFile(context, uri, cleanFdPath)) return
         require(!isForbiddenExternalPath(context, cleanFdPath)) {
             "App-private paths cannot be opened externally"
         }

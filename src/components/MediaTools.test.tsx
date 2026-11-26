@@ -638,6 +638,51 @@ describe("live cursor offsets, coordinate drops, and overlay registration", () =
     expect(noteContent).toBe("# Native Other Tab");
     expect(notice).toHaveBeenCalledExactlyOnceWith(SWITCHED_NOTE_IMPORT_MESSAGE);
 
+    // 5. Source mode (CodeMirror) delayed drop + typing & multi-line deletion before drop point -> remaps cleanly.
+    appliedInsert.mockClear();
+    notice.mockClear();
+    noteId = "source-delay-tab";
+    noteContent = "Header line 1\nHeader line 2\n\nBody anchor.\n\nTail.";
+    const posSpy = vi.spyOn(EditorView.prototype, "posAtCoords").mockReturnValue(noteContent.indexOf("Body anchor.") + "Body anchor.".length);
+    const renderSourceDelayedScene = async () => {
+      await act(async () => root.render(<div className="workspace">
+        <MediaTools documentId={noteId} content={noteContent} documentPath="/notes/source-delay.md" onInsert={appliedInsert} onNotice={notice} />
+        <Editor key={noteId} sessionId={noteId} value={noteContent} onChange={(next) => { noteContent = next; }} dark={false} focusMode={false} />
+      </div>));
+    };
+    await renderSourceDelayedScene();
+
+    let resolveSourceImport!: (images: Array<{ source: string; alt: string }>) => void;
+    vi.mocked(importImageFiles).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveSourceImport = resolve; }),
+    );
+    const cmTarget = host.querySelector<HTMLElement>(".cm-content")!;
+    await act(async () => {
+      const dropEvent = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(dropEvent, "dataTransfer", { value: { files: [file], types: ["Files"] } });
+      Object.defineProperty(dropEvent, "clientX", { value: 90 });
+      Object.defineProperty(dropEvent, "clientY", { value: 120 });
+      cmTarget.dispatchEvent(dropEvent);
+    });
+
+    // Delete "Header line 1\n" and expand "Header line 2" across two steps before importImageFiles resolves.
+    noteContent = "Header line 2\n\nBody anchor.\n\nTail.";
+    await renderSourceDelayedScene();
+    noteContent = "Header line 2 — typed in Source mode\n\nBody anchor.\n\nTail.";
+    await renderSourceDelayedScene();
+
+    const expectedSourceRemapped = noteContent.indexOf("Body anchor.") + "Body anchor.".length;
+    await act(async () => {
+      resolveSourceImport([{ source: "assets/source-delayed.svg", alt: "Source delayed" }]);
+    });
+    expect(appliedInsert).toHaveBeenCalledExactlyOnceWith("\n\n![Source delayed](<assets/source-delayed.svg>)\n", {
+      from: expectedSourceRemapped,
+      to: expectedSourceRemapped,
+    });
+    expect(noteContent).toContain("Header line 2 — typed in Source mode\n\nBody anchor.\n\n![Source delayed](<assets/source-delayed.svg>)\n\n\nTail.");
+    expect(notice).not.toHaveBeenCalled();
+
+    posSpy.mockRestore();
     document.elementFromPoint = originalFromPoint;
   });
 });

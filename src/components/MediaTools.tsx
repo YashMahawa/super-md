@@ -17,7 +17,7 @@ export interface PendingInsertion {
 interface RevisionStep {
   fromRevision: number;
   toRevision: number;
-  changes: Array<SourceChange & { deletedNewline: boolean; nextNewlineAfterTo: number }>;
+  changes: SourceChange[];
 }
 interface DocumentRevisionState {
   documentId: string;
@@ -56,9 +56,6 @@ function remapPointAcrossStep(point: InsertionPoint, step: RevisionStep, replaci
     }
     if (change.from <= from && change.to >= from) return null;
     if (change.to < from) {
-      if (change.deletedNewline && (change.nextNewlineAfterTo === -1 || change.nextNewlineAfterTo >= from)) {
-        return null;
-      }
       from += delta;
       to = from;
     }
@@ -164,12 +161,7 @@ export default function MediaTools({ documentId, content, documentPath: _documen
     docStateRef.current = { documentId, tabSwitchEpoch: docStateRef.current.tabSwitchEpoch + 1, revision: 0, content, history: [] };
   } else if (docStateRef.current.content !== content) {
     const before = docStateRef.current.content;
-    const rawChanges = sourceChanges(before, content);
-    const changes = rawChanges.map((change) => ({
-      ...change,
-      deletedNewline: change.to > change.from && before.slice(change.from, change.to).includes("\n"),
-      nextNewlineAfterTo: before.indexOf("\n", change.to),
-    }));
+    const changes = sourceChanges(before, content);
     const nextRevision = docStateRef.current.revision + 1;
     const history = [...docStateRef.current.history, { fromRevision: docStateRef.current.revision, toRevision: nextRevision, changes }];
     if (history.length > MAX_REVISION_HISTORY) history.splice(0, history.length - MAX_REVISION_HISTORY);

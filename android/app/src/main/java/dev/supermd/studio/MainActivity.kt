@@ -627,12 +627,14 @@ internal fun shouldBlockNativeDrop(
     settingsOpen: Boolean = false,
     exporting: Boolean = false,
     renaming: Boolean = false,
+    folderDialogOpen: Boolean = false,
     contentsShown: Boolean = false,
     drawerOpen: Boolean = false,
 ): Boolean =
     !state.welcomed ||
         state.busy ||
         state.readerOverlay ||
+        state.error != null ||
         folderSearchVisible ||
         accessRequestOpen ||
         state.pendingCloseNoteId != null ||
@@ -640,6 +642,7 @@ internal fun shouldBlockNativeDrop(
         settingsOpen ||
         exporting ||
         renaming ||
+        folderDialogOpen ||
         contentsShown ||
         drawerOpen
 
@@ -1125,7 +1128,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         imageCallback?.onReceiveValue(null); imageCallback = null
-        if (uris.isNotEmpty()) model.importDropped(uris, imageNote) { images -> images?.let { web?.evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
+        if (uris.isNotEmpty()) model.importPickedImages(uris, imageNote) { images -> images?.let { web?.evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
     }
     LaunchedEffect(activity) { WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info -> hinge = info.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull { it.isSeparating && it.orientation == FoldingFeature.Orientation.VERTICAL } } }
     val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { uri -> activity.requestOpen(uri) } }
@@ -1408,34 +1411,44 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
                 val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
-                    if (shouldBlockNativeDrop(
+                        if (shouldBlockNativeDrop(
                             model.state.value,
                             folderSearchVisible = model.folderSearch.value.visible,
-                            accessRequestOpen = model.documentAccessRequests.value != null,
+                            accessRequestOpen = !accessPickerShowing && model.documentAccessRequests.value != null,
                             settingsOpen = settings,
                             exporting = exporting,
                             renaming = renaming,
+                            folderDialogOpen = createFolderRequest != null || renameFolderTarget != null,
                             contentsShown = contentsShown,
                             drawerOpen = drawer.isOpen,
                         )) {
                         return@rememberUpdatedState
                     }
-                    val permissions = activity.requestDragAndDropPermissions(event)
                     val uris = extractDroppedFileUris(event.clipData)
+                    val hasContentUri = uris.any { it.scheme.equals("content", ignoreCase = true) }
+                    val permissions = if (hasContentUri) activity.requestDragAndDropPermissions(event) else null
                     if (uris.isNotEmpty()) {
                         val id = model.state.value.active.id
                         val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
                         val x = event.x / currentDensity
                         val y = event.y / currentDensity
                         reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                        model.importDropped(uris, id) { images ->
-                            permissions?.release()
-                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                        val job = model.importDropped(
+                            uris = uris,
+                            id = id,
+                            dragReadPermissionGranted = permissions != null,
+                        ) { images ->
+                            if (images != null) {
+                                reader.evaluateJavascript("window.supermdInsertImages?.($images)", null)
+                            } else {
+                                reader.evaluateJavascript("window.supermdInsertImages?.([])", null)
+                            }
                         }
+                        job.invokeOnCompletion { permissions?.release() }
                     } else {
                         permissions?.release()
                         if ((event.clipData?.itemCount ?: 0) > 0) {
-                            model.importDropped(emptyList(), model.state.value.active.id) {}
+                            model.importDropped(emptyList(), model.state.value.active.id, dragReadPermissionGranted = false) {}
                         }
                     }
                 }
