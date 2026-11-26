@@ -622,6 +622,24 @@ describe("ReadingSearch DOM behavior", () => {
       });
       expect(stepCard().getAttribute("data-step-index")).toBe("0");
       expect(host.querySelector("output")?.textContent).toMatch(/^1 \/ \d+$/);
+
+      // 7. Malformed diagram rendering .render-error still scrolls into view at a verified source occurrence and reports In Markdown source without indexing diagnostic chrome.
+      const brokenDoc = "# Intro\n\n```smd-chart\n{\"broken\": \"smd-chart\"}\n```\n";
+      const brokenHitStart = brokenDoc.lastIndexOf("smd-chart");
+      current = brokenDoc;
+      scrolledTargets.length = 0;
+      await renderReader({
+        query: "smd-chart",
+        caseSensitive: true,
+        sourceStart: brokenHitStart,
+        sourceEnd: brokenHitStart + "smd-chart".length,
+        matchText: "smd-chart",
+        nonce: 9,
+      });
+      const renderErr = host.querySelector<HTMLElement>(".render-error");
+      expect(renderErr).toBeTruthy();
+      expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+      expect(scrolledTargets).toContain(renderErr);
     } finally {
       Element.prototype.scrollIntoView = origScroll;
       act(() => root.unmount());

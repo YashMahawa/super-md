@@ -30,9 +30,9 @@ type HighlightRegistry = Map<string, unknown>;
 type SourceRange = { from: number; to: number };
 const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
 const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
-const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|document-properties|is-offstage)(?:\s|$)/;
+const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|inline-diagram-error|render-error|remote-image-card|document-properties|is-offstage)(?:\s|$)/;
 const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
-const DIAGRAM_ONLY_SELECTOR = ".inline-diagram,.inline-diagram-error,.svg-figure,.mermaid";
+const DIAGRAM_ONLY_SELECTOR = ".inline-diagram,.inline-diagram-error,.svg-figure,.mermaid,.render-error,.image-loading";
 
 function isHiddenOrExcludedSearchElement(el: Element): boolean {
   if (EXCLUDED_SEARCH_TAGS.has(el.localName)) return true;
