@@ -130,12 +130,51 @@ ApplicationWindow {
         self.assertEqual(self.palette.reopened, 2)
         self.assertEqual(self.palette.saved_as, 2)
 
-    def test_cross_note_search_is_not_duplicated_in_toolbar_or_overflow_menu(self):
-        qml = MAIN.read_text(encoding="utf-8")
-        self.assertNotIn('objectName: "folderSearchButton"', qml)
-        self.assertNotIn('"Search notes"', qml)
-        self.assertNotIn('text: "Search across notes"', qml)
-        self.assertIn('ToolTip.text: "Find in note ("', qml)
-        self.assertIn('case "search_folder": studio.openFolderSearch(); break', qml)
+    def test_overflow_menu_items_display_shortcut_hints_when_configured(self):
+        engine = QQmlEngine()
+        palette = CompactMenuPalette()
+        engine.rootContext().setContextProperty("studio", palette)
+        component = QQmlComponent(engine)
+        code = '''
+import QtQuick
+import QtQuick.Controls
+ApplicationWindow {
+    id: window
+    width: 840; height: 480; visible: true
+    property int contextMenuCount: 0
+    property int modalDialogCount: 0
+    property var shortcutLabels: ({
+        reopen_tab: "Ctrl+Shift+T",
+        save_as: "Disabled",
+        search_folder: "Ctrl+Shift+F"
+    })
+    function showExport(sharing) {}
+    function openMenu() { noteActions.popup() }
+    Item { x: window.width - 78; y: 64; width: 66; height: 54
+        %s
+    }
+}
+''' % compact_source()
+        component.setData(code.encode(), QUrl.fromLocalFile(str(QML_DIR / "compact-shortcuts-test.qml")))
+        self.assertFalse(component.isError(), str(component.errors()))
+        win = component.create()
+        self.assertIsNotNone(win)
+        try:
+            QTest.qWait(40)
+            QMetaObject.invokeMethod(win, "openMenu")
+            QTest.qWait(80)
+            reopen = win.findChild(QObject, "reopenClosedTabAction")
+            save_as = win.findChild(QObject, "saveAsAction")
+            search = win.findChild(QObject, "compactSearchFolderAction")
+            self.assertEqual(reopen.property("text"), "Reopen closed tab")
+            self.assertTrue(reopen.property("hasShortcutHint"))
+            self.assertEqual(reopen.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Shift+T")
+            self.assertFalse(save_as.property("hasShortcutHint"), "Disabled shortcuts must not render 'Disabled' in menus")
+            self.assertTrue(search.property("hasShortcutHint"))
+            self.assertEqual(search.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Shift+F")
+        finally:
+            win.close(); win.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            engine.deleteLater(); self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 if __name__=="__main__":unittest.main()

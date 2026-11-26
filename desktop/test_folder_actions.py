@@ -268,7 +268,16 @@ class FolderActionsDesktopTest(unittest.TestCase):
 
     def test_customizable_shortcuts_and_folder_sidebar_qml_preserve_search(self):
         shortcut_ids = {item["id"] for item in DEFINITIONS}
-        for required_id in ("new_folder_note", "new_subfolder", "rename_entry", "search_folder"):
+        for required_id in (
+            "new_folder_note",
+            "new_subfolder",
+            "rename_entry",
+            "search_folder",
+            "mode_live",
+            "mode_editor",
+            "mode_reader",
+            "mode_split",
+        ):
             self.assertIn(required_id, shortcut_ids)
             self.assertTrue(len(self.studio.shortcutSequences(required_id)) >= 1)
         self.assertNotIn("trash_entry", shortcut_ids)
@@ -296,7 +305,7 @@ ApplicationWindow {
     height: 620
     visible: true
     property var viewState: JSON.parse(studio.snapshot)
-    property var shortcutLabels: JSON.parse(studio.shortcutLabelsJson || "{}")
+    property var shortcutLabels: JSON.parse(studio.shortcutLabels || "{}")
     property int contextMenuCount: 0
     property int modalDialogCount: 0
     Material.theme: viewState.dark ? Material.Dark : Material.Light
@@ -323,12 +332,41 @@ ApplicationWindow {
         self.assertIsNotNone(sidebar)
         sidebar_search_btn = host_win.findChild(QObject, "sidebarFolderSearchButton")
         self.assertIsNotNone(sidebar_search_btn)
-        self.assertIsNone(host_win.findChild(QObject, "headerNewSubfolderButton"))
-        self.assertIsNotNone(host_win.findChild(QObject, "headerNewSubfolderItem"))
         self.assertTrue(QMetaObject.invokeMethod(sidebar_search_btn, "click"))
         self.assertTrue(self.studio.folderSearchState["open"])
         self.studio.closeFolderSearch()
         self.assertFalse(self.studio.folderSearchState["open"])
+
+        # Customized and Disabled shortcut labels update FolderSidebar tooltips and menu items cleanly.
+        host_win.setProperty(
+            "shortcutLabels",
+            {
+                "search_folder": "Disabled",
+                "new_folder_note": "Ctrl+Alt+M",
+                "new_subfolder": "Disabled",
+                "rename_entry": "F2",
+            },
+        )
+        QTest.qWait(20)
+        new_item_btn = host_win.findChild(QObject, "headerNewItemButton")
+        new_subfolder_btn = host_win.findChild(QObject, "headerNewSubfolderButton")
+        new_md_item = host_win.findChild(QObject, "headerNewMarkdownItem")
+        new_sub_item = host_win.findChild(QObject, "headerNewSubfolderItem")
+        menu_new_md = host_win.findChild(QObject, "menuNewMarkdown")
+        menu_new_sub = host_win.findChild(QObject, "menuNewSubfolder")
+        rename_item = host_win.findChild(QObject, "menuRenameEntry")
+        self.assertEqual(sidebar_search_btn.findChild(QObject, "actionHint").property("text"), "Search across notes")
+        self.assertEqual(new_item_btn.findChild(QObject, "actionHint").property("text"), "New note in folder (Ctrl+Alt+M)")
+        self.assertEqual(new_subfolder_btn.findChild(QObject, "actionHint").property("text"), "New subfolder")
+        self.assertTrue(new_md_item.property("hasShortcutHint"))
+        self.assertEqual(new_md_item.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Alt+M")
+        self.assertFalse(new_sub_item.property("hasShortcutHint"))
+        self.assertTrue(menu_new_md.property("hasShortcutHint"))
+        self.assertEqual(menu_new_md.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Alt+M")
+        self.assertFalse(menu_new_sub.property("hasShortcutHint"))
+        self.assertTrue(rename_item.property("hasShortcutHint"))
+        self.assertEqual(rename_item.findChild(QObject, "menuShortcutHint").property("text"), "F2")
+
         self.assertTrue(QMetaObject.invokeMethod(sidebar, "triggerNewFolderNote"))
         QTest.qWait(20)
         grabbed = host_win.grabWindow()

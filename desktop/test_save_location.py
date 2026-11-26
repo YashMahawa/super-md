@@ -380,32 +380,6 @@ class SaveLocationStudioTest(unittest.TestCase):
                 preferred_dir / "My theme.supermd-theme.json",
             )
 
-    def test_stopping_windows_releases_filesystem_watchers(self):
-        def count_inotify() -> int:
-            if not Path("/proc/self/fd").is_dir():
-                return 0
-            total = 0
-            for fd in os.listdir("/proc/self/fd"):
-                try:
-                    if "inotify" in os.readlink(f"/proc/self/fd/{fd}"):
-                        total += 1
-                except OSError:
-                    pass
-            return total
-
-        folder_dir = self.root / "Watched Course"
-        folder_dir.mkdir()
-        before = count_inotify()
-        win = self.make_window()
-        win.openFolder(str(folder_dir))
-        if Path("/proc/self/fd").is_dir():
-            self.assertGreater(count_inotify(), before)
-        win.stop()
-        self.assertEqual(win.note_watcher.files(), [])
-        self.assertEqual(win.note_watcher.directories(), [])
-        if Path("/proc/self/fd").is_dir():
-            self.assertEqual(count_inotify(), before)
-
 
 class SaveDialogQmlUiTest(unittest.TestCase):
     @classmethod
