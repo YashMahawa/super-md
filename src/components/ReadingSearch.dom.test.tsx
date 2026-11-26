@@ -311,7 +311,7 @@ describe("ReadingSearch DOM behavior", () => {
           <section className="android-reading">
             <div className="markdown-body">
               <h1 data-source-start="0" data-source-end="18">TopToken Heading</h1>
-              <pre><code>{tallLines.join("\n")}</code></pre>
+              <pre data-source-start="20" data-source-end={String(content.length)}><code>{tallLines.join("\n")}</code></pre>
             </div>
           </section>
         </div>,
@@ -377,9 +377,116 @@ describe("ReadingSearch DOM behavior", () => {
       const expandedTopMatchY = 24 + getClearance() - scroller.scrollTop;
       expect(expandedTopMatchY).toBeGreaterThanOrEqual(12 + barHeight + 12);
 
-      // Unmounting ReadingSearch removes temporary top clearance cleanly.
+      // Stepping to the second TopToken match deeper in the code block (if deeper than visibleTop) or searching DeepToken releases temporary top clearance automatically.
+      act(() => setInputValue(searchInput, "DeepToken"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(scroller.style.paddingTop).toBe("");
+
+      // Unmounting ReadingSearch leaves scroller clean.
       act(() => root.unmount());
       expect(scroller.style.paddingTop).toBe("");
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      host.remove();
+    }
+  });
+
+  it("scrolls nested scrollable Python source containers and isolates .android-reading clearance onto .reader-chrome-spacer", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const pyLines = Array.from({ length: 100 }, (_, i) => (i === 99 ? "print('PYTHON-END-99')" : `x_${i} = ${i}`));
+    const content = `# TopHeader\n\n\`\`\`python\n${pyLines.join("\n")}\n\`\`\``;
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={content} close={() => {}} onChange={() => {}} />
+          <section className="android-reading">
+            <div className="reader-chrome-spacer" aria-hidden="true" />
+            <div className="document-page-space">
+              <div className="document-page">
+                <div className="markdown-body">
+                  <h1>TopHeader</h1>
+                  <pre className="python-source" aria-label="Python source" style={{ overflowY: "auto" }}>
+                    {pyLines.join("\n")}
+                  </pre>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>,
+      );
+    });
+
+    const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+    const spacer = host.querySelector<HTMLElement>(".reader-chrome-spacer")!;
+    const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+    const heading = host.querySelector<HTMLElement>("h1")!;
+    const pySource = host.querySelector<HTMLElement>("pre.python-source")!;
+
+    Object.defineProperty(pySource, "clientHeight", { configurable: true, value: 240 });
+    Object.defineProperty(pySource, "scrollHeight", { configurable: true, value: 2000 });
+
+    const getSpacerMargin = () => parseFloat(spacer.style.marginBottom || "0") || 0;
+    searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 76);
+    scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+    heading.getBoundingClientRect = () => new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 400, 32);
+    pySource.getBoundingClientRect = () => new DOMRect(40, 500 + getSpacerMargin() - scroller.scrollTop, 600, 240);
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+    const computeRangeRect = (range: Range): DOMRect => {
+      if (heading.contains(range.startContainer)) {
+        return new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 120, 28);
+      }
+      const text = range.startContainer.textContent || "";
+      const lineIdx = text.slice(0, range.startOffset).split("\n").length - 1;
+      const pyTop = 500 + getSpacerMargin() - scroller.scrollTop;
+      return new DOMRect(48, pyTop + lineIdx * 20 - pySource.scrollTop, 160, 20);
+    };
+    Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+    Range.prototype.getClientRects = function () {
+      const r = computeRangeRect(this);
+      return Object.assign([r], { item: (idx: number) => (idx === 0 ? r : null) }) as unknown as DOMRectList;
+    };
+
+    try {
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+
+      // Top match uses .reader-chrome-spacer margin-bottom without mutating .android-reading paddingTop.
+      act(() => setInputValue(searchInput, "TopHeader"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(scroller.style.paddingTop).toBe("");
+      expect(getSpacerMargin()).toBeGreaterThan(0);
+
+      // Stepping to nested Python source match releases spacer clearance and scrolls BOTH pre.python-source and .android-reading.
+      act(() => setInputValue(searchInput, "PYTHON-END-99"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(getSpacerMargin()).toBe(0);
+      expect(pySource.scrollTop).toBeGreaterThan(0);
+      expect(scroller.scrollTop).toBeGreaterThan(0);
+
+      const finalRect = computeRangeRect(
+        (() => {
+          const r = document.createRange();
+          const tn = pySource.firstChild!;
+          const idx = (tn.textContent || "").indexOf("PYTHON-END-99");
+          r.setStart(tn, idx);
+          r.setEnd(tn, idx + 13);
+          return r;
+        })(),
+      );
+      expect(finalRect.top).toBeGreaterThanOrEqual(12 + 76 + 12);
+      expect(finalRect.bottom).toBeLessThanOrEqual(600 - 16);
+
+      act(() => root.unmount());
     } finally {
       Range.prototype.getClientRects = origGetClientRects;
       Range.prototype.getBoundingClientRect = origGetBoundingRect;

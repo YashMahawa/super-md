@@ -5,6 +5,7 @@ import { ArrowUpIcon, ArrowDownIcon, XIcon, TextAaIcon, TextboxIcon, AsteriskIco
 import { editorFindQuery, editorFindRange, ensureEditorSearchRangeVisible } from "./Editor";
 import { windowedMatches, revealWindowed, compileSearchPattern, nextSearchMatch, normalizeSearchOptions, type WindowedMatch, type SearchMatchConfig, type SearchMatchOptions } from "../windowedSearch";
 import { cancelHeadingNavigation } from "../documentNavigation";
+import { scrollInputVersion } from "../scrollAnchor";
 import { clearSearchTopClearances, scrollSearchMatchIntoView } from "../searchScroll";
 export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
 
@@ -501,6 +502,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const revealAndHighlightSource = (targetIndex: number, ranges: SourceRange[], sourceText: string, scroll: boolean) => {
     const range = ranges[targetIndex];
     if (!range) return;
+    if (scroll) clearSettleFrames();
     if (scroll && sourceSession) {
       editorFindRange(sourceSession, range.from, range.to);
       if (!findReadingHost()) return;
@@ -534,6 +536,43 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry.delete("smd-search-current");
       if (domRange) registry.set("smd-search-current", new HighlightClass(domRange));
     }
+    if (scroll && !sourceSession && (wasUnmounted || !!host.querySelector("[data-windowed-block]"))) {
+      const startInput = scrollInputVersion();
+      const settle = () => {
+        if (indexRef.current !== targetIndex || scrollInputVersion() !== startInput) return false;
+        const liveHost = findReadingHost();
+        const liveRange = ranges[targetIndex];
+        if (!liveHost || !liveRange) return false;
+        const liveBlock = findContainingBlock(liveHost, liveRange, sourceText);
+        if (!liveBlock) return false;
+        revealMountedBlock(liveBlock);
+        const resolvedBlock = findContainingBlock(liveHost, liveRange, sourceText) ?? liveBlock;
+        const liveOwner = deepestSourceOwner(resolvedBlock, liveRange, sourceText) ?? resolvedBlock;
+        openDisclosuresFor(liveOwner, resolvedBlock, null, liveRange);
+        const liveDomRange = mapSourceRangeToDomRange(resolvedBlock, sourceText, ranges, targetIndex, query, filterOptions);
+        openDisclosuresFor(liveOwner, resolvedBlock, liveDomRange, liveRange);
+        const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveOwner;
+        const liveBounds = !liveDomRange ? sourceBounds(liveOwner, sourceText) : null;
+        const liveOffset = liveBounds && liveBounds.end > liveBounds.start ? (liveRange.from - liveBounds.start) / (liveBounds.end - liveBounds.start) : undefined;
+        scrollSearchMatchIntoView({ range: liveDomRange, target: liveScrollEl ?? resolvedBlock, host: liveHost, proportionalOffset: liveOffset });
+        if (registry && HighlightClass) {
+          registry.set("smd-search", new HighlightClass(...readingMatches(liveHost, query, filterOptions)));
+          registry.delete("smd-search-current");
+          if (liveDomRange) registry.set("smd-search-current", new HighlightClass(liveDomRange));
+        }
+        return true;
+      };
+      settleFrames.current[0] = requestAnimationFrame(() => {
+        if (!settle()) {
+          settleFrames.current = [0, 0];
+          return;
+        }
+        settleFrames.current[1] = requestAnimationFrame(() => {
+          settleFrames.current = [0, 0];
+          settle();
+        });
+      });
+    }
   };
 
   const selectWindowedMatch = (next: number, activeWindowed: WindowedMatch[], host: HTMLElement | null) => {
@@ -552,10 +591,11 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry.delete("smd-search-current");
       if (range) registry.set("smd-search-current", new HighlightClass(range));
     }
+    const startInput = scrollInputVersion();
     settleFrames.current[0] = requestAnimationFrame(() => {
       settleFrames.current[1] = requestAnimationFrame(() => {
         settleFrames.current = [0, 0];
-        if (indexRef.current !== next || !match.element.isConnected) return;
+        if (indexRef.current !== next || scrollInputVersion() !== startInput || !match.element.isConnected) return;
         const liveHost = findReadingHost();
         const liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
         openDisclosuresFor(match.element, match.element, liveRange);
@@ -573,6 +613,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const selectDomMatch = (next: number, activeMatches: Range[], host: HTMLElement | null) => {
     const range = activeMatches[next];
     if (!range) return;
+    clearSettleFrames();
     const element = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
     openDisclosuresFor(element, element?.closest(".code-container,details") ?? element, range);
     scrollSearchMatchIntoView({ range, target: element, host });

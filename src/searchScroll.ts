@@ -6,8 +6,10 @@ export interface VerticalBandRect {
 }
 
 interface ClearanceEntry {
-  inlinePaddingTop: string;
-  basePaddingPx: number;
+  targetEl: HTMLElement;
+  prop: "margin-bottom" | "padding-top";
+  inlineValue: string;
+  basePx: number;
   appliedPx: number;
 }
 
@@ -43,41 +45,103 @@ function unobstructedBand(scroller: HTMLElement): { scrollerRect: DOMRect; visib
   return { scrollerRect, visibleTop: clampedTop, visibleBottom };
 }
 
-function increaseSearchTopClearance(scroller: HTMLElement, extraPx: number): void {
-  if (extraPx <= 0 || !scroller.isConnected) return;
+function resolveClearanceTarget(scroller: HTMLElement): { targetEl: HTMLElement; prop: "margin-bottom" | "padding-top" } {
+  const spacer = scroller.querySelector<HTMLElement>(":scope > .reader-chrome-spacer");
+  if (spacer) return { targetEl: spacer, prop: "margin-bottom" };
+  return { targetEl: scroller, prop: "padding-top" };
+}
+
+function setSearchTopClearance(scroller: HTMLElement, nextPx: number): void {
+  const clampedNext = Math.max(0, Math.ceil(nextPx));
   let entry = activeClearances.get(scroller);
   if (!entry) {
-    const computed = typeof getComputedStyle === "function" ? parseFloat(getComputedStyle(scroller).paddingTop || "0") : 0;
+    if (clampedNext === 0 || !scroller.isConnected) return;
+    const { targetEl, prop } = resolveClearanceTarget(scroller);
+    const computed =
+      typeof getComputedStyle === "function" ? parseFloat(getComputedStyle(targetEl).getPropertyValue(prop) || "0") : 0;
     entry = {
-      inlinePaddingTop: scroller.style.paddingTop,
-      basePaddingPx: Number.isFinite(computed) ? computed : 0,
+      targetEl,
+      prop,
+      inlineValue: targetEl.style.getPropertyValue(prop),
+      basePx: Number.isFinite(computed) ? computed : 0,
       appliedPx: 0,
     };
     activeClearances.set(scroller, entry);
   }
-  const delta = Math.ceil(extraPx);
-  entry.appliedPx += delta;
-  scroller.style.paddingTop = `${entry.basePaddingPx + entry.appliedPx}px`;
-  if (scroller.matches(".android-reading")) {
+  const delta = clampedNext - entry.appliedPx;
+  if (delta === 0) return;
+  entry.appliedPx = clampedNext;
+  if (clampedNext === 0) {
+    if (entry.inlineValue) entry.targetEl.style.setProperty(entry.prop, entry.inlineValue);
+    else entry.targetEl.style.removeProperty(entry.prop);
+    activeClearances.delete(scroller);
+  } else {
+    entry.targetEl.style.setProperty(entry.prop, `${entry.basePx + clampedNext}px`);
+  }
+  if (scroller.isConnected && scroller.matches(".android-reading")) {
     shiftDocumentOriginY(scroller, delta);
     refreshDocumentExtent(scroller);
   }
 }
 
+function releaseScrollerTopClearance(scroller: HTMLElement): void {
+  const entry = activeClearances.get(scroller);
+  if (!entry || entry.appliedPx <= 0) return;
+  const applied = entry.appliedPx;
+  const prevScrollTop = scroller.scrollTop;
+  setSearchTopClearance(scroller, 0);
+  scroller.scrollTop = prevScrollTop > applied ? prevScrollTop - applied : 0;
+}
+
 export function clearSearchTopClearances(): void {
-  for (const [scroller, entry] of activeClearances) {
-    if (entry.appliedPx > 0) {
-      const prevScrollTop = scroller.scrollTop;
-      if (entry.inlinePaddingTop) scroller.style.paddingTop = entry.inlinePaddingTop;
-      else scroller.style.removeProperty("padding-top");
-      if (scroller.isConnected && scroller.matches(".android-reading")) {
-        shiftDocumentOriginY(scroller, -entry.appliedPx);
-        refreshDocumentExtent(scroller);
-      }
-      scroller.scrollTop = prevScrollTop > entry.appliedPx ? prevScrollTop - entry.appliedPx : 0;
-    }
+  for (const scroller of Array.from(activeClearances.keys())) {
+    releaseScrollerTopClearance(scroller);
   }
   activeClearances.clear();
+}
+
+function isVerticallyScrollableElement(el: HTMLElement): boolean {
+  if (el.scrollHeight <= el.clientHeight + 1) return false;
+  const inlineY = el.style.overflowY || el.style.overflow;
+  if (inlineY === "auto" || inlineY === "scroll" || inlineY === "overlay") return true;
+  if (typeof getComputedStyle === "function") {
+    const oy = getComputedStyle(el).overflowY;
+    if (oy === "auto" || oy === "scroll" || oy === "overlay") return true;
+  }
+  return false;
+}
+
+function scrollNestedScrollables(
+  anchorEl: Element | null,
+  scroller: HTMLElement,
+  range: Range | null,
+  mode: "center" | "ensure-visible",
+): void {
+  for (let cur = anchorEl; cur && cur !== scroller; cur = cur.parentElement) {
+    if (!(cur instanceof HTMLElement) || !isVerticallyScrollableElement(cur)) continue;
+    const curRect = cur.getBoundingClientRect();
+    if (curRect.height <= 0) continue;
+    const matchRect = readRangeOrElementRect(range, cur === anchorEl ? null : anchorEl);
+    if (!matchRect) continue;
+    const matchHeight = Math.max(0, matchRect.bottom - matchRect.top);
+    const pad = Math.min(12, curRect.height * 0.15);
+    const innerTop = curRect.top + pad;
+    const innerBottom = Math.max(innerTop + 8, curRect.bottom - pad);
+    const innerBand = Math.max(1, innerBottom - innerTop);
+    if (mode === "ensure-visible" && matchRect.top >= innerTop && (matchRect.bottom <= innerBottom || matchHeight >= innerBand)) {
+      continue;
+    }
+    const desiredInnerTop =
+      matchHeight >= innerBand
+        ? innerTop
+        : mode === "ensure-visible"
+          ? matchRect.top < innerTop
+            ? innerTop
+            : innerBottom - matchHeight
+          : curRect.top + (curRect.height - matchHeight) / 2;
+    const maxScroll = Math.max(0, cur.scrollHeight - cur.clientHeight);
+    cur.scrollTop = Math.max(0, Math.min(maxScroll, cur.scrollTop + (matchRect.top - desiredInnerTop)));
+  }
 }
 
 export function readRangeOrElementRect(
@@ -125,13 +189,26 @@ export function scrollRectIntoSearchScroller(
   if (scroller.matches(".android-reading")) refreshDocumentExtent(scroller);
   const band = unobstructedBand(scroller);
   if (!band) return;
-  const { visibleTop, visibleBottom } = band;
+  const { scrollerRect, visibleTop, visibleBottom } = band;
   const bandHeight = Math.max(1, visibleBottom - visibleTop);
-  const rect = resolveLiveRect?.() ?? initialRect;
-  const matchHeight = Math.max(0, rect.bottom - rect.top);
+  let rect = resolveLiveRect?.() ?? initialRect;
+  let matchHeight = Math.max(0, rect.bottom - rect.top);
 
   if (mode === "ensure-visible" && rect.top >= visibleTop && (rect.bottom <= visibleBottom || matchHeight >= bandHeight)) {
     return;
+  }
+
+  const existingApplied = activeClearances.get(scroller)?.appliedPx ?? 0;
+  if (existingApplied > 0) {
+    const unpaddedZeroTop = rect.top + scroller.scrollTop - existingApplied;
+    if (unpaddedZeroTop >= visibleTop) {
+      releaseScrollerTopClearance(scroller);
+      rect = resolveLiveRect?.() ?? {
+        top: unpaddedZeroTop - scroller.scrollTop,
+        bottom: unpaddedZeroTop - scroller.scrollTop + matchHeight,
+      };
+      matchHeight = Math.max(0, rect.bottom - rect.top);
+    }
   }
 
   let desiredTop: number;
@@ -140,7 +217,8 @@ export function scrollRectIntoSearchScroller(
   } else if (mode === "ensure-visible") {
     desiredTop = rect.top < visibleTop ? visibleTop : visibleBottom - matchHeight;
   } else {
-    desiredTop = visibleTop + (bandHeight - matchHeight) / 2;
+    const naturalCenterTop = scrollerRect.top + (scrollerRect.height - matchHeight) / 2;
+    desiredTop = Math.max(visibleTop, Math.min(visibleBottom - matchHeight, naturalCenterTop));
   }
 
   const prevScrollTop = scroller.scrollTop;
@@ -149,9 +227,14 @@ export function scrollRectIntoSearchScroller(
   if (targetScrollTop < 0) {
     if (prevScrollTop !== 0) scroller.scrollTop = 0;
     if (scroller.matches(".android-reading")) refreshDocumentExtent(scroller);
+    const currentApplied = activeClearances.get(scroller)?.appliedPx ?? 0;
     const atZero = resolveLiveRect?.() ?? { top: rect.top + prevScrollTop, bottom: rect.bottom + prevScrollTop };
-    if (atZero.top < visibleTop) {
-      increaseSearchTopClearance(scroller, visibleTop - atZero.top);
+    const unpaddedTop = atZero.top - currentApplied;
+    if (unpaddedTop < visibleTop) {
+      setSearchTopClearance(scroller, visibleTop - unpaddedTop);
+      scroller.scrollTop = 0;
+    } else if (currentApplied > 0) {
+      setSearchTopClearance(scroller, 0);
       scroller.scrollTop = 0;
     }
     return;
@@ -168,9 +251,11 @@ export function scrollRectIntoSearchScroller(
         if (nextTop < 0) {
           const cur = scroller.scrollTop;
           scroller.scrollTop = 0;
+          const currentApplied = activeClearances.get(scroller)?.appliedPx ?? 0;
           const zeroRect = resolveLiveRect() ?? { top: after.top + cur, bottom: after.bottom + cur };
-          if (zeroRect.top < visibleTop) {
-            increaseSearchTopClearance(scroller, visibleTop - zeroRect.top);
+          const unpaddedTop = zeroRect.top - currentApplied;
+          if (unpaddedTop < visibleTop) {
+            setSearchTopClearance(scroller, visibleTop - unpaddedTop);
             scroller.scrollTop = 0;
           }
         } else {
@@ -199,6 +284,7 @@ export function scrollSearchMatchIntoView(options: {
         : range.startContainer.parentElement
       : null);
   const scroller = resolveSearchScroller(anchorEl, host);
+  if (scroller) scrollNestedScrollables(anchorEl, scroller, range, mode);
   if (scroller?.matches(".android-reading")) refreshDocumentExtent(scroller);
   const band = scroller ? unobstructedBand(scroller) : null;
   if (!scroller || !band) {
