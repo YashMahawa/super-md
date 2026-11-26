@@ -16,11 +16,11 @@ from typing import Any
 
 try:
     from . import documents
-    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component
+    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component, normalize_fence_language
     from .frontmatter import strip_frontmatter
 except ImportError:
     import documents
-    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component
+    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component, normalize_fence_language
     from frontmatter import strip_frontmatter
 
 DEFAULT_PDF_OPTIONS = {
@@ -254,8 +254,7 @@ def _contains_unsupported_diagrams(markdown: str) -> bool:
             continue
         marker = match.group(1)
         if fence_char is None:
-            info = line[match.end():].strip().split(None, 1)
-            if info and info[0].casefold() in ("mermaid", "smd-chart"):
+            if normalize_fence_language(line[match.end():]) in ("mermaid", "smd-chart"):
                 return True
             fence_char, fence_size = marker[0], len(marker)
         elif marker[0] == fence_char and len(marker) >= fence_size:

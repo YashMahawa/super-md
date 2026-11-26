@@ -712,6 +712,29 @@ fn heading_slug(value: &str) -> String {
     let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
     if slug.is_empty() { "section".into() } else { slug }
 }
+fn parse_braced_fence_language(raw_info: &str) -> Option<&'static str> {
+    let trimmed = raw_info.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let rest = inner.strip_prefix('.').unwrap_or(inner);
+    let first = rest.as_bytes().first().copied()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let ident_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        .count();
+    let tail = &rest[ident_len..];
+    if !tail.is_empty() && !tail.starts_with(|c: char| c.is_whitespace() || c == ',' || c == '#') {
+        return None;
+    }
+    match rest[..ident_len].to_ascii_lowercase().as_str() {
+        "python" => Some("python"),
+        "py" => Some("py"),
+        "mermaid" => Some("mermaid"),
+        _ => None,
+    }
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RenderStop<'b> {
     Tag(TagEnd),
@@ -795,7 +818,8 @@ impl<'a> Renderer<'a> {
                             let mut code = String::new();
                             while let Some(e) = self.events.next() { if e == Event::End(close) { break; } if let Event::Text(v) = e { code.push_str(&v); } }
                             let info = match kind { CodeBlockKind::Fenced(v) => v.to_string(), _ => String::new() };
-                            let lang_token = info.split_whitespace().next().unwrap_or("");
+                            let braced = parse_braced_fence_language(&info);
+                            let lang_token = braced.unwrap_or_else(|| info.split_whitespace().next().unwrap_or(""));
                             let lang = lang_token.to_ascii_lowercase();
                             if ["smd-steps", "smd-step-grid"].contains(&lang.as_str()) {
                                 out.push_str(&step_grid::render(&code, self.assets)?);

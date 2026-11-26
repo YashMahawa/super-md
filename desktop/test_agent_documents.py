@@ -273,6 +273,9 @@ class AgentDocumentsTest(unittest.TestCase):
             self.store.search("search-contract.md", "w.+d", regex=True)
         direct = search_source(source, "ward", 2, 0, 16, True, True, False, True)
         self.assertEqual(direct["matches"], second["matches"])
+        braced = "Lead token\n```{.mermaid, fig-width=6}\ntoken --> B\n```\ntrailing token"
+        braced_hits = search_source(braced, "token", 10, 0, 0, False, True, False, True)
+        self.assertEqual([item["matchOffset"] for item in braced_hits["matches"]], [5, 63])
         span = diagram_spans(source)[0]
         self.assertEqual(source[span["start"]:span["end"]], "Ward --> X\n")
 

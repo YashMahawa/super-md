@@ -947,6 +947,19 @@ def _word_character(value: str) -> bool:
 
 _INLINE_SVG_OPEN = re.compile(r"<svg\b[^>]*>", re.IGNORECASE)
 _INLINE_SVG_CLOSE = re.compile(r"</svg\s*>", re.IGNORECASE)
+_BRACED_FENCE_HEAD = re.compile(r"^\.?([A-Za-z][A-Za-z0-9_-]*)(?:$|[\s,#])")
+
+
+def normalize_fence_language(raw_info: str) -> str:
+    trimmed = raw_info.strip()
+    if len(trimmed) >= 4 and trimmed.startswith("{") and trimmed.endswith("}"):
+        match = _BRACED_FENCE_HEAD.match(trimmed[1:-1].strip())
+        if match:
+            lower = match.group(1).casefold()
+            if lower in ("python", "py", "mermaid"):
+                return lower
+    parts = trimmed.split(None, 1)
+    return parts[0].casefold() if parts else ""
 
 
 def diagram_spans(text: str, *, include_inline_svg: bool = False) -> list[dict]:
@@ -961,8 +974,7 @@ def diagram_spans(text: str, *, include_inline_svg: bool = False) -> list[dict]:
         if match:
             marker = match.group(1)
             if opened is None:
-                info = body[match.end():].strip().split(None, 1)
-                language = info[0].casefold() if info else ""
+                language = normalize_fence_language(body[match.end():])
                 opened = {
                     "char": marker[0],
                     "size": len(marker),
