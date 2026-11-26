@@ -10,9 +10,10 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from core.paths import SOURCE_ROOT
 from package_runtime import wayland_dependencies
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = SOURCE_ROOT
 OUTPUT = ROOT / "desktop/dist"
 PHASES = []
 CHECKSUM_CHUNK_SIZE = 1024 * 1024
