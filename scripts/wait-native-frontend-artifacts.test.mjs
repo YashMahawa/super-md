@@ -111,3 +111,112 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
     pollIntervalMs: 10,
   }), /Timed out waiting/);
 });
+
+it('retries GitHub HTTP 403 rate-limit responses with header backoff while rejecting permission 403 errors', async () => {
+  let clock = 1_000_000;
+  const sleeps = [];
+  let calls = 0;
+  const fetchImpl = async input => {
+    const url = new URL(input);
+    calls++;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 403,
+        headers: new Headers({
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': String(Math.floor((clock + 25_000) / 1_000)),
+        }),
+        text: async () => JSON.stringify({ message: 'API rate limit exceeded for installation ID 1.' }),
+      };
+    }
+    if (calls === 2) {
+      return {
+        ok: false,
+        status: 403,
+        headers: new Headers({ 'retry-after': '15' }),
+        text: async () => JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }),
+      };
+    }
+    const body = url.pathname.endsWith('/jobs')
+      ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'completed', conclusion: 'success' }] }
+      : url.pathname.endsWith('/artifacts')
+        ? { total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }
+        : run;
+    return { ok: true, status: 200, headers: new Headers(), json: async () => body };
+  };
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl,
+    sleep: async ms => { sleeps.push(ms); clock += ms; },
+    now: () => clock,
+    timeoutMs: 60_000,
+    pollIntervalMs: 5_000,
+  });
+  assert.deepEqual(result, names);
+  assert.deepEqual(sleeps, [25_000, 15_000]);
+
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: async () => ({
+      ok: false,
+      status: 403,
+      headers: new Headers({ 'x-ratelimit-remaining': '4999' }),
+      text: async () => JSON.stringify({ message: 'Resource not accessible by integration' }),
+    }),
+    sleep: async () => {},
+    now: () => 0,
+    timeoutMs: 1_000,
+    pollIntervalMs: 100,
+  }), /HTTP 403/);
+});
+
+it('does not poll workflow artifacts until native_frontend completes successfully', async () => {
+  let clock = 0;
+  let jobPolls = 0;
+  let artifactPolls = 0;
+  const fetchImpl = async input => {
+    const url = new URL(input);
+    if (url.pathname.endsWith('/jobs')) {
+      jobPolls++;
+      const status = jobPolls < 3 ? 'queued' : 'completed';
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          total_count: 1,
+          jobs: [{ name: 'native_frontend', status, conclusion: status === 'completed' ? 'success' : null }],
+        }),
+      };
+    }
+    if (url.pathname.endsWith('/artifacts')) {
+      artifactPolls++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }),
+      };
+    }
+    return { ok: true, status: 200, json: async () => run };
+  };
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl,
+    sleep: async ms => { clock += ms; },
+    now: () => clock,
+    timeoutMs: 100,
+    pollIntervalMs: 10,
+  });
+  assert.deepEqual(result, names);
+  assert.equal(jobPolls, 3);
+  assert.equal(artifactPolls, 1);
+});
