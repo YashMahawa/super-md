@@ -47,6 +47,10 @@ from fonts import FontStore
 from python_outputs import PythonOutputs
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
+if __package__:
+    from . import studio_tabs
+else:
+    import studio_tabs
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import ExactWriteAborted, LatestWriteExecutor
@@ -535,27 +539,11 @@ def export_destination(value: str, format: str) -> Path:
     return target
 
 def _same_closed_revision(current: dict, captured: dict) -> bool:
-    """Compare content-bearing fields after a background close snapshot."""
-    return current == captured
+    return studio_tabs.same_closed_revision(current, captured)
 
 
 def _snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -> dict:
-    """Snapshot tab metadata and asset dicts without walking immutable image strings."""
-    snapshot = {}
-    for key, value in tab.items():
-        if not include_view_state and key == "viewState":
-            continue
-        if key in ("assets", "saved_assets") and isinstance(value, dict):
-            snapshot[key] = dict(value)
-        elif key == "outline" and isinstance(value, list):
-            snapshot[key] = copy.deepcopy(value)
-        elif key == "viewState" and value is not None:
-            snapshot[key] = copy.deepcopy(value)
-        elif isinstance(value, (str, int, float, bool)) or value is None:
-            snapshot[key] = value
-        else:
-            snapshot[key] = copy.deepcopy(value)
-    return snapshot
+    return studio_tabs.snapshot_tab_state(tab, include_view_state=include_view_state)
 
 
 def _asset_identity(value):
@@ -1173,34 +1161,13 @@ class Studio(QObject):
 
     @Slot(str)
     def pinRecent(self,path):
-        matched_recent = next((item for item in self.recent if folder_ops.same_path(item, path)), None)
-        if matched_recent is None:
-            return
-        matched_pinned = next((item for item in self.session.pinned if folder_ops.same_path(item, matched_recent)), None)
-        if matched_pinned is not None:
-            self.session.pinned = [item for item in self.session.pinned if not folder_ops.same_path(item, matched_recent)]
-        else:
-            self.session.pinned.append(matched_recent)
-        self.recent=self.recent
-        self._preferences()
-        for window in tuple(self.session.windows.values()):
-            window._notify_sidebar()
+        return studio_tabs.pin_recent(self, path)
 
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
-        assets = dict(assets) if assets else {}
-        return {"id": uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
-                "assets": assets, "saved_assets": dict(assets), "assets_dirty": False,
-                "portable": portable, "conflict": False,
-                "agent_staged": False, "agent_unreviewed": False, "agent_edits": []}
+        return studio_tabs.make_note(self, name, content, path, saved, assets, portable)
 
     def _is_dirty(self, tab: dict) -> bool:
-        if tab.get("content") != tab.get("saved"):
-            return True
-        if tab.get("assets_dirty"):
-            return True
-        if tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}):
-            return True
-        return False
+        return studio_tabs.is_dirty(self, tab)
 
     @staticmethod
     def _bound_agent_edits(edits: list[dict]) -> list[dict]:
@@ -1268,22 +1235,10 @@ class Studio(QObject):
     def pinnedRecent(self):return list(self.session.pinned)
 
     def _current(self):
-        if not self.tabs:
-            return {"id": "", "name": "Super MD", "content": "", "path": "", "saved": "", "assets": {}, "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "outline": []}
-        return next((t for t in self.tabs if t["id"] == self.active), self.tabs[0])
+        return studio_tabs.current_tab(self)
 
     def _consume_seeded_find(self, tab: dict) -> dict | None:
-        pending = self._pending_seeded_find
-        if not pending or not tab.get("id"):
-            return None
-        target_id = pending.get("tabId") or ""
-        target_path = pending.get("path") or ""
-        matches_id = bool(target_id and tab["id"] == target_id)
-        matches_path = bool(target_path and tab.get("path") and os.path.normcase(str(Path(tab["path"]).resolve(strict=False))) == os.path.normcase(str(Path(target_path).resolve(strict=False))))
-        if not matches_id and not matches_path:
-            return None
-        self._pending_seeded_find = None
-        return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+        return studio_tabs.consume_seeded_find(self, tab)
 
     def _notify_sidebar(self):
         if self.retired:
@@ -2738,76 +2693,33 @@ class Studio(QObject):
         self._submit(prepare,done,False)
 
     def _can_move(self):
-        return not (self.retired or self.busy or self.saving or self._staging_tabs or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
+        return studio_tabs.can_move(self)
 
     @Slot(str, str, result=bool)
     def canReceiveTab(self, source_id, tab_id):
-        source = self.session.windows.get(source_id)
-        return bool(source and source._can_move() and self._can_move() and any(t["id"] == tab_id for t in source.tabs))
+        return studio_tabs.can_receive_tab(self, source_id, tab_id)
 
     @Slot(str, str, int)
     def receiveTab(self, source_id, tab_id, index):
-        if not self.canReceiveTab(source_id, tab_id): return
-        source = self.session.windows[source_id]
-        if source is self:
-            old = next(i for i, t in enumerate(self.tabs) if t["id"] == tab_id)
-            note = self.tabs.pop(old)
-            self.tabs.insert(max(0, min(len(self.tabs), index - (1 if old < index else 0))), note)
-            self._recover(); self._emit(False)
-        else:
-            source._flush("move_tab", json.dumps({"window": self.window_id, "tab": tab_id, "index": index}))
+        return studio_tabs.receive_tab(self, source_id, tab_id, index)
 
     def _move_tab(self, target, tab_id, index):
-        # Keep the exact note object, including unsaved content and portable assets.
-        # Only remove it after the destination is alive and can accept ownership.
-        if target is self or not self._can_move() or not target._can_move(): return False
-        note = next((t for t in self.tabs if t["id"] == tab_id), None)
-        if not note: return False
-        old = self.tabs.index(note)
-        self.tabs.remove(note)
-        self.session.reader_assets.revoke_tab(self.window_id, tab_id)
-        target.tabs.insert(max(0, min(len(target.tabs), index)), note)
-        target.active = tab_id
-        emptied = not self.tabs
-        if emptied: self.tabs.append(self._note("Untitled.md"))
-        if self.active == tab_id: self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
-        # Update both owners before writing one recovery snapshot: never duplicate
-        # or temporarily lose a dirty note in the durable recovery stream.
-        self.session.drafts[self.window_id] = self._window_recovery_drafts()
-        target._recover()
-        self._emit(); target._emit()
-        if emptied: QTimer.singleShot(0, self.allowClose.emit)
-        return True
+        return studio_tabs.move_tab(self, target, tab_id, index)
 
     @Slot(str)
     def detachTab(self, tab_id):
-        if self._can_move() and any(t["id"] == tab_id for t in self.tabs): self._flush("detach_tab", tab_id)
+        return studio_tabs.detach_tab(self, tab_id)
 
     @Slot(str,result=str)
     def tabPreview(self,id):
-        note=next((t for t in self.tabs if t["id"]==id),None)
-        return note["content"][:900] if note else ""
+        return studio_tabs.tab_preview(self, id)
 
     @Slot(str, int)
     def finishTabDrag(self, tab_id, action):
-        if action != int(Qt.DropAction.IgnoreAction.value): return
-        # QDrag's nested event loop can finish before Wayland delivers the
-        # release to Qt's button-state cache. Wait for that delivery before
-        # distinguishing an outside drop from Escape while still held.
-        QTimer.singleShot(150, lambda:self._finish_tab_drag(tab_id))
+        return studio_tabs.finish_tab_drag(self, tab_id, action)
 
     def _finish_tab_drag(self, tab_id):
-        # Escape cancels QDrag while the button is still held; never detach then.
-        if QGuiApplication.mouseButtons() & Qt.MouseButton.LeftButton: return
-        cursor = QCursor.pos()
-        for backend in self.session.windows.values():
-            host = backend.host_window
-            if not host or not host.isVisible(): continue
-            strip = host.findChild(QObject, "tabStrip")
-            if strip:
-                point = strip.mapFromGlobal(QPointF(cursor))
-                if 0 <= point.x() <= strip.width() and 0 <= point.y() <= strip.height(): return
-        self.detachTab(tab_id)
+        return studio_tabs.complete_tab_drag(self, tab_id)
 
     @Property("QStringList", notify=changed)
     def fonts(self):
@@ -3497,255 +3409,48 @@ class Studio(QObject):
 
     @Slot(str)
     def openPath(self, value):
-        path = local_path(value)
-        if path.is_dir():
-            self.openFolder(str(path))
-        else:
-            self.openNote(str(path))
+        return studio_tabs.open_path(self, value)
 
     @Slot()
     def chooseFolder(self):
-        if not sys.platform.startswith("linux"):
-            self.folderPickerRequested.emit()
-            return
-        if getattr(self, "_folder_check", None) is not None:
-            return
-        from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusVariant
-        message = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.DBus.Properties", "Get")
-        message.setArguments(["org.freedesktop.portal.FileChooser", "version"])
-        self._folder_check = watcher = QDBusPendingCallWatcher(QDBusConnection.sessionBus().asyncCall(message, 3000), self)
-        def finished(call):
-            reply = call.reply()
-            values = reply.arguments()
-            version = values[0].variant() if values and isinstance(values[0], QDBusVariant) else (values[0] if values else 0)
-            self._folder_check = None
-            call.deleteLater()
-            if reply.type() == QDBusMessage.MessageType.ReplyMessage and isinstance(version, int) and version >= 3:
-                self.folderPickerRequested.emit()
-            else:
-                self.message = "The system folder picker is unavailable. Enable an XDG desktop portal file chooser, or open a folder with Super MD from your file manager."
-                self._emit(False)
-        watcher.finished.connect(finished)
+        return studio_tabs.choose_folder(self)
 
     @Slot(str)
     def openNote(self, value):
-        self._open_note(value, explicit=True)
+        return studio_tabs.open_note_slot(self, value)
 
     def _focus_open_target(self, generation):
-        if generation != self._activation_generation or self.retired:
-            return
-        window = self.host_window
-        if window is None:
-            return
-        window.raise_()
-        window.requestActivate()
-        QTimer.singleShot(0, lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
-                          if generation == self._activation_generation and not self.retired else None)
+        return studio_tabs.focus_open_target(self, generation)
 
-    def _open_note(
-        self,
-        value,
-        *,
-        explicit,
-        activation_generation=None,
-        completion_callback=None,
-        batch_insert=None,
-        should_activate_fn=None,
-        pending_heading=None,
-    ):
-        if self.retired:
-            if completion_callback: completion_callback(None, "The document window is no longer available")
-            return
-        path = local_path(value)
-        if path.is_dir():
-            self.openFolder(str(path))
-            if completion_callback: completion_callback(None, "A folder cannot be opened as a document")
-            return
-        if explicit and activation_generation is None:
-            self._activation_generation += 1
-            activation_generation = self._activation_generation
-        elif activation_generation is None:
-            activation_generation = self._activation_generation
-        restoring = not explicit and str(path) in self._restoring_paths
-        def activate_existing(target_tab):
-            if explicit and activation_generation == self._activation_generation:
-                if should_activate_fn is None or should_activate_fn(target_tab):
-                    if pending_heading:
-                        target_tab["pendingHeading"] = pending_heading
-                    else:
-                        target_tab.pop("pendingHeading", None)
-                    if batch_insert is None:
-                        canon_existing_path = folder_ops.canonical_path_str(path)
-                        self.recent = [canon_existing_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_existing_path)][:29]
-                        self._preferences(notify=False)
-                    was_active = self.active == target_tab["id"]
-                    self._select_tab_from_open(target_tab["id"], activation_generation)
-                    if was_active:
-                        self._emit(bool(pending_heading))
-                    for window in list(self.session.windows.values()):
-                        if window is not self and not window.retired:
-                            window._emit(False)
-                    self._focus_open_target(activation_generation)
-        def same_open_tab_path(tab_path: str) -> bool:
-            if not tab_path:
-                return False
-            if tab_path == str(path) or folder_ops.same_path(tab_path, path):
-                return True
-            try:
-                return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
-            except OSError:
-                return False
-        found = next((t for t in self.tabs if same_open_tab_path(t["path"])), None)
-        if found:
-            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
-            self._restoring_paths.discard(str(path))
-            if restoring and activation_generation == self._activation_generation and str(path) == (self._startup_active or self.session.startup_active):
-                self._select_tab_from_open(found["id"], activation_generation)
-            activate_existing(found)
-            if completion_callback: completion_callback(found, None)
-            return
-        def finished(result, error):
-            self._restoring_paths.discard(str(path))
-            if error:
-                if completion_callback: completion_callback(None, error)
-                return
-            content, assets, portable = result
-            # A startup read and an explicit open may race for the same path.
-            # Keep one tab and let only an explicit, still-current request focus it.
-            existing = next((tab for tab in self.tabs if same_open_tab_path(tab["path"])), None)
-            if existing:
-                activate_existing(existing)
-                if completion_callback: completion_callback(existing, None)
-                return
-            note = self._note(path.name, content, str(path), content, assets, portable)
-            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
-            if restoring:
-                if activation_generation == self._activation_generation:
-                    self.tabs=[t for t in self.tabs if t["id"] not in self._startup_placeholder_ids]
-                    self._startup_placeholder_ids.clear()
-            if batch_insert is not None:
-                batch_insert(note)
-            else:
-                self.tabs.append(note)
-            if restoring:
-                keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
-                self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
-            if should_activate_fn is not None:
-                should_activate = bool(explicit and activation_generation == self._activation_generation and should_activate_fn(note))
-            else:
-                should_activate = (explicit and activation_generation == self._activation_generation)
-            if restoring and activation_generation == self._activation_generation:
-                target_active = self._startup_active or self.session.startup_active
-                should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
-            if should_activate:
-                self.active = note["id"]
-                if pending_heading:
-                    note["pendingHeading"] = pending_heading
-            self.settings["welcomed"] = True
-            canon_note_path = folder_ops.canonical_path_str(path)
-            self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
-            self._preferences(notify=False)
-            self.recovery_timer.start(800)
-            emit_load = should_activate if (should_activate_fn is not None or explicit) else True
-            for window in list(self.session.windows.values()):
-                if window is self:
-                    window._emit(emit_load)
-                else:
-                    window._emit()
-            if explicit and should_activate:
-                self._focus_open_target(activation_generation)
-            if completion_callback: completion_callback(note, None)
-        self._submit(lambda: open_note(path), finished)
+    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None, batch_insert=None, should_activate_fn=None, pending_heading=None):
+        return studio_tabs.open_note_workflow(self, value, explicit=explicit, activation_generation=activation_generation, completion_callback=completion_callback, batch_insert=batch_insert, should_activate_fn=should_activate_fn, pending_heading=pending_heading)
 
     @Slot()
     def newNote(self):
-        self._activation_generation += 1
-        note = self._note("Untitled.md")
-        self.tabs.append(note)
-        self.active = note["id"]
-        self.recovery_timer.start(800)
-        self._emit()
+        return studio_tabs.new_note(self)
 
     @Slot(str)
     def selectTab(self, id):
-        if any(t["id"] == id for t in self.tabs):
-            self._activation_generation += 1
-            for tab in self.tabs:
-                tab.pop("pendingHeading", None)
-        self._select_tab_from_open(id, self._activation_generation)
+        return studio_tabs.select_tab(self, id)
 
     def _select_tab_from_open(self, id, generation):
-        if generation != self._activation_generation:
-            return
-        if id!=self.active and any(t["id"] == id for t in self.tabs):
-            self.active = id
-            self._activate_tab_state(self._current())
-            self.recovery_timer.start(800)
-            self._emit()
+        return studio_tabs.select_tab_from_open(self, id, generation)
 
     @Slot(int)
     def cycleTab(self, direction):
-        if not self.tabs: return
-        index=next((i for i,t in enumerate(self.tabs) if t["id"]==self.active),0)
-        self.selectTab(self.tabs[(index+direction)%len(self.tabs)]["id"])
+        return studio_tabs.cycle_tab(self, direction)
 
     @Slot(int)
     def moveActiveTab(self, direction):
-        if direction not in (-1, 1) or len(self.tabs) < 2: return
-        index=next((i for i,t in enumerate(self.tabs) if t["id"]==self.active),-1)
-        target=max(0,min(len(self.tabs)-1,index+direction))
-        if index < 0 or target == index: return
-        self.tabs.insert(target,self.tabs.pop(index))
-        self._recover()
-        self._emit(False)
+        return studio_tabs.move_active_tab(self, direction)
 
     @Slot(int)
     def tabNumber(self, number):
-        index=len(self.tabs)-1 if number==9 else number-1
-        if 0<=index<len(self.tabs):self.selectTab(self.tabs[index]["id"])
+        return studio_tabs.tab_number(self, number)
 
     @Slot()
     def reopenTab(self):
-        if not self.closed_tabs:return
-        self._activation_generation += 1
-        activation_generation=self._activation_generation
-        reference=self.closed_tabs[0]
-        def finished(note,error):
-            if error:
-                self.message="Could not reopen the closed note: "+error
-                self._emit(False);return
-            if reference not in self.closed_tabs:return
-            note.setdefault("saved_assets", dict(note.get("assets", {})))
-            note.setdefault("assets_dirty", False)
-            note.setdefault("conflict", False)
-            note.setdefault("agent_staged", False)
-            note.setdefault("agent_unreviewed", False)
-            note.setdefault("agent_edits", [])
-            next_refs=[item for item in self.closed_tabs if item is not reference]
-            try:self.session.closed_note_store.save_index(next_refs)
-            except Exception as failure:
-                self.message="Could not update closed-note recovery: "+str(failure)
-                self._emit(False);return
-            existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
-            if existing:
-                if activation_generation==self._activation_generation:
-                    self.active=existing["id"]
-                    self._activate_tab_state(existing)
-            else:
-                self.tabs.append(note)
-                if note.get("path"):
-                    try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
-                    except OSError:pass
-                if activation_generation==self._activation_generation:
-                    self.active=note["id"]
-                    self._activate_tab_state(note)
-            self.closed_tabs[:]=next_refs
-            self._recover();self._emit()
-        def read_note():
-            if reference.get("_closedSnapshot"):
-                return self.session.closed_note_store.load(reference)
-            return _snapshot_tab_state(reference)  # compatibility with old in-memory entries
-        self._submit(read_note,finished,False,self.writes)
+        return studio_tabs.reopen_tab(self)
 
     def _restore_workspace_folder(self, folder_path: str, expanded_paths: list[str] | None = None):
         if not folder_path:
@@ -4798,114 +4503,24 @@ class Studio(QObject):
 
     @Slot(str)
     def closeTab(self, id):
-        tab = next((t for t in self.tabs if t["id"] == id), None)
-        if not tab:
-            return
-        self._activation_generation += 1
-        if self._is_dirty(tab) and (tab["path"] or tab["content"].strip() or tab["assets"]):
-            self.pending_close = id
-            self.selectTab(id)
-            self.closeRequested.emit(tab["name"])
-        else:
-            self._remove_tab(id)
+        return studio_tabs.close_tab(self, id)
 
     def _remove_tab(self, id):
-        removed=next((tab for tab in self.tabs if tab["id"]==id),None)
-        if removed is None:return
-        if removed["content"].strip() or removed["path"] or removed.get("assets"):
-            if id in self._closing_tabs:return
-            self._closing_tabs.add(id)
-            self._python_jobs.cancel_tab(id)
-            # Strings and encoded assets are immutable; snapshot small mutable
-            # metadata/asset mappings without walking large base64 strings.
-            captured=_snapshot_tab_state(removed)
-            def saved(reference,error):
-                self._closing_tabs.discard(id)
-                if error:
-                    self.message="Could not preserve the closed note: "+error
-                    return
-                current=next((tab for tab in self.tabs if tab["id"]==id),None)
-                if current is None:return
-                if not _same_closed_revision(current,captured):
-                    self.message="The note changed while it was closing. It remains open with the latest text."
-                    return
-                next_refs=[reference]+self.closed_tabs
-                next_refs=next_refs[:ClosedNoteStore.LIMIT]
-                try:self.session.closed_note_store.save_index(next_refs)
-                except Exception as failure:
-                    self.message="Could not update closed-note recovery: "+str(failure)
-                    return
-                self.closed_tabs[:]=next_refs
-                self._finish_remove_tab(id)
-            self._submit(lambda:self.session.closed_note_store.save(captured),saved,False,self.writes)
-            return
-        self._finish_remove_tab(id)
+        return studio_tabs.remove_tab(self, id)
 
     def _finish_remove_tab(self,id):
-        self._python_jobs.cancel_tab(id)
-        self.reader_edits.clear(id)
-        current_index=next((i for i,tab in enumerate(self.tabs) if tab["id"]==id),None)
-        if current_index is None:return
-        self.session.reader_assets.revoke_tab(self.window_id, id)
-        self.tabs.pop(current_index)
-        if not self.tabs:
-            self.tabs.append(self._note("Untitled.md"))
-        if self._agent_jump_tab_id == id:
-            self._agent_jump_tab_id = ""
-        self._last_reader_agent_seq.pop(id, None)
-        if self.active == id:
-            self._activation_generation += 1
-            self.active = self.tabs[min(current_index, len(self.tabs)-1)]["id"]
-            self._activate_tab_state(self._current())
-        self._recover()
-        self._emit()
+        return studio_tabs.finish_remove_tab(self, id)
 
     @Slot(result=bool)
     def requestWindowClose(self):
-        dirty = next((t for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])), None)
-        if dirty:
-            self.pending_close = "window"
-            self.selectTab(dirty["id"])
-            self.closeRequested.emit(dirty["name"])
-            return False
-        return True
+        return studio_tabs.request_window_close(self)
 
     @Slot(str)
     def resolveClose(self, choice):
-        if choice == "cancel": self.pending_close = ""; return
-        if choice == "save": self.save(); return
-        if choice == "discard":
-            # For a single-tab close, "discard" confirms closing the dirty
-            # buffer; the closed snapshot must retain its original saved text.
-            if self.pending_close != "window":
-                action=self.pending_close
-                self.pending_close=""
-                if action:self._remove_tab(action)
-                return
-            current = self._current()
-            if current["content"].strip() or current["path"] or current.get("assets"):
-                captured = _snapshot_tab_state(current)
-                try:
-                    reference = self.session.closed_note_store.save(captured)
-                    next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
-                    self.session.closed_note_store.save_index(next_refs)
-                    self.closed_tabs[:] = next_refs
-                except Exception as failure:
-                    self.message = "Could not preserve the closed note: " + str(failure)
-            current["saved"] = current["content"]
-            current["saved_assets"] = dict(current.get("assets", {}))
-            current["assets_dirty"] = False
-            self._finish_close()
+        return studio_tabs.resolve_close(self, choice)
 
     def _finish_close(self):
-        action = self.pending_close
-        self.pending_close = ""
-        if action == "window":
-            if self.requestWindowClose():
-                self._recover()
-                self.allowClose.emit()
-        elif action:
-            self.closeTab(action)
+        return studio_tabs.finish_close(self)
 
     @Slot(str, str)
     def exportTo(self, value, format):
