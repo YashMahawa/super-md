@@ -25,10 +25,14 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 import zipfile
 from pathlib import Path
+try:
+    import shiboken6
+except ImportError:  # pragma: no cover
+    shiboken6 = None
 from network_tls import client_context
-import shiboken6
 from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
@@ -55,6 +59,7 @@ import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 from quick_switcher import FolderNoteIndex, build_quick_switcher_candidates, coalesce_walk_roots, normalize_workspace_roots, rank_quick_switcher_items
+from workspace_links import WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
@@ -560,6 +565,35 @@ def _noop_done(*_):
     pass
 
 
+class _StoppedFileWatcher:
+    def files(self) -> list[str]:
+        return []
+
+    def directories(self) -> list[str]:
+        return []
+
+    def addPath(self, _path: str) -> bool:
+        return False
+
+    def addPaths(self, paths) -> list[str]:
+        return list(paths)
+
+    def removePath(self, _path: str) -> bool:
+        return False
+
+    def removePaths(self, paths) -> list[str]:
+        return list(paths)
+
+
+_STOPPED_WATCHER = _StoppedFileWatcher()
+
+
+def _watcher_alive(watcher) -> bool:
+    if watcher is None or watcher is _STOPPED_WATCHER:
+        return False
+    return shiboken6 is None or shiboken6.isValid(watcher)
+
+
 def _matches_media_signature(mime: str, data: bytes) -> bool:
     head = data[:4096]
     if mime == "image/png":
@@ -829,8 +863,19 @@ class Studio(QObject):
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
         self.quickSwitcherIndexed.connect(self._on_quick_switcher_indexed)
         self.session = session or Session(isolated)
-        self.session.changed.connect(lambda:self._emit())
-        self.session.locationChanged.connect(self._location_changed)
+        weak_self = weakref.ref(self)
+        def _on_session_changed():
+            inst = weak_self()
+            if inst is not None and not inst.retired:
+                inst._emit()
+        def _on_location_changed(old, new):
+            inst = weak_self()
+            if inst is not None and not inst.retired:
+                inst._location_changed(old, new)
+        self._session_changed_slot = _on_session_changed
+        self._location_changed_slot = _on_location_changed
+        self.session.changed.connect(self._session_changed_slot)
+        self.session.locationChanged.connect(self._location_changed_slot)
         self.writes = self.session.writes
         self.window_id = uuid.uuid4().hex
         self.session.windows[self.window_id] = self
@@ -923,6 +968,7 @@ class Studio(QObject):
         self.ready = False
         self._last_reader_text = None
         self._export_jobs = ExportJobRegistry()
+        self._python_jobs = python_runtime.PythonJobRegistry()
         self._agent_exports: dict[str, dict] = {}
         self._agent_owned_files: set[str] = getattr(self.session, "agent_owned_files", None) or set()
         self.session.agent_owned_files = self._agent_owned_files
@@ -938,7 +984,12 @@ class Studio(QObject):
         self.theme_debounce = QTimer(self)
         self.theme_debounce.setSingleShot(True)
         self.theme_debounce.timeout.connect(self._refresh_theme)
-        QGuiApplication.styleHints().colorSchemeChanged.connect(self._schedule_theme)
+        def _on_color_scheme_changed(*args):
+            inst = weak_self()
+            if inst is not None and not inst.retired:
+                inst._schedule_theme(*args)
+        self._color_scheme_slot = _on_color_scheme_changed
+        QGuiApplication.styleHints().colorSchemeChanged.connect(self._color_scheme_slot)
         self.palette_watcher = QFileSystemWatcher(self)
         self.palette_watcher.fileChanged.connect(self._palette_changed)
         self.palette_watcher.directoryChanged.connect(self._palette_changed)
@@ -1147,6 +1198,9 @@ class Studio(QObject):
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            pending_heading = tab.pop("pendingHeading", None)
+            if pending_heading:
+                payload["pendingHeading"] = pending_heading
             seeded_find = self._consume_seeded_find(tab)
             if seeded_find is not None:
                 payload["seededFind"] = seeded_find
@@ -1279,7 +1333,7 @@ class Studio(QObject):
             if not window.retired: window.shortcutsChanged.emit()
 
     def _watch_notes(self,force=False):
-        if self.retired or not shiboken6.isValid(self.note_watcher):
+        if self.retired or not _watcher_alive(self.note_watcher):
             return
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
         signature=(paths,self.folder,tuple(sorted(self.expanded)))
@@ -1296,7 +1350,7 @@ class Studio(QObject):
     def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool):
         parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
         for win in list(self.session.windows.values()):
-            if win.retired or not shiboken6.isValid(win.note_watcher):
+            if win.retired or not _watcher_alive(win.note_watcher):
                 continue
             watched = list(win.note_watcher.files() + win.note_watcher.directories())
             to_remove = [
@@ -1403,7 +1457,7 @@ class Studio(QObject):
         self.theme_debounce.start(150)
 
     def _watch_palette(self):
-        if self.retired or not shiboken6.isValid(self.palette_watcher):
+        if self.retired or not _watcher_alive(self.palette_watcher):
             return
         watched = set(self.palette_watcher.files()+self.palette_watcher.directories())
         for path in system_palette_paths():
@@ -1444,6 +1498,7 @@ class Studio(QObject):
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
+        self._python_jobs.cancel_all(retire=True)
         for agent_export in tuple(self._agent_exports.values()):
             try:
                 reserved = Path(agent_export["path"])
@@ -1464,13 +1519,29 @@ class Studio(QObject):
         self.flush_timer.stop()
         self.external_timer.stop()
         self.filter_timer.stop()
-        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
-            if not shiboken6.isValid(watcher):
+        for attr in ("note_watcher", "palette_watcher", "custom_theme_watcher"):
+            watcher = getattr(self, attr, None)
+            if watcher is None or watcher is _STOPPED_WATCHER:
                 continue
             watched = watcher.files() + watcher.directories()
             if watched:
                 watcher.removePaths(watched)
-            shiboken6.delete(watcher)
+            setattr(self, attr, _STOPPED_WATCHER)
+            if shiboken6 is not None and shiboken6.isValid(watcher):
+                watcher.setParent(None)
+                shiboken6.delete(watcher)
+            else:
+                watcher.deleteLater()
+        for signal, slot in (
+            (QGuiApplication.styleHints().colorSchemeChanged, getattr(self, "_color_scheme_slot", None)),
+            (self.session.changed, getattr(self, "_session_changed_slot", None)),
+            (self.session.locationChanged, getattr(self, "_location_changed_slot", None)),
+        ):
+            if slot is not None:
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
@@ -1858,18 +1929,24 @@ class Studio(QObject):
         if self.retired:
             return
         self.closeQuickSwitcher()
-        if tab_id:
-            existing = next((t for t in self.tabs if t["id"] == tab_id), None)
-            if existing is not None:
-                if existing.get("path"):
-                    self.openNote(existing["path"])
-                else:
-                    self.selectTab(existing["id"])
-                    self._focus_open_target(self._activation_generation)
-                return
+        existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
+        if existing is None and path:
+            existing = self._find_open_tab(path, canonicalize_local=True) or next(
+                (t for t in self.tabs if t.get("path") and folder_ops.same_path(t["path"], path)),
+                None,
+            )
+        for tab in self.tabs:
+            tab.pop("pendingHeading", None)
+        if existing is not None:
+            existing_path = existing.get("path") or ""
+            if existing_path and str(local_path(existing_path)) == existing_path:
+                self.openNote(existing_path)
+            else:
+                self.selectTab(existing["id"])
+                self._focus_open_target(self._activation_generation)
+            return
         if path:
-            matched_tab = next((t for t in self.tabs if t.get("path") and folder_ops.same_path(t["path"], path)), None)
-            self.openNote(matched_tab["path"] if matched_tab is not None else path)
+            self.openNote(path)
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -2706,8 +2783,8 @@ class Studio(QObject):
             self._preferences(False)
 
     def _watch_custom_theme(self):
-        watcher=self.custom_theme_watcher
-        if self.retired or not shiboken6.isValid(watcher):
+        watcher = self.custom_theme_watcher
+        if self.retired or not _watcher_alive(watcher):
             return
         paths=watcher.files()+watcher.directories()
         if paths:watcher.removePaths(paths)
@@ -3336,6 +3413,7 @@ class Studio(QObject):
         completion_callback=None,
         batch_insert=None,
         should_activate_fn=None,
+        pending_heading=None,
     ):
         if self.retired:
             if completion_callback: completion_callback(None, "The document window is no longer available")
@@ -3351,16 +3429,25 @@ class Studio(QObject):
         elif activation_generation is None:
             activation_generation = self._activation_generation
         restoring = not explicit and str(path) in self._restoring_paths
+        def activate_existing(target_tab):
+            if explicit and activation_generation == self._activation_generation:
+                if should_activate_fn is None or should_activate_fn(target_tab):
+                    if pending_heading:
+                        target_tab["pendingHeading"] = pending_heading
+                    else:
+                        target_tab.pop("pendingHeading", None)
+                    was_active = self.active == target_tab["id"]
+                    self._select_tab_from_open(target_tab["id"], activation_generation)
+                    if was_active and pending_heading:
+                        self._emit()
+                    self._focus_open_target(activation_generation)
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
             self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             self._restoring_paths.discard(str(path))
             if restoring and activation_generation == self._activation_generation and str(path) == (self._startup_active or self.session.startup_active):
                 self._select_tab_from_open(found["id"], activation_generation)
-            if explicit and activation_generation == self._activation_generation:
-                if should_activate_fn is None or should_activate_fn(found):
-                    self._select_tab_from_open(found["id"], activation_generation)
-                    self._focus_open_target(activation_generation)
+            activate_existing(found)
             if completion_callback: completion_callback(found, None)
             return
         def finished(result, error):
@@ -3373,10 +3460,7 @@ class Studio(QObject):
             # Keep one tab and let only an explicit, still-current request focus it.
             existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
             if existing:
-                if explicit and activation_generation == self._activation_generation:
-                    if should_activate_fn is None or should_activate_fn(existing):
-                        self._select_tab_from_open(existing["id"], activation_generation)
-                        self._focus_open_target(activation_generation)
+                activate_existing(existing)
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
@@ -3401,12 +3485,19 @@ class Studio(QObject):
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
             if should_activate:
                 self.active = note["id"]
+                if pending_heading:
+                    note["pendingHeading"] = pending_heading
             self.settings["welcomed"] = True
             canon_note_path = folder_ops.canonical_path_str(path)
             self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
-            self._preferences()
+            self._preferences(notify=False)
             self.recovery_timer.start(800)
-            self._emit(should_activate if should_activate_fn is not None else True)
+            emit_load = should_activate if (should_activate_fn is not None or explicit) else True
+            for window in list(self.session.windows.values()):
+                if window is self:
+                    window._emit(emit_load)
+                else:
+                    window._emit()
             if explicit and should_activate:
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(note, None)
@@ -3425,6 +3516,8 @@ class Studio(QObject):
     def selectTab(self, id):
         if any(t["id"] == id for t in self.tabs):
             self._activation_generation += 1
+            for tab in self.tabs:
+                tab.pop("pendingHeading", None)
         self._select_tab_from_open(id, self._activation_generation)
 
     def _select_tab_from_open(self, id, generation):
@@ -4465,6 +4558,7 @@ class Studio(QObject):
         if removed["content"].strip() or removed["path"] or removed.get("assets"):
             if id in self._closing_tabs:return
             self._closing_tabs.add(id)
+            self._python_jobs.cancel_tab(id)
             # Strings and encoded assets are immutable; snapshot small mutable
             # metadata/asset mappings without walking large base64 strings.
             captured=_snapshot_tab_state(removed)
@@ -4491,6 +4585,7 @@ class Studio(QObject):
         self._finish_remove_tab(id)
 
     def _finish_remove_tab(self,id):
+        self._python_jobs.cancel_tab(id)
         self.reader_edits.clear(id)
         current_index=next((i for i,tab in enumerate(self.tabs) if tab["id"]==id),None)
         if current_index is None:return
@@ -5656,6 +5751,7 @@ class Studio(QObject):
 
     def _post(self, id, command, raw):
         if self.retired:return
+        python_job = None
         try:
             if command == "save_media_native":
                 if not isinstance(raw, str) or len(raw) > 36_100_000:
@@ -5822,7 +5918,7 @@ class Studio(QObject):
                 source = args.get("source")
                 if not isinstance(document, str) or not isinstance(source, str):
                     raise ValueError("Invalid reader asset request")
-                tab = next((item for item in self.tabs if document in (item["id"], item["path"])), None)
+                tab = self._find_open_tab(document)
                 if tab is None:
                     raise ValueError("The note for this image is no longer open")
                 captured = dict(tab)
@@ -5853,6 +5949,86 @@ class Studio(QObject):
                 self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "open_external_url":
+                url = args.get("url")
+                if not isinstance(url, str) or len(url) > 4096:
+                    raise ValueError("Invalid external URL")
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme.lower() not in ("http", "https", "mailto"):
+                    raise ValueError("Unsupported external URL scheme")
+                QDesktopServices.openUrl(QUrl(url))
+                self.replied.emit(id, "true", "")
+                return
+            if command in ("open_workspace_link", "open_relative_note"):
+                raw_target = args.get("target")
+                raw_fragment = args.get("fragment")
+                if not raw_fragment:
+                    raw_fragment = args.get("heading", "")
+                if raw_fragment is None:
+                    raw_fragment = ""
+                wikilink = bool(args.get("wikilink", False)) if command == "open_workspace_link" else False
+                doc_ref = args.get("documentPath", "")
+                if (not isinstance(raw_target, str) or len(raw_target) > 4096
+                        or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024):
+                    raise ValueError("Invalid workspace link")
+                source_tab = self._find_open_tab(doc_ref, canonicalize_local=True) if doc_ref else self._current()
+                if source_tab is None:
+                    raise ValueError("The note for this link is no longer open.")
+                note_path = source_tab["path"]
+                folder = self.folder
+                if self.recovery_timer.isActive():
+                    self.recovery_timer.stop()
+                self._recover()
+                if self.autosave_timer.isActive() or (
+                    self.settings.get("autosave") and note_path and self._is_dirty(source_tab)
+                ):
+                    self.autosave_timer.stop()
+                    self._autosave()
+                self._activation_generation += 1
+                link_generation = self._activation_generation
+                def resolve_work():
+                    return resolve_workspace_link(
+                        raw_target,
+                        wikilink=wikilink,
+                        note_path=note_path,
+                        workspace_folder=folder,
+                    )
+                def resolve_done(resolved_path, error):
+                    if self.retired:
+                        self.replied.emit(id, json.dumps({"opened": False}), "")
+                        return
+                    if error:
+                        self.message = str(error)
+                        self._emit(False)
+                        self.replied.emit(id, json.dumps({"opened": False, "message": str(error)}), "")
+                        return
+                    fragment = raw_fragment.strip()
+                    heading_payload = {"heading": fragment, "token": uuid.uuid4().hex} if fragment else None
+                    def opened(opened_tab, open_error):
+                        if open_error or opened_tab is None:
+                            if open_error:
+                                self.message = str(open_error)
+                                self._emit(False)
+                            self.replied.emit(
+                                id,
+                                json.dumps({"opened": False, "message": str(open_error or "Could not open note")}),
+                                "",
+                            )
+                            return
+                        self.replied.emit(
+                            id,
+                            json.dumps({"opened": True, "id": opened_tab["id"], "path": opened_tab["path"]}),
+                            "",
+                        )
+                    self._open_note(
+                        str(resolved_path),
+                        explicit=True,
+                        activation_generation=link_generation,
+                        completion_callback=opened,
+                        pending_heading=heading_payload,
+                    )
+                self._submit(resolve_work, resolve_done, False)
+                return
             if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             context=args.get("context")
@@ -5861,7 +6037,7 @@ class Studio(QObject):
                 if context["interpreter"] != (self.settings["python"] or "embedded"):raise ValueError("Python runtime changed; retry this operation")
             reference = args.get("id") or args.get("documentPath") or (context.get("document") if context else None)
             if reference:
-                tab = next((t for t in self.tabs if reference in (t["id"],t["path"])),None)
+                tab = self._find_open_tab(reference)
                 if tab is None: raise ValueError("The note for this operation is no longer open")
             if context and context["document"] not in (tab["id"],tab["path"]):raise ValueError("Python output belongs to another note")
             captured = dict(tab)
@@ -5892,11 +6068,16 @@ class Studio(QObject):
                 self.saving.add(saving_tab_id)
             python = self.settings["python"]
             export_job = None
+            python_job = None
             if command == "export_pdf_native":
                 if not output: raise ValueError("Choose a PDF destination before exporting")
                 job_id = args.get("jobId")
                 if job_id is None: job_id = uuid.uuid4().hex
                 export_job = self._export_jobs.register(job_id)
+            elif command == "run_python":
+                if self.retired or captured["id"] in self._closing_tabs:
+                    raise ValueError("The note for this operation is no longer open")
+                python_job = self._python_jobs.register(captured["id"])
             def export_result(path):
                 if agent_export_info:
                     return self._agent_export_metadata(Path(path), agent_export_info["format"])
@@ -5925,7 +6106,15 @@ class Studio(QObject):
                         results.append({"source":name,"alt":Path(image["name"]).stem})
                     return results
                 if command == "run_python":
-                    result=self._python(python,args["code"],str(Path(captured["path"]).parent) if captured.get("path") else None)
+                    assert python_job is not None
+                    try:
+                        result=self._python(python,args["code"],str(Path(captured["path"]).parent) if captured.get("path") else None,job=python_job)
+                    except python_runtime.PythonCellCancelled:
+                        return {"_cancelled": True}
+                    finally:
+                        self._python_jobs.discard(python_job)
+                    if python_job.cancelled.is_set():
+                        return {"_cancelled": True}
                     if context:
                         try:
                             self.session.python_outputs.store(args["code"],result,context)
@@ -6045,6 +6234,9 @@ class Studio(QObject):
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
+                if command == "run_python" and isinstance(result, dict) and result.get("_cancelled"):
+                    self.replied.emit(id, "null", "Python cell cancelled")
+                    return
                 if command == "export_fmd_native" and isinstance(result, dict) and result.get("_conflict"):
                     target_tab = next((t for t in self.tabs if t["id"] == captured["id"]), None)
                     if target_tab:
@@ -6144,8 +6336,13 @@ class Studio(QObject):
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
                 self.saving.discard(saving_tab_id)
                 return
+            if python_job is not None and (self.retired or getattr(self.pool, "_shutdown", False)):
+                self._python_jobs.discard(python_job)
+                return
             self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
+            if python_job is not None:
+                self._python_jobs.discard(python_job)
             agent_export = self._agent_exports.pop(id, None)
             if agent_export:
                 if self.pending_export == agent_export.get("path"):
@@ -6196,6 +6393,20 @@ class Studio(QObject):
         if path.stat().st_size > 2_000_000: raise ValueError("Diagram source exceeds 2 MB")
         return path.read_text(encoding="utf-8")
 
+    def _find_open_tab(self, reference, *, canonicalize_local: bool = False):
+        if not isinstance(reference, str) or not reference:
+            return None
+        match = next((item for item in self.tabs if reference in (item["id"], item["path"])), None)
+        if match is not None or not canonicalize_local or "\x00" in reference:
+            return match
+        try:
+            if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
+                canonical = str(local_path(reference))
+                return next((item for item in self.tabs if item["path"] == canonical), None)
+        except OSError:
+            pass
+        return None
+
     def _fetch(self, args):
         url = args["url"]
         self._public_url(url)
@@ -6228,6 +6439,14 @@ class Studio(QObject):
             if path.is_file(): return path
         raise ValueError("Native PDF engine is not installed. Build smd-core's smd-engine binary.")
 
-    def _python(self, executable, code, folder=None):
+    def _python(self, executable, code, folder=None, job=None):
         # Explicit Run only. Python is trusted local code, not a sandbox.
-        return python_runtime.run(executable or self.settings["python"], code, cwd=folder)
+        owned_job = None
+        if job is None and hasattr(self, "_python_jobs"):
+            owned_job = self._python_jobs.register("")
+            job = owned_job
+        try:
+            return python_runtime.run(executable or self.settings["python"], code, cwd=folder, job=job)
+        finally:
+            if owned_job is not None:
+                self._python_jobs.discard(owned_job)

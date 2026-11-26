@@ -13,7 +13,15 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(normalized, defaults)
         self.assertEqual(defaults["save"], ["Ctrl+S"])
         self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
+        self.assertEqual(defaults["new_folder_note"], ["Ctrl+Alt+N"])
+        self.assertEqual(defaults["new_subfolder"], ["Ctrl+Alt+Shift+N"])
+        self.assertEqual(defaults["rename_entry"], ["F2"])
+        self.assertEqual(defaults["mode_live"], ["Ctrl+Alt+1"])
+        self.assertEqual(defaults["mode_editor"], ["Ctrl+Alt+2"])
+        self.assertEqual(defaults["mode_reader"], ["Ctrl+Alt+3"])
+        self.assertEqual(defaults["mode_split"], ["Ctrl+Alt+4"])
         self.assertTrue(native_label(defaults["find"][0]))
+        self.assertTrue(native_label(defaults["mode_live"][0]))
         self.assertEqual(defaults["replace"], ["Ctrl+H"])
         self.assertIn("F3", defaults["find_next"])
         self.assertIn("Shift+F3", defaults["find_previous"])
@@ -46,6 +54,13 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(defaults["undo"], ["Ctrl+Z"])
         self.assertEqual(defaults["redo"], ["Ctrl+Shift+Z"])
         self.assertEqual(defaults["typewriter_scroll"], ["Ctrl+Alt+T"])
+        self.assertEqual(defaults["new_folder_note"], ["Ctrl+Alt+N"])
+        self.assertEqual(defaults["new_subfolder"], ["Ctrl+Alt+Shift+N"])
+        self.assertEqual(defaults["rename_entry"], ["F2"])
+        self.assertEqual(defaults["mode_live"], ["Ctrl+Alt+1"])
+        self.assertEqual(defaults["mode_editor"], ["Ctrl+Alt+2"])
+        self.assertEqual(defaults["mode_reader"], ["Ctrl+Alt+3"])
+        self.assertEqual(defaults["mode_split"], ["Ctrl+Alt+4"])
         self.assertEqual(defaults["fullscreen"], ["F11", "Meta+Ctrl+F"])
         self.assertTrue(native_label(defaults["copy"][0]))
         if sys.platform == "darwin":
@@ -63,6 +78,16 @@ class ShortcutValidationTest(unittest.TestCase):
         earlier["bold"] = ["Ctrl+I"]
         _, error = normalize_shortcuts(earlier, edited_action="bold")
         self.assertIn("Italic", error)
+
+        mode_conflict = default_shortcuts()
+        mode_conflict["mode_reader"] = ["Ctrl+Alt+1"]
+        _, mode_error = normalize_shortcuts(mode_conflict)
+        self.assertIn("Live mode", mode_error)
+
+        folder_conflict = default_shortcuts()
+        folder_conflict["mode_live"] = ["Ctrl+Alt+N"]
+        _, folder_error = normalize_shortcuts(folder_conflict, edited_action="mode_live")
+        self.assertIn("New note in folder", folder_error)
 
 
     def test_recorder_captures_modified_combinations_and_rejects_plain_letters(self):

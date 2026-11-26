@@ -510,6 +510,83 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
         self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "Diagram.smd"))
         self.assertTrue(self.studio._current()["portable"])
 
+    def test_coexists_with_relative_link_activation_generation_and_manual_tab_selection(self):
+        ws = self.root / "activation-coexist"
+        ws.mkdir(parents=True)
+        index_note = ws / "Index.md"
+        keep_note = ws / "Keep.md"
+        linked_note = ws / "Linked.md"
+        switched_note = ws / "Switched.md"
+        index_note.write_text("# Index\n\n[[Linked#Target]]\n", encoding="utf-8")
+        keep_note.write_text("# Keep\n", encoding="utf-8")
+        linked_note.write_text("# Linked\n\n## Target\n", encoding="utf-8")
+        switched_note.write_text("# Switched\n", encoding="utf-8")
+
+        self.studio.ready = True
+        loads: list[dict] = []
+        self.studio.readerLoad.connect(lambda payload: loads.append(json.loads(payload)))
+        self.studio.openFolder(str(ws))
+        self.studio.openNote(str(index_note))
+        self.assertTrue(_wait_until(lambda: self.studio._current()["path"] == str(index_note.resolve())))
+        self.studio.openNote(str(keep_note))
+        self.assertTrue(_wait_until(lambda: self.studio._current()["path"] == str(keep_note.resolve())))
+        keep_id = self.studio.active
+        index_id = next(t["id"] for t in self.studio.tabs if t["path"] == str(index_note.resolve()))
+        self.studio.selectTab(index_id)
+
+        pending_reads: list[tuple[object, object]] = []
+
+        def intercept_submit(action, done, *args, **kwargs):
+            if getattr(done, "__name__", "") == "_noop_done":
+                return
+            pending_reads.append((action, done))
+
+        # 1. In-flight relative link (#72) superseded by Quick Switcher activation of an open tab:
+        #    Quick Switcher selection stays active and no stale pendingHeading is attached.
+        with mock.patch.object(self.studio, "_submit", side_effect=intercept_submit):
+            self.studio.post(
+                "qs-vs-link",
+                "open_workspace_link",
+                json.dumps(
+                    {
+                        "documentPath": str(index_note.resolve()),
+                        "target": "Linked.md",
+                        "fragment": "target",
+                        "wikilink": False,
+                    }
+                ),
+            )
+            self.assertEqual(len(pending_reads), 1)
+            resolve_action, resolve_done = pending_reads.pop()
+            resolve_done(resolve_action(), None)
+            self.assertEqual(len(pending_reads), 1)
+
+            self.studio.activateQuickSwitcherItem(keep_id, str(keep_note.resolve()))
+            loads.clear()
+            link_action, link_done = pending_reads.pop()
+            link_done(link_action(), None)
+
+        self.assertEqual(self.studio.active, keep_id)
+        self.assertEqual(loads, [])
+        linked_tab = next(t for t in self.studio.tabs if t["path"] == str(linked_note.resolve()))
+        self.assertNotIn("pendingHeading", linked_tab)
+
+        # 2. In-flight Quick Switcher disk note open superseded by manual selectTab before read completes:
+        #    manual tab selection stays active and backgrounded note does not emit readerLoad.
+        pending_reads.clear()
+        with mock.patch.object(self.studio, "_submit", side_effect=intercept_submit):
+            self.studio.activateQuickSwitcherItem("", str(switched_note))
+            self.assertEqual(len(pending_reads), 1)
+
+            self.studio.selectTab(index_id)
+            loads.clear()
+            qs_action, qs_done = pending_reads.pop()
+            qs_done(qs_action(), None)
+
+        self.assertEqual(self.studio.active, index_id)
+        self.assertEqual(loads, [])
+        self.assertTrue(any(t["path"] == str(switched_note.resolve()) for t in self.studio.tabs))
+
     def test_qml_quick_switcher_dialog_renders_parent_paths_and_restores_focus_in_qml_scene(self):
         ws = self.root / "qml-scene"
         (ws / "design").mkdir(parents=True)
@@ -546,6 +623,11 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
             compact_action = window.findChild(QObject, "quickSwitcherAction")
             self.assertIsNotNone(compact_action)
             self.assertEqual(compact_action.property("text"), "Quick switcher")
+            self.assertTrue(bool(compact_action.property("hasShortcutHint")))
+            self.assertEqual(
+                compact_action.findChild(QObject, "menuShortcutHint").property("text"),
+                native_label("Ctrl+P"),
+            )
 
             self.studio.openQuickSwitcher()
             dialog = window.findChild(QObject, "quickSwitcherDialog")

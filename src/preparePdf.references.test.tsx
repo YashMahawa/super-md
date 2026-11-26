@@ -21,6 +21,30 @@ it("prepares resolved reference images through the inline asset pipeline and kee
   expect(source).toBe(original);
 });
 
+it("normalizes spaced, aliased, portable, and section wikilinks in GUI PDF preparation without raw or escaped brackets",async()=>{
+  const source=[
+    "# Overview",
+    "",
+    "See [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], [[study.smd]], [Deck](study.smd), and [[#Overview|Jump]].",
+    "",
+    "Keep `[[Task Note]]` in inline code and:",
+    "",
+    "```python",
+    "matrix = [[1, 2], [3, 4]]",
+    "```",
+    "",
+  ].join("\n");
+  const prepared=await preparePdf(source,"/notes/index.md");
+  expect(prepared.content).toContain("[Task Note](Task%20Note.md)");
+  expect(prepared.content).toContain("[Bayes](Lecture%202.md#bayes-law)");
+  expect(prepared.content).toContain("[study.smd](study.smd)");
+  expect(prepared.content).toContain("[Deck](study.smd)");
+  expect(prepared.content).toContain("[Jump](#overview)");
+  expect(prepared.content).not.toContain("\\[");
+  expect(prepared.content).toContain("`[[Task Note]]`");
+  expect(prepared.content).toContain("matrix = [[1, 2], [3, 4]]");
+});
+
 it("preserves intentional escapes alongside unescaped study syntax, including single-tilde subscripts",async()=>{
   const source=[
     "\\==Literal markup==",
