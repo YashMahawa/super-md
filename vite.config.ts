@@ -61,8 +61,15 @@ export function renderSandboxDocument(iifeScript: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script>${escaped}</script></body></html>`;
 }
 
+export type MermaidSandboxBuildOutput =
+  | string
+  | {
+      script: string;
+      inputs?: Iterable<string>;
+    };
+
 export function mermaidSandboxPlugin(
-  buildSandboxScript?: () => Promise<string>,
+  buildSandboxScript?: () => Promise<MermaidSandboxBuildOutput>,
 ): Plugin {
   const repoRoot = fileURLToPath(new URL(".", import.meta.url));
   const virtualId = "virtual:mermaid-sandbox-url";
@@ -72,50 +79,62 @@ export function mermaidSandboxPlugin(
   let isServe = false;
   let isNative = false;
   let cachedBundlePromise: Promise<{ script: string; html: string }> | null = null;
+  let latestBuildId = 0;
   let watchedInputs = new Set<string>();
 
   const normalizeWatchPath = (filePath: string) => {
-    const resolved = path.resolve(filePath);
+    const resolved = path.resolve(repoRoot, filePath);
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+
+  const runDefaultBuild = async (): Promise<{ script: string; inputs: string[] }> => {
+    const esbuild = await import("esbuild");
+    const entry = fileURLToPath(new URL("./src/mermaidSandboxEntry.ts", import.meta.url));
+    const bundled = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      metafile: true,
+      write: false,
+      format: "iife",
+      platform: "browser",
+      target: "es2020",
+      charset: "ascii",
+      legalComments: "none",
+      minify: true,
+      alias: {
+        "decode-named-character-reference": fileURLToPath(
+          new URL("./node_modules/decode-named-character-reference/index.js", import.meta.url),
+        ),
+      },
+    });
+    return {
+      script: bundled.outputFiles[0]?.text ?? "",
+      inputs: Object.keys(bundled.metafile?.inputs ?? {}),
+    };
   };
 
   const getSandboxBundle = () => {
     if (!cachedBundlePromise) {
-      cachedBundlePromise = (async () => {
-        const script = buildSandboxScript
+      const buildId = ++latestBuildId;
+      let buildPromise: Promise<{ script: string; html: string }>;
+      buildPromise = (async () => {
+        const built = buildSandboxScript
           ? await buildSandboxScript()
-          : await (async () => {
-              const esbuild = await import("esbuild");
-              const entry = fileURLToPath(new URL("./src/mermaidSandboxEntry.ts", import.meta.url));
-              const bundled = await esbuild.build({
-                entryPoints: [entry],
-                bundle: true,
-                metafile: true,
-                write: false,
-                format: "iife",
-                platform: "browser",
-                target: "es2020",
-                charset: "ascii",
-                legalComments: "none",
-                minify: true,
-                alias: {
-                  "decode-named-character-reference": fileURLToPath(
-                    new URL("./node_modules/decode-named-character-reference/index.js", import.meta.url),
-                  ),
-                },
-              });
-              watchedInputs = new Set(
-                Object.keys(bundled.metafile?.inputs ?? {}).map((input) =>
-                  normalizeWatchPath(path.resolve(repoRoot, input)),
-                ),
-              );
-              return bundled.outputFiles[0]?.text ?? "";
-            })();
-        return { script, html: renderSandboxDocument(script) };
+          : await runDefaultBuild();
+        const script = typeof built === "string" ? built : built.script;
+        const inputs = typeof built === "string" ? undefined : built.inputs;
+        const html = renderSandboxDocument(script);
+        if (buildId === latestBuildId && cachedBundlePromise === buildPromise && inputs) {
+          watchedInputs = new Set(Array.from(inputs, normalizeWatchPath));
+        }
+        return { script, html };
       })().catch((error) => {
-        cachedBundlePromise = null;
+        if (buildId === latestBuildId && cachedBundlePromise === buildPromise) {
+          cachedBundlePromise = null;
+        }
         throw error;
       });
+      cachedBundlePromise = buildPromise;
     }
     return cachedBundlePromise;
   };
@@ -136,6 +155,7 @@ export function mermaidSandboxPlugin(
           /[\\/]mermaidSandbox/i.test(filePath) ||
           watchedInputs.has(normalizeWatchPath(filePath))
         ) {
+          latestBuildId += 1;
           cachedBundlePromise = null;
         }
       };

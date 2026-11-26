@@ -184,3 +184,185 @@ it('caches the Mermaid sandbox bundle across dev-server requests and invalidates
   expect(buildCount).toBe(2);
   expect(fourthScript.body).toBe('window.__sandboxGen = 2;');
 });
+
+it('keeps cached build B and recorded watch inputs when an invalidated in-flight build A settles later', async () => {
+  type BuildResult = { script: string; inputs?: string[] };
+  type DeferredBuild = {
+    promise: Promise<BuildResult>;
+    resolve: (value: BuildResult) => void;
+    reject: (reason?: unknown) => void;
+  };
+
+  const createDeferred = (): DeferredBuild => {
+    let resolve!: (value: BuildResult) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<BuildResult>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  };
+
+  const setupHarness = () => {
+    const builds: DeferredBuild[] = [];
+    const plugin = mermaidSandboxPlugin(() => {
+      const deferred = createDeferred();
+      builds.push(deferred);
+      return deferred.promise;
+    });
+    const watcherHandlers = new Map<string, Array<(filePath: string) => void>>();
+    let middleware:
+      | ((
+          req: { url?: string; method?: string },
+          res: Record<string, unknown>,
+          next: (err?: unknown) => void,
+        ) => Promise<void>)
+      | null = null;
+
+    const configureServer =
+      typeof plugin.configureServer === 'function' ? plugin.configureServer : plugin.configureServer?.handler;
+    configureServer?.call(
+      {} as never,
+      {
+        watcher: {
+          on(event: string, cb: (filePath: string) => void) {
+            watcherHandlers.set(event, [...(watcherHandlers.get(event) ?? []), cb]);
+          },
+        },
+        middlewares: {
+          use(fn: typeof middleware) {
+            middleware = fn;
+          },
+        },
+      } as never,
+    );
+
+    const emitChange = (filePath: string) => {
+      for (const cb of watcherHandlers.get('change') ?? []) {
+        cb(filePath);
+      }
+    };
+
+    const requestRoute = async (url: string) => {
+      let body = '';
+      await middleware!(
+        { url, method: 'GET' },
+        {
+          statusCode: 0,
+          setHeader() {},
+          end(chunk?: string) {
+            body = chunk ?? '';
+          },
+        },
+        (err) => {
+          if (err) throw err;
+        },
+      );
+      return body;
+    };
+
+    return { builds, emitChange, requestRoute };
+  };
+
+  // Case 1: Held warm-up build A is invalidated, build B succeeds and caches, then obsolete A rejects.
+  {
+    const { builds, emitChange, requestRoute } = setupHarness();
+    expect(builds).toHaveLength(1); // warm-up build A held in flight
+
+    emitChange('/repo/src/mermaidSandboxEntry.ts');
+
+    const pendingB = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(2);
+    builds[1].resolve({
+      script: 'window.__sandboxGen = "B";',
+      inputs: ['/repo/src/currentDepB.ts'],
+    });
+    expect(await pendingB).toBe('window.__sandboxGen = "B";');
+
+    // Obsolete build A rejects later — must not evict cached build B or start a third build.
+    builds[0].reject(new Error('obsolete warm-up build A failed'));
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(await requestRoute('/@mermaid-sandbox.js')).toBe('window.__sandboxGen = "B";');
+    const htmlB = await requestRoute('/@mermaid-sandbox.html');
+    expect(builds).toHaveLength(2);
+    const expectedDigest = createHash('sha256')
+      .update('window.__sandboxGen = "B";', 'utf8')
+      .digest('base64');
+    expect(htmlB).toContain(`script-src 'sha256-${expectedDigest}' 'wasm-unsafe-eval'`);
+  }
+
+  // Case 1b: Held warm-up build A is invalidated and resolves BEFORE build B is requested.
+  {
+    const { builds, emitChange, requestRoute } = setupHarness();
+    expect(builds).toHaveLength(1);
+
+    emitChange('/repo/src/mermaidSandboxEntry.ts');
+    builds[0].resolve({
+      script: 'window.__sandboxGen = "A-before-B";',
+      inputs: ['/repo/src/obsoleteDepA.ts'],
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    const pendingB = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(2);
+    builds[1].resolve({
+      script: 'window.__sandboxGen = "B-fresh";',
+      inputs: ['/repo/src/currentDepB.ts'],
+    });
+    expect(await pendingB).toBe('window.__sandboxGen = "B-fresh";');
+
+    emitChange('/repo/src/obsoleteDepA.ts');
+    expect(await requestRoute('/@mermaid-sandbox.js')).toBe('window.__sandboxGen = "B-fresh";');
+    expect(builds).toHaveLength(2);
+  }
+
+  // Case 2: Held warm-up build A is invalidated, build B succeeds, then obsolete A resolves with stale watch inputs.
+  {
+    const { builds, emitChange, requestRoute } = setupHarness();
+    expect(builds).toHaveLength(1);
+
+    emitChange('/repo/src/mermaidSandboxEntry.ts');
+
+    const pendingB = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(2);
+    builds[1].resolve({
+      script: 'window.__sandboxGen = "B";',
+      inputs: ['/repo/src/currentDepB.ts'],
+    });
+    expect(await pendingB).toBe('window.__sandboxGen = "B";');
+
+    builds[0].resolve({
+      script: 'window.__sandboxGen = "A-stale";',
+      inputs: ['/repo/src/obsoleteDepA.ts'],
+    });
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Stale watch input from obsolete build A must not invalidate cached build B.
+    emitChange('/repo/src/obsoleteDepA.ts');
+    expect(await requestRoute('/@mermaid-sandbox.js')).toBe('window.__sandboxGen = "B";');
+    expect(builds).toHaveLength(2);
+
+    // Watch input recorded by current build B still invalidates and triggers build C.
+    emitChange('/repo/src/currentDepB.ts');
+    const pendingC = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(3);
+    builds[2].resolve({
+      script: 'window.__sandboxGen = "C";',
+      inputs: ['/repo/src/currentDepC.ts'],
+    });
+    expect(await pendingC).toBe('window.__sandboxGen = "C";');
+
+    // If the current build itself fails, the failed promise is cleared so the next request retries.
+    emitChange('/repo/src/currentDepC.ts');
+    const pendingD = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(4);
+    builds[3].reject(new Error('transient esbuild failure'));
+    await expect(pendingD).rejects.toThrow('transient esbuild failure');
+
+    const pendingE = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(5);
+    builds[4].resolve({ script: 'window.__sandboxGen = "E";' });
+    expect(await pendingE).toBe('window.__sandboxGen = "E";');
+  }
+});
