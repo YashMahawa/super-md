@@ -275,6 +275,15 @@ ApplicationWindow {
         readerRecoveryMessage = "Reopening the document reader…"
         scheduleReaderRemount(0)
     }
+    function chooseSaveDestination(dialogTitle, folderUrl, fileUrl) {
+        const dialog = saveDestinationComponent.createObject(window, {
+            title: dialogTitle,
+            portableNote: Boolean(viewState.portable),
+            currentFolder: folderUrl,
+            selectedFile: fileUrl
+        })
+        dialog.open()
+    }
     function showExport(share) { sharing = share; outputFormat = "pdf"; exportDialog.open() }
     function chooseExportDestination() {
         // A fresh native chooser for every operation: some portal helpers keep
@@ -310,15 +319,15 @@ ApplicationWindow {
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
-        function onSaveRequested(name) { saveDialog.title = "Save note"; saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
-        function onSaveAsRequested(name) { saveDialog.title = "Save as"; saveDialog.selectedFile = studio.defaultSaveAsLocation(name); saveDialog.open() }
+        function onSaveRequested(name) { window.chooseSaveDestination("Save note", studio.defaultSaveFolder(), studio.defaultSaveLocation(name)) }
+        function onSaveAsRequested(name) { window.chooseSaveDestination("Save as", studio.defaultSaveAsFolder(), studio.defaultSaveAsLocation(name)) }
         function onSaveConflictRequested(name) { flushDialog.close(); closeDialog.close(); saveConflictDialog.title = name + " changed on disk"; if (!saveConflictDialog.visible) saveConflictDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
         function onThemePickerRequested() { themeDialog.open() }
-        function onThemeExportRequested() { themeExportDialog.open() }
+        function onThemeExportRequested() { themeExportDialog.selectedFile = studio.defaultThemeExportLocation("My theme.supermd-theme.json"); themeExportDialog.open() }
         function onReaderLoad(payload) {
             const script = "(function(){if(!window.supermdLoad)return false;window.supermdLoad(" + payload + ");window.supermdChromeInset?.(" + (studio.readerFullscreen ? 56 : 0) + ");document.documentElement.style.setProperty('--native-visible-chrome-inset','" + window.readerVisibleChromeInset + "px');return true})()"
             window.runDocumentScript(script)
@@ -390,7 +399,7 @@ ApplicationWindow {
     }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     FileDialog { id:themeDialog;title:"Import a Super MD theme";fileMode:FileDialog.OpenFile;nameFilters:["Theme files (*.json)"];onAccepted:studio.importCustomTheme(selectedFile.toString()) }
-    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
+    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultThemeExportLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
 
     header: Column {
@@ -786,7 +795,18 @@ ApplicationWindow {
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
-    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    Component {
+        id: saveDestinationComponent
+        FileDialog {
+            property bool portableNote: false
+            objectName: "saveDestination"
+            title: "Save note"
+            fileMode: FileDialog.SaveFile
+            nameFilters: portableNote ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]
+            onAccepted: { studio.saveAs(selectedFile.toString()); destroy() }
+            onRejected: { studio.resolveClose("cancel"); destroy() }
+        }
+    }
     Component {
         id: exportDestinationComponent
         FileDialog {

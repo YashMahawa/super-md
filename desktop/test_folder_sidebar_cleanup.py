@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +16,10 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
+
+_DESKTOP_DIR = str(Path(__file__).resolve().parent)
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
 
 import studio as studio_mod
 from folder_ops import canonical_path_str, normalized_relpath
