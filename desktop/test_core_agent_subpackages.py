@@ -65,8 +65,8 @@ class CoreAgentSubpackageTests(unittest.TestCase):
             f"repo_root, shim_first, prefix = {repo_root!r}, {shim_first!r}, {prefix!r}\n"
             "if not repo_root:\n"
             "    sys.path.insert(0, str(desktop_dir))\n"
-            "resolved = [pathlib.Path(p).resolve() for p in sys.path if p != '']\n"
-            "assert (desktop_dir if repo_root else source_root) not in resolved, resolved\n"
+            "resolved = lambda: {(pathlib.Path(p) if p else pathlib.Path.cwd()).resolve() for p in sys.path}\n"
+            "assert (desktop_dir if repo_root else source_root) not in resolved(), sys.path\n"
             "for blocked in (('core', 'agent') if repo_root else ('desktop',)):\n"
             "    try: importlib.import_module(blocked)\n"
             "    except ModuleNotFoundError: pass\n"
@@ -78,14 +78,20 @@ class CoreAgentSubpackageTests(unittest.TestCase):
             "    shim_mod = shim_mod or load_shim(mod)\n"
             "    assert shim_mod is pkg_mod, (pkg, mod)\n"
             "    assert sys.modules[f'{prefix}{mod}'] is sys.modules[f'{prefix}{pkg}.{mod}']\n"
+            "    if repo_root: assert getattr(sys.modules['desktop'], mod) is pkg_mod\n"
             "    assert pathlib.Path(pkg_mod.__file__).resolve() == (desktop_dir / pkg / f'{mod}.py').resolve()\n"
             "    sys.modules.pop(f'{prefix}{mod}', None)\n"
             "    if repo_root: delattr(sys.modules['desktop'], mod)\n"
             "    assert load_shim(mod) is pkg_mod\n"
+            "    if repo_root: assert getattr(sys.modules['desktop'], mod) is pkg_mod\n"
             "if repo_root:\n"
             "    from desktop import workspace_links, agent_stdio, agent_live_client\n"
             "    assert callable(workspace_links.resolve_workspace_link) and callable(agent_stdio.configure_stdio)\n"
             "    assert hasattr(agent_live_client, 'MultiSessionLiveClient')\n"
+            "    assert not any(n in ('core', 'agent') or n.startswith(('core.', 'agent.')) for n in sys.modules)\n"
+            "else:\n"
+            "    assert not any(n == 'desktop' or n.startswith('desktop.') for n in sys.modules)\n"
+            "assert (desktop_dir if repo_root else source_root) not in resolved(), sys.path\n"
             "completed = subprocess.CompletedProcess([], 0, 'super-md: /opt/super-md/super-md\\n', '')\n"
             "with (\n"
             "    mock.patch(f'{prefix}updates.shutil.which', side_effect=lambda n: '/usr/bin/dpkg-query' if n == 'dpkg-query' else None),\n"
@@ -113,48 +119,61 @@ class CoreAgentSubpackageTests(unittest.TestCase):
                     self._run_subprocess_probe(repo_root=False, shim_first=shim_first, cwd=Path(isolated_cwd))
 
     def test_root_shims_preserve_single_module_identity_and_reimport(self):
+        prefix = f"{__package__}." if __package__ else ""
         cases = [("core", mod) for mod in CORE_MODULES] + [("agent", mod) for mod in AGENT_MODULES]
         for pkg, mod in cases:
             with self.subTest(package=pkg, module=mod):
-                pkg_mod = importlib.import_module(f"{pkg}.{mod}")
-                root_mod = importlib.import_module(mod)
+                pkg_name = f"{prefix}{pkg}.{mod}"
+                shim_name = f"{prefix}{mod}"
+                pkg_mod = importlib.import_module(pkg_name)
+                root_mod = importlib.import_module(shim_name)
                 expected_file = (DESKTOP_DIR / pkg / f"{mod}.py").resolve()
                 self.assertIs(root_mod, pkg_mod)
-                self.assertIs(sys.modules[mod], sys.modules[f"{pkg}.{mod}"])
+                self.assertIs(sys.modules[shim_name], sys.modules[pkg_name])
                 self.assertEqual(Path(pkg_mod.__file__).resolve(), expected_file)
 
-                sys.modules.pop(mod, None)
-                reimported = importlib.import_module(mod)
-                self.assertIs(reimported, pkg_mod)
-                self.assertIs(sys.modules[mod], sys.modules[f"{pkg}.{mod}"])
-                self.assertEqual(Path(reimported.__file__).resolve(), expected_file)
+                sys.modules.pop(shim_name, None)
+                if __package__ and __package__ in sys.modules and hasattr(sys.modules[__package__], mod):
+                    delattr(sys.modules[__package__], mod)
+                try:
+                    reimported = importlib.import_module(shim_name)
+                    self.assertIs(reimported, pkg_mod)
+                    self.assertIs(sys.modules[shim_name], sys.modules[pkg_name])
+                    if __package__ and __package__ in sys.modules:
+                        self.assertIs(getattr(sys.modules[__package__], mod), pkg_mod)
+                    self.assertEqual(Path(reimported.__file__).resolve(), expected_file)
+                finally:
+                    sys.modules[shim_name] = sys.modules[pkg_name]
+                    if __package__ and __package__ in sys.modules:
+                        setattr(sys.modules[__package__], mod, sys.modules[pkg_name])
 
     def test_mock_patch_targets_propagate_across_alias_boundary(self):
-        core_updates = importlib.import_module("core.updates")
-        importlib.import_module("updates")
+        prefix = f"{__package__}." if __package__ else ""
+        core_updates = importlib.import_module(f"{prefix}core.updates")
+        importlib.import_module(f"{prefix}updates")
         completed = subprocess.CompletedProcess([], 0, "super-md: /opt/super-md/super-md\n", "")
         with (
-            mock.patch("updates.shutil.which", side_effect=lambda n: "/usr/bin/dpkg-query" if n == "dpkg-query" else None),
-            mock.patch("updates.subprocess.run", return_value=completed) as run_mock,
+            mock.patch(f"{prefix}updates.shutil.which", side_effect=lambda n: "/usr/bin/dpkg-query" if n == "dpkg-query" else None),
+            mock.patch(f"{prefix}updates.subprocess.run", return_value=completed) as run_mock,
         ):
             self.assertEqual(core_updates.linux_install_kind("/opt/super-md/super-md", {}, True, "/home/test"), "deb")
             run_mock.assert_called_once()
 
-        core_network_tls = importlib.import_module("core.network_tls")
-        importlib.import_module("network_tls")
+        core_network_tls = importlib.import_module(f"{prefix}core.network_tls")
+        importlib.import_module(f"{prefix}network_tls")
         fake_ctx = mock.MagicMock()
-        with mock.patch("network_tls.ssl.create_default_context", return_value=fake_ctx) as ctx_mock:
+        with mock.patch(f"{prefix}network_tls.ssl.create_default_context", return_value=fake_ctx) as ctx_mock:
             result = core_network_tls.client_context()
         ctx_mock.assert_called_once_with(purpose=ssl.Purpose.SERVER_AUTH)
         self.assertIs(result, fake_ctx)
         self.assertTrue(fake_ctx.check_hostname)
         self.assertEqual(fake_ctx.verify_mode, ssl.CERT_REQUIRED)
 
-        agent_live_client_pkg = importlib.import_module("agent.agent_live_client")
-        importlib.import_module("agent_live_client")
+        agent_live_client_pkg = importlib.import_module(f"{prefix}agent.agent_live_client")
+        importlib.import_module(f"{prefix}agent_live_client")
         original_client = agent_live_client_pkg.LiveTabClient
         sentinel = object()
-        with mock.patch("agent_live_client.LiveTabClient", sentinel):
+        with mock.patch(f"{prefix}agent_live_client.LiveTabClient", sentinel):
             self.assertIs(agent_live_client_pkg.LiveTabClient, sentinel)
         self.assertIs(agent_live_client_pkg.LiveTabClient, original_client)
 
