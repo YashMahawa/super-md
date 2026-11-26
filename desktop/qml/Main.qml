@@ -622,13 +622,15 @@ ApplicationWindow {
                         NoteMenuItem { text: "Search Google"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("google", readerContextMenu.selectionText) }
                         NoteMenuItem { text: "Ask " + (studio.selectionAssistantLabel || "ChatGPT") + "…"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("assistant", readerContextMenu.selectionText) }
                     }
-                    WheelHandler {
-                        target: null
-                        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                    MouseArea {
+                        objectName: "readerWheelOverlay"
+                        anchors.fill: parent
+                        z: 1
+                        acceptedButtons: Qt.NoButton
                         onWheel: function(event) {
-                            // Qt retains the device's pixel deltas. DOM wheel
-                            // events lose that distinction, so route touchpad
-                            // movement without guessing from notch magnitude.
+                            // Stack above QtWebEngine's internal Chromium child item so Qt
+                            // retains the device's pixel deltas before Chromium consumes them,
+                            // while acceptedButtons: Qt.NoButton leaves clicks/drags/menus untouched.
                             if (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)) {
                                 // Consume before Chromium applies browser zoom:
                                 // resetting zoomFactor afterward flashes a stale scale.
@@ -639,8 +641,9 @@ ApplicationWindow {
                                 event.accepted = true
                                 // The reader gives text drags priority over held-button zoom.
                                 const held = Boolean(event.buttons & Qt.LeftButton)
-                                const dx = event.pixelDelta.x || event.angleDelta.x
-                                const dy = event.pixelDelta.y || event.angleDelta.y
+                                const hasPixelDelta = Boolean(event.pixelDelta.x || event.pixelDelta.y)
+                                const dx = hasPixelDelta ? event.pixelDelta.x : event.angleDelta.x
+                                const dy = hasPixelDelta ? event.pixelDelta.y : event.angleDelta.y
                                 reader.runJavaScript("window.supermdNativeWheel?.(" + (-dx) + "," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + held + ")")
                             } else event.accepted = false
                         }
