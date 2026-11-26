@@ -279,7 +279,12 @@ function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export async function preparePdf(markdown: string, documentPath: string | null, python = "embedded", options: PreparePdfOptions = {}) {
   let generation = 1;
   const ownerGeneration = generation;
-  const { signal, trustedImageHosts, approvedImageUrls, loadedImageData } = options;
+  const { signal, noteId, trustedImageHosts, approvedImageUrls, loadedImageData } = options;
+  const hasConsentPolicy =
+    noteId !== undefined ||
+    trustedImageHosts !== undefined ||
+    approvedImageUrls !== undefined ||
+    loadedImageData !== undefined;
   const trustedHosts = normalizeTrustedImageHosts(trustedImageHosts);
   const approvedUrls = normalizeApprovedImageUrls(approvedImageUrls);
   const invalidate = () => { generation++; };
@@ -320,7 +325,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
             const source = step.image
               ? processor.stringify({type:"root",children:[{type:"paragraph",children:[{type:"image",url:step.image,alt:step.alt||step.label}]}]} as any)
               : "```" + (step.diagram ? "svg\n" + stepDiagramSvg(step.diagram) : "smd-chart\n" + step.chart) + "\n```";
-            const prepared = await preparePdf(source, documentPath, python, { signal, trustedImageHosts, approvedImageUrls, loadedImageData });
+            const prepared = await preparePdf(source, documentPath, python, { signal, noteId, trustedImageHosts, approvedImageUrls, loadedImageData });
             checkCurrent();
             const names = new Map<string,string>();
             for (const [name, body] of Object.entries(prepared.assets)) {
@@ -332,7 +337,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
           }
           let markdown: string|undefined;
           if(step.markdown){
-            const prepared=await preparePdf(step.markdown,documentPath,python,{signal,trustedImageHosts,approvedImageUrls,loadedImageData});checkCurrent();
+            const prepared=await preparePdf(step.markdown,documentPath,python,{signal,noteId,trustedImageHosts,approvedImageUrls,loadedImageData});checkCurrent();
             markdown=prepared.content;
             for(const [name,body] of Object.entries(prepared.assets)){
               const renamed=`step-${++count}-${name}`;assets[renamed]=body;
@@ -366,7 +371,13 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
         if (/^data:/i.test(rawUrl)) {
           if (!/^data:image\//i.test(rawUrl)) throw new Error("Unsupported PDF image type.");
         } else if (/^https?:\/\//i.test(rawUrl)) {
-          preloadedHtmlData = loadedReaderImageData(rawUrl, loadedImageData, trustedHosts, approvedUrls);
+          preloadedHtmlData = loadedReaderImageData(rawUrl, {
+            noteId,
+            loadedImageData,
+            trustedHosts,
+            approvedUrls,
+            enforcePolicy: hasConsentPolicy,
+          });
           if (!preloadedHtmlData && !isRemoteImageApproved(rawUrl, trustedHosts, approvedUrls)) {
             const host = remoteImageHost(rawUrl);
             throw new Error(`Remote image from ${host || rawUrl} requires explicit consent in the reader before exporting PDF.`);

@@ -197,13 +197,18 @@ describe("MarkdownPreview streamed local assets", () => {
       await act(async () => {
         root?.render(
           <MarkdownPreview
+            noteId="tab-1"
             markdown={markdown}
             documentPath="/notes/study.smd"
             python=""
             dark
             approvedImageUrls={consentStore.approvedUrls("tab-1")}
-            onApproveImageUrl={(url) => consentStore.approve("tab-1", url)}
-            onRemoteImageLoaded={(url, data) => consentStore.recordLoaded("tab-1", url, data)}
+            onApproveImageUrl={(noteId, url) => {
+              if (noteId) consentStore.approve(noteId, url);
+            }}
+            onRemoteImageLoaded={(noteId, url, data) => {
+              if (noteId) consentStore.recordLoaded(noteId, url, data);
+            }}
           />,
         );
       });
@@ -248,6 +253,94 @@ describe("MarkdownPreview streamed local assets", () => {
     expect(savedDeck.steps[2].image).toBe("https://blocked.example/slide2-nearby.png");
     expect(savedDeck.steps[4].image).toBe("https://blocked.example/slide4-unvisited.png");
     expect(savedDeck.steps[4].markdown).toBe("Deep unvisited ![S5](https://blocked.example/slide4-md.png)");
+  });
+
+  it("attributes in-flight remote image loads and approvals to the originating note when switching notes before resolution", async () => {
+    const remotePng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a44kAAAAASUVORK5CYII=";
+    let resolveInflight!: (value: { body: string }) => void;
+    invoke.mockImplementation((command: string) => {
+      if (command === "fetch_resource") {
+        return new Promise<{ body: string }>((resolve) => {
+          resolveInflight = resolve;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const sharedUrl = "https://once.example/shared-inflight.png";
+    const noteAMarkdown = `# Note A\n\n![Shared](${sharedUrl})\n`;
+    const noteBMarkdown = `# Note B\n\n![Shared](${sharedUrl})\n`;
+    const consentStore = new NoteRemoteImageConsentStore();
+    const approvalCalls: Array<[string | undefined, string]> = [];
+    const loadedCalls: Array<[string | undefined, string, string]> = [];
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const renderNote = async (noteId: string, markdown: string, documentPath: string) => {
+      await act(async () => {
+        root?.render(
+          <MarkdownPreview
+            noteId={noteId}
+            markdown={markdown}
+            documentPath={documentPath}
+            python=""
+            dark={false}
+            approvedImageUrls={consentStore.approvedUrls(noteId)}
+            onApproveImageUrl={(originId, url) => {
+              approvalCalls.push([originId, url]);
+              if (originId) consentStore.approve(originId, url);
+            }}
+            onRemoteImageLoaded={(originId, url, data) => {
+              loadedCalls.push([originId, url, data]);
+              if (originId) consentStore.recordLoaded(originId, url, data);
+            }}
+          />,
+        );
+      });
+    };
+
+    await renderNote("note-a", noteAMarkdown, "/notes/note-a.smd");
+    const loadButton = host.querySelector<HTMLButtonElement>('.remote-image-card[data-note-id="note-a"] .remote-image-actions button');
+    expect(loadButton).not.toBeNull();
+
+    // Start loading in Note A, then switch the preview to Note B BEFORE fetch_resource resolves.
+    await act(async () => {
+      loadButton?.click();
+    });
+    expect(approvalCalls).toEqual([["note-a", sharedUrl]]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("fetch_resource", { url: sharedUrl, image: true });
+
+    await renderNote("note-b", noteBMarkdown, "/notes/note-b.smd");
+    // Note B must stay blocked and never inherit Note A's local allowedOnce state.
+    expect(host.querySelector('.remote-image-card[data-note-id="note-b"]')).not.toBeNull();
+    expect(host.querySelector("img")).toBeNull();
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    // Resolve the in-flight image fetch after switching to Note B.
+    await act(async () => {
+      resolveInflight({ body: remotePng });
+      await Promise.resolve();
+    });
+
+    expect(loadedCalls).toEqual([["note-a", sharedUrl, remotePng]]);
+    expect(consentStore.approvedUrls("note-a")).toEqual([sharedUrl]);
+    expect(consentStore.approvedUrls("note-b")).toEqual([]);
+    expect(host.querySelector('.remote-image-card[data-note-id="note-b"]')).not.toBeNull();
+    expect(host.querySelector("img")).toBeNull();
+
+    // Saving Note B leaves the unapproved URL untouched; saving Note A packs the resolved bytes offline.
+    invoke.mockClear();
+    const savedB = await prepareFmd(noteBMarkdown, "/notes/note-b.smd", consentStore.policy("note-b", []));
+    expect(savedB.content).toBe(noteBMarkdown);
+    expect(savedB.assets).toEqual({});
+    expect(invoke).not.toHaveBeenCalled();
+
+    const savedA = await prepareFmd(noteAMarkdown, "/notes/note-a.smd", consentStore.policy("note-a", []));
+    expect(Object.values(savedA.assets)).toEqual([remotePng]);
+    expect(savedA.content).not.toContain(sharedUrl);
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("passes whole-document duplicate ordinals and interpreter context to runs", async () => {

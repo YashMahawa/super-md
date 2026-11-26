@@ -177,8 +177,9 @@ describe("portable media", () => {
     expect(packedDeck.steps[4].markdown).toBe("![[https://untrusted.example/unvisited-wiki.png|Slide Wiki]]");
   });
 
-  it("packs approved remote images from note consent and trusted hosts, including unvisited nested slides, while reusing loaded reader data offline", async () => {
+  it("packs approved remote images from note consent and trusted hosts, including unvisited nested slides, while scoping loaded reader data to the consenting note", async () => {
     const domPng = "data:image/png;base64,ZG9tLWxvYWRlZA==";
+    const leakedDomPng = "data:image/png;base64,bGVha2VkLWRvbQ==";
     const cachedPng = "data:image/png;base64,Y2FjaGVkLW5vdGU=";
     const remotePng = "data:image/png;base64,cmVtb3RlLXBuZw==";
     const remoteSvg = "data:image/svg+xml;base64,PHN2Zy8+";
@@ -190,14 +191,35 @@ describe("portable media", () => {
       throw new Error(`unexpected command: ${command}`);
     });
 
-    // Mounted [data-note-image-source] with registered media simulates an image already loaded in the reader.
+    // 1. Owned + approved reader DOM media for note-approved.
     const loadedSpan = document.createElement("span");
     loadedSpan.className = "note-image";
+    loadedSpan.dataset.noteId = "note-approved";
     loadedSpan.dataset.noteImageSource = "https://once.example/dom-approved.png";
     const loadedImg = document.createElement("img");
     loadedSpan.append(loadedImg);
     document.body.append(loadedSpan);
-    const unregister = registerMedia(loadedImg, { label: "DOM Approved", uri: () => domPng });
+    const unregisterApproved = registerMedia(loadedImg, { label: "DOM Approved", uri: () => domPng });
+
+    // 2. DOM media belonging to a DIFFERENT note (note-other) must never be reused by note-approved or background saves.
+    const otherNoteSpan = document.createElement("span");
+    otherNoteSpan.className = "note-image";
+    otherNoteSpan.dataset.noteId = "note-other";
+    otherNoteSpan.dataset.noteImageSource = "https://once.example/other-note.png";
+    const otherNoteImg = document.createElement("img");
+    otherNoteSpan.append(otherNoteImg);
+    document.body.append(otherNoteSpan);
+    const unregisterOtherNote = registerMedia(otherNoteImg, { label: "Other Note", uri: () => leakedDomPng });
+
+    // 3. Even a DOM element carrying note-approved's noteId must NOT be reused if note-approved's policy has not approved that URL.
+    const unapprovedDomSpan = document.createElement("span");
+    unapprovedDomSpan.className = "note-image";
+    unapprovedDomSpan.dataset.noteId = "note-approved";
+    unapprovedDomSpan.dataset.noteImageSource = "https://once.example/dom-unapproved.png";
+    const unapprovedDomImg = document.createElement("img");
+    unapprovedDomSpan.append(unapprovedDomImg);
+    document.body.append(unapprovedDomSpan);
+    const unregisterUnapproved = registerMedia(unapprovedDomImg, { label: "DOM Unapproved", uri: () => leakedDomPng });
 
     try {
       const deck = {
@@ -216,6 +238,10 @@ describe("portable media", () => {
       const md = [
         "![DOM](https://once.example/dom-approved.png)",
         "",
+        "![Other Note DOM](https://once.example/other-note.png)",
+        "",
+        "![Unapproved DOM](https://once.example/dom-unapproved.png)",
+        "",
         "![Cached](https://once.example/cached-note.png)",
         "",
         "![Explicit Note URL](https://note-only.example/one.png)",
@@ -228,17 +254,22 @@ describe("portable media", () => {
       ].join("\n");
 
       const result = await prepareFmd(md, "/notes/approved.smd", {
+        noteId: "note-approved",
         trustedImageHosts: ["CDN.EXAMPLE"],
-        approvedImageUrls: ["https://once.example/cached-note.png", "https://note-only.example/one.png"],
+        approvedImageUrls: [
+          "https://once.example/dom-approved.png",
+          "https://once.example/cached-note.png",
+          "https://note-only.example/one.png",
+        ],
         loadedImageData: {
           "https://once.example/cached-note.png": cachedPng,
-          "https://note-only.example/two.png": cachedPng,
+          "https://note-only.example/two.png": leakedDomPng,
         },
       });
 
       expect(fetchSpy).not.toHaveBeenCalled();
       const fetchedUrls = native.mock.calls.filter(([cmd]) => cmd === "fetch_resource").map(([, args]) => args.url);
-      // DOM-loaded and note-cached images reuse memory (zero network calls); unapproved siblings never fetch.
+      // Owned+approved DOM/cache images reuse memory (zero network calls); unapproved or foreign-note images never reuse or fetch.
       expect(fetchedUrls.sort()).toEqual([
         "https://cdn.example/unvisited-approved.png",
         "https://cdn.example/unvisited-nested.svg",
@@ -246,6 +277,9 @@ describe("portable media", () => {
       ]);
 
       expect(Object.values(result.assets)).toEqual(expect.arrayContaining([domPng, cachedPng, remotePng, remoteSvg]));
+      expect(Object.values(result.assets)).not.toContain(leakedDomPng);
+      expect(result.content).toContain("![Other Note DOM](https://once.example/other-note.png)");
+      expect(result.content).toContain("![Unapproved DOM](https://once.example/dom-unapproved.png)");
       expect(result.content).toContain("![Sibling On Same Host](https://note-only.example/two.png)");
       expect(result.content).not.toContain("https://once.example/dom-approved.png");
       expect(result.content).not.toContain("https://once.example/cached-note.png");
@@ -256,8 +290,25 @@ describe("portable media", () => {
       expect(packedDeck.steps[3].image).toMatch(/^assets\/image-.*\.png$/);
       expect(packedDeck.steps[3].markdown).toMatch(/!\[Diagram\]\(<assets\/image-.*\.svg>\)/);
       expect(packedDeck.steps[3].markdown).toContain("![Other](https://once.example/unapproved-sibling.png)");
+
+      // Background save of another note while note-approved's consented image is displayed in the DOM must NOT reuse note-approved's bytes.
+      native.mockClear();
+      const backgroundMd = "![DOM](https://once.example/dom-approved.png)\n";
+      const backgroundSaved = await prepareFmd(backgroundMd, "/notes/background.smd", {
+        noteId: "note-background",
+        trustedImageHosts: [],
+        approvedImageUrls: [],
+      });
+      expect(native).not.toHaveBeenCalled();
+      expect(backgroundSaved.content).toBe(backgroundMd);
+      expect(backgroundSaved.assets).toEqual({});
     } finally {
-      unregister();
+      unregisterApproved();
+      unregisterOtherNote();
+      unregisterUnapproved();
+      loadedSpan.remove();
+      otherNoteSpan.remove();
+      unapprovedDomSpan.remove();
     }
   });
 

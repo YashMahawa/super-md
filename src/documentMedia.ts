@@ -95,6 +95,7 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 export type PrepareFmdOptions = RemoteImageConsentPolicy;
 
 interface NormalizedFmdConsent {
+  noteId?: string;
   trustedHosts: Set<string>;
   approvedUrls: Set<string>;
   loadedImageData?: ReadonlyMap<string, string> | Record<string, string>;
@@ -120,7 +121,13 @@ async function prepareFmdInternal(
         if (!/^data:image\//i.test(source)) throw new Error(`Unsupported image ${source}`);
         data = source;
       } else if (isRemoteOrExplicitScheme(source)) {
-        const preloaded = loadedReaderImageData(source, consent.loadedImageData, consent.trustedHosts, consent.approvedUrls);
+        const preloaded = loadedReaderImageData(source, {
+          noteId: consent.noteId,
+          loadedImageData: consent.loadedImageData,
+          trustedHosts: consent.trustedHosts,
+          approvedUrls: consent.approvedUrls,
+          enforcePolicy: true,
+        });
         if (preloaded) {
           data = preloaded;
         } else if (isRemoteImageApproved(source, consent.trustedHosts, consent.approvedUrls)) {
@@ -205,6 +212,7 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
   const assets: Record<string, string> = {};
   const shared = new Map<string, Promise<string | null>>();
   const consent: NormalizedFmdConsent = {
+    noteId: options.noteId,
     trustedHosts: normalizeTrustedImageHosts(options.trustedImageHosts),
     approvedUrls: normalizeApprovedImageUrls(options.approvedImageUrls),
     loadedImageData: options.loadedImageData,

@@ -1,9 +1,18 @@
 import { mediaAt } from "./mediaExport";
 
 export interface RemoteImageConsentPolicy {
+  noteId?: string;
   trustedImageHosts?: readonly string[];
   approvedImageUrls?: Iterable<string>;
   loadedImageData?: ReadonlyMap<string, string> | Record<string, string>;
+}
+
+export interface LoadedReaderImageContext {
+  noteId?: string;
+  loadedImageData?: ReadonlyMap<string, string> | Record<string, string>;
+  trustedHosts?: ReadonlySet<string>;
+  approvedUrls?: ReadonlySet<string>;
+  enforcePolicy?: boolean;
 }
 
 export function remoteImageHost(url: string): string | null {
@@ -60,25 +69,39 @@ function cachedNoteImageData(
 
 export function loadedReaderImageData(
   source: string,
-  loadedImageData?: ReadonlyMap<string, string> | Record<string, string>,
-  trustedHosts?: ReadonlySet<string>,
-  approvedUrls?: ReadonlySet<string>,
+  context: LoadedReaderImageContext = {},
 ): string | null {
   if (/^https?:/i.test(source) && !remoteImageHost(source)) return null;
+  const {
+    noteId,
+    loadedImageData,
+    trustedHosts,
+    approvedUrls,
+    enforcePolicy = true,
+  } = context;
+  if (enforcePolicy) {
+    if (
+      !trustedHosts ||
+      !approvedUrls ||
+      !isRemoteImageApproved(source, trustedHosts, approvedUrls)
+    ) {
+      return null;
+    }
+  }
+  const cached = cachedNoteImageData(source, loadedImageData);
+  if (cached) return cached;
   if (typeof document !== "undefined") {
     for (const element of document.querySelectorAll<HTMLElement>("[data-note-image-source]")) {
       if (element.dataset.noteImageSource !== source) continue;
+      const elementNoteId =
+        element.dataset.noteId ??
+        element.closest<HTMLElement>("[data-note-id]")?.dataset.noteId;
+      if (noteId !== undefined ? elementNoteId !== noteId : elementNoteId !== undefined) {
+        continue;
+      }
       const uri = mediaAt(element.querySelector("img"))?.uri?.();
       if (uri && /^data:image\//i.test(uri)) return uri;
     }
-  }
-  if (
-    loadedImageData &&
-    trustedHosts &&
-    approvedUrls &&
-    isRemoteImageApproved(source, trustedHosts, approvedUrls)
-  ) {
-    return cachedNoteImageData(source, loadedImageData);
   }
   return null;
 }
@@ -174,8 +197,9 @@ export class NoteRemoteImageConsentStore {
   policy(noteId: string | null | undefined, trustedImageHosts: readonly string[]): RemoteImageConsentPolicy {
     const entry = noteId ? this.notes.get(noteId) : undefined;
     return {
+      ...(noteId ? { noteId } : {}),
       trustedImageHosts,
-      ...(entry && entry.approvedUrls.size > 0 ? { approvedImageUrls: Array.from(entry.approvedUrls) } : {}),
+      approvedImageUrls: entry && entry.approvedUrls.size > 0 ? Array.from(entry.approvedUrls) : EMPTY_APPROVED_URLS,
       ...(entry && entry.loadedData.size > 0 ? { loadedImageData: new Map(entry.loadedData) } : {}),
     };
   }
