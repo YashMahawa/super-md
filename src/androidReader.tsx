@@ -87,12 +87,18 @@ function parseImportedAnchor(raw: unknown): SharedSourceAnchor | undefined {
 }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
 interface PendingHeadingNavigation { heading: string; token: string }
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean;sourceStart?:number;sourceEnd?:number;matchText?:string}|null }
+function normalizeSeedBounds(start?: unknown, end?: unknown, matchText?: unknown): { sourceStart?: number; sourceEnd?: number; matchText?: string } {
+  if (typeof start === "number" && typeof end === "number" && Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end >= start) {
+    return { sourceStart: start, sourceEnd: end, ...(typeof matchText === "string" && matchText ? { matchText } : {}) };
+  }
+  return {};
+}
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
   if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
@@ -142,6 +148,7 @@ export function Reader() {
   const [searchReplace,setSearchReplace] = useState(false);
   const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
   const searchSeedNonce = useRef(0);
+  const suppressRestoreForSeed = useRef(false);
   const searchingRef = useRef(false); searchingRef.current = searching;
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
@@ -250,8 +257,9 @@ export function Reader() {
       const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
       const applyIncomingFind=()=>{
         if(seededFind&&typeof seededFind.query==='string'){
+          if(seededFind.query)requestAnimationFrame(()=>markScrollInput());
           searchSeedNonce.current+=1;
-          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,...normalizeSeedBounds(seededFind.sourceStart,seededFind.sourceEnd,seededFind.matchText),nonce:searchSeedNonce.current});
           setSearchReplace(false);
           setSearching(true);
           requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:false}})));
@@ -369,9 +377,21 @@ export function Reader() {
           primeEditorAnchor(next.id, null);
         }
       }
-      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; applyIncomingFind(); };
+      const load = () => {
+        if (seededFind && typeof seededFind.query === "string" && seededFind.query && (!old || old.id !== loaded.id || old.mode !== loaded.mode)) {
+          suppressRestoreForSeed.current = true;
+          modeAnchor.current = null;
+          primeEditorAnchor(loaded.id, null);
+        }
+        if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false });
+        reference.current = loaded;
+        setState(loaded);
+        zoomReference.current = loaded.zoom;
+        applyIncomingFind();
+      };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
-      if (old?.id === next.id && old.mode === next.mode && !hasNewPendingHeading && !typewriterChanged) anchored(load); else load();
+      const hasSeededQuery = Boolean(seededFind && typeof seededFind.query === "string" && seededFind.query);
+      if (old?.id === next.id && old.mode === next.mode && !hasNewPendingHeading && !typewriterChanged && !hasSeededQuery) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
@@ -507,12 +527,13 @@ export function Reader() {
     };
     window.supermdFind = (replaceOrQuery, options) => {
       if(document.querySelector('.theme-guide-dialog'))return;
+      if(typeof replaceOrQuery==='string'&&replaceOrQuery)markScrollInput();
       const requestedReplace=typeof replaceOrQuery==="boolean"?replaceOrQuery:Boolean(options?.replace);
       const openReplace=requestedReplace&&reference.current?.mode!=="reader";
       flushSync(()=>{
         if(typeof replaceOrQuery==='string'){
           searchSeedNonce.current+=1;
-          setSearchSeed({query:replaceOrQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:replaceOrQuery.slice(0,200),caseSensitive:options?.caseSensitive,...normalizeSeedBounds(options?.sourceStart,options?.sourceEnd,options?.matchText),nonce:searchSeedNonce.current});
           setSearchReplace(openReplace);
         } else if(!searchingRef.current) {
           setSearchReplace(openReplace);
@@ -772,6 +793,11 @@ export function Reader() {
       const outerFrame=requestAnimationFrame(()=>{apply();innerFrame=requestAnimationFrame(apply);});
       const timers=[120,320,700].map(delay=>window.setTimeout(apply,delay));
       return()=>{stopped=true;cancelAnimationFrame(outerFrame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    }
+    if(suppressRestoreForSeed.current){
+      suppressRestoreForSeed.current=false;
+      primeEditorAnchor(state.id,null);
+      return;
     }
     if (suppressedRestoreKey.current === `${state.id}:${state.mode}`) return;
     suppressedRestoreKey.current = null;

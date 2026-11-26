@@ -30,9 +30,9 @@ import type {Components} from 'react-markdown';
 export {normalizeCallouts} from '../markdownSource';
 
 const MermaidDiagram = lazy(() => import("./MermaidDiagram"));
-function ThemedChart({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <InteractiveChart source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors}/>;}
-function ThemedSvg({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text} colors={theme?.colors}/>;}
-function ThemedMermaid({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <MermaidDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors}/>;}
+function ThemedChart({source,dark,sourceStart,sourceEnd}:{source:string;dark:boolean;sourceStart?:number;sourceEnd?:number}) {const theme=useContext(DocumentAppearance);return <InteractiveChart source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors} sourceStart={sourceStart} sourceEnd={sourceEnd}/>;}
+function ThemedSvg({source,dark,sourceStart,sourceEnd}:{source:string;dark:boolean;sourceStart?:number;sourceEnd?:number}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text} colors={theme?.colors} sourceStart={sourceStart} sourceEnd={sourceEnd}/>;}
+function ThemedMermaid({source,dark,sourceStart,sourceEnd}:{source:string;dark:boolean;sourceStart?:number;sourceEnd?:number}) {const theme=useContext(DocumentAppearance);return <MermaidDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors} sourceStart={sourceStart} sourceEnd={sourceEnd}/>;}
 const EMPTY_TRUSTED_IMAGE_HOSTS: string[] = [];
 // Keep this component type stable across edits so unchanged paragraphs and
 // their loaded media are not remounted just to classify a standalone figure.
@@ -355,11 +355,11 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   const context = documentPath && pythonCell
     ? { document: documentPath, cell: String(pythonCell.ordinal), interpreter: python || 'embedded' }
     : undefined;
-  const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
-  if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)} />);
-  if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)} />);
+  const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source} sourceStart={srcStart} sourceEnd={srcEnd}>{block}</CodeBlockBoundary>;
+  if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)} sourceStart={srcStart} sourceEnd={srcEnd} />);
+  if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)} sourceStart={srcStart} sourceEnd={srcEnd} />);
   if (language === "smd-steps") return (
-    <CodeBlockBoundary key={language} source={source}>
+    <CodeBlockBoundary key={language} source={source} sourceStart={srcStart} sourceEnd={srcEnd}>
       <StepCards
         source={source}
         sourceStart={srcStart}
@@ -370,9 +370,9 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
       />
     </CodeBlockBoundary>
   );
-  if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
-  if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
-  if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
+  if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} sourceStart={srcStart} sourceEnd={srcEnd} />);
+  if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} sourceStart={srcStart} sourceEnd={srcEnd} />);
+  if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status" data-source-start={srcStart} data-source-end={srcEnd}>Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} sourceStart={srcStart} sourceEnd={srcEnd} /></Suspense>);
   if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />);
   const sourceText = liveStateRef.current.markdown;
   const lineBreak = srcStart !== undefined ? sourceText.indexOf("\n", srcStart) : -1;

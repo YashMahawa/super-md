@@ -6,16 +6,33 @@ import { editorFindQuery, editorFindRange } from "./Editor";
 import { windowedMatches, revealWindowed, compileSearchPattern, nextSearchMatch, normalizeSearchOptions, type WindowedMatch, type SearchMatchConfig, type SearchMatchOptions } from "../windowedSearch";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import { refreshDocumentExtent } from "../documentZoom";
+import { scrollInputVersion } from "../scrollAnchor";
+import {
+  STEP_REVEAL_EVENT,
+  classifyStepDeckOccurrence,
+  inspectChartSource,
+  inspectStepDeckSource,
+  mapSourceRangeToDecoded,
+  type DecodedStringSpan,
+  type StepRevealDetail,
+  type StepVisibleRegion,
+} from "../stepDeckSource";
 export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
 
 const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
+const findScrollContainer = (target: Element | null, host?: Element | null): HTMLElement | null =>
+  target?.closest<HTMLElement>(".android-reading,.reading-scroll") ??
+  (host?.matches(".android-reading,.reading-scroll")
+    ? (host as HTMLElement)
+    : host?.closest<HTMLElement>(".android-reading,.reading-scroll") ?? null);
 type HighlightRegistry = Map<string, unknown>;
 type SourceRange = { from: number; to: number };
 const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
 const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
 const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|document-properties|is-offstage)(?:\s|$)/;
 const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
+const DIAGRAM_ONLY_SELECTOR = ".inline-diagram,.inline-diagram-error,.svg-figure,.mermaid";
 
 function isHiddenOrExcludedSearchElement(el: Element): boolean {
   if (EXCLUDED_SEARCH_TAGS.has(el.localName)) return true;
@@ -52,11 +69,12 @@ function revealMountedBlock(element: Element): void {
   else revealWindowed(element);
 }
 
-function scrollTargetIntoView(target: Element | null, host?: Element | null): void {
-  if (!target) return;
-  const scroller = target.closest<HTMLElement>(".android-reading,.reading-scroll") ?? (host?.matches(".android-reading,.reading-scroll") ? host as HTMLElement : host?.closest<HTMLElement>(".android-reading,.reading-scroll") ?? null);
+function scrollTargetIntoView(target: Element | null, host?: Element | null): HTMLElement | null {
+  if (!target) return null;
+  const scroller = findScrollContainer(target, host);
   if (scroller) refreshDocumentExtent(scroller);
   target.scrollIntoView?.({ block: "center", behavior: "instant" });
+  return scroller;
 }
 
 function expandRegexReplacement(replacement: string, match: RegExpExecArray, source: string): string {
@@ -159,8 +177,25 @@ function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
   return hidden;
 }
 
+function closestSourceOwner(el: Element | null): HTMLElement | null {
+  let cur = el?.closest<HTMLElement>("[data-source-start],.code-container") ?? null;
+  while (cur) {
+    const stepDeck = cur.closest<HTMLElement>(".step-cards");
+    if (stepDeck && stepDeck !== cur) {
+      cur = stepDeck.hasAttribute("data-source-start")
+        ? stepDeck
+        : (stepDeck.parentElement?.closest<HTMLElement>("[data-source-start],.code-container") ?? null);
+      continue;
+    }
+    return cur;
+  }
+  return null;
+}
+
 function sourceBounds(el: Element, content?: string): { start: number; end: number } | null {
   if (!(el instanceof HTMLElement) || el.tagName === "TEXTAREA") return null;
+  const stepDeck = el.closest(".step-cards");
+  if (stepDeck && stepDeck !== el) return null;
   const attrStart = el.getAttribute("data-source-start"), attrEnd = el.getAttribute("data-source-end");
   if (attrStart !== null && attrEnd !== null) {
     const start = Number(attrStart), end = Number(attrEnd);
@@ -201,22 +236,186 @@ function openDisclosuresFor(target: Element | null, scope?: Element | null, rang
   const startEl = range ? (range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement) : null;
   for (const anchor of [startEl, target, scope]) {
     for (let owner = anchor?.closest("details") || null; owner; owner = owner.parentElement?.closest("details") || null) {
+      if (owner.classList.contains("step-cards-legacy-note") && !(range && owner.contains(range.startContainer))) continue;
       if (!owner.open) { owner.open = true; opened = true; }
     }
   }
   const container = scope ?? target;
   if (container) {
-    if (container instanceof HTMLDetailsElement && !container.open) { container.open = true; opened = true; }
+    if (container instanceof HTMLDetailsElement && !container.open && !container.classList.contains("step-cards-legacy-note")) {
+      container.open = true;
+      opened = true;
+    }
     for (const disclosure of container.querySelectorAll<HTMLDetailsElement>("details")) {
       if (disclosure.open) continue;
       if (range && disclosure.contains(range.startContainer)) { disclosure.open = true; opened = true; continue; }
+      if (disclosure.classList.contains("step-cards-legacy-note")) continue;
       if (sourceRange) {
-        const bounds = sourceBounds(disclosure.closest("[data-source-start]") || disclosure);
+        const bounds = sourceBounds(closestSourceOwner(disclosure) || disclosure);
         if (!bounds || (bounds.start <= sourceRange.from && sourceRange.from <= bounds.end)) { disclosure.open = true; opened = true; }
       }
     }
   }
   return opened;
+}
+
+function resolveRenderedStepCard(owner: HTMLElement): HTMLElement | null {
+  if (owner.classList.contains("step-cards")) return owner;
+  if (owner.classList.contains("step-cards-placeholder")) {
+    const deckId = owner.getAttribute("data-step-deck-id");
+    if (deckId) {
+      for (const card of document.querySelectorAll<HTMLElement>(".step-viewer .step-cards")) {
+        if (card.getAttribute("data-step-deck-id") === deckId) return card;
+      }
+    }
+  }
+  return owner.querySelector<HTMLElement>(".step-cards");
+}
+
+function revealStepCardsForRange(owner: HTMLElement, content: string, target: SourceRange): { changed: boolean; card: HTMLElement | null } {
+  const stepOwner = owner.matches(".step-cards,.step-cards-placeholder")
+    ? owner
+    : owner.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
+  if (!stepOwner || stepOwner.classList.contains("step-cards-error")) {
+    return { changed: false, card: null };
+  }
+  const bounds = sourceBounds(stepOwner, content);
+  if (!bounds) return { changed: false, card: resolveRenderedStepCard(stepOwner) };
+  const deckInfo = inspectStepDeckSource(content.slice(bounds.start, bounds.end), bounds.start);
+  const initialCard = resolveRenderedStepCard(stepOwner);
+  if (!deckInfo) return { changed: false, card: initialCard };
+  const beforeStep = Number(initialCard?.getAttribute("data-step-index") ?? stepOwner.getAttribute("data-step-index") ?? 0) || 0;
+  const beforeLegacyOpen = Boolean(initialCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
+  const occ = classifyStepDeckOccurrence(deckInfo, target, beforeStep);
+  if (occ.stepIndex === null) return { changed: false, card: initialCard };
+  (initialCard ?? stepOwner).dispatchEvent(
+    new CustomEvent<StepRevealDetail>(STEP_REVEAL_EVENT, {
+      detail: { stepIndex: occ.stepIndex, openLegacyNote: occ.openLegacyNote },
+    }),
+  );
+  const liveCard = resolveRenderedStepCard(stepOwner);
+  let openedNested = false;
+  if (liveCard && occ.visibleRegion === "step-markdown") {
+    const desc = liveCard.querySelector(".step-cards-description");
+    if (desc) openedNested = openDisclosuresFor(desc, desc, null, target);
+  }
+  const afterStep = Number(liveCard?.getAttribute("data-step-index") ?? stepOwner.getAttribute("data-step-index") ?? 0) || 0;
+  const afterLegacyOpen = Boolean(liveCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
+  return {
+    changed: afterStep !== beforeStep || afterLegacyOpen !== beforeLegacyOpen || openedNested,
+    card: liveCard,
+  };
+}
+
+function stepCardScrollTarget(owner: HTMLElement): Element {
+  const card = resolveRenderedStepCard(owner);
+  if (!card || card.closest(".step-viewer")) return owner;
+  const viewportHeight = typeof window !== "undefined" && window.innerHeight > 0 ? window.innerHeight : 800;
+  if (card.getBoundingClientRect().height > viewportHeight * 0.85) {
+    return card.querySelector(".step-cards-inline-figure,.step-cards-chart-frame.is-current,.step-cards-figure.is-current,.step-cards-stage") ?? card;
+  }
+  return card;
+}
+
+function isDecodedSliceVisibleMatch(
+  span: DecodedStringSpan,
+  dRange: { from: number; to: number },
+  region: StepVisibleRegion,
+  pattern: RegExp | null,
+): boolean {
+  if (span.toSource[dRange.to] - span.toSource[dRange.from] !== dRange.to - dRange.from) {
+    if (!pattern) return false;
+    pattern.lastIndex = 0;
+    const sub = span.decoded.slice(dRange.from, dRange.to);
+    const m = pattern.exec(sub);
+    if (!m || m.index !== 0 || m[0].length !== sub.length) return false;
+  }
+  if ((region === "step-markdown" || region === "step-legacy-description") && span.decoded.length <= 200_000) {
+    const hidden = hiddenSpansInSlice(span.decoded, 0);
+    if (hidden.some(h => dRange.from >= h.from && dRange.to <= h.to)) return false;
+  }
+  return true;
+}
+
+function stepRegionElement(card: HTMLElement, region: StepVisibleRegion): Element | null {
+  switch (region) {
+    case "deck-title":
+      return card.querySelector(".step-cards-heading");
+    case "chart-title":
+      return card.querySelector(".step-cards-chart-frame.is-current figcaption");
+    case "step-label":
+      return card.querySelector(".step-cards-step-title");
+    case "step-markdown":
+      return card.querySelector(".step-cards-description");
+    case "step-legacy-description":
+      return card.querySelector(".step-cards-legacy-note > div");
+  }
+}
+
+function mapStepDeckSourceRangeToDomRange(
+  owner: HTMLElement,
+  content: string,
+  ranges: SourceRange[],
+  activeIndex: number,
+  query: string,
+  options: SearchMatchConfig,
+): Range | null {
+  const target = ranges[activeIndex];
+  if (!target) return null;
+  const bounds = sourceBounds(owner, content);
+  if (!bounds) return null;
+  const card = resolveRenderedStepCard(owner);
+  if (!card || card.classList.contains("step-cards-error")) return null;
+  const deckInfo = inspectStepDeckSource(content.slice(bounds.start, bounds.end), bounds.start);
+  if (!deckInfo) return null;
+  const currentStep = Number(card.getAttribute("data-step-index") ?? 0) || 0;
+  const occ = classifyStepDeckOccurrence(deckInfo, target, currentStep);
+  if (occ.stepIndex === null || occ.stepIndex !== currentStep || !occ.visibleRegion || !occ.fieldSpan || !occ.decodedRange) {
+    return null;
+  }
+  const { pattern } = compileSearchPattern(query, options, false);
+  if (!isDecodedSliceVisibleMatch(occ.fieldSpan, occ.decodedRange, occ.visibleRegion, pattern)) {
+    return null;
+  }
+  const scopeEl = stepRegionElement(card, occ.visibleRegion);
+  if (!scopeEl) return null;
+  const domRanges = readingMatches(scopeEl, query, options).filter(
+    r => !r.startContainer.parentElement?.closest(".code-container > details > summary,.python-cell summary"),
+  );
+  if (!domRanges.length) return null;
+  let ordinal = 0;
+  for (let i = 0; i < activeIndex; i++) {
+    const candidate = ranges[i];
+    if (candidate.from < bounds.start || candidate.to > bounds.end) continue;
+    const prev = classifyStepDeckOccurrence(deckInfo, candidate, currentStep);
+    if (
+      prev.stepIndex === currentStep &&
+      prev.visibleRegion === occ.visibleRegion &&
+      prev.fieldSpan &&
+      prev.decodedRange &&
+      isDecodedSliceVisibleMatch(prev.fieldSpan, prev.decodedRange, prev.visibleRegion, pattern)
+    ) {
+      ordinal++;
+    }
+  }
+  return domRanges[ordinal] ?? null;
+}
+
+function isDirectVisibleChartMatch(owner: HTMLElement, content: string, candidate: SourceRange, query?: string, options: SearchMatchConfig = false): boolean {
+  const bounds = sourceBounds(owner, content);
+  if (!bounds || candidate.from < bounds.start || candidate.to > bounds.end) return false;
+  const chartInfo = inspectChartSource(content.slice(bounds.start, bounds.end), bounds.start);
+  if (!chartInfo?.titleSpan) return false;
+  const dRange = mapSourceRangeToDecoded(chartInfo.titleSpan, candidate, true);
+  if (!dRange) return false;
+  if (query !== undefined && chartInfo.titleSpan.toSource[dRange.to] - chartInfo.titleSpan.toSource[dRange.from] !== dRange.to - dRange.from) {
+    const { pattern } = compileSearchPattern(query, options, false);
+    if (!pattern) return false;
+    const sub = chartInfo.titleSpan.decoded.slice(dRange.from, dRange.to);
+    const m = pattern.exec(sub);
+    if (!m || m.index !== 0 || m[0].length !== sub.length) return false;
+  }
+  return true;
 }
 
 function visibleSourceSpan(owner: HTMLElement, content: string): { start: number; end: number } | null {
@@ -250,6 +449,9 @@ function visibleSourceSpan(owner: HTMLElement, content: string): { start: number
 function ownerDomScope(owner: HTMLElement): Element {
   if (owner.matches(".code-container,.python-cell")) {
     return owner.querySelector("pre.python-source,pre") ?? owner;
+  }
+  if (owner.matches(".interactive-chart")) {
+    return owner.querySelector("figcaption") ?? owner;
   }
   return owner;
 }
@@ -295,7 +497,24 @@ function deepestSourceOwner(block: HTMLElement, range: SourceRange, content?: st
   return owner;
 }
 
-function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange): boolean {
+function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, query?: string, options: SearchMatchConfig = false): boolean {
+  if (owner.matches(DIAGRAM_ONLY_SELECTOR)) return false;
+  if (owner.matches(".interactive-chart")) return isDirectVisibleChartMatch(owner, content, candidate, query, options);
+  if (owner.matches(".step-cards,.step-cards-placeholder")) {
+    const bounds = sourceBounds(owner, content);
+    if (!bounds || candidate.from < bounds.start || candidate.to > bounds.end) return false;
+    const card = resolveRenderedStepCard(owner);
+    if (!card || card.classList.contains("step-cards-error")) return false;
+    const deckInfo = inspectStepDeckSource(content.slice(bounds.start, bounds.end), bounds.start);
+    if (!deckInfo) return false;
+    const currentStep = Number(card.getAttribute("data-step-index") ?? 0) || 0;
+    const occ = classifyStepDeckOccurrence(deckInfo, candidate, currentStep);
+    if (occ.stepIndex === null || occ.stepIndex !== currentStep || !occ.visibleRegion || !occ.fieldSpan || !occ.decodedRange) {
+      return false;
+    }
+    const { pattern } = query !== undefined ? compileSearchPattern(query, options, false) : { pattern: null };
+    return isDecodedSliceVisibleMatch(occ.fieldSpan, occ.decodedRange, occ.visibleRegion, pattern);
+  }
   const visible = visibleSourceSpan(owner, content);
   if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
   if (deepestSourceOwner(owner, candidate, content) !== owner) return false;
@@ -311,7 +530,7 @@ function directOwnerDomRanges(owner: HTMLElement, query: string, options: Search
   return readingMatches(scope, query, options).filter(r => {
     if (owner.matches(".code-container,.python-cell") && r.startContainer.parentElement?.closest("summary")) return false;
     const common = r.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? r.commonAncestorContainer as Element : r.commonAncestorContainer.parentElement;
-    const closestOwner = common?.closest("[data-source-start],.code-container");
+    const closestOwner = closestSourceOwner(common ?? null);
     return !closestOwner || closestOwner === owner || !owner.contains(closestOwner);
   });
 }
@@ -320,7 +539,11 @@ function mapSourceRangeToDomRange(block: HTMLElement, content: string, ranges: S
   const target = ranges[activeIndex];
   if (!target || block.closest('[data-windowed-mounted="false"]')) return null;
   const owner = deepestSourceOwner(block, target, content);
-  if (!owner || !isDirectVisibleMatch(owner, content, target)) return null;
+  if (!owner) return null;
+  if (owner.matches(".step-cards,.step-cards-placeholder")) {
+    return mapStepDeckSourceRangeToDomRange(owner, content, ranges, activeIndex, query, options);
+  }
+  if (!isDirectVisibleMatch(owner, content, target, query, options)) return null;
   const domRanges = directOwnerDomRanges(owner, query, options);
   if (!domRanges.length) return null;
   const ownerBounds = sourceBounds(owner, content);
@@ -328,7 +551,7 @@ function mapSourceRangeToDomRange(block: HTMLElement, content: string, ranges: S
   for (let i = 0; i < activeIndex; i++) {
     const candidate = ranges[i];
     if (ownerBounds && (candidate.from < ownerBounds.start || candidate.to > ownerBounds.end)) continue;
-    if (deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate)) ordinal++;
+    if (deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate, query, options)) ordinal++;
   }
   return domRanges[ordinal] ?? null;
 }
@@ -339,8 +562,8 @@ function sameDomRange(a: Range, b: Range): boolean {
 
 function mapDomRangeToSourceIndex(host: Element, content: string, ranges: SourceRange[], domRange: Range, query: string, options: SearchMatchConfig = false): number {
   const common = domRange.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? domRange.commonAncestorContainer as Element : domRange.commonAncestorContainer.parentElement;
-  const owner = common?.closest<HTMLElement>("[data-source-start],.code-container");
-  if (owner) {
+  const owner = closestSourceOwner(common ?? null);
+  if (owner && !owner.matches(".step-cards,.step-cards-placeholder")) {
     const domRanges = directOwnerDomRanges(owner, query, options);
     const ordinal = domRanges.findIndex(r => sameDomRange(r, domRange));
     if (ordinal >= 0) {
@@ -350,14 +573,16 @@ function mapDomRangeToSourceIndex(host: Element, content: string, ranges: Source
         const candidate = ranges[i];
         if (ownerBounds && (candidate.from < ownerBounds.start || candidate.to > ownerBounds.end)) continue;
         const block = findContainingBlock(host, candidate, content);
-        if (block && deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate)) {
+        if (block && deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate, query, options)) {
           if (seen === ordinal) return i;
           seen++;
         }
       }
     }
   }
+  const scopedBounds = owner ? sourceBounds(owner, content) : null;
   for (let i = 0; i < ranges.length; i++) {
+    if (scopedBounds && (ranges[i].from < scopedBounds.start || ranges[i].to > scopedBounds.end)) continue;
     const resolved = resolveSourceHighlightRange(host, content, ranges, i, query, options);
     if (resolved && sameDomRange(resolved, domRange)) return i;
   }
@@ -481,7 +706,125 @@ export function sourceMatches(content: string, query: string, options: SearchMat
 export interface ReadingSearchSeed {
   query: string;
   caseSensitive?: boolean;
+  sourceStart?: number;
+  sourceEnd?: number;
+  matchText?: string;
   nonce: number;
+}
+
+function extractSeedRange(seed?: ReadingSearchSeed | null): SourceRange | null {
+  if (!seed) return null;
+  const { sourceStart, sourceEnd } = seed;
+  if (typeof sourceStart === "number" && typeof sourceEnd === "number" && Number.isInteger(sourceStart) && Number.isInteger(sourceEnd) && sourceStart >= 0 && sourceEnd >= sourceStart) {
+    return { from: sourceStart, to: sourceEnd };
+  }
+  return null;
+}
+
+function extractSeedMatchText(seed?: ReadingSearchSeed | null): string | undefined {
+  return typeof seed?.matchText === "string" && seed.matchText.length > 0 ? seed.matchText : undefined;
+}
+
+function foldCodePointForSearch(cp: number): string {
+  switch (cp) {
+    case 0x00df:
+    case 0x1e9e:
+      return "ss";
+    case 0x0130:
+      return "i\u0307";
+    case 0x0149:
+      return "\u02bcn";
+    case 0x01f0:
+      return "j\u030c";
+    case 0x0390:
+      return "\u03b9\u0308\u0301";
+    case 0x03b0:
+      return "\u03c5\u0308\u0301";
+    case 0x03c2:
+      return "\u03c3";
+    case 0x00b5:
+      return "\u03bc";
+    case 0x0345:
+      return "\u03b9";
+    case 0x0587:
+      return "\u0565\u0582";
+    case 0x1e96:
+      return "h\u0331";
+    case 0x1e97:
+      return "t\u0308";
+    case 0x1e98:
+      return "w\u030a";
+    case 0x1e99:
+      return "y\u030a";
+    case 0x1e9a:
+      return "a\u02be";
+    case 0xfb00:
+      return "ff";
+    case 0xfb01:
+      return "fi";
+    case 0xfb02:
+      return "fl";
+    case 0xfb03:
+      return "ffi";
+    case 0xfb04:
+      return "ffl";
+    case 0xfb05:
+    case 0xfb06:
+      return "st";
+    case 0xfb13:
+      return "\u0574\u0576";
+    case 0xfb14:
+      return "\u0574\u0565";
+    case 0xfb15:
+      return "\u0574\u056b";
+    case 0xfb16:
+      return "\u057e\u0576";
+    case 0xfb17:
+      return "\u0574\u056d";
+    default:
+      return String.fromCodePoint(cp).toLowerCase();
+  }
+}
+
+export function foldUnicodeForSearch(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; ) {
+    const cp = text.codePointAt(i)!;
+    out += foldCodePointForSearch(cp);
+    i += cp > 0xffff ? 2 : 1;
+  }
+  return out;
+}
+
+function isSplitUtf16Surrogate(text: string, index: number): boolean {
+  if (index <= 0 || index >= text.length) return false;
+  const prev = text.charCodeAt(index - 1);
+  const curr = text.charCodeAt(index);
+  return prev >= 0xd800 && prev <= 0xdbff && curr >= 0xdc00 && curr <= 0xdfff;
+}
+
+function isValidSeedOccurrence(
+  content: string,
+  seedRange: SourceRange,
+  query: string,
+  caseSensitive: boolean,
+  expectedMatchText?: string,
+): boolean {
+  if (!query || seedRange.from < 0 || seedRange.to <= seedRange.from || seedRange.to > content.length) {
+    return false;
+  }
+  if (isSplitUtf16Surrogate(content, seedRange.from) || isSplitUtf16Surrogate(content, seedRange.to)) {
+    return false;
+  }
+  const slice = content.slice(seedRange.from, seedRange.to);
+  if (expectedMatchText !== undefined && slice !== expectedMatchText) {
+    return false;
+  }
+  return caseSensitive ? slice === query : foldUnicodeForSearch(slice) === foldUnicodeForSearch(query);
+}
+
+function findMatchingSourceRangeIndex(ranges: SourceRange[], target: SourceRange): number {
+  return ranges.findIndex(r => r.from === target.from && r.to === target.to);
 }
 
 export default function ReadingSearch({ content, close, onChange, sourceSession, seed, initialReplace = false }: { content: string; close: () => void; onChange?: (content: string) => void; sourceSession?: string; seed?: ReadingSearchSeed | null; initialReplace?: boolean }) {
@@ -497,10 +840,18 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const [windowed, setWindowed] = useState<WindowedMatch[] | null>(null);
   const [appliedNonce, setAppliedNonce] = useState<number | null>(seed ? seed.nonce : null);
   const pendingAutoSelect = useRef(Boolean(seed && seed.query));
+  const pendingSeedRange = useRef<SourceRange | null>(extractSeedRange(seed));
+  const pendingSeedMatchText = useRef<string | undefined>(extractSeedMatchText(seed));
+  const [hiddenSourceHit, setHiddenSourceHit] = useState(false);
+  const hiddenSourceAnchorRef = useRef<SourceRange | null>(null);
   const pendingReplaceIndex = useRef<number | null>(null);
   if (seed && appliedNonce !== seed.nonce) {
     setAppliedNonce(seed.nonce);
     pendingAutoSelect.current = Boolean(seed.query);
+    pendingSeedRange.current = extractSeedRange(seed);
+    pendingSeedMatchText.current = extractSeedMatchText(seed);
+    setHiddenSourceHit(false);
+    hiddenSourceAnchorRef.current = null;
     pendingReplaceIndex.current = null;
     setQuery(seed.query.slice(0, 200));
     if (seed.caseSensitive !== undefined) setCaseSensitive(Boolean(seed.caseSensitive));
@@ -516,12 +867,161 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const input = useRef<HTMLInputElement>(null);
   const closeRef = useRef(close); closeRef.current = close;
   const prevState = useRef({ query, content, caseSensitive, wholeWord, regexp });
-  const settleFrames = useRef<[number, number]>([0, 0]);
-  const clearSettleFrames = () => {
-    cancelAnimationFrame(settleFrames.current[0]);
-    cancelAnimationFrame(settleFrames.current[1]);
-    settleFrames.current = [0, 0];
+  const settleCancelRef = useRef<(() => void) | null>(null);
+  const clearSettle = () => {
+    settleCancelRef.current?.();
+    settleCancelRef.current = null;
   };
+  const scheduleRevealSettle = (
+    expectedIndex: number,
+    host: HTMLElement | null,
+    initialScroller: HTMLElement | null,
+    observedTarget: Element | null,
+    runPass: () => HTMLElement | null,
+  ) => {
+    clearSettle();
+    const initialInput = scrollInputVersion();
+    let active = true;
+    let rafId = 0;
+    let timerId = 0;
+    let remainingInitialFrames = 4;
+    let layoutMutating = false;
+    let trackedScroller = initialScroller ?? findScrollContainer(host, host);
+    let lastScrollTop = trackedScroller?.scrollTop ?? null;
+    let lastScrollHeight = trackedScroller?.scrollHeight ?? null;
+
+    const recordScroller = (scroller: HTMLElement | null) => {
+      const s = scroller ?? trackedScroller;
+      if (s) {
+        trackedScroller = s;
+        lastScrollTop = s.scrollTop;
+        lastScrollHeight = s.scrollHeight;
+      }
+    };
+
+    const stop = () => {
+      if (!active) return;
+      active = false;
+      if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+      if (timerId) { window.clearTimeout(timerId); timerId = 0; }
+      resizeObserver?.disconnect();
+      liveHost?.removeEventListener("supermd-window-change", onWindowChange);
+      scroller?.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", onPointerDown, true);
+      window.removeEventListener("touchstart", onPointerDown, true);
+      window.removeEventListener("touchmove", onPointerDown, true);
+      window.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("supermd-goto-offset", stop);
+      if (settleCancelRef.current === stop) settleCancelRef.current = null;
+    };
+
+    const hasManualScroll = () => {
+      if (scrollInputVersion() !== initialInput) return true;
+      if (
+        !layoutMutating &&
+        trackedScroller &&
+        lastScrollTop !== null &&
+        (lastScrollHeight === null || trackedScroller.scrollHeight === lastScrollHeight) &&
+        Math.abs(trackedScroller.scrollTop - lastScrollTop) > 2
+      ) {
+        return true;
+      }
+      return false;
+    };
+
+    const executePass = () => {
+      rafId = 0;
+      if (!active) return;
+      if (indexRef.current !== expectedIndex || hasManualScroll()) {
+        stop();
+        return;
+      }
+      const nextScroller = runPass();
+      recordScroller(nextScroller);
+      if (active && remainingInitialFrames > 0) {
+        remainingInitialFrames--;
+        rafId = requestAnimationFrame(executePass);
+      }
+    };
+
+    const schedulePass = () => {
+      if (!active || rafId) return;
+      rafId = requestAnimationFrame(executePass);
+    };
+
+    const onWindowChange = () => {
+      if (!active) return;
+      layoutMutating = true;
+      queueMicrotask(() => {
+        layoutMutating = false;
+        if (active) recordScroller(trackedScroller);
+      });
+      schedulePass();
+    };
+
+    const onScroll = () => {
+      if (!active || !scroller || layoutMutating) return;
+      if (lastScrollHeight !== null && scroller.scrollHeight !== lastScrollHeight) {
+        recordScroller(scroller);
+        schedulePass();
+        return;
+      }
+      if (lastScrollTop !== null && Math.abs(scroller.scrollTop - lastScrollTop) > 2) {
+        stop();
+      }
+    };
+
+    const onLayoutShift = () => {
+      if (!active) return;
+      if (trackedScroller && lastScrollHeight !== null && trackedScroller.scrollHeight !== lastScrollHeight) {
+        recordScroller(trackedScroller);
+      }
+      if (indexRef.current !== expectedIndex || hasManualScroll()) {
+        stop();
+        return;
+      }
+      schedulePass();
+    };
+
+    const onPointerDown = (event: Event) => {
+      const t = event.target instanceof Element ? event.target : null;
+      if (t?.closest(".reading-search")) return;
+      stop();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      const t = event.target instanceof Element ? event.target : null;
+      if (t?.closest(".reading-search")) return;
+      if (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "PageDown" || event.key === "PageUp" || event.key === "Home" || event.key === "End" || event.key === " ") {
+        stop();
+      }
+    };
+
+    const liveHost = host ?? findReadingHost();
+    const scroller = trackedScroller ?? findScrollContainer(liveHost, liveHost);
+    const contentRoot =
+      scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body") ??
+      liveHost?.querySelector<HTMLElement>(".live-document,.markdown-body") ??
+      liveHost;
+    const resizeObserver = typeof ResizeObserver !== "undefined" ? new ResizeObserver(onLayoutShift) : null;
+    if (resizeObserver) {
+      if (contentRoot) resizeObserver.observe(contentRoot);
+      if (observedTarget && observedTarget !== contentRoot) resizeObserver.observe(observedTarget);
+    }
+    liveHost?.addEventListener("supermd-window-change", onWindowChange);
+    scroller?.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", onPointerDown, { capture: true, passive: true });
+    window.addEventListener("touchstart", onPointerDown, { capture: true, passive: true });
+    window.addEventListener("touchmove", onPointerDown, { capture: true, passive: true });
+    window.addEventListener("pointerdown", onPointerDown, { capture: true, passive: true });
+    window.addEventListener("keydown", onKeyDown, { capture: true, passive: true });
+    window.addEventListener("supermd-goto-offset", stop);
+    remainingInitialFrames--;
+    rafId = requestAnimationFrame(executePass);
+    timerId = window.setTimeout(stop, 800);
+    settleCancelRef.current = stop;
+  };
+
   const sourceCacheRef = useRef<{
     content: string;
     query: string;
@@ -574,14 +1074,14 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         }
       }
       const owner = deepestSourceOwner(block, sr, content);
-      if (owner && !isDirectVisibleMatch(owner, content, sr)) return -1;
+      if (owner && !isDirectVisibleMatch(owner, content, sr, query, filterOptions)) return -1;
       const wBlock = block.closest<HTMLElement>("[data-windowed-block]") ?? block;
       const wBounds = sourceBounds(wBlock, content);
       let targetOrdinal = 0;
       if (wBounds) {
         for (let i = 0; i < sourceIdx; i++) {
           const prev = activeSourceRanges[i];
-          if (prev.from >= wBounds.start && prev.to <= wBounds.end && isDirectVisibleMatch(wBlock, content, prev)) {
+          if (prev.from >= wBounds.start && prev.to <= wBounds.end && isDirectVisibleMatch(wBlock, content, prev, query, filterOptions)) {
             targetOrdinal++;
           }
         }
@@ -589,8 +1089,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const exactIdx = liveWindowed.findIndex(w => w.element === wBlock && w.ordinal === targetOrdinal);
       if (exactIdx >= 0) return exactIdx;
       return liveWindowed.findIndex(w => {
-        const b = sourceBounds(w.element, content);
-        return b !== null && sr.from >= b.start && sr.to <= b.end;
+        const wb = sourceBounds(w.element, content);
+        return wb !== null && sr.from >= wb.start && sr.to <= wb.end && w.ordinal === targetOrdinal;
       });
     }
     const liveMatches = knownMatches !== undefined
@@ -621,9 +1121,10 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
   }, [canReplace, replacing]);
 
-  const revealAndHighlightSource = (targetIndex: number, ranges: SourceRange[], sourceText: string, scroll: boolean) => {
+  const revealAndHighlightSource = (targetIndex: number, ranges: SourceRange[], sourceText: string, scroll: boolean, matchQuery = query, matchOptions: SearchMatchConfig = filterOptions) => {
     const range = ranges[targetIndex];
     if (!range) return;
+    if (scroll) clearSettle();
     if (scroll && sourceSession) {
       editorFindRange(sourceSession, range.from, range.to);
       if (!findReadingHost()) return;
@@ -634,7 +1135,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!initialBlock) {
       registry?.delete("smd-search-current");
       if (scroll) {
-        const fallback = host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
+        const fallback = resolveSourceBlock(host, range, sourceText) ?? host.querySelector("[data-frontmatter-properties],.document-properties");
         scrollTargetIntoView(fallback, host);
       }
       return;
@@ -643,57 +1144,88 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (scroll) revealMountedBlock(initialBlock);
     const block = findContainingBlock(host, range, sourceText) ?? initialBlock;
     const owner = deepestSourceOwner(block, range, sourceText) ?? block;
-    if (scroll) openDisclosuresFor(owner, block, null, range);
-    const domRange = mapSourceRangeToDomRange(block, sourceText, ranges, targetIndex, query, filterOptions);
+    let stepReveal = { changed: false, card: null as HTMLElement | null };
+    if (scroll) {
+      openDisclosuresFor(owner, block, null, range);
+      stepReveal = revealStepCardsForRange(owner, sourceText, range);
+    }
+    const domRange = mapSourceRangeToDomRange(block, sourceText, ranges, targetIndex, matchQuery, matchOptions);
+    let initialScroller: HTMLElement | null = null;
     if (scroll) {
       openDisclosuresFor(owner, block, domRange, range);
-      const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner;
-      scrollTargetIntoView(scrollEl ?? block, host);
+      const fallbackTarget = owner.matches(".step-cards,.step-cards-placeholder") ? stepCardScrollTarget(owner) : owner;
+      const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : fallbackTarget;
+      initialScroller = scrollTargetIntoView(scrollEl ?? block, host);
     }
     if (registry && HighlightClass) {
-      if (wasUnmounted || scroll) registry.set("smd-search", new HighlightClass(...readingMatches(host, query, filterOptions)));
+      if (wasUnmounted || scroll || stepReveal.changed) registry.set("smd-search", new HighlightClass(...readingMatches(host, matchQuery, matchOptions)));
       registry.delete("smd-search-current");
       if (domRange) registry.set("smd-search-current", new HighlightClass(domRange));
+    }
+    if (scroll && !sourceSession) {
+      scheduleRevealSettle(indexRef.current, host, initialScroller, stepReveal.card ?? owner, () => {
+        const liveHost = findReadingHost();
+        if (!liveHost || !liveHost.isConnected) return null;
+        const initialLiveBlock = findContainingBlock(liveHost, range, sourceText);
+        if (!initialLiveBlock || !initialLiveBlock.isConnected) return null;
+        revealMountedBlock(initialLiveBlock);
+        const liveBlock = findContainingBlock(liveHost, range, sourceText) ?? initialLiveBlock;
+        const liveOwner = deepestSourceOwner(liveBlock, range, sourceText) ?? liveBlock;
+        openDisclosuresFor(liveOwner, liveBlock, null, range);
+        revealStepCardsForRange(liveOwner, sourceText, range);
+        const liveDomRange = mapSourceRangeToDomRange(liveBlock, sourceText, ranges, targetIndex, matchQuery, matchOptions);
+        openDisclosuresFor(liveOwner, liveBlock, liveDomRange, range);
+        const liveFallback = liveOwner.matches(".step-cards,.step-cards-placeholder") ? stepCardScrollTarget(liveOwner) : liveOwner;
+        const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveFallback;
+        const nextScroller = scrollTargetIntoView(liveScrollEl ?? liveBlock, liveHost);
+        if (registry && HighlightClass) {
+          registry.set("smd-search", new HighlightClass(...readingMatches(liveHost, matchQuery, matchOptions)));
+          registry.delete("smd-search-current");
+          if (liveDomRange) registry.set("smd-search-current", new HighlightClass(liveDomRange));
+        }
+        return nextScroller;
+      });
     }
   };
 
   const selectWindowedMatch = (next: number, activeWindowed: WindowedMatch[], host: HTMLElement | null) => {
     const match = activeWindowed[next];
     if (!match) return;
-    clearSettleFrames();
+    clearSettle();
     revealMountedBlock(match.element);
     openDisclosuresFor(match.element, match.element);
     let range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
     if (openDisclosuresFor(match.element, match.element, range)) range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
     const scrollEl = range ? (range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement) : match.element;
-    scrollTargetIntoView(scrollEl ?? match.element, host);
+    const initialScroller = scrollTargetIntoView(scrollEl ?? match.element, host);
     updateIndex(next);
     if (registry && HighlightClass) {
       registry.set("smd-search", new HighlightClass(...readingMatches(host ?? match.element, query, filterOptions)));
       registry.delete("smd-search-current");
       if (range) registry.set("smd-search-current", new HighlightClass(range));
     }
-    settleFrames.current[0] = requestAnimationFrame(() => {
-      settleFrames.current[1] = requestAnimationFrame(() => {
-        settleFrames.current = [0, 0];
-        if (indexRef.current !== next || !match.element.isConnected) return;
-        const liveHost = findReadingHost();
-        const liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-        openDisclosuresFor(match.element, match.element, liveRange);
-        const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
-        scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
-        if (registry && HighlightClass) {
-          registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
-          registry.delete("smd-search-current");
-          if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
-        }
-      });
+    scheduleRevealSettle(next, host, initialScroller, match.element, () => {
+      if (!match.element.isConnected) return null;
+      revealMountedBlock(match.element);
+      const liveHost = findReadingHost();
+      openDisclosuresFor(match.element, match.element);
+      let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
+      const nextScroller = scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
+      if (registry && HighlightClass) {
+        registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
+        registry.delete("smd-search-current");
+        if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
+      }
+      return nextScroller;
     });
   };
 
   const selectDomMatch = (next: number, activeMatches: Range[], host: HTMLElement | null) => {
     const range = activeMatches[next];
     if (!range) return;
+    clearSettle();
     const element = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
     openDisclosuresFor(element, element?.closest(".code-container,details") ?? element, range);
     scrollTargetIntoView(element, host);
@@ -710,6 +1242,18 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (nextReplacing) {
       const activeSourceRanges = regexError ? [] : getSourceRanges();
       setSourceRanges(activeSourceRanges);
+      if (!sourceSession && nextIndex < 0 && hiddenSourceAnchorRef.current && activeSourceRanges.length) {
+        const mappedHidden = findMatchingSourceRangeIndex(activeSourceRanges, hiddenSourceAnchorRef.current);
+        if (mappedHidden >= 0) {
+          nextIndex = mappedHidden;
+          setHiddenSourceHit(false);
+          hiddenSourceAnchorRef.current = null;
+          setReplacing(true);
+          updateIndex(nextIndex);
+          revealAndHighlightSource(nextIndex, activeSourceRanges, content, true);
+          return;
+        }
+      }
       if (!sourceSession && nextIndex >= 0) {
         const host = findReadingHost();
         const liveWindowed = windowed && windowed.every(w => w.element.isConnected && Boolean(host?.contains(w.element)))
@@ -729,7 +1273,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             if (bounds) {
               for (let i = 0; i < activeSourceRanges.length; i++) {
                 const sr = activeSourceRanges[i];
-                if (sr.from >= bounds.start && sr.to <= bounds.end && isDirectVisibleMatch(active.element, content, sr)) {
+                if (sr.from >= bounds.start && sr.to <= bounds.end && isDirectVisibleMatch(active.element, content, sr, query, filterOptions)) {
                   if (seen === active.ordinal) { mapped = i; break; }
                   seen++;
                 }
@@ -752,7 +1296,11 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       if (nextIndex >= 0 && !regexError) {
         const sr = activeSourceRanges[nextIndex];
         const block = sr && host ? findContainingBlock(host, sr, content) : null;
-        if (block) revealMountedBlock(block);
+        if (block) {
+          revealMountedBlock(block);
+          const owner = deepestSourceOwner(block, sr!, content) ?? block;
+          revealStepCardsForRange(owner, content, sr!);
+        }
       }
       const liveWindowed = host && !regexError ? windowedMatches(host, query, filterOptions) : null;
       const liveMatches = host && !liveWindowed && !regexError ? readingMatches(host, query, filterOptions) : [];
@@ -761,6 +1309,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       if (nextIndex >= 0) nextIndex = regexError ? -1 : mapSourceIndexToRendered(nextIndex, activeSourceRanges, liveWindowed, liveMatches);
     }
     setReplacing(nextReplacing);
+    if (!nextReplacing && nextIndex < 0) setHiddenSourceHit(false);
     if (nextIndex !== indexRef.current) updateIndex(nextIndex);
   };
   const toggleReplacingRef = useRef(toggleReplacing); toggleReplacingRef.current = toggleReplacing;
@@ -770,7 +1319,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     // observing heading jump must not pull the viewport back after this move.
     cancelSettlingHeading();
     pendingAutoSelect.current = false;
+    pendingSeedRange.current = null;
+    pendingSeedMatchText.current = undefined;
     if (regexError) return;
+    if (hiddenSourceHit) setHiddenSourceHit(false);
+    const hiddenAnchor = hiddenSourceAnchorRef.current;
+    hiddenSourceAnchorRef.current = null;
     const current = indexRef.current;
     if (sourceSearch) {
       const activeSourceRanges = sourceRanges.length || !query ? sourceRanges : getSourceRanges();
@@ -782,13 +1336,38 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
     const host = findReadingHost();
     const activeWindowed = windowed ?? (host ? windowedMatches(host, query, filterOptions) : null);
+    const activeMatches = activeWindowed ? [] : (matches.length || !host ? matches : readingMatches(host, query, filterOptions));
+    const renderedTotal = activeWindowed ? activeWindowed.length : activeMatches.length;
+    if (current < 0 && hiddenAnchor && renderedTotal > 0) {
+      const activeSourceRanges = sourceRanges.length ? sourceRanges : getSourceRanges();
+      if (activeSourceRanges.length) {
+        let anchoredRendered = -1;
+        if (direction > 0) {
+          for (let i = 0; i < activeSourceRanges.length; i++) {
+            if (activeSourceRanges[i].from < hiddenAnchor.to) continue;
+            const mapped = mapSourceIndexToRendered(i, activeSourceRanges, activeWindowed, activeMatches);
+            if (mapped >= 0) { anchoredRendered = mapped; break; }
+          }
+          if (anchoredRendered < 0) anchoredRendered = 0;
+        } else {
+          for (let i = activeSourceRanges.length - 1; i >= 0; i--) {
+            if (activeSourceRanges[i].to > hiddenAnchor.from) continue;
+            const mapped = mapSourceIndexToRendered(i, activeSourceRanges, activeWindowed, activeMatches);
+            if (mapped >= 0) { anchoredRendered = mapped; break; }
+          }
+          if (anchoredRendered < 0) anchoredRendered = renderedTotal - 1;
+        }
+        if (activeWindowed) selectWindowedMatch(anchoredRendered, activeWindowed, host);
+        else selectDomMatch(anchoredRendered, activeMatches, host);
+        return;
+      }
+    }
     if (activeWindowed) {
       const next = nextSearchIndex(current, direction, activeWindowed.length);
       if (next < 0) return;
       selectWindowedMatch(next, activeWindowed, host);
       return;
     }
-    const activeMatches = matches.length || !host ? matches : readingMatches(host, query, filterOptions);
     const next = nextSearchIndex(current, direction, activeMatches.length);
     if (next < 0) return;
     selectDomMatch(next, activeMatches, host);
@@ -855,7 +1434,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     window.addEventListener("supermd-find-step", step);
     return () => {
       cancelAnimationFrame(focusFrame);
-      clearSettleFrames();
+      clearSettle();
       setReaderOverlay("search", false);
       document.removeEventListener("keydown", key, true);
       window.removeEventListener("supermd-find-focus", focus);
@@ -864,7 +1443,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   }, []);
 
   useEffect(() => {
-    clearSettleFrames();
+    clearSettle();
     const prev = prevState.current;
     const criteriaChanged = prev.query !== query || prev.caseSensitive !== caseSensitive || prev.wholeWord !== wholeWord || prev.regexp !== regexp;
     const contentChanged = prev.content !== content;
@@ -881,15 +1460,23 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       pendingReplaceIndex.current = null;
     } else if (criteriaChanged || regexError) {
       pendingAutoSelect.current = false;
+      pendingSeedRange.current = null;
+      pendingSeedMatchText.current = undefined;
       pendingReplaceIndex.current = null;
+      setHiddenSourceHit(false);
+      hiddenSourceAnchorRef.current = null;
       targetIndex = -1;
       if (indexRef.current !== -1) updateIndex(-1);
     } else if (pendingReplaceIndex.current !== null) {
+      setHiddenSourceHit(false);
+      hiddenSourceAnchorRef.current = null;
       targetIndex = pendingReplaceIndex.current;
       pendingReplaceIndex.current = null;
       shouldScrollReplaced = targetIndex >= 0;
       updateIndex(targetIndex);
     } else if (contentChanged) {
+      setHiddenSourceHit(false);
+      hiddenSourceAnchorRef.current = null;
       targetIndex = -1;
       if (indexRef.current !== -1) updateIndex(-1);
     } else if (sourceSearch && indexRef.current >= nextSourceRanges.length) {
@@ -898,7 +1485,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
     const frame = requestAnimationFrame(() => {
       const runAutoSelect = pendingAutoSelect.current;
+      const seedRange = runAutoSelect ? pendingSeedRange.current : null;
+      const seedMatchText = runAutoSelect ? pendingSeedMatchText.current : undefined;
       pendingAutoSelect.current = false;
+      pendingSeedRange.current = null;
+      pendingSeedMatchText.current = undefined;
+      if (sourceSession) editorFindQuery(sourceSession, regexError ? "" : query, caseSensitive, { wholeWord, regexp });
       if (!runAutoSelect && shouldScrollReplaced && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
         revealAndHighlightSource(targetIndex, nextSourceRanges, content, true);
       }
@@ -915,6 +1507,23 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
         setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
         if (runAutoSelect) {
+          setHiddenSourceHit(false);
+          hiddenSourceAnchorRef.current = null;
+          if (seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText)) {
+            const seedSourceIndex = findMatchingSourceRangeIndex(activeRanges, seedRange);
+            if (seedSourceIndex >= 0) {
+              updateIndex(seedSourceIndex);
+              revealAndHighlightSource(seedSourceIndex, activeRanges, content, true);
+              return;
+            }
+            updateIndex(-1);
+            if (sourceSession) editorFindRange(sourceSession, seedRange.from, seedRange.to);
+            const sliceText = content.slice(seedRange.from, seedRange.to);
+            const sliceRanges = sourceMatches(content, sliceText, true);
+            const sliceIdx = findMatchingSourceRangeIndex(sliceRanges, seedRange);
+            if (sliceIdx >= 0) revealAndHighlightSource(sliceIdx, sliceRanges, content, true, sliceText, true);
+            return;
+          }
           if (activeRanges.length) {
             updateIndex(0);
             revealAndHighlightSource(0, activeRanges, content, true);
@@ -936,6 +1545,155 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         return;
       }
       const nextWindowed = host ? windowedMatches(host, query, filterOptions) : null;
+      if (runAutoSelect && seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText) && host) {
+        const seedSourceRanges = getSourceRanges();
+        const seedSourceIndex = findMatchingSourceRangeIndex(seedSourceRanges, seedRange);
+        const targetRange = seedSourceIndex >= 0 ? seedSourceRanges[seedSourceIndex] : seedRange;
+        const initialResult = nextWindowed === null ? readingMatches(host, query, filterOptions) : [];
+        const initialBlock = findContainingBlock(host, targetRange, content);
+        if (!initialBlock) {
+          setWindowed(nextWindowed);
+          setMatches(initialResult);
+          const fallback = resolveSourceBlock(host, targetRange, content) ?? host.querySelector("[data-frontmatter-properties],.document-properties");
+          if (fallback) { revealMountedBlock(fallback); scrollTargetIntoView(fallback, host); }
+          updateIndex(-1);
+          setHiddenSourceHit(true);
+          hiddenSourceAnchorRef.current = targetRange;
+          if (registry && HighlightClass) {
+            const visible = nextWindowed !== null ? (nextWindowed.length ? readingMatches(host, query, filterOptions) : []) : initialResult;
+            registry.set("smd-search", new HighlightClass(...visible));
+            registry.delete("smd-search-current");
+          }
+          return;
+        }
+        const wasUnmounted = !!initialBlock.closest('[data-windowed-mounted="false"]');
+        if (wasUnmounted) revealMountedBlock(initialBlock);
+        const block = findContainingBlock(host, targetRange, content) ?? initialBlock;
+        const owner = deepestSourceOwner(block, targetRange, content) ?? block;
+        const openedDisclosures = openDisclosuresFor(owner, block, null, targetRange);
+        const stepReveal = revealStepCardsForRange(owner, content, targetRange);
+        const domChanged = wasUnmounted || openedDisclosures || stepReveal.changed;
+        const activeWindowed = domChanged ? windowedMatches(host, query, filterOptions) : nextWindowed;
+        const activeResult = activeWindowed !== null ? [] : (domChanged ? readingMatches(host, query, filterOptions) : initialResult);
+        setWindowed(activeWindowed);
+        setMatches(activeResult);
+        let domRange: Range | null = null;
+        if (seedSourceIndex >= 0) {
+          domRange = mapSourceRangeToDomRange(block, content, seedSourceRanges, seedSourceIndex, query, filterOptions);
+        } else {
+          const sliceText = content.slice(targetRange.from, targetRange.to);
+          const sliceRanges = sliceText ? sourceMatches(content, sliceText, true) : [];
+          const sliceIdx = sliceRanges.length ? findMatchingSourceRangeIndex(sliceRanges, targetRange) : -1;
+          domRange = sliceIdx >= 0 ? mapSourceRangeToDomRange(block, content, sliceRanges, sliceIdx, sliceText, true) : null;
+        }
+        if (domRange) {
+          setHiddenSourceHit(false);
+          hiddenSourceAnchorRef.current = null;
+          if (seedSourceIndex >= 0) {
+            if (activeWindowed) {
+              let wIdx = -1;
+              for (let i = 0; i < activeWindowed.length; i++) {
+                const w = activeWindowed[i];
+                if (w.element === block || w.element.contains(block) || block.contains(w.element)) {
+                  const wRange = readingMatches(w.element, query, filterOptions)[w.ordinal];
+                  if (wRange && sameDomRange(wRange, domRange)) { wIdx = i; break; }
+                }
+              }
+              if (wIdx >= 0) {
+                selectWindowedMatch(wIdx, activeWindowed, host);
+                return;
+              }
+            }
+            const mIdx = activeResult.findIndex(m => sameDomRange(m, domRange));
+            if (mIdx >= 0) {
+              if (registry && HighlightClass) registry.set("smd-search", new HighlightClass(...activeResult));
+              selectDomMatch(mIdx, activeResult, host);
+              return;
+            }
+          }
+          if (!activeWindowed) {
+            const augmented = [...activeResult];
+            let insertAt = augmented.findIndex(m => sameDomRange(m, domRange));
+            if (insertAt < 0) {
+              insertAt = augmented.findIndex(m => m.compareBoundaryPoints(Range.START_TO_START, domRange) > 0);
+              if (insertAt < 0) insertAt = augmented.length;
+              augmented.splice(insertAt, 0, domRange);
+              setMatches(augmented);
+            }
+            if (registry && HighlightClass) registry.set("smd-search", new HighlightClass(...augmented));
+            selectDomMatch(insertAt, augmented, host);
+            return;
+          }
+          const scrollEl = domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement;
+          openDisclosuresFor(scrollEl, block, domRange, targetRange);
+          const initialScroller = scrollTargetIntoView(scrollEl ?? owner, host);
+          updateIndex(-1);
+          if (registry && HighlightClass) {
+            const visible = activeWindowed.length ? readingMatches(host, query, filterOptions) : [];
+            registry.set("smd-search", new HighlightClass(...visible, domRange));
+            registry.set("smd-search-current", new HighlightClass(domRange));
+          }
+          if (wasUnmounted || owner.matches(".step-cards,.step-cards-placeholder")) {
+            const sliceText = content.slice(targetRange.from, targetRange.to);
+            const sliceRanges = sliceText ? sourceMatches(content, sliceText, true) : [];
+            const sliceIdx = sliceRanges.length ? findMatchingSourceRangeIndex(sliceRanges, targetRange) : -1;
+            scheduleRevealSettle(-1, host, initialScroller, stepReveal.card ?? owner, () => {
+              const liveHost = findReadingHost();
+              if (!liveHost || !liveHost.isConnected) return null;
+              const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
+              if (!initialLiveBlock || !initialLiveBlock.isConnected) return null;
+              revealMountedBlock(initialLiveBlock);
+              const liveBlock = findContainingBlock(liveHost, targetRange, content) ?? initialLiveBlock;
+              const liveOwner = deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock;
+              openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
+              revealStepCardsForRange(liveOwner, content, targetRange);
+              const liveDomRange = sliceIdx >= 0 ? mapSourceRangeToDomRange(liveBlock, content, sliceRanges, sliceIdx, sliceText, true) : null;
+              const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveOwner;
+              openDisclosuresFor(liveScrollEl, liveBlock, liveDomRange, targetRange);
+              const nextScroller = scrollTargetIntoView(liveScrollEl ?? liveOwner, liveHost);
+              if (registry && HighlightClass && liveDomRange) {
+                const visible = activeWindowed.length ? readingMatches(liveHost, query, filterOptions) : [];
+                registry.set("smd-search", new HighlightClass(...visible, liveDomRange));
+                registry.set("smd-search-current", new HighlightClass(liveDomRange));
+              }
+              return nextScroller;
+            });
+          }
+          return;
+        } else {
+          openDisclosuresFor(owner, block, null, targetRange);
+          const scrollTarget = owner.matches(".step-cards,.step-cards-placeholder") ? stepCardScrollTarget(owner) : owner;
+          const initialScroller = scrollTargetIntoView(scrollTarget ?? block, host);
+          updateIndex(-1);
+          setHiddenSourceHit(true);
+          hiddenSourceAnchorRef.current = targetRange;
+          if (registry && HighlightClass) {
+            const visible = activeWindowed !== null ? (activeWindowed.length ? readingMatches(host, query, filterOptions) : []) : activeResult;
+            registry.set("smd-search", new HighlightClass(...visible));
+            registry.delete("smd-search-current");
+          }
+          if (wasUnmounted || owner.matches(".mermaid,.step-cards,.step-cards-placeholder,.svg-figure")) {
+            scheduleRevealSettle(-1, host, initialScroller, stepReveal.card ?? owner, () => {
+              const liveHost = findReadingHost();
+              if (!liveHost || !liveHost.isConnected) return null;
+              const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
+              if (!initialLiveBlock || !initialLiveBlock.isConnected) return null;
+              revealMountedBlock(initialLiveBlock);
+              const liveBlock = findContainingBlock(liveHost, targetRange, content) ?? initialLiveBlock;
+              const liveOwner = deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock;
+              openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
+              revealStepCardsForRange(liveOwner, content, targetRange);
+              const liveTarget = liveOwner.matches(".step-cards,.step-cards-placeholder") ? stepCardScrollTarget(liveOwner) : liveOwner;
+              return scrollTargetIntoView(liveTarget ?? liveBlock, liveHost);
+            });
+          }
+          return;
+        }
+      }
+      if (runAutoSelect) {
+        setHiddenSourceHit(false);
+        hiddenSourceAnchorRef.current = null;
+      }
       if (nextWindowed !== null) {
         setWindowed(nextWindowed);
         setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
@@ -972,7 +1730,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     });
     return () => {
       cancelAnimationFrame(frame);
-      clearSettleFrames();
+      clearSettle();
       registry?.delete("smd-search");
       registry?.delete("smd-search-current");
       if (sourceSession) editorFindQuery(sourceSession, "", false);
@@ -1029,13 +1787,35 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   }, [windowed, sourceSearch, sourceRanges, content, query, caseSensitive, wholeWord, regexp, regexError]);
 
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
-    <input ref={input} aria-label="Find in note" aria-invalid={!!regexError || undefined} role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => { pendingAutoSelect.current = false; setQuery(event.target.value); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
-    <output aria-live="polite" className={regexError ? "search-error" : undefined} title={regexError ? regexError : count >= 5000 ? "Showing the first 5,000 matches. Narrow your search to find later results." : undefined}>{regexError ? regexError : count ? `${index < 0 ? 0 : index + 1} / ${count}${count >= 5000 ? "+" : ""}` : query ? "No matches" : ""}</output>
+    <input ref={input} aria-label="Find in note" aria-invalid={!!regexError || undefined} role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => { pendingAutoSelect.current = false; pendingSeedRange.current = null; pendingSeedMatchText.current = undefined; setQuery(event.target.value); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
+    <output
+      aria-live="polite"
+      className={regexError ? "search-error" : undefined}
+      title={
+        regexError
+          ? regexError
+          : !sourceSearch && hiddenSourceHit && index < 0
+            ? "Selected match is in hidden Markdown or diagram syntax."
+            : count >= 5000
+              ? "Showing the first 5,000 matches. Narrow your search to find later results."
+              : undefined
+      }
+    >
+      {regexError
+        ? regexError
+        : !sourceSearch && hiddenSourceHit && index < 0
+          ? (count ? `In source · 0 / ${count}${count >= 5000 ? "+" : ""}` : "In Markdown source")
+          : count
+            ? `${index < 0 ? 0 : index + 1} / ${count}${count >= 5000 ? "+" : ""}`
+            : query
+              ? "No matches"
+              : ""}
+    </output>
     <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={() => move(-1)} title="Previous match (Shift+Enter / Shift+F3)"><ArrowUpIcon size={20} weight="bold" /></button>
     <button className="search-icon" aria-label="Next match" disabled={!count} onClick={() => move(1)} title="Next match (Enter / F3)"><ArrowDownIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={caseSensitive} onClick={() => { pendingAutoSelect.current = false; setCaseSensitive(!caseSensitive); }} title="Match case" aria-label="Match case"><TextAaIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={wholeWord} onClick={() => { pendingAutoSelect.current = false; setWholeWord(!wholeWord); }} title="Match whole word" aria-label="Match whole word"><TextboxIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={regexp} onClick={() => { pendingAutoSelect.current = false; setRegexp(!regexp); }} title="Regular expression" aria-label="Regular expression"><AsteriskIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={caseSensitive} onClick={() => { pendingAutoSelect.current = false; pendingSeedRange.current = null; pendingSeedMatchText.current = undefined; setCaseSensitive(!caseSensitive); }} title="Match case" aria-label="Match case"><TextAaIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={wholeWord} onClick={() => { pendingAutoSelect.current = false; pendingSeedRange.current = null; pendingSeedMatchText.current = undefined; setWholeWord(!wholeWord); }} title="Match whole word" aria-label="Match whole word"><TextboxIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={regexp} onClick={() => { pendingAutoSelect.current = false; pendingSeedRange.current = null; pendingSeedMatchText.current = undefined; setRegexp(!regexp); }} title="Regular expression" aria-label="Regular expression"><AsteriskIcon size={20} weight="bold" /></button>
     {canReplace && <button className="search-icon" aria-pressed={activeReplacing} onClick={() => toggleReplacing()} title="Replace in source (Ctrl+H)" aria-label="Replace in source"><ArrowsClockwiseIcon size={20} weight="bold" /></button>}
     <button className="search-icon" onClick={close} title="Close search (Esc)" aria-label="Close search"><XIcon size={20} weight="bold" /></button>
     {activeReplacing && onChange && <div className="search-replace"><input aria-label="Replacement text" placeholder="Replace with" value={replacement} onChange={e => setReplacement(e.target.value)} /><button disabled={!query || !!regexError || !count || index < 0} onClick={handleSingleReplace}>Replace</button><button disabled={!query || !!regexError || !count} onClick={handleReplaceAll}>Replace all</button><small>{regexError ? `${regexError}.` : regexp ? "Replaces regex matches in Markdown source ($1, $&, $$ supported)." : "Replaces literal text in Markdown source."}</small></div>}

@@ -1,5 +1,5 @@
 import {useEffect,useId,useLayoutEffect,useMemo,useRef,useState, type CSSProperties, type KeyboardEvent, type ReactNode} from "react";
-import {createPortal} from "react-dom";
+import {createPortal,flushSync} from "react-dom";
 import {setReaderOverlay} from "../readerOverlays";
 import {zoomTranslation,type Point} from "../focalZoom";
 import {wheelIntent} from "../wheelIntent";
@@ -7,6 +7,7 @@ import InlineDiagram,{parseDiagram,type DiagramSpec} from "./InlineDiagram";
 import {parseBinaryTree} from "./BinaryTree";
 import {parseChartSpec} from "../chartModel";
 import {remember,stepIndices} from "../renderedOutputs";
+import {STEP_REVEAL_EVENT,type StepRevealDetail} from "../stepDeckSource";
 
 export interface StepCard { label:string; image?:string; diagram?:DiagramSpec; chart?:string; description?:string; markdown?:string; alt?:string }
 export interface StepDeck { title:string; steps:StepCard[] }
@@ -60,6 +61,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   const [index,setIndex]=useState(()=>{const saved=stepIndices.get(source);return count&&saved!==undefined?Math.max(0,Math.min(saved,count-1)):0;});
   const hovered=useRef(false);
   const region=useRef<HTMLElement>(null);
+  const placeholderRef=useRef<HTMLDivElement>(null);
   const figureRef=useRef<HTMLDivElement>(null);
   const [figureHeight,setFigureHeight]=useState<number|null>(null);
   const [fitWidth,setFitWidth]=useState<number|null>(null);
@@ -148,6 +150,27 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     setIndex(target);
   };
   navigation.current=go;
+  useLayoutEffect(()=>{
+    if(!count)return;
+    const node=region.current,placeholder=placeholderRef.current;
+    const onReveal=(event:Event)=>{
+      const detail=(event as CustomEvent<StepRevealDetail>).detail;
+      if(!detail||typeof detail.stepIndex!=="number"||!Number.isFinite(detail.stepIndex))return;
+      const target=Math.max(0,Math.min(Math.trunc(detail.stepIndex),count-1));
+      if(target!==currentRef.current)flushSync(()=>navigation.current(target));
+      else if(target>0)remember(stepIndices,source,target);
+      if(detail.openLegacyNote){
+        const legacy=region.current?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note");
+        if(legacy&&!legacy.open)legacy.open=true;
+      }
+    };
+    node?.addEventListener(STEP_REVEAL_EVENT,onReveal);
+    placeholder?.addEventListener(STEP_REVEAL_EVENT,onReveal);
+    return()=>{
+      node?.removeEventListener(STEP_REVEAL_EVENT,onReveal);
+      placeholder?.removeEventListener(STEP_REVEAL_EVENT,onReveal);
+    };
+  },[count,expanded,source]);
   const enlarge=()=>{if(!expandedRef.current){liveBlockRef.current=region.current?.closest<HTMLElement>('.live-block')??null;setPlaceholderHeight(region.current?.getBoundingClientRect().height??0);setExpanded(true);}};
   useEffect(()=>{
     const node=region.current;
@@ -206,7 +229,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     if(event.key==="ArrowRight"){event.preventDefault();event.stopPropagation();go(current+1);}
     else if(event.key==="ArrowLeft"){event.preventDefault();event.stopPropagation();go(current-1);}
   };
-  if(!deck)return <section className="step-cards step-cards-error" role="alert">Invalid step cards. Use a fenced <code>smd-steps</code> block with a title and 2–40 labeled steps.</section>;
+  if(!deck)return <section className="step-cards step-cards-error" role="alert" data-source-start={sourceStart} data-source-end={sourceEnd}>Invalid step cards. Use a fenced <code>smd-steps</code> block with a title and 2–40 labeled steps.</section>;
   const step=deck.steps[current];
   const hasVisual=Boolean(step.image||step.diagram||step.chart);
   const enlargeButton=!expanded?<button type="button" className="step-cards-enlarge" aria-label="Enlarge slide" onClick={enlarge}>⤢</button>:null;
@@ -254,5 +277,5 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   </section>;
   const liveBlock=expanded?liveBlockRef.current:(region.current?.closest<HTMLElement>('.live-block')??null);
   const editSource=()=>{skipRestoreFocus.current=true;setExpanded(false);if(liveBlock?.isConnected)liveBlock.dispatchEvent(new CustomEvent('supermd-edit-block',{bubbles:true}));};
-  return expanded?<><div className="step-cards-placeholder" data-output-pinned="true" style={{height:placeholderHeight}} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar">{zoomableVisual&&<><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button type="button" aria-label="Fit slide image" onClick={fit}>Fit</button></>}{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button type="button" className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
+  return expanded?<><div ref={placeholderRef} className="step-cards-placeholder" data-output-pinned="true" style={{height:placeholderHeight}} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar">{zoomableVisual&&<><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button type="button" aria-label="Fit slide image" onClick={fit}>Fit</button></>}{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button type="button" className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
 }
