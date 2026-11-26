@@ -655,6 +655,22 @@ try:
     fallback_rename.close()
     QTest.qWait(30)
 
+    # Remapping and disabling mode + folder shortcuts updates Main.qml, FolderSidebar, and TabStrip hints live.
+    assert studio.setShortcut("mode_live", "Ctrl+Alt+9") == ""
+    assert studio.setShortcut("mode_reader", "") == ""
+    assert studio.setShortcut("new_folder_note", "Ctrl+Alt+M") == ""
+    assert studio.setShortcut("settings", "") == ""
+    QTest.qWait(40)
+    mode_group = window.findChild(QObject, "documentModeGroup")
+    choices = mode_group.property("choices").toVariant()
+    choice_tips = {entry["key"]: entry["tooltip"] for entry in choices}
+    assert "9" in choice_tips["live"], choice_tips
+    assert choice_tips["reader"] == "Read mode", choice_tips
+    settings_btn = window.findChild(QObject, "settingsButton")
+    assert settings_btn.findChild(QObject, "actionHint").property("text") == "Settings"
+    header_new_btn = window.findChild(QObject, "headerNewItemButton")
+    assert "M" in header_new_btn.findChild(QObject, "actionHint").property("text")
+
     window.close()
     del engine
     studio.stop()

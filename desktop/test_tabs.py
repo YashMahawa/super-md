@@ -257,3 +257,18 @@ ApplicationWindow {
         rename_dialog.close()
         QTest.qWait(20)
 
+        # Opening dropped external notes (#118 _open_dropped_notes) appends and reveals the activated dropped tab.
+        drop_dir = Path(tempfile.mkdtemp(prefix="supermd-tab-drop-reveal-"))
+        self.addCleanup(lambda: shutil.rmtree(drop_dir, ignore_errors=True))
+        dropped_a = drop_dir / "Dropped Appendix A.md"
+        dropped_b = drop_dir / "Dropped Appendix B Final Summary.md"
+        dropped_a.write_text("# Appendix A\n", encoding="utf-8")
+        dropped_b.write_text("# Appendix B\n", encoding="utf-8")
+        self.studio._open_dropped_notes([dropped_a, dropped_b])
+        wait_until(
+            lambda: self.studio.busy == 0
+            and self.studio._current()["name"] == "Dropped Appendix B Final Summary.md"
+        )
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after opening multi-note workspace drop")
+

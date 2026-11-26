@@ -193,15 +193,15 @@ ColumnLayout {
     NoteContextMenu {
         id: folderEntryMenu
         objectName: "folderEntryContextMenu"
-        implicitWidth: 260
+        implicitWidth: 310
         property string targetPath: ""
         property string targetName: ""
         property bool targetIsDirectory: false
 
         NoteMenuItem { objectName: "menuOpenNote"; text: "Open note"; icon.source: "../icons/File.svg"; actionVisible: !folderEntryMenu.targetIsDirectory; onTriggered: studio.openNote(folderEntryMenu.targetPath) }
-        NoteMenuItem { objectName: "menuNewMarkdown"; text: "New Markdown note (.md)"; icon.source: "../icons/Plus.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("md", folderEntryMenu.targetPath) }
+        NoteMenuItem { objectName: "menuNewMarkdown"; text: "New Markdown note (.md)"; shortcutText: root.shortcutLabels.new_folder_note || ""; icon.source: "../icons/Plus.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("md", folderEntryMenu.targetPath) }
         NoteMenuItem { objectName: "menuNewPortable"; text: "New portable note (.smd)"; icon.source: "../icons/File.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("smd", folderEntryMenu.targetPath) }
-        NoteMenuItem { objectName: "menuNewSubfolder"; text: "New subfolder"; icon.source: "../icons/FolderOpen.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("folder", folderEntryMenu.targetPath) }
+        NoteMenuItem { objectName: "menuNewSubfolder"; text: "New subfolder"; shortcutText: root.shortcutLabels.new_subfolder || ""; icon.source: "../icons/FolderOpen.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("folder", folderEntryMenu.targetPath) }
         MenuSeparator {}
         NoteMenuItem { objectName: "menuRenameEntry"; text: folderEntryMenu.targetIsDirectory ? "Rename folder" : "Rename note"; shortcutText: root.shortcutLabels.rename_entry || ""; icon.source: "../icons/Rename.svg"; onTriggered: root.openRenameFor(folderEntryMenu.targetPath, folderEntryMenu.targetName, folderEntryMenu.targetIsDirectory) }
     }

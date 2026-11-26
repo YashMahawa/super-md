@@ -352,6 +352,8 @@ ApplicationWindow {
         new_subfolder_btn = host_win.findChild(QObject, "headerNewSubfolderButton")
         new_md_item = host_win.findChild(QObject, "headerNewMarkdownItem")
         new_sub_item = host_win.findChild(QObject, "headerNewSubfolderItem")
+        menu_new_md = host_win.findChild(QObject, "menuNewMarkdown")
+        menu_new_sub = host_win.findChild(QObject, "menuNewSubfolder")
         rename_item = host_win.findChild(QObject, "menuRenameEntry")
         self.assertEqual(sidebar_search_btn.findChild(QObject, "actionHint").property("text"), "Search across notes")
         self.assertEqual(new_item_btn.findChild(QObject, "actionHint").property("text"), "New note in folder (Ctrl+Alt+M)")
@@ -359,6 +361,9 @@ ApplicationWindow {
         self.assertTrue(new_md_item.property("hasShortcutHint"))
         self.assertEqual(new_md_item.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Alt+M")
         self.assertFalse(new_sub_item.property("hasShortcutHint"))
+        self.assertTrue(menu_new_md.property("hasShortcutHint"))
+        self.assertEqual(menu_new_md.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Alt+M")
+        self.assertFalse(menu_new_sub.property("hasShortcutHint"))
         self.assertTrue(rename_item.property("hasShortcutHint"))
         self.assertEqual(rename_item.findChild(QObject, "menuShortcutHint").property("text"), "F2")
 
