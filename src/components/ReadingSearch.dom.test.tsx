@@ -129,11 +129,11 @@ describe("ReadingSearch DOM behavior", () => {
     host.remove();
   });
 
-  it("maps body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
+  it("maps displayed metadata and body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
-    let current = "---\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
+    let current = "---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
     const changes: string[] = [];
 
     await act(async () => {
@@ -152,22 +152,118 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => setInputValue(searchInput, "Alpha"));
     await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
 
-    // Body search ignores rendered YAML properties, counting only the 1 body match.
-    expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+    // Rendered search includes displayed title, author, and tags (3 matches) + 1 body match = 4, excluding description.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 4");
     const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    // Match 1 in DOM order is displayed title ("Alpha Study"), which is source match 4 / 5 in YAML key order!
     act(() => nextButton.click());
-    expect(host.querySelector("output")?.textContent).toBe("1 / 1");
-
-    // Toggling Replace in source maps that active body match to source match 2 / 2 (after frontmatter title).
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
     const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
     act(() => replaceToggle.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(host.querySelector("output")?.textContent).toBe("4 / 5");
+    // Toggle Replace back off -> returns to 1 / 4!
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
+
+    // Step to match 4 / 4 (Alpha body.) and toggle Replace in source -> maps to source match 5 / 5!
+    act(() => nextButton.click()); // 2 / 4 (author: Dr. Alpha)
+    act(() => nextButton.click()); // 3 / 4 (tag: alpha-tag)
+    act(() => nextButton.click()); // 4 / 4 (Alpha body.)
+    expect(host.querySelector("output")?.textContent).toBe("4 / 4");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("5 / 5");
 
     const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
     const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
     act(() => setInputValue(replaceInput, "Beta"));
     act(() => buttons[0].click());
-    expect(changes.at(-1)).toBe("---\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+    expect(changes.at(-1)).toBe("---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  it("maps quoted, folded, flow, and duplicate frontmatter values across Replace in source while redacting hidden fields", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    let current = [
+      "---",
+      "subtitle: Hidden Orbit Subtitle",
+      "tags: ['orbit-one', \"orbit-two\", orbit-one]",
+      "author:",
+      "  - { given: \"Ada\", family: \"Orbit\" }",
+      "  - \"Ada Orbit\"",
+      "  - 'Grace Orbit'",
+      "description: >",
+      "  Hidden Orbit description",
+      "title: >-",
+      "  Folded Orbit",
+      "  Atlas",
+      "aliases: [OrbitAlias]",
+      "---",
+      "",
+      "Body Orbit conclusion.",
+    ].join("\n");
+    const changes: string[] = [];
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Orbit"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Rendered matches:
+    // 1: title ("Folded Orbit Atlas")
+    // 2: author #1 ("Ada Orbit", deduplicated)
+    // 3: author #2 ("Grace Orbit")
+    // 4: tag #1 ('orbit-one', deduplicated)
+    // 5: tag #2 ("orbit-two")
+    // 6: body ("Body Orbit conclusion.")
+    // Excluded from rendered Find: subtitle, duplicate tag 'orbit-one', duplicate author "Ada Orbit", description, aliases.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 6");
+
+    const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+
+    // Step to match 3 / 6 ("Grace Orbit" — second author in the single <dd data-frontmatter-field="author">)
+    act(() => nextButton.click()); // 1 / 6: folded title
+    act(() => nextButton.click()); // 2 / 6: flow author Ada Orbit
+    act(() => nextButton.click()); // 3 / 6: quoted author Grace Orbit
+    expect(host.querySelector("output")?.textContent).toBe("3 / 6");
+
+    // Source matches for "Orbit" (11 total):
+    // 0: subtitle, 1: 'orbit-one', 2: "orbit-two", 3: duplicate orbit-one,
+    // 4: { family: "Orbit" }, 5: duplicate "Ada Orbit", 6: 'Grace Orbit',
+    // 7: description, 8: folded title, 9: OrbitAlias, 10: Body Orbit
+    // Match 3 / 6 ('Grace Orbit') maps to source index 6 -> "7 / 11"!
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("7 / 11");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 6");
+
+    // Step to match 5 / 6 ("orbit-two" tag after deduplicated 'orbit-one') -> source index 2 -> "3 / 11"!
+    act(() => nextButton.click()); // 4 / 6: 'orbit-one'
+    act(() => nextButton.click()); // 5 / 6: "orbit-two"
+    expect(host.querySelector("output")?.textContent).toBe("5 / 6");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 11");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
+    act(() => setInputValue(replaceInput, "phase"));
+    act(() => buttons[0].click());
+    expect(changes.at(-1)).toContain('tags: [\'orbit-one\', "phase-two", orbit-one]');
 
     act(() => root.unmount());
     host.remove();
@@ -398,7 +494,7 @@ describe("ReadingSearch DOM behavior", () => {
 
     let markdown = [
       "---",
-      "title: HiddenFrontmatterToken and SharedNeedle",
+      "description: HiddenFrontmatterToken and SharedNeedle",
       "---",
       "",
       "First visible SharedNeedle paragraph.",
@@ -409,11 +505,13 @@ describe("ReadingSearch DOM behavior", () => {
     ].join("\n");
 
     const sharedRanges = sourceMatches(markdown, "SharedNeedle", true);
-    // 0: YAML frontmatter (hidden)
+    // 0: YAML hidden frontmatter description (hidden)
     // 1: First visible paragraph (rendered 1 / 2)
     // 2: Link URL https://example.com/SharedNeedle (hidden)
     // 3: Last visible paragraph (rendered 2 / 2)
     expect(sharedRanges).toHaveLength(4);
+    const hiddenFmOnlyRanges = sourceMatches(markdown, "HiddenFrontmatterToken", true);
+    expect(hiddenFmOnlyRanges).toHaveLength(1);
     const urlOnlyRanges = sourceMatches(markdown, "OnlyInHiddenUrl", true);
     expect(urlOnlyRanges).toHaveLength(1);
 
@@ -450,7 +548,7 @@ describe("ReadingSearch DOM behavior", () => {
       act(() => nextBtn.click());
       expect(host.querySelector("output")?.textContent).toBe("2 / 2");
 
-      // Hidden-only URL match shows "In Markdown source" rather than misleading "No matches".
+      // Hidden-only URL match and hidden frontmatter description match show "In Markdown source" rather than misleading "No matches".
       await act(async () => {
         root.render(
           <div className="android-document">
@@ -473,6 +571,116 @@ describe("ReadingSearch DOM behavior", () => {
       });
       await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
       expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              seed={{
+                query: "HiddenFrontmatterToken",
+                caseSensitive: true,
+                sourceStart: hiddenFmOnlyRanges[0].from,
+                sourceEnd: hiddenFmOnlyRanges[0].to,
+                nonce: 115,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+
+      // Displayed frontmatter fields (#119: title, author, tags) select their rendered DOM match directly,
+      // while hidden frontmatter fields (description) surface "In source · 0 / N" and step into visible matches!
+      const mixedFrontmatter = [
+        "---",
+        "tags: [SharedTag]",
+        "description: Hidden SharedTag note",
+        "title: SharedTag Große Straße",
+        "---",
+        "",
+        "Body SharedTag conclusion.",
+      ].join("\n");
+      const tagHits = sourceMatches(mixedFrontmatter, "SharedTag", true);
+      // Source order: 0 = tags (rendered 2/3), 1 = description (hidden), 2 = title (rendered 1/3), 3 = body (rendered 3/3)
+      expect(tagHits).toHaveLength(4);
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={mixedFrontmatter}
+              close={() => {}}
+              seed={{
+                query: "SharedTag",
+                caseSensitive: true,
+                sourceStart: tagHits[0].from,
+                sourceEnd: tagHits[0].to,
+                matchText: "SharedTag",
+                nonce: 116,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={mixedFrontmatter} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={mixedFrontmatter}
+              close={() => {}}
+              seed={{
+                query: "SharedTag",
+                caseSensitive: true,
+                sourceStart: tagHits[1].from,
+                sourceEnd: tagHits[1].to,
+                matchText: "SharedTag",
+                nonce: 117,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={mixedFrontmatter} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 3");
+
+      const titleStrasseFrom = mixedFrontmatter.indexOf("Straße");
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={mixedFrontmatter}
+              close={() => {}}
+              seed={{
+                query: "strasse",
+                caseSensitive: false,
+                sourceStart: titleStrasseFrom,
+                sourceEnd: titleStrasseFrom + "Straße".length,
+                matchText: "Straße",
+                nonce: 118,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={mixedFrontmatter} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
 
       // Live mode (onChange provided): toggling Replace in source from a hidden URL hit targets that exact hidden source occurrence (3 / 4).
       await act(async () => {
@@ -716,7 +924,7 @@ describe("ReadingSearch DOM behavior", () => {
     try {
       let markdown = [
         "---",
-        "title: a+b_header and SharedNeedle",
+        "description: a+b_header and SharedNeedle",
         "---",
         "",
         "First a+b_one and SharedNeedle intro.",
