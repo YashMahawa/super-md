@@ -12,6 +12,13 @@ ScrollView {
     contentHeight: 48
     ScrollBar.vertical.policy: ScrollBar.AlwaysOff
     ScrollBar.horizontal: ExpressiveScrollBar { implicitHeight: 8; padding: 1 }
+    function noteStem(name) {
+        const raw = name || ""
+        const known = raw.replace(/\.(markdown|smd|fmd|md|txt)$/i, "")
+        if (known !== raw && known.length > 0) return known
+        const custom = raw.replace(/\.[A-Za-z][A-Za-z0-9]{0,15}$/, "")
+        return custom.length > 0 ? custom : raw
+    }
     function openRename(id, name) {
         renameDialog.noteId = id
         renameField.text = name
@@ -47,7 +54,12 @@ ScrollView {
             }
             onAccepted: { if (text.trim().length) renameDialog.accept() }
         }
-        onOpened: { renameField.forceActiveFocus(); renameField.selectAll() }
+        onOpened: {
+            renameField.forceActiveFocus()
+            const stem = strip.noteStem(renameField.text)
+            if (stem.length > 0 && stem.length < renameField.text.length) renameField.select(0, stem.length)
+            else renameField.selectAll()
+        }
         onAccepted: studio.renameNote(noteId, renameField.text)
     }
     function receive(drop, index) {

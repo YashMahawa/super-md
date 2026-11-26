@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, useState } from "react";
+import { act, StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -1614,5 +1614,105 @@ it("keeps WritingSuggestions replacements undoable and isolated both inside the 
       value: originalWorker,
     });
     vi.useRealTimers();
+  }
+});
+
+it("keeps the active textarea mounted, focused, and undo/redo reconciled inside React StrictMode across Edit block and double-click", async () => {
+  installNativeTextareaExecCommandMock();
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const historyRef: { current: NoteHistory } = { current: { undo: [], redo: [], last: 0 } };
+  const triggerRef: { current: (direction: "undo" | "redo") => void } = { current: () => {} };
+  let currentDoc = "# First heading\n\nSecond paragraph";
+  const removedTextareas: HTMLTextAreaElement[] = [];
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of record.removedNodes) {
+        if (node instanceof HTMLTextAreaElement) removedTextareas.push(node);
+      }
+    }
+  });
+  observer.observe(host, { childList: true, subtree: true });
+
+  await act(async () => {
+    root.render(
+      <StrictMode>
+        <div className="reading-scroll">
+          <HistoryBackedLiveEditor
+            initial={currentDoc}
+            historyRef={historyRef}
+            triggerRef={triggerRef}
+            onDocChange={(next) => {
+              currentDoc = next;
+            }}
+          />
+        </div>
+      </StrictMode>,
+    );
+  });
+
+  // 1. Open first block via revealed "Edit block" button inside StrictMode.
+  const firstBlock = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
+  act(() => {
+    firstBlock.focus();
+  });
+  const editButton = firstBlock.querySelector<HTMLButtonElement>('button[aria-label="Edit block"]')!;
+  expect(editButton).not.toBeNull();
+  act(() => {
+    editButton.click();
+  });
+  const firstTextarea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]');
+  expect(firstTextarea).not.toBeNull();
+  expect(document.activeElement).toBe(firstTextarea);
+  expect(removedTextareas).toHaveLength(0);
+
+  act(() => {
+    firstTextarea!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  // 2. Open second block via double-click with Typewriter scroll enabled inside StrictMode, edit, undo, exit, and redo.
+  act(() => {
+    setTypewriterScroll(true);
+  });
+  try {
+    removedTextareas.length = 0;
+    const secondBlock = host.querySelectorAll<HTMLElement>(".live-block")[1]!;
+    act(() => {
+      secondBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+    const secondTextarea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+    expect(secondTextarea).not.toBeNull();
+    expect(document.activeElement).toBe(secondTextarea);
+    expect(removedTextareas).toHaveLength(0);
+
+    act(() => {
+      secondTextarea.setSelectionRange(secondTextarea.value.length, secondTextarea.value.length);
+      document.execCommand("insertText", false, " updated");
+    });
+    expect(currentDoc).toBe("# First heading\n\nSecond paragraph updated");
+
+    act(() => {
+      secondTextarea.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(currentDoc).toBe("# First heading\n\nSecond paragraph");
+
+    act(() => {
+      secondTextarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(host.querySelector("textarea")).toBeNull();
+
+    act(() => {
+      triggerRef.current("redo");
+    });
+    expect(currentDoc).toBe("# First heading\n\nSecond paragraph updated");
+  } finally {
+    act(() => {
+      setTypewriterScroll(false);
+    });
+    observer.disconnect();
+    act(() => root.unmount());
+    host.remove();
   }
 });

@@ -108,63 +108,101 @@ function ActiveBlockEditor(){
 
 function ActiveBlockEditorInner({draft}:{draft:ActiveDraftContextValue}){
   const {session,editorRef,sourceStart,text,caret,spellCheck,grammarCheck,onSuggestionChange,onSuggestionAction}=draft;
-  const hostRef=useRef<HTMLDivElement|null>(null);
+  const areaRef=useRef<HTMLTextAreaElement|null>(null);
   const draftRef=useRef(draft);
   draftRef.current=draft;
+  const getOrCreateTextarea=useCallback(()=>{
+    let area=areaRef.current;
+    if(!area){
+      const initial=draftRef.current;
+      area=document.createElement('textarea');
+      area.setAttribute('data-source-start',String(initial.sourceStart));
+      area.spellcheck=false;
+      area.setAttribute('spellcheck','false');
+      area.setAttribute('aria-label','Edit Markdown block');
+      area.defaultValue=initial.text;
+      area.value=initial.text;
+      area.style.height=`${Math.max(120,initial.text.split('\n').length*27+32)}px`;
+      areaRef.current=area;
+    }
+    return area;
+  },[]);
+  const setHostRef=useCallback((host:HTMLDivElement|null)=>{
+    const ref=draftRef.current.editorRef as {current:HTMLTextAreaElement|null};
+    if(!host){
+      if(ref.current===areaRef.current)ref.current=null;
+      return;
+    }
+    const area=getOrCreateTextarea();
+    if(area.parentElement!==host)host.insertBefore(area,host.firstChild);
+    ref.current=area;
+  },[getOrCreateTextarea]);
   useLayoutEffect(()=>{
-    const host=hostRef.current;
-    if(!host)return;
-    const initial=draftRef.current;
-    const area=document.createElement('textarea');
-    area.setAttribute('data-source-start',String(initial.sourceStart));
-    area.spellcheck=false;
-    area.setAttribute('spellcheck','false');
-    area.setAttribute('aria-label','Edit Markdown block');
-    area.defaultValue=initial.text;
-    area.value=initial.text;
-    area.style.height=`${Math.max(120,initial.text.split('\n').length*27+32)}px`;
-    area.addEventListener('paste',event=>draftRef.current.onPaste(area,event));
-    area.addEventListener('beforeinput',event=>draftRef.current.onBeforeInput((event as InputEvent).inputType));
-    area.addEventListener('focus',()=>draftRef.current.onRememberSelection(area));
-    area.addEventListener('select',()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);});
-    area.addEventListener('pointerup',()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);});
-    area.addEventListener('click',()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);});
-    area.addEventListener('input',event=>{
+    const area=areaRef.current;
+    if(!area)return;
+    (draftRef.current.editorRef as {current:HTMLTextAreaElement|null}).current=area;
+    let disposed=false;
+    const onPaste=(event:ClipboardEvent)=>draftRef.current.onPaste(area,event);
+    const onBeforeInput=(event:Event)=>draftRef.current.onBeforeInput((event as InputEvent).inputType);
+    const onFocus=()=>draftRef.current.onRememberSelection(area);
+    const onSelect=()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);};
+    const onPointerUp=()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);};
+    const onClick=()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);};
+    const onInput=(event:Event)=>{
       const inputType=(event as InputEvent).inputType;
       const dir=inputType==='historyUndo'?'undo':inputType==='historyRedo'?'redo':undefined;
       draftRef.current.onSyncCaret(area);
       draftRef.current.onChange(area.value,area,dir?{historyDirection:dir}:undefined);
-    });
-    area.addEventListener('keyup',event=>{
+    };
+    const onKeyUp=(event:KeyboardEvent)=>{
       draftRef.current.onSyncCaret(area);
       draftRef.current.onRememberSelection(area);
       if(CARET_KEYS.has(event.key))draftRef.current.onCaretMove();
-    });
-    area.addEventListener('keydown',event=>draftRef.current.onKeyDown(area,event));
-    area.addEventListener('blur',event=>{
-      if(!area.isConnected)return;
+    };
+    const onKeyDown=(event:KeyboardEvent)=>draftRef.current.onKeyDown(area,event);
+    const onBlur=(event:FocusEvent)=>{
+      if(disposed||!area.isConnected)return;
       const related=event.relatedTarget;
       const shouldClose=!(related instanceof Node&&area.parentElement?.contains(related));
       draftRef.current.onBlurSession(session,area,shouldClose,related instanceof Element?related:null);
-    });
-    host.insertBefore(area,host.firstChild);
-    (initial.editorRef as {current:HTMLTextAreaElement|null}).current=area;
+    };
+    area.addEventListener('paste',onPaste);
+    area.addEventListener('beforeinput',onBeforeInput);
+    area.addEventListener('focus',onFocus);
+    area.addEventListener('select',onSelect);
+    area.addEventListener('pointerup',onPointerUp);
+    area.addEventListener('click',onClick);
+    area.addEventListener('input',onInput);
+    area.addEventListener('keyup',onKeyUp);
+    area.addEventListener('keydown',onKeyDown);
+    area.addEventListener('blur',onBlur);
     return()=>{
+      disposed=true;
+      area.removeEventListener('paste',onPaste);
+      area.removeEventListener('beforeinput',onBeforeInput);
+      area.removeEventListener('focus',onFocus);
+      area.removeEventListener('select',onSelect);
+      area.removeEventListener('pointerup',onPointerUp);
+      area.removeEventListener('click',onClick);
+      area.removeEventListener('input',onInput);
+      area.removeEventListener('keyup',onKeyUp);
+      area.removeEventListener('keydown',onKeyDown);
+      area.removeEventListener('blur',onBlur);
       const ref=draftRef.current.editorRef as {current:HTMLTextAreaElement|null};
       if(ref.current===area)ref.current=null;
-      area.remove();
     };
   },[session]);
   useLayoutEffect(()=>{
-    const area=editorRef.current;
+    const area=editorRef.current??areaRef.current;
     if(!area)return;
-    area.setAttribute('data-source-start',String(sourceStart));
+    const nextStart=String(sourceStart);
+    if(area.getAttribute('data-source-start')!==nextStart)area.setAttribute('data-source-start',nextStart);
     if(area.value!==text)area.value=text;
     const nextHeight=`${Math.max(120,text.split('\n').length*27+32)}px`;
     if(area.style.height!==nextHeight)area.style.height=nextHeight;
   },[editorRef,sourceStart,text]);
   return (
-    <div ref={hostRef} className="live-active-block">
+    <div ref={setHostRef} className="live-active-block">
       <WritingSuggestions text={text} caret={caret} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={onSuggestionChange} onAction={onSuggestionAction}/>
     </div>
   );
@@ -735,17 +773,86 @@ export default function LiveEditor({markdown,onChange,onHistory,historyReplayTok
 
   useEffect(()=>{
     const point=(event:Event)=>{
-      const detail=(event as CustomEvent<{point?:{from:number;to:number};x?:number;y?:number;coords?:{x:number;y:number}}>).detail;
+      const detail=(event as CustomEvent<{point?:{from:number;to:number};x?:number;y?:number;coords?:{x:number;y:number};target?:Element|null}>).detail;
       if(!detail||detail.point!==undefined)return;
       const x=typeof detail.x==='number'?detail.x:detail.coords?.x;
       const y=typeof detail.y==='number'?detail.y:detail.coords?.y;
-      if(typeof x==='number'&&typeof y==='number'&&Number.isFinite(x)&&Number.isFinite(y))return;
-      const {markdown:currentMarkdown,editing:currentEditing}=latestRef.current;
+      const hasCoords=typeof x==='number'&&typeof y==='number'&&Number.isFinite(x)&&Number.isFinite(y);
+      const {markdown:currentMarkdown,editing:currentEditing,draftText:latestDraft,frontmatter:currentFrontmatter}=latestRef.current;
+      const activeDoc=currentEditing?syncedMarkdownRef.current:currentMarkdown;
+      if(hasCoords||detail.target){
+        const root=rootRef.current;
+        if(!root||!root.isConnected)return;
+        const surface=root.closest<HTMLElement>('.android-reading,.reading-scroll,.live-pane,.live-scroll')??root;
+        const rawTarget=detail.target instanceof Element?detail.target:(hasCoords&&typeof document.elementFromPoint==='function'?document.elementFromPoint(x!,y!):null);
+        const bounds=surface.getBoundingClientRect();
+        const surfaceHasLayout=bounds.width>0&&bounds.height>0;
+        if(rawTarget){
+          if(!surface.contains(rawTarget)&&!root.contains(rawTarget))return;
+        }else{
+          if(!hasCoords||!surfaceHasLayout||x!<bounds.left||x!>bounds.right||y!<bounds.top||y!>bounds.bottom)return;
+        }
+        const clampOffset=(offset:number)=>Math.max(0,Math.min(offset,activeDoc.length));
+        const resolveBlockSpan=(blockEl:HTMLElement):[number,number]|null=>{
+          if(currentEditing&&(blockEl.matches('.live-active-block')||blockEl.querySelector('.live-active-block')||blockEl.closest('.live-active-block'))){
+            if(currentEditing.insertAfter!==undefined&&latestDraft===''){
+              const pos=clampOffset(currentEditing.baseSplitEnd);
+              return [pos,pos];
+            }
+            const start=clampOffset(currentEditing.prefix.length);
+            const end=Math.max(start,clampOffset(currentEditing.prefix.length+latestDraft.length));
+            return [start,end];
+          }
+          const rawStart=blockEl.dataset.sourceStart!==undefined?Number(blockEl.dataset.sourceStart):NaN;
+          const rawEnd=blockEl.dataset.sourceEnd!==undefined?Number(blockEl.dataset.sourceEnd):NaN;
+          if(!Number.isFinite(rawStart)||!Number.isFinite(rawEnd))return null;
+          const [start,end]=translateRenderedRange(rawStart,rawEnd,currentEditing,activeDoc);
+          const clampedStart=clampOffset(start);
+          return [clampedStart,Math.max(clampedStart,clampOffset(end))];
+        };
+        if(rawTarget?.closest('[data-frontmatter-properties],.document-properties')){
+          const pos=clampOffset(currentFrontmatter?.end??0);
+          detail.point={from:pos,to:pos};
+          return;
+        }
+        const hitBlock=rawTarget?.closest<HTMLElement>('.live-block,.live-active-block');
+        if(hitBlock&&root.contains(hitBlock)){
+          const span=resolveBlockSpan(hitBlock);
+          if(span){
+            detail.point={from:span[1],to:span[1]};
+            return;
+          }
+        }
+        const blockEls=Array.from(root.querySelectorAll<HTMLElement>('.live-block,.live-active-block')).filter(el=>!el.parentElement?.closest('.live-block'));
+        const measured=blockEls.map(el=>({el,span:resolveBlockSpan(el),rect:el.getBoundingClientRect()})).filter((entry):entry is {el:HTMLElement;span:[number,number];rect:DOMRect}=>entry.span!==null);
+        if(!measured.length){
+          const pos=clampOffset(currentFrontmatter?.end??activeDoc.length);
+          detail.point={from:pos,to:pos};
+          return;
+        }
+        if(hasCoords&&measured.some(entry=>entry.rect.height>0||entry.rect.top!==0||entry.rect.bottom!==0)){
+          if(y!<measured[0].rect.top){
+            const pos=clampOffset(currentFrontmatter?.end??measured[0].span[0]);
+            detail.point={from:pos,to:pos};
+            return;
+          }
+          let chosen=measured[0];
+          for(const entry of measured){
+            if(entry.rect.top<=y!)chosen=entry;
+            else break;
+          }
+          detail.point={from:chosen.span[1],to:chosen.span[1]};
+          return;
+        }
+        const lastEnd=measured[measured.length-1].span[1];
+        detail.point={from:lastEnd,to:lastEnd};
+        return;
+      }
       if(editor.current&&currentEditing)rememberSelection(editor.current,currentEditing);
       const saved=savedSelection.current;
-      if(!saved||saved.markdown!==currentMarkdown){savedSelection.current=null;return;}
-      const from=Math.max(0,Math.min(saved.from,currentMarkdown.length));
-      const to=Math.max(from,Math.min(saved.to,currentMarkdown.length));
+      if(!saved||saved.markdown!==activeDoc){savedSelection.current=null;return;}
+      const from=Math.max(0,Math.min(saved.from,activeDoc.length));
+      const to=Math.max(from,Math.min(saved.to,activeDoc.length));
       detail.point={from,to};
     };
     window.addEventListener('supermd-insertion-point',point);

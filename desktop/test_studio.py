@@ -13,12 +13,6 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
-    def __init__(self, isolated: bool = False, session: Session | None = None):
-        session = session or Session(isolated)
-        if not session.settings.get("python"):
-            session.settings["python"] = sys.executable
-        super().__init__(isolated, session)
-
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -217,6 +211,7 @@ class StudioTest(unittest.TestCase):
         self.session = Session(True)
         self.windows = []
         self.studio = self.window()
+        self.session.writes.flush(timeout=3)
 
     def window(self):
         window = QuietStudio(True,self.session)
@@ -320,6 +315,142 @@ class StudioTest(unittest.TestCase):
         studio._choose_default_python()
         studio._submit(lambda:1,lambda *_:self.fail("Retired callback ran"))
         studio._complete((lambda *_:self.fail("Retired callback ran"),None,None,False))
+
+    def test_startup_populates_default_python_before_reader_load_without_probing(self):
+        with (
+            patch("python_runtime.probe", side_effect=AssertionError("startup must not probe Python")),
+            patch("python_runtime.discover", side_effect=AssertionError("startup must not discover Python")),
+        ):
+            fresh_session = Session(True)
+            self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+            self.assertEqual(fresh_session.settings["python"], "")
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            self.assertFalse(fresh_studio.pythonBusy)
+            self.assertTrue(fresh_studio.settings["python"])
+            loads = []
+            fresh_studio.readerLoad.connect(loads.append)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.assertEqual(json.loads(loads[-1])["python"], fresh_studio.settings["python"])
+            self.app.processEvents()
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            saved_session = Session(True)
+            self.addCleanup(lambda: saved_session.writes.shutdown(wait=True))
+            saved_session.settings["python"] = sys.executable
+            saved_studio = QuietStudio(True, saved_session)
+            self.windows.append(saved_studio)
+            self.assertFalse(saved_studio.pythonBusy)
+            self.assertEqual(saved_studio.settings["python"], sys.executable)
+            self.app.processEvents()
+
+    def test_startup_default_python_persists_during_init_without_reader_ready_or_ui_completion(self):
+        fresh_session = Session(True)
+        self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+        submitted_writes = []
+        original_submit = fresh_session.writes.submit
+
+        def record_submit(fn, *args, **kwargs):
+            submitted_writes.append(fn)
+            return original_submit(fn, *args, **kwargs)
+
+        with patch.object(fresh_session.writes, "submit", side_effect=record_submit):
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            # Queued directly during __init__ before any QTimer.singleShot(0) or reader_ready runs.
+            self.assertEqual(len(submitted_writes), 1)
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            completed_events = []
+            fresh_studio.completed.connect(completed_events.append)
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertEqual(completed_events, [])
+
+            writes_before_ready = len(submitted_writes)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.app.processEvents()
+            self.assertEqual(len(submitted_writes), writes_before_ready)
+
+        with patch("studio.atomic_write", side_effect=OSError("disk full")):
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertIn("disk full", fresh_studio.message)
+
+    def test_concurrent_refresh_python_and_preferred_share_single_discover_run(self):
+        import concurrent.futures
+        import threading
+        import python_runtime
+
+        studio = self.studio
+        started = threading.Event()
+        release = threading.Event()
+        probe_calls = 0
+        lock = threading.Lock()
+
+        def controlled_probe(executable, timeout=6):
+            nonlocal probe_calls
+            with lock:
+                probe_calls += 1
+            started.set()
+            release.wait(5)
+            return {
+                "version": "3.12.0",
+                "prefix": sys.prefix,
+                "venv": True,
+                "matplotlib": True,
+                "numpy": True,
+                "venvModule": True,
+            }
+
+        with (
+            patch("python_runtime.bundled_available", return_value=False),
+            patch("python_runtime.candidates", return_value=[Path(sys.executable)]),
+            patch("python_runtime.probe", side_effect=controlled_probe),
+        ):
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            self.assertTrue(started.wait(2))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+                preferred_future = caller.submit(python_runtime.preferred, studio.data / "python-env")
+                time.sleep(0.05)
+                release.set()
+                chosen = preferred_future.result(timeout=5)
+            self._wait_for(lambda: not studio.pythonBusy)
+
+        self.assertEqual(probe_calls, 1)
+        self.assertEqual(chosen, sys.executable)
+        self.assertEqual([item["path"] for item in studio.python_choices], [sys.executable])
+
+    def test_default_python_selection_and_refresh_publish_discovered_choices(self):
+        studio = self.studio
+        studio.settings["python"] = ""
+        choices = [{"path": sys.executable, "label": "Virtual environment 3.13.0", "detail": ".venv · numpy + matplotlib ready",
+                    "matplotlib": True, "managed": False, "venv": True, "venvModule": True}]
+        pending = []
+        with patch.object(studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))), \
+             patch("python_runtime.default_python", return_value=sys.executable) as default_python, \
+             patch("python_runtime.discover", return_value=choices) as discover:
+            studio._choose_default_python()
+            action, done = pending.pop()
+            done(action(), None)
+            default_python.assert_called_once_with(studio.data / "python-env")
+            self.assertEqual(studio.settings["python"], sys.executable)
+
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            action, done = pending.pop()
+            done(action(), None)
+            discover.assert_called_once()
+            self.assertFalse(studio.pythonBusy)
+            self.assertEqual(json.loads(studio.pythonChoices), choices)
+            self.assertEqual(studio.pythonStatus, "")
 
     def test_pinned_recents_are_first_and_never_evicted_by_recent_opens(self):
         studio=self.studio;studio.recent=["/notes/pinned.md"]
