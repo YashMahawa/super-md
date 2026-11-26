@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as pickMobileDocument, save as chooseMobileDocument } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
@@ -24,6 +24,8 @@ import ZoomInput from "./components/ZoomInput";
 import ReadingSearch from "./components/ReadingSearch";
 import { MaterialButton, MaterialIconButton, MaterialSelect, MaterialSlider, MaterialSwitch, materialThemes } from "./components/MaterialControls";
 import { isTypewriterShortcutEvent, setTypewriterScroll, toggleTypewriterScroll, useTypewriterScroll } from "./typewriterScroll";
+import { scrollInputVersion } from "./scrollAnchor";
+import { applySharedAnchor, captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, isProgrammaticAnchorScroll, primeEditorAnchor, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
 
 const welcome = `# Super MD
 
@@ -195,6 +197,44 @@ export default function App() {
   const gestureInWorkspace = useRef(false);
   const pinchStartDistance = useRef(0);
   const zoomRef = useRef(100);
+  const viewRef = useRef<ViewMode>(view);
+  viewRef.current = view;
+  const contentRef = useRef(content);
+  contentRef.current = content;
+  const tabAnchors = useRef(new Map<string, SharedSourceAnchor>());
+  const pendingTransitionAnchor = useRef<SharedSourceAnchor | null>(null);
+  const splitPaneRef = useRef<SplitAnchorPane | null>(null);
+  const splitScrollTopsRef = useRef<{ editor: number | null; preview: number | null }>({ editor: null, preview: null });
+  const restoringAnchorRef = useRef(false);
+  const restoringAnchorSeq = useRef(0);
+  const previousViewAndTab = useRef<{ id: string; view: ViewMode }>({ id: activeTab.id, view });
+  const snapshotActiveTabAnchor = useCallback(() => {
+    const id = documentsRef.current.activeId;
+    const currentMode = viewRef.current;
+    const anchor = captureSharedAnchor({
+      id,
+      mode: currentMode,
+      zoom: zoomRef.current,
+      readingRoot: workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null,
+      preferredSplitPane: splitPaneRef.current,
+    });
+    tabAnchors.current.set(id, anchor);
+    while (tabAnchors.current.size > 40) tabAnchors.current.delete(tabAnchors.current.keys().next().value!);
+    return anchor;
+  }, []);
+  const switchView = useCallback((nextMode: ViewMode) => {
+    if (nextMode === viewRef.current) return;
+    pendingTransitionAnchor.current = snapshotActiveTabAnchor();
+    splitPaneRef.current = null;
+    setView(nextMode);
+  }, [snapshotActiveTabAnchor]);
+  const selectTabById = useCallback((nextId: string) => {
+    if (nextId === documentsRef.current.activeId) return;
+    snapshotActiveTabAnchor();
+    pendingTransitionAnchor.current = null;
+    splitPaneRef.current = null;
+    setDocuments((current) => ({ ...current, activeId: nextId }));
+  }, [snapshotActiveTabAnchor]);
   const [autosave, setAutosave] = useState(() => localStorage.getItem("autosave") === "true");
   const typewriterScroll = useTypewriterScroll();
   const [reduceMotion, setReduceMotion] = useState(() => localStorage.getItem("reduceMotion") === "true");
@@ -219,10 +259,17 @@ export default function App() {
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
     const query = window.matchMedia("(max-width: 760px)");
-    const onChange = () => { setMobileUi(query.matches); if (query.matches) setView((current) => current === "split" ? "live" : current); };
+    const onChange = () => {
+      setMobileUi(query.matches);
+      if (query.matches && viewRef.current === "split") {
+        pendingTransitionAnchor.current = snapshotActiveTabAnchor();
+        splitPaneRef.current = null;
+        setView("live");
+      }
+    };
     query.addEventListener("change", onChange);
     return () => query.removeEventListener("change", onChange);
-  }, []);
+  }, [snapshotActiveTabAnchor]);
 
   useEffect(() => {
     if (android) document.documentElement.dataset.platform = "android";
@@ -317,7 +364,7 @@ export default function App() {
   };
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
-  const applyDocument = useCallback((doc: DocumentData) => { setDocuments((current) => openTab(current, doc)); recordRecent(doc.path); }, []);
+  const applyDocument = useCallback((doc: DocumentData) => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => openTab(current, doc)); recordRecent(doc.path); }, [snapshotActiveTabAnchor]);
   const chooseFolder = useCallback(async () => {
     try { const root = await invoke<string | null>("open_workspace_folder"); if (root) { setFolderRoot(root); setFolderVisible(true); localStorage.setItem("folder.root", root); } }
     catch (error) { flash(`Could not open folder: ${error}`); }
@@ -338,7 +385,7 @@ export default function App() {
     getCurrentWindow().onCloseRequested((event) => { event.preventDefault(); void closeWindow(); }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; });
     return () => { disposed = true; stop?.(); };
   }, [closeWindow]);
-  const newDocument = useCallback(() => setDocuments((current) => addTab(current)), []);
+  const newDocument = useCallback(() => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => addTab(current)); }, [snapshotActiveTabAnchor]);
   const insertMedia = useCallback((text: string, point?: InsertionPoint) => {
     setDocuments((current) => { const tab = current.tabs.find((t) => t.id === current.activeId)!; const from = Math.max(0, Math.min(point?.from ?? tab.content.length, tab.content.length)); const to = Math.max(from, Math.min(point?.to ?? from, tab.content.length)); return editTab(current, tab.id, tab.content.slice(0, from) + text + tab.content.slice(to)); });
   }, []);
@@ -496,11 +543,14 @@ export default function App() {
       }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); event.shiftKey ? closeWindow() : setDocuments((current) => closeTab(current, current.activeId)); }
-      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); setDocuments(restoreClosedTab); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); if (event.shiftKey) void closeWindow(); else { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, current.activeId)); } }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments(restoreClosedTab); }
       if (!event.defaultPrevented && isTypewriterShortcutEvent(event)) { event.preventDefault(); toggleTypewriterScroll(); }
       if ((event.ctrlKey || event.metaKey) && event.key === "Tab") {
         event.preventDefault();
+        snapshotActiveTabAnchor();
+        pendingTransitionAnchor.current = null;
+        splitPaneRef.current = null;
         setDocuments((current) => {
           const index = current.tabs.findIndex((tab) => tab.id === current.activeId);
           const next = (index + (event.shiftKey ? current.tabs.length - 1 : 1)) % current.tabs.length;
@@ -527,7 +577,143 @@ export default function App() {
       window.removeEventListener("keydown", handler);
       window.removeEventListener("supermd-find", openFind);
     };
-  }, [newDocument, open, openNewWindow, save, setZoom, toggleFullscreen, zoomBy, chooseFolder, closeWindow, view]);
+  }, [newDocument, open, openNewWindow, save, setZoom, snapshotActiveTabAnchor, toggleFullscreen, zoomBy, chooseFolder, closeWindow, view]);
+
+  useEffect(() => {
+    let frame = 0;
+    const scheduleSnapshot = () => {
+      if (restoringAnchorRef.current || frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        if (!restoringAnchorRef.current) snapshotActiveTabAnchor();
+      });
+    };
+    const trackInput = (event: Event) => {
+      if (viewRef.current === "split") {
+        const pane = detectSplitPaneFromTarget(event.target);
+        if (pane) {
+          const scroller = pane === "editor"
+            ? workspaceRef.current?.querySelector(".cm-scroller")
+            : workspaceRef.current?.querySelector(".reading-scroll");
+          clearProgrammaticAnchorScroll(scroller);
+          splitPaneRef.current = pane;
+        }
+      }
+    };
+    const trackScroll = (event: Event) => {
+      if (restoringAnchorRef.current) return;
+      if (event.target instanceof HTMLElement && isProgrammaticAnchorScroll(event.target)) return;
+      if (viewRef.current === "split") {
+        const pane = detectSplitPaneFromTarget(event.target);
+        if (pane && event.target instanceof HTMLElement) {
+          const recorded = splitScrollTopsRef.current[pane];
+          if (recorded === null || Math.abs(event.target.scrollTop - recorded) > 2) {
+            splitScrollTopsRef.current[pane] = event.target.scrollTop;
+            splitPaneRef.current = pane;
+          }
+        }
+      }
+      scheduleSnapshot();
+    };
+    const inputEvents = ["wheel", "pointerdown", "touchstart", "keydown", "focusin"] as const;
+    const syncEvents = ["keyup", "pointerup"] as const;
+    inputEvents.forEach((name) => document.addEventListener(name, trackInput, { capture: true, passive: true }));
+    syncEvents.forEach((name) => document.addEventListener(name, scheduleSnapshot, { capture: true, passive: true }));
+    document.addEventListener("scroll", trackScroll, { capture: true, passive: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      inputEvents.forEach((name) => document.removeEventListener(name, trackInput, true));
+      syncEvents.forEach((name) => document.removeEventListener(name, scheduleSnapshot, true));
+      document.removeEventListener("scroll", trackScroll, true);
+    };
+  }, [snapshotActiveTabAnchor]);
+
+  useLayoutEffect(() => {
+    const previous = previousViewAndTab.current;
+    previousViewAndTab.current = { id: activeTab.id, view };
+    if (previous.id === activeTab.id && previous.view === view) return;
+    const startingInput = scrollInputVersion();
+    const initialContent = contentRef.current;
+    const tabId = activeTab.id;
+    const targetMode = view;
+    const isModeTransition = previous.id === tabId && previous.view !== targetMode;
+    const anchor = isModeTransition
+      ? (pendingTransitionAnchor.current ?? tabAnchors.current.get(tabId))
+      : tabAnchors.current.get(tabId);
+    pendingTransitionAnchor.current = null;
+    if (!anchor) {
+      primeEditorAnchor(tabId, null);
+      const scroller = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll");
+      if (scroller) scroller.scrollTop = 0;
+      return;
+    }
+    const allowExactTop = !isModeTransition;
+    if (targetMode === "editor" || targetMode === "split") {
+      const sameGeometry = allowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - zoomRef.current) < 1;
+      if (sameGeometry && anchor.editorTop !== undefined) {
+        primeEditorAnchor(tabId, { offset: anchor.offset, top: anchor.editorTop });
+      } else {
+        primeEditorAnchor(tabId, { offset: anchor.offset, caretOffset: anchor.caretOffset });
+      }
+    } else {
+      primeEditorAnchor(tabId, null);
+    }
+    const shouldStop = () =>
+      documentsRef.current.activeId !== tabId ||
+      viewRef.current !== targetMode ||
+      contentRef.current !== initialContent ||
+      scrollInputVersion() !== startingInput ||
+      Boolean(window.getSelection()?.toString()) ||
+      Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
+    let stopped = false;
+    const stop = () => { stopped = true; };
+    const inputs = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    inputs.forEach((name) => window.addEventListener(name, stop, { capture: true, passive: true }));
+    let firstPass = true;
+    const apply = () => {
+      if (stopped || shouldStop()) return;
+      const updateSelection = firstPass;
+      firstPass = false;
+      const seq = ++restoringAnchorSeq.current;
+      restoringAnchorRef.current = true;
+      applySharedAnchor({
+        id: tabId,
+        targetMode,
+        targetZoom: zoomRef.current,
+        anchor,
+        readingRoot: workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null,
+        allowExactTop,
+        updateSelection,
+      });
+      if (targetMode === "split") {
+        splitScrollTopsRef.current = {
+          editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
+          preview: workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll")?.scrollTop ?? null,
+        };
+      } else {
+        splitScrollTopsRef.current = { editor: null, preview: null };
+      }
+      requestAnimationFrame(() => { if (restoringAnchorSeq.current === seq) restoringAnchorRef.current = false; });
+    };
+    apply();
+    let innerFrame = 0;
+    const outerFrame = requestAnimationFrame(() => {
+      apply();
+      innerFrame = requestAnimationFrame(() => {
+        apply();
+        if (!stopped && !shouldStop()) snapshotActiveTabAnchor();
+      });
+    });
+    const timers = [120, 320].map((delay) => window.setTimeout(apply, delay));
+    return () => {
+      stopped = true;
+      restoringAnchorRef.current = false;
+      cancelAnimationFrame(outerFrame);
+      cancelAnimationFrame(innerFrame);
+      timers.forEach(window.clearTimeout);
+      inputs.forEach((name) => window.removeEventListener(name, stop, { capture: true }));
+    };
+  }, [activeTab.id, snapshotActiveTabAnchor, view]);
 
   useEffect(() => {
     if (view === "editor" || view === "split") setSearching(false);
@@ -621,7 +807,7 @@ export default function App() {
         </nav>
         <nav className="right-actions" aria-label="View and export">
           <div className="segmented" aria-label="View mode">
-            {(mobileUi ? ["live", "editor", "reader"] : ["editor", "live", "split", "reader"] as ViewMode[]).map((mode) => <button key={mode} className={view === mode ? "active" : ""} onClick={() => setView(mode as ViewMode)} title={`${mode[0].toUpperCase()}${mode.slice(1)} view`} aria-label={`${mode} view`} aria-pressed={view === mode}>{view === mode && <motion.i className="segment-indicator" layoutId="view-indicator" transition={motionEnabled ? spring.selector : { duration: 0 }} />}{mode === "editor" ? <PencilSimpleIcon size={17} /> : mode === "split" ? <ColumnsIcon size={17} /> : mode === "live" ? <SparkleIcon size={17} /> : <BookOpenIcon size={17} />}<span>{mode === "editor" && mobileUi ? "Source" : mode === "reader" && mobileUi ? "Read" : mode}</span></button>)}
+            {(mobileUi ? ["live", "editor", "reader"] : ["editor", "live", "split", "reader"] as ViewMode[]).map((mode) => <button key={mode} className={view === mode ? "active" : ""} onClick={() => switchView(mode as ViewMode)} title={`${mode[0].toUpperCase()}${mode.slice(1)} view`} aria-label={`${mode} view`} aria-pressed={view === mode}>{view === mode && <motion.i className="segment-indicator" layoutId="view-indicator" transition={motionEnabled ? spring.selector : { duration: 0 }} />}{mode === "editor" ? <PencilSimpleIcon size={17} /> : mode === "split" ? <ColumnsIcon size={17} /> : mode === "live" ? <SparkleIcon size={17} /> : <BookOpenIcon size={17} />}<span>{mode === "editor" && mobileUi ? "Source" : mode === "reader" && mobileUi ? "Read" : mode}</span></button>)}
           </div>
           <MaterialIconButton motion={motionEnabled} selected={focusMode} onClick={() => setFocusMode((value) => !value)} title="Focus mode" label="Focus mode"><CrosshairIcon size={20} /></MaterialIconButton>
           <MaterialIconButton motion={motionEnabled} onClick={toggleFullscreen} title="Fullscreen · F11" label="Fullscreen"><ArrowsOutIcon size={20} /></MaterialIconButton>
@@ -631,11 +817,11 @@ export default function App() {
       </header>}
       {!fullscreen && <div className="tab-strip" role="tablist" aria-label="Open documents">
         <div className="tab-scroll">{documents.tabs.map((tab) => <div key={tab.id} className={`document-tab ${tab.id === documents.activeId ? "selected" : ""}`} role="presentation">
-          <button role="tab" aria-selected={tab.id === documents.activeId} title={tab.path ?? tab.name} onClick={() => setDocuments((current) => ({ ...current, activeId: tab.id }))} onAuxClick={(event) => { if (event.button === 1) setDocuments((current) => closeTab(current, tab.id)); }}><span className={`tab-dot ${isDirty(tab) ? "dirty" : ""}`} /><span className="tab-name">{tabTitle(tab)}</span></button>
-          <button className="tab-close" onClick={() => setDocuments((current) => closeTab(current, tab.id))} title={`Close ${tabTitle(tab)}`} aria-label={`Close ${tabTitle(tab)}`}><XIcon size={14} /></button>
+          <button role="tab" aria-selected={tab.id === documents.activeId} title={tab.path ?? tab.name} onClick={() => selectTabById(tab.id)} onAuxClick={(event) => { if (event.button === 1) { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, tab.id)); } }}><span className={`tab-dot ${isDirty(tab) ? "dirty" : ""}`} /><span className="tab-name">{tabTitle(tab)}</span></button>
+          <button className="tab-close" onClick={() => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, tab.id)); }} title={`Close ${tabTitle(tab)}`} aria-label={`Close ${tabTitle(tab)}`}><XIcon size={14} /></button>
         </div>)}</div>
         <button className="tab-add" onClick={newDocument} title="New tab · Ctrl+N" aria-label="New tab"><PlusIcon size={17} /></button>
-        {documents.recentlyClosed.length > 0 && <button className="tab-reopen" onClick={() => setDocuments(restoreClosedTab)} title="Reopen closed tab · Ctrl+Shift+T">Reopen</button>}
+        {documents.recentlyClosed.length > 0 && <button className="tab-reopen" onClick={() => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments(restoreClosedTab); }} title="Reopen closed tab · Ctrl+Shift+T">Reopen</button>}
       </div>}
       {!fullscreen && view === "editor" && <div className="formatbar" aria-label="Formatting tools">
         <span className="format-label">Insert</span>
