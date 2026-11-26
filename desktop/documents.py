@@ -521,15 +521,26 @@ def _decode_text_note(raw: str, path: Path, *, decode_assets: bool = True) -> tu
     return raw, {}, False
 
 
+import portable_search
 from portable_search import (
-    MAX_SEARCH_MARKDOWN_BYTES,
-    _PORTABLE_ENVELOPE_RE,
-    _PORTABLE_FORMATS,
-    _extract_portable_markdown,
-    _read_bounded_utf8_stream,
-    iter_single_member_gzip_chunks,
-    read_searchable_markdown,
+    MAX_SEARCH_MARKDOWN_BYTES, _PORTABLE_ENVELOPE_RE, _PORTABLE_FORMATS,
+    _extract_portable_markdown, iter_single_member_gzip_chunks,
 )
+
+def _lookup_cached_portable_markdown(stat_key: tuple[int, int, int, int]) -> str | None:
+    if not _RECENT_PORTABLE_FILES:
+        return None
+    with _VALIDATED_LOCK:
+        cached = _RECENT_PORTABLE_FILES.get(stat_key)
+    return cached[1] if cached is not None else None
+
+def _read_bounded_utf8_stream(path: Path, *, is_gzip: bool):
+    return portable_search._read_bounded_utf8_stream(path, is_gzip=is_gzip, max_file_bytes=MAX_FILE)
+
+def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
+    return portable_search.read_searchable_markdown(
+        path, max_text_bytes, max_file_bytes=MAX_FILE, cache_lookup=_lookup_cached_portable_markdown
+    )
 
 def atomic_write(path: Path, data: bytes) -> None:
     # Same-filesystem replace is atomic; a cancelled/failed write leaves the old note intact.

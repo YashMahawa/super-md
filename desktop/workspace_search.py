@@ -12,15 +12,6 @@ from typing import Callable, Iterator
 
 from agent_documents import diagram_spans
 import documents
-import portable_search
-
-_DEFAULT_DOC_READER = documents.read_searchable_markdown
-
-
-def _read_disk_searchable_markdown(path: str) -> str | None:
-    if documents.read_searchable_markdown is not _DEFAULT_DOC_READER:
-        return documents.read_searchable_markdown(path)
-    return portable_search.read_searchable_markdown(path)
 
 KNOWN_NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
 MAX_WALK_ENTRIES = 10_000
@@ -427,7 +418,7 @@ def _iter_searchable_notes(
         return
     if len(deduped_candidates) == 1:
         meta = deduped_candidates[0]
-        markdown = _read_disk_searchable_markdown(meta["path"])
+        markdown = documents.read_searchable_markdown(meta["path"])
         if markdown is not None:
             yield markdown, meta
         return
@@ -439,7 +430,7 @@ def _iter_searchable_notes(
         for meta in chunk:
             if stop_workers.is_set() or (cancel_event is not None and cancel_event.is_set()):
                 break
-            out.append((_read_disk_searchable_markdown(meta["path"]), meta))
+            out.append((documents.read_searchable_markdown(meta["path"]), meta))
         return out
 
     chunks: list[list[dict]] = []

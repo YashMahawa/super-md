@@ -6,33 +6,14 @@ import json
 import os
 import re
 import stat
-import sys
 import zlib
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 GZIP_MAGIC = b"\x1f\x8b"
-_DEFAULT_MAX_FILE = 120_000_000
 MAX_SEARCH_MARKDOWN_BYTES = 20_000_000
 _PORTABLE_FORMATS = ("supermd-smd", "supermd-fmd")
 _PORTABLE_ENVELOPE_RE = re.compile(r'^\ufeff?\s*\{\s*"format"\s*:\s*"supermd-(?:smd|fmd)"')
-
-
-def _max_file_bytes() -> int:
-    docs = sys.modules.get("documents")
-    return int(getattr(docs, "MAX_FILE", _DEFAULT_MAX_FILE))
-
-
-def _lookup_recent_portable_markdown(stat_key: tuple[int, int, int, int], max_text_bytes: int) -> str | None:
-    docs = sys.modules.get("documents")
-    recent = getattr(docs, "_RECENT_PORTABLE_FILES", None)
-    lock = getattr(docs, "_VALIDATED_LOCK", None)
-    if recent and lock is not None:
-        with lock:
-            cached = recent.get(stat_key)
-        if cached is not None and len(cached[1].encode("utf-8")) <= max_text_bytes:
-            return cached[1]
-    return None
 
 
 def iter_single_member_gzip_chunks(
@@ -107,21 +88,20 @@ def iter_single_member_gzip_chunks(
         yield tail
 
 
-def _read_bounded_utf8_stream(path: Path, *, is_gzip: bool) -> Iterator[str]:
-    max_file = _max_file_bytes()
+def _read_bounded_utf8_stream(path: Path, *, is_gzip: bool, max_file_bytes: int) -> Iterator[str]:
     utf8 = codecs.getincrementaldecoder("utf-8")(errors="strict")
     with path.open("rb") as source:
         if not is_gzip:
             total = 0
             while chunk := source.read(65536):
                 total += len(chunk)
-                if total > max_file:
+                if total > max_file_bytes:
                     raise ValueError("Portable note exceeds size limit")
                 yield utf8.decode(chunk, final=False)
         else:
             for decoded in iter_single_member_gzip_chunks(
                 source,
-                max_bytes=max_file,
+                max_bytes=max_file_bytes,
                 read_chunk_size=32768,
                 max_decompress_chunk=65536,
                 label="portable note",
@@ -222,18 +202,24 @@ def _extract_portable_markdown(chunks, max_markdown_bytes: int = MAX_SEARCH_MARK
     return markdown if fmt in _PORTABLE_FORMATS and version == 1 and isinstance(markdown, str) else None
 
 
-def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
+def read_searchable_markdown(
+    path: str | os.PathLike[str],
+    max_text_bytes: int = MAX_SEARCH_MARKDOWN_BYTES,
+    *,
+    max_file_bytes: int,
+    cache_lookup: Callable[[tuple[int, int, int, int]], str | None] | None = None,
+) -> str | None:
     """Read searchable Markdown from plain or portable (.smd/.fmd) notes by content without decoding images."""
     raw_path = os.fspath(path)
-    max_file = _max_file_bytes()
     try:
         info = os.lstat(raw_path)
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > max_file:
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > max_file_bytes:
             return None
-        stat_key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-        cached = _lookup_recent_portable_markdown(stat_key, max_text_bytes)
-        if cached is not None:
-            return cached
+        if cache_lookup is not None:
+            stat_key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+            cached = cache_lookup(stat_key)
+            if cached is not None and len(cached.encode("utf-8")) <= max_text_bytes:
+                return cached
         with open(raw_path, "rb") as handle:
             head = handle.read(8192)
             if not head:
@@ -255,13 +241,19 @@ def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int =
     path_obj = path if isinstance(path, Path) else Path(raw_path)
     if head.startswith(GZIP_MAGIC):
         try:
-            return _extract_portable_markdown(_read_bounded_utf8_stream(path_obj, is_gzip=True), max_text_bytes)
+            return _extract_portable_markdown(
+                _read_bounded_utf8_stream(path_obj, is_gzip=True, max_file_bytes=max_file_bytes),
+                max_text_bytes,
+            )
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError, zlib.error, OSError, EOFError):
             return None
     head_text = head.decode("utf-8-sig", errors="replace")
     if head_text.lstrip().startswith("{"):
         try:
-            extracted = _extract_portable_markdown(_read_bounded_utf8_stream(path_obj, is_gzip=False), max_text_bytes)
+            extracted = _extract_portable_markdown(
+                _read_bounded_utf8_stream(path_obj, is_gzip=False, max_file_bytes=max_file_bytes),
+                max_text_bytes,
+            )
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError, OSError):
             if _PORTABLE_ENVELOPE_RE.match(head_text):
                 return None
