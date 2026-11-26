@@ -7,24 +7,30 @@ from pathlib import Path
 from material_color_utilities import get_contrast_ratio
 MAX_THEME = 2 * 1024 * 1024
 
-BUNDLED_PRESETS = (
-    ("apricot-glow", "Apricot glow"),
-    ("avengers-assembly", "Avengers Assembly"),
-    ("avengers-ink", "Avengers Ink"),
-    ("blueprint", "Blueprint"),
-    ("catnap-paws", "Catnap paws"),
-    ("copper-grid", "Copper grid"),
-    ("doctor-doom", "Doctor Doom"),
-    ("gotham-midnight", "Gotham Midnight"),
-    ("ink-dots", "Ink dots"),
-    ("iron-man-reactor", "Iron Man Reactor"),
-    ("lazy-sunday-cats", "Lazy Sunday cats"),
-    ("midnight-paws", "Midnight paws"),
-    ("plum-linen", "Plum linen"),
-    ("rose-paper", "Rose paper"),
-    ("spider-city", "Spider City"),
-    ("study-desk", "Study desk"),
-)
+def _bundled_catalog(directory):
+    repo_root = Path(__file__).resolve().parent.parent
+    candidates = (directory / "index.json", bundled_themes_dir(None) / "index.json", repo_root / "public" / "themes" / "index.json")
+    path = next((item for item in candidates if item.is_file()), None)
+    if path is None:
+        return ()
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_THEME + 1)
+        entries = json.loads(raw.decode("utf-8-sig")) if len(raw) <= MAX_THEME else None
+    except (OSError, ValueError, TypeError):
+        return ()
+    if not isinstance(entries, list):
+        return ()
+    catalog, seen = [], set()
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        preset_id, name, filename = item.get("id"), item.get("name"), item.get("filename")
+        if isinstance(preset_id, str) and _PRESET_ID_RE.match(preset_id) and preset_id not in seen and isinstance(name, str) and name.strip() and filename == f"{preset_id}.supermd-theme.json":
+            seen.add(preset_id)
+            catalog.append((preset_id, name, filename))
+    return tuple(catalog)
+
 _PRESET_ID_RE = re.compile(r"^[a-z0-9-]+$")
 
 TEMPLATE = {"format":"supermd-theme","version":1,"name":"My theme","accent":"violet","variants":{"light":{"colors":{},"background":{"pattern":"dots","color":"#7255a5","opacity":0.05,"spacing":24,"angle":0}},"dark":{"colors":{},"background":{"pattern":"dots","color":"#d4bbfc","opacity":0.04,"spacing":24,"angle":0}}},"metrics":{"controlRadius":22,"contentRadius":16,"paragraphSpacing":1.2,"codePadding":18,"headingWeight":700,"headingTracking":-0.02,"textTracking":0,"tableBorderWidth":1}}
@@ -38,10 +44,10 @@ def bundled_themes_dir(root=None):
 
 def bundled_themes(root=None):
     directory = bundled_themes_dir(root)
-    known = {preset_id: name for preset_id, name in BUNDLED_PRESETS}
+    catalog = _bundled_catalog(directory)
+    known = {preset_id for preset_id, _, _ in catalog}
     result = []
-    for preset_id, name in BUNDLED_PRESETS:
-        filename = f"{preset_id}.supermd-theme.json"
+    for preset_id, name, filename in catalog:
         if not directory.is_dir() or (directory / filename).is_file():
             result.append({"id": preset_id, "name": name, "filename": filename})
     if directory.is_dir():
