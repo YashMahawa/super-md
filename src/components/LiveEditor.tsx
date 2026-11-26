@@ -25,7 +25,7 @@ import {
   type PendingBlockFocus,
   type SelectionDirection,
 } from '../liveBlockHistory';
-import {useLiveInsertionPoint,type SavedLiveSelection} from '../liveInsertionPoint';
+import {resolveLiveCaretOffset,useLiveInsertionPoint,type SavedLiveSelection} from '../liveInsertionPoint';
 import {useLiveViewportHold} from '../useLiveViewportHold';
 
 const noTrustedHosts:string[]=[];
@@ -82,6 +82,7 @@ export default function LiveEditor({markdown,onChange,onHistory,historyReplayTok
   const blocks=sourceAnalysis.analysis.bodyBlocks;
   const frontmatter=sourceAnalysis.analysis.frontmatter;
   const hasBodyNodes=sourceAnalysis.analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
+  const protectedSpans=useMemo(()=>sourceAnalysis.analysis.tree.children.filter(node=>['code','math','html','definition'].includes(node.type)&&node.position?.start.offset!==undefined&&node.position?.end.offset!==undefined).map(node=>[node.position!.start.offset!,node.position!.end.offset!] as const),[sourceAnalysis]);
   const latestRef=useRef<LiveEditorState>({markdown,onChange,onHistory,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter});
   latestRef.current={markdown,onChange,onHistory,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter};
 
@@ -185,11 +186,14 @@ export default function LiveEditor({markdown,onChange,onHistory,historyReplayTok
     setEditing(nextSession);
   },[resetOutsidePress]);
 
-  const openRenderedBlock=useCallback((element:HTMLElement|null,renderedStart:number,renderedEnd:number,protectedHint?:boolean)=>{
-    const {editing:currentEditing,markdown:latestMarkdown}=latestRef.current;
+  const openRenderedBlock=useCallback((element:HTMLElement|null,renderedStart:number,renderedEnd:number,protectedHint?:boolean,caretRange?:Range|null)=>{
+    const {editing:currentEditing,markdown:latestMarkdown,renderedSource:frozenSource,sourceAnalysis:latestAnalysis}=latestRef.current;
     const activeDoc=currentEditing?syncedMarkdownRef.current:latestMarkdown;
     const [start,end]=translateRenderedRange(renderedStart,renderedEnd,currentEditing,activeDoc);
-    openDocBlock(element,start,end,activeDoc,undefined,protectedHint);
+    const caretOffset=!protectedHint&&caretRange
+      ?resolveLiveCaretOffset(element,caretRange,frozenSource,renderedStart,renderedEnd,latestAnalysis.source===frozenSource?latestAnalysis.analysis.tree:undefined)
+      :null;
+    openDocBlock(element,start,end,activeDoc,caretOffset!==null?{start:caretOffset,end:caretOffset}:undefined,protectedHint);
   },[openDocBlock]);
 
   const openInsertedBlock=useCallback((baseDoc:string,insertPos:number,insertAfter:number|'end')=>{
@@ -501,7 +505,7 @@ export default function LiveEditor({markdown,onChange,onHistory,historyReplayTok
     const active=!!editing&&editing.insertAfter===undefined&&block.start===editing.prefix.length;
     const insertedBelow=!!editing&&editing.insertAfter===block.start;
     const blockKey=blockKeys.get(block.start)??`block-${entry.key}`;
-    const protectedHint=['code','math','html','definition'].includes(entry.node.type);
+    const protectedHint=protectedSpans.some(([s,e])=>s>=start&&e<=end);
     return (
       <Fragment key={blockKey}>
         <LiveBlockShell windowed={entry.windowed} estimate={entry.estimate} text={entry.text} headings={entry.headings} start={start} end={end} blockIndex={low} active={active} protectedHint={protectedHint} onOpen={openRenderedBlock} editor={<ActiveBlockEditor/>}>
@@ -510,7 +514,7 @@ export default function LiveEditor({markdown,onChange,onHistory,historyReplayTok
         {insertedBelow&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
       </Fragment>
     );
-  },[blocks,blockKeys,editing,openRenderedBlock]);
+  },[blocks,blockKeys,editing,openRenderedBlock,protectedSpans]);
 
   const previewChange=useCallback((next:string)=>{
     const {editing:currentEditing,renderedSource:frozenSource}=latestRef.current;

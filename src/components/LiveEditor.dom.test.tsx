@@ -1716,3 +1716,187 @@ it("keeps the active textarea mounted, focused, and undo/redo reconciled inside 
     host.remove();
   }
 });
+
+it("preserves the clicked rendered text caret on double-click across inline emphasis, links, code, math, lists, and callouts while keeping keyboard entry and protected blocks intact", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+
+  const proseBlock = [
+    "Review *italic* and **bold** plus [reference guide](https://example.com/docs?mode=live) with `npm test`, $x^2 + 1$, ==key==, and \\*literal\\* above",
+    "then inspect the target phrase below.",
+  ].join("\n");
+  const listBlock = [
+    "- [x] Ship *core* parser",
+    "- [ ] Verify [live caret](https://example.com/list) on the second item",
+  ].join("\n");
+  const calloutBlock = [
+    "> [!note] Custom *callout* heading",
+    "> First quoted line with [spec](https://example.com/spec)",
+    "> Second quoted target line.",
+  ].join("\n");
+  const defaultCalloutBlock = [
+    "> [!tip]",
+    "> Synthesized title body target.",
+  ].join("\n");
+  const tableBlock = [
+    "| Feature | Notes |",
+    "| --- | --- |",
+    "| [[Project Plan|Roadmap]] | Table cell target entry |",
+  ].join("\n");
+  const codeBlock = [
+    "```ts",
+    "- keep literal code behavior",
+    "```",
+  ].join("\n");
+
+  let doc = [proseBlock, listBlock, calloutBlock, defaultCalloutBlock, tableBlock, codeBlock].join("\n\n");
+  const renderDoc = () =>
+    root.render(
+      <LiveEditor
+        markdown={doc}
+        documentPath={null}
+        dark={false}
+        python=""
+        onChange={(next) => {
+          doc = next;
+          renderDoc();
+        }}
+      />,
+    );
+  await act(async () => { renderDoc(); });
+
+  let mockedHit: { offsetNode: Node; offset: number } | null = null;
+  const caretSpy = vi.fn(() => mockedHit);
+  Object.defineProperty(document, "caretPositionFromPoint", {
+    configurable: true,
+    writable: true,
+    value: caretSpy,
+  });
+
+  const findTextHit = (rootEl: Element, needle: string, innerOffset = 0): { offsetNode: Text; offset: number } => {
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const parent = node.parentElement;
+      if (parent?.closest(".katex-mathml")) continue;
+      const textNode = node as Text;
+      const at = textNode.data.indexOf(needle);
+      if (at >= 0) return { offsetNode: textNode, offset: at + innerOffset };
+    }
+    throw new Error(`Text "${needle}" not found inside ${rootEl.tagName}`);
+  };
+
+  const dblClickAt = (blockIndex: number, needle: string, innerOffset = 0) => {
+    const blockEl = host.querySelectorAll<HTMLElement>(".live-block")[blockIndex]!;
+    const hit = findTextHit(blockEl, needle, innerOffset);
+    mockedHit = hit;
+    act(() => {
+      (hit.offsetNode.parentElement ?? blockEl).dispatchEvent(
+        new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2, clientX: 160, clientY: 120 }),
+      );
+    });
+    return host.querySelector<HTMLTextAreaElement>("textarea")!;
+  };
+
+  try {
+    // 1. Double-clicking "target" on line 2 below emphasis, strong, link, inline code, inline math, highlight, and escapes:
+    let area = dblClickAt(0, "target", 0);
+    expect(area.value).toBe(proseBlock);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      proseBlock.indexOf("target"),
+      proseBlock.indexOf("target"),
+    ]);
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    // 2. Double-clicking mid-word inside *italic* ("ita|lic") places collapsed caret inside the emphasis content:
+    area = dblClickAt(0, "italic", 3);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      proseBlock.indexOf("italic") + 3,
+      proseBlock.indexOf("italic") + 3,
+    ]);
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    // 3. Double-clicking inside inline code `npm test` ("npm |test") places collapsed caret at "test":
+    area = dblClickAt(0, "npm test", 4);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      proseBlock.indexOf("npm test") + 4,
+      proseBlock.indexOf("npm test") + 4,
+    ]);
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    // 4. Double-clicking downstream task item while upstream block is actively edited with changed length:
+    area = dblClickAt(0, "target", 0);
+    const expandedProse = proseBlock + " — expanded while active with extra characters";
+    await act(async () => { typeInTextarea(area, expandedProse); });
+    area = dblClickAt(1, "second item", 0);
+    expect(area.value).toBe(listBlock);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      listBlock.indexOf("second item"),
+      listBlock.indexOf("second item"),
+    ]);
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    // 5. Custom-titled callout and default-titled callout map lower body lines accurately:
+    area = dblClickAt(2, "target line", 0);
+    expect(area.value).toBe(calloutBlock);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      calloutBlock.indexOf("target line"),
+      calloutBlock.indexOf("target line"),
+    ]);
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    area = dblClickAt(3, "target.", 0);
+    expect(area.value).toBe(defaultCalloutBlock);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      defaultCalloutBlock.indexOf("target."),
+      defaultCalloutBlock.indexOf("target."),
+    ]);
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    // 5b. GFM table cell after a wikilink column maps accurately:
+    area = dblClickAt(4, "target entry", 0);
+    expect(area.value).toBe(tableBlock);
+    expect([area.selectionStart, area.selectionEnd]).toEqual([
+      tableBlock.indexOf("target entry"),
+      tableBlock.indexOf("target entry"),
+    ]);
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    // 6. Keyboard edit entry (Enter and F2) does not query click caret coordinates:
+    caretSpy.mockClear();
+    const focusedBlock = host.querySelectorAll<HTMLElement>(".live-block")[4]!;
+    expect(document.activeElement).toBe(focusedBlock);
+    act(() => { focusedBlock.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); });
+    area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    expect(area.value).toBe(tableBlock);
+    expect(area.selectionStart).toBe(area.selectionEnd);
+    expect(caretSpy).not.toHaveBeenCalled();
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    act(() => { focusedBlock.dispatchEvent(new KeyboardEvent("keydown", { key: "F2", bubbles: true, cancelable: true })); });
+    area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    expect(area.value).toBe(tableBlock);
+    expect(area.selectionStart).toBe(area.selectionEnd);
+    expect(caretSpy).not.toHaveBeenCalled();
+    act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+    // 7. Protected fenced code block skips prose click caret lookup and preserves literal Enter:
+    caretSpy.mockClear();
+    const protectedEl = host.querySelectorAll<HTMLElement>(".live-block")[5]!;
+    act(() => {
+      protectedEl.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, detail: 2, clientX: 160, clientY: 300 }));
+    });
+    area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    expect(area.value).toBe(codeBlock);
+    expect(area.selectionStart).toBe(area.selectionEnd);
+    expect(caretSpy).not.toHaveBeenCalled();
+    area.setSelectionRange(area.value.indexOf("behavior") + 8, area.value.indexOf("behavior") + 8);
+    const codeEnter = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
+    act(() => { area.dispatchEvent(codeEnter); });
+    expect(codeEnter.defaultPrevented).toBe(false);
+  } finally {
+    delete (document as Partial<Document>).caretPositionFromPoint;
+    act(() => root.unmount());
+    host.remove();
+  }
+});
