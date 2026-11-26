@@ -358,6 +358,25 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         by_slug = self._call_with_qt_pump(lambda: self.client.read_tab(
             self.active_id, heading="detail", view="source", window_id=self.window_id))
         self.assertEqual(by_slug["sectionStart"], source.index("### Detail"))
+        svg_section = (
+            "# Overview\nIntro\n\n## 2. Visuals\n```svg\n# Not a heading\n<svg><rect/></svg>\n```\nCaption.\n\n## 3. Next\nLater\n"
+        )
+        self.studio.live_source = svg_section
+        self.studio.tabs[0]["content"] = svg_section
+        import agent_documents
+        with unittest.mock.patch(
+            "agent_documents._step_fence_boundary",
+            wraps=agent_documents._step_fence_boundary,
+        ) as step_spy:
+            prose_heading = self._call_with_qt_pump(lambda: self.client.read_tab(
+                self.active_id, heading="2. Visuals", view="prose", window_id=self.window_id))
+            self.assertEqual(step_spy.call_count, len(svg_section.splitlines(keepends=True)))
+        self.assertIn("[SVG omitted:", prose_heading["markdown"])
+        self.assertIn("Caption.", prose_heading["markdown"])
+        self.assertNotIn("Later", prose_heading["markdown"])
+        self.assertEqual(len(prose_heading["svg_omissions"]), 1)
+        with self.assertRaises(agent_live.LiveBridgeError):
+            self.client.read_tab(self.active_id, heading="", window_id=self.window_id)
         with self.assertRaises(agent_live.LiveBridgeError):
             self._call_with_qt_pump(lambda: self.client.read_tab(
                 self.active_id, heading="missing heading", window_id=self.window_id))

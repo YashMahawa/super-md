@@ -61,6 +61,7 @@ class BackgroundService(QObject):
         if not studio.backgroundEnabled or has_other:
             studio.stop()
             if hasattr(studio,'pool'):studio.pool.shutdown(wait=False,cancel_futures=True)
+            if hasattr(studio,'_search_pool'):studio._search_pool.shutdown(wait=False,cancel_futures=True)
             if studios is not None and studio in studios:studios.remove(studio)
             if engines is not None and engine is not None and engine in engines:engines.remove(engine)
             if engine is not None and hasattr(engine,'deleteLater'):engine.deleteLater()
@@ -106,7 +107,10 @@ class BackgroundService(QObject):
                 if prefs_changed and hasattr(open_windows[0],'_preferences'):open_windows[0]._preferences()
                 self.disable()
                 return {'ok':True,'running':False,'stopped':running,'quitRequested':False}
-            self._cli_started_agent_access=False;self._stopping_from_cli=True;self.quitting=True
+            if self._cli_started_agent_access:
+                self._cli_started_agent_access=False
+                if isinstance(settings,dict):settings['agentAccessEnabled']=False
+            self._stopping_from_cli=True;self.quitting=True
             if bridge is not None:bridge.stop()
             self.disable();self._notify_windows();self.quit()
             return {'ok':True,'running':False,'stopped':True,'quitRequested':True}

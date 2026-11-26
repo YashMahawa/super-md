@@ -29,6 +29,10 @@ def main(argv):
     args=parser.parse_args(argv)
     from PySide6.QtCore import QCoreApplication,QLockFile,QStandardPaths
     from PySide6.QtNetwork import QLocalSocket
+    try:
+        from .instance import is_process_exit_clear,posix_ipc_exchange
+    except ImportError:
+        from instance import is_process_exit_clear,posix_ipc_exchange
     app=QCoreApplication.instance() or QCoreApplication(['super-md'])
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
     root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
@@ -40,32 +44,46 @@ def main(argv):
             probe.unlock();return False
         return True
     def _process_exit_clear():
-        try:
-            from .instance import is_process_exit_clear
-        except ImportError:
-            from instance import is_process_exit_clear
         return is_process_exit_clear(root)
+    def _probe_still_listening():
+        if os.name!='nt':
+            connected,_,_=posix_ipc_exchange(name,b'{"service":"status"}\n',connect_timeout=.1,read_timeout=.1)
+            return connected
+        probe=QLocalSocket();probe.connectToServer(name)
+        still=probe.waitForConnected(100)
+        if still:
+            probe.write(b'{"service":"status"}\n');probe.flush();probe.waitForBytesWritten(100)
+            ack=bytes(probe.readAll())
+            while b'\n' not in ack and probe.waitForReadyRead(100):ack+=bytes(probe.readAll())
+            probe.disconnectFromServer()
+        return still
     def request(action,*,startup_poll=False):
         wire_action='quit' if action=='stop' else action
-        socket=QLocalSocket();socket.connectToServer(name)
-        if not socket.waitForConnected(1000):return None
-        socket.write(json.dumps({'service':wire_action}).encode('utf-8')+b'\n');socket.flush();socket.waitForBytesWritten(1000)
-        read_timeout=3000 if startup_poll else 2000
-        raw=bytes(socket.readAll())
-        while b'\n' not in raw and socket.waitForReadyRead(read_timeout):raw+=bytes(socket.readAll())
-        if b'\n' not in raw:raw+=bytes(socket.readAll())
-        if not raw and socket.state()==QLocalSocket.LocalSocketState.ConnectedState:
-            socket.waitForDisconnected(50)
-        peer_closed=(
-            socket.state() in (QLocalSocket.LocalSocketState.UnconnectedState,QLocalSocket.LocalSocketState.ClosingState)
-            or socket.error() in (
-                QLocalSocket.LocalSocketError.PeerClosedError,
-                QLocalSocket.LocalSocketError.ConnectionError,
-                QLocalSocket.LocalSocketError.ServerNotFoundError,
-                QLocalSocket.LocalSocketError.ConnectionRefusedError,
+        payload=json.dumps({'service':wire_action}).encode('utf-8')+b'\n'
+        read_timeout_sec=5.0 if startup_poll else 2.0
+        if os.name!='nt':
+            connected,raw,peer_closed=posix_ipc_exchange(name,payload,connect_timeout=1.0,read_timeout=read_timeout_sec)
+            if not connected:return None
+        else:
+            socket=QLocalSocket();socket.connectToServer(name)
+            if not socket.waitForConnected(1000):return None
+            socket.write(payload);socket.flush();socket.waitForBytesWritten(1000)
+            read_timeout=int(read_timeout_sec*1000)
+            raw=bytes(socket.readAll())
+            while b'\n' not in raw and socket.waitForReadyRead(read_timeout):raw+=bytes(socket.readAll())
+            if b'\n' not in raw:raw+=bytes(socket.readAll())
+            if not raw and socket.state()==QLocalSocket.LocalSocketState.ConnectedState:
+                socket.waitForDisconnected(50)
+            peer_closed=(
+                socket.state() in (QLocalSocket.LocalSocketState.UnconnectedState,QLocalSocket.LocalSocketState.ClosingState)
+                or socket.error() in (
+                    QLocalSocket.LocalSocketError.PeerClosedError,
+                    QLocalSocket.LocalSocketError.ConnectionError,
+                    QLocalSocket.LocalSocketError.ServerNotFoundError,
+                    QLocalSocket.LocalSocketError.ConnectionRefusedError,
+                )
             )
-        )
-        socket.disconnectFromServer()
+            socket.disconnectFromServer()
         if not raw:
             if peer_closed or startup_poll:return None
             raise ValueError('Existing Super MD instance did not respond to service request')
@@ -86,13 +104,7 @@ def main(argv):
                 vanish_deadline=time.monotonic()+1.5
                 still_listening=True
                 while still_listening and not _instance_lock_held() and time.monotonic()<vanish_deadline:
-                    probe=QLocalSocket();probe.connectToServer(name)
-                    still_listening=probe.waitForConnected(100)
-                    if still_listening:
-                        probe.write(b'{"service":"status"}\n');probe.flush();probe.waitForBytesWritten(100)
-                        ack=bytes(probe.readAll())
-                        while b'\n' not in ack and probe.waitForReadyRead(100):ack+=bytes(probe.readAll())
-                        probe.disconnectFromServer()
+                    still_listening=_probe_still_listening()
                     if still_listening:time.sleep(.05)
                 if still_listening and not _instance_lock_held():raise
                 reply=None

@@ -631,8 +631,9 @@ class BackgroundTests(unittest.TestCase):
 
 
 _HEADLESS_DAEMON_BOOTSTRAP = """
-import os, sys, time
+import faulthandler, os, sys, time
 from pathlib import Path
+faulthandler.enable()
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
@@ -1974,6 +1975,34 @@ desktop_main._exit_process(rc)""",
                 )
             self.assertEqual(status_res["code"], 0, status_res)
             self.assertEqual(json.loads(status_res["stdout"])["ok"], True)
+
+            # Pre-#41 QLocalSocket clients (in a separate CLI process) must also interoperate directly over the shared socket path.
+            legacy_probe_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; from PySide6.QtCore import QCoreApplication; "
+                        "from PySide6.QtNetwork import QLocalSocket; "
+                        "app = QCoreApplication(['probe']); s = QLocalSocket(); "
+                        "s.connectToServer(sys.argv[1]); assert s.waitForConnected(2000); "
+                        "s.write(b'{\"service\":\"status\"}\\n'); s.flush(); s.waitForBytesWritten(1000); "
+                        "raw = bytes(s.readAll()); "
+                        "raw = raw if b'\\n' in raw else (raw + (bytes(s.readAll()) if s.waitForReadyRead(2000) else b'')); "
+                        "s.disconnectFromServer(); sys.stdout.buffer.write(raw)"
+                    ),
+                    deferred_broker.name,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            qlocal_deadline = time.monotonic() + 5.0
+            while legacy_probe_proc.poll() is None and time.monotonic() < qlocal_deadline:
+                self.qt_app.processEvents()
+                time.sleep(0.005)
+            qlocal_out, qlocal_err = legacy_probe_proc.communicate(timeout=2.0)
+            self.assertEqual(legacy_probe_proc.returncode, 0, qlocal_err.decode("utf-8", errors="replace"))
+            self.assertEqual(json.loads(qlocal_out.decode("utf-8")).get("ok"), True)
 
             # Intentional server.close() (empty errorString) must stay closed until stop_accepting/close.
             deferred_broker.server.close()
