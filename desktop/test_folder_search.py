@@ -62,17 +62,22 @@ def _webengine_e2e_probe() -> int:
     from PySide6.QtQuick import QQuickItem, QQuickWindow  # noqa: F401
     from PySide6.QtQuickControls2 import QQuickStyle
     from PySide6.QtTest import QTest
+    from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
     from PySide6.QtWidgets import QApplication
 
-    QQuickStyle.setStyle("Material")
-    QtWebEngineQuick.initialize()
-    app = QApplication(["Super MD folder search probe"])
-
     root = Path(__file__).resolve().parent
     sys.path.insert(0, str(root))
+    from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
     from studio import Session
     from test_studio import QuietStudio
+
+    QQuickStyle.setStyle("Material")
+    register_reader_schemes()
+    QtWebEngineQuick.initialize()
+    app = QApplication(["Super MD folder search probe"])
+    bundle_handler = ReaderBundleSchemeHandler(root.parent / "dist", app)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
 
     with tempfile.TemporaryDirectory(prefix="supermd-search-e2e-") as temp_dir:
         resolved_temp = Path(temp_dir).resolve()
@@ -102,7 +107,7 @@ def _webengine_e2e_probe() -> int:
             raise RuntimeError("Qt WebChannel runtime unavailable")
         engine = QQmlApplicationEngine()
         engine.rootContext().setContextProperty("studio", studio)
-        engine.rootContext().setContextProperty("readerUrl", QUrl.fromLocalFile(str(root.parent / "dist" / "qt-reader.html")))
+        engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
         engine.rootContext().setContextProperty("channelScript", bytes(channel.readAll()).decode())
         engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(root.parent / "public" / "brand-mark-fixed.svg")))
         engine.load(QUrl.fromLocalFile(str(root / "qml" / "Main.qml")))
