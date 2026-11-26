@@ -1,7 +1,10 @@
 package dev.supermd.studio
 
+import android.content.ContentResolver
+import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
+import androidx.documentfile.provider.DocumentFile
 
 internal val WORKSPACE_NOTE_EXTENSIONS = listOf("md", "smd", "fmd", "markdown", "txt")
 
@@ -9,6 +12,15 @@ data class PendingHeadingJump(
     val noteId: String,
     val heading: String,
     val token: String,
+)
+
+data class WorkspaceFolderPrompt(
+    val noteId: String,
+    val noteName: String,
+    val initialUri: Uri,
+    val target: String,
+    val fragment: String,
+    val wikilink: Boolean,
 )
 
 internal enum class ReaderUrlDecision {
@@ -44,6 +56,101 @@ internal data class WorkspaceResolvedNote(
     val name: String,
     val relative: String,
 )
+
+internal data class WorkspaceTreeChild(
+    val documentId: String,
+    val name: String,
+    val uri: Uri,
+    val isDirectory: Boolean,
+    val isVirtualOrLink: Boolean = false,
+)
+
+internal interface WorkspaceTreeLister {
+    fun rootDocumentId(treeUri: Uri): String
+    fun listChildren(treeUri: Uri, parentDocumentId: String): List<WorkspaceTreeChild>
+}
+
+internal class ContentResolverTreeLister(private val context: Context) : WorkspaceTreeLister {
+    private val resolver: ContentResolver get() = context.contentResolver
+
+    override fun rootDocumentId(treeUri: Uri): String = DocumentsContract.getTreeDocumentId(treeUri)
+
+    override fun listChildren(treeUri: Uri, parentDocumentId: String): List<WorkspaceTreeChild> {
+        val childrenUri = runCatching {
+            DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
+        }.getOrNull()
+        if (childrenUri != null) {
+            val queried = try {
+                val results = mutableListOf<WorkspaceTreeChild>()
+                resolver.query(
+                    childrenUri,
+                    arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE,
+                        DocumentsContract.Document.COLUMN_FLAGS,
+                    ),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor ->
+                    val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                    val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                    val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                    val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+                    while (cursor.moveToNext()) {
+                        val docId = if (idIdx >= 0 && !cursor.isNull(idIdx)) cursor.getString(idIdx) else continue
+                        val name = if (nameIdx >= 0 && !cursor.isNull(nameIdx)) cursor.getString(nameIdx) else continue
+                        if (name.isNullOrBlank()) continue
+                        val mime = if (mimeIdx >= 0 && !cursor.isNull(mimeIdx)) cursor.getString(mimeIdx) else ""
+                        val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
+                        val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                        val isVirtual = (flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0
+                        val childUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                        results += WorkspaceTreeChild(
+                            documentId = docId,
+                            name = name,
+                            uri = childUri,
+                            isDirectory = isDir,
+                            isVirtualOrLink = isVirtual,
+                        )
+                    }
+                    results
+                }
+            } catch (security: SecurityException) {
+                throw security
+            } catch (_: Exception) {
+                null
+            }
+            if (queried != null) return queried
+        }
+
+        // Fallback for providers that only expose DocumentFile traversal.
+        val root = DocumentFile.fromTreeUri(context, treeUri) ?: return emptyList()
+        val targetDir = if (parentDocumentId == rootDocumentId(treeUri)) {
+            root
+        } else {
+            val rootId = rootDocumentId(treeUri)
+            val rel = extractRelativeFromDocId(rootId, parentDocumentId) ?: return emptyList()
+            var current: DocumentFile = root
+            for (part in rel.split('/').filter { it.isNotEmpty() }) {
+                current = current.findFile(part) ?: return emptyList()
+            }
+            current
+        }
+        return targetDir.listFiles().mapNotNull { file ->
+            val name = file.name?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val docId = runCatching { DocumentsContract.getDocumentId(file.uri) }.getOrDefault(name)
+            WorkspaceTreeChild(
+                documentId = docId,
+                name = name,
+                uri = file.uri,
+                isDirectory = file.isDirectory,
+                isVirtualOrLink = file.isVirtual,
+            )
+        }
+    }
+}
 
 internal fun extractRelativeFromDocId(rootId: String, documentId: String): String? = when {
     documentId == rootId -> ""
@@ -175,4 +282,288 @@ internal fun resolveLocalFileWorkspaceLink(
         )
     }
     throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+}
+
+private fun extensionPriority(extLower: String): Int {
+    val idx = WORKSPACE_NOTE_EXTENSIONS.indexOf(extLower)
+    return if (idx >= 0) idx else WORKSPACE_NOTE_EXTENSIONS.size
+}
+
+/**
+ * Bounded, in-memory cache of notes inside a granted SAF tree.
+ * Never writes index files or hidden metadata to disk.
+ */
+internal class WorkspaceLinkCache(
+    private val lister: WorkspaceTreeLister,
+    private val maxFiles: Int = MAX_SCAN_FILES,
+    private val maxDirectories: Int = MAX_SCAN_DIRECTORIES,
+    private val maxDepth: Int = MAX_SCAN_DEPTH,
+    private val ttlMillis: Long = CACHE_TTL_MILLIS,
+    private val clock: () -> Long = System::currentTimeMillis,
+) {
+    private data class IndexedEntry(
+        val uri: Uri,
+        val documentId: String,
+        val name: String,
+        val stem: String,
+        val stemLower: String,
+        val extLower: String,
+        val relative: String,
+        val relativeLower: String,
+        val relativeWithoutExt: String,
+        val relativeWithoutExtLower: String,
+        val depth: Int,
+    )
+
+    private data class CachedTree(
+        val treeKey: String,
+        val builtAtMillis: Long,
+        val entries: List<IndexedEntry>,
+        val byRelativeExact: Map<String, IndexedEntry>,
+        val byRelativeLower: Map<String, IndexedEntry>,
+    )
+
+    @Volatile
+    private var cached: CachedTree? = null
+    private val lock = Any()
+
+    fun invalidate() {
+        synchronized(lock) {
+            cached = null
+        }
+    }
+
+    /**
+     * Determines the note's relative path inside `treeUri` (e.g. `"sub/Note.md"`),
+     * or `null` if `noteUri` does not belong to `treeUri`.
+     */
+    fun noteRelativeInTree(treeUri: Uri, noteUri: Uri, knownRelative: String? = null): String? {
+        if (noteUri.scheme == "content" && treeUri.scheme == "content" && noteUri.authority == treeUri.authority) {
+            val rootId = runCatching { lister.rootDocumentId(treeUri) }.getOrNull()
+            val docId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrNull()
+            if (rootId != null && docId != null) {
+                extractRelativeFromDocId(rootId, docId)?.takeIf { it.isNotEmpty() }?.let { return it }
+            }
+        }
+        val index = ensureIndexed(treeUri)
+        if (!knownRelative.isNullOrBlank()) {
+            val cleaned = knownRelative.trim('/')
+            index.byRelativeExact[cleaned]?.takeIf { sameDocument(it.uri, noteUri) }?.let { return it.relative }
+            index.byRelativeLower[cleaned.lowercase()]?.takeIf { sameDocument(it.uri, noteUri) }?.let { return it.relative }
+        }
+        return index.entries.firstOrNull { sameDocument(it.uri, noteUri) }?.relative
+    }
+
+    fun resolve(
+        treeUri: Uri,
+        noteRelative: String?,
+        rawTarget: String,
+        wikilink: Boolean,
+    ): WorkspaceResolvedNote =
+        resolveCandidates(treeUri, noteRelative, rawTarget, wikilink).first()
+
+    fun resolveCandidates(
+        treeUri: Uri,
+        noteRelative: String?,
+        rawTarget: String,
+        wikilink: Boolean,
+    ): List<WorkspaceResolvedNote> {
+        val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
+        val noteParentDir = noteRelative?.let { if ('/' in it) it.substringBeforeLast('/') else "" }
+        if (isExplicitRelativeWorkspaceTarget(cleaned, wikilink)) {
+            if (noteRelative == null) {
+                throw WorkspaceLinkException("Choose the folder containing this note to follow relative links.")
+            }
+            val parentRelative = noteParentDir ?: ""
+            val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
+            val index = ensureIndexed(treeUri)
+            val found = ArrayList<WorkspaceResolvedNote>(2)
+            for (parts in candidateLists) {
+                resolveRelativeCandidate(index, parts.joinToString("/"))?.let { candidate ->
+                    if (found.none { it.relative == candidate.relative }) found += candidate
+                }
+            }
+            if (found.isNotEmpty()) return found
+            throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+        }
+
+        // Wikilink resolution (sibling, root, or ranked basename/subpath inside the granted folder)
+        val parts = workspaceRelativePathParts("", cleaned)
+        val normalizedQuery = parts.joinToString("/")
+        val queryLower = normalizedQuery.lowercase()
+        val (_, queryExt) = splitWorkspaceNameAndExt(parts.last())
+        val hasKnownNoteExt = queryExt in WORKSPACE_NOTE_EXTENSIONS
+        val index = ensureIndexed(treeUri)
+        val ordered = LinkedHashMap<String, WorkspaceResolvedNote>()
+
+        if (noteParentDir != null) {
+            val siblingRel = if (noteParentDir.isEmpty()) normalizedQuery else "$noteParentDir/$normalizedQuery"
+            resolveRelativeCandidate(index, siblingRel, exactOnly = true)?.let { ordered.putIfAbsent(it.relative, it) }
+        }
+
+        if (parts.size > 1) {
+            resolveRelativeCandidate(index, normalizedQuery, exactOnly = true)?.let { ordered.putIfAbsent(it.relative, it) }
+            val suffixMatches = index.entries.filter { entry ->
+                if (hasKnownNoteExt) {
+                    entry.relativeLower == queryLower ||
+                        entry.relativeLower.endsWith("/$queryLower")
+                } else {
+                    entry.relativeWithoutExtLower == queryLower ||
+                        entry.relativeWithoutExtLower.endsWith("/$queryLower")
+                }
+            }
+            for (entry in rankMatches(suffixMatches, noteParentDir) { entry ->
+                if (hasKnownNoteExt) {
+                    entry.relative == normalizedQuery || entry.relative.endsWith("/$normalizedQuery")
+                } else {
+                    entry.relativeWithoutExt == normalizedQuery || entry.relativeWithoutExt.endsWith("/$normalizedQuery")
+                }
+            }) {
+                ordered.putIfAbsent(entry.relative, entry.toResolved())
+            }
+            if (ordered.isNotEmpty()) return ordered.values.toList()
+            throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
+        }
+
+        val targetSegment = parts.single()
+        val targetNameLower = targetSegment.lowercase()
+        val matches = index.entries.filter { entry ->
+            if (hasKnownNoteExt) {
+                entry.name.lowercase() == targetNameLower
+            } else {
+                entry.stemLower == targetNameLower || entry.name.lowercase() == targetNameLower
+            }
+        }
+        for (entry in rankMatches(matches, noteParentDir) { entry ->
+            if (hasKnownNoteExt) entry.name == targetSegment else entry.stem == targetSegment
+        }) {
+            ordered.putIfAbsent(entry.relative, entry.toResolved())
+        }
+        if (ordered.isNotEmpty()) return ordered.values.toList()
+        throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
+    }
+
+    private fun resolveRelativeCandidate(
+        index: CachedTree,
+        candidateRel: String,
+        exactOnly: Boolean = false,
+    ): WorkspaceResolvedNote? {
+        index.byRelativeExact[candidateRel]?.let { return it.toResolved() }
+        if (!exactOnly) {
+            index.byRelativeLower[candidateRel.lowercase()]?.let { return it.toResolved() }
+        }
+        val (_, ext) = splitWorkspaceNameAndExt(candidateRel.substringAfterLast('/'))
+        if (ext !in WORKSPACE_NOTE_EXTENSIONS) {
+            for (noteExt in WORKSPACE_NOTE_EXTENSIONS) {
+                val withExt = "$candidateRel.$noteExt"
+                index.byRelativeExact[withExt]?.let { return it.toResolved() }
+                if (!exactOnly) {
+                    index.byRelativeLower[withExt.lowercase()]?.let { return it.toResolved() }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun rankMatches(
+        matches: List<IndexedEntry>,
+        noteParentDir: String?,
+        exactCasePredicate: (IndexedEntry) -> Boolean,
+    ): List<IndexedEntry> =
+        matches.sortedWith(
+            compareBy<IndexedEntry> { if (exactCasePredicate(it)) 0 else 1 }
+                .thenBy { entry ->
+                    val entryDir = if ('/' in entry.relative) entry.relative.substringBeforeLast('/') else ""
+                    if (noteParentDir != null && entryDir.equals(noteParentDir, ignoreCase = true)) 0 else 1
+                }
+                .thenBy { it.depth }
+                .thenBy { extensionPriority(it.extLower) }
+                .thenBy { it.relativeLower }
+                .thenBy { it.relative },
+        )
+
+    private fun IndexedEntry.toResolved() = WorkspaceResolvedNote(uri = uri, name = name, relative = relative)
+
+    private fun ensureIndexed(treeUri: Uri): CachedTree {
+        val key = treeUri.toString()
+        val now = clock()
+        cached?.takeIf { it.treeKey == key && now - it.builtAtMillis in 0..ttlMillis }?.let { return it }
+        synchronized(lock) {
+            val againNow = clock()
+            cached?.takeIf { it.treeKey == key && againNow - it.builtAtMillis in 0..ttlMillis }?.let { return it }
+            val built = scanTree(treeUri, key, againNow)
+            cached = built
+            return built
+        }
+    }
+
+    private fun scanTree(treeUri: Uri, treeKey: String, now: Long): CachedTree {
+        val rootDocId = lister.rootDocumentId(treeUri)
+        val entries = ArrayList<IndexedEntry>()
+        val byExact = LinkedHashMap<String, IndexedEntry>()
+        val byLower = LinkedHashMap<String, IndexedEntry>()
+        val queue = ArrayDeque<Triple<String, String, Int>>()
+        queue.addLast(Triple(rootDocId, "", 0))
+        val visitedDirs = HashSet<String>()
+        visitedDirs.add(rootDocId)
+        var scannedDirs = 0
+
+        while (queue.isNotEmpty() && scannedDirs < maxDirectories && entries.size < maxFiles) {
+            val (dirDocId, prefix, depth) = queue.removeFirst()
+            scannedDirs++
+            val children = (if (depth == 0) {
+                lister.listChildren(treeUri, dirDocId)
+            } else {
+                runCatching { lister.listChildren(treeUri, dirDocId) }.getOrDefault(emptyList())
+            }).sortedWith(compareBy<WorkspaceTreeChild> { it.name.lowercase() }.thenBy { it.name })
+            for (child in children) {
+                val name = child.name
+                if (name.isBlank() || name.startsWith('.') || child.isVirtualOrLink) continue
+                if (name.contains('/') || name.contains('\\') || name.contains('\u0000')) continue
+                val relative = if (prefix.isEmpty()) name else "$prefix/$name"
+                if (child.isDirectory) {
+                    if (depth + 1 <= maxDepth && visitedDirs.add(child.documentId) && scannedDirs + queue.size < maxDirectories) {
+                        queue.addLast(Triple(child.documentId, relative, depth + 1))
+                    }
+                } else {
+                    if (entries.size >= maxFiles) break
+                    val (stem, ext) = splitWorkspaceNameAndExt(name)
+                    if (ext !in WORKSPACE_NOTE_EXTENSIONS) continue
+                    val relativeLower = relative.lowercase()
+                    val withoutExt = if (prefix.isEmpty()) stem else "$prefix/$stem"
+                    val entry = IndexedEntry(
+                        uri = child.uri,
+                        documentId = child.documentId,
+                        name = name,
+                        stem = stem,
+                        stemLower = stem.lowercase(),
+                        extLower = ext,
+                        relative = relative,
+                        relativeLower = relativeLower,
+                        relativeWithoutExt = withoutExt,
+                        relativeWithoutExtLower = withoutExt.lowercase(),
+                        depth = depth,
+                    )
+                    entries += entry
+                    byExact.putIfAbsent(relative, entry)
+                    byLower.putIfAbsent(relativeLower, entry)
+                }
+            }
+        }
+
+        return CachedTree(
+            treeKey = treeKey,
+            builtAtMillis = now,
+            entries = entries,
+            byRelativeExact = byExact,
+            byRelativeLower = byLower,
+        )
+    }
+
+    companion object {
+        const val MAX_SCAN_FILES = 6_000
+        const val MAX_SCAN_DIRECTORIES = 2_000
+        const val MAX_SCAN_DEPTH = 16
+        const val CACHE_TTL_MILLIS = 5_000L
+    }
 }
