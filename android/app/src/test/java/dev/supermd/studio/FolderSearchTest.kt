@@ -500,11 +500,11 @@ class FolderSearchTest {
         composeRule.onNodeWithText("Close").performClick()
         assertFalse(modalOpen)
 
+        composeRule.onNodeWithContentDescription("Find in note").assertIsDisplayed()
         composeRule.onNode(hasText("Search across notes") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
         assertEquals(1, folderSearchClicks)
 
         composeRule.onNodeWithContentDescription("More actions").performClick()
-        composeRule.onNode(hasText("Search across notes") and hasAnyAncestor(isPopup())).assertIsDisplayed().performClick()
-        assertEquals(2, folderSearchClicks)
+        assertEquals(0, composeRule.onAllNodes(hasText("Search across notes") and hasAnyAncestor(isPopup())).fetchSemanticsNodes().size)
     }
 }

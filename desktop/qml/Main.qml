@@ -424,7 +424,6 @@ ApplicationWindow {
                     }
                 }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
-                ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Search across notes", "search_folder"); onClicked: studio.openFolderSearch() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -436,7 +435,6 @@ ApplicationWindow {
                         implicitWidth: 250
                         NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.reopen_tab || "") : ""; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
                         NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.save_as || "") : ""; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
-                        NoteMenuItem { objectName: "compactSearchFolderAction"; text: "Search across notes"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.search_folder || "") : ""; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
                         NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; actionVisible: window.width < 1060; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
