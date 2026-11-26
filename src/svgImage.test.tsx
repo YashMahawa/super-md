@@ -44,4 +44,40 @@ describe("inline SVG", () => {
     expect(html, html).toContain("svg-diagram");
     expect(html).not.toContain("&lt;circle");
   });
+  it("rejects SMIL href animations, external CSS url() references, and invalid SVG data URIs in notes", async () => {
+    expect(() => presentSvg('<svg><animate attributeName="href" to="https://evil.example"/></svg>', "#fff")).toThrow();
+    expect(() => presentSvg('<svg><rect style="fill:url(/local/secret.svg#p)"/></svg>', "#fff")).toThrow();
+    expect(() => presentSvg('<svg><style>.a{background:url(supermdasset://token)}</style></svg>', "#fff")).toThrow();
+    expect(presentSvg('<svg viewBox="0 0 10 10"><defs><linearGradient id="g"><stop stop-color="#123"/></linearGradient></defs><rect width="4" height="4" fill="url(#g)"/></svg>', "#fff").mode).toBe("color");
+
+    const badUri = "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg"><script>evil()</script></svg>');
+    const html = renderToStaticMarkup(<MarkdownPreview documentPath={null} python="" dark={false} markdown={`![Malicious](${badUri})`} />);
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("evil()");
+
+    const { createRoot } = await import("react-dom/client");
+    const { act } = await import("react");
+    (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
+    const prevBridge = window.SuperMD;
+    window.SuperMD = {
+      post: (id, command) => {
+        queueMicrotask(() => {
+          window.supermdReply?.(id, command === "load_asset" ? badUri : null, null);
+        });
+      },
+    };
+    const host = document.createElement("div");
+    const root = createRoot(host);
+    try {
+      await act(async () => {
+        root.render(<MarkdownPreview documentPath="/tmp/note.md" python="" dark={false} markdown="![Bad local SVG](diagram.svg)" />);
+        await new Promise(resolve => setTimeout(resolve, 25));
+      });
+      expect(host.querySelector(".image-error")?.textContent).toContain("Image unavailable");
+      expect(host.querySelector("img")).toBeNull();
+    } finally {
+      await act(async () => root.unmount());
+      window.SuperMD = prevBridge;
+    }
+  });
 });

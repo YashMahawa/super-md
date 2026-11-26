@@ -138,7 +138,10 @@ class MainActivity : ComponentActivity() {
     )
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
-    var openReaderFind: (() -> Unit)? = null
+    var openReaderFind: ((Boolean) -> Unit)? = null
+    var stepReaderFind: ((Int) -> Unit)? = null
+    var formatDocument: ((String) -> Unit)? = null
+    var canFormatEditor: (() -> Boolean)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
@@ -166,23 +169,54 @@ class MainActivity : ComponentActivity() {
         // Create this task's workspace before RESUMED/lifecycle consumers can
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
-        intent?.data?.let(windowModel::retainDocumentAccess)
         setContent { Studio(windowModel, this) }
         val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
         if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
-            intent?.data?.let { uri ->
-                if (savedInstanceState == null || windowModel.state.value.let { state ->
-                        state.tabs.none { it.uri == uri.toString() } && state.closedTabs.none { it.uri == uri.toString() }
-                    }) {
-                    windowModel.requestInitialOpen(uri)
-                }
-            }
+            handleExternalDocumentIntent(intent, savedInstanceState, initial = true, targetModel = windowModel)
         }
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        intent.data?.let { requestOpen(it) }
+        handleExternalDocumentIntent(intent, savedInstanceState = null, initial = false, targetModel = model)
+    }
+    private fun handleExternalDocumentIntent(
+        incoming: Intent?,
+        savedInstanceState: Bundle?,
+        initial: Boolean,
+        targetModel: StudioViewModel,
+    ) {
+        val caller = resolveExternalIntentCaller(incoming, initial)
+        ExternalDocumentEntryGuard.dispatchIncomingIntent(this, incoming, savedInstanceState, initial, targetModel, caller)
+    }
+    private fun resolveExternalIntentCaller(incoming: Intent?, initial: Boolean): ExternalIntentCaller {
+        val uri = incoming?.data
+        val isOwnShareUri = uri != null &&
+            uri.scheme.equals("content", ignoreCase = true) &&
+            uri.authority == "${packageName}.share"
+        if (Build.VERSION.SDK_INT >= 35) {
+            val caller = runCatching { currentCaller }.getOrNull()?.takeIf { it.uid > 0 }
+                ?: if (initial) runCatching { initialCaller }.getOrNull()?.takeIf { it.uid > 0 } else null
+            if (caller != null) {
+                val grantedShare = isOwnShareUri && runCatching {
+                    caller.checkContentUriPermission(uri!!, Intent.FLAG_GRANT_READ_URI_PERMISSION) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                }.getOrDefault(false)
+                return ExternalIntentCaller(uid = caller.uid, callerGrantedOwnShareUri = grantedShare)
+            }
+        }
+        if (initial && Build.VERSION.SDK_INT >= 34) {
+            val launchedUid = runCatching { launchedFromUid }.getOrDefault(-1)
+            if (launchedUid > 0) {
+                val grantedShare = isOwnShareUri && (
+                    launchedUid == android.os.Process.myUid() ||
+                        checkUriPermission(uri!!, -1, launchedUid, Intent.FLAG_GRANT_READ_URI_PERMISSION) ==
+                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                    )
+                return ExternalIntentCaller(uid = launchedUid, callerGrantedOwnShareUri = grantedShare)
+            }
+        }
+        return ExternalIntentCaller()
     }
     fun requestOpen(uri: android.net.Uri, relative: String? = null) {
         model.retainDocumentAccess(uri)
@@ -423,8 +457,27 @@ class MainActivity : ComponentActivity() {
         }
     }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
+        if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+            if (canFormatEditor?.invoke() == true) {
+                val formatAction = markdownFormatActionForKey(
+                    keyCode = event.keyCode,
+                    isCtrlPressed = event.isCtrlPressed,
+                    isShiftPressed = event.isShiftPressed,
+                    isAltPressed = event.isAltPressed,
+                    isMetaPressed = event.isMetaPressed,
+                )
+                if (formatAction != null) {
+                    if (event.repeatCount == 0) formatDocument?.invoke(formatAction)
+                    return true
+                }
+            }
+        }
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_F3 && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) {
+                if (!model.folderSearch.value.visible) stepReaderFind?.invoke(if (event.isShiftPressed) -1 else 1)
+                return true
+            }
             if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE) {
                 if (model.folderSearch.value.visible) {
                     model.cancelWorkspaceSearch()
@@ -438,7 +491,11 @@ class MainActivity : ComponentActivity() {
             val primaryMod = event.isCtrlPressed || event.isMetaPressed
             if (primaryMod && !event.isAltPressed) {
                 if (event.keyCode == android.view.KeyEvent.KEYCODE_F) {
-                    if (event.isShiftPressed) model.openFolderSearch() else openReaderFind?.invoke()
+                    if (event.isShiftPressed) model.openFolderSearch() else openReaderFind?.invoke(false)
+                    return true
+                }
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_H && !event.isShiftPressed) {
+                    openReaderFind?.invoke(true)
                     return true
                 }
                 if (event.keyCode == android.view.KeyEvent.KEYCODE_S) {
@@ -532,6 +589,7 @@ private object NoMotionScheme : MotionScheme {
     var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var findRequest by remember { mutableIntStateOf(0) }
+    var findReplace by remember { mutableStateOf(false) }
     var renaming by rememberSaveable {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
     var readingChromeVisible by remember {mutableStateOf(true)}
@@ -596,15 +654,24 @@ private object NoMotionScheme : MotionScheme {
         }
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
-        activity.openReaderFind = {
+        activity.openReaderFind = { replace ->
             menu = false
+            findReplace = replace
             findRequest++
         }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
+        activity.stepReaderFind = { direction ->
+            menu = false
+            web?.let { reader ->
+                reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFindStep?.(${if (direction < 0) -1 else 1}); true", null)
+            }
+        }
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;activity.stepReaderFind=null;model.assetAccessRestored=null }
     }
     LaunchedEffect(findRequest, menu, web) {
         if (findRequest == 0 || menu) return@LaunchedEffect
         val requested = findRequest
+        val replace = findReplace
         // Wait for the popup window to release native focus before asking the
         // WebView for focus. This follows the actual dismissal instead of
         // estimating its transition duration.
@@ -612,8 +679,9 @@ private object NoMotionScheme : MotionScheme {
         reader.awaitWindowFocus()
         if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
         findRequest = 0
+        findReplace = false
         reader.requestFocus(View.FOCUS_DOWN)
-        reader.evaluateJavascript("window.supermdFind?.(); true") {
+        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
             reader.post {
                 reader.requestFocus(View.FOCUS_DOWN)
                 val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
@@ -641,7 +709,16 @@ private object NoMotionScheme : MotionScheme {
         onDispose { model.readerFlushRequester = null }
     }
     DisposableEffect(activity, model, readerReady) {
-        val handler = if (readerReady) OpenIntentDispatcher.Handler<android.net.Uri> { uri, relative -> model.open(uri, relative) } else null
+        val handler = if (readerReady) {
+            OpenIntentDispatcher.Handler<OpenDocumentTarget> { target, relative ->
+                model.openDocument(
+                    target.uri,
+                    relative,
+                    externalIntentFlags = target.externalIntentFlags,
+                    externalCaller = target.externalCaller,
+                )
+            }
+        } else null
         model.attachReaderOpenHandler(handler)
         onDispose { if (handler != null) model.detachReaderOpenHandler(handler) }
     }
@@ -1074,6 +1151,27 @@ private object NoMotionScheme : MotionScheme {
         val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
+        val imeVisible = WindowInsets.ime.getBottom(density) > 0
+        val modalOpen = settings || exporting || renaming || contentsShown || folderSearch.visible || drawer.isOpen || (!accessPickerShowing && accessRequest != null) || state.pendingCloseNote != null || state.pendingSaveConflictNote != null || state.error != null || !state.welcomed
+        val showFormattingBar = shouldShowKeyboardFormattingBar(actualMode, imeVisible, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        val triggerFormat = rememberUpdatedState<(String) -> Unit> { action ->
+            val reader = web
+            if (reader != null && readerReady) {
+                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFormat?.(${JSONObject.quote(action)}); true", null)
+            }
+        }
+        val canFormatNow = rememberUpdatedState {
+            canTriggerHardwareFormatShortcut(actualMode, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        }
+        DisposableEffect(activity) {
+            activity.formatDocument = { action -> triggerFormat.value(action) }
+            activity.canFormatEditor = { canFormatNow.value() }
+            onDispose {
+                activity.formatDocument = null
+                activity.canFormatEditor = null
+            }
+        }
         val readerContent=remember {arrayOfNulls<String>(1)}
         LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
@@ -1183,7 +1281,7 @@ private object NoMotionScheme : MotionScheme {
                                 }
                             },
                             onFolderSearch = { model.openFolderSearch() },
-                            onFind = { activity.openReaderFind?.invoke() },
+                            onFind = { activity.openReaderFind?.invoke(false) },
                             onSave = saveAction,
                             onExport = { sharing = false; exporting = true },
                             onToggleFullscreen = { model.fullscreen(!state.fullscreen) },
@@ -1223,7 +1321,7 @@ private object NoMotionScheme : MotionScheme {
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
-                Box(Modifier.fillMaxSize()) {
+                Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
                     key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         clipChildren = true
@@ -1242,6 +1340,7 @@ private object NoMotionScheme : MotionScheme {
                                 if (wasCurrent) {
                                     readerReady = false
                                     readerPdfOwnsProgress = false
+                                    model.editorFocus(false)
                                     readerNote[0] = null
                                     readerGeneration++
                                     web = null
@@ -1327,7 +1426,7 @@ private object NoMotionScheme : MotionScheme {
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
                         if (released != null) {
-                            if (web === released) { web = null; readerReady = false }
+                            if (web === released) { web = null; readerReady = false; model.editorFocus(false) }
                             retireAndDestroyReader(released)
                         }
                         frame.removeAllViews()
@@ -1335,6 +1434,7 @@ private object NoMotionScheme : MotionScheme {
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
+                if (showFormattingBar) KeyboardFormattingBar(onFormat = { triggerFormat.value(it) }) }
             }
         }
     }

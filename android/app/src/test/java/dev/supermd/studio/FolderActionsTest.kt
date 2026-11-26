@@ -385,6 +385,192 @@ class FolderActionsTest {
         assertFalse(restored.navigateFolderUp())
     }
 
+    @Test
+    fun opaqueSafIdsSupportCreateRenameAndGrantedFolderRecoveryWithoutPathSplitting() {
+        val opaqueRoot = Files.createTempDirectory("android-opaque-folder-test").toFile()
+        val outsideDir = Files.createTempDirectory("android-opaque-outside-test").toFile()
+        try {
+            val outsideSecret = File(outsideDir, "outside-secret.md").apply { writeText("# Outside\n") }
+            val opaqueAuthority = "dev.supermd.test.opaque.${UUID.randomUUID()}"
+            val opaqueProvider = OpaqueFolderDocumentsProvider(app, opaqueRoot, outsideSecret).also {
+                it.attach(app, opaqueAuthority)
+            }
+            ShadowContentResolver.registerProviderInternal(opaqueAuthority, opaqueProvider)
+            val opaqueTreeUri = DocumentsContract.buildTreeDocumentUri(opaqueAuthority, OpaqueFolderDocumentsProvider.ROOT_ID)
+            app.grantUriPermission(
+                app.packageName,
+                opaqueTreeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+            )
+
+            val model = newModel()
+            model.setFolder(opaqueTreeUri)
+            await { model.state.value.folder == opaqueTreeUri.toString() }
+
+            // Create nested folders Sem1/Math and notes using non-hierarchical opaque document IDs
+            model.createSubfolder("", "Sem1")
+            await { model.state.value.files.any { it.directory && it.name == "Sem1" } }
+            val sem1Entry = model.state.value.files.single { it.directory && it.name == "Sem1" }
+            assertFalse("Expected opaque ID without path hierarchy, got ${sem1Entry.uri}", DocumentsContract.getDocumentId(Uri.parse(sem1Entry.uri)).contains('/'))
+
+            model.listFolder(opaqueTreeUri, "Sem1")
+            await { model.state.value.folderRelative == "Sem1" }
+            model.createSubfolder("Sem1", "Math")
+            await { model.state.value.files.any { it.directory && it.name == "Math" } }
+            model.listFolder(opaqueTreeUri, "Sem1/Math")
+            await { model.state.value.folderRelative == "Sem1/Math" }
+
+            model.createFolderNote("Sem1/Math", "Lecture 1", portable = false)
+            await {
+                model.state.value.active.name == "Lecture 1.md" &&
+                    model.state.value.active.relative == "Sem1/Math/Lecture 1.md"
+            }
+            val lectureTreeUri = Uri.parse(model.state.value.active.uri!!)
+            val lectureDocId = DocumentsContract.getDocumentId(lectureTreeUri)
+            assertFalse("Expected opaque note ID without path slashes: $lectureDocId", lectureDocId.contains('/'))
+            val lectureNoteId = model.state.value.active.id
+            model.edit(lectureNoteId, "# Lecture 1\n\nOpaque SAF baseline\n")
+            model.save(noteId = lectureNoteId)
+            await { !model.state.value.active.dirty }
+            model.pinRecent(lectureTreeUri.toString())
+            model.readingPosition(
+                lectureNoteId,
+                JSONObject().put("top", 55.0).put("offset", 4.0).put("zoom", 100.0).put("mode", "live"),
+            )
+
+            model.createFolderNote("Sem1/Math", "Workbook", portable = true)
+            await {
+                model.state.value.active.name == "Workbook.smd" &&
+                    model.state.value.active.relative == "Sem1/Math/Workbook.smd"
+            }
+
+            // #95 granted-folder recovery: plain document URI loses direct grant, then recovers via setFolder(opaqueTreeUri)
+            app.contentResolver.releasePersistableUriPermission(
+                opaqueTreeUri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            val grantedUris = mutableMapOf<Uri, Int>()
+            val enforcingApp = object : android.app.Application() {
+                init {
+                    attachBaseContext(app)
+                }
+
+                override fun getApplicationContext(): Context = this
+
+                override fun checkUriPermission(uri: Uri?, pid: Int, uid: Int, modeFlags: Int): Int {
+                    if (uri == null) return android.content.pm.PackageManager.PERMISSION_DENIED
+                    val held = grantedUris.entries
+                        .filter { (granted, _) ->
+                            granted == uri || (DocumentsContract.isTreeUri(granted) && uri.toString().startsWith(granted.toString() + "/"))
+                        }
+                        .fold(0) { acc, (_, flags) -> acc or flags }
+                    return if ((held and modeFlags) == modeFlags) {
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                    } else {
+                        android.content.pm.PackageManager.PERMISSION_DENIED
+                    }
+                }
+            }
+            val rwFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            val plainLectureUri = DocumentsContract.buildDocumentUri(opaqueAuthority, lectureDocId)
+            grantedUris[plainLectureUri] = rwFlags
+            val recoveryStore = ViewModelStore().also(viewModels::add)
+            val recoveryKey = "folder-actions-recovery-${UUID.randomUUID()}".also(workspaceKeys::add)
+            val recoveryModel = StudioViewModel(enforcingApp, recoveryKey).also {
+                it.readerFlushRequester = { true }
+                recoveryStore.put("recovery", it)
+            }
+            recoveryModel.open(plainLectureUri)
+            await {
+                recoveryModel.state.value.active.uri == plainLectureUri.toString() &&
+                    recoveryModel.state.value.active.content.contains("Opaque SAF baseline")
+            }
+            val recoveryNoteId = recoveryModel.state.value.active.id
+            val updatedDraft = "# Lecture 1\n\nRecovered through granted opaque folder\n"
+            recoveryModel.edit(recoveryNoteId, updatedDraft)
+            grantedUris.remove(plainLectureUri)
+            opaqueProvider.rejectPlainDocumentUris = true
+            recoveryModel.save(noteId = recoveryNoteId)
+            await {
+                recoveryModel.documentAccessRequests.value != null &&
+                    recoveryModel.documentWriteNeedsAccess(recoveryNoteId)
+            }
+            recoveryModel.dismissDocumentAccess()
+
+            // Grant the containing tree; unlisted document whose opaque ID happens to share a string prefix with root must NEVER resolve into tree
+            grantedUris[opaqueTreeUri] = rwFlags
+            val trickyOutsidePlainUri = DocumentsContract.buildDocumentUri(
+                opaqueAuthority,
+                OpaqueFolderDocumentsProvider.UNLISTED_PREFIXED_ID,
+            )
+            val checkAccess = DocumentAccess(
+                context = enforcingApp,
+                activeFolderUriProvider = { opaqueTreeUri },
+            )
+            assertEquals(
+                "Unlisted path-prefixed opaque ID must not manufacture tree access",
+                trickyOutsidePlainUri,
+                checkAccess.resolve(trickyOutsidePlainUri, writing = false),
+            )
+
+            recoveryModel.setFolder(opaqueTreeUri)
+            await(debugInfo = {
+                "unblock: folder=${recoveryModel.state.value.folder} blocked=${recoveryModel.documentWriteNeedsAccess(recoveryNoteId)} err=${recoveryModel.state.value.error}"
+            }) {
+                recoveryModel.state.value.folder == opaqueTreeUri.toString() &&
+                    !recoveryModel.documentWriteNeedsAccess(recoveryNoteId)
+            }
+            recoveryModel.save(noteId = recoveryNoteId)
+            await(debugInfo = {
+                "recoverySave: uri=${recoveryModel.state.value.active.uri} rel=${recoveryModel.state.value.active.relative} dirty=${recoveryModel.state.value.active.dirty} err=${recoveryModel.state.value.error}"
+            }) {
+                recoveryModel.state.value.active.uri == lectureTreeUri.toString() &&
+                    recoveryModel.state.value.active.relative == "Sem1/Math/Lecture 1.md" &&
+                    !recoveryModel.state.value.active.dirty &&
+                    recoveryModel.documentAccessRequests.value == null
+            }
+            assertEquals(updatedDraft, File(opaqueRoot, "Sem1/Math/Lecture 1.md").readText())
+
+            // Sibling note rename + directory rename where provider rotates child opaque IDs
+            model.refreshExternal()
+            model.refreshMetadata()
+            await { model.state.value.files.any { it.name == "Lecture 1.md" } }
+            model.renameFolderEntry(lectureTreeUri, "Sem1/Math/Lecture 1.md", isDirectory = false, requested = "1.1 Intro")
+            await(debugInfo = { "noteRename: tabs=${model.state.value.tabs.map { it.name to it.relative }} err=${model.state.value.error}" }) {
+                model.state.value.tabs.any { it.name == "1.1 Intro.md" && it.relative == "Sem1/Math/1.1 Intro.md" }
+            }
+
+            model.listFolder(opaqueTreeUri, "Sem1")
+            await { model.state.value.folderRelative == "Sem1" && model.state.value.files.any { it.directory && it.name == "Math" } }
+            val mathEntry = model.state.value.files.single { it.directory && it.name == "Math" }
+            val mathUri = Uri.parse(mathEntry.uri)
+            model.listFolder(opaqueTreeUri, "Sem1/Math")
+            await { model.state.value.folderRelative == "Sem1/Math" && model.state.value.files.any { it.name == "1.1 Intro.md" } }
+
+            model.renameFolderEntry(mathUri, "Sem1/Math", isDirectory = true, requested = "PureMath")
+            await(debugInfo = {
+                "dirRename: folderRel=${model.state.value.folderRelative} tabs=${model.state.value.tabs.map { it.name to it.relative }} err=${model.state.value.error}"
+            }) {
+                model.state.value.folderRelative == "Sem1/PureMath" &&
+                    model.state.value.tabs.any { it.name == "1.1 Intro.md" && it.relative == "Sem1/PureMath/1.1 Intro.md" } &&
+                    model.state.value.tabs.any { it.name == "Workbook.smd" && it.relative == "Sem1/PureMath/Workbook.smd" }
+            }
+
+            val introTab = model.state.value.tabs.single { it.name == "1.1 Intro.md" }
+            val introNewUri = introTab.uri!!
+            assertTrue(model.recent.value.any { it.uri == introNewUri && it.pinned })
+            assertNotNull(model.readingLocation(introNewUri))
+            assertNull(model.readingLocation(lectureTreeUri.toString()))
+            assertEquals("Expected zero guessed/unknown documentId queries", emptyList<String>(), opaqueProvider.unknownIdQueries)
+        } finally {
+            opaqueRoot.deleteRecursively()
+            outsideDir.deleteRecursively()
+        }
+    }
+
     private fun newModel(explicitKey: String? = null): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = explicitKey ?: "folder-actions-${UUID.randomUUID()}".also(workspaceKeys::add)
@@ -603,6 +789,266 @@ private class TreeTestDocumentsProvider(private val rootDir: File) : ContentProv
     }
 
     companion object {
+        private val DEFAULT_DOC_PROJECTION = arrayOf(
+            Document.COLUMN_DOCUMENT_ID,
+            Document.COLUMN_DISPLAY_NAME,
+            Document.COLUMN_MIME_TYPE,
+            Document.COLUMN_SIZE,
+            Document.COLUMN_LAST_MODIFIED,
+            Document.COLUMN_FLAGS,
+        )
+    }
+}
+
+private class OpaqueFolderDocumentsProvider(
+    private val appContext: Context,
+    private val rootDir: File,
+    outsideFile: File,
+) : ContentProvider() {
+    private var attachedAuthority: String = ""
+    private var nextSeq = 1
+    private val idToPath = linkedMapOf<String, String>()
+    private val pathToId = linkedMapOf<String, String>()
+    val unknownIdQueries = mutableListOf<String>()
+    var rejectPlainDocumentUris: Boolean = false
+
+    init {
+        idToPath[ROOT_ID] = rootDir.canonicalPath
+        pathToId[rootDir.canonicalPath] = ROOT_ID
+        idToPath[UNLISTED_PREFIXED_ID] = outsideFile.canonicalPath
+        pathToId[outsideFile.canonicalPath] = UNLISTED_PREFIXED_ID
+    }
+
+    fun attach(context: Context, authority: String) {
+        attachedAuthority = authority
+        attachInfo(
+            context,
+            ProviderInfo().apply {
+                this.authority = authority
+                exported = true
+                grantUriPermissions = true
+            },
+        )
+    }
+
+    override fun onCreate(): Boolean = true
+
+    @Synchronized
+    private fun idForFile(file: File): String {
+        val canonical = file.canonicalPath
+        return pathToId.getOrPut(canonical) {
+            "opaque:node-${nextSeq++}".also { id -> idToPath[id] = canonical }
+        }
+    }
+
+    @Synchronized
+    private fun fileForId(documentId: String): File {
+        val path = idToPath[documentId] ?: run {
+            unknownIdQueries += documentId
+            throw FileNotFoundException("Unknown opaque documentId: $documentId")
+        }
+        return File(path)
+    }
+
+    @Synchronized
+    private fun rotateSubtreeIds(oldCanonicalRoot: String, newRoot: File) {
+        val newCanonicalRoot = newRoot.canonicalPath
+        val affected = idToPath.entries.filter { (_, path) ->
+            path == oldCanonicalRoot || path.startsWith(oldCanonicalRoot + File.separator)
+        }
+        for ((oldId, _) in affected) {
+            idToPath.remove(oldId)
+        }
+        val stalePaths = pathToId.keys.filter { path ->
+            path == oldCanonicalRoot || path.startsWith(oldCanonicalRoot + File.separator)
+        }
+        stalePaths.forEach(pathToId::remove)
+        if (newRoot.exists()) {
+            newRoot.walkTopDown().forEach { f ->
+                val freshId = "opaque:rotated-${nextSeq++}"
+                val canonical = f.canonicalPath
+                idToPath[freshId] = canonical
+                pathToId[canonical] = freshId
+                grantPermissions(treeUriForDocId(freshId))
+            }
+        } else {
+            val freshId = "opaque:rotated-${nextSeq++}"
+            idToPath[freshId] = newCanonicalRoot
+            pathToId[newCanonicalRoot] = freshId
+            grantPermissions(treeUriForDocId(freshId))
+        }
+    }
+
+    private fun enforceGrantMode(uri: Uri) {
+        if (rejectPlainDocumentUris && !DocumentsContract.isTreeUri(uri)) {
+            throw SecurityException("Direct grant expired for plain document URI: $uri")
+        }
+    }
+
+    private fun treeUriForDocId(docId: String): Uri {
+        val tree = DocumentsContract.buildTreeDocumentUri(attachedAuthority, ROOT_ID)
+        return DocumentsContract.buildDocumentUriUsingTree(tree, docId)
+    }
+
+    private fun mimeFor(file: File): String =
+        if (file.isDirectory) Document.MIME_TYPE_DIR
+        else when (file.extension.lowercase()) {
+            "smd" -> "application/vnd.supermd.smd"
+            "fmd" -> "application/vnd.supermd.fmd"
+            "md", "markdown" -> "text/markdown"
+            "txt" -> "text/plain"
+            else -> "application/octet-stream"
+        }
+
+    private fun includeFile(cursor: MatrixCursor, file: File) {
+        if (!file.exists()) throw FileNotFoundException(file.path)
+        val flags = if (file.isDirectory) {
+            Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_RENAME
+        } else {
+            Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_RENAME
+        }
+        val docId = idForFile(file)
+        val cols = cursor.columnNames
+        val row = arrayOfNulls<Any>(cols.size)
+        val displayName = if (file.canonicalPath == rootDir.canonicalPath) "OpaqueWorkspace" else file.name
+        val size = if (file.isFile) file.length() else 0L
+        for (i in cols.indices) {
+            row[i] = when (cols[i]) {
+                Document.COLUMN_DOCUMENT_ID -> docId
+                Document.COLUMN_DISPLAY_NAME, OpenableColumns.DISPLAY_NAME -> displayName
+                Document.COLUMN_MIME_TYPE -> mimeFor(file)
+                Document.COLUMN_SIZE, OpenableColumns.SIZE -> size
+                Document.COLUMN_LAST_MODIFIED -> file.lastModified()
+                Document.COLUMN_FLAGS -> flags
+                else -> null
+            }
+        }
+        cursor.addRow(row)
+    }
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?,
+    ): Cursor {
+        enforceGrantMode(uri)
+        val cols = projection ?: DEFAULT_DOC_PROJECTION
+        val segments = uri.pathSegments
+        if (segments.lastOrNull() == "children" && segments.size >= 2) {
+            val parentDocId = Uri.decode(segments[segments.size - 2])
+            val parent = fileForId(parentDocId)
+            if (!parent.isDirectory) throw FileNotFoundException(parentDocId)
+            return MatrixCursor(cols).also { cursor ->
+                parent.listFiles()?.forEach { child -> includeFile(cursor, child) }
+            }
+        }
+        val docId = DocumentsContract.getDocumentId(uri)
+        val file = fileForId(docId)
+        return MatrixCursor(cols).also { includeFile(it, file) }
+    }
+
+    override fun getType(uri: Uri): String {
+        enforceGrantMode(uri)
+        val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return Document.MIME_TYPE_DIR
+        val file = runCatching { fileForId(docId) }.getOrNull() ?: return "application/octet-stream"
+        return mimeFor(file)
+    }
+
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+    override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
+        val inExtras = extras ?: Bundle.EMPTY
+        val docUri = inExtras.getParcelable("uri", Uri::class.java)
+        if (docUri != null) enforceGrantMode(docUri)
+        val out = Bundle()
+        when (method) {
+            "android:createDocument" -> {
+                val parentId = DocumentsContract.getDocumentId(requireNotNull(docUri))
+                val mimeType = inExtras.getString(Document.COLUMN_MIME_TYPE).orEmpty()
+                val displayName = requireNotNull(inExtras.getString(Document.COLUMN_DISPLAY_NAME))
+                val parent = fileForId(parentId)
+                if (!parent.isDirectory) throw FileNotFoundException(parentId)
+                val target = File(parent, displayName)
+                if (mimeType == Document.MIME_TYPE_DIR) {
+                    check(target.mkdirs() || target.isDirectory) { "Could not mkdir $target" }
+                } else {
+                    check(target.createNewFile()) { "Could not create $target" }
+                }
+                val newId = idForFile(target)
+                val outUri = treeUriForDocId(newId)
+                grantPermissions(outUri)
+                out.putParcelable("uri", outUri)
+            }
+            "android:renameDocument" -> {
+                val docId = DocumentsContract.getDocumentId(requireNotNull(docUri))
+                val displayName = requireNotNull(inExtras.getString(Document.COLUMN_DISPLAY_NAME))
+                val source = fileForId(docId)
+                if (!source.exists()) throw FileNotFoundException(docId)
+                val oldCanonical = source.canonicalPath
+                val wasDir = source.isDirectory
+                val dest = File(source.parentFile, displayName)
+                check(source.renameTo(dest)) { "Rename failed" }
+                val newId = if (wasDir) {
+                    rotateSubtreeIds(oldCanonical, dest)
+                    idForFile(dest)
+                } else {
+                    synchronized(this) {
+                        idToPath.remove(docId)
+                        pathToId.remove(oldCanonical)
+                        idForFile(dest)
+                    }
+                }
+                val outUri = treeUriForDocId(newId)
+                grantPermissions(outUri)
+                out.putParcelable("uri", outUri)
+            }
+            "android:deleteDocument" -> {
+                val docId = DocumentsContract.getDocumentId(requireNotNull(docUri))
+                val target = fileForId(docId)
+                val oldCanonical = target.canonicalPath
+                if (target.exists()) {
+                    target.deleteRecursively()
+                }
+                synchronized(this) {
+                    idToPath.remove(docId)
+                    pathToId.remove(oldCanonical)
+                }
+            }
+        }
+        return out
+    }
+
+    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        enforceGrantMode(uri)
+        val docId = DocumentsContract.getDocumentId(uri)
+        val file = fileForId(docId)
+        val flags = when (mode) {
+            "r" -> ParcelFileDescriptor.MODE_READ_ONLY
+            "rw" -> ParcelFileDescriptor.MODE_READ_WRITE
+            "wt", "w" -> ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
+            else -> ParcelFileDescriptor.parseMode(mode)
+        }
+        if (!file.exists() && !mode.contains('w')) throw FileNotFoundException(docId)
+        return ParcelFileDescriptor.open(file, flags)
+    }
+
+    private fun grantPermissions(docUri: Uri) {
+        appContext.grantUriPermission(
+            appContext.packageName,
+            docUri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+    }
+
+    companion object {
+        const val ROOT_ID = "opaque:root-0"
+        const val UNLISTED_PREFIXED_ID = "opaque:root-0/outside-secret.md"
         private val DEFAULT_DOC_PROJECTION = arrayOf(
             Document.COLUMN_DOCUMENT_ID,
             Document.COLUMN_DISPLAY_NAME,

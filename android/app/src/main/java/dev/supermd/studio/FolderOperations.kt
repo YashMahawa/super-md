@@ -1,7 +1,11 @@
 package dev.supermd.studio
 
 import android.net.Uri
-import androidx.documentfile.provider.DocumentFile
+import android.provider.DocumentsContract
+
+private const val MAX_SAF_SUBTREE_DIRS = 256
+private const val MAX_SAF_SUBTREE_DEPTH = 32
+private const val MAX_SAF_OPEN_FOLDER_PROBE_DIRS = 64
 
 internal val FOLDER_NOTE_EXTENSIONS = setOf("md", "smd", "markdown", "fmd", "txt")
 private val KNOWN_NOTE_SUFFIXES = listOf(".markdown", ".smd", ".fmd", ".md", ".txt")
@@ -120,29 +124,180 @@ internal fun validateFolderEntryName(
     return "$trimmed.$expected"
 }
 
-internal fun resolveTreeDirectory(treeRoot: DocumentFile, relative: String): DocumentFile {
-    var current = treeRoot
-    require(current.isDirectory) { "Open folder is not accessible" }
-    for (segment in normalizeRelativePath(relative).split('/').filter { it.isNotEmpty() }) {
+internal data class ResolvedSafParentDirectory(
+    val treeUri: Uri,
+    val rootDocumentId: String,
+    val parentDocumentId: String,
+    val parentDocumentUri: Uri,
+    val children: List<ProjectedSafChild>,
+)
+
+internal data class ProjectedSafSubtreeNode(
+    val documentId: String,
+    val treeDocumentUri: Uri,
+    val displayName: String,
+    val relativePath: String,
+    val isDirectory: Boolean,
+)
+
+internal fun canonicalTreeScopedUri(treeUri: Uri, candidateUri: Uri): Uri {
+    if (candidateUri.scheme != "content" || candidateUri.authority != treeUri.authority) return candidateUri
+    val docId = runCatching { DocumentsContract.getDocumentId(candidateUri) }.getOrNull()?.takeIf { it.isNotEmpty() }
+        ?: return candidateUri
+    return DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+}
+
+internal fun knownPathRelativeInTree(uri: Uri, treeUri: Uri): String? {
+    if (uri.scheme != "content" || treeUri.scheme != "content" || uri.authority != treeUri.authority) return null
+    if (!DocumentsContract.isTreeUri(treeUri) || !isKnownPathDocumentProvider(treeUri.authority)) return null
+    val rootId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull() ?: return null
+    val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return null
+    val rootPath = parseExternalStorageDocumentId(rootId) ?: return null
+    val docPath = parseExternalStorageDocumentId(docId) ?: return null
+    if (rootPath.volume != docPath.volume || docPath.relativePath == rootPath.relativePath) return null
+    val rawRel = when {
+        rootPath.relativePath.isEmpty() -> docPath.relativePath
+        docPath.relativePath.startsWith("${rootPath.relativePath}/") ->
+            docPath.relativePath.removePrefix("${rootPath.relativePath}/")
+        else -> return null
+    }
+    return normalizeRelativePath(rawRel).takeIf { it.isNotEmpty() }
+}
+
+internal fun resolveSafParentDirectory(
+    documentAccess: DocumentAccess,
+    pass: SafProjectionPass,
+    folderUri: Uri,
+    parentRelative: String,
+): ResolvedSafParentDirectory {
+    require(!hasInvalidSafFolderRelative(parentRelative)) { "Invalid folder path" }
+    val (treeUri, rootDocumentId) = documentAccess.resolveReadableTreeRoot(folderUri)
+        ?: error("Choose the folder again to restore access")
+    val segments = normalizeRelativePath(parentRelative).split('/').filter { it.isNotEmpty() }
+    var currentDocumentId = rootDocumentId
+    for (segment in segments) {
         require(segment != "." && segment != ".." && !segment.startsWith('.')) { "Invalid folder path" }
-        val next = current.findFile(segment) ?: error("Folder '$segment' no longer exists")
+        val children = when (val projection = pass.projectDirectory(treeUri, currentDocumentId)) {
+            is SafProjectionPass.DirectoryProjection.Loaded -> projection.children
+            SafProjectionPass.DirectoryProjection.Denied -> error("Choose the folder again to restore access")
+            SafProjectionPass.DirectoryProjection.Missing,
+            SafProjectionPass.DirectoryProjection.Unavailable -> error("Open folder is not accessible")
+        }
+        val next = children.firstOrNull { it.displayName == segment && !it.isVirtual }
+            ?: error("Folder '$segment' no longer exists")
         require(next.isDirectory) { "'$segment' is not a folder" }
-        current = next
+        currentDocumentId = next.documentId
     }
-    return current
+    val finalChildren = when (val projection = pass.projectDirectory(treeUri, currentDocumentId)) {
+        is SafProjectionPass.DirectoryProjection.Loaded -> projection.children
+        SafProjectionPass.DirectoryProjection.Denied -> error("Choose the folder again to restore access")
+        SafProjectionPass.DirectoryProjection.Missing,
+        SafProjectionPass.DirectoryProjection.Unavailable -> error("Open folder is not accessible")
+    }
+    return ResolvedSafParentDirectory(
+        treeUri = treeUri,
+        rootDocumentId = rootDocumentId,
+        parentDocumentId = currentDocumentId,
+        parentDocumentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, currentDocumentId),
+        children = finalChildren,
+    )
 }
 
-internal fun resolveTreeEntry(treeRoot: DocumentFile, relative: String): DocumentFile? {
-    var current: DocumentFile = treeRoot
-    for (segment in normalizeRelativePath(relative).split('/').filter { it.isNotEmpty() }) {
-        if (segment == "." || segment == "..") return null
-        current = current.findFile(segment) ?: return null
+internal fun findDuplicateProjectedChild(
+    children: List<ProjectedSafChild>,
+    treeUri: Uri,
+    candidateName: String,
+    ignoreUri: Uri? = null,
+): ProjectedSafChild? =
+    children.firstOrNull { child ->
+        val childUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, child.documentId)
+        !(ignoreUri != null && sameDocument(childUri, ignoreUri)) &&
+            child.displayName.equals(candidateName, ignoreCase = true)
     }
-    return current
+
+internal fun collectSafSubtree(
+    pass: SafProjectionPass,
+    treeUri: Uri,
+    directoryDocumentId: String,
+    baseRelative: String,
+): List<ProjectedSafSubtreeNode> {
+    val cleanBase = normalizeRelativePath(baseRelative)
+    val results = ArrayList<ProjectedSafSubtreeNode>()
+    val visitedDirs = HashSet<String>()
+    val queue = ArrayDeque<Triple<String, String, Int>>()
+    if (visitedDirs.add(directoryDocumentId)) {
+        queue.addLast(Triple(directoryDocumentId, cleanBase, 0))
+    }
+    var projectedDirs = 0
+    while (queue.isNotEmpty() && projectedDirs < MAX_SAF_SUBTREE_DIRS) {
+        val (currentDirId, currentRel, depth) = queue.removeFirst()
+        projectedDirs++
+        val projection = pass.projectDirectory(treeUri, currentDirId)
+        if (projection !is SafProjectionPass.DirectoryProjection.Loaded) continue
+        for (child in projection.children) {
+            if (child.isVirtual || child.displayName.isEmpty()) continue
+            val childRel = childRelativePath(currentRel, child.displayName)
+            val childTreeUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, child.documentId)
+            results.add(
+                ProjectedSafSubtreeNode(
+                    documentId = child.documentId,
+                    treeDocumentUri = childTreeUri,
+                    displayName = child.displayName,
+                    relativePath = childRel,
+                    isDirectory = child.isDirectory,
+                ),
+            )
+            if (child.isDirectory && depth + 1 < MAX_SAF_SUBTREE_DEPTH && visitedDirs.add(child.documentId)) {
+                queue.addLast(Triple(child.documentId, childRel, depth + 1))
+            }
+        }
+    }
+    return results
 }
 
-internal fun findDuplicateInDirectory(parentDir: DocumentFile, candidateName: String, ignoreUri: Uri? = null): DocumentFile? =
-    parentDir.listFiles().firstOrNull { child ->
-        val existingName = child.name ?: return@firstOrNull false
-        !(ignoreUri != null && sameDocument(child.uri, ignoreUri)) && existingName.equals(candidateName, ignoreCase = true)
+internal fun findRelativeInSafTree(
+    pass: SafProjectionPass,
+    documentAccess: DocumentAccess,
+    folderUri: Uri,
+    targetUri: Uri,
+    preferredDirRelative: String? = null,
+): String? {
+    if (targetUri.scheme != "content" || folderUri.scheme != "content" || targetUri.authority != folderUri.authority) return null
+    if (!DocumentsContract.isTreeUri(folderUri)) return null
+    if (isKnownPathDocumentProvider(folderUri.authority)) {
+        return knownPathRelativeInTree(targetUri, folderUri)
     }
+    val targetDocId = runCatching { DocumentsContract.getDocumentId(targetUri) }.getOrNull()
+        ?.takeIf { it.isNotEmpty() && '\u0000' !in it } ?: return null
+    val (treeUri, rootDocId) = documentAccess.resolveReadableTreeRoot(folderUri) ?: return null
+    if (targetDocId == rootDocId) return null
+
+    if (preferredDirRelative != null && !hasInvalidSafFolderRelative(preferredDirRelative)) {
+        val cleanPref = normalizeRelativePath(preferredDirRelative)
+        val resolvedPref = runCatching { resolveSafParentDirectory(documentAccess, pass, treeUri, cleanPref) }.getOrNull()
+        resolvedPref?.children?.firstOrNull { !it.isVirtual && it.documentId == targetDocId }?.let { match ->
+            return childRelativePath(cleanPref, match.displayName)
+        }
+    }
+
+    val visitedDirs = HashSet<String>()
+    val queue = ArrayDeque<Triple<String, String, Int>>()
+    visitedDirs.add(rootDocId)
+    queue.addLast(Triple(rootDocId, "", 0))
+    var projectedDirs = 0
+    while (queue.isNotEmpty() && projectedDirs < MAX_SAF_OPEN_FOLDER_PROBE_DIRS) {
+        val (dirId, dirRel, depth) = queue.removeFirst()
+        projectedDirs++
+        val projection = pass.projectDirectory(treeUri, dirId)
+        if (projection !is SafProjectionPass.DirectoryProjection.Loaded) continue
+        for (child in projection.children) {
+            if (child.isVirtual || child.displayName.isEmpty()) continue
+            val childRel = childRelativePath(dirRel, child.displayName)
+            if (child.documentId == targetDocId) return childRel
+            if (child.isDirectory && depth + 1 < MAX_SAF_SUBTREE_DEPTH && visitedDirs.add(child.documentId)) {
+                queue.addLast(Triple(child.documentId, childRel, depth + 1))
+            }
+        }
+    }
+    return null
+}
