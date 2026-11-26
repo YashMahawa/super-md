@@ -310,63 +310,81 @@ def _gzip_json_input(path: Path, raw: bytes | None = None, hasher=None) -> bytea
             raise ValueError("SMD gzip stream contains trailing or concatenated data")
     return output
 
-def _write_gzip_json(target, value: dict) -> None:
+def _write_gzip_json(target, value: dict, *, _trusted_ascii_assets: bool = False) -> None:
     """Write deterministic gzip with an empty filename and fixed timestamp."""
-    with gzip.GzipFile(fileobj=target, mode="wb", filename="", mtime=0, compresslevel=PORTABLE_COMPRESSLEVEL) as compressed:
-        length = 0
+    compressor = zlib.compressobj(PORTABLE_COMPRESSLEVEL, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    header_buf = bytearray()
+    header_written = False
+    length = 0
 
-        def write_bytes(data: bytes) -> None:
-            nonlocal length
-            length += len(data)
-            if length > MAX_FILE:
-                raise ValueError("SMD JSON exceeds 120 MB")
-            compressed.write(data)
-
-        assets = value.get("assets")
-        if (list(value.keys()) == ["format", "version", "markdown", "assets"]
-                and isinstance(value["format"], str)
-                and isinstance(value["version"], int) and not isinstance(value["version"], bool)
-                and isinstance(value["markdown"], str)
-                and isinstance(assets, dict)):
-            head = (
-                '{"format":' + json.dumps(value["format"], ensure_ascii=False, separators=(",", ":"))
-                + ',"version":' + str(value["version"])
-                + ',"markdown":' + json.dumps(value["markdown"], ensure_ascii=False, separators=(",", ":"))
-                + ',"assets":{'
-            ).encode("utf-8")
-            write_bytes(head)
-            first = True
-            ascii_chunk = 1_048_576
-            for name, data in assets.items():
-                if (isinstance(name, str) and _SAFE_ASSET_NAME.fullmatch(name)
-                        and _is_cached_validated_asset(data)):
-                    prefix = (b"" if first else b",") + b'"' + name.encode("ascii") + b'":"'
-                    if len(data) <= ascii_chunk * 4:
-                        write_bytes(prefix + data.encode("ascii") + b'"')
-                    else:
-                        write_bytes(prefix)
-                        end = len(data)
-                        for offset in range(0, end, ascii_chunk):
-                            next_offset = offset + ascii_chunk
-                            chunk = data[offset:next_offset].encode("ascii")
-                            write_bytes(chunk + b'"' if next_offset >= end else chunk)
-                else:
-                    entry = (
-                        ("" if first else ",")
-                        + json.dumps(name, ensure_ascii=False, separators=(",", ":"))
-                        + ":"
-                        + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-                    ).encode("utf-8")
-                    write_bytes(entry)
-                first = False
-            write_bytes(b"}}")
+    def emit(raw_chunk: bytes) -> None:
+        nonlocal header_written
+        if not raw_chunk:
             return
+        if not header_written:
+            header_buf.extend(raw_chunk)
+            if len(header_buf) < 10:
+                return
+            header_written = True
+            header_buf[4:8] = b"\x00\x00\x00\x00"
+            header_buf[9] = 255
+            target.write(bytes(header_buf))
+            header_buf.clear()
+            return
+        target.write(raw_chunk)
 
-        class BoundedTextWriter:
-            def write(self, text):
-                write_bytes(text.encode("utf-8"))
-                return len(text)
-        json.dump(value, BoundedTextWriter(), ensure_ascii=False, separators=(",", ":"))
+    def write_bytes(data: bytes) -> None:
+        nonlocal length
+        length += len(data)
+        if length > MAX_FILE:
+            raise ValueError("SMD JSON exceeds 120 MB")
+        emit(compressor.compress(data))
+
+    assets = value.get("assets")
+    if (list(value.keys()) == ["format", "version", "markdown", "assets"]
+            and isinstance(value["format"], str)
+            and isinstance(value["version"], int) and not isinstance(value["version"], bool)
+            and isinstance(value["markdown"], str)
+            and isinstance(assets, dict)):
+        head = (
+            '{"format":' + json.dumps(value["format"], ensure_ascii=False, separators=(",", ":"))
+            + ',"version":' + str(value["version"])
+            + ',"markdown":' + json.dumps(value["markdown"], ensure_ascii=False, separators=(",", ":"))
+            + ',"assets":{'
+        ).encode("utf-8")
+        write_bytes(head)
+        first = True
+        ascii_chunk = 1_048_576
+        for name, data in assets.items():
+            if (type(name) is str and type(data) is str
+                    and (_trusted_ascii_assets or (_SAFE_ASSET_NAME.fullmatch(name) and _is_cached_validated_asset(data)))):
+                write_bytes((b"" if first else b",") + b'"' + name.encode("ascii") + b'":"')
+                end = len(data)
+                if end <= ascii_chunk:
+                    write_bytes(data.encode("ascii"))
+                else:
+                    for offset in range(0, end, ascii_chunk):
+                        write_bytes(data[offset:offset + ascii_chunk].encode("ascii"))
+                write_bytes(b'"')
+            else:
+                entry = (
+                    ("" if first else ",")
+                    + json.dumps(name, ensure_ascii=False, separators=(",", ":"))
+                    + ":"
+                    + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                ).encode("utf-8")
+                write_bytes(entry)
+            first = False
+        write_bytes(b"}}")
+        emit(compressor.flush())
+        return
+
+    class BoundedTextWriter:
+        def write(self, text):
+            write_bytes(text.encode("utf-8"))
+            return len(text)
+    json.dump(value, BoundedTextWriter(), ensure_ascii=False, separators=(",", ":"))
+    emit(compressor.flush())
 
 def compressed_bundle(
     markdown: str,
@@ -377,7 +395,7 @@ def compressed_bundle(
     value = bundle(markdown, assets, validated_assets=validated_assets)
     import io
     output = io.BytesIO()
-    _write_gzip_json(output, value)
+    _write_gzip_json(output, value, _trusted_ascii_assets=True)
     data = output.getvalue()
     if len(data) > MAX_FILE:
         raise ValueError("Compressed SMD exceeds 120 MB")
@@ -418,9 +436,14 @@ def write_portable(
     hasher = hashlib.sha256()
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(handle, "wb") as raw:
-            if os.name != "nt" and hasattr(os, "fchmod") and path.exists():
-                os.fchmod(raw.fileno(), stat.S_IMODE(path.stat().st_mode))
+        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as raw:
+            if os.name != "nt" and hasattr(os, "fchmod"):
+                try:
+                    st_mode = path.stat().st_mode
+                except FileNotFoundError:
+                    pass
+                else:
+                    os.fchmod(raw.fileno(), stat.S_IMODE(st_mode))
 
             class _HashingWriter:
                 def write(self, data: bytes) -> int:
@@ -430,7 +453,7 @@ def write_portable(
                 def flush(self) -> None:
                     raw.flush()
 
-            _write_gzip_json(_HashingWriter(), value)
+            _write_gzip_json(_HashingWriter(), value, _trusted_ascii_assets=True)
             if raw.tell() > MAX_FILE:
                 raise ValueError("Compressed SMD exceeds 120 MB")
             raw.flush()
@@ -719,18 +742,96 @@ def atomic_write(path: Path, data: bytes) -> None:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def _write_json_str(raw, text: str) -> None:
+    if type(text) is str and _is_cached_validated_asset(text):
+        raw.write(b'"')
+        for offset in range(0, len(text), _B64_DECODE_CHUNK):
+            raw.write(text[offset:offset + _B64_DECODE_CHUNK].encode("ascii"))
+        raw.write(b'"')
+        return
+    if len(text) <= _B64_DECODE_CHUNK:
+        raw.write(json.dumps(text, ensure_ascii=False).encode("utf-8", errors="backslashreplace"))
+        return
+    plain = text if type(text) is str else str(text)
+    raw.write(b'"')
+    for offset in range(0, len(plain), _B64_DECODE_CHUNK):
+        chunk = json.dumps(plain[offset:offset + _B64_DECODE_CHUNK], ensure_ascii=False)[1:-1]
+        raw.write(chunk.encode("utf-8", errors="backslashreplace"))
+    raw.write(b'"')
+
+
+def _write_json_value(raw, value, seen: set[int]) -> None:
+    if isinstance(value, str):
+        _write_json_str(raw, value)
+    elif value is None:
+        raw.write(b"null")
+    elif value is True:
+        raw.write(b"true")
+    elif value is False:
+        raw.write(b"false")
+    elif isinstance(value, (int, float)):
+        raw.write(json.dumps(value).encode("ascii"))
+    elif isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("Circular reference detected")
+        seen.add(marker)
+        try:
+            raw.write(b"[")
+            for idx, item in enumerate(value):
+                if idx:
+                    raw.write(b", ")
+                _write_json_value(raw, item, seen)
+            raw.write(b"]")
+        finally:
+            seen.remove(marker)
+    elif isinstance(value, dict):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("Circular reference detected")
+        seen.add(marker)
+        try:
+            raw.write(b"{")
+            first = True
+            for key, item in value.items():
+                if not first:
+                    raw.write(b", ")
+                first = False
+                if isinstance(key, str):
+                    _write_json_str(raw, key)
+                elif key is None:
+                    raw.write(b'"null"')
+                elif key is True:
+                    raw.write(b'"true"')
+                elif key is False:
+                    raw.write(b'"false"')
+                elif isinstance(key, (int, float)):
+                    raw.write(b'"' + json.dumps(key).encode("ascii") + b'"')
+                else:
+                    raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
+                raw.write(b": ")
+                _write_json_value(raw, item, seen)
+            raw.write(b"}")
+        finally:
+            seen.remove(marker)
+    else:
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def atomic_json(path: Path, value) -> None:
-    """Write ordered recovery without full-workspace JSON + UTF-8 copies."""
+    """Write ordered recovery without full-workspace JSON + UTF-8 copies or long GIL holds."""
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(handle, "w", encoding="utf-8", errors="backslashreplace") as file:
-            if path.exists() and hasattr(os,"fchmod"):
-                os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
-            json.dump(value,file,ensure_ascii=False)
-            file.flush();os.fsync(file.fileno())
-        _replace_with_windows_sharing_retry(temporary,path)
+        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as file:
+            if path.exists() and hasattr(os, "fchmod"):
+                os.fchmod(file.fileno(), stat.S_IMODE(path.stat().st_mode))
+            _write_json_value(file, value, set())
+            file.flush()
+            os.fsync(file.fileno())
+        _replace_with_windows_sharing_retry(temporary, path)
     finally:
-        if os.path.exists(temporary):os.unlink(temporary)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 def materialize_assets(root: Path, assets: dict[str,str]) -> None:
     """Save a portable note as Markdown without dropping its pictures or overwriting others."""

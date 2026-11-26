@@ -295,4 +295,108 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => root.unmount());
     host.remove();
   });
+
+  it("preserves windowed DOM-order navigation and unmounted source-range mapping when toggling Replace in source", async () => {
+    const { registerWindowedText } = await import("../windowedSearch");
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const part0 = "## First\n\nTarget alpha.";
+    const part1 = "## Second\n\nTarget beta.";
+    const part2 = "## Third\n\nTarget gamma.";
+    let current = `${part0}\n\n${part1}\n\n${part2}`;
+    const start0 = 0, end0 = part0.length;
+    const start1 = end0 + 2, end1 = start1 + part1.length;
+    const start2 = end1 + 2, end2 = start2 + part2.length;
+    const changes: string[] = [];
+
+    const renderWindowed = () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <div className="markdown-body">
+              <section data-windowed-block="" data-windowed-mounted="true" data-source-start={start0} data-source-end={end0}>
+                <h2>First</h2><p>Target alpha.</p>
+              </section>
+              <section data-windowed-block="" data-windowed-mounted="false" data-source-start={start1} data-source-end={end1}>
+                <span aria-hidden="true" />
+              </section>
+              <section data-windowed-block="" data-windowed-mounted="false" data-source-start={start2} data-source-end={end2}>
+                <span aria-hidden="true" />
+              </section>
+            </div>
+          </section>
+        </div>
+      );
+    };
+
+    await act(async () => { renderWindowed(); });
+    const sections = Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+    // Register out of DOM order (`sections[2]`, `sections[1]`, then `sections[0]`) to simulate Live block edits.
+    const cleanups = [
+      registerWindowedText(sections[2], "Third\nTarget gamma.\n"),
+      registerWindowedText(sections[1], "Second\nTarget beta.\n"),
+      registerWindowedText(sections[0], "First\nTarget alpha.\n"),
+    ];
+    let revealedSection: HTMLElement | null = null;
+    sections[1].addEventListener("supermd-reveal-window", () => {
+      revealedSection = sections[1];
+      sections[1].setAttribute("data-windowed-mounted", "true");
+      sections[1].innerHTML = "<h2>Second</h2><p>Target beta.</p>";
+    });
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Target"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+    expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+
+    // Step forward twice: 1 / 3 is sections[0], 2 / 3 reveals unmounted sections[1] in DOM order (not registration order).
+    const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    act(() => nextBtn.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+    expect(revealedSection).toBeNull();
+
+    act(() => nextBtn.click());
+    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+    expect(revealedSection).toBe(sections[1]);
+
+    // Step to 3 / 3 (still unmounted sections[2] until revealed or mapped), or toggle Replace at 2 / 3 and replace only second match.
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+
+    // Toggling Replace off and back on preserves 2 / 3 synchronously.
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const replaceSingle = () => host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+    act(() => setInputValue(replaceInput, "Updated"));
+    act(() => replaceSingle().click());
+    expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nTarget gamma.");
+
+    // Also verify #83 regex + capture-group replacement across the remaining unmounted block in DOM order.
+    await act(async () => { renderWindowed(); });
+    const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+    const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
+    act(() => regexBtn.click());
+    act(() => wholeWordBtn.click());
+    act(() => setInputValue(searchInput, "Target (\\w+)"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+    expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+    const prevBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Previous match"]')!;
+    act(() => prevBtn.click());
+    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+    act(() => setInputValue(replaceInput, "Rewritten-$1"));
+    act(() => replaceSingle().click());
+    expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nRewritten-gamma.");
+
+    cleanups.forEach((fn) => fn());
+    act(() => root.unmount());
+    host.remove();
+  });
 });
