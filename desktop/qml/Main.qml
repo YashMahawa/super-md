@@ -130,6 +130,27 @@ ApplicationWindow {
         settingsPageItem.section = "agents"
         settingsOpen = true
     }
+    function hintWithShortcut(label, key, fallback) {
+        const map = window.shortcutLabels || {}
+        const raw = map[key] !== undefined ? map[key] : (fallback || "")
+        return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
+    }
+    function fullscreenHint() {
+        const map = window.shortcutLabels || {}
+        const full = map.fullscreen && map.fullscreen !== "Disabled" ? map.fullscreen : ""
+        const exitKey = map.dismiss && map.dismiss !== "Disabled" ? map.dismiss + " to exit" : ""
+        const parts = [full, exitKey].filter(Boolean)
+        return parts.length > 0 ? "Fullscreen (" + parts.join(" · ") + ")" : "Fullscreen"
+    }
+    function modeChoices(includeSplit) {
+        const items = [
+            { key: "live", label: "Live", tooltip: window.hintWithShortcut("Live mode", "mode_live") },
+            { key: "editor", label: "Source", tooltip: window.hintWithShortcut("Source mode", "mode_editor") },
+            { key: "reader", label: "Read", tooltip: window.hintWithShortcut("Read mode", "mode_reader") },
+        ]
+        if (includeSplit) items.push({ key: "split", label: "Split", tooltip: window.hintWithShortcut("Split mode", "mode_split") })
+        return items
+    }
     function nativeTextEditorFocused() {
         // Application-level shortcuts must leave real Qt settings fields to
         // their own platform editing commands. WebEngine's DOM inputs are
@@ -151,6 +172,8 @@ ApplicationWindow {
             return !modalDialogCount && !window.nativeTextEditorFocused() && !viewState.readerOverlay && viewState.mode !== "reader"
         }
         if (action === "undo" || action === "redo") return !modalDialogCount && !viewState.readerOverlay
+        if (action === "mode_live" || action === "mode_editor" || action === "mode_reader" || action === "mode_split")
+            return !modalDialogCount && !viewState.fullscreen && !viewState.readerOverlay && !viewState.imageOverlay && (action !== "mode_split" || window.width >= 1000)
         if (action === "close_tab") return !modalDialogCount
         if (action === "dismiss") return !modalDialogCount && !contentsPopup.visible
         return true
@@ -222,6 +245,10 @@ ApplicationWindow {
         case "new_folder_note": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewFolderNote(); break
         case "new_subfolder": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewSubfolder(); break
         case "rename_entry": folderSidebar.triggerRenameSelectedOrActive(); break
+        case "mode_live": studio.setMode("live"); break
+        case "mode_editor": studio.setMode("editor"); break
+        case "mode_reader": studio.setMode("reader"); break
+        case "mode_split": if (window.width >= 1000) studio.setMode("split"); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
@@ -383,10 +410,10 @@ ApplicationWindow {
                 spacing: 8
                 SidebarToggle { expanded: sidebar; onClicked: sidebar = !sidebar }
                 ActionButton { glyph: "FolderOpen"; ToolTip.text: "Open folder"; Accessible.name: "Open folder"; onClicked: studio.chooseFolder() }
-                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (" + window.shortcutLabels.open + ")"; onClicked: openDialog.open() }
-                ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note (" + window.shortcutLabels.save + ")"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
-                ActionButton { glyph: "Undo"; ToolTip.text: "Undo (" + window.shortcutLabels.undo + ")"; onClicked: studio.command("undo") }
-                ActionButton { glyph: "Redo"; ToolTip.text: "Redo (" + window.shortcutLabels.redo + ")"; onClicked: studio.command("redo") }
+                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: window.hintWithShortcut("Open note", "open"); onClicked: openDialog.open() }
+                ActionButton { glyph: "FloppyDisk"; ToolTip.text: window.hintWithShortcut("Save note", "save"); onClicked: studio.saveSafely(); enabled: !viewState.busy }
+                ActionButton { glyph: "Undo"; ToolTip.text: window.hintWithShortcut("Undo", "undo"); onClicked: studio.command("undo") }
+                ActionButton { glyph: "Redo"; ToolTip.text: window.hintWithShortcut("Redo", "redo"); onClicked: studio.command("redo") }
                 Item {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
@@ -436,8 +463,8 @@ ApplicationWindow {
                     TapHandler { onTapped: window.openAgentSettings() }
                     Hint { requested: agentPillHover.hovered; text: (viewState.agentConnection && viewState.agentConnection.detail ? viewState.agentConnection.detail + " · " : "") + "Open AI agent settings" }
                 }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
-                ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
+                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
+                ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Search across notes", "search_folder"); onClicked: studio.openFolderSearch() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -447,16 +474,16 @@ ApplicationWindow {
                         id: noteActions
                         objectName: "compactNoteActions"
                         implicitWidth: 250
-                        NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
-                        NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
-                        NoteMenuItem { text: "Search across notes"; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
+                        NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.reopen_tab || "") : ""; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
+                        NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.save_as || "") : ""; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
+                        NoteMenuItem { objectName: "compactSearchFolderAction"; text: "Search across notes"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.search_folder || "") : ""; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
                         NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; actionVisible: window.width < 1060; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
                     }
                 }
                 ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
-                ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
+                ActionButton { objectName: "settingsButton"; glyph: "GearSix"; ToolTip.text: window.hintWithShortcut("Settings", "settings"); onClicked: settingsOpen = !settingsOpen }
                 WindowControls { visible: studio.showToolbarWindowControls; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
@@ -548,7 +575,7 @@ ApplicationWindow {
                 }
                 Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
-                ActionButton { text: "New window"; tonal: true; Layout.fillWidth: true; onClicked: studio.command("window") }
+                ActionButton { objectName: "newWindowButton"; text: "New window"; tonal: true; Layout.fillWidth: true; ToolTip.text: window.hintWithShortcut("New window", "new_window"); onClicked: studio.command("window") }
             }
         }
         Item {
@@ -563,7 +590,7 @@ ApplicationWindow {
                     background: ThemeSurface { area:"toolbar"; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .4 } }
                     RowLayout {
                     anchors.fill: parent
-                    ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
+                    ModeGroup { objectName: "documentModeGroup"; choices: window.modeChoices(window.width >= 1000); selected: viewState.mode; onChosen: key => studio.setMode(key) }
                     Item { Layout.fillWidth: true }
                     ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 40; to: 300; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
                     TextField {
@@ -584,7 +611,7 @@ ApplicationWindow {
                         background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
                         Accessible.name: "Zoom percentage"
                     }
-                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (" + window.shortcutLabels.fullscreen + " · " + window.shortcutLabels.dismiss + " to exit)"; onClicked: windowModes.setFullscreen(true) }
+                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: window.fullscreenHint(); onClicked: windowModes.setFullscreen(true) }
                     ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
                     }
                 }
@@ -692,26 +719,28 @@ ApplicationWindow {
                         property string selectionText: ""
                         property int editFlags: 0
                         property bool hasLink: false
-                        NoteMenuItem { text: "Undo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
-                        NoteMenuItem { text: "Redo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
-                        NoteMenuItem { text: "Cut"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
-                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy) || readerContextMenu.selectionText.trim().length > 0; onTriggered: { window.reader.forceActiveFocus(); window.reader.triggerWebAction(WebEngineView.Copy) } }
-                        NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
+                        NoteMenuItem { text: "Undo"; shortcutText: window.shortcutLabels.undo || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
+                        NoteMenuItem { text: "Redo"; shortcutText: window.shortcutLabels.redo || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
+                        NoteMenuItem { text: "Cut"; shortcutText: window.shortcutLabels.cut || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
+                        NoteMenuItem { text: "Copy"; shortcutText: window.shortcutLabels.copy || ""; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy) || readerContextMenu.selectionText.trim().length > 0; onTriggered: { window.reader.forceActiveFocus(); window.reader.triggerWebAction(WebEngineView.Copy) } }
+                        NoteMenuItem { text: "Paste"; shortcutText: window.shortcutLabels.paste || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
                         NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
-                        NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                        NoteMenuItem { text: "Select all"; shortcutText: window.shortcutLabels.select_all || ""; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
                         MenuSeparator {}
                         NoteMenuItem { objectName: "reloadMenuItem"; text: "Reload"; enabled: viewState.readerReady && !viewState.busy; onTriggered: studio.reloadReaderSafely() }
                         MenuSeparator { visible: readerContextMenu.selectionText.trim().length > 0; height: visible ? implicitHeight : 0 }
                         NoteMenuItem { text: "Search Google"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("google", readerContextMenu.selectionText) }
                         NoteMenuItem { text: "Ask " + (studio.selectionAssistantLabel || "ChatGPT") + "…"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("assistant", readerContextMenu.selectionText) }
                     }
-                    WheelHandler {
-                        target: null
-                        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                    MouseArea {
+                        objectName: "readerWheelOverlay"
+                        anchors.fill: parent
+                        z: 1
+                        acceptedButtons: Qt.NoButton
                         onWheel: function(event) {
-                            // Qt retains the device's pixel deltas. DOM wheel
-                            // events lose that distinction, so route touchpad
-                            // movement without guessing from notch magnitude.
+                            // Stack above QtWebEngine's internal Chromium child item so Qt
+                            // retains the device's pixel deltas before Chromium consumes them,
+                            // while acceptedButtons: Qt.NoButton leaves clicks/drags/menus untouched.
                             if (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)) {
                                 // Consume before Chromium applies browser zoom:
                                 // resetting zoomFactor afterward flashes a stale scale.
@@ -722,8 +751,9 @@ ApplicationWindow {
                                 event.accepted = true
                                 // The reader gives text drags priority over held-button zoom.
                                 const held = Boolean(event.buttons & Qt.LeftButton)
-                                const dx = event.pixelDelta.x || event.angleDelta.x
-                                const dy = event.pixelDelta.y || event.angleDelta.y
+                                const hasPixelDelta = Boolean(event.pixelDelta.x || event.pixelDelta.y)
+                                const dx = hasPixelDelta ? event.pixelDelta.x : event.angleDelta.x
+                                const dy = hasPixelDelta ? event.pixelDelta.y : event.angleDelta.y
                                 reader.runJavaScript("window.supermdNativeWheel?.(" + (-dx) + "," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + held + ")")
                             } else event.accepted = false
                         }
@@ -761,7 +791,7 @@ ApplicationWindow {
                         if (window.readerRecoveryLoading && target === "about:blank") return
                         if (target.split("#")[0] !== readerUrl.toString()) {
                             request.reject()
-                            if (target.startsWith("https://") || target.startsWith("http://")) Qt.openUrlExternally(request.url)
+                            if (target.startsWith("https://") || target.startsWith("http://") || target.startsWith("mailto:")) Qt.openUrlExternally(request.url)
                         }
                     }
                     }

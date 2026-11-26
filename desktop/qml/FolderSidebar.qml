@@ -20,6 +20,11 @@ ColumnLayout {
         return custom.length > 0 ? custom : raw
     }
 
+    function shortcutHint(label, key, fallback) {
+        const raw = root.shortcutLabels && root.shortcutLabels[key] !== undefined ? root.shortcutLabels[key] : fallback
+        return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
+    }
+
     function parentPathOf(fullPath) {
         if (!fullPath) return ""
         const idx = fullPath.replace(/\\/g, "/").lastIndexOf("/")
@@ -119,7 +124,7 @@ ColumnLayout {
         compact: true
         tonal: true
         Layout.fillWidth: true
-        ToolTip.text: "Search across notes (" + (root.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"
+        ToolTip.text: root.shortcutHint("Search across notes", "search_folder", "Ctrl+Shift+F")
         onClicked: studio.openFolderSearch()
     }
 
@@ -137,23 +142,23 @@ ColumnLayout {
             objectName: "headerNewItemButton"
             glyph: "Plus"; compact: true
             Accessible.name: "New note or subfolder"
-            ToolTip.text: "New note in folder (" + (root.shortcutLabels.new_folder_note || "Ctrl+Alt+N") + ")"
+            ToolTip.text: root.shortcutHint("New note in folder", "new_folder_note", "Ctrl+Alt+N")
             onClicked: headerCreateMenu.popup()
             NoteContextMenu {
                 id: headerCreateMenu
                 objectName: "headerCreateMenu"
-                implicitWidth: 230
-                NoteMenuItem { objectName: "headerNewMarkdownItem"; text: "New Markdown note (.md)"; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("md", viewState.folder) }
+                implicitWidth: 310
+                NoteMenuItem { objectName: "headerNewMarkdownItem"; text: "New Markdown note (.md)"; shortcutText: root.shortcutLabels.new_folder_note || ""; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("md", viewState.folder) }
                 NoteMenuItem { objectName: "headerNewPortableItem"; text: "New portable note (.smd)"; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("smd", viewState.folder) }
                 MenuSeparator {}
-                NoteMenuItem { objectName: "headerNewSubfolderItem"; text: "New subfolder"; icon.source: "../icons/FolderOpen.svg"; onTriggered: root.openCreateDialog("folder", viewState.folder) }
+                NoteMenuItem { objectName: "headerNewSubfolderItem"; text: "New subfolder"; shortcutText: root.shortcutLabels.new_subfolder || ""; icon.source: "../icons/FolderOpen.svg"; onTriggered: root.openCreateDialog("folder", viewState.folder) }
             }
         }
         ActionButton {
             objectName: "headerNewSubfolderButton"
             glyph: "FolderOpen"; compact: true
             Accessible.name: "New subfolder"
-            ToolTip.text: "New subfolder (" + (root.shortcutLabels.new_subfolder || "Ctrl+Alt+Shift+N") + ")"
+            ToolTip.text: root.shortcutHint("New subfolder", "new_subfolder", "Ctrl+Alt+Shift+N")
             onClicked: root.openCreateDialog("folder", viewState.folder)
         }
         ActionButton {
@@ -188,17 +193,17 @@ ColumnLayout {
     NoteContextMenu {
         id: folderEntryMenu
         objectName: "folderEntryContextMenu"
-        implicitWidth: 236
+        implicitWidth: 310
         property string targetPath: ""
         property string targetName: ""
         property bool targetIsDirectory: false
 
         NoteMenuItem { objectName: "menuOpenNote"; text: "Open note"; icon.source: "../icons/File.svg"; actionVisible: !folderEntryMenu.targetIsDirectory; onTriggered: studio.openNote(folderEntryMenu.targetPath) }
-        NoteMenuItem { objectName: "menuNewMarkdown"; text: "New Markdown note (.md)"; icon.source: "../icons/Plus.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("md", folderEntryMenu.targetPath) }
+        NoteMenuItem { objectName: "menuNewMarkdown"; text: "New Markdown note (.md)"; shortcutText: root.shortcutLabels.new_folder_note || ""; icon.source: "../icons/Plus.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("md", folderEntryMenu.targetPath) }
         NoteMenuItem { objectName: "menuNewPortable"; text: "New portable note (.smd)"; icon.source: "../icons/File.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("smd", folderEntryMenu.targetPath) }
-        NoteMenuItem { objectName: "menuNewSubfolder"; text: "New subfolder"; icon.source: "../icons/FolderOpen.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("folder", folderEntryMenu.targetPath) }
+        NoteMenuItem { objectName: "menuNewSubfolder"; text: "New subfolder"; shortcutText: root.shortcutLabels.new_subfolder || ""; icon.source: "../icons/FolderOpen.svg"; actionVisible: folderEntryMenu.targetIsDirectory; onTriggered: root.openCreateDialog("folder", folderEntryMenu.targetPath) }
         MenuSeparator {}
-        NoteMenuItem { objectName: "menuRenameEntry"; text: folderEntryMenu.targetIsDirectory ? "Rename folder" : "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: root.openRenameFor(folderEntryMenu.targetPath, folderEntryMenu.targetName, folderEntryMenu.targetIsDirectory) }
+        NoteMenuItem { objectName: "menuRenameEntry"; text: folderEntryMenu.targetIsDirectory ? "Rename folder" : "Rename note"; shortcutText: root.shortcutLabels.rename_entry || ""; icon.source: "../icons/Rename.svg"; onTriggered: root.openRenameFor(folderEntryMenu.targetPath, folderEntryMenu.targetName, folderEntryMenu.targetIsDirectory) }
     }
 
     Item {

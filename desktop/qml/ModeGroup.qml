@@ -18,11 +18,14 @@ Control {
             model: control.choices
             delegate: ActionButton {
                 required property var modelData
+                objectName: modelData.objectName || ("modeButton_" + modelData.key)
                 text: modelData.label
                 compact: true
+                ToolTip.text: modelData.tooltip || ""
                 // Qt's stock highlighted label uses its own accent palette,
                 // ignoring Material.foreground. Keep our validated color pair.
                 prominent: control.selected === modelData.key
+                Accessible.name: modelData.label
                 Accessible.description: prominent ? "Selected" : ""
                 Layout.fillWidth: true
                 onClicked: control.chosen(modelData.key)
