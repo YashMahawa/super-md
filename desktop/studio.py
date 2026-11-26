@@ -910,6 +910,7 @@ class Studio(QObject):
         self.ready = False
         self._last_reader_text = None
         self._export_jobs = ExportJobRegistry()
+        self._python_jobs = python_runtime.PythonJobRegistry()
         self._agent_exports: dict[str, dict] = {}
         self._agent_owned_files: set[str] = getattr(self.session, "agent_owned_files", None) or set()
         self.session.agent_owned_files = self._agent_owned_files
@@ -1421,6 +1422,7 @@ class Studio(QObject):
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
+        self._python_jobs.cancel_all(retire=True)
         for agent_export in tuple(self._agent_exports.values()):
             try:
                 reserved = Path(agent_export["path"])
@@ -4214,6 +4216,7 @@ class Studio(QObject):
         if removed["content"].strip() or removed["path"] or removed.get("assets"):
             if id in self._closing_tabs:return
             self._closing_tabs.add(id)
+            self._python_jobs.cancel_tab(id)
             # Strings and encoded assets are immutable; snapshot small mutable
             # metadata/asset mappings without walking large base64 strings.
             captured=_snapshot_tab_state(removed)
@@ -4240,6 +4243,7 @@ class Studio(QObject):
         self._finish_remove_tab(id)
 
     def _finish_remove_tab(self,id):
+        self._python_jobs.cancel_tab(id)
         self.reader_edits.clear(id)
         current_index=next((i for i,tab in enumerate(self.tabs) if tab["id"]==id),None)
         if current_index is None:return
@@ -5405,6 +5409,7 @@ class Studio(QObject):
 
     def _post(self, id, command, raw):
         if self.retired:return
+        python_job = None
         try:
             if command == "save_media_native":
                 if not isinstance(raw, str) or len(raw) > 36_100_000:
@@ -5641,11 +5646,16 @@ class Studio(QObject):
                 self.saving.add(saving_tab_id)
             python = self.settings["python"]
             export_job = None
+            python_job = None
             if command == "export_pdf_native":
                 if not output: raise ValueError("Choose a PDF destination before exporting")
                 job_id = args.get("jobId")
                 if job_id is None: job_id = uuid.uuid4().hex
                 export_job = self._export_jobs.register(job_id)
+            elif command == "run_python":
+                if self.retired or captured["id"] in self._closing_tabs:
+                    raise ValueError("The note for this operation is no longer open")
+                python_job = self._python_jobs.register(captured["id"])
             def export_result(path):
                 if agent_export_info:
                     return self._agent_export_metadata(Path(path), agent_export_info["format"])
@@ -5674,7 +5684,15 @@ class Studio(QObject):
                         results.append({"source":name,"alt":Path(image["name"]).stem})
                     return results
                 if command == "run_python":
-                    result=self._python(python,args["code"],str(Path(captured["path"]).parent) if captured.get("path") else None)
+                    assert python_job is not None
+                    try:
+                        result=self._python(python,args["code"],str(Path(captured["path"]).parent) if captured.get("path") else None,job=python_job)
+                    except python_runtime.PythonCellCancelled:
+                        return {"_cancelled": True}
+                    finally:
+                        self._python_jobs.discard(python_job)
+                    if python_job.cancelled.is_set():
+                        return {"_cancelled": True}
                     if context:
                         try:
                             self.session.python_outputs.store(args["code"],result,context)
@@ -5794,6 +5812,9 @@ class Studio(QObject):
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
+                if command == "run_python" and isinstance(result, dict) and result.get("_cancelled"):
+                    self.replied.emit(id, "null", "Python cell cancelled")
+                    return
                 if command == "export_fmd_native" and isinstance(result, dict) and result.get("_conflict"):
                     target_tab = next((t for t in self.tabs if t["id"] == captured["id"]), None)
                     if target_tab:
@@ -5893,8 +5914,13 @@ class Studio(QObject):
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
                 self.saving.discard(saving_tab_id)
                 return
+            if python_job is not None and (self.retired or getattr(self.pool, "_shutdown", False)):
+                self._python_jobs.discard(python_job)
+                return
             self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
+            if python_job is not None:
+                self._python_jobs.discard(python_job)
             agent_export = self._agent_exports.pop(id, None)
             if agent_export:
                 if self.pending_export == agent_export.get("path"):
@@ -5977,6 +6003,14 @@ class Studio(QObject):
             if path.is_file(): return path
         raise ValueError("Native PDF engine is not installed. Build smd-core's smd-engine binary.")
 
-    def _python(self, executable, code, folder=None):
+    def _python(self, executable, code, folder=None, job=None):
         # Explicit Run only. Python is trusted local code, not a sandbox.
-        return python_runtime.run(executable or self.settings["python"], code, cwd=folder)
+        owned_job = None
+        if job is None and hasattr(self, "_python_jobs"):
+            owned_job = self._python_jobs.register("")
+            job = owned_job
+        try:
+            return python_runtime.run(executable or self.settings["python"], code, cwd=folder, job=job)
+        finally:
+            if owned_job is not None:
+                self._python_jobs.discard(owned_job)

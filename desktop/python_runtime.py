@@ -5,14 +5,17 @@ local Python is trusted user code, not a sandbox.
 """
 from __future__ import annotations
 from collections.abc import Sequence
+import ctypes
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 BUNDLED = "bundled"
@@ -122,22 +125,488 @@ def _command(executable: str) -> list[str]:
         return [sys.executable, CELL_FLAG]
     return [executable, "-c", RUNNER]
 
-def run(executable: str, code: str, timeout: int = 90, cwd: str | None = None) -> dict:
+
+_JOB_OBJECT_EXTENDED_LIMIT_INFO_CLASS = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_uint64),
+        ("WriteOperationCount", ctypes.c_uint64),
+        ("OtherOperationCount", ctypes.c_uint64),
+        ("ReadTransferCount", ctypes.c_uint64),
+        ("WriteTransferCount", ctypes.c_uint64),
+        ("OtherTransferCount", ctypes.c_uint64),
+    ]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _load_kernel32():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetInformationJobObject.restype = ctypes.c_int
+    kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+    kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateJobObject.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    return kernel32
+
+
+class _WindowsJob:
+    """Anonymous Windows Job Object confining cleanup to one Python cell's processes."""
+
+    def __init__(self, handle: int, kernel32):
+        self._handle: int | None = handle
+        self._kernel32 = kernel32
+        self._assigned = False
+        self._lock = threading.Lock()
+
+    @classmethod
+    def create(cls, kernel32=None) -> _WindowsJob | None:
+        try:
+            api = _load_kernel32() if kernel32 is None else kernel32
+            handle = api.CreateJobObjectW(None, None)
+            if not handle:
+                return None
+            info = _JobObjectExtendedLimitInformation()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = api.SetInformationJobObject(
+                ctypes.c_void_p(handle),
+                _JOB_OBJECT_EXTENDED_LIMIT_INFO_CLASS,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if not ok:
+                api.CloseHandle(ctypes.c_void_p(handle))
+                return None
+            return cls(int(handle), api)
+        except Exception:
+            return None
+
+    def assign(self, process) -> bool:
+        with self._lock:
+            handle = self._handle
+            if handle is None:
+                return False
+            proc_handle = int(getattr(process, "_handle", 0) or 0)
+            if not proc_handle:
+                ok = 0
+            else:
+                try:
+                    ok = self._kernel32.AssignProcessToJobObject(
+                        ctypes.c_void_p(handle), ctypes.c_void_p(proc_handle)
+                    )
+                except Exception:
+                    ok = 0
+            if not ok:
+                self._handle = None
+                try:
+                    self._kernel32.CloseHandle(ctypes.c_void_p(handle))
+                except Exception:
+                    pass
+                return False
+            self._assigned = True
+            return True
+
+    def close(self, *, terminate: bool = False) -> None:
+        with self._lock:
+            handle = self._handle
+            if handle is None:
+                return
+            self._handle = None
+            assigned = self._assigned
+        try:
+            if terminate and assigned:
+                self._kernel32.TerminateJobObject(ctypes.c_void_p(handle), 1)
+        except Exception:
+            pass
+        try:
+            self._kernel32.CloseHandle(ctypes.c_void_p(handle))
+        except Exception:
+            pass
+
+
+def _cell_spawn_kwargs(os_name: str | None = None) -> dict:
+    resolved = os.name if os_name is None else os_name
+    if resolved == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+        )
+        return {"creationflags": flags}
+    return {"start_new_session": True}
+
+
+def _posix_safe_pgid(pgid: int | None, *, own_pgid: int | None = None) -> bool:
+    if not isinstance(pgid, int) or isinstance(pgid, bool) or pgid <= 1:
+        return False
+    if own_pgid is None:
+        try:
+            own_pgid = os.getpgrp()
+        except AttributeError:
+            return False
+    return pgid != own_pgid
+
+
+def _posix_pgid_alive(pgid: int | None, *, killpg_fn=None, own_pgid: int | None = None) -> bool:
+    if not _posix_safe_pgid(pgid, own_pgid=own_pgid):
+        return False
+    caller = os.killpg if killpg_fn is None else killpg_fn
+    try:
+        caller(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_posix_cell(
+    process,
+    pgid: int | None,
+    *,
+    grace: float = 0.2,
+    killpg_fn=None,
+    own_pgid: int | None = None,
+) -> None:
+    caller = os.killpg if killpg_fn is None else killpg_fn
+    use_pgid = _posix_safe_pgid(pgid, own_pgid=own_pgid)
+    sigterm = getattr(signal, "SIGTERM", 15)
+    sigkill = getattr(signal, "SIGKILL", 9)
+    if use_pgid:
+        try:
+            caller(pgid, sigterm)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    elif process is not None and process.poll() is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+    deadline = time.monotonic() + max(0.0, grace)
+    while True:
+        reaped = process is None or process.poll() is not None
+        group_alive = _posix_pgid_alive(pgid, killpg_fn=caller, own_pgid=own_pgid) if use_pgid else False
+        if reaped and not group_alive:
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.01)
+
+    if use_pgid:
+        try:
+            caller(pgid, sigkill)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    if process is not None and process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    if process is not None and process.poll() is None:
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _terminate_windows_cell(process, win_job: _WindowsJob | None, *, run_cmd=None) -> None:
+    if win_job is not None:
+        win_job.close(terminate=True)
+    elif process is not None and process.poll() is None:
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int) and pid > 0:
+            runner = subprocess.run if run_cmd is None else run_cmd
+            try:
+                runner(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+    if process is not None and process.poll() is None:
+        try:
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+class _CellProcessController:
+    """Owns and confines cleanup to the process tree spawned for one Python cell."""
+
+    def __init__(
+        self,
+        process,
+        *,
+        os_name: str | None = None,
+        pgid: int | None = None,
+        win_job: _WindowsJob | None = None,
+        grace: float = 0.2,
+    ):
+        self.process = process
+        self._os_name = os.name if os_name is None else os_name
+        self._pgid = pgid
+        self._win_job = win_job
+        self._grace = grace
+        self._lock = threading.Lock()
+        self._terminated = False
+
+    def wait_step(self, timeout: float) -> bool:
+        try:
+            self.process.wait(timeout=max(0.0, timeout))
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    def terminate(self) -> None:
+        with self._lock:
+            if self._terminated:
+                return
+            self._terminated = True
+            if self._os_name == "nt":
+                _terminate_windows_cell(self.process, self._win_job)
+            else:
+                _terminate_posix_cell(self.process, self._pgid, grace=self._grace)
+
+    def cleanup(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self.terminate()
+            return
+        with self._lock:
+            if self._terminated:
+                return
+            self._terminated = True
+            if self._os_name == "nt":
+                if self._win_job is not None:
+                    self._win_job.close(terminate=True)
+            else:
+                if _posix_pgid_alive(self._pgid):
+                    _terminate_posix_cell(self.process, self._pgid, grace=min(0.15, self._grace))
+
+
+class PythonCellCancelled(RuntimeError):
+    """Raised when a Python cell execution is cancelled by tab or window cleanup."""
+
+
+class PythonCellJob:
+    """Per-cell cancellation and process-tree ownership handle."""
+
+    def __init__(self, tab_id: str = ""):
+        self.tab_id = tab_id
+        self.cancelled = threading.Event()
+        self._lock = threading.RLock()
+        self._controller: _CellProcessController | None = None
+
+    def check(self) -> None:
+        if self.cancelled.is_set():
+            raise PythonCellCancelled("Python cell cancelled")
+
+    def attach(self, controller: _CellProcessController) -> None:
+        with self._lock:
+            self._controller = controller
+            cancelled = self.cancelled.is_set()
+        if cancelled:
+            controller.terminate()
+
+    def detach(self, controller: _CellProcessController) -> None:
+        with self._lock:
+            if self._controller is controller:
+                self._controller = None
+
+    def cancel(self) -> bool:
+        with self._lock:
+            was_cancelled = self.cancelled.is_set()
+            self.cancelled.set()
+            controller = self._controller
+        if controller is not None:
+            controller.terminate()
+        return not was_cancelled
+
+
+class PythonJobRegistry:
+    """Thread-safe registry of active Python cell executions scoped to one Studio window."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._jobs: set[PythonCellJob] = set()
+        self._retired = False
+
+    def register(self, tab_id: str = "") -> PythonCellJob:
+        job = PythonCellJob(tab_id)
+        with self._lock:
+            if self._retired:
+                job.cancelled.set()
+            else:
+                self._jobs.add(job)
+        return job
+
+    def discard(self, job: PythonCellJob | None) -> None:
+        if job is None:
+            return
+        with self._lock:
+            self._jobs.discard(job)
+
+    def cancel_tab(self, tab_id: str) -> int:
+        if not tab_id:
+            return 0
+        with self._lock:
+            targets = tuple(job for job in self._jobs if job.tab_id == tab_id)
+        cancelled = 0
+        for job in targets:
+            if job.cancel():
+                cancelled += 1
+        return cancelled
+
+    def cancel_all(self, *, retire: bool = False) -> int:
+        with self._lock:
+            if retire:
+                self._retired = True
+            targets = tuple(self._jobs)
+        cancelled = 0
+        for job in targets:
+            if job.cancel():
+                cancelled += 1
+        return cancelled
+
+
+def _spawn_cell_process(
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict,
+    stderr_path: Path,
+) -> _CellProcessController:
+    win_job = _WindowsJob.create() if os.name == "nt" else None
+    try:
+        with open(stderr_path, "wb") as stderr_handle:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_handle,
+                env=env,
+                cwd=cwd,
+                **_cell_spawn_kwargs(),
+            )
+    except Exception:
+        if win_job is not None:
+            win_job.close(terminate=False)
+        raise
+    if win_job is not None and not win_job.assign(process):
+        win_job = None
+    pgid = process.pid if os.name != "nt" else None
+    return _CellProcessController(process, pgid=pgid, win_job=win_job)
+
+
+def _read_stderr_tail(stderr_path: Path, limit: int = 16384) -> str:
+    try:
+        with open(stderr_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - limit))
+            return handle.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def run(
+    executable: str,
+    code: str,
+    timeout: float = 90,
+    cwd: str | None = None,
+    *,
+    job: PythonCellJob | None = None,
+) -> dict:
     if not isinstance(code, str) or len(code) > MAX_CODE:
         raise ValueError("Python cell exceeds 200 KB")
+    if job is not None:
+        job.check()
     executable = validate(executable)
-    with tempfile.TemporaryDirectory(prefix="supermd-cell-") as folder:
-        source, result = Path(folder) / "cell.json", Path(folder) / "result.json"
+    with tempfile.TemporaryDirectory(prefix="supermd-cell-", ignore_cleanup_errors=True) as folder:
+        source = Path(folder) / "cell.json"
+        result = Path(folder) / "result.json"
+        stderr_path = Path(folder) / "stderr.txt"
         source.write_text(json.dumps({"code": code}), encoding="utf-8")
+        if job is not None:
+            job.check()
+        controller = _spawn_cell_process(
+            [*_command(executable), str(source), str(result)],
+            cwd=cwd if cwd and Path(cwd).is_dir() else folder,
+            env=clean_environment(),
+            stderr_path=stderr_path,
+        )
         try:
-            process = subprocess.run([*_command(executable), str(source), str(result)], capture_output=True, text=True,
-                                     encoding="utf-8", errors="replace", timeout=timeout, env=clean_environment(),
-                                     cwd=cwd if cwd and Path(cwd).is_dir() else folder, stdin=subprocess.DEVNULL, **_no_window())
-        except subprocess.TimeoutExpired:
-            raise ValueError(f"Python cell stopped after {timeout} seconds") from None
-        if not result.is_file():
-            raise ValueError((process.stderr or "Python exited without a result").strip()[-2000:])
-        output = json.loads(result.read_text(encoding="utf-8"))
+            if job is not None:
+                job.attach(controller)
+                job.check()
+            deadline = time.monotonic() + timeout
+            while True:
+                if job is not None and job.cancelled.is_set():
+                    controller.terminate()
+                    raise PythonCellCancelled("Python cell cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    controller.terminate()
+                    if job is not None and job.cancelled.is_set():
+                        raise PythonCellCancelled("Python cell cancelled")
+                    raise ValueError(f"Python cell stopped after {timeout} seconds")
+                if controller.wait_step(min(0.05, remaining)):
+                    break
+            if job is not None:
+                job.check()
+            if not result.is_file():
+                stderr_text = _read_stderr_tail(stderr_path)
+                raise ValueError((stderr_text or "Python exited without a result").strip()[-2000:])
+            output = json.loads(result.read_text(encoding="utf-8"))
+        finally:
+            if job is not None:
+                job.detach(controller)
+            controller.cleanup()
     output["images"] = [image for image in output.get("images", [])[:MAX_FIGURES]
                         if isinstance(image, str) and image.startswith("data:image/svg+xml;base64,") and len(image) <= MAX_FIGURE_BYTES * 4 // 3 + 64]
     return output
