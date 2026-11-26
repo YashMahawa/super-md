@@ -3,10 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const native = vi.hoisted(() => ({ fullscreen: false }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
-vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ isFullscreen: async () => native.fullscreen, setFullscreen: async (value: boolean) => { native.fullscreen = value; } }) }));
-vi.mock("@tauri-apps/api/webviewWindow", () => ({ WebviewWindow: class {} }));
+vi.mock("./nativeBridge", () => ({ invoke: vi.fn(async () => null) }));
 vi.mock("./components/Editor", () => ({ default: () => <div className="mock-editor" /> }));
 vi.mock("./components/MarkdownPreview", () => ({ default: () => <div className="mock-preview" /> }));
 import App from "./App";
@@ -19,7 +16,6 @@ let root: Root | null = null;
 afterEach(() => {
   if (root) act(() => root?.unmount());
   root = null;
-  native.fullscreen = false;
   document.body.innerHTML = "";
   localStorage.clear();
 });

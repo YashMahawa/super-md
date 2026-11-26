@@ -198,7 +198,6 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .format-hint { margin-left: auto; color: var(--muted); font-size: .76rem; }
 .workspace { position: relative; min-height: 0; display: grid; grid-template-columns: minmax(0, var(--split-left, 50fr)) 12px minmax(0, var(--split-right, 50fr)); gap: 4px; padding: 12px; background: var(--surface-low); transition: grid-template-columns .38s var(--standard); }
 .workspace[data-resizing="true"] { transition: none; cursor: col-resize; user-select: none; }
-.workspace[data-dragging-file="true"]::after { content: "Drop to open Markdown"; position: absolute; z-index: 6; inset: 12px; display: grid; place-items: center; border: 2px dashed var(--primary); border-radius: 22px; color: var(--primary); background: color-mix(in srgb, var(--surface) 92%, transparent); font-size: 1.12rem; font-weight: 760; pointer-events: none; }
 .view-editor .workspace, .view-reader .workspace, .view-live .workspace { grid-template-columns: minmax(0, 1fr); }
 .pane-resizer { display: grid; place-items: center; min-width: 12px; border-radius: 99px; cursor: col-resize; touch-action: none; outline: none; }
 .pane-resizer span { width: 4px; height: 50px; border-radius: 99px; background: var(--outline); transition: width .25s var(--expressive), height .25s var(--expressive), background-color .25s var(--standard); }

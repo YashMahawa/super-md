@@ -1,9 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { open as pickMobileDocument, save as chooseMobileDocument } from "@tauri-apps/plugin-dialog";
-import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { invoke } from "./nativeBridge";
 import { AnimatePresence, motion, MotionConfig, useReducedMotion } from "motion/react";
 import { ArrowsOutIcon, BookOpenIcon, BrowsersIcon, ChartLineIcon, CodeIcon, ColumnsIcon, CrosshairIcon, FilePdfIcon, FloppyDiskIcon, FolderOpenIcon, FunctionIcon, GearSixIcon, MagnifyingGlassIcon, MinusIcon, NoteIcon, SidebarSimpleIcon, PencilSimpleIcon, PlusIcon, SparkleIcon, TextBIcon, TextHTwoIcon, TextItalicIcon, XIcon } from "@phosphor-icons/react";
 import Editor from "./components/Editor";
@@ -18,7 +14,7 @@ import type { DocumentData, ExportOptions, ThemeMode, ViewMode } from "./types";
 import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
 import MediaTools, { type InsertionPoint } from "./components/MediaTools";
 import ImageViewer from "./components/ImageViewer";
-import { imageMarkdown, prepareFmd, type ImportedImage } from "./documentMedia";
+import { prepareFmd } from "./documentMedia";
 import { recordRecent } from "./recentFiles";
 import ZoomInput from "./components/ZoomInput";
 import ReadingSearch from "./components/ReadingSearch";
@@ -123,10 +119,10 @@ function firstRunSetup(): boolean {
 const android = /Android/i.test(navigator.userAgent);
 const compactViewport = () => (typeof window.matchMedia === "function" && window.matchMedia("(max-width: 760px)").matches);
 const pickerCancelled = (error: unknown) => /cancelled|canceled/i.test(String(error));
+const isDocumentData = (value: unknown): value is DocumentData => Boolean(value && typeof value === "object" && typeof (value as DocumentData).path === "string" && typeof (value as DocumentData).content === "string");
 
 export default function App() {
-  const windowLabel = useMemo(() => "__TAURI_INTERNALS__" in window ? getCurrentWindow().label : "browser", []);
-  const sessionKey = `workspace.tabs.${windowLabel}`;
+  const sessionKey = "workspace.tabs.browser";
   const [documents, setDocuments] = useState<DocumentWorkspace>(() => readWorkspace(localStorage, sessionKey,
     new URLSearchParams(window.location.search).has("window") ? initialWorkspace() : initialWorkspace(welcome, "Welcome.smd")));
   const documentsRef = useRef(documents);
@@ -171,7 +167,6 @@ export default function App() {
   const [folderVisible, setFolderVisible] = useState(() => localStorage.getItem("folder.visible") === "true");
   const [folderWidth, setFolderWidth] = useState(() => Math.max(180, Math.min(420, storedNumber("folder.width", 248))));
   const folderDrag = useRef(false);
-  const closing = useRef(false);
   useEffect(() => { localStorage.setItem("pdf.options", JSON.stringify(exportOptions)); }, [exportOptions]);
   useEffect(() => { localStorage.setItem("folder.visible", String(folderVisible)); localStorage.setItem("folder.width", String(folderWidth)); }, [folderVisible, folderWidth]);
   const [notice, setNotice] = useState("");
@@ -185,8 +180,6 @@ export default function App() {
   const [previewViewportWidth, setPreviewViewportWidth] = useState(900);
   const [splitPercent, setSplitPercent] = useState(() => Math.max(25, Math.min(75, storedNumber("workspace.split", 50))));
   const [resizing, setResizing] = useState(false);
-  const [windowResizing, setWindowResizing] = useState(false);
-  const [draggingFile, setDraggingFile] = useState(false);
   const workspaceRef = useRef<HTMLElement>(null);
   const savingRef = useRef(new Set<string>());
   const openingRef = useRef(false);
@@ -366,25 +359,10 @@ export default function App() {
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
   const applyDocument = useCallback((doc: DocumentData) => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => openTab(current, doc)); recordRecent(doc.path); }, [snapshotActiveTabAnchor]);
   const chooseFolder = useCallback(async () => {
-    try { const root = await invoke<string | null>("open_workspace_folder"); if (root) { setFolderRoot(root); setFolderVisible(true); localStorage.setItem("folder.root", root); } }
+    try { const root = await invoke<string | null>("open_workspace_folder"); if (typeof root === "string" && root) { setFolderRoot(root); setFolderVisible(true); localStorage.setItem("folder.root", root); } }
     catch (error) { flash(`Could not open folder: ${error}`); }
   }, []);
-  const openFolderFile = useCallback(async (path: string) => { try { applyDocument(await invoke<DocumentData>("read_document_at", { path })); } catch (error) { flash(String(error)); } }, [applyDocument]);
-  const closeWindow = useCallback(async () => {
-    if (closing.current || !("__TAURI_INTERNALS__" in window)) return;
-    closing.current = true;
-    try {
-      // Drafts are recovered next launch; no cancel/close loop or data discard.
-      localStorage.setItem(sessionKey, JSON.stringify(documentsRef.current));
-      await getCurrentWindow().destroy();
-    } catch (error) { closing.current = false; flash(`Window could not close: ${error}. Save your note first.`); }
-  }, [sessionKey]);
-  useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
-    let disposed = false; let stop: (() => void) | undefined;
-    getCurrentWindow().onCloseRequested((event) => { event.preventDefault(); void closeWindow(); }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; });
-    return () => { disposed = true; stop?.(); };
-  }, [closeWindow]);
+  const openFolderFile = useCallback(async (path: string) => { try { const doc = await invoke<DocumentData>("read_document_at", { path }); if (isDocumentData(doc)) applyDocument(doc); } catch (error) { flash(String(error)); } }, [applyDocument]);
   const newDocument = useCallback(() => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => addTab(current)); }, [snapshotActiveTabAnchor]);
   const insertMedia = useCallback((text: string, point?: InsertionPoint) => {
     const targetId = documentsRef.current.activeId;
@@ -401,11 +379,8 @@ export default function App() {
     if (openingRef.current) return;
     openingRef.current = true;
     try {
-      const doc = android ? await (async () => {
-        const selected = await pickMobileDocument({ multiple: false, directory: false, filters: [{ name: "Markdown", extensions: ["md", "markdown", "smd"] }] });
-        return typeof selected === "string" ? { path: selected, content: await readTextFile(selected) } : null;
-      })() : await invoke<DocumentData | null>("open_document");
-      if (doc) applyDocument(doc);
+      const doc = await invoke<DocumentData | null>("open_document");
+      if (isDocumentData(doc)) applyDocument(doc);
     } catch (error) { if (!pickerCancelled(error)) flash(`Could not open: ${error}`); }
     finally { openingRef.current = false; }
   }, [applyDocument]);
@@ -415,65 +390,50 @@ export default function App() {
     savingRef.current.add(tab.id);
     try {
       const prepared = /\.fmd$/i.test(tab.path || "") && !saveAs ? await prepareFmd(tab.content, tab.path) : { content: tab.content, assets: {} };
-      const saved = android ? await (async () => {
-        const target = saveAs || !tab.path ? await chooseMobileDocument({ defaultPath: tabTitle(tab), filters: [{ name: "Markdown", extensions: ["smd", "md"] }] }) : tab.path;
-        if (!target) return null;
-        await writeTextFile(target, tab.content);
-        return target;
-      })() : await invoke<string | null>("save_document", { request: { path: saveAs ? null : tab.path, content: prepared.content, assets: prepared.assets, sourcePath: tab.path } });
-      if (saved) { setDocuments((current) => markTabSaved(current.tabs.find((t) => t.id === tab.id)?.content === tab.content ? editTab(current, tab.id, prepared.content) : current, tab.id, saved, prepared.content)); recordRecent(saved); flash("Saved"); }
+      const saved = await invoke<string | null>("save_document", { request: { path: saveAs ? null : tab.path, content: prepared.content, assets: prepared.assets, sourcePath: tab.path } });
+      if (typeof saved === "string" && saved) { setDocuments((current) => markTabSaved(current.tabs.find((t) => t.id === tab.id)?.content === tab.content ? editTab(current, tab.id, prepared.content) : current, tab.id, saved, prepared.content)); recordRecent(saved); flash("Saved"); }
     } catch (error) { if (!pickerCancelled(error)) flash(`Could not save: ${error}`); }
     finally { savingRef.current.delete(tab.id); }
   }, []);
   const toggleFullscreen = useCallback(async () => {
-    if(!fullscreen) setFullscreenZoom(normalZoom);
-    if (!("__TAURI_INTERNALS__" in window)) {
-      const next = !fullscreen;
-      if (document.fullscreenEnabled) {
-        try { if (next) await document.documentElement.requestFullscreen(); else if (document.fullscreenElement) await document.exitFullscreen(); }
-        catch (error) { flash(`Fullscreen could not change: ${error}`); return; }
-      }
-      setFullscreen(next); return;
+    if (!fullscreen) setFullscreenZoom(normalZoom);
+    const next = !fullscreen;
+    if (document.fullscreenEnabled) {
+      try { if (next) await document.documentElement.requestFullscreen(); else if (document.fullscreenElement) await document.exitFullscreen(); }
+      catch (error) { flash(`Fullscreen could not change: ${error}`); return; }
     }
-    try {
-      const nativeWindow = getCurrentWindow();
-      const next = !(await nativeWindow.isFullscreen());
-      await nativeWindow.setFullscreen(next); setFullscreen(next);
-    } catch (error) { flash(`Fullscreen could not change: ${error}`); }
-  }, [fullscreen,normalZoom]);
+    setFullscreen(next);
+  }, [fullscreen, normalZoom]);
   useEffect(() => {
-    if ("__TAURI_INTERNALS__" in window) return;
     const changed = () => setFullscreen(Boolean(document.fullscreenElement));
     document.addEventListener("fullscreenchange", changed);
     return () => document.removeEventListener("fullscreenchange", changed);
   }, []);
 
-  const openNewWindow = useCallback((recoverLabel?: string) => {
-    if (!("__TAURI_INTERNALS__" in window)) { flash("New windows are available in the desktop app"); return; }
-    const label = recoverLabel ?? `document-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const child = new WebviewWindow(label, { url: `index.html?window=${recoverLabel ? "recover" : "new"}`, title: recoverLabel ? "Super MD — Recovered draft" : "Super MD — New window", width: 1180, height: 800, minWidth: 760, minHeight: 520, zoomHotkeysEnabled: false });
-    child.once("tauri://error", (event) => flash(`Could not open window: ${event.payload}`));
+  const openNewWindow = useCallback((_recoverLabel?: string) => {
+    flash("New windows are available in the desktop app");
   }, []);
 
   useEffect(() => {
-    const syncTheme = () => invoke<any>("load_system_theme").then(setCaelestia).catch(() => undefined);
+    const syncTheme = () => invoke<any>("load_system_theme").then((theme) => { if (theme && typeof theme === "object") setCaelestia(theme); }).catch(() => undefined);
     void syncTheme();
     const themeTimer = window.setInterval(syncTheme, 30_000);
     const query = new URLSearchParams(window.location.search);
     const hadSession = localStorage.getItem(sessionKey) !== null;
     if (query.get("window") === "recover" || (!hadSession && query.get("window") !== "new")) {
       invoke<string | null>("load_draft").then((draft) => {
-        if (draft) setDocuments((current) => {
+        if (typeof draft === "string" && draft) setDocuments((current) => {
           const next = addTab(current);
           return editTab(next, next.activeId, draft);
         });
       }).catch(() => undefined);
     }
-    if (query.has("document")) invoke<DocumentData>("read_document_at", { path: query.get("document") }).then(applyDocument).catch(() => undefined);
-    else if (!hadSession && !query.has("window")) invoke<DocumentData | null>("startup_document").then((doc) => { if (doc) applyDocument(doc); }).catch(() => undefined);
+    if (query.has("document")) invoke<DocumentData>("read_document_at", { path: query.get("document") }).then((doc) => { if (isDocumentData(doc)) applyDocument(doc); }).catch(() => undefined);
+    else if (!hadSession && !query.has("window")) invoke<DocumentData | null>("startup_document").then((doc) => { if (isDocumentData(doc)) applyDocument(doc); }).catch(() => undefined);
     invoke<string | null>("detect_python").then((detected) => {
+      if (typeof detected !== "string" || !detected) return;
       setPython((current) => {
-        if (current || !detected) return current;
+        if (current) return current;
         localStorage.setItem("python", detected);
         return detected;
       });
@@ -492,40 +452,8 @@ export default function App() {
   }, [documents, sessionKey]);
 
   useEffect(() => {
-    if (showSettings) invoke<string[]>("list_draft_windows").then(setDraftWindows).catch(() => setDraftWindows([]));
+    if (showSettings) invoke<string[]>("list_draft_windows").then((list) => setDraftWindows(Array.isArray(list) ? list.filter((item): item is string => typeof item === "string") : [])).catch(() => setDraftWindows([]));
   }, [showSettings]);
-
-  useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
-    const nativeWindow = getCurrentWindow();
-    let unlisten: (() => void) | undefined;
-    let resizeTimer = 0;
-    nativeWindow.isFullscreen().then(setFullscreen).catch(() => undefined);
-    nativeWindow.onResized(() => {
-      setWindowResizing(true);
-      window.clearTimeout(resizeTimer);
-      resizeTimer = window.setTimeout(() => setWindowResizing(false), 160);
-      nativeWindow.isFullscreen().then(setFullscreen).catch(() => undefined);
-    }).then((stop) => { unlisten = stop; });
-    return () => { unlisten?.(); window.clearTimeout(resizeTimer); };
-  }, []);
-
-  useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
-    let unlisten: (() => void) | undefined;
-    getCurrentWindow().onDragDropEvent(async ({ payload }) => {
-      if (payload.type === "over") { setDraggingFile(true); return; }
-      setDraggingFile(false);
-      if (payload.type !== "drop") return;
-      const images = payload.paths.filter((name) => /\.(png|jpe?g|svg|gif|webp|avif)$/i.test(name));
-      if (images.length) { const id = documentsRef.current.activeId; try { const imported = await invoke<ImportedImage[]>("import_image_paths", { paths: images }); setDocuments((current) => { const tab = current.tabs.find((tab) => tab.id === id); return tab ? editTab(current, id, tab.content + "\n\n" + imported.map(imageMarkdown).join("\n\n") + "\n") : current; }); } catch (e) { flash(String(e)); } return; }
-      const candidate = payload.paths.find((name) => /\.(smd|md|markdown|fmd)$/i.test(name));
-      if (!candidate) { flash("Drop an image, .fmd, .smd or Markdown document"); return; }
-      try { applyDocument(await invoke<DocumentData>("read_document_at", { path: candidate })); }
-      catch (error) { flash(`Could not open dropped file: ${error}`); }
-    }).then((stop) => { unlisten = stop; });
-    return () => unlisten?.();
-  }, [applyDocument, insertMedia]);
 
   useEffect(() => {
     const flush = () => {
@@ -551,7 +479,7 @@ export default function App() {
       }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); if (event.shiftKey) void closeWindow(); else { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, current.activeId)); } }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); if (!event.shiftKey) { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, current.activeId)); } }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments(restoreClosedTab); }
       if (!event.defaultPrevented && isTypewriterShortcutEvent(event)) { event.preventDefault(); toggleTypewriterScroll(); }
       if ((event.ctrlKey || event.metaKey) && event.key === "Tab") {
@@ -585,7 +513,7 @@ export default function App() {
       window.removeEventListener("keydown", handler);
       window.removeEventListener("supermd-find", openFind);
     };
-  }, [newDocument, open, openNewWindow, save, setZoom, snapshotActiveTabAnchor, toggleFullscreen, zoomBy, chooseFolder, closeWindow, view]);
+  }, [newDocument, open, openNewWindow, save, setZoom, snapshotActiveTabAnchor, toggleFullscreen, zoomBy, chooseFolder, view]);
 
   useEffect(() => {
     let frame = 0;
@@ -780,7 +708,7 @@ export default function App() {
   const wordCount = useMemo(() => content.trim() ? content.trim().split(/\s+/).length : 0, [content]);
   const choosePython = async () => {
     const selected = await invoke<string | null>("choose_python");
-    if (selected) { setPython(selected); localStorage.setItem("python", selected); }
+    if (typeof selected === "string" && selected) { setPython(selected); localStorage.setItem("python", selected); }
   };
   const exportPdf = async () => {
     if (exporting) return;
@@ -789,7 +717,7 @@ export default function App() {
       const output = exportFormat === "fmd"
         ? await invoke<string | null>("export_fmd", await prepareFmd(content, path))
         : await invoke<string | null>("export_portable_pdf", { path, ...await preparePdf(content, path, python || "embedded", { trustedImageHosts }), options: exportOptions });
-      if (output) { flash(`Exported ${output}`); setShowExport(false); }
+      if (typeof output === "string" && output) { flash(`Exported ${output}`); setShowExport(false); }
     } catch (error) { setExportError(String(error)); }
     finally { setExporting(false); }
   };
@@ -847,12 +775,12 @@ export default function App() {
       {fullscreen && <div className="fullscreen-controls" aria-label="Fullscreen controls"><button onClick={() => zoomBy(-10)} title="Zoom out"><MinusIcon size={16} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in"><PlusIcon size={16} /></button><span /><button onClick={toggleFullscreen} title="Leave fullscreen · F11"><ArrowsOutIcon size={17} /></button></div>}
       <div className="work-area" style={{ "--folder-width": `${folderWidth}px` } as React.CSSProperties}>
       {folderVisible && !fullscreen && <><FolderPanel root={folderRoot} activePath={path} onChoose={chooseFolder} onHide={() => setFolderVisible(false)} onOpen={openFolderFile} /><div className="folder-resizer" role="separator" aria-label="Resize folder sidebar" aria-orientation="vertical" tabIndex={0} onPointerDown={(e) => { folderDrag.current = true; e.currentTarget.setPointerCapture(e.pointerId); }} onPointerMove={(e) => { if (folderDrag.current) setFolderWidth(Math.max(180, Math.min(420, e.clientX))); }} onPointerUp={() => { folderDrag.current = false; }} onLostPointerCapture={() => { folderDrag.current = false; }} onKeyDown={(e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); setFolderWidth((w) => Math.max(180, Math.min(420, w + (e.key === "ArrowRight" ? 10 : -10)))); } }} /></>}
-      <main className="workspace" ref={workspaceRef} data-resizing={resizing || windowResizing} data-dragging-file={draggingFile} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
+      <main className="workspace" ref={workspaceRef} data-resizing={resizing} style={{ "--split-left": `${splitPercent}fr`, "--split-right": `${100 - splitPercent}fr`, "--workspace-scale": workspaceZoom / 100 } as React.CSSProperties}>
         {searching && (view === "reader" || view === "live") && <ReadingSearch content={content} close={() => setSearching(false)} onChange={view === "reader" ? undefined : (value) => setDocuments((current) => editTab(current, activeTab.id, value))} />}
-        {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimpleIcon size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} aria-label="Zoom in"><PlusIcon size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} onTypewriterChange={setTypewriterScroll} /></motion.section>}
+        {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimpleIcon size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} aria-label="Zoom in"><PlusIcon size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} onTypewriterChange={setTypewriterScroll} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
-        {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpenIcon size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><PlusIcon size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
-        {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><SparkleIcon size={15} /> Live preview</span><span className="preview-tools"><small>Click content to edit</small><ZoomInput value={workspaceZoom} onChange={setZoom} /></span></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} /></div></motion.section>}
+        {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpenIcon size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><PlusIcon size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
+        {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><SparkleIcon size={15} /> Live preview</span><span className="preview-tools"><small>Click content to edit</small><ZoomInput value={workspaceZoom} onChange={setZoom} /></span></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} /></div></motion.section>}
       </main></div>
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" role="dialog" aria-modal="true" aria-label="Settings" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>
