@@ -20,7 +20,7 @@ pub fn asset_mime(name: &str) -> Option<&'static str> {
     match name.rsplit('.').next()?.to_ascii_lowercase().as_str() { "png" => Some("image/png"), "jpg" | "jpeg" => Some("image/jpeg"), "svg" => Some("image/svg+xml"), "gif" => Some("image/gif"), "webp" => Some("image/webp"), "avif" => Some("image/avif"), _ => None }
 }
 pub fn asset_name(name: &str) -> bool {
-    name.strip_prefix("assets/").is_some_and(|name| !name.is_empty() && name.len() < 160 && name != "." && name != ".." && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+    name.strip_prefix("assets/").is_some_and(|name| !name.is_empty() && name.len() <= 150 && name != "." && name != ".." && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
 }
 pub fn image_bytes(data: &str) -> Result<(&str, Vec<u8>)> {
     let (header, encoded) = data.split_once(",").ok_or_else(|| anyhow::anyhow!("Invalid image data"))?;
@@ -134,7 +134,16 @@ pub fn pack(markdown: &str, mut load: impl FnMut(&str) -> Result<String>) -> Res
         assert_eq!(reopened.markdown, doc.markdown); assert_eq!(reopened.assets, doc.assets); assert!(!reopened.markdown.contains("base64"));
     }
     #[test] fn rejects_traversal_active_payloads_and_unknown_versions() {
-        for name in ["../x", "assets/../x", "assets/x/y", "/x"] { assert!(!asset_name(name)); }
+        for name in ["../x", "assets/../x", "assets/x/y", "/x", "assets/.", "assets/.."] { assert!(!asset_name(name)); }
+        let svg_data = format!("data:image/svg+xml;base64,{}", STANDARD.encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>"));
+        let max_key = format!("assets/{}.svg", "a".repeat(146));
+        assert!(asset_name(&max_key));
+        PortableDocument::new("notes".into(), BTreeMap::from([(max_key, svg_data.clone())])).validate().unwrap();
+        let over_key = format!("assets/{}.svg", "a".repeat(147));
+        for invalid in [over_key.as_str(), "assets/.", "assets/.."] {
+            assert!(!asset_name(invalid));
+            assert!(PortableDocument::new("notes".into(), BTreeMap::from([(invalid.to_string(), svg_data.clone())])).validate().is_err());
+        }
         assert!(image_bytes("data:text/html;base64,eA==").is_err());
         let mut doc = PortableDocument::new("notes".into(), BTreeMap::new()); doc.version = 2; assert!(doc.encode().is_err());
     }

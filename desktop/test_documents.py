@@ -188,9 +188,24 @@ class DocumentsTest(unittest.TestCase):
                 exact_25mb_len = (documents.MAX_IMAGE // 3) * 4 + 4  # 33,333,336 chars -> 25,000,000 bytes with '=='
                 exact_25mb = "A" * (exact_25mb_len - 2) + "=="
                 over_25mb = "A" * (exact_25mb_len - 1) + "="  # 25,000,001 bytes
+                max_asset_filename = "a" * 146 + ".png"
+                over_asset_filename = "a" * 147 + ".png"
+                max_asset_key = "assets/" + max_asset_filename
+                over_asset_key = "assets/" + over_asset_filename
+                self.assertTrue(documents.is_valid_asset_filename(max_asset_filename))
+                self.assertTrue(documents.is_valid_asset_key(max_asset_key))
+                self.assertIsNotNone(documents._SAFE_ASSET_NAME.fullmatch(max_asset_key))
+                for bad_filename in (over_asset_filename, ".", "..", ""):
+                    self.assertFalse(documents.is_valid_asset_filename(bad_filename))
+                for bad_key in (over_asset_key, "assets/.", "assets/..", "assets/"):
+                    self.assertFalse(documents.is_valid_asset_key(bad_key))
+                    self.assertIsNone(documents._SAFE_ASSET_NAME.fullmatch(bad_key))
                 validate_envelope({
                     "format": "supermd-smd", "version": 1, "markdown": "ok",
-                    "assets": {"assets/max.png": "data:image/png;base64," + exact_25mb},
+                    "assets": {
+                        "assets/max.png": "data:image/png;base64," + exact_25mb,
+                        max_asset_key: "data:image/png;base64,eA==",
+                    },
                 })
                 for invalid_envelope in (
                     {"format": "other", "version": 1, "markdown": "", "assets": {}},
@@ -202,6 +217,15 @@ class DocumentsTest(unittest.TestCase):
                     }},
                     {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
                         "assets/../escape.png": "data:image/png;base64,eA=="
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        over_asset_key: "data:image/png;base64,eA=="
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        "assets/.": "data:image/png;base64,eA=="
+                    }},
+                    {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
+                        "assets/..": "data:image/png;base64,eA=="
                     }},
                     {"format": "supermd-smd", "version": 1, "markdown": "", "assets": {
                         "assets/mismatch.png": "data:image/jpeg;base64,eA=="

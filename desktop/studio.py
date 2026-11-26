@@ -37,7 +37,8 @@ from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPat
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
-    encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    encode_base64_chunked, image_data, is_valid_asset_filename,
+    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
@@ -5078,7 +5079,7 @@ class Studio(QObject):
                     raise ValueError("Asset exceeds 25 MB")
 
             filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
-            if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+            if not is_valid_asset_filename(filename):
                 raise ValueError("Asset name must be a simple filename")
             ext = Path(filename).suffix.lower().lstrip(".")
             if not ext:

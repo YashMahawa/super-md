@@ -317,6 +317,11 @@ class AgentDocumentsTest(unittest.TestCase):
         attached = self.store.attach_asset("portable.smd", "图形 with space.svg", expected_revision=revision)
         self.assertRegex(attached["asset"]["name"], r"^assets/[A-Za-z0-9._-]+\.svg$")
         revision = attached["revision"]
+        for bad_name in ("a" * 147 + ".png", ".", ".."):
+            with self.assertRaisesRegex(AgentDocumentError, "simple filename"):
+                self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name=bad_name)
+        max_attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name="a" * 146 + ".png")
+        revision = max_attached["revision"]
         attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision)
         output = self.root / "extracted.png"
         extracted = self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",

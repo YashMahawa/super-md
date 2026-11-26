@@ -15,15 +15,20 @@ test("device RPC schema rejects unknown fields, oversized ranges and stale-write
   assert.equal(validateRpcRequest({ requestId: "r6", action: "document_action", documentAction: "job_status", jobId: "job-1" }).jobId, "job-1");
   assert.throws(() => validateRpcRequest({ requestId: "r7", action: "replace_tab_asset", tabId: "tab:1", assetName: "image.png", assetPath: "a".repeat(4097), expectedRevision: "a".repeat(64) }), /asset path/);
   const assetRequest = {requestId:"asset",action:"replace_tab_asset",tabId:"tab:1",assetPath:"/Downloads/new.png",expectedRevision:"a".repeat(64)};
+  const maxAssetKey = `assets/${"a".repeat(146)}.png`;
+  const overAssetKey = `assets/${"a".repeat(147)}.png`;
   assert.equal(validateRpcRequest({...assetRequest,assetName:"assets/current.png"}).assetName,"assets/current.png");
+  assert.equal(validateRpcRequest({...assetRequest,assetName:maxAssetKey}).assetName,maxAssetKey);
   assert.equal(validateRpcRequest({...assetRequest,assetName:"b".repeat(64)}).assetName,"b".repeat(64));
-  for(const assetName of ["../secret.png","assets/../secret.png","assets/a/b.png","assets/..","/secret.png"])
+  for(const assetName of ["../secret.png","assets/../secret.png","assets/a/b.png","assets/.","assets/..","/secret.png",overAssetKey])
     assert.throws(()=>validateRpcRequest({...assetRequest,assetName}),/asset name/);
   const inline = {requestId:"media",action:"asset_action",tabId:"tab:1",assetAction:"attach",assetName:"assets/model.png",mimeType:"image/png",body:"iVBORw0KGgo=",expectedRevision:"b".repeat(64)};
   assert.equal(validateRpcRequest(inline).assetAction,"attach");
+  assert.equal(validateRpcRequest({...inline,assetName:maxAssetKey}).assetName,maxAssetKey);
   assert.throws(()=>validateRpcRequest({...inline,body:"A".repeat(1_400_001)}),/Media body is too large/);
   assert.throws(()=>validateRpcRequest({...inline,mimeType:"text/html"}),/Unsupported image type/);
-  assert.throws(()=>validateRpcRequest({...inline,assetName:"assets/../model.png"}),/Invalid asset name/);
+  for(const assetName of ["assets/../model.png","assets/.","assets/..",".","..",overAssetKey])
+    assert.throws(()=>validateRpcRequest({...inline,assetName}),/Invalid asset name/);
   assert.throws(()=>validateRpcRequest({...inline,assetAction:"source",assetName:undefined,body:undefined}),/source requires assetName/);
   assert.equal(validateRpcRequest({ requestId: "jpeg", action: "render_tab", tabId: "tab:1", imageFormat: "jpeg" }).imageFormat, "jpeg");
   assert.equal(validateRpcRequest({ requestId: "png", action: "render_tab", tabId: "tab:1", imageFormat: "png" }).imageFormat, "png");

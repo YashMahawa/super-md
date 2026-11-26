@@ -385,6 +385,59 @@ class PortableUnchangedAssetSaveTest {
         assertThrows(Exception::class.java) {
             media.portableEnvelopeMatches(ByteArrayInputStream(validCompressed + byteArrayOf(0x42)), "# Hi", JSONObject())
         }
+
+        // 5. Canonical 1..150 character portable asset filename cap across media and AgentRelayClient.
+        val maxFilename = "a".repeat(146) + ".png"
+        val overFilename = "a".repeat(147) + ".png"
+        val maxKey = "assets/$maxFilename"
+        val overKey = "assets/$overFilename"
+        assertTrue(media.validKey(maxKey))
+        val maxArchive = ByteArrayOutputStream().also {
+            media.writeFmd(it, "# Max filename", JSONObject().put(maxKey, validPngUrl))
+        }.toByteArray()
+        val reopenedMax = media.openFmd(ByteArrayInputStream(maxArchive))
+        try {
+            assertTrue(media.portableAssets(reopenedMax.directory).has(maxKey))
+        } finally {
+            File(app.filesDir, "portable-assets/${reopenedMax.directory}").deleteRecursively()
+        }
+        val relayClient = AgentRelayClient()
+        val relayPngBody = Base64.encodeToString(syntheticPngBytes(64, 9L), Base64.NO_WRAP)
+        fun attachRequest(assetName: String) = JSONObject()
+            .put("requestId", "asset_cap")
+            .put("action", "asset_action")
+            .put("tabId", "tab:device:workspace:1")
+            .put("expectedRevision", "a".repeat(64))
+            .put("assetAction", "attach")
+            .put("assetName", assetName)
+            .put("mimeType", "image/png")
+            .put("body", relayPngBody)
+        relayClient.validateRequest(attachRequest(maxKey))
+        relayClient.validateRequest(attachRequest(maxFilename))
+        for (badKey in listOf(overKey, "assets/.", "assets/..")) {
+            assertFalse("Expected validKey to reject $badKey", media.validKey(badKey))
+            assertThrows(IllegalArgumentException::class.java) {
+                media.writeFmd(ByteArrayOutputStream(), "# Bad key", JSONObject().put(badKey, validPngUrl))
+            }
+            val badEnvelope = JSONObject()
+                .put("format", "supermd-smd")
+                .put("version", 1)
+                .put("markdown", "# Bad key")
+                .put("assets", JSONObject().put(badKey, validPngUrl))
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            assertThrows(IllegalArgumentException::class.java) {
+                media.openFmd(ByteArrayInputStream(badEnvelope))
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                relayClient.validateRequest(attachRequest(badKey))
+            }
+        }
+        for (badName in listOf(overFilename, ".", "..")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                relayClient.validateRequest(attachRequest(badName))
+            }
+        }
     }
 
     @Test

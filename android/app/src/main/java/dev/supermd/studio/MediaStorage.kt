@@ -272,11 +272,10 @@ class MediaStorage(private val context: Context) {
         check(File(bundles, id).mkdirs()) { "Could not prepare the portable note's local asset directory" }
         return id
     }
-    private val key = Regex("assets/[a-zA-Z0-9_.-]{1,150}")
     private fun gzip(output: java.io.OutputStream) = object : GZIPOutputStream(output, 8192) {
         init { def.setLevel(PORTABLE_GZIP_LEVEL) }
     }
-    fun validKey(source: String) = key.matches(source) && source.substringAfter('/') !in listOf(".", "..")
+    fun validKey(source: String): Boolean = isValidPortableAssetKey(source)
     private fun mime(name: String) = when(name.substringAfterLast('.').lowercase()) {
         "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"; "avif" -> "image/avif"; "svg" -> "image/svg+xml"; else -> error("Choose a supported image (PNG, JPEG, GIF, WebP, AVIF or SVG)")
     }

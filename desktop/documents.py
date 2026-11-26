@@ -20,7 +20,16 @@ MAX_TOTAL_IMAGES = 75_000_000
 MAX_ASSETS = 512
 GZIP_MAGIC = b"\x1f\x8b"
 PORTABLE_COMPRESSLEVEL = 3
-_SAFE_ASSET_NAME = re.compile(r"assets/[A-Za-z0-9._-]{1,150}")
+_SAFE_ASSET_FILENAME = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]{1,150}")
+_SAFE_ASSET_NAME = re.compile(r"assets/(?!\.\.?\Z)[A-Za-z0-9._-]{1,150}")
+
+
+def is_valid_asset_filename(filename: str) -> bool:
+    return isinstance(filename, str) and _SAFE_ASSET_FILENAME.fullmatch(filename) is not None
+
+
+def is_valid_asset_key(name: str) -> bool:
+    return isinstance(name, str) and name.startswith("assets/") and is_valid_asset_filename(name[7:])
 _MAX_CACHED_ASSETS = 512
 _MAX_CACHED_CHARS = 110_000_000
 _VALIDATED_LOCK = threading.Lock()
@@ -256,7 +265,7 @@ def validate_envelope(value: dict) -> None:
         raise ValueError("Portable note is too large or malformed")
     total = 0
     for name, data in value["assets"].items():
-        if not isinstance(name, str) or not _SAFE_ASSET_NAME.fullmatch(name) or name.rsplit("/", 1)[1] in (".", ".."):
+        if not is_valid_asset_key(name):
             raise ValueError("Unsafe asset name")
         mime, _, estimated = _parse_image_header(data)
         if MIMES.get(name.rsplit(".", 1)[-1].lower()) != mime:
@@ -357,7 +366,7 @@ def _write_gzip_json(target, value: dict, *, _trusted_ascii_assets: bool = False
         ascii_chunk = 1_048_576
         for name, data in assets.items():
             if (type(name) is str and type(data) is str
-                    and (_trusted_ascii_assets or (_SAFE_ASSET_NAME.fullmatch(name) and _is_cached_validated_asset(data)))):
+                    and (_trusted_ascii_assets or (is_valid_asset_key(name) and _is_cached_validated_asset(data)))):
                 write_bytes((b"" if first else b",") + b'"' + name.encode("ascii") + b'":"')
                 end = len(data)
                 if end <= ascii_chunk:

@@ -228,7 +228,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
                 require(body.isNotEmpty() && body.length <= MAX_ASSET_BASE64 && body.length % 4 == 0) { "Asset body must be at most 1 MiB of base64" }
                 val bytes = android.util.Base64.decode(body, android.util.Base64.DEFAULT)
                 require(bytes.size in 1..MAX_ASSET_BYTES && android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP) == body) { "Asset body must be canonical base64 and at most 1 MiB" }
-                require(Regex("^(?:assets/)?[A-Za-z0-9._-]{1,150}$").matches(request.getString("assetName")) && request.getString("assetName").substringAfterLast('/') !in setOf(".", "..")) { "Invalid assetName" }
+                require(isValidPortableAssetNameOrKey(request.getString("assetName"))) { "Invalid assetName" }
             }
         }
         if (action == "document_action") {
