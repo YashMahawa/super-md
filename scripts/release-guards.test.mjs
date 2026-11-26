@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -20,7 +20,7 @@ test("tags and platform versions must agree", () => {
   for (const tag of ["main", "v0.3.0;evil", "v0.3.0-rc1", "../v0.3.0"]) assert.throws(() => versionFromTag(tag));
   assert.throws(() => validateVersions("v0.3.0", { android: "0.2.0" }));
 });
-test("versions CLI validates live manifests and smd-core/Cargo.toml without reading src-tauri", () => {
+test("versions CLI validates package, smd-core, and Android manifests", () => {
   const pkgVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
   assert.equal(
     execFileSync(process.execPath, ["scripts/release-guards.mjs", "versions", `v${pkgVersion}`], {
@@ -39,13 +39,28 @@ test("versions CLI validates live manifests and smd-core/Cargo.toml without read
     /does not match v0\.0\.0/,
   );
 
+  for (const iconFile of ["icon.ico", "icon.icns", "icon-source.png"]) {
+    assert.equal(
+      existsSync(path.join(repoRoot, "desktop/brand", iconFile)),
+      true,
+      `Expected desktop brand asset desktop/brand/${iconFile} to exist`,
+    );
+  }
+
   const fixture = mkdtempSync(path.join(os.tmpdir(), "supermd-release-guards-"));
   try {
     mkdirSync(path.join(fixture, "smd-core"), { recursive: true });
     mkdirSync(path.join(fixture, "android/app"), { recursive: true });
-    writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ version: pkgVersion }));
-    writeFileSync(path.join(fixture, "smd-core/Cargo.toml"), `[package]\nname = "smd-core"\nversion = "${pkgVersion}"\n`);
-    writeFileSync(path.join(fixture, "android/app/build.gradle.kts"), `defaultConfig { versionName = "${pkgVersion}" }\n`);
+    const writeManifests = ({
+      pkg = pkgVersion,
+      smdCore = pkgVersion,
+      android = pkgVersion,
+    } = {}) => {
+      writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ version: pkg }));
+      writeFileSync(path.join(fixture, "smd-core/Cargo.toml"), `[package]\nname = "smd-core"\nversion = "${smdCore}"\n`);
+      writeFileSync(path.join(fixture, "android/app/build.gradle.kts"), `defaultConfig { versionName = "${android}" }\n`);
+    };
+    writeManifests();
     writeFileSync(path.join(fixture, "README.md"), readFileSync(new URL("../README.md", import.meta.url), "utf8"));
     assert.equal(
       execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
@@ -54,16 +69,23 @@ test("versions CLI validates live manifests and smd-core/Cargo.toml without read
       }).trim(),
       pkgVersion,
     );
-    writeFileSync(path.join(fixture, "smd-core/Cargo.toml"), '[package]\nname = "smd-core"\nversion = "0.1.0"\n');
-    assert.throws(
-      () =>
-        execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
-          cwd: fixture,
-          encoding: "utf8",
-          stdio: "pipe",
-        }),
-      /rust version 0\.1\.0 does not match/,
-    );
+
+    for (const [override, pattern] of [
+      [{ pkg: "0.1.0" }, /package version 0\.1\.0 does not match/],
+      [{ smdCore: "0.1.0" }, /smd-core version 0\.1\.0 does not match/],
+      [{ android: "0.1.0" }, /android version 0\.1\.0 does not match/],
+    ]) {
+      writeManifests(override);
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
+            cwd: fixture,
+            encoding: "utf8",
+            stdio: "pipe",
+          }),
+        pattern,
+      );
+    }
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }

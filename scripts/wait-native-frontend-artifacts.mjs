@@ -33,7 +33,7 @@ function validatePage(page, label) {
   return list;
 }
 
-function inspectProducerReadiness({ repository, runId, run, jobsPage }) {
+export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
   const expectedRunId = Number(runId);
   if (run?.id !== expectedRunId) throw new Error(`GitHub returned workflow run ${run?.id}, expected ${runId}`);
   if (run?.repository?.full_name?.toLowerCase() !== repository.toLowerCase()) {
@@ -45,22 +45,14 @@ function inspectProducerReadiness({ repository, runId, run, jobsPage }) {
   if (producerJobs.length > 1) throw new Error('Ambiguous native frontend producer jobs in this workflow run');
   if (producerJobs.length === 0) {
     if (run.status === 'completed') throw new Error('Native frontend producer is missing from the completed workflow run');
-    return { ready: false, producerRegistered: false, reason: 'producer job has not been registered yet' };
+    return { ready: false, reason: 'producer job has not been registered yet' };
   }
 
   const [producer] = producerJobs;
   if (producer.status === 'completed' && producer.conclusion !== 'success') {
     throw new Error(`Native frontend producer failed (${producer.conclusion || 'unknown'}); refusing fallback`);
   }
-  if (producer.status !== 'completed') {
-    return { ready: false, producerRegistered: true, reason: `producer job is ${producer.status}` };
-  }
-  return { ready: true, producerRegistered: true };
-}
-
-export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
-  const producerState = inspectProducerReadiness({ repository, runId, run, jobsPage });
-  if (!producerState.ready) return { ready: false, reason: producerState.reason };
+  if (producer.status !== 'completed') return { ready: false, reason: `producer job is ${producer.status}` };
 
   const artifacts = validatePage(artifactsPage, 'workflow artifacts');
   const expected = frontendArtifactNames(sourceSha);
@@ -74,42 +66,7 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   return { ready: true, names: expected };
 }
 
-function parseRetryAfterMs(headers, nowMs) {
-  const getHeader = name => headers?.get?.(name) ?? null;
-  const retryAfter = getHeader('retry-after');
-  if (retryAfter !== null) {
-    const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
-    const retryDate = Date.parse(retryAfter);
-    if (Number.isFinite(retryDate)) return Math.max(0, retryDate - nowMs);
-  }
-  const reset = getHeader('x-ratelimit-reset');
-  if (reset !== null && getHeader('x-ratelimit-remaining') === '0') {
-    const resetEpochSeconds = Number(reset);
-    if (Number.isFinite(resetEpochSeconds) && resetEpochSeconds > 0) {
-      return Math.max(0, Math.ceil(resetEpochSeconds * 1_000 - nowMs) + 1_000);
-    }
-  }
-  return null;
-}
-
-async function isRateLimitedForbidden(response) {
-  const getHeader = name => response.headers?.get?.(name) ?? null;
-  if (getHeader('retry-after') !== null || getHeader('x-ratelimit-remaining') === '0') {
-    return true;
-  }
-  if (typeof response.text === 'function') {
-    try {
-      const bodyText = await response.text();
-      if (/rate[- ]limit/i.test(bodyText)) return true;
-    } catch {
-      // Ignore body read failures and fall through to fail closed.
-    }
-  }
-  return false;
-}
-
-async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
+async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -122,18 +79,12 @@ async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
     });
   } catch (error) {
     if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || error instanceof TypeError) {
-      return { retry: true, status: error.name || 'network-error', retryAfterMs: null };
+      return { retry: true, status: error.name || 'network-error' };
     }
     throw error;
   }
   if (!response.ok) {
-    const retryAfterMs = parseRetryAfterMs(response.headers, nowMs);
-    if (response.status >= 500 || response.status === 429) {
-      return { retry: true, status: response.status, retryAfterMs };
-    }
-    if (response.status === 403 && await isRateLimitedForbidden(response)) {
-      return { retry: true, status: response.status, retryAfterMs };
-    }
+    if (response.status >= 500 || response.status === 429) return { retry: true, status: response.status };
     throw new Error(`GitHub Actions API request failed with HTTP ${response.status}`);
   }
   return { value: await response.json() };
@@ -147,75 +98,41 @@ export async function waitForNativeFrontendArtifacts({
   apiUrl,
   fetchImpl = fetch,
   sleep = delay,
-  timeoutMs = 1_200_000,
-  pollIntervalMs = 10_000,
+  timeoutMs = 600_000,
+  pollIntervalMs = 5_000,
   now = Date.now,
 }) {
   const endpoint = assertInputs({ repository, runId, sourceSha, token, apiUrl });
-  frontendArtifactNames(sourceSha);
-  const baseUrl = `${endpoint.href.replace(/\/?$/, '/')}`;
+  const names = frontendArtifactNames(sourceSha);
   const runPath = `repos/${repository}/actions/runs/${runId}`;
   const started = now();
   const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
-  const pause = async (retryAfterMs = null) => {
+  const pause = async () => {
     const left = timeoutMs - (now() - started);
-    if (left <= 0) return;
-    const desiredMs = retryAfterMs !== null ? Math.max(pollIntervalMs, retryAfterMs) : pollIntervalMs;
-    await sleep(Math.min(desiredMs, left));
+    if (left > 0) await sleep(Math.min(pollIntervalMs, left));
   };
-  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()), now());
-  let cachedRun = null;
+  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
   while (now() - started < timeoutMs) {
-    let fetchedRunThisPoll = false;
-    if (!cachedRun) {
-      const runResult = await request(new URL(runPath, baseUrl));
-      if (runResult.retry) {
-        await pause(runResult.retryAfterMs);
-        continue;
-      }
-      cachedRun = runResult.value;
-      fetchedRunThisPoll = true;
-    }
-    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, baseUrl));
-    if (jobsResult.retry) {
-      await pause(jobsResult.retryAfterMs);
-      continue;
-    }
-    let producerState = inspectProducerReadiness({
-      repository,
-      runId,
-      run: cachedRun,
-      jobsPage: jobsResult.value,
-    });
-    if ((!producerState.producerRegistered || producerState.ready) && !fetchedRunThisPoll) {
-      const freshRunResult = await request(new URL(runPath, baseUrl));
-      if (freshRunResult.retry) {
-        await pause(freshRunResult.retryAfterMs);
-        continue;
-      }
-      cachedRun = freshRunResult.value;
-      fetchedRunThisPoll = true;
-      producerState = inspectProducerReadiness({
-        repository,
-        runId,
-        run: cachedRun,
-        jobsPage: jobsResult.value,
-      });
-    }
-    if (!producerState.ready) {
+    const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
+    if (runResult.retry) {
       await pause();
       continue;
     }
-    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, baseUrl));
+    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
+    if (jobsResult.retry) {
+      await pause();
+      continue;
+    }
+    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (artifactsResult.retry) {
-      await pause(artifactsResult.retryAfterMs);
+      await pause();
       continue;
     }
     const state = inspectFrontendArtifactReadiness({
       repository,
       runId,
       sourceSha,
-      run: cachedRun,
+      run: runResult.value,
       jobsPage: jobsResult.value,
       artifactsPage: artifactsResult.value,
     });
