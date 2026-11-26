@@ -645,3 +645,78 @@ test('get_context reads visible text, reading.offset, and active selection acros
   expect(liveCtx.reading.offset).toBe(Array.from(content.slice(0,content.indexOf('Target phrase'))).length);
   expect(liveCtx.selection.text).toBe('Target phrase');
 });
+
+test('get_context includes displayed frontmatter title, author, and tags while preserving canonical source offsets across scroll positions',async({page})=>{
+  const paragraphs=Array.from({length:45},(_,i)=>`Paragraph ${i}: body prose with Unicode 🧭 and canonical offset tracking.`).join('\n\n');
+  const content=[
+    '\uFEFF---',
+    'title: "Path Integrals & Symmetries"',
+    'subtitle: Graduate Lecture Notes',
+    'author:',
+    '  - name: Richard Feynman',
+    '  - given: Emmy',
+    '    family: Noether',
+    'date: 2026-03-15',
+    'tags: [quantum, physics]',
+    'keywords: physics, qft',
+    'aliases: [QFT Notes]',
+    '---',
+    '',
+    '# Propagator Kernel',
+    '',
+    paragraphs,
+    '',
+    '## Asymptotic Tail',
+    '',
+    'Bottom boundary check.',
+  ].join('\n');
+
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+  const tabId='frontmatter-agent-context-e2e';
+  await page.evaluate(value=>window.supermdLoad?.(value),{
+    id:tabId,path:null,content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false,
+  });
+  await expect(page.getByRole('region',{name:'Document properties'})).toBeVisible();
+  await settleReadingScroll(page);
+
+  // At scroll top (.document-properties visible): properties + visibleText include title/author/tags, redact hidden fields, and start canonical source at 0.
+  const topCtx:any=await agent(page,{action:'get_context',tabId});
+  expect(topCtx.properties).toEqual({
+    title:'Path Integrals & Symmetries',
+    author:'Richard Feynman, Emmy Noether',
+    authors:['Richard Feynman','Emmy Noether'],
+    tags:['quantum','physics','qft'],
+  });
+  expect(topCtx.reading.visibleText).toContain('Path Integrals & Symmetries');
+  expect(topCtx.reading.visibleText).toContain('Author: Richard Feynman, Emmy Noether');
+  expect(topCtx.reading.visibleText).toContain('Tags: quantum, physics, qft');
+  expect(topCtx.reading.visibleText).not.toContain('Graduate Lecture Notes');
+  expect(topCtx.reading.visibleText).not.toContain('2026-03-15');
+  expect(topCtx.reading.offset).toBe(0);
+  expect(topCtx.visibleSource.start).toBe(0);
+  expect(topCtx.visibleSource.text).toBe(Array.from(content).slice(0,topCtx.visibleSource.end).join(''));
+
+  // Scroll past .document-properties to ## Asymptotic Tail: properties stay attached while offsets match canonical body coordinates.
+  await page.evaluate(()=>window.supermdHeading?.('asymptotic-tail'));
+  await expect(page.getByRole('heading',{name:'Asymptotic Tail',exact:true})).toBeInViewport();
+  await settleReadingScroll(page);
+
+  const bottomCtx:any=await agent(page,{action:'get_context',tabId});
+  expect(bottomCtx.properties).toEqual(topCtx.properties);
+  expect(bottomCtx.reading.offset).toBeGreaterThan(0);
+  expect(bottomCtx.visibleSource.start).toBe(bottomCtx.reading.offset);
+  expect(bottomCtx.visibleSource.text).toBe(Array.from(content).slice(bottomCtx.visibleSource.start,bottomCtx.visibleSource.end).join(''));
+  expect(bottomCtx.reading.visibleText).not.toContain('Author: Richard Feynman');
+  expect(bottomCtx.reading.visibleText).toContain('Bottom boundary check.');
+
+  // Headingless note falls back reading.heading to frontmatter title.
+  const headingless='---\ntitle: Frontmatter Fallback Heading\ntags: [meta]\n---\n\nPlain body paragraph without ATX headings.\n';
+  await page.evaluate(value=>window.supermdLoad?.(value),{
+    id:'headingless-fm-e2e',path:null,content:headingless,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false,
+  });
+  await expect(page.getByRole('region',{name:'Document properties'})).toContainText('Frontmatter Fallback Heading');
+  const fallbackCtx:any=await agent(page,{action:'get_context',tabId:'headingless-fm-e2e'});
+  expect(fallbackCtx.reading.heading).toBe('Frontmatter Fallback Heading');
+  expect(fallbackCtx.properties).toEqual({title:'Frontmatter Fallback Heading',tags:['meta']});
+});
