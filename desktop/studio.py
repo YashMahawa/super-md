@@ -77,16 +77,8 @@ def _normalize_mcp_roots(roots) -> list[str]:
     normalized: list[str] = []
     seen: set[str] = set()
     for candidate in roots:
-        if candidate is None:
-            continue
-        raw = str(candidate).strip()
-        if not raw or "\0" in raw:
-            continue
-        try:
-            resolved = Path(raw).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError, ValueError):
-            continue
-        if not resolved.is_dir():
+        resolved = _canonical_approved_directory(candidate)
+        if resolved is None:
             continue
         key = str(resolved)
         if key not in seen:
@@ -191,75 +183,274 @@ _SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
 )
 
 
-def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[Path], *,
-                                   unavailable_message: str, outside_message: str,
-                                   _system_aliases: tuple[tuple[str, str], ...] | None = None) -> Path:
-    if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
-        raise ValueError(unavailable_message)
-    candidate = Path(raw_path).expanduser()
-    if not candidate.is_absolute():
-        candidate = note_path.parent / candidate
-    absolute = Path(os.path.abspath(candidate))
-
-    # On macOS /var and /tmp are system-provided symlinks into /private. Rewrite
-    # those known aliases before walking path components so temp-folder paths
-    # work when tab["path"] was resolved, while still rejecting symlinks inside
-    # user folders.
-    system_aliases = _SYSTEM_PATH_ALIASES if _system_aliases is None else _system_aliases
-    for raw_alias, raw_canonical in system_aliases:
+def _rewrite_system_path_alias(
+    path: Path,
+    system_aliases: tuple[tuple[str, str], ...] | None = None,
+) -> Path:
+    aliases = _SYSTEM_PATH_ALIASES if system_aliases is None else system_aliases
+    for raw_alias, raw_canonical in aliases:
         alias = Path(raw_alias)
         canonical = Path(raw_canonical)
         try:
             if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
-                    and (absolute == alias or alias in absolute.parents)):
-                absolute = canonical / absolute.relative_to(alias)
-                break
+                    and (path == alias or alias in path.parents)):
+                return canonical / path.relative_to(alias)
         except (OSError, RuntimeError):
             continue
+    return path
+
+
+def _has_link_or_junction_component(path: Path) -> bool:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current = current / part
+        try:
+            if folder_ops._is_link_or_junction(current):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _canonical_approved_directory(
+    raw_value,
+    *,
+    _system_aliases: tuple[tuple[str, str], ...] | None = None,
+) -> Path | None:
+    """Validate an existing local directory without traversing symlinks or junctions."""
+    if raw_value is None or not isinstance(raw_value, (str, os.PathLike)):
+        return None
+    raw = folder_ops.strip_extended_length_prefix(str(raw_value).strip())
+    if not raw or "\0" in raw or len(raw) > 4096:
+        return None
+    try:
+        expanded = Path(raw).expanduser()
+        if folder_ops._is_link_or_junction(expanded):
+            return None
+        supplied = Path(os.path.abspath(expanded))
+        aliased = _rewrite_system_path_alias(supplied, _system_aliases)
+        if _has_link_or_junction_component(aliased):
+            return None
+        resolved = Path(folder_ops.strip_extended_length_prefix(str(aliased.resolve(strict=True))))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _is_disallowed_root_setting(raw_value: str) -> bool:
+    """Return True if a persisted root setting is malformed, a symlink/junction, or a non-directory file."""
+    cleaned = folder_ops.strip_extended_length_prefix(raw_value.strip())
+    if not cleaned:
+        return False
+    try:
+        expanded = Path(cleaned).expanduser()
+        if folder_ops._is_link_or_junction(expanded):
+            return True
+        supplied = Path(os.path.abspath(expanded))
+        aliased = _rewrite_system_path_alias(supplied)
+        if _has_link_or_junction_component(aliased):
+            return True
+        if aliased.exists() and not aliased.is_dir():
+            return True
+    except (OSError, RuntimeError, ValueError):
+        return True
+    return False
+
+
+def _raw_local_path(value: str) -> Path:
+    url = QUrl(value)
+    raw = url.toLocalFile() if url.isLocalFile() else value
+    return Path(folder_ops.strip_extended_length_prefix(str(Path(raw).expanduser())))
+
+
+def _validate_approved_local_file_path(
+    raw_path,
+    *,
+    note_path: Path | None = None,
+    extra_roots: list[Path] | tuple[Path, ...] = (),
+    approved_files: list[str | Path] | set[str] | tuple[str | Path, ...] = (),
+    allow_note_parent: bool = False,
+    unavailable_message: str,
+    outside_message: str,
+    _system_aliases: tuple[tuple[str, str], ...] | None = None,
+) -> Path:
+    """Shared Desktop path validator for live open_document and portable tab asset operations."""
+    if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
+        raise ValueError(unavailable_message)
+    cleaned_raw = folder_ops.strip_extended_length_prefix(raw_path.strip())
+    candidate = Path(cleaned_raw).expanduser()
+    if not candidate.is_absolute() and any(folder_ops.is_hidden_name(part) for part in candidate.parts):
+        raise ValueError(outside_message)
+
+    root_inputs: list[Path] = []
+    if note_path is not None and allow_note_parent:
+        root_inputs.append(note_path.parent)
+    root_inputs.extend(Path(root) for root in extra_roots if root)
 
     canonical_roots: list[Path] = []
     root_aliases: list[tuple[Path, Path]] = []
-    for root in (note_path.parent, *extra_roots):
-        if not root:
-            continue
+    for root in root_inputs:
         try:
-            supplied_root = Path(os.path.abspath(Path(root).expanduser()))
-            canonical_root = supplied_root.resolve(strict=True)
-        except (OSError, RuntimeError):
+            supplied_root = Path(os.path.abspath(Path(folder_ops.strip_extended_length_prefix(str(root))).expanduser()))
+            aliased_root = _rewrite_system_path_alias(supplied_root, _system_aliases)
+            if _has_link_or_junction_component(aliased_root):
+                continue
+            canonical_root = Path(folder_ops.strip_extended_length_prefix(str(aliased_root.resolve(strict=True))))
+        except (OSError, RuntimeError, ValueError):
             continue
         if not canonical_root.is_dir():
             continue
         if canonical_root not in canonical_roots:
             canonical_roots.append(canonical_root)
-        if supplied_root != canonical_root:
-            pair = (supplied_root, canonical_root)
-            if pair not in root_aliases:
-                root_aliases.append(pair)
+        for alias_candidate in (supplied_root, aliased_root):
+            if alias_candidate != canonical_root:
+                pair = (alias_candidate, canonical_root)
+                if pair not in root_aliases:
+                    root_aliases.append(pair)
     root_aliases.sort(key=lambda item: len(item[0].parts), reverse=True)
 
-    for supplied_root, canonical_root in root_aliases:
-        if absolute == supplied_root or supplied_root in absolute.parents:
-            absolute = canonical_root / absolute.relative_to(supplied_root)
-            break
-
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current = current / part
+    canonical_files: set[Path] = set()
+    file_aliases: list[tuple[Path, Path]] = []
+    for item in approved_files:
+        if not item:
+            continue
+        raw_item = folder_ops.strip_extended_length_prefix(str(item).strip())
+        if not raw_item or "\0" in raw_item:
+            continue
         try:
-            if current.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(current)):
-                raise ValueError(outside_message)
-        except OSError as error:
-            raise ValueError(unavailable_message) from error
+            supplied_file = Path(os.path.abspath(Path(raw_item).expanduser()))
+            aliased_file = _rewrite_system_path_alias(supplied_file, _system_aliases)
+            if folder_ops.is_hidden_name(aliased_file.name) or _has_link_or_junction_component(aliased_file):
+                continue
+            canonical_file = Path(folder_ops.strip_extended_length_prefix(str(aliased_file.resolve(strict=True))))
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if not canonical_file.is_file() or folder_ops.is_hidden_name(canonical_file.name):
+            continue
+        canonical_files.add(canonical_file)
+        for alias_candidate in (supplied_file, aliased_file):
+            if alias_candidate != canonical_file:
+                pair = (alias_candidate, canonical_file)
+                if pair not in file_aliases:
+                    file_aliases.append(pair)
+    file_aliases.sort(key=lambda item: len(item[0].parts), reverse=True)
 
-    try:
-        resolved = absolute.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise ValueError(unavailable_message) from error
-    if not resolved.is_file():
-        raise ValueError(outside_message)
-    if any(resolved == canonical_root or canonical_root in resolved.parents for canonical_root in canonical_roots):
-        return resolved
+    candidate_paths: list[Path] = []
+    if candidate.is_absolute():
+        candidate_paths.append(candidate)
+    else:
+        for canonical_root in canonical_roots:
+            candidate_paths.append(canonical_root / candidate)
+        if len(candidate.parts) == 1:
+            matched_files = [approved for approved in canonical_files if approved.name == candidate.name]
+            if len(matched_files) == 1:
+                candidate_paths.append(matched_files[0])
+        if not candidate_paths:
+            raise ValueError(outside_message)
+
+    def _rewrite_aliases_raw(path_obj: Path) -> Path:
+        rewritten = _rewrite_system_path_alias(path_obj, _system_aliases)
+        for supplied_root, canonical_root in root_aliases:
+            if (len(rewritten.parts) >= len(supplied_root.parts)
+                    and rewritten.parts[:len(supplied_root.parts)] == supplied_root.parts):
+                tail = rewritten.parts[len(supplied_root.parts):]
+                return canonical_root.joinpath(*tail) if tail else canonical_root
+        for supplied_file, canonical_file in file_aliases:
+            if rewritten.parts == supplied_file.parts:
+                return canonical_file
+        return rewritten
+
+    def _has_traversed_hidden_segment(raw_obj: Path, approved_base: Path) -> bool:
+        common = 0
+        for left, right in zip(raw_obj.parts, approved_base.parts):
+            if folder_ops.normalize_path_key(left) != folder_ops.normalize_path_key(right):
+                break
+            common += 1
+        return any(folder_ops.is_hidden_name(part) for part in raw_obj.parts[common:])
+
+    saw_missing = False
+    for attempt in candidate_paths:
+        raw_attempt = _rewrite_aliases_raw(attempt if attempt.is_absolute() else Path(os.getcwd()) / attempt)
+        raw_current = Path(raw_attempt.anchor)
+        for part in raw_attempt.parts[1:]:
+            raw_current = raw_current / part
+            if part in (".", ".."):
+                continue
+            try:
+                if folder_ops._is_link_or_junction(raw_current):
+                    raise ValueError(outside_message)
+            except OSError as error:
+                raise ValueError(unavailable_message) from error
+
+        absolute = Path(os.path.abspath(attempt))
+        absolute = _rewrite_system_path_alias(absolute, _system_aliases)
+        for supplied_root, canonical_root in root_aliases:
+            if absolute == supplied_root or supplied_root in absolute.parents:
+                absolute = canonical_root / absolute.relative_to(supplied_root)
+                break
+        else:
+            for supplied_file, canonical_file in file_aliases:
+                if absolute == supplied_file:
+                    absolute = canonical_file
+                    break
+
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:]:
+            current = current / part
+            try:
+                if folder_ops._is_link_or_junction(current):
+                    raise ValueError(outside_message)
+            except OSError as error:
+                raise ValueError(unavailable_message) from error
+
+        try:
+            resolved = Path(folder_ops.strip_extended_length_prefix(str(raw_attempt.resolve(strict=True))))
+        except (OSError, RuntimeError):
+            saw_missing = True
+            continue
+        if not resolved.is_file() or folder_ops.is_hidden_name(resolved.name):
+            raise ValueError(outside_message)
+        if resolved in canonical_files:
+            if _has_traversed_hidden_segment(raw_attempt, resolved):
+                raise ValueError(outside_message)
+            return resolved
+        for canonical_root in canonical_roots:
+            if canonical_root in resolved.parents:
+                if (folder_ops.has_hidden_relative_segment(resolved, canonical_root)
+                        or folder_ops.has_hidden_relative_segment(absolute, canonical_root)
+                        or _has_traversed_hidden_segment(raw_attempt, canonical_root)):
+                    raise ValueError(outside_message)
+                return resolved
+    if saw_missing and (candidate.is_absolute() or len(candidate_paths) == 1):
+        # Preserve outside_message when a missing path is not even lexically under an approved root/file.
+        probe = Path(os.path.abspath(candidate_paths[0]))
+        probe = _rewrite_system_path_alias(probe, _system_aliases)
+        for supplied_root, canonical_root in root_aliases:
+            if probe == supplied_root or supplied_root in probe.parents:
+                probe = canonical_root / probe.relative_to(supplied_root)
+                break
+        in_scope = any(
+            canonical_root in probe.parents and not folder_ops.has_hidden_relative_segment(probe, canonical_root)
+            for canonical_root in canonical_roots
+        )
+        if in_scope:
+            raise ValueError(unavailable_message)
     raise ValueError(outside_message)
+
+
+def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[Path], *,
+                                   unavailable_message: str, outside_message: str,
+                                   allow_note_parent: bool = True,
+                                   _system_aliases: tuple[tuple[str, str], ...] | None = None) -> Path:
+    return _validate_approved_local_file_path(
+        raw_path,
+        note_path=note_path,
+        extra_roots=extra_roots,
+        allow_note_parent=allow_note_parent,
+        unavailable_message=unavailable_message,
+        outside_message=outside_message,
+        _system_aliases=_system_aliases,
+    )
 
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":3,\"step\":0.05,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
@@ -436,13 +627,23 @@ class Session(QObject):
         # opt-ins; each desktop launch mints a fresh temporary loopback token.
         self.settings["agentAccessEnabled"] = self.settings.get("agentAccessEnabled") is True
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
+        raw_note_location = self.settings.get("newNoteLocation")
+        if (not isinstance(raw_note_location, str) or "\0" in raw_note_location
+                or len(raw_note_location) > 4096 or _is_disallowed_root_setting(raw_note_location)):
+            self.settings["newNoteLocation"] = ""
+        else:
+            self.settings["newNoteLocation"] = raw_note_location.strip()
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
         try:
             workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
             self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
             self.startup_active=workspace.get("active","") if isinstance(workspace.get("active"),str) else ""
-            self.startup_entries=[entry for entry in workspace.get("tabs",[]) if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)][:100]
+            self.startup_entries=[
+                {"id": entry["id"], "path": entry["path"], **({"agentCreated": True} if entry.get("agentCreated") is True else {})}
+                for entry in workspace.get("tabs",[])
+                if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)
+            ][:100]
             self.startup_active_id=workspace.get("activeId","") if isinstance(workspace.get("activeId"),str) else ""
             self.startup_folder=workspace.get("folder","") if isinstance(workspace.get("folder"),str) else ""
             self.startup_expanded=[p for p in workspace.get("expanded",[]) if isinstance(p,str)][:500] if isinstance(workspace.get("expanded"),list) else []
@@ -451,7 +652,11 @@ class Session(QObject):
                 for item in raw_windows[:20]:
                     if not isinstance(item,dict):
                         continue
-                    w_tabs=[entry for entry in item.get("tabs",[]) if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)][:100]
+                    w_tabs=[
+                        {"id": entry["id"], "path": entry["path"], **({"agentCreated": True} if entry.get("agentCreated") is True else {})}
+                        for entry in item.get("tabs",[])
+                        if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)
+                    ][:100]
                     w_paths=list(dict.fromkeys(entry["path"] for entry in w_tabs if entry["path"]))[:100]
                     w_folder=item.get("folder","") if isinstance(item.get("folder"),str) else ""
                     w_expanded=[p for p in item.get("expanded",[]) if isinstance(p,str)][:500] if isinstance(item.get("expanded"),list) else []
@@ -794,7 +999,13 @@ class Studio(QObject):
             tab.setdefault("saved_assets", dict(tab.get("assets", {})))
             tab.setdefault("assets_dirty", False)
             tab.setdefault("conflict", False)
-        self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
+            if tab.get("path"):
+                resolved_tab = folder_ops.canonical_path_str(tab["path"])
+                if resolved_tab:
+                    if tab.get("agentCreated"):
+                        self._agent_owned_files.add(resolved_tab)
+                    else:
+                        self._agent_open_paths.add(resolved_tab)
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
         if not self.tabs:
             self.tabs.append(self._note("Untitled.md") if self.settings["welcomed"] else self._note("Welcome.md", SAMPLE, saved=SAMPLE))
@@ -1477,7 +1688,9 @@ class Studio(QObject):
             candidates.append(location)
         for window in windows:
             for tab in getattr(window, "tabs", ()):
-                tab_path = tab.get("path") if isinstance(tab, dict) else None
+                if not isinstance(tab, dict) or Studio._is_agent_created_tab(window, tab):
+                    continue
+                tab_path = tab.get("path")
                 if isinstance(tab_path, str) and tab_path:
                     candidates.append(Path(tab_path).parent)
         return _normalize_mcp_roots(candidates)
@@ -2512,10 +2725,13 @@ class Studio(QObject):
 
     @Slot(str)
     def setNoteLocation(self, value):
-        directory = local_path(value)
-        if directory.is_dir():
+        directory = _canonical_approved_directory(_raw_local_path(value))
+        if directory is not None:
             self.settings["newNoteLocation"] = str(directory)
             self._preferences(); self._emit(False)
+        else:
+            self.message = "Choose an existing local folder."
+            self._emit(False)
 
     @Slot(str)
     def importFont(self,value):
@@ -2634,7 +2850,10 @@ class Studio(QObject):
 
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
-        window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t)]
+        window_tabs = [
+            {"path": t["path"], "id": t["id"], **({"agentCreated": True} if t.get("agentCreated") else {})}
+            for t in self.tabs if t["path"] or self._is_dirty(t)
+        ]
         self.session.workspace[self.window_id] = window_tabs
         self.session.window_workspaces[self.window_id] = {
             "folder": self.folder,
@@ -2733,7 +2952,7 @@ class Studio(QObject):
         QTimer.singleShot(0, lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
                           if generation == self._activation_generation and not self.retired else None)
 
-    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None):
+    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None, agent_owned: bool = False):
         if self.retired:
             if completion_callback: completion_callback(None, "The document window is no longer available")
             return
@@ -2748,9 +2967,25 @@ class Studio(QObject):
         elif activation_generation is None:
             activation_generation = self._activation_generation
         restoring = not explicit and str(path) in self._restoring_paths
+        restored_agent_created = bool(
+            restoring and any(
+                isinstance(entry, dict) and entry.get("agentCreated") is True
+                and entry.get("path") and folder_ops.same_path(entry["path"], str(path))
+                for entry in self._startup_entries
+            )
+        )
+        canon_open_path = folder_ops.canonical_path_str(path)
+        track_as_agent_owned = bool(
+            agent_owned
+            or restored_agent_created
+            or (canon_open_path and canon_open_path in self._agent_owned_files and canon_open_path not in self._agent_open_paths)
+        )
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
-            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
+            if not track_as_agent_owned and not Studio._is_agent_created_tab(self, found):
+                self._agent_open_paths.add(canon_open_path)
+            else:
+                self._agent_owned_files.add(canon_open_path)
             self._restoring_paths.discard(str(path))
             if restoring and activation_generation == self._activation_generation and str(path) == (self._startup_active or self.session.startup_active):
                 self._select_tab_from_open(found["id"], activation_generation)
@@ -2775,7 +3010,11 @@ class Studio(QObject):
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
-            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
+            if track_as_agent_owned:
+                note["agentCreated"] = True
+                self._agent_owned_files.add(folder_ops.canonical_path_str(path))
+            else:
+                self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             if restoring:
                 if activation_generation == self._activation_generation:
                     self.tabs=[t for t in self.tabs if t["id"] not in self._startup_placeholder_ids]
@@ -2870,8 +3109,12 @@ class Studio(QObject):
             else:
                 self.tabs.append(note)
                 if note.get("path"):
-                    try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
-                    except OSError:pass
+                    canon_reopened = folder_ops.canonical_path_str(note["path"])
+                    if canon_reopened:
+                        if Studio._is_agent_created_tab(self, note):
+                            self._agent_owned_files.add(canon_reopened)
+                        else:
+                            self._agent_open_paths.add(canon_reopened)
                 if activation_generation==self._activation_generation:self.active=note["id"]
             self.closed_tabs[:]=next_refs
             self._recover();self._emit()
@@ -3060,8 +3303,8 @@ class Studio(QObject):
 
     @Slot(str)
     def openFolder(self, value):
-        path = local_path(value)
-        if not path.is_dir():
+        path = _canonical_approved_directory(_raw_local_path(value))
+        if path is None:
             self.message = "Choose an existing local folder."
             self._emit(False)
             return
@@ -3202,7 +3445,7 @@ class Studio(QObject):
         if key == "shortcuts":
             value, error = normalize_shortcuts(value)
             if error: return
-        if key in ("window","widthMigrated"): return  # Internal state, not user settings.
+        if key in ("window","widthMigrated","newNoteLocation","agentAccessEnabled","cloudAgentEnabled","readingMode"): return  # Internal/dedicated state, not generic settings.
         if key == "size": value = max(6, min(32, float(value)))
         if key == "width": value = max(0, min(5000, int(value)))
         if key == "widthPercent": value = max(50,min(150,float(value)))
@@ -3443,10 +3686,15 @@ class Studio(QObject):
                     portable=portable,
                     conflict=False,
                 )
-                try:
-                    self._agent_open_paths.add(str(Path(path).resolve()))
-                except OSError:
-                    pass
+                if not automatic and not same_path:
+                    target.pop("agentCreated", None)
+                resolved_saved_str = folder_ops.canonical_path_str(path)
+                if resolved_saved_str:
+                    if not automatic and not same_path:
+                        self._agent_owned_files.discard(resolved_saved_str)
+                        self._agent_open_paths.add(resolved_saved_str)
+                    elif not Studio._is_agent_created_tab(self, target):
+                        self._agent_open_paths.add(resolved_saved_str)
                 if str(path) != original_path:
                     self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                     self._preferences()
@@ -3799,9 +4047,16 @@ class Studio(QObject):
             self._sync_path_change(folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after), is_dir=False, message=f"Renamed to {final_name}")
         self._submit(work,finished,executor=self.writes)
 
+    def _default_output_directory(self) -> Path:
+        configured = _canonical_approved_directory(self.settings.get("newNoteLocation")) if isinstance(getattr(self, "settings", None), dict) else None
+        if configured is not None:
+            return configured
+        fallback = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
+        return Path(fallback).expanduser()
+
     @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
+        directory = self._default_output_directory()
         return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
 
     @Slot(str,result=QUrl)
@@ -3973,7 +4228,7 @@ class Studio(QObject):
         stem = "".join(char for char in stem if char.isalnum() or char in " ._()-").strip(" .")[:100]
         if not stem or stem in (".", ".."):
             stem = "Super MD export"
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
+        directory = Studio._default_output_directory(self)
         if not directory.is_dir():
             raise ValueError("The configured export folder is unavailable")
         for index in range(1, 10_001):
@@ -4195,6 +4450,7 @@ class Studio(QObject):
             elif not title.lower().endswith("." + fmt):
                 title += "." + fmt
             note = self._note(title, content, "", "", {}, fmt == "smd")
+            note["agentCreated"] = True
             self.tabs.append(note)
             if not background:
                 self.active = note["id"]
@@ -4243,14 +4499,9 @@ class Studio(QObject):
                     raise ValueError("The requested live tab is no longer open")
                 if not background: self.selectTab(existing["id"])
                 return self._agent_tab_result(existing, active=not background)
-            candidate = Path(filename).expanduser()
-            if not candidate.is_absolute():
-                directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
-                candidate = directory / candidate.name
-            if not self._agent_path_allowed(candidate):
-                raise ValueError("The file is outside the approved agent note roots")
-            resolved = str(candidate.resolve())
-            existing = next((item for item in self.tabs if item["path"] and str(Path(item["path"]).resolve()) == resolved), None)
+            resolved_path = Studio._resolve_agent_open_path(self, filename)
+            resolved = str(resolved_path)
+            existing = next((item for item in self.tabs if item["path"] and folder_ops.same_path(item["path"], resolved)), None)
             if existing:
                 if not background: self.selectTab(existing["id"])
                 return self._agent_tab_result(existing, active=not background)
@@ -4261,11 +4512,13 @@ class Studio(QObject):
                     raise ValueError("The desktop already has 20 active agent jobs")
                 self._agent_job_records.pop(removable, None)
             job_id = uuid.uuid4().hex
-            fmt = "smd" if Path(resolved).suffix.lower() == ".smd" else "md"
+            fmt = "smd" if resolved_path.suffix.lower() == ".smd" else "md"
             self._agent_job_records[job_id] = {"jobId": job_id, "status": "running", "action": "open_document",
                                                "path": resolved, "windowId": self.window_id,
                                                "active": not background, "format": fmt}
-            self._agent_open_paths.add(resolved)
+            owned_target = any(folder_ops.same_path(item, resolved) for item in getattr(self, "_agent_owned_files", ()))
+            if not owned_target:
+                self._agent_open_paths.add(resolved)
             def opened(result, error):
                 record = self._agent_job_records.get(job_id)
                 if record is None: return
@@ -4274,7 +4527,7 @@ class Studio(QObject):
                 else:
                     metadata = self._agent_tab_result(result)
                     record.update(status="completed", **metadata)
-            self._open_note(resolved, explicit=not background, completion_callback=opened)
+            self._open_note(resolved, explicit=not background, completion_callback=opened, agent_owned=owned_target)
             return {"status": "opening", "jobId": job_id, "path": resolved, "windowId": self.window_id,
                     "active": not background, "format": fmt}
         raise ValueError("Unsupported native document action")
@@ -4287,46 +4540,105 @@ class Studio(QObject):
                 "path": path, "title": title or tab["name"], "active": self.active == tab["id"] if active is None else active,
                 "sourceLength": len(content), "format": fmt, "isDirty": Studio._is_dirty(self, tab)}
 
-    def _agent_path_allowed(self, path: Path) -> bool:
-        """Check open targets against user-selected note roots and session paths."""
-        absolute = Path(os.path.abspath(path))
-        # On macOS /var is the system-provided alias for /private/var. Resolve
-        # this one known alias before checking path components so a temporary
-        # folder selected through /var remains usable, while symlinks inside
-        # the selected note root are still rejected below.
-        if sys.platform == "darwin":
-            alias = Path("/var")
-            canonical = Path("/private/var")
-            try:
-                if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
-                        and (absolute == alias or alias in absolute.parents)):
-                    absolute = canonical / absolute.relative_to(alias)
-            except (OSError, RuntimeError):
-                pass
-        try:
-            if not absolute.is_file(): return False
-            # Refuse symlinks in every component, including the selected file.
-            current = Path(absolute.anchor)
-            for component in absolute.parts[1:]:
-                current /= component
-                if current.is_symlink(): return False
-            resolved = absolute.resolve(strict=True)
-        except (OSError, RuntimeError):
+    def _is_agent_created_tab(self, tab: dict) -> bool:
+        if not isinstance(tab, dict):
             return False
-        if str(resolved) in self._agent_owned_files or str(resolved) in self._agent_open_paths:
+        if tab.get("agentCreated"):
             return True
-        roots = []
-        location = self.settings.get("newNoteLocation")
-        if location: roots.append(Path(location).expanduser())
-        if self.folder: roots.append(Path(self.folder))
-        roots.extend(Path(tab["path"]).parent for tab in self.tabs if tab.get("path"))
-        for root in roots:
-            try:
-                root = root.resolve(strict=True)
-                if root.is_dir() and (resolved == root or root in resolved.parents): return True
-            except (OSError, RuntimeError):
-                continue
-        return False
+        tab_path = tab.get("path")
+        if not isinstance(tab_path, str) or not tab_path:
+            return False
+        owned = getattr(self, "_agent_owned_files", None)
+        if not owned:
+            session = getattr(self, "session", None)
+            owned = getattr(session, "agent_owned_files", None)
+        if not owned:
+            return False
+        canon = folder_ops.canonical_path_str(tab_path)
+        return bool(canon and any(folder_ops.same_path(item, canon) for item in owned))
+
+    def _approved_agent_roots(self) -> list[Path]:
+        windows = [self]
+        session = getattr(self, "session", None)
+        if session is not None and isinstance(getattr(session, "windows", None), dict):
+            windows.extend(
+                window for window in session.windows.values()
+                if window is not self and not getattr(window, "retired", False)
+            )
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for window in windows:
+            folder = getattr(window, "folder", "")
+            if folder:
+                resolved = _canonical_approved_directory(folder)
+                if resolved is not None:
+                    key = folder_ops.normalize_path_key(resolved)
+                    if key not in seen:
+                        seen.add(key)
+                        roots.append(resolved)
+        settings = getattr(self, "settings", None)
+        location = settings.get("newNoteLocation") if isinstance(settings, dict) else None
+        if location:
+            resolved_loc = _canonical_approved_directory(location)
+            if resolved_loc is not None:
+                key = folder_ops.normalize_path_key(resolved_loc)
+                if key not in seen:
+                    seen.add(key)
+                    roots.append(resolved_loc)
+        return roots
+
+    def _approved_individual_agent_files(self) -> list[str]:
+        approved: list[str] = []
+        seen: set[str] = set()
+        for collection in (getattr(self, "_agent_open_paths", ()), getattr(self, "_agent_owned_files", ())):
+            for entry in collection or ():
+                if isinstance(entry, str) and entry:
+                    key = folder_ops.normalize_path_key(entry)
+                    if key and key not in seen:
+                        seen.add(key)
+                        approved.append(entry)
+        windows = [self]
+        session = getattr(self, "session", None)
+        if session is not None and isinstance(getattr(session, "windows", None), dict):
+            windows.extend(
+                window for window in session.windows.values()
+                if window is not self and not getattr(window, "retired", False)
+            )
+        for window in windows:
+            for tab in getattr(window, "tabs", ()) or ():
+                if not isinstance(tab, dict):
+                    continue
+                tab_path = tab.get("path")
+                if isinstance(tab_path, str) and tab_path:
+                    key = folder_ops.normalize_path_key(tab_path)
+                    if key and key not in seen:
+                        seen.add(key)
+                        approved.append(tab_path)
+        return approved
+
+    def _resolve_agent_open_path(
+        self,
+        raw_path,
+        *,
+        _system_aliases: tuple[tuple[str, str], ...] | None = None,
+    ) -> Path:
+        return _validate_approved_local_file_path(
+            raw_path if isinstance(raw_path, str) else str(raw_path),
+            extra_roots=Studio._approved_agent_roots(self),
+            approved_files=Studio._approved_individual_agent_files(self),
+            allow_note_parent=False,
+            unavailable_message="The file is outside the approved agent note roots",
+            outside_message="The file is outside the approved agent note roots",
+            _system_aliases=_system_aliases,
+        )
+
+    def _agent_path_allowed(self, path: Path | str, *, _system_aliases: tuple[tuple[str, str], ...] | None = None) -> bool:
+        """Check open targets against explicitly approved workspace roots and individual session notes."""
+        try:
+            Studio._resolve_agent_open_path(self, str(path), _system_aliases=_system_aliases)
+            return True
+        except ValueError:
+            return False
 
     @staticmethod
     def _run_prepared_write_sync(studio, prepared):
@@ -4499,10 +4811,15 @@ class Studio(QObject):
                     portable=fmt == "smd",
                     conflict=False,
                 )
+                if created_new_path:
+                    target["agentCreated"] = True
                 is_dirty = Studio._is_dirty(self, target)
                 if is_dirty and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
                     self.autosave_timer.start(900)
-            self._agent_open_paths.add(str(resolved_path))
+            if created_new_path or (target is not None and Studio._is_agent_created_tab(self, target)):
+                self._agent_owned_files.add(str(resolved_path))
+            else:
+                self._agent_open_paths.add(str(resolved_path))
             self._recover()
             self._emit()
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
@@ -4513,13 +4830,7 @@ class Studio(QObject):
         return tab_id, work, finalize, abort
 
     def _extra_asset_roots(self) -> list[Path]:
-        roots: list[Path] = []
-        if getattr(self, "folder", ""):
-            roots.append(Path(self.folder))
-        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
-        if location:
-            roots.append(Path(location))
-        return roots
+        return Studio._approved_agent_roots(self)
 
     def _apply_saved_tab_assets(self, tab_id: str, path: Path, content_snapshot: str,
                                 assets_snapshot: dict, updated: dict, stamp=None) -> None:
@@ -4582,6 +4893,7 @@ class Studio(QObject):
                 asset_path,
                 path,
                 Studio._extra_asset_roots(self),
+                allow_note_parent=not Studio._is_agent_created_tab(self, tab),
                 unavailable_message="Asset file is unavailable",
                 outside_message="Asset must be inside the current note folder or a configured folder",
             )
@@ -4762,7 +5074,7 @@ class Studio(QObject):
         raise ValueError("Could not find an unused media filename")
 
     def _media_download_directory(self) -> Path:
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
+        directory = Studio._default_output_directory(self)
         if not directory.is_dir():
             raise ValueError("The media download folder is unavailable")
         return directory
@@ -4799,6 +5111,7 @@ class Studio(QObject):
             asset_path_value,
             path,
             Studio._extra_asset_roots(self),
+            allow_note_parent=not Studio._is_agent_created_tab(self, tab),
             unavailable_message="Replacement asset file is unavailable",
             outside_message="Replacement asset must be inside the current note folder or a configured folder",
         )
@@ -5473,10 +5786,15 @@ class Studio(QObject):
                             portable=True,
                             conflict=False,
                         )
-                        try:
-                            self._agent_open_paths.add(str(Path(save_as).resolve()))
-                        except OSError:
-                            pass
+                        if path_changed:
+                            save_target.pop("agentCreated", None)
+                        resolved_save_as = folder_ops.canonical_path_str(save_as)
+                        if resolved_save_as:
+                            if path_changed:
+                                self._agent_owned_files.discard(resolved_save_as)
+                                self._agent_open_paths.add(resolved_save_as)
+                            elif not Studio._is_agent_created_tab(self, save_target):
+                                self._agent_open_paths.add(resolved_save_as)
                         self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
                         self._preferences()
                         self.message = "Saved"
