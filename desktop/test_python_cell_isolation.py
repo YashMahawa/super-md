@@ -34,7 +34,7 @@ class PythonCellIsolationTest(unittest.TestCase):
         )
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.session = Session(True)
+        self.session = Session(True, self.root / "session")
         self.session.settings["python"] = sys.executable
         self.windows: list[QuietStudio] = []
 
@@ -90,26 +90,32 @@ class PythonCellIsolationTest(unittest.TestCase):
         w1_code = f"""
 import pathlib, subprocess, sys
 inner = (
-    "import pathlib, subprocess, sys, time\\n"
+    "import pathlib, subprocess, sys\\n"
     "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\\n"
-    f"pathlib.Path({str(w1_grandchild_pid_file)!r}).write_text(str(gc.pid), encoding='utf-8')\\n"
-    f"pathlib.Path({str(w1_ready)!r}).write_text('1', encoding='utf-8')\\n"
+    "pathlib.Path(sys.argv[1]).write_text(str(gc.pid), encoding='utf-8')\\n"
+    "pathlib.Path(sys.argv[2]).write_text('1', encoding='utf-8')\\n"
     "gc.wait()\\n"
 )
-child = subprocess.Popen([sys.executable, "-c", inner])
+child = subprocess.Popen([
+    sys.executable,
+    "-c",
+    inner,
+    {str(w1_grandchild_pid_file)!r},
+    {str(w1_ready)!r},
+])
 pathlib.Path({str(w1_child_pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
 child.wait()
 """
         w2_code = f"""
-import pathlib, subprocess, sys, time
-helper = subprocess.Popen([
-    sys.executable,
-    "-c",
-    f"import pathlib, time\\n"
-    f"deadline = time.monotonic() + 30\\n"
-    f"while not pathlib.Path({str(w2_release)!r}).exists() and time.monotonic() < deadline:\\n"
-    f"    time.sleep(0.02)\\n",
-])
+import pathlib, subprocess, sys
+helper_script = (
+    "import pathlib, sys, time\\n"
+    "release = pathlib.Path(sys.argv[1])\\n"
+    "deadline = time.monotonic() + 30\\n"
+    "while not release.exists() and time.monotonic() < deadline:\\n"
+    "    time.sleep(0.02)\\n"
+)
+helper = subprocess.Popen([sys.executable, "-c", helper_script, {str(w2_release)!r}])
 pathlib.Path({str(w2_child_pid_file)!r}).write_text(str(helper.pid), encoding="utf-8")
 pathlib.Path({str(w2_ready)!r}).write_text("1", encoding="utf-8")
 helper.wait()
@@ -187,28 +193,28 @@ child.wait()
 """
         code_b = f"""
 import pathlib, subprocess, sys
-child = subprocess.Popen([
-    sys.executable,
-    "-c",
-    f"import pathlib, time\\n"
-    f"deadline = time.monotonic() + 30\\n"
-    f"while not pathlib.Path({str(release_bc)!r}).exists() and time.monotonic() < deadline:\\n"
-    f"    time.sleep(0.02)\\n",
-])
+wait_script = (
+    "import pathlib, sys, time\\n"
+    "release = pathlib.Path(sys.argv[1])\\n"
+    "deadline = time.monotonic() + 30\\n"
+    "while not release.exists() and time.monotonic() < deadline:\\n"
+    "    time.sleep(0.02)\\n"
+)
+child = subprocess.Popen([sys.executable, "-c", wait_script, {str(release_bc)!r}])
 pathlib.Path({str(b_pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
 child.wait()
 print("tab b result")
 """
         code_c = f"""
 import pathlib, subprocess, sys
-child = subprocess.Popen([
-    sys.executable,
-    "-c",
-    f"import pathlib, time\\n"
-    f"deadline = time.monotonic() + 30\\n"
-    f"while not pathlib.Path({str(release_bc)!r}).exists() and time.monotonic() < deadline:\\n"
-    f"    time.sleep(0.02)\\n",
-])
+wait_script = (
+    "import pathlib, sys, time\\n"
+    "release = pathlib.Path(sys.argv[1])\\n"
+    "deadline = time.monotonic() + 30\\n"
+    "while not release.exists() and time.monotonic() < deadline:\\n"
+    "    time.sleep(0.02)\\n"
+)
+child = subprocess.Popen([sys.executable, "-c", wait_script, {str(release_bc)!r}])
 pathlib.Path({str(c_pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
 child.wait()
 print("window 2 tab c result")
@@ -274,9 +280,12 @@ print("window 2 tab c result")
         pid_a1_file = self.root / "drain-a1.pid"
         pid_a2_file = self.root / "drain-a2.pid"
         child_snippet = (
-            "import signal, time; "
-            "hasattr(signal, 'SIGTERM') and signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "time.sleep(30)"
+            "import signal, time\n"
+            "try:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "time.sleep(30)\n"
         )
         code_a1 = (
             "import pathlib, subprocess, sys\n"

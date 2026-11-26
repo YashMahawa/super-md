@@ -410,17 +410,19 @@ pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf
             done_file = Path(folder) / "done.txt"
             code = f"""
 import pathlib, subprocess, sys, time
+ready_path = {str(ready_file)!r}
 child = subprocess.Popen([
     sys.executable,
     "-c",
     "import pathlib, signal, sys, time; "
     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-    f"pathlib.Path({str(ready_file)!r}).write_text('1', encoding='utf-8'); "
+    "pathlib.Path(sys.argv[1]).write_text('1', encoding='utf-8'); "
     "sys.stdout.write('held\\\\n'); sys.stdout.flush(); time.sleep(30)",
+    ready_path,
 ])
 pathlib.Path({str(pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
 deadline = time.monotonic() + 8
-while not pathlib.Path({str(ready_file)!r}).exists() and time.monotonic() < deadline:
+while not pathlib.Path(ready_path).exists() and time.monotonic() < deadline:
     time.sleep(0.01)
 print("preserved output")
 pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf-8")
@@ -447,16 +449,23 @@ pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf
             other_release = root / "other-release.txt"
 
             timed_out_code = f"""
-import pathlib, subprocess, sys
+import subprocess, sys
 script = (
-    "import os, pathlib, subprocess, sys, time\\n"
-    f"pathlib.Path({str(child_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\\n"
+    "import os, pathlib, subprocess, sys\\n"
+    "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')\\n"
     "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\\n"
-    f"pathlib.Path({str(grandchild_pid_file)!r}).write_text(str(gc.pid), encoding='utf-8')\\n"
-    f"pathlib.Path({str(ready_file)!r}).write_text('ready', encoding='utf-8')\\n"
+    "pathlib.Path(sys.argv[2]).write_text(str(gc.pid), encoding='utf-8')\\n"
+    "pathlib.Path(sys.argv[3]).write_text('ready', encoding='utf-8')\\n"
     "gc.wait()\\n"
 )
-child = subprocess.Popen([sys.executable, "-c", script])
+child = subprocess.Popen([
+    sys.executable,
+    "-c",
+    script,
+    {str(child_pid_file)!r},
+    {str(grandchild_pid_file)!r},
+    {str(ready_file)!r},
+])
 child.wait()
 """
             other_code = f"""
