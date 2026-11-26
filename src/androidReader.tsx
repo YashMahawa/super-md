@@ -486,13 +486,27 @@ export function Reader() {
     };
     window.supermdFlush = operation => {
       savePosition.current();
-      const current = reference.current; if (!current) return;
+      const current = reference.current;
       if(operation.action==='android_flush'){
+        if(edits.current?.unacknowledged(operation.target)!==undefined&&current?.id!==operation.target){
+          void invoke('document_flushed',{id:operation.target,token:operation.token,error:'Reader has unacknowledged edits for this note'}).catch(()=>{});
+          return;
+        }
+        if(!current){
+          void invoke('document_flushed',{id:'',token:operation.token,error:'Reader has not loaded a note yet'}).catch(()=>{});
+          return;
+        }
+        if(current.id!==operation.target){
+          void invoke('document_flushed',{id:current.id,token:operation.token,error:'The active note changed before its edit flush'}).catch(()=>{});
+          return;
+        }
         void (async()=>{
-          if(current.id!==operation.target)throw new Error('The active note changed before its edit flush');
           if(current.editProtocol===1)await edits.current!.flush(current.id);
           const latest=reference.current;
-          if(!latest||latest.id!==operation.target)throw new Error('The active note changed during its edit flush');
+          if(!latest||latest.id!==operation.target){
+            await invoke('document_flushed',{id:latest?.id??'',token:operation.token,error:'The active note changed during its edit flush'});
+            return;
+          }
           await invoke('document_flushed',{id:latest.id,token:operation.token,content:latest.content});
         })().catch(error=>{
           setEditError(String(error));
@@ -500,6 +514,7 @@ export function Reader() {
         });
         return;
       }
+      if (!current) return;
       let id = current.id;
       if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
       else if (operation.action === "detach_tab") id = operation.target;

@@ -12,6 +12,7 @@ import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
 import { navigateExternalLink, navigateHeading, navigateWorkspaceLink, remarkHeadingIds, UNSAVED_RELATIVE_NOTE_NOTICE } from "../documentNavigation";
+import { trustEquationHref } from "../equationReferences";
 import { classifyRenderedLink } from "../workspaceLinks";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
@@ -101,7 +102,7 @@ export function remarkCallouts() {
 
 export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-diagram", "smd-steps", "smd-chart"] as const;
 export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
-export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
+export const PREVIEW_REHYPE_PLUGINS: PluggableList = [[rehypeKatex, { trust: trustEquationHref }], [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
 
 function AssetImage({ noteId, src = "", alt = "", documentPath, trustedImageHosts, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, editable = false }: { noteId?: string; src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; approvedImageUrls?: readonly string[]; onTrustImageHost?: (host: string) => void; onApproveImageUrl?: (noteId: string | undefined, url: string) => void; onRemoteImageLoaded?: (noteId: string | undefined, url: string, data: string) => void; editable?: boolean }) {
   const isRemote = /^https?:\/\//i.test(src);

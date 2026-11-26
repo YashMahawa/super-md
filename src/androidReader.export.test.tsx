@@ -128,6 +128,7 @@ beforeEach(() => {
   prepareFmdMock.mockReset();
   mediaBytesMock.mockReset();
   editorBridge.onChange = null;
+  previewBridge.noteId = undefined;
   previewBridge.onTrustImageHost = null;
   previewBridge.onApproveImageUrl = null;
   previewBridge.onRemoteImageLoaded = null;
@@ -706,6 +707,129 @@ it("routes undo and redo through note history even when a reused task checkbox k
   expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: checked });
 });
 
+it("acknowledges android_flush handoffs before supermdLoad without spurious edit errors and reports document_outline for the new draft", async () => {
+  native.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "document_sync") return { accepted: true, revision: 0 };
+    if (command === "document_patch") {
+      const payload = args as { id: string; revision: number };
+      if (payload.id === "fail-tab") return { accepted: false, reason: "conflict" };
+      return { accepted: true, revision: payload.revision };
+    }
+    if (command === "document_resync") return { accepted: false, reason: "conflict" };
+    return { accepted: true };
+  });
+
+  const host = await mountReader();
+
+  // 1. Flush arriving before the initial supermdLoad replies immediately instead of hanging 12s.
+  native.mockClear();
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "tab-initial", token: "tok-pre-load" });
+  });
+  expect(native).toHaveBeenCalledWith("document_flushed", {
+    id: "",
+    token: "tok-pre-load",
+    error: "Reader has not loaded a note yet",
+  });
+  expect(host.querySelector(".reader-edit-error")).toBeNull();
+
+  // 2. Load sample note, then request flush for a newly selected native tab before supermdLoad catches up.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-sample",
+      content: "# A clear place to think\n",
+      path: "tab-sample",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  native.mockClear();
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "tab-draft", token: "tok-handoff" });
+  });
+  expect(native).toHaveBeenCalledWith("document_flushed", {
+    id: "tab-sample",
+    token: "tok-handoff",
+    error: "The active note changed before its edit flush",
+  });
+  expect(host.querySelector(".reader-edit-error")).toBeNull();
+
+  // 3. Once supermdLoad delivers the draft, document_outline reports headings for that exact draft ID
+  // and android_flush acknowledges its content.
+  native.mockClear();
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-draft",
+      content: "# Recoverable draft",
+      path: "tab-draft",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  await vi.waitFor(() =>
+    expect(native).toHaveBeenCalledWith("document_outline", {
+      id: "tab-draft",
+      headings: [expect.objectContaining({ title: "Recoverable draft", level: 1 })],
+    }),
+  );
+
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "tab-draft", token: "tok-draft-ok" });
+  });
+  await vi.waitFor(() =>
+    expect(native).toHaveBeenCalledWith("document_flushed", {
+      id: "tab-draft",
+      token: "tok-draft-ok",
+      content: "# Recoverable draft",
+    }),
+  );
+  expect(host.querySelector(".reader-edit-error")).toBeNull();
+
+  // 4. Genuine editProtocol flush failure on the active note still surfaces .reader-edit-error and fails flush.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "fail-tab",
+      content: "# Baseline\n",
+      path: "fail-tab",
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  await act(async () => {
+    editorBridge.onChange!("# Unsynced change\n");
+  });
+  native.mockClear();
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "fail-tab", token: "tok-fail" });
+  });
+  await vi.waitFor(() =>
+    expect(native).toHaveBeenCalledWith(
+      "document_flushed",
+      expect.objectContaining({ id: "fail-tab", token: "tok-fail", error: expect.any(String) }),
+    ),
+  );
+  expect(host.querySelector(".reader-edit-error")).not.toBeNull();
+});
+
 it("forwards note and host image consent policy to portable in-place save, portable export, and agent smd export without cross-tab leakage", async () => {
   await mountReader();
   const png = "data:image/png;base64,aGVsbG8=";
@@ -766,8 +890,10 @@ it("forwards note and host image consent policy to portable in-place save, porta
     "![Once](https://once.example/a.png)\n![Host](https://trusted.example/b.png)\n",
     "/vault/ConsentA.smd",
     expect.objectContaining({
+      noteId: "tab-consent-a",
       trustedImageHosts: ["trusted.example"],
       approvedImageUrls: ["https://once.example/a.png"],
+      loadedImageData: new Map([["https://once.example/a.png", png]]),
     }),
   );
 
