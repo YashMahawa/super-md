@@ -80,7 +80,7 @@ internal class ContentResolverTreeLister(private val context: Context) : Workspa
             DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocumentId)
         }.getOrNull()
         if (childrenUri != null) {
-            val queried = runCatching {
+            val queried = try {
                 val results = mutableListOf<WorkspaceTreeChild>()
                 resolver.query(
                     childrenUri,
@@ -117,7 +117,11 @@ internal class ContentResolverTreeLister(private val context: Context) : Workspa
                     }
                     results
                 }
-            }.getOrNull()
+            } catch (security: SecurityException) {
+                throw security
+            } catch (_: Exception) {
+                null
+            }
             if (queried != null) return queried
         }
 
@@ -345,6 +349,7 @@ internal class WorkspaceLinkCache(
         if (!knownRelative.isNullOrBlank()) {
             val cleaned = knownRelative.trim('/')
             index.byRelativeExact[cleaned]?.takeIf { sameDocument(it.uri, noteUri) }?.let { return it.relative }
+            index.byRelativeLower[cleaned.lowercase()]?.takeIf { sameDocument(it.uri, noteUri) }?.let { return it.relative }
         }
         return index.entries.firstOrNull { sameDocument(it.uri, noteUri) }?.relative
     }
@@ -354,7 +359,15 @@ internal class WorkspaceLinkCache(
         noteRelative: String?,
         rawTarget: String,
         wikilink: Boolean,
-    ): WorkspaceResolvedNote {
+    ): WorkspaceResolvedNote =
+        resolveCandidates(treeUri, noteRelative, rawTarget, wikilink).first()
+
+    fun resolveCandidates(
+        treeUri: Uri,
+        noteRelative: String?,
+        rawTarget: String,
+        wikilink: Boolean,
+    ): List<WorkspaceResolvedNote> {
         val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
         val noteParentDir = noteRelative?.let { if ('/' in it) it.substringBeforeLast('/') else "" }
         if (isExplicitRelativeWorkspaceTarget(cleaned, wikilink)) {
@@ -364,9 +377,13 @@ internal class WorkspaceLinkCache(
             val parentRelative = noteParentDir ?: ""
             val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
             val index = ensureIndexed(treeUri)
+            val found = ArrayList<WorkspaceResolvedNote>(2)
             for (parts in candidateLists) {
-                resolveRelativeCandidate(index, parts.joinToString("/"))?.let { return it }
+                resolveRelativeCandidate(index, parts.joinToString("/"))?.let { candidate ->
+                    if (found.none { it.relative == candidate.relative }) found += candidate
+                }
             }
+            if (found.isNotEmpty()) return found
             throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
         }
 
@@ -377,29 +394,34 @@ internal class WorkspaceLinkCache(
         val (_, queryExt) = splitWorkspaceNameAndExt(parts.last())
         val hasKnownNoteExt = queryExt in WORKSPACE_NOTE_EXTENSIONS
         val index = ensureIndexed(treeUri)
+        val ordered = LinkedHashMap<String, WorkspaceResolvedNote>()
 
         if (noteParentDir != null) {
             val siblingRel = if (noteParentDir.isEmpty()) normalizedQuery else "$noteParentDir/$normalizedQuery"
-            resolveRelativeCandidate(index, siblingRel, exactOnly = true)?.let { return it }
+            resolveRelativeCandidate(index, siblingRel, exactOnly = true)?.let { ordered.putIfAbsent(it.relative, it) }
         }
 
         if (parts.size > 1) {
-            resolveRelativeCandidate(index, normalizedQuery, exactOnly = true)?.let { return it }
+            resolveRelativeCandidate(index, normalizedQuery, exactOnly = true)?.let { ordered.putIfAbsent(it.relative, it) }
             val suffixMatches = index.entries.filter { entry ->
                 if (hasKnownNoteExt) {
-                    entry.relativeLower.endsWith("/$queryLower")
+                    entry.relativeLower == queryLower ||
+                        entry.relativeLower.endsWith("/$queryLower")
                 } else {
                     entry.relativeWithoutExtLower == queryLower ||
                         entry.relativeWithoutExtLower.endsWith("/$queryLower")
                 }
             }
-            pickBestMatch(suffixMatches, noteParentDir) { entry ->
+            for (entry in rankMatches(suffixMatches, noteParentDir) { entry ->
                 if (hasKnownNoteExt) {
                     entry.relative == normalizedQuery || entry.relative.endsWith("/$normalizedQuery")
                 } else {
                     entry.relativeWithoutExt == normalizedQuery || entry.relativeWithoutExt.endsWith("/$normalizedQuery")
                 }
-            }?.let { return it.toResolved() }
+            }) {
+                ordered.putIfAbsent(entry.relative, entry.toResolved())
+            }
+            if (ordered.isNotEmpty()) return ordered.values.toList()
             throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
         }
 
@@ -412,9 +434,12 @@ internal class WorkspaceLinkCache(
                 entry.stemLower == targetNameLower || entry.name.lowercase() == targetNameLower
             }
         }
-        pickBestMatch(matches, noteParentDir) { entry ->
+        for (entry in rankMatches(matches, noteParentDir) { entry ->
             if (hasKnownNoteExt) entry.name == targetSegment else entry.stem == targetSegment
-        }?.let { return it.toResolved() }
+        }) {
+            ordered.putIfAbsent(entry.relative, entry.toResolved())
+        }
+        if (ordered.isNotEmpty()) return ordered.values.toList()
         throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
     }
 
@@ -440,20 +465,21 @@ internal class WorkspaceLinkCache(
         return null
     }
 
-    private fun pickBestMatch(
+    private fun rankMatches(
         matches: List<IndexedEntry>,
         noteParentDir: String?,
         exactCasePredicate: (IndexedEntry) -> Boolean,
-    ): IndexedEntry? =
-        matches.minWithOrNull(
+    ): List<IndexedEntry> =
+        matches.sortedWith(
             compareBy<IndexedEntry> { if (exactCasePredicate(it)) 0 else 1 }
                 .thenBy { entry ->
                     val entryDir = if ('/' in entry.relative) entry.relative.substringBeforeLast('/') else ""
-                    if (noteParentDir != null && entryDir == noteParentDir) 0 else 1
+                    if (noteParentDir != null && entryDir.equals(noteParentDir, ignoreCase = true)) 0 else 1
                 }
                 .thenBy { it.depth }
                 .thenBy { extensionPriority(it.extLower) }
-                .thenBy { it.relativeLower },
+                .thenBy { it.relativeLower }
+                .thenBy { it.relative },
         )
 
     private fun IndexedEntry.toResolved() = WorkspaceResolvedNote(uri = uri, name = name, relative = relative)
@@ -485,8 +511,11 @@ internal class WorkspaceLinkCache(
         while (queue.isNotEmpty() && scannedDirs < maxDirectories && entries.size < maxFiles) {
             val (dirDocId, prefix, depth) = queue.removeFirst()
             scannedDirs++
-            val children = runCatching { lister.listChildren(treeUri, dirDocId) }.getOrDefault(emptyList())
-                .sortedBy { it.name.lowercase() }
+            val children = (if (depth == 0) {
+                lister.listChildren(treeUri, dirDocId)
+            } else {
+                runCatching { lister.listChildren(treeUri, dirDocId) }.getOrDefault(emptyList())
+            }).sortedWith(compareBy<WorkspaceTreeChild> { it.name.lowercase() }.thenBy { it.name })
             for (child in children) {
                 val name = child.name
                 if (name.isBlank() || name.startsWith('.') || child.isVirtualOrLink) continue

@@ -3211,7 +3211,16 @@ class Studio(QObject):
                         if window is not self and not window.retired:
                             window._emit(False)
                     self._focus_open_target(activation_generation)
-        found = next((t for t in self.tabs if t["path"] == str(path)), None)
+        def same_open_tab_path(tab_path: str) -> bool:
+            if not tab_path:
+                return False
+            if tab_path == str(path) or folder_ops.same_path(tab_path, path):
+                return True
+            try:
+                return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
+            except OSError:
+                return False
+        found = next((t for t in self.tabs if same_open_tab_path(t["path"])), None)
         if found:
             self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             self._restoring_paths.discard(str(path))
@@ -3228,7 +3237,7 @@ class Studio(QObject):
             content, assets, portable = result
             # A startup read and an explicit open may race for the same path.
             # Keep one tab and let only an explicit, still-current request focus it.
-            existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
+            existing = next((tab for tab in self.tabs if same_open_tab_path(tab["path"])), None)
             if existing:
                 activate_existing(existing)
                 if completion_callback: completion_callback(existing, None)
@@ -6166,7 +6175,16 @@ class Studio(QObject):
         try:
             if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
                 canonical = str(local_path(reference))
-                return next((item for item in self.tabs if item["path"] == canonical), None)
+                exact = next((item for item in self.tabs if item["path"] == canonical or (item["path"] and folder_ops.same_path(item["path"], canonical))), None)
+                if exact is not None:
+                    return exact
+                return next(
+                    (
+                        item for item in self.tabs
+                        if item["path"] and not Path(item["path"]).is_symlink() and os.path.samefile(item["path"], canonical)
+                    ),
+                    None,
+                )
         except OSError:
             pass
         return None

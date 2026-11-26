@@ -474,6 +474,29 @@ class StudioOpenTabJumpTest(unittest.TestCase):
         self._wait_until(lambda: second_tab["path"] == str(case_renamed))
         self.assertEqual(second_tab["name"], "renamed spec.md")
 
+        # Even if an open tab holds a differently-cased path string (as on macOS APFS before canonicalization),
+        # workspace link jump reuses that open tab via inode identity without opening a duplicate tab.
+        first_tab = next(t for t in studio.tabs if t["id"] == first_tab_id)
+        first_tab["path"] = str(vault / "FIRST.MD")
+        real_samefile = os.path.samefile
+        with mock.patch.object(
+            os.path,
+            "samefile",
+            side_effect=lambda a, b: True if {str(a), str(b)} == {str(vault / "FIRST.MD"), str(first)} else real_samefile(a, b),
+        ):
+            replies.clear()
+            studio.post("link-4", "open_workspace_link", json.dumps({
+                "documentPath": str(case_renamed),
+                "target": "First",
+                "fragment": "",
+                "wikilink": True,
+            }))
+            self._wait_until(lambda: any(r[0] == "link-4" for r in replies))
+        first_tab["path"] = str(first)
+        self.assertEqual(len(studio.tabs), tab_count)
+        self.assertEqual(studio.active, first_tab_id)
+        self.assertEqual(studio._current()["content"], "# First (unsaved draft)\n")
+
     @unittest.skipIf(workspace_links._fcntl is None, "POSIX fcntl.fcntl FCNTL_BUFSZ test")
     def test_darwin_studio_rejects_traversal_and_symlinks_and_runs_folder_hooks_without_fcntl_error(self):
         sandbox = (self.studio.data / "darwin_containment").resolve()

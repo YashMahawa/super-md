@@ -3419,7 +3419,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             stateSnapshot.active
         }
         val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
-        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
+        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf {
+            DocumentsContract.isTreeUri(it) && documentAccess.hasReadGrant(it)
+        }
         val rawNoteUri = sourceNote.uri
         if (rawNoteUri.isNullOrBlank()) {
             if (explicitRelative || openFolder == null) {
@@ -3436,11 +3438,33 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if (sourceUri != null && sourceUri.scheme == "file") {
                     return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
                 }
+                fun firstReadableRankedCandidate(candidates: List<WorkspaceResolvedNote>): WorkspaceResolvedNote? {
+                    for (candidate in candidates) {
+                        canonicalTreeDocumentKey(candidate.uri)?.let(confirmedTreeDocumentKeys::add)
+                        val targetUri = documentAccess.resolve(candidate.uri)
+                        if (documentAccess.hasReadGrant(targetUri) &&
+                            runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
+                        ) {
+                            return candidate.copy(uri = targetUri)
+                        }
+                    }
+                    return null
+                }
                 val treeMatch = when {
                     sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
-                        ?: openFolder?.let { folderUri ->
-                            val rel = workspaceLinks.noteRelativeInTree(folderUri, sourceUri, knownRelative = sourceNote.relative)
-                            if (rel != null) SafTreeMatch(folderUri, DocumentsContract.getTreeDocumentId(folderUri), rel) else null
+                        ?: run {
+                            val candidateTrees = buildList {
+                                if (openFolder != null) add(openFolder)
+                                resolver.persistedUriPermissions
+                                    .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == sourceUri.authority }
+                                    .mapTo(this) { it.uri }
+                            }.distinctBy { it.toString() }
+                            candidateTrees.firstNotNullOfOrNull { folderUri ->
+                                val rel = runCatching {
+                                    workspaceLinks.noteRelativeInTree(folderUri, sourceUri, knownRelative = sourceNote.relative)
+                                }.getOrNull()
+                                if (rel != null) SafTreeMatch(folderUri, DocumentsContract.getTreeDocumentId(folderUri), rel) else null
+                            }
                         }
                     openFolder != null -> SafTreeMatch(openFolder, DocumentsContract.getTreeDocumentId(openFolder), "")
                     else -> null
@@ -3449,17 +3473,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     if (!explicitRelative) {
                         val noteRel = if (sourceUri == null) null else treeMatch.relativePath
                         val ranked = runCatching {
-                            workspaceLinks.resolve(treeMatch.folderUri, noteRelative = noteRel, rawTarget = cleaned, wikilink = true)
-                        }.getOrNull()
-                        if (ranked != null) {
-                            canonicalTreeDocumentKey(ranked.uri)?.let(confirmedTreeDocumentKeys::add)
-                            val targetUri = documentAccess.resolve(ranked.uri)
-                            if (documentAccess.hasReadGrant(targetUri) &&
-                                runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
-                            ) {
-                                return@withContext ranked.copy(uri = targetUri)
-                            }
-                        }
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = noteRel, rawTarget = cleaned, wikilink = true)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(ranked)?.let { return@withContext it }
                     }
                     val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
                     val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
@@ -3510,17 +3526,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     }
                     if (explicitRelative && sourceUri != null) {
                         val rankedRel = runCatching {
-                            workspaceLinks.resolve(treeMatch.folderUri, noteRelative = treeMatch.relativePath, rawTarget = cleaned, wikilink = false)
-                        }.getOrNull()
-                        if (rankedRel != null) {
-                            canonicalTreeDocumentKey(rankedRel.uri)?.let(confirmedTreeDocumentKeys::add)
-                            val targetUri = documentAccess.resolve(rankedRel.uri)
-                            if (documentAccess.hasReadGrant(targetUri) &&
-                                runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
-                            ) {
-                                return@withContext rankedRel.copy(uri = targetUri)
-                            }
-                        }
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = treeMatch.relativePath, rawTarget = cleaned, wikilink = false)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(rankedRel)?.let { return@withContext it }
                     }
                     if (deniedTreeCandidate != null) {
                         throw PromptWorkspaceNoteAccessException(deniedTreeCandidate)
@@ -3529,17 +3537,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
                 if (!explicitRelative && openFolder != null) {
                     val ranked = runCatching {
-                        workspaceLinks.resolve(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
-                    }.getOrNull()
-                    if (ranked != null) {
-                        canonicalTreeDocumentKey(ranked.uri)?.let(confirmedTreeDocumentKeys::add)
-                        val targetUri = documentAccess.resolve(ranked.uri)
-                        if (documentAccess.hasReadGrant(targetUri) &&
-                            runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
-                        ) {
-                            return@withContext ranked.copy(uri = targetUri)
-                        }
-                    }
+                        workspaceLinks.resolveCandidates(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
+                    }.getOrDefault(emptyList())
+                    firstReadableRankedCandidate(ranked)?.let { return@withContext it }
                 }
 
                 val nonNullSourceUri = sourceUri ?: throw WorkspaceLinkException("Save this note before opening linked notes.")

@@ -92,15 +92,28 @@ class WorkspaceLinkResolverTest {
             "Specs/Bundle.smd",
             cache.resolve(treeUri, noteRelative = "Index.md", rawTarget = "Bundle.smd", wikilink = true).relative,
         )
+        // Case-folded wikilinks and subpath links resolve to exact on-disk casing
+        assertEquals(
+            "Specs/Sub Note.md",
+            cache.resolve(treeUri, noteRelative = "Index.md", rawTarget = "sub note", wikilink = true).relative,
+        )
+        assertEquals(
+            "Specs/Bundle.smd",
+            cache.resolve(treeUri, noteRelative = "Index.md", rawTarget = "specs/bundle.smd", wikilink = true).relative,
+        )
+        assertEquals(
+            "Specs/Sub Note.md",
+            cache.resolve(treeUri, noteRelative = "specs/bundle.smd", rawTarget = "./sub%20note.md", wikilink = false).relative,
+        )
         // Exact case ("Topic") beats lowercase ("topic")
         assertEquals(
             "Archive/Topic.md",
             cache.resolve(treeUri, noteRelative = "Specs/Deep/Sub.md", rawTarget = "Topic", wikilink = true).relative,
         )
-        // Same-directory ("Specs/Sibling.smd") beats other-directory ("Archive/Sibling.md") when case matches
+        // Same-directory ("Specs/Sibling.smd") beats other-directory ("Archive/Sibling.md") even when noteRelative folder casing differs
         assertEquals(
             "Specs/Sibling.smd",
-            cache.resolve(treeUri, noteRelative = "Specs/Sub Note.md", rawTarget = "Sibling", wikilink = true).relative,
+            cache.resolve(treeUri, noteRelative = "specs/Sub Note.md", rawTarget = "Sibling", wikilink = true).relative,
         )
         // Zero hidden or index files written to disk
         assertTrue(root.walkTopDown().drop(1).none { it.name.startsWith(".") })
@@ -178,6 +191,19 @@ class WorkspaceLinkResolverTest {
         assertEquals(indexTab.id, model.state.value.activeId)
         assertEquals("# Index with unsaved edits\n", model.state.value.active.content)
         assertTrue(sameDocument(Uri.parse(model.recent.value.first().uri), standaloneIndexUri))
+
+        // Even after closing the folder sidebar (state.folder == null), a persisted SAF workspace grant
+        // resolves case-folded nested wikilinks from a standalone note URI without re-prompting.
+        model.closeFolder()
+        assertNull(model.state.value.folder)
+        val grantedLookupResult = runBlocking {
+            model.openWorkspaceLink(standaloneIndexUri.toString(), "sub note", "Deep Section", wikilink = true)
+        }
+        assertTrue(grantedLookupResult.getBoolean("opened"))
+        assertFalse(grantedLookupResult.optBoolean("promptedFolderAccess"))
+        assertNull(model.state.value.folderAccessPrompt)
+        assertEquals(subTab.id, model.state.value.activeId)
+        assertEquals("Deep Section", model.state.value.pendingHeading?.heading)
     }
 
     private fun grantReadWrite(uri: Uri) {
