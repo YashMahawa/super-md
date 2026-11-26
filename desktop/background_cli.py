@@ -35,6 +35,8 @@ def main(argv):
         from instance import is_process_exit_clear,posix_ipc_exchange
     app=QCoreApplication.instance() or QCoreApplication(['super-md'])
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
+    platform=sys.platform
+    is_win=platform.startswith('win')
     root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def _instance_lock_held():
@@ -46,7 +48,7 @@ def main(argv):
     def _process_exit_clear():
         return is_process_exit_clear(root)
     def _probe_still_listening():
-        if os.name!='nt':
+        if not is_win:
             connected,_,_=posix_ipc_exchange(name,b'{"service":"status"}\n',connect_timeout=.1,read_timeout=.1)
             return connected
         probe=QLocalSocket();probe.connectToServer(name)
@@ -61,7 +63,7 @@ def main(argv):
         wire_action='quit' if action=='stop' else action
         payload=json.dumps({'service':wire_action}).encode('utf-8')+b'\n'
         read_timeout_sec=5.0 if startup_poll else 2.0
-        if os.name!='nt':
+        if not is_win:
             connected,raw,peer_closed=posix_ipc_exchange(name,payload,connect_timeout=1.0,read_timeout=read_timeout_sec)
             if not connected:return None
         else:
@@ -180,13 +182,13 @@ def main(argv):
             raise ValueError('Background service did not start; previous instance is still shutting down')
         proc=None;daemon_exit_code=None
         if not running:
-            flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
-            popen_session={'process_group':0} if sys.platform=='darwin' else {'start_new_session':os.name!='nt'}
+            flags=(getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|getattr(subprocess,'CREATE_NO_WINDOW',0)) if is_win else 0
+            popen_session={'process_group':0} if platform=='darwin' else {'start_new_session':not is_win}
             log_path=root/'background-service.log'
             had_legacy_log=log_path.is_file()
             spawn_env=None if had_legacy_log else {**os.environ,'SUPERMD_FRESH_SERVICE_LOG':'1'}
             with log_path.open('ab') as log:
-                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=spawn_env,creationflags=flags,**popen_session)
+                proc=subprocess.Popen(_daemon_command(platform=platform),stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=spawn_env,creationflags=flags,**popen_session)
             deadline=time.monotonic()+30
             while time.monotonic()<deadline:
                 status=request('status',startup_poll=True)

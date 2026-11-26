@@ -631,18 +631,19 @@ class BackgroundTests(unittest.TestCase):
                 reopened_gui_session.writes.shutdown(wait=True)
 
         # 6. On macOS (`darwin`), spawning the background daemon uses `process_group=0` (`setpgid`)
-        #    rather than `start_new_session=True` (`setsid`) so Mach bootstrap namespaces stay intact.
-        appdata_darwin = make_env("Profile Z — Darwin Spawn Session")
-        captured_popen = {}
-
-        class _DoneProc:
+        #    rather than `start_new_session=True` (`setsid`) so Mach bootstrap namespaces stay intact,
+        #    while Linux continues using `start_new_session=True` and neither passes Windows flags.
+        class _LiveProc:
             def poll(self):
-                return 0
+                return None
+
+        appdata_darwin = make_env("Profile Z — Darwin Spawn Session")
+        captured_darwin = {}
 
         def _capture_darwin_popen(cmd, **kwargs):
-            captured_popen["cmd"] = cmd
-            captured_popen["kwargs"] = kwargs
-            return _DoneProc()
+            captured_darwin["cmd"] = cmd
+            captured_darwin["kwargs"] = kwargs
+            return _LiveProc()
 
         with patch.object(
             QStandardPaths,
@@ -656,8 +657,33 @@ class BackgroundTests(unittest.TestCase):
         ), redirect_stdout(io.StringIO()):
             rc = background_cli.main(["start"])
         self.assertEqual(rc, 0)
-        self.assertEqual(captured_popen["kwargs"].get("process_group"), 0)
-        self.assertFalse(captured_popen["kwargs"].get("start_new_session", False))
+        self.assertEqual(captured_darwin["kwargs"].get("creationflags"), 0)
+        self.assertEqual(captured_darwin["kwargs"].get("process_group"), 0)
+        self.assertFalse(captured_darwin["kwargs"].get("start_new_session", False))
+
+        appdata_linux = make_env("Profile Η — Linux Spawn Session")
+        captured_linux = {}
+
+        def _capture_linux_popen(cmd, **kwargs):
+            captured_linux["cmd"] = cmd
+            captured_linux["kwargs"] = kwargs
+            return _LiveProc()
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_linux: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
+        ), patch("instance.posix_ipc_exchange", side_effect=[
+            (False, b"", True),
+            (True, b'{"ok":true,"running":true,"agentAccess":true}\n', True),
+        ]), patch.object(background_cli.sys, "platform", "linux"), patch.object(
+            background_cli.subprocess, "Popen", side_effect=_capture_linux_popen
+        ), redirect_stdout(io.StringIO()):
+            rc_linux = background_cli.main(["start"])
+        self.assertEqual(rc_linux, 0)
+        self.assertEqual(captured_linux["kwargs"].get("creationflags"), 0)
+        self.assertNotIn("process_group", captured_linux["kwargs"])
+        self.assertIs(captured_linux["kwargs"].get("start_new_session"), True)
 
 
 _HEADLESS_DAEMON_BOOTSTRAP = """
