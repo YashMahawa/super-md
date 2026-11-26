@@ -398,4 +398,167 @@ class PortableAgentSaveSafetyTest {
             tempDir.deleteRecursively()
         }
     }
+
+    private inline fun withPortableModel(block: (app: android.app.Application, tempDir: File, model: StudioViewModel) -> Unit) {
+        val app = RuntimeEnvironment.getApplication()
+        val bundlesRoot = File(app.filesDir, "portable-assets")
+        val baselineDirs = bundlesRoot.listFiles()?.map { it.name }?.toSet().orEmpty()
+        val tempDir = Files.createTempDirectory("android-smd-safety").toFile()
+        val workspaceKey = "test-${UUID.randomUUID()}"
+        val store = androidx.lifecycle.ViewModelStore()
+        val factory = object : androidx.lifecycle.ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T =
+                StudioViewModel(app, workspaceKey).apply {
+                    reading(autosave = false)
+                    readerFlushRequester = { true }
+                } as T
+        }
+        val model = androidx.lifecycle.ViewModelProvider(store, factory)[StudioViewModel::class.java]
+        try {
+            block(app, tempDir, model)
+        } finally {
+            model.portablePostWriteObserver = null
+            val openDirs = model.state.value.tabs.mapNotNull { it.assetDirectory }
+            store.clear()
+            openDirs.forEach { File(bundlesRoot, it).deleteRecursively() }
+            bundlesRoot.listFiles()?.forEach { dir ->
+                if (dir.name !in baselineDirs) dir.deleteRecursively()
+            }
+            File(app.filesDir, "workspaces/$workspaceKey.json").deleteRecursively()
+            File(app.filesDir, "workspaces/$workspaceKey").deleteRecursively()
+            tempDir.deleteRecursively()
+        }
+    }
+
+    @Test fun uppercaseExpectedRevisionAcceptedInAgentAssetActionAndReplacePortableAsset() = withPortableModel { app, tempDir, model ->
+        val importFile = File(app.filesDir, "attachments/import-${UUID.randomUUID()}.svg")
+        try {
+            val markdown = "# Case-insensitive Revision\n\n![Fig](assets/fig.svg)\n"
+            val smdFile = File(tempDir, "UpperRev.smd")
+            smdFile.outputStream().use { model.media.writeFmd(it, markdown, svgAssets("assets/fig.svg", svgA)) }
+            awaitJob(model.open(Uri.fromFile(smdFile)))
+            val noteId = model.state.value.active.id
+            val upperRev = agentContentRevision(markdown).uppercase()
+
+            val listResult = runSuspend {
+                model.agentAssetAction(
+                    JSONObject().put("tabId", noteId).put("assetAction", "list").put("expectedRevision", upperRev),
+                )
+            }
+            assertEquals(1, listResult.getInt("total"))
+
+            val sourceResult = runSuspend {
+                model.agentAssetAction(
+                    JSONObject().put("tabId", noteId).put("assetAction", "source")
+                        .put("assetName", "assets/fig.svg").put("expectedRevision", upperRev),
+                )
+            }
+            assertEquals("image/svg+xml", sourceResult.getString("mimeType"))
+
+            val attachResult = runSuspend {
+                model.agentAssetAction(
+                    JSONObject().put("tabId", noteId).put("assetAction", "attach")
+                        .put("assetName", "extra.svg").put("mimeType", "image/svg+xml")
+                        .put("body", Base64.encodeToString(svgB, Base64.NO_WRAP)).put("expectedRevision", upperRev),
+                )
+            }
+            assertTrue(attachResult.getBoolean("saved"))
+
+            importFile.parentFile?.mkdirs()
+            importFile.writeBytes(svgB)
+            val replaceResult = runSuspend {
+                model.replacePortableAsset(noteId, "assets/fig.svg", "assets/${importFile.name}", upperRev)
+            }
+            assertTrue(replaceResult.getBoolean("saved"))
+            assertTrue(replaceResult.getBoolean("changed"))
+        } finally {
+            importFile.delete()
+        }
+    }
+
+    @Test fun agentAssetActionAttachRollbackRestoresOurWriteAndPreservesConcurrentExternalBytes() = withPortableModel { app, tempDir, model ->
+        val markdown = "# Attach Rollback\n\n![Fig](assets/fig.svg)\n"
+        val smdFile = File(tempDir, "Rollback.smd")
+        smdFile.outputStream().use { model.media.writeFmd(it, markdown, svgAssets("assets/fig.svg", svgA)) }
+        val backupBytes = smdFile.readBytes()
+
+        awaitJob(model.open(Uri.fromFile(smdFile)))
+        val noteId = model.state.value.active.id
+
+        // 1. RESTORE_OUR_WRITE: draft changes after staged write while disk still matches stagedBytes -> restores backupBytes.
+        val restoreEntered = CompletableDeferred<Unit>()
+        val restoreRelease = CompletableDeferred<Unit>()
+        model.portablePostWriteObserver = {
+            restoreEntered.complete(Unit)
+            restoreRelease.await()
+        }
+        var restoreFailure: Throwable? = null
+        val restoreAttempt = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+            restoreFailure = runCatching {
+                model.agentAssetAction(
+                    JSONObject().put("tabId", noteId).put("assetAction", "attach")
+                        .put("assetName", "attached-one.svg").put("mimeType", "image/svg+xml")
+                        .put("body", Base64.encodeToString(svgB, Base64.NO_WRAP))
+                        .put("expectedRevision", agentContentRevision(markdown)),
+                )
+            }.exceptionOrNull()
+        }
+        awaitCondition { restoreEntered.isCompleted }
+        assertFalse("Staged bytes should be on disk before rollback", smdFile.readBytes().contentEquals(backupBytes))
+        model.edit(noteId, "# Local draft edited mid-attach\n")
+        model.portablePostWriteObserver = null
+        restoreRelease.complete(Unit)
+        awaitJob(restoreAttempt)
+        assertTrue("Expected failure on mid-attach edit, got $restoreFailure", restoreFailure is IllegalArgumentException || restoreFailure is IllegalStateException)
+        assertTrue("Unexpected message: ${restoreFailure?.message}", restoreFailure?.message.orEmpty().contains("document changed while the image was being attached"))
+        assertArrayEquals("Rollback must restore original backup when disk still matches stagedBytes", backupBytes, smdFile.readBytes())
+
+        // Reset tab back to clean baseline so we can exercise LEAVE_CONCURRENT_BYTES.
+        model.reloadFromDisk(noteId)
+        awaitCondition { !model.state.value.active.dirty && model.state.value.active.content == markdown }
+
+        // 2. LEAVE_CONCURRENT_BYTES: external writer updates .smd after staged write and before rollback -> concurrent bytes preserved.
+        val concurrentBytes = java.io.ByteArrayOutputStream().also { out ->
+            MediaStorage(app).writeFmd(out, "# External concurrent update\n", svgAssets("assets/fig.svg", svgB))
+        }.toByteArray()
+        val concurrentEntered = CompletableDeferred<Unit>()
+        val concurrentRelease = CompletableDeferred<Unit>()
+        model.portablePostWriteObserver = {
+            concurrentEntered.complete(Unit)
+            concurrentRelease.await()
+        }
+        var concurrentFailure: Throwable? = null
+        val concurrentAttempt = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+            concurrentFailure = runCatching {
+                model.agentAssetAction(
+                    JSONObject().put("tabId", noteId).put("assetAction", "attach")
+                        .put("assetName", "attached-two.svg").put("mimeType", "image/svg+xml")
+                        .put("body", Base64.encodeToString(svgB, Base64.NO_WRAP))
+                        .put("expectedRevision", agentContentRevision(markdown)),
+                )
+            }.exceptionOrNull()
+        }
+        awaitCondition { concurrentEntered.isCompleted }
+        smdFile.writeBytes(concurrentBytes)
+        model.edit(noteId, "# Local draft edited during concurrent write\n")
+        model.portablePostWriteObserver = null
+        concurrentRelease.complete(Unit)
+        awaitJob(concurrentAttempt)
+
+        assertTrue("Expected IllegalStateException when concurrent bytes prevent rollback, got $concurrentFailure", concurrentFailure is IllegalStateException)
+        assertTrue(concurrentFailure?.message.orEmpty().contains("destination was not overwritten during recovery"))
+        val causeChainMessages = generateSequence(concurrentFailure) { it.cause }.mapNotNull { it.message }.toList()
+        assertTrue("Expected cause chain to mention leaving concurrent bytes intact, got $causeChainMessages", causeChainMessages.any { it.contains("left intact to avoid overwriting newer bytes") })
+        assertArrayEquals("Concurrent external .smd bytes must remain untouched during rollback", concurrentBytes, smdFile.readBytes())
+    }
+
+    private fun <T> runSuspend(timeoutMs: Long = 5_000, block: suspend () -> T): T {
+        var result: Result<T>? = null
+        val job = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+            result = runCatching { block() }
+        }
+        awaitJob(job, timeoutMs)
+        return result!!.getOrThrow()
+    }
 }
