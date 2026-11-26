@@ -1128,7 +1128,18 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     }
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         imageCallback?.onReceiveValue(null); imageCallback = null
-        if (uris.isNotEmpty()) model.importPickedImages(uris, imageNote) { images -> images?.let { web?.evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
+        if (uris.isNotEmpty()) {
+            model.importPickedImages(uris, imageNote) { images ->
+                if (images != null) {
+                    val activeWeb = web
+                    if (activeWeb != null && readerReady) {
+                        activeWeb.evaluateJavascript("window.supermdInsertImages?.($images)", null)
+                    } else {
+                        model.discardDroppedImages(images)
+                    }
+                }
+            }
+        }
     }
     LaunchedEffect(activity) { WindowInfoTracker.getOrCreate(activity).windowLayoutInfo(activity).collect { info -> hinge = info.displayFeatures.filterIsInstance<FoldingFeature>().firstOrNull { it.isSeparating && it.orientation == FoldingFeature.Orientation.VERTICAL } } }
     val open = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { it?.let { uri -> activity.requestOpen(uri) } }
@@ -1426,7 +1437,11 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     }
                     val uris = extractDroppedFileUris(event.clipData)
                     val hasContentUri = uris.any { it.scheme.equals("content", ignoreCase = true) }
-                    val permissions = if (hasContentUri) activity.requestDragAndDropPermissions(event) else null
+                    val permissions = if (hasContentUri) {
+                        runCatching { activity.requestDragAndDropPermissions(event) }.getOrNull()
+                    } else {
+                        null
+                    }
                     if (uris.isNotEmpty()) {
                         val id = model.state.value.active.id
                         val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
@@ -1438,15 +1453,19 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                             id = id,
                             dragReadPermissionGranted = permissions != null,
                         ) { images ->
-                            if (images != null) {
-                                reader.evaluateJavascript("window.supermdInsertImages?.($images)", null)
-                            } else {
-                                reader.evaluateJavascript("window.supermdInsertImages?.([])", null)
+                            if (web === reader && readerReady) {
+                                if (images != null) {
+                                    reader.evaluateJavascript("window.supermdInsertImages?.($images)", null)
+                                } else {
+                                    reader.evaluateJavascript("window.supermdInsertImages?.([])", null)
+                                }
+                            } else if (images != null) {
+                                model.discardDroppedImages(images)
                             }
                         }
-                        job.invokeOnCompletion { permissions?.release() }
+                        job.invokeOnCompletion { runCatching { permissions?.release() } }
                     } else {
-                        permissions?.release()
+                        runCatching { permissions?.release() }
                         if ((event.clipData?.itemCount ?: 0) > 0) {
                             model.importDropped(emptyList(), model.state.value.active.id, dragReadPermissionGranted = false) {}
                         }

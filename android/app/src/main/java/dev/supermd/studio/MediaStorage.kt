@@ -421,27 +421,36 @@ class MediaStorage(private val context: Context) {
         return result
     }
     private fun resolveUriDisplayName(uri: Uri): String? =
-        androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name
+        runCatching { androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name }
+            .getOrNull()
             ?.takeIf { it.isNotBlank() }
             ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
 
     fun importUris(uris: List<Uri>): JSONArray {
         require(uris.size in 1..32)
-        var total = 0L; val result = JSONArray()
-        for (uri in uris) {
-            ExternalDocumentEntryGuard.validatePickedMediaUri(context, uri)
-            val name = resolveUriDisplayName(uri) ?: "Image"
-            val type = imageMime(name, context.contentResolver.getType(uri))
-            val bytes = ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
-                context = context,
-                resolver = context.contentResolver,
-                uri = uri,
-            ).use { readLimited(it, 25_000_000) }
-            requireMediaSignature(type, bytes)
-            total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-            result.put(store(name, type, bytes))
+        var total = 0L
+        val result = JSONArray()
+        try {
+            for (uri in uris) {
+                ExternalDocumentEntryGuard.validatePickedMediaUri(context, uri)
+                val name = resolveUriDisplayName(uri) ?: "Image"
+                val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                val type = imageMime(name, providerMime)
+                val bytes = ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
+                    context = context,
+                    resolver = context.contentResolver,
+                    uri = uri,
+                ).use { readLimited(it, 25_000_000) }
+                requireMediaSignature(type, bytes)
+                total += bytes.size
+                require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+                result.put(store(name, type, bytes))
+            }
+            return result
+        } catch (error: Throwable) {
+            discardImportedImages(result)
+            throw error
         }
-        return result
     }
 
     fun importDroppedUris(
@@ -453,62 +462,70 @@ class MediaStorage(private val context: Context) {
         var skipped = 0
         var missingGrants = 0
         val result = JSONArray()
-        for (uri in uris) {
-            when (ExternalDocumentEntryGuard.validateDroppedUri(context, uri, dragReadPermissionGranted)) {
-                is ExternalDropUriDecision.MissingGrant -> {
-                    missingGrants++
-                    continue
+        try {
+            for (uri in uris) {
+                when (ExternalDocumentEntryGuard.validateDroppedUri(context, uri, dragReadPermissionGranted)) {
+                    is ExternalDropUriDecision.MissingGrant -> {
+                        missingGrants++
+                        continue
+                    }
+                    is ExternalDropUriDecision.Rejected -> {
+                        skipped++
+                        continue
+                    }
+                    is ExternalDropUriDecision.Allowed -> Unit
                 }
-                is ExternalDropUriDecision.Rejected -> {
+                val name = resolveUriDisplayName(uri)
+                val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                val resolvedMime = resolveDroppedImageMime(name, providerMime)
+                if (resolvedMime == null) {
                     skipped++
                     continue
                 }
-                is ExternalDropUriDecision.Allowed -> Unit
+                require(result.length() < 32) { "Insert at most 32 images at a time" }
+                val stream = try {
+                    ExternalDocumentEntryGuard.openVerifiedDroppedInputStream(
+                        context = context,
+                        resolver = context.contentResolver,
+                        uri = uri,
+                        dragReadPermissionGranted = dragReadPermissionGranted,
+                    )
+                } catch (_: SecurityException) {
+                    missingGrants++
+                    continue
+                } catch (_: Exception) {
+                    skipped++
+                    continue
+                }
+                val bytes = stream.use { readLimited(it, 25_000_000) }
+                val validSignature = runCatching { requireMediaSignature(resolvedMime, bytes) }.isSuccess
+                if (!validSignature) {
+                    skipped++
+                    continue
+                }
+                total += bytes.size
+                require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+                result.put(store(name ?: "Image", resolvedMime, bytes))
             }
-            val name = resolveUriDisplayName(uri)
-            val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
-            val resolvedMime = resolveDroppedImageMime(name, providerMime)
-            if (resolvedMime == null) {
-                skipped++
-                continue
-            }
-            require(result.length() < 32) { "Insert at most 32 images at a time" }
-            val stream = try {
-                ExternalDocumentEntryGuard.openVerifiedDroppedInputStream(
-                    context = context,
-                    resolver = context.contentResolver,
-                    uri = uri,
-                    dragReadPermissionGranted = dragReadPermissionGranted,
-                )
-            } catch (_: SecurityException) {
-                missingGrants++
-                continue
-            } catch (_: Exception) {
-                skipped++
-                continue
-            }
-            val bytes = stream.use { readLimited(it, 25_000_000) }
-            val validSignature = runCatching { requireMediaSignature(resolvedMime, bytes) }.isSuccess
-            if (!validSignature) {
-                skipped++
-                continue
-            }
-            total += bytes.size
-            require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-            result.put(store(name ?: "Image", resolvedMime, bytes))
+            return DroppedImageBatch(
+                images = result,
+                skippedCount = skipped + missingGrants,
+                missingGrantCount = missingGrants,
+            )
+        } catch (error: Throwable) {
+            discardImportedImages(result)
+            throw error
         }
-        return DroppedImageBatch(
-            images = result,
-            skippedCount = skipped + missingGrants,
-            missingGrantCount = missingGrants,
-        )
     }
 
     internal fun discardImportedImages(images: JSONArray) {
         for (i in 0 until images.length()) {
             val source = images.optJSONObject(i)?.optString("source").orEmpty()
             if (source.startsWith("assets/import-")) {
-                local(source, null)?.delete()
+                local(source, null)?.let { file ->
+                    invalidateLocalAsset(file)
+                    file.delete()
+                }
             }
         }
     }

@@ -394,10 +394,12 @@ class DropSafetyTest {
     @Test fun grantedExternalContentAndPublicFileDropsAndUserGrantedPickerImportsSucceed() {
         provider.entries["drop.png"] = FakeDropProvider.Entry("drop.png", "image/png", VALID_PNG_BYTES)
         provider.entries["picked.svg"] = FakeDropProvider.Entry("picked.svg", "image/svg+xml", VALID_SVG_BYTES)
+        provider.entries["exported-picker.png"] = FakeDropProvider.Entry("exported-picker.png", "image/png", VALID_PNG_BYTES)
         provider.entries["spoofed-picker.png"] = FakeDropProvider.Entry("spoofed-picker.png", "image/png", PDF_BYTES)
         val grantedDropUri = android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "vault/drop.png")
         val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(AUTHORITY, "vault")
         val treePickedUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/picked.svg")
+        val exportedPickerUri = Uri.parse("content://$AUTHORITY/exported-picker.png")
         val spoofedPickerUri = android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "vault/spoofed-picker.png")
         val publicFile = File(tempDir, "ordinary-external.png").apply { writeBytes(VALID_PNG_BYTES) }
         val publicFileUri = Uri.fromFile(publicFile)
@@ -422,23 +424,45 @@ class DropSafetyTest {
         assertEquals("ordinary-external", droppedImages!!.getJSONObject(1).getString("alt"))
         assertTrue(app.contentResolver.persistedUriPermissions.none { it.uri == grantedDropUri })
 
-        // 2. User-granted system picker (OpenMultipleDocuments) imports granted SAF documents (including tree-backed picker URIs).
+        // 2. User-granted system picker (OpenMultipleDocuments) imports granted SAF documents (including tree-backed picker URIs)
+        //    as well as readable exported picker URIs that do not insert a dynamic checkUriPermission record.
         var pickedImages: JSONArray? = null
-        model.importPickedImages(listOf(treePickedUri), activeId) { images -> pickedImages = images }
+        model.importPickedImages(listOf(treePickedUri, exportedPickerUri), activeId) { images -> pickedImages = images }
         drainMain { pickedImages != null }
-        assertEquals(1, pickedImages!!.length())
+        assertEquals(2, pickedImages!!.length())
         assertEquals("picked", pickedImages!!.getJSONObject(0).getString("alt"))
+        assertEquals("exported-picker", pickedImages!!.getJSONObject(1).getString("alt"))
 
-        // 3. Signature validation still guards user-granted picker imports against spoofed image bytes.
+        // Verify the same ungranted exported URI is still rejected on untrusted external drag-and-drop before opening bytes.
+        val openBeforeDrop = provider.openCount
+        var ungrantedExportedDone = false
+        var ungrantedExportedResult: JSONArray? = JSONArray().put("sentinel")
+        model.importDropped(
+            uris = listOf(exportedPickerUri),
+            id = activeId,
+            dragReadPermissionGranted = true,
+        ) { images ->
+            ungrantedExportedResult = images
+            ungrantedExportedDone = true
+        }
+        drainMain { ungrantedExportedDone }
+        assertNull(ungrantedExportedResult)
+        assertEquals(openBeforeDrop, provider.openCount)
+        assertEquals(MediaStorage.UNGRANTED_DROP_IMAGE_MESSAGE, model.state.value.message)
+
+        // 3. Signature validation guards user-granted picker imports against spoofed image bytes and rolls back staged batch items.
+        val attachmentsBeforeFailedBatch = File(app.filesDir, "attachments").listFiles()?.map { it.name }?.toSet().orEmpty()
         var spoofedCallbackDone = false
         var spoofedPicked: JSONArray? = JSONArray().put("sentinel")
-        model.importPickedImages(listOf(spoofedPickerUri), activeId) { images ->
+        model.importPickedImages(listOf(grantedDropUri, spoofedPickerUri), activeId) { images ->
             spoofedPicked = images
             spoofedCallbackDone = true
         }
         drainMain { spoofedCallbackDone }
         assertNull(spoofedPicked)
         assertTrue(model.state.value.error?.contains("PNG signature is invalid") == true)
+        val attachmentsAfterFailedBatch = File(app.filesDir, "attachments").listFiles()?.map { it.name }?.toSet().orEmpty()
+        assertEquals(attachmentsBeforeFailedBatch, attachmentsAfterFailedBatch)
     }
 
     @Test fun missingDragGrantOrMissingUriPermissionDropsAreRejectedBeforeOpeningBytesEvenWithExistingAppGrants() {
@@ -457,6 +481,7 @@ class DropSafetyTest {
             android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
         app.grantUriPermission(app.packageName, secretDocUri, folderFlags)
         app.grantUriPermission(app.packageName, treeUri, folderFlags)
+        app.contentResolver.takePersistableUriPermission(treeUri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
         grantRead(allowedUri)
 
         val model = StudioViewModel(app)
@@ -485,7 +510,8 @@ class DropSafetyTest {
         assertEquals(initialContent, model.state.value.active.content)
         assertEquals(MediaStorage.UNGRANTED_DROP_IMAGE_MESSAGE, model.state.value.message)
 
-        // 2. Missing live URI read grant on an individual URI (even when dragReadPermissionGranted = true) never opens bytes.
+        // 2. Missing live URI read grant on an individual URI (even when dragReadPermissionGranted = true and
+        //    the containing SAF folder grant is persisted) never manufactures tree access or opens bytes.
         var done2 = false
         var res2: JSONArray? = JSONArray().put("sentinel")
         model.importDropped(
@@ -543,6 +569,7 @@ class DropSafetyTest {
         }
         val publicSymlinkToPrivate = File(tempDir, "innocent-symlink.png")
         Files.createSymbolicLink(publicSymlinkToPrivate.toPath(), privateFilesImg.toPath())
+        val publicDirectory = File(tempDir, "folder.png").apply { mkdirs() }
 
         // Malicious external ContentProvider that grants read access to its own URI, but redirects openFile()
         // to return a ParcelFileDescriptor pointing inside Super MD's app-private filesDir.
@@ -553,6 +580,7 @@ class DropSafetyTest {
             backingFile = privateFilesImg,
         )
         val redirectedUri = Uri.parse("content://$AUTHORITY/redirected.png")
+        val userPrefixedShareUri = Uri.parse("content://0@${app.packageName}.share/secret.png")
         grantRead(redirectedUri)
 
         val model = StudioViewModel(app)
@@ -566,8 +594,11 @@ class DropSafetyTest {
             Uri.fromFile(privateCacheImg),
             Uri.fromFile(privatePrefsImg),
             Uri.fromFile(publicSymlinkToPrivate),
+            Uri.fromFile(publicDirectory),
             Uri.parse("file:///data/data/${app.packageName}/files/private-attachment.png"),
+            Uri.parse("file:///sdcard/android/DATA/${app.packageName}/files/private-attachment.png"),
             Uri.parse("file:///proc/self/cmdline"),
+            userPrefixedShareUri,
             redirectedUri,
         )
 
@@ -589,6 +620,19 @@ class DropSafetyTest {
         assertEquals(MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE, model.state.value.message)
         val afterAttachments = File(app.filesDir, "attachments").listFiles()?.map { it.name }?.toSet().orEmpty()
         assertEquals(beforeAttachments, afterAttachments)
+
+        // Descriptor redirection and user-prefixed share URIs are also blocked on the picker path.
+        for (forbiddenPickerUri in listOf(redirectedUri, userPrefixedShareUri)) {
+            var pickerDone = false
+            var pickerResult: JSONArray? = JSONArray().put("sentinel")
+            model.importPickedImages(listOf(forbiddenPickerUri), noteId) { images ->
+                pickerResult = images
+                pickerDone = true
+            }
+            drainMain { pickerDone }
+            assertNull(pickerResult)
+            assertNotNull(model.state.value.error)
+        }
 
         privateFilesImg.delete()
         privateCacheImg.delete()

@@ -14,7 +14,9 @@ import android.system.OsConstants
 import java.io.File
 import java.io.InputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Paths
+import java.nio.file.attribute.BasicFileAttributes
 
 internal data class ExternalIntentCaller(
     val uid: Int? = null,
@@ -273,6 +275,18 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
+    private fun providerAuthority(uri: Uri): String? =
+        uri.authority?.substringAfter('@')?.takeIf { it.isNotBlank() }
+
+    private fun requireRegularSafeExternalFile(context: Context, candidate: File): File {
+        val safeFile = requireSafeExternalFile(context, candidate)
+        val attrs = runCatching {
+            Files.readAttributes(safeFile.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        }.getOrNull() ?: throw IllegalArgumentException("File path could not be resolved")
+        require(attrs.isRegularFile) { "Document is not a regular file" }
+        return safeFile
+    }
+
     fun validateDroppedUri(
         context: Context,
         uri: Uri,
@@ -280,10 +294,9 @@ internal object ExternalDocumentEntryGuard {
     ): ExternalDropUriDecision {
         return when (uri.scheme?.lowercase()) {
             "content" -> {
-                if (uri.authority.isNullOrBlank()) {
-                    return ExternalDropUriDecision.Rejected(uri, "Missing content provider authority")
-                }
-                if (uri.authority.equals("${context.packageName}.share", ignoreCase = true)) {
+                val authority = providerAuthority(uri)
+                    ?: return ExternalDropUriDecision.Rejected(uri, "Missing content provider authority")
+                if (authority.equals("${context.packageName}.share", ignoreCase = true)) {
                     return ExternalDropUriDecision.Rejected(uri, "App-private share URIs cannot be dropped")
                 }
                 if (DocumentsContract.isTreeUri(uri)) {
@@ -302,7 +315,7 @@ internal object ExternalDocumentEntryGuard {
                 if (rawPath.isNullOrBlank() || '\u0000' in rawPath) {
                     return ExternalDropUriDecision.Rejected(uri, "Invalid file path")
                 }
-                val check = runCatching { requireSafeExternalFile(context, File(rawPath)) }
+                val check = runCatching { requireRegularSafeExternalFile(context, File(rawPath)) }
                 if (check.isFailure) {
                     return ExternalDropUriDecision.Rejected(
                         uri,
@@ -337,7 +350,7 @@ internal object ExternalDocumentEntryGuard {
                     }
                 }
                 "file" -> {
-                    val safeFile = requireSafeExternalFile(context, File(uri.path!!))
+                    val safeFile = requireRegularSafeExternalFile(context, File(uri.path!!))
                     val pfd = ParcelFileDescriptor.open(safeFile, ParcelFileDescriptor.MODE_READ_ONLY)
                     try {
                         verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = false)
@@ -355,11 +368,8 @@ internal object ExternalDocumentEntryGuard {
     fun validatePickedMediaUri(context: Context, uri: Uri) {
         when (uri.scheme?.lowercase()) {
             "content" -> {
-                require(!uri.authority.isNullOrBlank()) { "Unsupported image URI" }
-                require(!uri.authority.equals("${context.packageName}.share", ignoreCase = true)) { "Unsupported image URI" }
-                if (!hasDirectReadUriPermission(context, uri)) {
-                    throw SecurityException("Image permission is unavailable")
-                }
+                val authority = providerAuthority(uri) ?: throw IllegalArgumentException("Unsupported image URI")
+                require(!authority.equals("${context.packageName}.share", ignoreCase = true)) { "Unsupported image URI" }
             }
             "file" -> {
                 require(uri.authority.isNullOrEmpty() || uri.authority.equals("localhost", ignoreCase = true)) {
@@ -367,7 +377,7 @@ internal object ExternalDocumentEntryGuard {
                 }
                 val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
                     ?: throw IllegalArgumentException("Unsupported image URI")
-                requireSafeExternalFile(context, File(rawPath))
+                requireRegularSafeExternalFile(context, File(rawPath))
             }
             else -> throw IllegalArgumentException("Unsupported image URI")
         }
@@ -392,7 +402,7 @@ internal object ExternalDocumentEntryGuard {
                 }
             }
             "file" -> {
-                val safeFile = requireSafeExternalFile(context, File(uri.path!!))
+                val safeFile = requireRegularSafeExternalFile(context, File(uri.path!!))
                 val pfd = ParcelFileDescriptor.open(safeFile, ParcelFileDescriptor.MODE_READ_ONLY)
                 try {
                     verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = false)
@@ -414,7 +424,8 @@ internal object ExternalDocumentEntryGuard {
     ) {
         val stat = runCatching { Os.fstat(pfd.fileDescriptor) }.getOrNull()
         if (stat != null && stat.st_mode != 0) {
-            require(OsConstants.S_ISREG(stat.st_mode) || OsConstants.S_ISFIFO(stat.st_mode)) {
+            val isFileScheme = uri.scheme.equals("file", ignoreCase = true)
+            require(OsConstants.S_ISREG(stat.st_mode) || (!isFileScheme && OsConstants.S_ISFIFO(stat.st_mode))) {
                 "Document is not a regular file"
             }
         }
@@ -460,7 +471,9 @@ internal object ExternalDocumentEntryGuard {
         val pkg = context.packageName
         if (pkg.isNotBlank()) {
             for (segment in listOf("/Android/data/$pkg", "/Android/obb/$pkg", "/Android/media/$pkg")) {
-                if (normalized.endsWith(segment) || normalized.contains("$segment/")) return true
+                if (normalized.endsWith(segment, ignoreCase = true) || normalized.contains("$segment/", ignoreCase = true)) {
+                    return true
+                }
             }
         }
         for (privateRoot in appPrivateRoots(context)) {

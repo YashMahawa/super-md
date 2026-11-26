@@ -3718,6 +3718,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } }
         closeTargetId?.let { close(it) }
     }
+    internal fun discardDroppedImages(images: JSONArray) {
+        viewModelScope.launch(Dispatchers.IO) { media.discardImportedImages(images) }
+    }
     fun importPickedImages(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
         if (uris.isEmpty()) {
             result(null)
