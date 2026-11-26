@@ -104,28 +104,6 @@ internal fun shouldShowNativeBusyOverlay(busy: Boolean, readerReady: Boolean, re
 internal fun isSystemMotionEnabled(context: android.content.Context): Boolean =
     android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f
 
-private suspend fun View.awaitWindowFocus() {
-    if (hasWindowFocus()) return
-    suspendCancellableCoroutine<Unit> { continuation ->
-        val observer = viewTreeObserver
-        val completed = AtomicBoolean(false)
-        lateinit var listener: android.view.ViewTreeObserver.OnWindowFocusChangeListener
-        fun removeListener() { if (observer.isAlive) observer.removeOnWindowFocusChangeListener(listener) }
-        fun resumeIfFocused() {
-            if (hasWindowFocus() && completed.compareAndSet(false, true)) {
-                removeListener()
-                continuation.resume(Unit)
-            }
-        }
-        listener = android.view.ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
-            if (hasFocus) resumeIfFocused()
-        }
-        observer.addOnWindowFocusChangeListener(listener)
-        continuation.invokeOnCancellation { removeListener() }
-        resumeIfFocused()
-    }
-}
-
 class MainActivity : ComponentActivity() {
     private data class AgentExportArtifact(
         val uri: android.net.Uri,
@@ -690,138 +668,16 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     var web by remember { mutableStateOf<WebView?>(null) }
     var chromeHeight by remember { mutableIntStateOf(0) }
     val readerNote = remember { arrayOfNulls<String>(1) }
-    // WebView timer controls are process-wide. Track every reader so a stopped
-    // activity cannot pause another window that is still visible.
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner, web) {
-        val currentWeb = web
-        if (currentWeb == null) {
-            // No reader exists during initial composition or renderer recovery;
-            // registering that gap would create an owner with no view through
-            // which to apply WebView's process-wide timer call.
-            onDispose { }
-        } else {
-            val owner = Any()
-            fun applyGlobalAction(action: ReaderTimerOwners.GlobalAction) {
-                when (action) {
-                    ReaderTimerOwners.GlobalAction.PAUSE -> currentWeb.pauseTimers()
-                    ReaderTimerOwners.GlobalAction.RESUME -> currentWeb.resumeTimers()
-                    ReaderTimerOwners.GlobalAction.NONE -> Unit
-                }
-            }
-            val started = lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)
-            // A view can be recreated while its Activity is already STOPPED;
-            // explicitly pause that view even when another reader keeps the
-            // process-wide timers running.
-            if (started) currentWeb.onResume() else currentWeb.onPause()
-            applyGlobalAction(ReaderTimerOwners.process.acquire(owner, started))
-            val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
-                when (event) {
-                    androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
-                        currentWeb.onPause()
-                        applyGlobalAction(ReaderTimerOwners.process.setStarted(owner, false))
-                    }
-                    androidx.lifecycle.Lifecycle.Event.ON_START -> {
-                        applyGlobalAction(ReaderTimerOwners.process.setStarted(owner, true))
-                        currentWeb.onResume()
-                    }
-                    else -> Unit
-                }
-            }
-            lifecycleOwner.lifecycle.addObserver(observer)
-            onDispose {
-                lifecycleOwner.lifecycle.removeObserver(observer)
-                applyGlobalAction(ReaderTimerOwners.process.release(owner))
-            }
-        }
-    }
-    DisposableEffect(activity, web) {
-        model.assetAccessRestored = { document, source ->
-            web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
-        }
-        activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
-        activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
-        activity.openReaderFind = { replace ->
-            menu = false
-            findReplace = replace
-            findRequest++
-        }
-        activity.stepReaderFind = { direction ->
-            menu = false
-            web?.let { reader ->
-                reader.requestFocus(View.FOCUS_DOWN)
-                reader.evaluateJavascript("window.supermdFindStep?.(${if (direction < 0) -1 else 1}); true", null)
-            }
-        }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;activity.stepReaderFind=null;model.assetAccessRestored=null }
-    }
-    LaunchedEffect(findRequest, menu, web) {
-        if (findRequest == 0 || menu) return@LaunchedEffect
-        val requested = findRequest
-        val replace = findReplace
-        // Wait for the popup window to release native focus before asking the
-        // WebView for focus. This follows the actual dismissal instead of
-        // estimating its transition duration.
-        val reader = web ?: return@LaunchedEffect
-        reader.awaitWindowFocus()
-        if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
-        findRequest = 0
-        findReplace = false
-        reader.requestFocus(View.FOCUS_DOWN)
-        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
-            reader.post {
-                reader.requestFocus(View.FOCUS_DOWN)
-                val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
-                val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
-                val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                if (!hasHardwareKeyboard || showImeWithHardware) {
-                    inputMethod?.showSoftInput(reader, InputMethodManager.SHOW_IMPLICIT)
-                } else {
-                    // WebView.focus() can itself open the software keyboard
-                    // after an input receives focus. Honor the hardware-keyboard
-                    // preference even when DOM focus was restored natively.
-                    inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
-                }
-            }
-        }
-    }
     var readerReady by remember { mutableStateOf(false) }
     var readerGeneration by remember { mutableIntStateOf(0) }
-    DisposableEffect(model, readerReady, readerGeneration, web) {
-        model.readerFlushRequester = { noteId ->
-            val current = web
-            if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
-            else (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlush(noteId) ?: false
-        }
-        model.readerFlushStatusRequester = { noteId ->
-            val current = web
-            if (!readerReady || current == null) {
-                if (model.readerStateIsNativeAuthoritative(noteId)) ReaderFlushStatus.ACKNOWLEDGED
-                else ReaderFlushStatus.FAILED
-            } else {
-                (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlushStatus(noteId)
-                    ?: ReaderFlushStatus.FAILED
-            }
-        }
-        onDispose {
-            model.readerFlushRequester = null
-            model.readerFlushStatusRequester = null
-        }
-    }
-    DisposableEffect(activity, model, readerReady) {
-        val handler = if (readerReady) {
-            OpenIntentDispatcher.Handler<OpenDocumentTarget> { target, relative ->
-                model.openDocument(
-                    target.uri,
-                    relative,
-                    externalIntentFlags = target.externalIntentFlags,
-                    externalCaller = target.externalCaller,
-                )
-            }
-        } else null
-        model.attachReaderOpenHandler(handler)
-        onDispose { if (handler != null) model.detachReaderOpenHandler(handler) }
-    }
+    BindReaderLifecycleAndHooks(
+        activity = activity, model = model, web = web, currentWeb = { web },
+        menu = menu, isMenuOpen = { menu }, onDismissMenu = { menu = false },
+        findRequest = findRequest, currentFindRequest = { findRequest }, findReplace = findReplace,
+        onOpenReaderFind = { replace -> menu = false; findReplace = replace; findRequest++ },
+        onConsumeFindRequest = { findRequest = 0; findReplace = false },
+        readerReady = readerReady, isReaderReady = { readerReady }, readerGeneration = readerGeneration,
+    )
     DisposableEffect(activity, model, readerReady, web, state.tabs, state.activeId) {
         val bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = if (!readerReady || web == null) null else bridge@{ incoming, reply ->
             val request = JSONObject(incoming.toString())
@@ -1212,23 +1068,10 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
         }
         onDispose { activity.setAgentUiHandler(null) }
     }
-    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(noteStem(state.active.name).ifBlank { "Untitled" } + ".smd") }; onDispose { model.requestPortable = null } }
-    DisposableEffect(save, portableSaveAs, model) {
-        model.requestSaveAs = { note ->
-            val stem = noteStem(note.name).ifBlank { "Untitled" }
-            if (note.portable) portableSaveAs.launch("$stem.smd")
-            else save.launch("$stem.md")
-        }
-        onDispose { model.requestSaveAs = null }
-    }
-    DisposableEffect(web, readerReady, model) {
-        model.requestPortableWrite = if (readerReady && web != null) { saveInPlace ->
-            model.busy(true)
-            web?.evaluateJavascript("window.supermdPortable?.($saveInPlace)", null)
-            true
-        } else null
-        onDispose { model.requestPortableWrite = null }
-    }
+    BindReaderPersistenceCallbacks(
+        model = model, activeNoteName = state.active.name, portable = portable,
+        save = save, portableSaveAs = portableSaveAs, web = web, readerReady = readerReady, currentWeb = { web },
+    )
     val saveAction: () -> Unit = { model.saveManual() }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
@@ -1260,24 +1103,10 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
         val imeVisible = WindowInsets.ime.getBottom(density) > 0
         val modalOpen = settings || exporting || renaming || contentsShown || folderSearch.visible || drawer.isOpen || (!accessPickerShowing && accessRequest != null) || state.pendingCloseNote != null || state.pendingSaveConflictNote != null || state.error != null || !state.welcomed
         val showFormattingBar = shouldShowKeyboardFormattingBar(actualMode, imeVisible, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
-        val triggerFormat = rememberUpdatedState<(String) -> Unit> { action ->
-            val reader = web
-            if (reader != null && readerReady) {
-                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
-                reader.evaluateJavascript("window.supermdFormat?.(${JSONObject.quote(action)}); true", null)
-            }
-        }
-        val canFormatNow = rememberUpdatedState {
-            canTriggerHardwareFormatShortcut(actualMode, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
-        }
-        DisposableEffect(activity) {
-            activity.formatDocument = { action -> triggerFormat.value(action) }
-            activity.canFormatEditor = { canFormatNow.value() }
-            onDispose {
-                activity.formatDocument = null
-                activity.canFormatEditor = null
-            }
-        }
+        val triggerFormat = BindReaderFormattingShortcuts(
+            activity = activity, web = web, readerReady = readerReady, actualMode = actualMode,
+            editorFocused = state.editorFocused, readerOverlay = state.readerOverlay, modalOpen = modalOpen,
+        )
         val readerContent=remember {arrayOfNulls<String>(1)}
         LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
@@ -1465,98 +1294,20 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     }
                 }
                 Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
-                    key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
-                        layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                        clipChildren = true
-                        clipToPadding = true
-                        addView(SelectionReaderWebView(context, model).apply {
-                            // Percentage-height HTML needs MATCH_PARENT, not
-                            // WRAP_CONTENT. The native container also confines
-                            // WebView's accelerated drawing to the reading pane.
-                            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-                            web = this
-                            setOnKeyListener { _, _, event -> activity.handleShortcut(event) }
-                            setBackgroundColor(AndroidColor.TRANSPARENT)
-                            configureReader(this, model, scope, ready = { if (web === this) readerReady = true }, onAgentReply = activity::deliverAgentReply, onAgentExport = activity::requestAgentExport, rendererGone = { failedView ->
-                                val wasCurrent = web === failedView
-                                retireAndDestroyReader(failedView)
-                                if (wasCurrent) {
-                                    readerReady = false
-                                    readerPdfOwnsProgress = false
-                                    model.editorFocus(false)
-                                    readerNote[0] = null
-                                    readerGeneration++
-                                    web = null
-                                    scope.launch {
-                                        snackbar.showSnackbar("The reader restarted. Changes already received by Super MD were restored; an edit still in transit may be missing.")
-                                    }
-                                }
-                            })
-                            var touchY=0f
-                            var downX=0f
-                            var downY=0f
-                            var downTime=0L
-                            var moved=false
-                            var multiTouch=false
-                            var chromeIntent:Boolean?=null
-                            var gestureEpoch=0L
-                            var gestureActive=false
-                            setOnTouchListener {_,event->
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_DOWN) {
-                                    chromeTapJob[0]?.cancel()
-                                    gestureEpoch++
-                                    gestureActive=true
-                                    touchY=event.rawY
-                                    downX=event.x;downY=event.y;downTime=event.eventTime;moved=false
-                                    multiTouch=false
-                                    chromeIntent=null
-                                }
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_POINTER_DOWN) {multiTouch=true;chromeIntent=null}
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_MOVE && !multiTouch && event.pointerCount==1 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay) {
-                                    if(kotlin.math.hypot(event.x-downX,event.y-downY)>8*density.density)moved=true
-                                    val travel=event.rawY-touchY
-                                    if(kotlin.math.abs(travel)>36*density.density){chromeIntent=travel>0;touchY=event.rawY}
-                                }
-                                // Never resize the viewport under an active
-                                // gesture, selection handle or live editor.
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_UP && !multiTouch) {
-                                    gestureActive=false
-                                    val completedEpoch=gestureEpoch
-                                    val show=chromeIntent
-                                    val tap=!moved && event.eventTime-downTime<350 && model.state.value.mode in listOf("live","reader") && !model.state.value.readerOverlay
-                                    if(show!=null || tap) {
-                                        val x=event.x/density.density;val y=event.y/density.density
-                                        chromeTapJob[0]=scope.launch {
-                                            if(tap)delay(260)
-                                            evaluateJavascript("(() => { const e=document.elementFromPoint($x,$y); return !!document.querySelector('.live-active-block textarea:focus') || !!window.getSelection()?.toString() || ${if(tap) "!!e?.closest('a,button,input,textarea,summary,img,.note-image,[data-independent-zoom],.interactive-chart,.media-dialog,.reading-search,.math-repair-panel')" else "false"}; })()") { interacting ->
-                                                if(interacting!="true" && !gestureActive && completedEpoch==gestureEpoch) {
-                                                    readingChromeAfterGesture(model.state.value.fullscreen, readingChromeVisible, show, tap)?.let { readingChromeVisible=it }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if(event.actionMasked==android.view.MotionEvent.ACTION_UP || event.actionMasked==android.view.MotionEvent.ACTION_CANCEL)gestureActive=false
-                                false
-                            }
-                            webChromeClient = object : android.webkit.WebChromeClient() {
-                                override fun onShowFileChooser(view: WebView, callback: android.webkit.ValueCallback<Array<android.net.Uri>>, parameters: FileChooserParams): Boolean {
-                                    imageCallback?.onReceiveValue(null); imageCallback = callback; imageNote = model.state.value.active.id
-                                    imagePicker.launch(arrayOf("image/*")); return true
-                                }
-                            }
-                            setOnDragListener(ExternalDropDragController { event ->
-                                handleExternalDrop.value(this, event)
-                            })
-                        })
-                    } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
-                        val released = frame.getChildAt(0) as? WebView
-                        if (released != null) {
-                            if (web === released) { web = null; readerReady = false; model.editorFocus(false) }
-                            retireAndDestroyReader(released)
-                        }
-                        frame.removeAllViews()
-                    }) }
+                    StudioReaderWebViewHost(
+                        activity = activity, model = model, scope = scope, snackbar = snackbar,
+                        readerGeneration = readerGeneration, chromeTapJob = chromeTapJob, readerNote = readerNote,
+                        currentWeb = { web }, onWebChange = { web = it }, onReaderReadyChange = { readerReady = it },
+                        onResetPdfProgressOwnership = { readerPdfOwnsProgress = false },
+                        onIncrementReaderGeneration = { readerGeneration++ },
+                        isReadingChromeVisible = { readingChromeVisible },
+                        onReadingChromeVisibleChange = { readingChromeVisible = it },
+                        onShowImageChooser = { callback ->
+                            imageCallback?.onReceiveValue(null); imageCallback = callback; imageNote = model.state.value.active.id
+                            imagePicker.launch(arrayOf("image/*"))
+                        },
+                        onExternalDrop = { reader, event -> handleExternalDrop.value(reader, event) },
+                    )
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
