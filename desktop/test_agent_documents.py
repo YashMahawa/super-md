@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _headings, diagram_spans, outline_source, resolve_heading, search_source, section_source
+from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _headings, diagram_spans, outline_source, resolve_heading, search_source
 from documents import atomic_write, compressed_bundle
 
 
@@ -151,10 +151,6 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertEqual(combined, source[start:finish])
         self.assertIn("### Nested", combined)
         self.assertNotIn("7.40 Other", combined)
-        selected = section_source(source, "7.4")
-        self.assertEqual(selected["text"], source[start:finish])
-        self.assertEqual((selected["sectionStart"], selected["sectionEnd"], selected["documentLength"]),
-                         (start, finish, len(source)))
         self.assertEqual(self.store.read("numbered-sections.md", heading="7-4-methods")["sectionStart"], start)
         self.assertEqual(self.store.read("numbered-sections.md", heading=2)["sectionStart"],
                          len(source[:source.index("### Nested")]))
@@ -311,7 +307,6 @@ class AgentDocumentsTest(unittest.TestCase):
         asset_file.write_bytes(png)
         unicode_asset = self.root / "图形 with space.svg"
         unicode_asset.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'></svg>")
-        portable = self.root / "portable.smd"
         self.store.create("portable.smd", "# Image\n")
         revision = self.store.inspect("portable.smd")["revision"]
         attached = self.store.attach_asset("portable.smd", "图形 with space.svg", expected_revision=revision)

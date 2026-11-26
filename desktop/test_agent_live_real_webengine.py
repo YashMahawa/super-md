@@ -25,7 +25,7 @@ def _probe(directory: str) -> int:
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS","--disable-gpu --disable-dev-shm-usage")
     os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX","1")
     from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QObject, QMetaObject, Q_ARG, Qt
-    from PySide6.QtGui import QGuiApplication, QImage
+    from PySide6.QtGui import QImage
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
     from PySide6.QtWidgets import QApplication

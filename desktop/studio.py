@@ -9,12 +9,10 @@ import io
 import json
 import ipaddress
 import math
-import mimetypes
 import os
 import platform
 import shutil
 import re
-import secrets
 import socket
 import stat
 import subprocess
@@ -58,7 +56,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_links import WorkspaceLinkError, resolve_workspace_link
+from workspace_links import resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent

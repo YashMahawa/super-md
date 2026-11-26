@@ -203,8 +203,6 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_tab_tools_use_bridge_revisions_and_return_mcp_image_blocks(self):
         import base64
-        from mcp import Client
-        from mcp.types import ImageContent
         from mcp_server import build_mcp_server
 
         class FakeLive:
@@ -348,7 +346,7 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                 "action": "outline", "path": target, "offset": 2, "limit": 7})
             self.assertEqual(outline.structured_content["target"], target)
             self.assertEqual((live.outline_call["offset"], live.outline_call["limit"]), (2, 7))
-            search = await client.call_tool("document_search", {
+            await client.call_tool("document_search", {
                 "path": target, "query": "body", "limit": 3, "context": 10, "offset": 5,
                 "case_sensitive": True, "whole_word": True, "regex": False, "exclude_diagrams": True,
             })

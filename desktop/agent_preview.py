@@ -19,13 +19,13 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
     os.environ.setdefault('QT_QUICK_BACKEND','software')
     flags=os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS','')
     os.environ['QTWEBENGINE_CHROMIUM_FLAGS']=flags+' --disable-gpu'
-    from PySide6.QtCore import QObject, Signal, Slot, QFile, QIODevice, QUrl, QTimer, Qt
+    from PySide6.QtCore import QObject, Signal, Slot, QFile, QIODevice, QTimer, Qt
     from PySide6.QtWidgets import QApplication
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWebEngineCore import QWebEngineScript, QWebEngineSettings, QWebEnginePage, QWebEngineProfile
     from PySide6.QtWebChannel import QWebChannel
     from PySide6.QtGui import QFontDatabase
-    from documents import MIMES, atomic_write
+    from documents import MIMES
     from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
     root=Path(sys._MEIPASS)/'resources' if getattr(sys,'frozen',False) else Path(__file__).resolve().parent.parent
     reader=root/'dist'/'qt-reader.html'

@@ -80,7 +80,7 @@ class CloudRevocationUITests(unittest.TestCase):
             self.dispose(session, studio)
 
     def test_explicit_revoke_runs_off_ui_thread_then_erases_config(self):
-        session,studio,config=self.make_studio(); started=threading.Event(); release=threading.Event(); errors=[]
+        session,studio,config=self.make_studio(); started=threading.Event(); release=threading.Event()
         def revoke(value,timeout):
             self.assertEqual(value["deviceId"],config["deviceId"]); self.assertLessEqual(timeout,10)
             started.set(); release.wait(2)

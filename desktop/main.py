@@ -40,7 +40,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
-from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
+from PySide6.QtWebEngineCore import QWebEngineProfile
 from studio import Session, Studio, ROOT
 from agent_live import create_qt_bridge
 from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes

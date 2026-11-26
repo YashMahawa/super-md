@@ -1,5 +1,5 @@
 """Bounded subprocess rendering for MCP calls from a non-GUI server thread."""
-import hashlib,os,subprocess,sys,tempfile
+import hashlib,subprocess,sys,tempfile
 from pathlib import Path
 
 def render_offline(store,path_value,*,width=1200,expected_revision=None):

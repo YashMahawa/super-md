@@ -1,6 +1,6 @@
 """Subprocess CLI coverage against a protected, event-pumped Qt bridge."""
 from __future__ import annotations
-import base64, hashlib, json, os, subprocess, sys, tempfile, threading, time, unittest
+import base64, hashlib, json, os, subprocess, sys, tempfile, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -134,7 +134,7 @@ class LiveCLISubprocessTests(unittest.TestCase):
         stdout,stderr=process.communicate()
         self.assertEqual(stderr,"",stderr)
         try: value=json.loads(stdout)
-        except ValueError as error: self.fail(f"CLI did not emit one JSON response: {stdout!r}")
+        except ValueError: self.fail(f"CLI did not emit one JSON response: {stdout!r}")
         self.assertEqual(value.get("ok"),process.returncode==0,value)
         return process.returncode,value
     def test_subprocess_live_tab_actions_and_snapshot_output(self):
