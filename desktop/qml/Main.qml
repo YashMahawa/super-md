@@ -121,11 +121,12 @@ ApplicationWindow {
     function syncVisibleReaderChrome() {
         window.runDocumentScript("document.documentElement.style.setProperty('--native-visible-chrome-inset','" + readerVisibleChromeInset + "px')")
     }
-    function openFind() {
+    function openFind(replace) {
         if (!reader) return
         const target = reader
+        const script = replace ? "window.supermdFind?.(true)" : "window.supermdFind?.()"
         target.forceActiveFocus()
-        target.runJavaScript("window.supermdFind?.()", function() {
+        target.runJavaScript(script, function() {
             if (window.reader === target) target.forceActiveFocus()
         })
     }
@@ -146,6 +147,9 @@ ApplicationWindow {
         // application shortcuts are disabled while the modal is open.
         if (modalDialogCount > 0) return false
         if (["copy", "cut", "paste", "select_all"].includes(action) && window.nativeTextEditorFocused()) return false
+        if (["bold", "italic", "inline_code", "link", "heading", "list", "quote", "inline_math"].includes(action)) {
+            return !modalDialogCount && !window.nativeTextEditorFocused() && !viewState.readerOverlay && viewState.mode !== "reader"
+        }
         if (action === "undo" || action === "redo") return !modalDialogCount && !viewState.readerOverlay
         if (action === "close_tab") return !modalDialogCount
         if (action === "dismiss") return !modalDialogCount && !contentsPopup.visible
@@ -185,7 +189,21 @@ ApplicationWindow {
         case "cut": window.nativeReaderEditAction("cut"); break
         case "paste": window.nativeReaderEditAction("paste"); break
         case "select_all": window.nativeReaderEditAction("select_all"); break
-        case "find": window.openFind(); break
+        case "bold":
+        case "italic":
+        case "inline_code":
+        case "link":
+        case "heading":
+        case "list":
+        case "quote":
+        case "inline_math":
+            window.focusReader()
+            studio.command("format_" + action)
+            break
+        case "find": window.openFind(false); break
+        case "replace": window.openFind(true); break
+        case "find_next": window.focusReader(); studio.command("find_next"); break
+        case "find_previous": window.focusReader(); studio.command("find_previous"); break
         case "search_folder": studio.openFolderSearch(); break
         case "close_tab": studio.closeTabSafely(viewState.active); break
         case "next_tab": studio.cycleTab(1); break
@@ -637,7 +655,7 @@ ApplicationWindow {
                     backgroundColor: window.color
                     webChannel: WebChannel { id: documentChannel; Component.onCompleted: registerObject("studio", studio) }
                     settings.localContentCanAccessRemoteUrls: false
-                    settings.localContentCanAccessFileUrls: true
+                    settings.localContentCanAccessFileUrls: false
                     settings.javascriptCanOpenWindows: false
                     settings.fullScreenSupportEnabled: false
                     onContextMenuRequested: function(request) {
@@ -715,10 +733,19 @@ ApplicationWindow {
                         }
                     }
                     onNavigationRequested: function(request) {
-                        if (window.readerRecoveryLoading && request.url.toString() === "about:blank") return
-                        if (request.url.toString().split("#")[0] !== readerUrl.toString()) {
+                        const target = request.url.toString()
+                        if (!request.isMainFrame) {
+                            if (target === "about:blank") return
+                            const readerBase = readerUrl.toString().replace(/\/[^/]*([?#].*)?$/, "")
+                            const rel = target.startsWith(readerBase) ? target.slice(readerBase.length) : ""
+                            if (/^\/assets\/mermaid-sandbox-[A-Za-z0-9_-]+\.html$/.test(rel) || rel === "/@mermaid-sandbox.html") return
                             request.reject()
-                            if (request.url.toString().startsWith("https://") || request.url.toString().startsWith("http://")) Qt.openUrlExternally(request.url)
+                            return
+                        }
+                        if (window.readerRecoveryLoading && target === "about:blank") return
+                        if (target.split("#")[0] !== readerUrl.toString()) {
+                            request.reject()
+                            if (target.startsWith("https://") || target.startsWith("http://")) Qt.openUrlExternally(request.url)
                         }
                     }
                     }

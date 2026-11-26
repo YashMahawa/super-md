@@ -216,7 +216,20 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
   return new XMLSerializer().serializeToString(root);
 }
 
+export function decodeSvgDataUri(uri:string):string {
+  if(uri.length>1_400_000)throw new Error('SVG data URI exceeds size limit.');
+  const comma=uri.indexOf(',');
+  if(comma<0)throw new Error('Malformed SVG data URI.');
+  const header=uri.slice(0,comma),body=uri.slice(comma+1);
+  if(/;base64(?:;|$)/i.test(header)){
+    const bytes=Uint8Array.from(atob(body),ch=>ch.charCodeAt(0));
+    return new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+  }
+  return decodeURIComponent(body);
+}
+
 export function adaptSvgData(uri:string,colors:Record<string,string>,dark:boolean,monochrome=false):string {
-  if(!uri.startsWith('data:image/svg+xml')||uri.length>1_400_000)return uri;
-  try {const comma=uri.indexOf(','),source=uri.slice(0,comma).includes(';base64')?decodeURIComponent(escape(atob(uri.slice(comma+1)))):decodeURIComponent(uri.slice(comma+1));return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(adaptSvg(source,colors,dark,monochrome));}catch{return uri;}
+  if(!/^data:image\/svg\+xml(?:[;,]|$)/i.test(uri))return uri;
+  const source=decodeSvgDataUri(uri);
+  return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(adaptSvg(source,colors,dark,monochrome));
 }

@@ -43,7 +43,7 @@ from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
 from agent_live import create_qt_bridge
-from reader_assets import ReaderAssetSchemeHandler, SCHEME
+from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes
 from instance import InstanceBroker
 from reader_gestures import ReaderGestures
 import native_frame
@@ -109,13 +109,9 @@ def main():
         if flag not in flags:
             flags += " " + flag
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags.strip()
-    # The reader image scheme is deliberately not a local-file access scheme;
-    # it serves only opaque, per-open-note raster capabilities.
-    scheme = QWebEngineUrlScheme(SCHEME.encode("ascii"))
-    scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
-    scheme.setFlags(QWebEngineUrlScheme.Flag.SecureScheme | QWebEngineUrlScheme.Flag.CorsEnabled |
-                    QWebEngineUrlScheme.Flag.LocalScheme)
-    QWebEngineUrlScheme.registerScheme(scheme)
+    # The reader and raster image schemes are deliberately not local-file access
+    # schemes; they serve only packaged reader assets and per-note capabilities.
+    register_reader_schemes()
     QtWebEngineQuick.initialize()
     QGuiApplication.setApplicationName("super-md-qt" if args.test_state else "super-md")
     QGuiApplication.setOrganizationName("SuperMD")
@@ -151,7 +147,9 @@ def main():
     session.agent_bridge = create_qt_bridge(session, session.data)
     app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
+    bundle_handler = ReaderBundleSchemeHandler(ROOT / "dist", app)
     QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
     reader_profile_ready = {"initialized": True}
     session.ensure_reader_profile = lambda: None
     def detach_window(source_id, tab_id):
@@ -180,7 +178,12 @@ def main():
             # Only the disposable smoke workspace: verify the lazy renderer
             # in the packaged Qt WebEngine, then its self-contained PDF SVG.
             smoke_note=next(tab for tab in studio.tabs if tab['id']==studio.active)
-            smoke_note['content']=smoke_note['content'].replace('\n','\n\n```mermaid\nflowchart LR\n Read --> Understand\n```\n',1)
+            smoke_note['content']=smoke_note['content'].replace(
+                '\n',
+                '\n\n```mermaid\nflowchart LR\n Read --> Understand\n```\n\n'
+                '```mermaid\ngantt\n title Study plan\n dateFormat YYYY-MM-DD\n Read :a1, 2026-10-01, 2d\n Review :after a1, 2d\n```\n',
+                1,
+            )
             smoke_note['saved']=smoke_note['content']
             if args.smoke_theme:
                 studio.settings["theme"]="light"
@@ -188,7 +191,7 @@ def main():
         studio.newWindowRequested.connect(create_window)
         studio.detachedWindowRequested.connect(detach_window)
         engine.rootContext().setContextProperty("studio", studio)
-        engine.rootContext().setContextProperty("readerUrl", QUrl.fromLocalFile(str(ROOT / "dist" / "qt-reader.html")))
+        engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
         engine.rootContext().setContextProperty("channelScript", channel_script)
         engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(ROOT / "public" / "brand-mark-fixed.svg")))
         engine.load(QUrl.fromLocalFile(str(ROOT / "desktop" / "qml" / "Main.qml")))
@@ -278,14 +281,14 @@ def main():
                     QTimer.singleShot(max(0,when-previous),step)
                 advance()
             def verify():
-                script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,pele:Array.from(document.querySelectorAll('.mermaid img')).filter(i=>i.complete&&i.naturalWidth>0&&decodeURIComponent(i.src).includes('data-diagram-engine=\\\"pele\\\"')).length,themePattern:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient'),themeArt:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('data:image/svg+xml'),themeWeight:document.documentElement.style.getPropertyValue('--custom-heading-weight'),zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
+                script = "window.SuperMD?.post('smoke','export_failed',JSON.stringify({error:'SMOKE:'+JSON.stringify({headings:document.querySelectorAll('h1').length,math:document.querySelectorAll('.katex').length,charts:document.querySelectorAll('.interactive-chart svg').length,surfaces:document.querySelectorAll('.surface-chart').length,answers:document.querySelectorAll('details.callout').length,pele:Array.from(document.querySelectorAll('.mermaid img')).filter(i=>i.complete&&i.naturalWidth>0&&decodeURIComponent(i.src).includes('data-diagram-engine=\\\"pele\\\"')).length,mermaid:Array.from(document.querySelectorAll('.mermaid img')).filter(i=>i.complete&&i.naturalWidth>0&&decodeURIComponent(i.src).includes('data-diagram-engine=\\\"mermaid\\\"')).length,themePattern:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient'),themeArt:getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('data:image/svg+xml'),themeWeight:document.documentElement.style.getPropertyValue('--custom-heading-weight'),zoom:getComputedStyle(document.documentElement).getPropertyValue('--workspace-scale')})}))"
                 QMetaObject.invokeMethod(window,"runDocumentScript",Q_ARG("QVariant",script))
             def result():
                 if studio.message.startswith("SMOKE:"):
                     reader = window.findChild(QObject, "documentReader")
                     print(studio.message,flush=True)
                     window.grabWindow().save("/tmp/supermd-qt-smoke.png")
-                    valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":1','"surfaces":0','"answers":1','"pele":1'))
+                    valid = all(value in studio.message for value in ('"headings":1','"math":1','"charts":1','"surfaces":0','"answers":1','"pele":1','"mermaid":1'))
                     if args.smoke_theme:valid=valid and studio.customThemeActive and '"themePattern":true' in studio.message and '"themeWeight":"800"' in studio.message
                     zoom = window.findChild(QObject,"zoomPercentage")
                     valid = valid and zoom is not None and zoom.property("height") == 36
@@ -558,6 +561,7 @@ def main():
         engines,
         asset_handler,
         broker,
+        bundle_handler=bundle_handler,
         reader_profile_initialized=reader_profile_ready["initialized"],
     )
     return status
@@ -576,7 +580,7 @@ def _exit_process(status: int) -> None:
         sys.exit(status)
 
 
-def _run_teardown(app, session, studios, engines, asset_handler, broker, *, reader_profile_initialized=False):
+def _run_teardown(app, session, studios, engines, asset_handler, broker, *, bundle_handler=None, reader_profile_initialized=False):
     global _TEARDOWN_COMPLETED
     session.agent_bridge.stop()
     for studio in list(studios):
@@ -600,7 +604,7 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
         if broker:
             broker.close()
             broker.set_service_handler(None)
-        _DARWIN_EXIT_ANCHOR[:] = [app, session, list(studios), list(engines), asset_handler, broker]
+        _DARWIN_EXIT_ANCHOR[:] = [app, session, list(studios), list(engines), asset_handler, bundle_handler, broker]
         _TEARDOWN_COMPLETED = True
         return
     for engine in list(engines):
@@ -617,9 +621,13 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
     if reader_profile_initialized:
         try:
             QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(asset_handler)
+            if bundle_handler is not None:
+                QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(bundle_handler)
         except RuntimeError:
             pass
     asset_handler.deleteLater()
+    if bundle_handler is not None:
+        bundle_handler.deleteLater()
     for studio in list(studios):
         studio.host_window = None
     studios.clear()

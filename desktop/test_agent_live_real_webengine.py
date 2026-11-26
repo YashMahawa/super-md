@@ -29,10 +29,15 @@ def _probe(directory: str) -> int:
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
     from PySide6.QtWidgets import QApplication
+    from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
+    from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
     QQuickStyle.setStyle("Material")
+    register_reader_schemes()
     QtWebEngineQuick.initialize()
     app=QApplication(["Super MD real live viewport test"])
+    bundle_handler=ReaderBundleSchemeHandler(ROOT.parent/"dist",app)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"),bundle_handler)
     from agent_live import create_qt_bridge
     from studio import Session, Studio
     temp=Path(directory); temp.mkdir(parents=True,exist_ok=True)
@@ -53,7 +58,7 @@ def _probe(directory: str) -> int:
     channel_script=bytes(channel.readAll()).decode()
     engine=QQmlApplicationEngine()
     engine.rootContext().setContextProperty("studio",studio)
-    engine.rootContext().setContextProperty("readerUrl",QUrl.fromLocalFile(str(ROOT.parent/"dist"/"qt-reader.html")))
+    engine.rootContext().setContextProperty("readerUrl",reader_bundle_url())
     engine.rootContext().setContextProperty("channelScript",channel_script)
     engine.rootContext().setContextProperty("brandUrl",QUrl.fromLocalFile(str(ROOT.parent/"public"/"brand-mark-fixed.svg")))
     engine.load(QUrl.fromLocalFile(str(ROOT/"qml"/"Main.qml")))

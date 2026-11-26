@@ -14,6 +14,9 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
     if platform == "darwin":
         fullscreen.append("Ctrl+Meta+F")  # Command+Control+F, macOS convention.
     redo = ["Ctrl+Shift+Z"] if platform == "darwin" else ["Ctrl+Y"]
+    find_next = ["F3", f"{primary}+G"] if platform == "darwin" else ["F3"]
+    find_previous = ["Shift+F3", f"{primary}+Shift+G"] if platform == "darwin" else ["Shift+F3"]
+    quote = [f"{primary}+Alt+Q"] if platform == "darwin" else [f"{primary}+Shift+Q"]
     return (
         ("new_window", "New window", [f"{primary}+N", f"{primary}+Shift+N"]),
         ("new_note", "New note", [f"{primary}+T"]),
@@ -26,7 +29,18 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("cut", "Cut", [f"{primary}+X"]),
         ("paste", "Paste", [f"{primary}+V"]),
         ("select_all", "Select all", [f"{primary}+A"]),
+        ("bold", "Bold", [f"{primary}+B"]),
+        ("italic", "Italic", [f"{primary}+I"]),
+        ("inline_code", "Inline code", [f"{primary}+E"]),
+        ("link", "Link", [f"{primary}+K"]),
+        ("heading", "Heading", [f"{primary}+Shift+H"]),
+        ("list", "List", [f"{primary}+Shift+L"]),
+        ("quote", "Quote", quote),
+        ("inline_math", "Inline math", [f"{primary}+Shift+M"]),
         ("find", "Find in note", [f"{primary}+F"]),
+        ("replace", "Replace in note", [f"{primary}+H"]),
+        ("find_next", "Find next match", find_next),
+        ("find_previous", "Find previous match", find_previous),
         ("search_folder", "Search across notes", [f"{primary}+Shift+F"]),
         ("close_tab", "Close note tab", [f"{primary}+W"]),
         ("next_tab", "Next tab", [f"{primary}+Tab", f"{primary}+PgDown"]),
@@ -82,7 +96,7 @@ def native_label(value: str) -> str:
     return sequence.toString(QKeySequence.SequenceFormat.NativeText) or "Disabled"
 
 
-def normalize_shortcuts(candidate) -> tuple[dict[str, list[str]] | None, str]:
+def normalize_shortcuts(candidate, edited_action: str | None = None) -> tuple[dict[str, list[str]] | None, str]:
     """Validate the complete binding map and reject exact or prefix conflicts."""
     if not isinstance(candidate, dict):
         return None, "Shortcut settings must be a map."
@@ -100,7 +114,11 @@ def normalize_shortcuts(candidate) -> tuple[dict[str, list[str]] | None, str]:
                 parsed.append(portable)
         normalized[action] = parsed
     assigned: list[tuple[str, str]] = []
-    for action, sequences in normalized.items():
+    check_order = [action for action in normalized if action != edited_action]
+    if edited_action in normalized:
+        check_order.append(edited_action)
+    for action in check_order:
+        sequences = normalized[action]
         for value in sequences:
             current = QKeySequence.fromString(value, QKeySequence.SequenceFormat.PortableText)
             for other_action, other_value in assigned:

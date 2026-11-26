@@ -44,11 +44,18 @@ smd-engine inspect ./lesson.smd
 smd-engine read ./lesson.smd --offset 0 --limit 16000
 smd-engine assets ./lesson.smd
 smd-engine extract ./lesson.smd assets/image-1.svg ./figure.svg
+smd-engine unpack ./lesson.smd ./unpacked
 ```
 
 `read` emits bounded Markdown, with continuation information on stderr. `inspect`
 and `assets` emit metadata, not image bytes. `extract` writes one named image to a
-file and refuses to overwrite an existing output. Avoid `cat lesson.smd` or
+file and refuses to overwrite an existing output. `unpack` extracts the note's
+Markdown and `assets/` into a target directory within the same portable size limits,
+rejecting symlinks across destination ancestors, guarding Windows/FAT-reserved
+filenames, pre-checking all destination paths before writing, and publishing
+each file with exclusive `create_new` file creation (so removable FAT/exFAT folders
+work without hard links while existing files are never overwritten, rolling back
+newly created files on failure). Avoid `cat lesson.smd` or
 putting its JSON/base64 envelope in an AI's context. Use file/image tools on the
 extracted asset separately. For edits, use `super-md agent patch` and `replace-asset` to keep unchanged
 assets intact without unpacking or rewriting a document through a script. The GUI handles
@@ -233,7 +240,9 @@ old output. These plots are static figures, not live Python widgets.
 
 ## Links, images and export
 
-Pasting a URL opens an insertion choice with an editable fetched title. Supported
+Pasting an HTTP/HTTPS URL over selected prose wraps `[selected text](url)` inline,
+while pasting a URL elsewhere inserts the plain URL directly. Use **Insert image or
+link** for an insertion dialog with an editable fetched title. Supported
 YouTube links offer an optional thumbnail preview; insertion downloads the image
 as a local asset. Image URLs can also be inserted explicitly. Remote pictures in
 existing Markdown require loading/trust consent in the reader. Links remain
