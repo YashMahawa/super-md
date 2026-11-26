@@ -567,22 +567,26 @@ fn equation_references_and_pdf_labels_coexist_with_percent_comments_and_callouts
         "%%\n$$\nE = 0 \\tag{0.0}\\label{eq:energy}\n$$\n%%\n\n",
         "$$\nE = mc^2 \\tag{2.1}\\label{eq:energy}\\label{eq:einstein}\n$$\n\n",
         "> [!note] Relativity\n",
-        "> Alias \\ref{eq:einstein} and inline $K = \\eqref{eq:energy}$.\n",
+        "> Alias \\ref{eq:einstein} and inline $K = \\eqref{eq:energy}$.\n\n",
+        "```smd-step-grid\n",
+        "{\"title\":\"Derivation\",\"steps\":[{\"label\":\"Impulse\",\"markdown\":\"Step \\\\eqref{eq:impulse}:\\n\\n$$\\np = mv \\\\tag*{S.1}\\\\label{eq:impulse}\\n$$\"},{\"label\":\"Check\",\"markdown\":\"Verified.\"}]}\n",
+        "```\n",
     );
     let typst = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
     assert!(typst.contains("<smd-eq-eq_3a_energy>") && typst.contains("#metadata(none) <smd-eq-eq_3a_einstein>"), "{typst}");
+    assert!(typst.contains("<smd-eq-eq_3a_impulse>") && typst.contains("#link(label(\"smd-eq-eq_3a_impulse\"))[#text(\"(S.1)\")]"), "{typst}");
     assert!(typst.contains("#link(label(\"smd-eq-eq_3a_energy\"))[#text(\"(2.1)\")]") && !typst.contains("(0.0)"), "{typst}");
     let pdf = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
     let raw_pdf = String::from_utf8_lossy(&pdf);
     assert!(raw_pdf.contains("/Subtype /Link") || raw_pdf.contains("/Subtype/Link"));
-    let path = std::env::temp_dir().join(format!("supermd-eq-merge-{}.pdf", std::process::id()));
-    std::fs::write(&path, &pdf).unwrap();
-    if let Ok(out) = std::process::Command::new("pdftotext").arg("-layout").arg(&path).arg("-").output() {
-        if out.status.success() {
-            let flat = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(flat.contains("Forward (2.1) and Mass-energy.") && flat.contains("Alias 2.1") && !flat.contains("0.0"), "{flat}");
-        }
+    if cfg!(target_os = "linux") && std::env::var_os("SUPERMD_TEST_NON_POPPLER").is_none() {
+        let path = std::env::temp_dir().join(format!("supermd-eq-merge-{}.pdf", std::process::id()));
+        std::fs::write(&path, &pdf).unwrap();
+        let out = std::process::Command::new("pdftotext").arg("-layout").arg(&path).arg("-").output().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(out.status.success());
+        let flat = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("Forward (2.1) and Mass-energy.") && flat.contains("Alias 2.1") && flat.contains("Step (S.1):") && !flat.contains("0.0"), "{flat}");
     }
-    let _ = std::fs::remove_file(path);
 }
 
