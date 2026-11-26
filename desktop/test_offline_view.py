@@ -1,6 +1,7 @@
 """Process containment, artifact preservation, and multi-window isolation tests for Desktop offline preview helpers."""
 from __future__ import annotations
 
+import ast
 import base64
 import ctypes
 import hashlib
@@ -24,8 +25,10 @@ from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
 from agent_documents import DocumentStore
+from core import process_tree
 from folder_ops import same_path
 import offline_view
+import python_runtime
 from studio import Session, Studio
 
 
@@ -266,6 +269,34 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
     def test_offline_view_keeps_separate_ownership_from_python_runtime_and_package_setup(self):
         self.assertFalse(hasattr(offline_view, "PythonJobRegistry"))
         self.assertTrue(hasattr(offline_view, "PreviewJobRegistry"))
+        self.assertFalse(hasattr(python_runtime, "PreviewJobRegistry"))
+        self.assertIsNot(offline_view.PreviewJobRegistry, python_runtime.PythonJobRegistry)
+        self.assertIsNot(offline_view.PreviewCancelled, python_runtime.PythonCellCancelled)
+
+        # Both modules share the core.process_tree platform containment primitive without copying
+        # Windows API loaders, NtResumeProcess wrappers, or Job Object lifecycle classes.
+        self.assertTrue(issubclass(offline_view._PreviewProcessController, process_tree.OwnedProcessTree))
+        self.assertTrue(issubclass(python_runtime._CellProcessController, process_tree.OwnedProcessTree))
+        self.assertIs(python_runtime._WindowsJob, process_tree.WindowsJob)
+        self.assertIs(offline_view._preview_spawn_kwargs, process_tree.contained_spawn_kwargs)
+        self.assertIs(python_runtime._cell_spawn_kwargs, process_tree.contained_spawn_kwargs)
+
+        forbidden_defs = {
+            "_load_kernel32",
+            "_load_ntdll",
+            "_resume_windows_process",
+            "_WindowsJob",
+            "_JobObjectBasicLimitInformation",
+            "_JobObjectExtendedLimitInformation",
+        }
+        for mod in (offline_view, python_runtime):
+            tree = ast.parse(Path(mod.__file__).read_text(encoding="utf-8"), filename=mod.__file__)
+            defined = {
+                node.name
+                for node in tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            }
+            self.assertEqual(defined & forbidden_defs, set(), f"{mod.__name__} duplicated {defined & forbidden_defs}")
 
     def test_preserves_artifacts_revision_checks_and_useful_stdout_or_stderr_errors(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
@@ -716,7 +747,63 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                 )
             self.assertEqual(fail_events, ["assign_failed"])
             unassigned_proc.kill.assert_called_once()
-            self.assertNotIn("taskkill", Path(offline_view.__file__).read_text(encoding="utf-8").lower())
+
+            # NtResumeProcess failure terminates the Job Object and reaps via owned handle.
+            resume_fail_events: list[str] = []
+
+            class ResumeFailKernel32(FakeKernel32):
+                def TerminateJobObject(self, _job, _code):
+                    resume_fail_events.append("terminate_job")
+                    return 1
+
+                def CloseHandle(self, _h):
+                    resume_fail_events.append("close_handle")
+                    return 1
+
+            class FailResumeNtdll:
+                def NtResumeProcess(self, _proc):
+                    resume_fail_events.append("resume_failed")
+                    return -1
+
+            unresumed_proc = mock.MagicMock()
+            unresumed_proc._handle = 888
+            unresumed_proc.poll.return_value = None
+
+            with self.assertRaisesRegex(RuntimeError, "Could not start contained offline preview process"):
+                offline_view._spawn_preview_process(
+                    ["fake-preview"],
+                    stdout_path=out_file,
+                    stderr_path=err_file,
+                    os_name="nt",
+                    popen_fn=lambda *_a, **_kw: unresumed_proc,
+                    kernel32=ResumeFailKernel32(),
+                    ntdll=FailResumeNtdll(),
+                )
+            self.assertEqual(resume_fail_events, ["resume_failed", "terminate_job", "close_handle"])
+            unresumed_proc.kill.assert_called_once()
+
+            # Pre-resume cancellation aborts before NtResumeProcess and raises PreviewCancelled (not PythonCellCancelled).
+            cancelled_job = offline_view.PreviewJob("tab-1")
+            cancelled_job.cancel()
+            cancelled_proc = mock.MagicMock()
+            cancelled_proc._handle = 999
+            cancelled_proc.poll.return_value = None
+
+            with self.assertRaises(offline_view.PreviewCancelled):
+                offline_view._spawn_preview_process(
+                    ["fake-preview"],
+                    stdout_path=out_file,
+                    stderr_path=err_file,
+                    job=cancelled_job,
+                    os_name="nt",
+                    popen_fn=lambda *_a, **_kw: cancelled_proc,
+                    kernel32=FakeKernel32(),
+                    ntdll=NeverResumeNtdll(),
+                )
+            cancelled_proc.kill.assert_called_once()
+
+            for mod in (offline_view, process_tree):
+                self.assertNotIn("taskkill", Path(mod.__file__).read_text(encoding="utf-8").lower())
 
 
 if __name__ == "__main__":
