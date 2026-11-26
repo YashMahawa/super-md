@@ -374,10 +374,12 @@ function splitLinesWithOffsets(doc: string): DocLine[] {
   while (start <= doc.length) {
     const nl = doc.indexOf("\n", start);
     if (nl === -1) {
-      lines.push({ index, from: start, to: doc.length, text: doc.slice(start) });
+      const end = doc.length > start && doc[doc.length - 1] === "\r" ? doc.length - 1 : doc.length;
+      lines.push({ index, from: start, to: end, text: doc.slice(start, end) });
       break;
     }
-    lines.push({ index, from: start, to: nl, text: doc.slice(start, nl) });
+    const end = nl > start && doc[nl - 1] === "\r" ? nl - 1 : nl;
+    lines.push({ index, from: start, to: end, text: doc.slice(start, end) });
     start = nl + 1;
     index++;
   }
@@ -395,11 +397,58 @@ function lineIndexAt(lines: DocLine[], offset: number): number {
   return low;
 }
 
+interface LeadingQuotePrefix {
+  depth: number;
+  raw: string;
+}
+
+function scanLeadingQuotePrefix(line: string): LeadingQuotePrefix {
+  let pos = 0;
+  let col = 0;
+  let baseCol = 0;
+  let depth = 0;
+  while (pos < line.length) {
+    let nextPos = pos;
+    let nextCol = col;
+    while (nextPos < line.length && (line[nextPos] === " " || line[nextPos] === "\t")) {
+      const step = line[nextPos] === "\t" ? 4 - (nextCol % 4) : 1;
+      if (nextCol + step - baseCol > 3) break;
+      nextCol += step;
+      nextPos++;
+    }
+    if (line[nextPos] !== ">") break;
+    pos = nextPos + 1;
+    col = nextCol + 1;
+    depth++;
+    if (line[pos] === " ") {
+      pos++;
+      col++;
+      baseCol = col;
+    } else if (line[pos] === "\t") {
+      baseCol = col + 1;
+    } else {
+      baseCol = col;
+    }
+  }
+  return { depth, raw: depth > 0 ? line.slice(0, pos) : "" };
+}
+
+const THEMATIC_BREAK_AFTER_QUOTE = /^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/;
+
+function isBlankForBlockAction(line: string, action: "heading" | "list" | "quote"): boolean {
+  if (action === "quote") return line.trim().length === 0;
+  const quote = scanLeadingQuotePrefix(line);
+  return line.slice(quote.raw.length).trim().length === 0;
+}
+
 function hasBlockPrefix(line: string, action: "heading" | "list" | "quote"): boolean {
-  if (action === "heading") return /^(\s{0,3})#{1,6}(?:[ \t]+|$)/.test(line);
   if (action === "quote") return /^(\s*)>[ \t]?/.test(line);
+  const quote = scanLeadingQuotePrefix(line);
+  const afterQuote = line.slice(quote.raw.length);
+  if (action === "heading") return /^([ \t]{0,3})#{1,6}(?:[ \t]+|$)/.test(afterQuote);
+  if (THEMATIC_BREAK_AFTER_QUOTE.test(afterQuote)) return false;
   // list: `- item`, `* item`, `+ item`, or an empty list marker `- ` / `-` (not `---` or `**bold**`)
-  return /^(\s*)[-*+][ \t]+/.test(line) || /^(\s*)[-*+]$/.test(line);
+  return /^([ \t]*)[-*+][ \t]+/.test(afterQuote) || /^([ \t]*)[-*+]$/.test(afterQuote);
 }
 
 function toggleBlockPrefixOnLine(
@@ -407,18 +456,6 @@ function toggleBlockPrefixOnLine(
   action: "heading" | "list" | "quote",
   remove: boolean,
 ): TextChangeSpec | null {
-  if (action === "heading") {
-    const match = line.text.match(/^(\s{0,3})(#{1,6}(?:[ \t]+|$))/);
-    if (remove) {
-      if (!match) return null;
-      const prefixStart = line.from + match[1].length;
-      return { from: prefixStart, to: prefixStart + match[2].length, insert: "" };
-    }
-    const indent = line.text.match(/^(\s{0,3})/)?.[1] ?? "";
-    if (match) return null;
-    return { from: line.from + indent.length, to: line.from + indent.length, insert: "## " };
-  }
-
   if (action === "quote") {
     const match = line.text.match(/^(\s*)(>[ \t]?)/);
     if (remove) {
@@ -430,21 +467,48 @@ function toggleBlockPrefixOnLine(
     return { from: line.from + indent.length, to: line.from + indent.length, insert: "> " };
   }
 
+  const quote = scanLeadingQuotePrefix(line.text);
+  const quoteLen = quote.raw.length;
+  const afterQuote = line.text.slice(quoteLen);
+
+  if (action === "heading") {
+    const match = afterQuote.match(/^([ \t]{0,3})(#{1,6}(?:[ \t]+|$))/);
+    if (remove) {
+      if (!match) return null;
+      const prefixStart = line.from + quoteLen + match[1].length;
+      return { from: prefixStart, to: prefixStart + match[2].length, insert: "" };
+    }
+    if (match) return null;
+    const indent = afterQuote.match(/^([ \t]{0,3})/)?.[1] ?? "";
+    const insertPos = line.from + quoteLen + indent.length;
+    const needsQuoteSpace = quote.depth > 0 && !/[ \t]$/.test(quote.raw + indent);
+    return { from: insertPos, to: insertPos, insert: needsQuoteSpace ? " ## " : "## " };
+  }
+
   // action === "list"
-  const bulletMatch = line.text.match(/^(\s*)([-*+][ \t]+|[-*+]$)/);
+  const bulletMatch = THEMATIC_BREAK_AFTER_QUOTE.test(afterQuote)
+    ? null
+    : afterQuote.match(/^([ \t]*)([-*+][ \t]+|[-*+]$)/);
   if (remove) {
     if (!bulletMatch) return null;
-    const prefixStart = line.from + bulletMatch[1].length;
+    const prefixStart = line.from + quoteLen + bulletMatch[1].length;
     return { from: prefixStart, to: prefixStart + bulletMatch[2].length, insert: "" };
   }
   if (bulletMatch) return null;
-  const orderedMatch = line.text.match(/^(\s*)(\d+\.[ \t]+)/);
+  const orderedMatch = afterQuote.match(/^([ \t]*)(\d+[.)][ \t]+)/);
   if (orderedMatch) {
-    const prefixStart = line.from + orderedMatch[1].length;
-    return { from: prefixStart, to: prefixStart + orderedMatch[2].length, insert: "- " };
+    const prefixStart = line.from + quoteLen + orderedMatch[1].length;
+    const needsQuoteSpace = quote.depth > 0 && !/[ \t]$/.test(quote.raw + orderedMatch[1]);
+    return {
+      from: prefixStart,
+      to: prefixStart + orderedMatch[2].length,
+      insert: needsQuoteSpace ? " - " : "- ",
+    };
   }
-  const indent = line.text.match(/^(\s*)/)?.[1] ?? "";
-  return { from: line.from + indent.length, to: line.from + indent.length, insert: "- " };
+  const indent = afterQuote.match(/^([ \t]*)/)?.[1] ?? "";
+  const insertPos = line.from + quoteLen + indent.length;
+  const needsQuoteSpace = quote.depth > 0 && !/[ \t]$/.test(quote.raw + indent);
+  return { from: insertPos, to: insertPos, insert: needsQuoteSpace ? " - " : "- " };
 }
 
 function mapOffsetThroughChanges(pos: number, changes: TextChangeSpec[]): number {
@@ -481,13 +545,13 @@ function toggleBlockFormat(
   }
 
   const orderedLines = [...touchedIndices].sort((a, b) => a - b).map((idx) => lines[idx]);
-  const nonEmptyLines = orderedLines.filter((line) => line.text.trim().length > 0);
+  const nonEmptyLines = orderedLines.filter((line) => !isBlankForBlockAction(line.text, action));
   const checkPool = nonEmptyLines.length > 0 ? nonEmptyLines : orderedLines;
   const shouldRemove = checkPool.length > 0 && checkPool.every((line) => hasBlockPrefix(line.text, action));
 
   const changes: TextChangeSpec[] = [];
   for (const line of orderedLines) {
-    if (!shouldRemove && orderedLines.length > 1 && line.text.trim().length === 0) continue;
+    if (!shouldRemove && orderedLines.length > 1 && isBlankForBlockAction(line.text, action)) continue;
     const change = toggleBlockPrefixOnLine(line, action, shouldRemove);
     if (change && (change.from !== change.to || change.insert.length > 0)) {
       changes.push(change);
