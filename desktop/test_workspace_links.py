@@ -133,7 +133,7 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                     except OSError:
                         pass
                     try:
-                        with os.scandir(cur) as it:
+                        with real_scandir(cur) as it:
                             found = next((e.name for e in it if e.name.casefold() == seg.casefold()), None)
                     except OSError:
                         found = None
@@ -151,11 +151,19 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                         return real_stat(mapped, follow_symlinks=follow_symlinks)
                     raise
 
-            def fake_is_file(self_path: Path) -> bool:
-                return real_is_file(self_path) or real_is_file(_ci_real_target(self_path))
+            def fake_is_file(self_path: Path, *args, **kwargs) -> bool:
+                return real_is_file(self_path, *args, **kwargs) or real_is_file(
+                    _ci_real_target(self_path),
+                    *args,
+                    **kwargs,
+                )
 
-            def fake_is_dir(self_path: Path) -> bool:
-                return real_is_dir(self_path) or real_is_dir(_ci_real_target(self_path))
+            def fake_is_dir(self_path: Path, *args, **kwargs) -> bool:
+                return real_is_dir(self_path, *args, **kwargs) or real_is_dir(
+                    _ci_real_target(self_path),
+                    *args,
+                    **kwargs,
+                )
 
             def fake_canonicalize(path: Path) -> Path:
                 mapped = _ci_real_target(path)
@@ -220,7 +228,7 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             # Nested directory case-only rename invalidates/refreshes within TTL even without explicit invalidate()
             live_cache = WorkspaceLinkCache(ttl_seconds=60.0)
             self.assertEqual(
-                resolve_workspace_link("Topic", wikilink=True, note_path=root / "Archive" / "Topic.md", workspace_folder=root, cache=live_cache),
+                resolve_workspace_link("Topic", wikilink=True, note_path=lower_topic, workspace_folder=root, cache=live_cache),
                 exact_topic.resolve(),
             )
             # Rename Archive/Topic.md -> Archive/topic.md and Specs/Deep/topic.md -> Specs/Deep/Topic.md
@@ -238,6 +246,124 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                 upper_deep.resolve(),
             )
             self.assertFalse(any(p.name.startswith(".") for p in root.rglob("*")))
+
+    def test_windows_direntry_zero_inode_stat_preserves_case_folded_resolution(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir) / "Vault"
+            deep = root / "Specs" / "Deep"
+            deep.mkdir(parents=True)
+            root = root.resolve()
+            deep = deep.resolve()
+            lower_topic = deep / "topic.md"
+            lower_topic.write_text("# Topic\n", encoding="utf-8")
+            sibling = deep / "Index.md"
+            sibling.write_text("# Index\n", encoding="utf-8")
+
+            real_stat = Path.stat
+            real_is_file = Path.is_file
+            real_scandir = os.scandir
+
+            class _WinDirEntryProxy:
+                def __init__(self, inner):
+                    self._inner = inner
+                    self.name = inner.name
+                    self.path = inner.path
+
+                def is_symlink(self) -> bool:
+                    return self._inner.is_symlink()
+
+                def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+                    return self._inner.is_dir(follow_symlinks=follow_symlinks)
+
+                def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                    return self._inner.is_file(follow_symlinks=follow_symlinks)
+
+                def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+                    raw = list(self._inner.stat(follow_symlinks=follow_symlinks))
+                    raw[1] = 0  # st_ino == 0 on Windows nt.DirEntry.stat()
+                    raw[2] = 0  # st_dev == 0 on Windows nt.DirEntry.stat()
+                    return os.stat_result(raw)
+
+            class _ScandirContext:
+                def __init__(self, target_dir):
+                    self._ctx = real_scandir(target_dir)
+
+                def __enter__(self):
+                    return (_WinDirEntryProxy(e) for e in self._ctx.__enter__())
+
+                def __exit__(self, exc_type, exc, tb):
+                    return self._ctx.__exit__(exc_type, exc, tb)
+
+            def fake_stat(self_path: Path, *, follow_symlinks: bool = True):
+                try:
+                    return real_stat(self_path, follow_symlinks=follow_symlinks)
+                except OSError:
+                    if self_path.name == "Topic.md" and self_path.parent == deep:
+                        return real_stat(lower_topic, follow_symlinks=follow_symlinks)
+                    raise
+
+            def fake_is_file(self_path: Path, *args, **kwargs) -> bool:
+                if self_path.name == "Topic.md" and self_path.parent == deep:
+                    return True
+                return real_is_file(self_path, *args, **kwargs)
+
+            with (
+                mock.patch.object(Path, "stat", fake_stat),
+                mock.patch.object(Path, "is_file", fake_is_file),
+                mock.patch.object(os, "scandir", side_effect=_ScandirContext),
+            ):
+                resolved = resolve_workspace_link(
+                    "Topic.md",
+                    wikilink=False,
+                    note_path=sibling,
+                    workspace_folder=root,
+                    cache=WorkspaceLinkCache(),
+                )
+                self.assertEqual(resolved, lower_topic)
+
+    @unittest.skipIf(workspace_links._fcntl is None, "POSIX fcntl.fcntl FCNTL_BUFSZ test")
+    def test_darwin_f_getpath_respects_cpython_fcntl_bufsz_limit(self):
+        with tempfile.TemporaryDirectory() as base_dir:
+            base = Path(base_dir).resolve()
+            real_vault = base / "private" / "Vault"
+            real_vault.mkdir(parents=True)
+            note = real_vault / "Inside.md"
+            note.write_text("# Inside\n", encoding="utf-8")
+            alias_parent = base / "var_alias"
+            alias_parent.symlink_to(base / "private", target_is_directory=True)
+
+            real_fcntl = workspace_links._fcntl.fcntl
+
+            def darwin_fcntl(fd: int, cmd: int, arg=0):
+                # Delegate to real CPython fcntl.fcntl first so any buffer > FCNTL_BUFSZ (1024)
+                # raises ValueError("fcntl string arg too long") on Linux and macOS alike.
+                try:
+                    return real_fcntl(fd, cmd, arg)
+                except OSError:
+                    if cmd == workspace_links._MACOS_F_GETPATH and isinstance(arg, (bytes, bytearray)):
+                        target = os.fsencode(os.path.realpath(f"/proc/self/fd/{fd}"))
+                        padded = target + b"\x00" * max(1, len(arg) - len(target))
+                        return padded[: len(arg)]
+                    raise
+
+            with (
+                mock.patch.object(sys, "platform", "darwin"),
+                mock.patch.object(workspace_links._fcntl, "fcntl", side_effect=darwin_fcntl),
+            ):
+                canonical = workspace_links._canonicalize_existing_path(alias_parent / "Vault" / "Inside.md")
+                self.assertEqual(canonical, note)
+                cache = WorkspaceLinkCache()
+                cache.invalidate(alias_parent / "Vault")
+                self.assertEqual(
+                    resolve_workspace_link(
+                        "Inside.md",
+                        wikilink=False,
+                        note_path=alias_parent / "Vault" / "Inside.md",
+                        workspace_folder=alias_parent / "Vault",
+                        cache=cache,
+                    ),
+                    note,
+                )
 
 
 class StudioOpenTabJumpTest(unittest.TestCase):
@@ -347,6 +473,73 @@ class StudioOpenTabJumpTest(unittest.TestCase):
         case_renamed = nested / "renamed spec.md"
         self._wait_until(lambda: second_tab["path"] == str(case_renamed))
         self.assertEqual(second_tab["name"], "renamed spec.md")
+
+    @unittest.skipIf(workspace_links._fcntl is None, "POSIX fcntl.fcntl FCNTL_BUFSZ test")
+    def test_darwin_studio_rejects_traversal_and_symlinks_and_runs_folder_hooks_without_fcntl_error(self):
+        sandbox = (self.studio.data / "darwin_containment").resolve()
+        folder = sandbox / "guarded"
+        folder.mkdir(parents=True, exist_ok=True)
+        outside = sandbox / "outside.md"
+        outside.write_text("# Secret\n", encoding="utf-8")
+        inside = folder / "Inside.md"
+        inside.write_text("# Inside\n", encoding="utf-8")
+        peer = folder / "Peer.md"
+        peer.write_text("# Peer\n", encoding="utf-8")
+        symlink_note = folder / "Symlink.md"
+        symlink_note.symlink_to(outside)
+
+        real_fcntl = workspace_links._fcntl.fcntl
+
+        def darwin_fcntl(fd: int, cmd: int, arg=0):
+            try:
+                return real_fcntl(fd, cmd, arg)
+            except OSError:
+                if cmd == workspace_links._MACOS_F_GETPATH and isinstance(arg, (bytes, bytearray)):
+                    target = os.fsencode(os.path.realpath(f"/proc/self/fd/{fd}"))
+                    padded = target + b"\x00" * max(1, len(arg) - len(target))
+                    return padded[: len(arg)]
+                raise
+
+        studio = self.studio
+        studio.ready = True
+        replies = []
+        studio.replied.connect(lambda req_id, res, err: replies.append((req_id, res, err)))
+
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.object(workspace_links._fcntl, "fcntl", side_effect=darwin_fcntl),
+        ):
+            studio.openFolder(str(folder))
+            studio.openNote(str(inside))
+            self._wait_until(lambda: studio._current()["path"] == str(inside))
+
+            for idx, bad_target in enumerate(["../outside.md", "../missing-outside.md", "Symlink.md"]):
+                replies.clear()
+                req = f"darwin-bad-{idx}"
+                studio.post(req, "open_workspace_link", json.dumps({
+                    "documentPath": str(inside),
+                    "target": bad_target,
+                    "wikilink": False,
+                }))
+                self._wait_until(lambda: any(r[0] == req for r in replies))
+                rejected = json.loads(replies[-1][1])
+                self.assertFalse(rejected["opened"])
+                self.assertNotIn("fcntl", rejected["message"])
+                if bad_target.startswith("../"):
+                    self.assertIn("outside the authorized folder", rejected["message"])
+                else:
+                    self.assertIn("symlink", rejected["message"])
+
+            replies.clear()
+            studio.post("darwin-ok", "open_workspace_link", json.dumps({
+                "documentPath": str(inside),
+                "target": "Peer",
+                "wikilink": True,
+            }))
+            self._wait_until(lambda: any(r[0] == "darwin-ok" for r in replies))
+            self.assertTrue(json.loads(replies[-1][1])["opened"])
+            self.assertEqual(studio._current()["path"], str(peer))
+            studio.closeFolder()
 
 
 if __name__ == "__main__":

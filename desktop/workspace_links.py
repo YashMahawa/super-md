@@ -20,6 +20,7 @@ _EXTENSION_PRIORITY = {ext: idx for idx, ext in enumerate(NOTE_EXTENSIONS)}
 _ENCODED_SEP = re.compile(r"%2f|%5c", re.IGNORECASE)
 _ENCODED_NUL = re.compile(r"%00", re.IGNORECASE)
 _MACOS_F_GETPATH = 50
+_MACOS_MAXPATHLEN = 1024
 
 MAX_SCAN_FILES = 8_000
 MAX_SCAN_DIRS = 2_500
@@ -60,12 +61,12 @@ def _canonicalize_existing_path(path: Path) -> Path:
         try:
             open_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             fd = os.open(os.fspath(resolved), open_flags)
-            raw = _fcntl.fcntl(fd, _MACOS_F_GETPATH, b"\x00" * 4096)
+            raw = _fcntl.fcntl(fd, _MACOS_F_GETPATH, b"\x00" * _MACOS_MAXPATHLEN)
             nul = raw.find(b"\x00")
             trimmed = raw[:nul] if nul >= 0 else raw
             if trimmed:
                 return Path(os.fsdecode(trimmed))
-        except OSError:
+        except (OSError, ValueError):
             pass
         finally:
             if fd >= 0:
@@ -171,7 +172,10 @@ def _match_child_entry(
                     raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
                 if not exact_case and folded_match is None:
                     try:
-                        entry_stat = entry.stat(follow_symlinks=False)
+                        # Query Path.stat rather than DirEntry.stat: on Windows, nt.DirEntry.stat()
+                        # populates WIN32_FIND_DATAW with st_ino=0/st_dev=0 whereas Path.stat()
+                        # queries GetFileInformationByHandle with real volume/file-index identity.
+                        entry_stat = Path(entry.path).stat(follow_symlinks=False)
                     except OSError:
                         continue
                     if os.path.samestat(entry_stat, probed_stat) or _stat_identity(probed_stat) is None:
@@ -273,7 +277,7 @@ class WorkspaceLinkCache:
             canonical = _canonicalize_existing_path(Path(os.path.abspath(Path(folder).expanduser())))
             resolved_fold = _fold_cache_path(canonical)
             target_id = _path_identity(canonical, follow_symlinks=False)
-        except OSError:
+        except (OSError, ValueError):
             target_id = _path_identity(Path(os.path.abspath(Path(folder).expanduser())), follow_symlinks=True)
 
         with self._lock:
@@ -309,7 +313,11 @@ class WorkspaceLinkCache:
             cached = self._entries.get(root_fold)
             if cached is None and root_id is not None:
                 cached = next((item for item in self._entries.values() if item.root_id == root_id), None)
-            if cached is not None and cached.root == boundary_path and self._is_fresh(cached, now):
+            if (
+                cached is not None
+                and os.fspath(cached.root) == os.fspath(boundary_path)
+                and self._is_fresh(cached, now)
+            ):
                 return cached.entries
 
         collected: list[IndexedNote] = []
@@ -534,11 +542,9 @@ def _probe_candidate(base_dir: Path, rel_path: str, boundary: Path, *, exact_cas
         try:
             if walked.is_file() and walked.suffix.lower() in NOTE_EXTENSIONS:
                 resolved = _canonicalize_existing_path(walked)
-                if not _is_within_or_equal(resolved, boundary) and not _same_disk_object(resolved, walked):
+                if not _is_within_or_equal(resolved, boundary) or not _is_within_or_equal(walked, boundary):
                     raise WorkspaceLinkError("Linked note is outside the authorized folder.")
-                if not _is_within_or_equal(walked, boundary):
-                    raise WorkspaceLinkError("Linked note is outside the authorized folder.")
-                return walked if _same_disk_object(resolved, walked) else resolved
+                return resolved
         except WorkspaceLinkError:
             raise
         except OSError:
@@ -580,6 +586,8 @@ def _rank_and_select_indexed_match(
                 folded = entry.stem_fold == cleaned_fold
         if not exact and not folded:
             continue
+        if not _verify_exact_on_disk_path(boundary, entry.path):
+            return None, True
         entry_dir_fold = entry.rel_posix.rsplit("/", 1)[0].casefold() if "/" in entry.rel_posix else ""
         same_dir_rank = 0 if (note_rel_dir_fold is not None and entry_dir_fold == note_rel_dir_fold) else 1
         case_rank = 0 if exact else 1
@@ -590,18 +598,15 @@ def _rank_and_select_indexed_match(
     saw_stale = False
     for _rank, winner in matches:
         candidate = winner.path
-        if not _verify_exact_on_disk_path(boundary, candidate):
-            saw_stale = True
-            continue
         try:
             resolved = _canonicalize_existing_path(candidate)
         except OSError:
             saw_stale = True
             continue
-        if not _is_within_or_equal(resolved, boundary) and not _same_disk_object(resolved, candidate):
+        if not _is_within_or_equal(resolved, boundary) or not _is_within_or_equal(candidate, boundary):
             continue
         if candidate.is_file():
-            return (candidate if _same_disk_object(resolved, candidate) else resolved), saw_stale
+            return resolved, saw_stale
 
     return None, saw_stale
 
