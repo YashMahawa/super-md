@@ -321,7 +321,11 @@ AppDialog {
         Qt.callLater(function() {
             if (dialog.visible || !hostWindow) return
             const currentFocus = hostWindow.activeFocusItem
-            if (!currentFocus || dialog.isInsideDialog(currentFocus)) {
+            const lostFocusToRootOrPopup = !currentFocus
+                || currentFocus === hostWindow.contentItem
+                || currentFocus === dialog.parent
+                || dialog.isInsideDialog(currentFocus)
+            if (lostFocusToRootOrPopup) {
                 dialog.restoreTargetFocus(wasActivated, savedTarget)
             }
         })

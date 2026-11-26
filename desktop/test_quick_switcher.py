@@ -14,8 +14,10 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 
-from PySide6.QtCore import QObject, Qt, QUrl
+from PySide6.QtCore import QEvent, QObject, Qt, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
@@ -68,9 +70,8 @@ def _wait_until(predicate, timeout: float = 8.0, interval: float = 0.02) -> bool
 def _run_webengine_quick_switcher_probe() -> None:
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     os.environ["QT_QUICK_BACKEND"] = "software"
-    existing_flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-    extra_flags = "--no-sandbox --disable-gpu --disable-software-rasterizer"
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{existing_flags} {extra_flags}".strip()
+    os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 
     from PySide6.QtCore import QFile, QIODevice, QMetaObject, QPoint
     from PySide6.QtGui import QKeySequence
@@ -214,7 +215,8 @@ def _run_webengine_quick_switcher_probe() -> None:
         ), "Focus did not recover to documentReader after Escape"
 
         trigger_quick_switcher()
-        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(12, 12))
+        scrim_point = QPoint(int(window.property("width")) - 16, int(window.property("height")) // 2)
+        QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, scrim_point)
         assert _wait_until(
             lambda: not bool(qs_dialog.property("visible"))
             and int(window.property("modalDialogCount") or 0) == 0
@@ -418,6 +420,7 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
         documents.write_portable(ws / "beta.smd", "# Beta\n", {})
 
         self.studio.openFolder(str(ws))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) > 0))
         with mock.patch.object(quick_switcher, "walk_folder_notes", wraps=walk_folder_notes) as spy:
             self.studio.openQuickSwitcher()
             self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
@@ -440,7 +443,12 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
             # Creating a new note via Studio invalidates the folder index so the new note appears.
             self.studio.closeQuickSwitcher()
             self.studio.createFolderNote(str(ws), "gamma", "smd")
-            self.assertTrue(_wait_until(lambda: (ws / "gamma.smd").is_file()))
+            self.assertTrue(
+                _wait_until(
+                    lambda: (ws / "gamma.smd").is_file()
+                    and any(t.get("name") == "gamma.smd" for t in self.studio.tabs)
+                )
+            )
 
             self.studio.openQuickSwitcher()
             self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
@@ -453,7 +461,7 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
             calls_before_ext = spy.call_count
             ext_file = ws / "empty_sub" / "external-added.md"
             ext_file.write_text("# Added externally\n", encoding="utf-8")
-            future_ns = (ws / "empty_sub").stat().st_mtime_ns + 5_000_000
+            future_ns = (ws / "empty_sub").stat().st_mtime_ns + 1_000_000_000
             os.utime(ws / "empty_sub", ns=(future_ns, future_ns))
 
             self.studio.openQuickSwitcher()
@@ -586,15 +594,32 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
             window.setProperty("closingAllowed", True)
             window.setProperty("intentionalShutdown", True)
             window.close()
-            del engine
+            window.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def test_end_to_end_webengine_keyboard_selection_and_focus_recovery(self):
-        dist_dir = Path(__file__).resolve().parent.parent / "dist"
-        self.assertTrue(dist_dir.is_dir() and any(dist_dir.iterdir()), f"Missing built native reader bundle at {dist_dir}")
+        if "--webengine-quick-switcher-probe" in sys.argv:
+            raise unittest.SkipTest("probe subprocess only")
+        root = Path(__file__).resolve().parent
+        dist_dir = root.parent / "dist"
+        self.assertTrue((dist_dir / "qt-reader.html").is_file(), f"Missing built native reader bundle at {dist_dir}")
+        env = dict(
+            os.environ,
+            QT_QPA_PLATFORM="offscreen",
+            QT_QUICK_BACKEND="software",
+            QTWEBENGINE_DISABLE_SANDBOX="1",
+            QTWEBENGINE_CHROMIUM_FLAGS="--disable-gpu --disable-dev-shm-usage",
+        )
         proc = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "--webengine-quick-switcher-probe"],
+            cwd=str(root),
+            env=env,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="strict",
             timeout=90,
         )
         self.assertEqual(

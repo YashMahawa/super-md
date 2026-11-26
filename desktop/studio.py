@@ -28,6 +28,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from network_tls import client_context
+import shiboken6
 from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
@@ -1278,6 +1279,8 @@ class Studio(QObject):
             if not window.retired: window.shortcutsChanged.emit()
 
     def _watch_notes(self,force=False):
+        if self.retired or not shiboken6.isValid(self.note_watcher):
+            return
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
         signature=(paths,self.folder,tuple(sorted(self.expanded)))
         if not force and signature==self.note_watch_paths:return
@@ -1293,7 +1296,7 @@ class Studio(QObject):
     def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool):
         parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
         for win in list(self.session.windows.values()):
-            if win.retired:
+            if win.retired or not shiboken6.isValid(win.note_watcher):
                 continue
             watched = list(win.note_watcher.files() + win.note_watcher.directories())
             to_remove = [
@@ -1400,6 +1403,8 @@ class Studio(QObject):
         self.theme_debounce.start(150)
 
     def _watch_palette(self):
+        if self.retired or not shiboken6.isValid(self.palette_watcher):
+            return
         watched = set(self.palette_watcher.files()+self.palette_watcher.directories())
         for path in system_palette_paths():
             for target in (path,path.parent):
@@ -1460,9 +1465,12 @@ class Studio(QObject):
         self.external_timer.stop()
         self.filter_timer.stop()
         for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
+            if not shiboken6.isValid(watcher):
+                continue
             watched = watcher.files() + watcher.directories()
             if watched:
                 watcher.removePaths(watched)
+            shiboken6.delete(watcher)
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
@@ -1481,7 +1489,9 @@ class Studio(QObject):
             next(iter(self.session.windows.values()))._recover()
         if self.system_preferences.state() != QProcess.ProcessState.NotRunning:
             self.system_preferences.terminate()
-            self.system_preferences.waitForFinished(300)
+            if not self.system_preferences.waitForFinished(300):
+                self.system_preferences.kill()
+                self.system_preferences.waitForFinished(100)
 
     @Property(str, notify=changed)
     def snapshot(self):
@@ -2697,6 +2707,8 @@ class Studio(QObject):
 
     def _watch_custom_theme(self):
         watcher=self.custom_theme_watcher
+        if self.retired or not shiboken6.isValid(watcher):
+            return
         paths=watcher.files()+watcher.directories()
         if paths:watcher.removePaths(paths)
         source=Path(self.session.theme_source) if self.session.active_theme_kind!="preset" and self.session.theme_source else None
@@ -4229,7 +4241,9 @@ class Studio(QObject):
                 write_portable(target, "", {})
             else:
                 atomic_write(target, b"")
-            return folder_ops.canonical_path_str(target.resolve(strict=True))
+            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+            self._invalidate_folder_index(created_str)
+            return created_str
 
         def finished(created_path, error):
             if error or not created_path:
@@ -4288,7 +4302,9 @@ class Studio(QObject):
             if target.exists() or folder_ops._is_link_or_junction(target):
                 raise ValueError("An item with that name already exists.")
             target.mkdir(parents=False, exist_ok=False)
-            return folder_ops.canonical_path_str(target.resolve(strict=True))
+            created_str = folder_ops.canonical_path_str(target.resolve(strict=True))
+            self._invalidate_folder_index(created_str)
+            return created_str
 
         def finished(created_dir, error):
             if error or not created_dir:
