@@ -150,13 +150,6 @@ ColumnLayout {
             }
         }
         ActionButton {
-            objectName: "headerNewSubfolderButton"
-            glyph: "FolderOpen"; compact: true
-            Accessible.name: "New subfolder"
-            ToolTip.text: "New subfolder (" + (root.shortcutLabels.new_subfolder || "Ctrl+Alt+Shift+N") + ")"
-            onClicked: root.openCreateDialog("folder", viewState.folder)
-        }
-        ActionButton {
             objectName: "closeFolderButton"
             glyph: "X"; compact: true
             Accessible.name: "Close folder"

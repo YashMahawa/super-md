@@ -453,7 +453,6 @@ class FolderSearchTest {
                             menuExpanded = menuOpen,
                             onMenuExpandedChange = { menuOpen = it },
                             onNavigateIcon = {},
-                            onFolderSearch = { folderSearchClicks++ },
                             onFind = {},
                             onSave = {},
                             onExport = {},
@@ -503,8 +502,9 @@ class FolderSearchTest {
         composeRule.onNode(hasText("Search across notes") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
         assertEquals(1, folderSearchClicks)
 
+        // Search across notes is not duplicated inside StudioTopBar or More actions overflow menu
         composeRule.onNodeWithContentDescription("More actions").performClick()
-        composeRule.onNode(hasText("Search across notes") and hasAnyAncestor(isPopup())).assertIsDisplayed().performClick()
-        assertEquals(2, folderSearchClicks)
+        composeRule.onNodeWithText("Settings").assertIsDisplayed()
+        assertEquals(0, composeRule.onAllNodes(hasText("Search across notes") and hasAnyAncestor(isPopup())).fetchSemanticsNodes().size)
     }
 }

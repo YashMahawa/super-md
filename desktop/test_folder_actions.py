@@ -323,6 +323,8 @@ ApplicationWindow {
         self.assertIsNotNone(sidebar)
         sidebar_search_btn = host_win.findChild(QObject, "sidebarFolderSearchButton")
         self.assertIsNotNone(sidebar_search_btn)
+        self.assertIsNone(host_win.findChild(QObject, "headerNewSubfolderButton"))
+        self.assertIsNotNone(host_win.findChild(QObject, "headerNewSubfolderItem"))
         self.assertTrue(QMetaObject.invokeMethod(sidebar_search_btn, "click"))
         self.assertTrue(self.studio.folderSearchState["open"])
         self.studio.closeFolderSearch()

@@ -1366,7 +1366,6 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                                     state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), state.folderRelative) }
                                 }
                             },
-                            onFolderSearch = { model.openFolderSearch() },
                             onFind = { activity.openReaderFind?.invoke(false) },
                             onSave = saveAction,
                             onExport = { sharing = false; exporting = true },
@@ -1921,7 +1920,6 @@ internal fun buildHighlightedSnippet(
     onFixLatex: () -> Unit,
     onRename: () -> Unit,
     onSettings: () -> Unit,
-    onFolderSearch: () -> Unit = {},
 ) {
     val palette = MaterialTheme.colorScheme
     TopAppBar(
@@ -1939,9 +1937,6 @@ internal fun buildHighlightedSnippet(
             }
         },
         actions = {
-            if (wide && !fullscreen) {
-                IconButton(onClick = onFolderSearch, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_search), "Search across notes (Ctrl+Shift+F)") }
-            }
             StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
             IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
@@ -1952,7 +1947,6 @@ internal fun buildHighlightedSnippet(
             Box {
                 IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
-                    DropdownMenuItem(text = { Text("Search across notes") }, onClick = { onMenuExpandedChange(false); onFolderSearch() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                     DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = canReopenClosedTab, onClick = { onMenuExpandedChange(false); onReopenClosedTab() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
                     DropdownMenuItem(text = { Text("Save as") }, enabled = !busy, onClick = { onMenuExpandedChange(false); onSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
                     HorizontalDivider()

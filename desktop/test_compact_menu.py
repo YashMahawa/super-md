@@ -130,4 +130,12 @@ ApplicationWindow {
         self.assertEqual(self.palette.reopened, 2)
         self.assertEqual(self.palette.saved_as, 2)
 
+    def test_cross_note_search_is_not_duplicated_in_toolbar_or_overflow_menu(self):
+        qml = MAIN.read_text(encoding="utf-8")
+        self.assertNotIn('objectName: "folderSearchButton"', qml)
+        self.assertNotIn('"Search notes"', qml)
+        self.assertNotIn('text: "Search across notes"', qml)
+        self.assertIn('ToolTip.text: "Find in note ("', qml)
+        self.assertIn('case "search_folder": studio.openFolderSearch(); break', qml)
+
 if __name__=="__main__":unittest.main()
