@@ -58,40 +58,46 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_links import WorkspaceLinkError, resolve_workspace_link
+from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 
 FOLDER_TREE_NOTE_SUFFIXES = frozenset({".md", ".smd", ".txt"})
+FOLDER_TREE_SCAN_BUDGET = 25000
 
 
 def _is_folder_tree_note_name(filename: str) -> bool:
     return bool(filename) and not filename.startswith(".") and Path(filename).suffix.lower() in FOLDER_TREE_NOTE_SUFFIXES
 
 
-def _directory_has_visible_note(
+def _probe_directory_visible_note(
     dir_path: Path,
     *,
     depth: int,
     max_depth: int = MAX_FOLDER_DEPTH,
     budget: list[int] | None = None,
     memo: dict[str, bool] | None = None,
-) -> bool:
-    if depth > max_depth:
-        return False
+) -> bool | None:
+    """Return True if a visible note exists, False if confirmed absent, or None if scan bounds stopped early."""
     key = folder_ops.normalize_path_key(dir_path)
     if memo is not None and key in memo:
         return memo[key]
+    if depth > max_depth:
+        return None
     if budget is not None and budget[0] <= 0:
-        return False
+        return None
     subdirs: list[Path] = []
     found = False
+    unresolved = False
+    saw_entry = False
     try:
         with os.scandir(dir_path) as it:
             for entry in it:
+                saw_entry = True
                 if budget is not None:
-                    budget[0] -= 1
                     if budget[0] <= 0:
+                        unresolved = True
                         break
+                    budget[0] -= 1
                 name = entry.name
                 if name.startswith("."):
                     continue
@@ -106,26 +112,59 @@ def _directory_has_visible_note(
                         break
                 except OSError:
                     continue
+        if not saw_entry and budget is not None:
+            budget[0] -= 1
     except OSError:
         if memo is not None:
             memo[key] = False
         return False
-    if not found:
-        for subdir in subdirs:
+    if found:
+        if memo is not None:
+            memo[key] = True
+        return True
+    if unresolved:
+        return None
+    for subdir in subdirs:
+        sub_result = _probe_directory_visible_note(
+            subdir,
+            depth=depth + 1,
+            max_depth=max_depth,
+            budget=budget,
+            memo=memo,
+        )
+        if sub_result is True:
+            if memo is not None:
+                memo[key] = True
+            return True
+        if sub_result is None:
+            unresolved = True
             if budget is not None and budget[0] <= 0:
                 break
-            if _directory_has_visible_note(
-                subdir,
-                depth=depth + 1,
-                max_depth=max_depth,
-                budget=budget,
-                memo=memo,
-            ):
-                found = True
-                break
+    if unresolved:
+        return None
     if memo is not None:
-        memo[key] = found
-    return found
+        memo[key] = False
+    return False
+
+
+def _directory_has_visible_note(
+    dir_path: Path,
+    *,
+    depth: int,
+    max_depth: int = MAX_FOLDER_DEPTH,
+    budget: list[int] | None = None,
+    memo: dict[str, bool] | None = None,
+) -> bool:
+    return (
+        _probe_directory_visible_note(
+            dir_path,
+            depth=depth,
+            max_depth=max_depth,
+            budget=budget,
+            memo=memo,
+        )
+        is not False
+    )
 
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
@@ -779,6 +818,7 @@ class Session(QObject):
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
+        self.workspace_links = WorkspaceLinkCache()
 
     def is_quitting(self) -> bool:
         background = getattr(self, "background", None)
@@ -1432,6 +1472,8 @@ class Studio(QObject):
             if self.retired or error:return
             for old,new in result.items():self.session.locationChanged.emit(old,new or "")
             self._reload_changed_content(changed)
+            if self.folder:
+                self.session.workspace_links.invalidate(self.folder)
             if self.folder and any(
                 folder_ops.same_path(ch, self.folder) or folder_ops.matches_path_prefix(ch, self.folder, is_directory=True)
                 for ch in changed
@@ -3269,12 +3311,28 @@ class Studio(QObject):
                         target_tab["pendingHeading"] = pending_heading
                     else:
                         target_tab.pop("pendingHeading", None)
+                    if batch_insert is None:
+                        canon_existing_path = folder_ops.canonical_path_str(path)
+                        self.recent = [canon_existing_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_existing_path)][:29]
+                        self._preferences(notify=False)
                     was_active = self.active == target_tab["id"]
                     self._select_tab_from_open(target_tab["id"], activation_generation)
-                    if was_active and pending_heading:
-                        self._emit()
+                    if was_active:
+                        self._emit(bool(pending_heading))
+                    for window in list(self.session.windows.values()):
+                        if window is not self and not window.retired:
+                            window._emit(False)
                     self._focus_open_target(activation_generation)
-        found = next((t for t in self.tabs if t["path"] == str(path)), None)
+        def same_open_tab_path(tab_path: str) -> bool:
+            if not tab_path:
+                return False
+            if tab_path == str(path) or folder_ops.same_path(tab_path, path):
+                return True
+            try:
+                return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
+            except OSError:
+                return False
+        found = next((t for t in self.tabs if same_open_tab_path(t["path"])), None)
         if found:
             self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             self._restoring_paths.discard(str(path))
@@ -3291,7 +3349,7 @@ class Studio(QObject):
             content, assets, portable = result
             # A startup read and an explicit open may race for the same path.
             # Keep one tab and let only an explicit, still-current request focus it.
-            existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
+            existing = next((tab for tab in self.tabs if same_open_tab_path(tab["path"])), None)
             if existing:
                 activate_existing(existing)
                 if completion_callback: completion_callback(existing, None)
@@ -3445,6 +3503,7 @@ class Studio(QObject):
             except OSError:
                 continue
         self.folder = root_str
+        self.session.workspace_links.invalidate(self.folder)
         self.expanded = valid_expanded
         self.session.window_workspaces[self.window_id] = {
             "folder": self.folder,
@@ -3604,6 +3663,7 @@ class Studio(QObject):
             return
         self._clear_folder_filter()
         self.folder = folder_ops.canonical_path_str(path)
+        self.session.workspace_links.invalidate(self.folder)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
@@ -3623,12 +3683,14 @@ class Studio(QObject):
         folder, expanded = self.folder, set(self.expanded)
         hide_non_note = bool(self.settings.get("hideNonNoteFolders", True))
         expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
+        custom_budget = getattr(self, "_folder_tree_scan_budget", None)
+        initial_budget = FOLDER_TREE_SCAN_BUDGET if custom_budget is None else max(0, int(custom_budget))
         def scan():
             entries: list[dict[str, object]] = []
             note_memo: dict[str, bool] = {}
-            scan_budget = [25000]
+            scan_budget = [initial_budget]
             def visit(path, depth):
-                if depth > MAX_FOLDER_DEPTH:
+                if depth > 256:
                     return
                 try:
                     children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -3686,6 +3748,8 @@ class Studio(QObject):
     def closeFolder(self):
         self._tree_generation = getattr(self, "_tree_generation", 0) + 1
         self._clear_folder_filter()
+        if self.folder:
+            self.session.workspace_links.invalidate(self.folder)
         self.folder = ""
         self.files = []
         self.expanded.clear()
@@ -4007,6 +4071,7 @@ class Studio(QObject):
                 except OSError:
                     pass
                 if str(path) != original_path:
+                    self.session.workspace_links.invalidate(path.parent)
                     self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                     self._preferences()
                     self._refresh_open_folders_for_path(path)
@@ -4133,6 +4198,7 @@ class Studio(QObject):
                 entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
         if message:
             self.message = message
+        self.session.workspace_links.invalidate()
         self._save_positions()
         self._preferences(notify=False)
         for win in list(self.session.windows.values()):
@@ -4200,6 +4266,7 @@ class Studio(QObject):
         def finished(created_path, error):
             if error or not created_path:
                 return
+            self.session.workspace_links.invalidate(self.folder)
             created = Path(created_path)
             for win in list(self.session.windows.values()):
                 if not win.retired and win.folder:
@@ -4258,6 +4325,7 @@ class Studio(QObject):
         def finished(created_dir, error):
             if error or not created_dir:
                 return
+            self.session.workspace_links.invalidate(self.folder)
             created = Path(created_dir)
             for win in list(self.session.windows.values()):
                 if not win.retired and win.folder:
@@ -5847,6 +5915,7 @@ class Studio(QObject):
                         wikilink=wikilink,
                         note_path=note_path,
                         workspace_folder=folder,
+                        cache=self.session.workspace_links,
                     )
                 def resolve_done(resolved_path, error):
                     if self.retired:
@@ -6152,6 +6221,8 @@ class Studio(QObject):
                             self._agent_open_paths.add(str(Path(save_as).resolve()))
                         except OSError:
                             pass
+                        if path_changed:
+                            self.session.workspace_links.invalidate(Path(save_as).parent)
                         self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
                         self._preferences()
                         if path_changed:
@@ -6262,7 +6333,16 @@ class Studio(QObject):
         try:
             if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
                 canonical = str(local_path(reference))
-                return next((item for item in self.tabs if item["path"] == canonical), None)
+                exact = next((item for item in self.tabs if item["path"] == canonical or (item["path"] and folder_ops.same_path(item["path"], canonical))), None)
+                if exact is not None:
+                    return exact
+                return next(
+                    (
+                        item for item in self.tabs
+                        if item["path"] and not Path(item["path"]).is_symlink() and os.path.samefile(item["path"], canonical)
+                    ),
+                    None,
+                )
         except OSError:
             pass
         return None

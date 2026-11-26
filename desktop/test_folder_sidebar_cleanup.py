@@ -200,6 +200,8 @@ ApplicationWindow {
         self.studio.openFolder(str(self.workspace))
         QTest.qWait(60)
         self._wait_for(lambda: self.studio.files == [])
+        # Prime workspace link cache (#64) while workspace has 0 notes so invalidation on create/save/reconcile is exercised
+        self.assertEqual(self.session.workspace_links.scan(self.workspace), ())
 
         # Collapsed/hidden subdirectories must not hold OS directory watches at rest (prevents Win32 rename locks)
         watched_dirs = {canonical_path_str(d) for d in self.studio.note_watcher.directories()}
@@ -224,6 +226,106 @@ ApplicationWindow {
         self._wait_for(lambda: "Inbox" in self._rels())
         self.studio.toggleDirectory(str(self.workspace / "Inbox"))
         self._wait_for(lambda: "Inbox/Clipped" in self._rels())
+
+        # Workspace link cache (#64) stays synchronized across folder note creation, Save As, and external reconcile
+        resolved_summary = studio_mod.resolve_workspace_link(
+            "Summary",
+            wikilink=True,
+            note_path=self.workspace / "HiddenDrafts" / "First Idea.md",
+            workspace_folder=self.workspace,
+            cache=self.session.workspace_links,
+        )
+        self.assertEqual(canonical_path_str(resolved_summary), canonical_path_str(saved_target / "Summary.txt"))
+        resolved_clip = studio_mod.resolve_workspace_link(
+            "WebClip",
+            wikilink=True,
+            note_path=self.workspace / "HiddenDrafts" / "First Idea.md",
+            workspace_folder=self.workspace,
+            cache=self.session.workspace_links,
+        )
+        self.assertEqual(canonical_path_str(resolved_clip), canonical_path_str(ext_file))
+
+    def test_small_scan_budget_preserves_unresolved_and_later_note_folders(self):
+        # Early folders completely scanned before budget exhaustion (no notes -> hidden)
+        (self.workspace / "00_EmptyBeforeBudget").mkdir()
+        early_asset = self.workspace / "01_AssetBeforeBudget"
+        early_asset.mkdir()
+        (early_asset / "diagram.png").write_bytes(b"\x89PNG\r\n")
+
+        # Heavy non-note folder that exhausts the small shared scan budget mid-directory
+        noisy_assets = self.workspace / "02_NoisyAssets"
+        noisy_assets.mkdir()
+        for idx in range(10):
+            (noisy_assets / f"asset_{idx:02d}.bin").write_bytes(b"\x00")
+
+        # Later folders with valid .md, .txt, and .smd notes that appear after budget exhaustion
+        later_md = self.workspace / "03_LaterMarkdown"
+        later_md.mkdir()
+        (later_md / "Lecture.md").write_text("# Lecture\n", encoding="utf-8")
+
+        later_nested = self.workspace / "04_LaterNested" / "Unit 1"
+        later_nested.mkdir(parents=True)
+        (later_nested / "Notes.txt").write_text("Chapter 1\n", encoding="utf-8")
+
+        later_portable = self.workspace / "05_LaterPortable"
+        later_portable.mkdir()
+        (later_portable / "StudyPack.smd").write_bytes(b"{}")
+
+        # Direct helper verification: resolved note-free folders return False & memoize False,
+        # while unresolved folders return True without caching False.
+        memo: dict[str, bool] = {}
+        budget = [3]
+        self.assertFalse(studio_mod._directory_has_visible_note(self.workspace / "00_EmptyBeforeBudget", depth=1, budget=budget, memo=memo))
+        self.assertFalse(studio_mod._directory_has_visible_note(early_asset, depth=1, budget=budget, memo=memo))
+        self.assertEqual(budget, [1])
+        self.assertIs(memo[studio_mod.folder_ops.normalize_path_key(early_asset)], False)
+
+        # 02_NoisyAssets has 10 files > remaining budget 1 -> unresolved -> kept visible (True), not memoized False
+        self.assertTrue(studio_mod._directory_has_visible_note(noisy_assets, depth=1, budget=budget, memo=memo))
+        self.assertEqual(budget, [0])
+        self.assertNotIn(studio_mod.folder_ops.normalize_path_key(noisy_assets), memo)
+
+        # Subsequent valid-note folder with exhausted budget [0] stays visible (True)
+        self.assertTrue(studio_mod._directory_has_visible_note(later_md, depth=1, budget=budget, memo=memo))
+        self.assertNotIn(studio_mod.folder_ops.normalize_path_key(later_md), memo)
+
+        # Boundary case: first child subdir finishes exact remaining budget with 0 notes,
+        # leaving second sibling subdir (with valid note) unvisited -> parent must stay visible.
+        parent_boundary = self.root / "BoundaryWorkspace" / "CourseRoot"
+        exact_slides = parent_boundary / "01_ExactSlides"
+        exact_slides.mkdir(parents=True)
+        (exact_slides / "a.pdf").write_bytes(b"%PDF\n")
+        (exact_slides / "b.pdf").write_bytes(b"%PDF\n")
+        sibling_notes = parent_boundary / "02_Homework"
+        sibling_notes.mkdir(parents=True)
+        (sibling_notes / "hw1.md").write_text("# HW 1\n", encoding="utf-8")
+        boundary_memo: dict[str, bool] = {}
+        # 2 entries in CourseRoot + 2 entries in 01_ExactSlides = 4 budget units; 02_Homework sees budget == 0
+        boundary_budget = [4]
+        self.assertTrue(studio_mod._directory_has_visible_note(parent_boundary, depth=1, budget=boundary_budget, memo=boundary_memo))
+        self.assertIs(boundary_memo[studio_mod.folder_ops.normalize_path_key(exact_slides)], False)
+        self.assertNotIn(studio_mod.folder_ops.normalize_path_key(parent_boundary), boundary_memo)
+
+        # End-to-end Studio._load_tree() small-budget fixture
+        self.studio._folder_tree_scan_budget = 6
+        self.studio.openFolder(str(self.workspace))
+        self._wait_for(
+            lambda: self._rels()
+            == [
+                "02_NoisyAssets",
+                "03_LaterMarkdown",
+                "04_LaterNested",
+                "05_LaterPortable",
+            ]
+        )
+
+        # Expanding later folders under the small budget still reveals their nested folders and notes
+        self.studio.toggleDirectory(str(later_md))
+        self._wait_for(lambda: "03_LaterMarkdown/Lecture.md" in self._rels())
+        self.studio.toggleDirectory(str(self.workspace / "04_LaterNested"))
+        self._wait_for(lambda: "04_LaterNested/Unit 1" in self._rels())
+        self.studio.toggleDirectory(str(later_nested))
+        self._wait_for(lambda: "04_LaterNested/Unit 1/Notes.txt" in self._rels())
 
     def test_folder_sidebar_qml_removes_clutter_and_highlights_active_note(self):
         (self.workspace / "Overview.md").write_text("# Overview\n", encoding="utf-8")
