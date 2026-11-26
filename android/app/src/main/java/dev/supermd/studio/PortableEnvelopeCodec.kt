@@ -8,6 +8,8 @@ import android.util.JsonWriter
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FilterInputStream
 import java.io.FilterOutputStream
@@ -15,6 +17,7 @@ import java.io.FilterReader
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.Reader
+import java.io.SequenceInputStream
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.security.MessageDigest
@@ -457,7 +460,61 @@ internal class PortableEnvelopeCodec(
     }
 
     fun readSearchableNote(input: InputStream, maxPlainBytes: Int = 5_000_000, maxPortableMarkdownBytes: Int = MAX_PORTABLE_MARKDOWN_BYTES): String? {
-        val buffered = if (input.markSupported()) input else BufferedInputStream(input, 65_536)
+        val initial = ByteArray(8_192)
+        var initialLen = 0
+        while (initialLen < initial.size) {
+            val count = input.read(initial, initialLen, initial.size - initialLen)
+            if (count <= 0) break
+            initialLen += count
+        }
+        if (initialLen == 0) return ""
+        val isGzip = initialLen >= 2 && initial[0] == 0x1f.toByte() && initial[1] == 0x8b.toByte()
+        var nonWsIdx = if (initialLen >= 3 && initial[0] == 0xef.toByte() && initial[1] == 0xbb.toByte() && initial[2] == 0xbf.toByte()) 3 else 0
+        val hasUtf8Bom = nonWsIdx == 3
+        while (nonWsIdx < initialLen) {
+            val b = initial[nonWsIdx].toInt() and 0xff
+            if (b != 0x20 && b != 0x09 && b != 0x0a && b != 0x0d) break
+            nonWsIdx++
+        }
+        val mightBeJson = !isGzip && (nonWsIdx >= initialLen || initial[nonWsIdx] == '{'.code.toByte())
+        if (!isGzip && !mightBeJson) {
+            for (i in 0 until initialLen) {
+                if (initial[i] == 0.toByte()) return null
+            }
+            val nextByte = if (initialLen == initial.size) input.read() else -1
+            if (nextByte < 0) {
+                if (initialLen > maxPlainBytes) return null
+                return runCatching {
+                    val offset = if (hasUtf8Bom) 3 else 0
+                    Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
+                        .decode(ByteBuffer.wrap(initial, offset, initialLen - offset)).toString()
+                }.getOrNull()
+            }
+            return runCatching {
+                val out = ByteArrayOutputStream(minOf(maxPlainBytes, 32_768))
+                out.write(initial, 0, initialLen)
+                if (nextByte == 0) return null
+                out.write(nextByte)
+                require(out.size() <= maxPlainBytes)
+                val buf = ByteArray(16_384)
+                while (true) {
+                    val count = input.read(buf)
+                    if (count <= 0) break
+                    for (i in 0 until count) {
+                        if (buf[i] == 0.toByte()) return null
+                    }
+                    require(out.size() + count <= maxPlainBytes)
+                    out.write(buf, 0, count)
+                }
+                val raw = out.toByteArray()
+                val offset = if (hasUtf8Bom) 3 else 0
+                Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(raw, offset, raw.size - offset)).toString()
+            }.getOrNull()
+        }
+
+        val combined = SequenceInputStream(ByteArrayInputStream(initial, 0, initialLen), input)
+        val buffered = BufferedInputStream(combined, 65_536)
         buffered.mark(65_536)
         val prefix = ByteArray(32_768)
         var prefixLen = 0
@@ -467,9 +524,7 @@ internal class PortableEnvelopeCodec(
             prefixLen += count
         }
         buffered.reset()
-        if (prefixLen == 0) return ""
         val headBytes = prefix.copyOfRange(0, prefixLen)
-        val isGzip = portableGzipHeader(headBytes)
         val headerPreview = if (!isGzip) runCatching { String(headBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') }.getOrDefault("") else ""
         if (isGzip || portableEnvelopeHeader(headerPreview)) {
             return runCatching { portableMarkdown(buffered, stopAfterMarkdown = true, maxMarkdownBytes = maxPortableMarkdownBytes) }.getOrNull()
