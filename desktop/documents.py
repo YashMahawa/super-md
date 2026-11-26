@@ -7,10 +7,13 @@ import json
 import os
 import re
 import stat
-import tempfile
 import threading
 import zlib
 from pathlib import Path
+from atomic_io import (
+    _replace_with_windows_sharing_retry, _write_json_str, _write_json_value,
+    atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate,
+)
 
 MIMES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "svg": "image/svg+xml", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 MAX_FILE = 120_000_000
@@ -211,6 +214,9 @@ def _is_cached_validated_asset(data: str) -> bool:
     return _lookup_validated_asset(data) is not None
 
 
+set_trusted_ascii_predicate(_is_cached_validated_asset)
+
+
 def image_data(data: str) -> tuple[str, bytes]:
     mime, encoded_start, _ = _parse_image_header(data)
     result = decode_base64_chunked(data, start=encoded_start)
@@ -401,29 +407,6 @@ def compressed_bundle(
         raise ValueError("Compressed SMD exceeds 120 MB")
     return data
 
-def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
-    """Preserve atomic replacement despite brief Windows AV/indexer file locks.
-
-    Only transient sharing/access-denied errors are retried, for at most one
-    second. Other errors fail immediately and the caller cleans up its temp.
-    """
-    if os.name != "nt":
-        os.replace(source, target)
-        return
-    import time
-    deadline = time.monotonic() + 1.0
-    delay = 0.005
-    while True:
-        try:
-            os.replace(source, target)
-            return
-        except PermissionError as error:
-            remaining = deadline - time.monotonic()
-            if getattr(error, "winerror", None) not in (5, 32) or remaining <= 0:
-                raise
-            time.sleep(min(delay, remaining))
-            delay = min(0.04, delay * 2)
-
 def write_portable(
     path: Path,
     markdown: str,
@@ -434,45 +417,29 @@ def write_portable(
     """Atomically save the unchanged v1 JSON envelope in deterministic gzip."""
     value = bundle(markdown, assets, validated_assets=validated_assets)
     hasher = hashlib.sha256()
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    with atomic_output_file(path, buffering=_B64_DECODE_CHUNK) as raw:
+        class _HashingWriter:
+            def write(self, data: bytes) -> int:
+                hasher.update(data)
+                return raw.write(data)
+
+            def flush(self) -> None:
+                raw.flush()
+
+        _write_gzip_json(_HashingWriter(), value, _trusted_ascii_assets=True)
+        if raw.tell() > MAX_FILE:
+            raise ValueError("Compressed SMD exceeds 120 MB")
     try:
-        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as raw:
-            if os.name != "nt" and hasattr(os, "fchmod"):
-                try:
-                    st_mode = path.stat().st_mode
-                except FileNotFoundError:
-                    pass
-                else:
-                    os.fchmod(raw.fileno(), stat.S_IMODE(st_mode))
-
-            class _HashingWriter:
-                def write(self, data: bytes) -> int:
-                    hasher.update(data)
-                    return raw.write(data)
-
-                def flush(self) -> None:
-                    raw.flush()
-
-            _write_gzip_json(_HashingWriter(), value, _trusted_ascii_assets=True)
-            if raw.tell() > MAX_FILE:
-                raise ValueError("Compressed SMD exceeds 120 MB")
-            raw.flush()
-            os.fsync(raw.fileno())
-        _replace_with_windows_sharing_retry(temporary, path)
-        try:
-            st = path.stat()
-            _cache_portable_file(
-                (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns),
-                hasher.hexdigest(),
-                markdown,
-                assets,
-                assets_decoded=True,
-            )
-        except OSError:
-            pass
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        st = path.stat()
+        _cache_portable_file(
+            (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns),
+            hasher.hexdigest(),
+            markdown,
+            assets,
+            assets_decoded=True,
+        )
+    except OSError:
+        pass
 
 
 def open_note(path: Path, *, decode_assets: bool = True) -> tuple[str, dict[str, str], bool]:
@@ -726,112 +693,6 @@ def read_searchable_markdown(path: Path, max_text_bytes: int = MAX_SEARCH_MARKDO
         return path.read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return None
-
-def atomic_write(path: Path, data: bytes) -> None:
-    # Same-filesystem replace is atomic; a cancelled/failed write leaves the old note intact.
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(handle, "wb") as file:
-            if path.exists() and hasattr(os,"fchmod"):
-                os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
-            file.write(data)
-            file.flush()
-            os.fsync(file.fileno())
-        _replace_with_windows_sharing_retry(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-def _write_json_str(raw, text: str) -> None:
-    if type(text) is str and _is_cached_validated_asset(text):
-        raw.write(b'"')
-        for offset in range(0, len(text), _B64_DECODE_CHUNK):
-            raw.write(text[offset:offset + _B64_DECODE_CHUNK].encode("ascii"))
-        raw.write(b'"')
-        return
-    if len(text) <= _B64_DECODE_CHUNK:
-        raw.write(json.dumps(text, ensure_ascii=False).encode("utf-8", errors="backslashreplace"))
-        return
-    plain = text if type(text) is str else str(text)
-    raw.write(b'"')
-    for offset in range(0, len(plain), _B64_DECODE_CHUNK):
-        chunk = json.dumps(plain[offset:offset + _B64_DECODE_CHUNK], ensure_ascii=False)[1:-1]
-        raw.write(chunk.encode("utf-8", errors="backslashreplace"))
-    raw.write(b'"')
-
-
-def _write_json_value(raw, value, seen: set[int]) -> None:
-    if isinstance(value, str):
-        _write_json_str(raw, value)
-    elif value is None:
-        raw.write(b"null")
-    elif value is True:
-        raw.write(b"true")
-    elif value is False:
-        raw.write(b"false")
-    elif isinstance(value, (int, float)):
-        raw.write(json.dumps(value).encode("ascii"))
-    elif isinstance(value, (list, tuple)):
-        marker = id(value)
-        if marker in seen:
-            raise ValueError("Circular reference detected")
-        seen.add(marker)
-        try:
-            raw.write(b"[")
-            for idx, item in enumerate(value):
-                if idx:
-                    raw.write(b", ")
-                _write_json_value(raw, item, seen)
-            raw.write(b"]")
-        finally:
-            seen.remove(marker)
-    elif isinstance(value, dict):
-        marker = id(value)
-        if marker in seen:
-            raise ValueError("Circular reference detected")
-        seen.add(marker)
-        try:
-            raw.write(b"{")
-            first = True
-            for key, item in value.items():
-                if not first:
-                    raw.write(b", ")
-                first = False
-                if isinstance(key, str):
-                    _write_json_str(raw, key)
-                elif key is None:
-                    raw.write(b'"null"')
-                elif key is True:
-                    raw.write(b'"true"')
-                elif key is False:
-                    raw.write(b'"false"')
-                elif isinstance(key, (int, float)):
-                    raw.write(b'"' + json.dumps(key).encode("ascii") + b'"')
-                else:
-                    raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
-                raw.write(b": ")
-                _write_json_value(raw, item, seen)
-            raw.write(b"}")
-        finally:
-            seen.remove(marker)
-    else:
-        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
-
-
-def atomic_json(path: Path, value) -> None:
-    """Write ordered recovery without full-workspace JSON + UTF-8 copies or long GIL holds."""
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as file:
-            if path.exists() and hasattr(os, "fchmod"):
-                os.fchmod(file.fileno(), stat.S_IMODE(path.stat().st_mode))
-            _write_json_value(file, value, set())
-            file.flush()
-            os.fsync(file.fileno())
-        _replace_with_windows_sharing_retry(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
 
 def materialize_assets(root: Path, assets: dict[str,str]) -> None:
     """Save a portable note as Markdown without dropping its pictures or overwriting others."""
