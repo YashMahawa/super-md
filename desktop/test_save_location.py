@@ -31,14 +31,29 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 
+def _assert_same_path(
+    test_case: unittest.TestCase,
+    actual: str | os.PathLike[str],
+    expected: str | os.PathLike[str],
+):
+    test_case.assertTrue(
+        folder_ops.same_path(actual, expected),
+        f"Expected same path:\n  actual:   {actual}\n  expected: {expected}",
+    )
+    test_case.assertEqual(
+        folder_ops._pure_path(str(actual)).name,
+        folder_ops._pure_path(str(expected)).name,
+    )
+
+
 class SaveLocationStudioTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Save location tests"])
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="supermd-save-loc-")
-        self.root = Path(folder_ops.canonical_path_str(self.temp.name))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="supermd-save-loc-"))
+        self.root = Path(folder_ops.canonical_path_str(self.temp_dir))
         self.data_dir = self.root / "app-data"
         self.downloads_dir = self.root / "Downloads"
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -48,11 +63,7 @@ class SaveLocationStudioTest(unittest.TestCase):
         self.windows: list[QuietStudio] = []
 
     def assertSamePath(self, actual: str | os.PathLike[str], expected: str | os.PathLike[str]):
-        self.assertTrue(
-            folder_ops.same_path(actual, expected),
-            f"Expected same path:\n  actual:   {actual}\n  expected: {expected}",
-        )
-        self.assertEqual(Path(actual).name, Path(expected).name)
+        _assert_same_path(self, actual, expected)
 
     def tearDown(self):
         for win in list(self.windows):
@@ -60,9 +71,18 @@ class SaveLocationStudioTest(unittest.TestCase):
                 win.stop()
             win.pool.shutdown(wait=True, cancel_futures=True)
             win._search_pool.shutdown(wait=True, cancel_futures=True)
+            win.deleteLater()
         self.session.writes.shutdown(wait=True)
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
-        self.temp.cleanup()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _remove_dir_externally(self, win: QuietStudio, directory: Path):
+        # Release Windows QFileSystemWatcher directory handles before simulating external
+        # folder deletion, while keeping win.folder and open tab paths intact.
+        win._suspend_watches_for_prefix(str(directory), is_dir=True)
+        self.app.processEvents()
+        shutil.rmtree(directory)
 
     def flush_writes(self):
         self.session.writes.submit(lambda: None).result(timeout=5)
@@ -102,12 +122,9 @@ class SaveLocationStudioTest(unittest.TestCase):
         with self._patch_downloads():
             win1 = self.make_window()
             # Without open folder or custom preference, untitled note suggests Downloads.
-            self.assertEqual(
-                Path(win1.defaultSaveFolder().toLocalFile()),
-                self.downloads_dir,
-            )
-            self.assertEqual(
-                Path(win1.defaultSaveLocation("Untitled.md").toLocalFile()),
+            self.assertSamePath(win1.defaultSaveFolder().toLocalFile(), self.downloads_dir)
+            self.assertSamePath(
+                win1.defaultSaveLocation("Untitled.md").toLocalFile(),
                 self.downloads_dir / "Untitled.md",
             )
 
@@ -129,29 +146,29 @@ class SaveLocationStudioTest(unittest.TestCase):
             win1.saveRequested.connect(requested_names.append)
             win1.save()
             self.assertEqual(requested_names, ["Untitled.md"])
-            self.assertEqual(Path(win1.defaultSaveFolder().toLocalFile()), canon_course)
-            self.assertEqual(
-                Path(win1.defaultSaveLocation("Untitled.md").toLocalFile()),
+            self.assertSamePath(win1.defaultSaveFolder().toLocalFile(), canon_course)
+            self.assertSamePath(
+                win1.defaultSaveLocation("Untitled.md").toLocalFile(),
                 canon_course / "Untitled.md",
             )
 
             # Closing the folder returns untitled note save destination to Downloads; re-opening restores it.
             win1.closeFolder()
-            self.assertEqual(Path(win1.defaultSaveFolder().toLocalFile()), self.downloads_dir)
+            self.assertSamePath(win1.defaultSaveFolder().toLocalFile(), self.downloads_dir)
             win1.openFolder(str(course_dir))
-            self.assertEqual(Path(win1.defaultSaveFolder().toLocalFile()), canon_course)
+            self.assertSamePath(win1.defaultSaveFolder().toLocalFile(), canon_course)
 
             # Active window isolation: win2 with a different folder (or no folder) uses its own folder.
             win2 = self.make_window()
-            self.assertEqual(Path(win2.defaultSaveFolder().toLocalFile()), self.downloads_dir)
+            self.assertSamePath(win2.defaultSaveFolder().toLocalFile(), self.downloads_dir)
             win2.openFolder(str(other_dir))
             canon_other = Path(folder_ops.canonical_path_str(other_dir))
-            self.assertEqual(Path(win2.defaultSaveFolder().toLocalFile()), canon_other)
-            self.assertEqual(
-                Path(win2.defaultSaveLocation("Draft.smd").toLocalFile()),
+            self.assertSamePath(win2.defaultSaveFolder().toLocalFile(), canon_other)
+            self.assertSamePath(
+                win2.defaultSaveLocation("Draft.smd").toLocalFile(),
                 canon_other / "Draft.smd",
             )
-            self.assertEqual(Path(win1.defaultSaveFolder().toLocalFile()), canon_course)
+            self.assertSamePath(win1.defaultSaveFolder().toLocalFile(), canon_course)
 
             # Simulate app quit & startup restore: restored open folder is used immediately for untitled save.
             self.session.quitting = True
@@ -163,14 +180,14 @@ class SaveLocationStudioTest(unittest.TestCase):
             restored_win1 = QuietStudio(True, session=restored_session)
             restored_win2 = QuietStudio(True, session=restored_session)
             try:
-                self.assertEqual(Path(restored_win1.defaultSaveFolder().toLocalFile()), canon_course)
-                self.assertEqual(
-                    Path(restored_win1.defaultSaveLocation("Untitled.md").toLocalFile()),
+                self.assertSamePath(restored_win1.defaultSaveFolder().toLocalFile(), canon_course)
+                self.assertSamePath(
+                    restored_win1.defaultSaveLocation("Untitled.md").toLocalFile(),
                     canon_course / "Untitled.md",
                 )
-                self.assertEqual(Path(restored_win2.defaultSaveFolder().toLocalFile()), canon_other)
-                self.assertEqual(
-                    Path(restored_win2.defaultSaveLocation("Untitled.md").toLocalFile()),
+                self.assertSamePath(restored_win2.defaultSaveFolder().toLocalFile(), canon_other)
+                self.assertSamePath(
+                    restored_win2.defaultSaveLocation("Untitled.md").toLocalFile(),
                     canon_other / "Untitled.md",
                 )
             finally:
@@ -178,7 +195,9 @@ class SaveLocationStudioTest(unittest.TestCase):
                     rw.stop()
                     rw.pool.shutdown(wait=True, cancel_futures=True)
                     rw._search_pool.shutdown(wait=True, cancel_futures=True)
+                    rw.deleteLater()
                 restored_session.writes.shutdown(wait=True)
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
     def test_explicit_new_note_location_overrides_open_folder_until_cleared_or_unavailable(self):
         open_dir = self.root / "Open Workspace"
@@ -245,7 +264,7 @@ class SaveLocationStudioTest(unittest.TestCase):
             )
 
             # Delete the open folder while the window is still open -> falls back to Downloads.
-            shutil.rmtree(transient_dir)
+            self._remove_dir_externally(win, transient_dir)
             self.assertSamePath(win.defaultSaveFolder().toLocalFile(), self.downloads_dir)
             self.assertSamePath(
                 win.defaultSaveLocation("Untitled.md").toLocalFile(),
@@ -284,27 +303,22 @@ class SaveLocationStudioTest(unittest.TestCase):
 
             # Save As from an existing note starts in that note's parent directory even when
             # both openFolder and newNoteLocation point elsewhere.
-            self.assertEqual(
-                folder_ops.canonical_path_str(win.defaultSaveAsFolder().toLocalFile()),
-                folder_ops.canonical_path_str(note_dir),
+            self.assertSamePath(win.defaultSaveAsFolder().toLocalFile(), note_dir)
+            self.assertSamePath(
+                win.defaultSaveAsLocation(win._current()["name"]).toLocalFile(),
+                note_dir / "1.2 Eigenvalues.md",
             )
-            save_as_target = Path(win.defaultSaveAsLocation(win._current()["name"]).toLocalFile())
-            self.assertEqual(
-                folder_ops.canonical_path_str(save_as_target.parent),
-                folder_ops.canonical_path_str(note_dir),
-            )
-            self.assertEqual(save_as_target.name, "1.2 Eigenvalues.md")
 
             # If the existing note's parent directory is deleted externally, Save As falls back
             # to _note_save_directory() (preferred_dir -> workspace_dir -> Downloads).
-            shutil.rmtree(note_dir)
+            self._remove_dir_externally(win, note_dir)
             self.assertSamePath(win.defaultSaveAsFolder().toLocalFile(), preferred_dir)
             win.settings["newNoteLocation"] = ""
             self.assertSamePath(
                 win.defaultSaveAsFolder().toLocalFile(),
                 folder_ops.canonical_path_str(workspace_dir),
             )
-            shutil.rmtree(workspace_dir)
+            self._remove_dir_externally(win, workspace_dir)
             self.assertSamePath(win.defaultSaveAsFolder().toLocalFile(), self.downloads_dir)
 
     def test_export_and_theme_destinations_are_preserved_when_folder_is_open(self):
@@ -323,8 +337,8 @@ class SaveLocationStudioTest(unittest.TestCase):
 
             # Untitled note with open folder: note save goes to workspace_dir,
             # while export and theme export still go to Downloads!
-            self.assertEqual(
-                Path(win.defaultSaveLocation("Untitled.md").toLocalFile()),
+            self.assertSamePath(
+                win.defaultSaveLocation("Untitled.md").toLocalFile(),
                 Path(folder_ops.canonical_path_str(workspace_dir)) / "Untitled.md",
             )
             for fmt, expected_name in (
@@ -333,21 +347,25 @@ class SaveLocationStudioTest(unittest.TestCase):
                 ("md", "Untitled.md"),
                 ("mdzip", "Untitled.zip"),
             ):
-                export_path = Path(win.defaultExportLocation(fmt).toLocalFile())
-                self.assertEqual(export_path, self.downloads_dir / expected_name)
+                self.assertSamePath(
+                    win.defaultExportLocation(fmt).toLocalFile(),
+                    self.downloads_dir / expected_name,
+                )
 
-            theme_path = Path(win.defaultThemeExportLocation("My theme.supermd-theme.json").toLocalFile())
-            self.assertEqual(theme_path, self.downloads_dir / "My theme.supermd-theme.json")
+            self.assertSamePath(
+                win.defaultThemeExportLocation("My theme.supermd-theme.json").toLocalFile(),
+                self.downloads_dir / "My theme.supermd-theme.json",
+            )
 
             # Even when viewing a saved note in saved_dir, export and theme destinations remain unchanged.
             win.openNote(str(saved_note))
             self.wait_until(lambda: folder_ops.same_path(win._current()["path"], saved_note))
-            self.assertEqual(
-                Path(win.defaultExportLocation("pdf").toLocalFile()),
+            self.assertSamePath(
+                win.defaultExportLocation("pdf").toLocalFile(),
                 self.downloads_dir / "Lecture 4.pdf",
             )
-            self.assertEqual(
-                Path(win.defaultThemeExportLocation("My theme.supermd-theme.json").toLocalFile()),
+            self.assertSamePath(
+                win.defaultThemeExportLocation("My theme.supermd-theme.json").toLocalFile(),
                 self.downloads_dir / "My theme.supermd-theme.json",
             )
 
@@ -362,15 +380,44 @@ class SaveLocationStudioTest(unittest.TestCase):
                 preferred_dir / "My theme.supermd-theme.json",
             )
 
+    def test_stopping_windows_releases_filesystem_watchers(self):
+        def count_inotify() -> int:
+            if not Path("/proc/self/fd").is_dir():
+                return 0
+            total = 0
+            for fd in os.listdir("/proc/self/fd"):
+                try:
+                    if "inotify" in os.readlink(f"/proc/self/fd/{fd}"):
+                        total += 1
+                except OSError:
+                    pass
+            return total
+
+        folder_dir = self.root / "Watched Course"
+        folder_dir.mkdir()
+        before = count_inotify()
+        win = self.make_window()
+        win.openFolder(str(folder_dir))
+        if Path("/proc/self/fd").is_dir():
+            self.assertGreater(count_inotify(), before)
+        win.stop()
+        self.assertEqual(win.note_watcher.files(), [])
+        self.assertEqual(win.note_watcher.directories(), [])
+        if Path("/proc/self/fd").is_dir():
+            self.assertEqual(count_inotify(), before)
+
 
 class SaveDialogQmlUiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Save chooser QML tests"])
 
+    def assertSamePath(self, actual: str | os.PathLike[str], expected: str | os.PathLike[str]):
+        _assert_same_path(self, actual, expected)
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="supermd-save-qml-")
-        self.root = Path(folder_ops.canonical_path_str(self.temp.name))
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="supermd-save-qml-"))
+        self.root = Path(folder_ops.canonical_path_str(self.temp_dir))
         self.open_folder = self.root / "Open Folder"
         self.open_folder.mkdir()
         self.note_folder = self.root / "Existing Note Folder"
@@ -485,7 +532,7 @@ ApplicationWindow {{
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.engine.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        self.temp.cleanup()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_save_and_save_as_create_fresh_dialogs_and_preserve_theme_export(self):
         # 1. Untitled Save note -> seeded with active window's open folder
@@ -494,12 +541,12 @@ ApplicationWindow {{
         chooser = self.window.findChild(QObject, "saveDestination")
         self.assertIsNotNone(chooser)
         self.assertEqual(chooser.property("title"), "Save note")
-        self.assertEqual(Path(chooser.property("currentFolder").toLocalFile()), self.open_folder)
-        self.assertEqual(Path(chooser.property("selectedFile").toLocalFile()), self.open_folder / "Untitled.md")
+        self.assertSamePath(chooser.property("currentFolder").toLocalFile(), self.open_folder)
+        self.assertSamePath(chooser.property("selectedFile").toLocalFile(), self.open_folder / "Untitled.md")
         self.assertTrue(chooser.property("nameFilters")[0].startswith("Markdown"))
         QMetaObject.invokeMethod(chooser, "accepted")
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        self.assertEqual(self.backend.saved[-1], str(self.open_folder / "Untitled.md"))
+        self.assertSamePath(self.backend.saved[-1], self.open_folder / "Untitled.md")
         self.assertIsNone(self.window.findChild(QObject, "saveDestination"))
 
         # 2. Save As on existing portable note -> fresh chooser in note's parent folder with portable filter first
@@ -509,8 +556,8 @@ ApplicationWindow {{
         chooser2 = self.window.findChild(QObject, "saveDestination")
         self.assertIsNotNone(chooser2)
         self.assertEqual(chooser2.property("title"), "Save as")
-        self.assertEqual(Path(chooser2.property("currentFolder").toLocalFile()), self.note_folder)
-        self.assertEqual(Path(chooser2.property("selectedFile").toLocalFile()), self.note_folder / "Bundle Ω.smd")
+        self.assertSamePath(chooser2.property("currentFolder").toLocalFile(), self.note_folder)
+        self.assertSamePath(chooser2.property("selectedFile").toLocalFile(), self.note_folder / "Bundle Ω.smd")
         self.assertTrue(chooser2.property("nameFilters")[0].startswith("Portable Super MD"))
         QMetaObject.invokeMethod(chooser2, "rejected")
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
@@ -523,17 +570,18 @@ ApplicationWindow {{
         # Invoke accepted on themeExportDialog by checking its selectedFile via backend export
         for child in self.window.children():
             if child.property("title") == "Export editable theme":
-                self.assertEqual(
-                    Path(child.property("selectedFile").toLocalFile()),
+                self.assertSamePath(
+                    child.property("selectedFile").toLocalFile(),
                     self.downloads / "My theme.supermd-theme.json",
                 )
                 QMetaObject.invokeMethod(child, "accepted")
                 break
         else:
             self.fail("themeExportDialog not found")
-        self.assertEqual(
-            self.backend.exported_themes,
-            [str(self.downloads / "My theme.supermd-theme.json")],
+        self.assertEqual(len(self.backend.exported_themes), 1)
+        self.assertSamePath(
+            self.backend.exported_themes[0],
+            self.downloads / "My theme.supermd-theme.json",
         )
 
 

@@ -784,6 +784,26 @@ class Session(QObject):
         payload = tab.get("assets", {}).get(grant.source)
         return payload if isinstance(payload, str) and id(payload) == grant.embedded_identity else None
 
+class _RetiredWatcher:
+    def files(self) -> list[str]:
+        return []
+
+    def directories(self) -> list[str]:
+        return []
+
+    def addPath(self, _path: str) -> bool:
+        return False
+
+    def addPaths(self, _paths: list[str]) -> list[str]:
+        return []
+
+    def removePath(self, _path: str) -> bool:
+        return False
+
+    def removePaths(self, _paths: list[str]) -> list[str]:
+        return []
+
+
 class Studio(QObject):
     changed = Signal()
     shortcutsChanged = Signal()
@@ -823,7 +843,8 @@ class Studio(QObject):
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
         self.session = session or Session(isolated)
-        self.session.changed.connect(lambda:self._emit())
+        self._on_session_changed = lambda: self._emit()
+        self.session.changed.connect(self._on_session_changed)
         self.session.locationChanged.connect(self._location_changed)
         self.writes = self.session.writes
         self.window_id = uuid.uuid4().hex
@@ -843,9 +864,11 @@ class Studio(QObject):
         self._cloud_revocation_pending = False
         self.cloudRevocationFinished.connect(self._finish_cloud_revocation)
         self._agent_viewport_capture = None
+        self._on_bridge_enabled = None
         agent_bridge = getattr(self.session, "agent_bridge", None)
         if agent_bridge is not None:
-            agent_bridge.enabledChanged.connect(lambda: self._emit(False))
+            self._on_bridge_enabled = lambda: self._emit(False)
+            agent_bridge.enabledChanged.connect(self._on_bridge_enabled)
             agent_bridge.cloudStatusChanged.connect(self._cloud_status_changed)
         self.update_status=""
         self.update_info=None
@@ -1266,6 +1289,7 @@ class Studio(QObject):
             if not window.retired: window.shortcutsChanged.emit()
 
     def _watch_notes(self,force=False):
+        if self.retired:return
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
         signature=(paths,self.folder,tuple(sorted(self.expanded)))
         if not force and signature==self.note_watch_paths:return
@@ -1380,9 +1404,11 @@ class Studio(QObject):
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
 
     def _schedule_theme(self,*_):
+        if self.retired:return
         self.theme_debounce.start(150)
 
     def _watch_palette(self):
+        if self.retired:return
         watched = set(self.palette_watcher.files()+self.palette_watcher.directories())
         for path in system_palette_paths():
             for target in (path,path.parent):
@@ -1441,13 +1467,41 @@ class Studio(QObject):
         self.flush_timer.stop()
         self.external_timer.stop()
         self.filter_timer.stop()
-        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
-            watched = watcher.files() + watcher.directories()
-            if watched:
-                watcher.removePaths(watched)
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
+        for disconnect_call in (
+            lambda: QGuiApplication.styleHints().colorSchemeChanged.disconnect(self._schedule_theme),
+            lambda: self.session.changed.disconnect(self._on_session_changed),
+            lambda: self.session.locationChanged.disconnect(self._location_changed),
+        ):
+            try:
+                disconnect_call()
+            except (RuntimeError, TypeError):
+                pass
+        agent_bridge = getattr(self.session, "agent_bridge", None)
+        if agent_bridge is not None:
+            for bridge_disconnect in (
+                (lambda: agent_bridge.enabledChanged.disconnect(self._on_bridge_enabled)) if self._on_bridge_enabled is not None else None,
+                lambda: agent_bridge.cloudStatusChanged.disconnect(self._cloud_status_changed),
+            ):
+                if bridge_disconnect is not None:
+                    try:
+                        bridge_disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+        app = QGuiApplication.instance()
+        for watcher_attr in ("note_watcher", "palette_watcher", "custom_theme_watcher"):
+            watcher = getattr(self, watcher_attr, None)
+            if isinstance(watcher, QFileSystemWatcher):
+                watched = watcher.files() + watcher.directories()
+                if watched:
+                    watcher.removePaths(watched)
+                watcher.setParent(None)
+                watcher.deleteLater()
+                if app is not None and watcher.thread() == app.thread():
+                    app.sendPostedEvents(watcher, QEvent.Type.DeferredDelete)
+            setattr(self, watcher_attr, _RetiredWatcher())
         with self._write_callback_lock:
             retired_callbacks = list(self._pending_write_retirements.values())
             self._pending_write_retirements.clear()
@@ -2478,6 +2532,7 @@ class Studio(QObject):
             self._preferences(False)
 
     def _watch_custom_theme(self):
+        if self.retired:return
         watcher=self.custom_theme_watcher
         paths=watcher.files()+watcher.directories()
         if paths:watcher.removePaths(paths)
