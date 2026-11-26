@@ -111,3 +111,87 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
     pollIntervalMs: 10,
   }), /Timed out waiting/);
 });
+
+it('does not burn active artifact timeout while the producer job is queued for a runner', async () => {
+  let clock = 0;
+  const fetchImpl = async input => {
+    const url = new URL(input);
+    const jobs = clock < 50_000
+      ? []
+      : clock < 800_000
+        ? [{ name: 'native_frontend', status: 'queued', conclusion: null }]
+        : clock < 870_000
+          ? [{ name: 'native_frontend', status: 'in_progress', conclusion: null }]
+          : [{ name: 'native_frontend', status: 'completed', conclusion: 'success' }];
+    const artifacts = clock >= 870_000
+      ? [{ name: names.dist }, { name: names.manifest }]
+      : [];
+    const body = url.pathname.endsWith('/jobs')
+      ? { total_count: jobs.length, jobs }
+      : url.pathname.endsWith('/artifacts')
+        ? { total_count: artifacts.length, artifacts }
+        : { ...run, status: clock >= 870_000 ? 'in_progress' : 'queued' };
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl,
+    sleep: async ms => { clock += ms; },
+    now: () => clock,
+    pollIntervalMs: 50_000,
+  });
+  assert.deepEqual(result, names);
+  assert.equal(clock, 900_000);
+});
+
+it('still fails closed when the producer stays queued past queueTimeoutMs or stalls after starting', async () => {
+  let queuedClock = 0;
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: async input => {
+      const url = new URL(input);
+      const body = url.pathname.endsWith('/jobs')
+        ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'queued', conclusion: null }] }
+        : url.pathname.endsWith('/artifacts')
+          ? { total_count: 0, artifacts: [] }
+          : { ...run, status: 'queued' };
+      return { ok: true, status: 200, json: async () => body };
+    },
+    sleep: async ms => { queuedClock += ms; },
+    now: () => queuedClock,
+    timeoutMs: 40,
+    queueTimeoutMs: 120,
+    pollIntervalMs: 20,
+  }), /Timed out waiting/);
+  assert.equal(queuedClock, 120);
+
+  let stalledClock = 0;
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: async input => {
+      const url = new URL(input);
+      const status = stalledClock < 60 ? 'queued' : 'in_progress';
+      const body = url.pathname.endsWith('/jobs')
+        ? { total_count: 1, jobs: [{ name: 'native_frontend', status, conclusion: null }] }
+        : url.pathname.endsWith('/artifacts')
+          ? { total_count: 0, artifacts: [] }
+          : { ...run, status: 'in_progress' };
+      return { ok: true, status: 200, json: async () => body };
+    },
+    sleep: async ms => { stalledClock += ms; },
+    now: () => stalledClock,
+    timeoutMs: 40,
+    queueTimeoutMs: 200,
+    pollIntervalMs: 20,
+  }), /Timed out waiting/);
+  assert.equal(stalledClock, 100);
+});

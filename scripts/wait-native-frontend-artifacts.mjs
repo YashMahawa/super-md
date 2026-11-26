@@ -45,14 +45,20 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   if (producerJobs.length > 1) throw new Error('Ambiguous native frontend producer jobs in this workflow run');
   if (producerJobs.length === 0) {
     if (run.status === 'completed') throw new Error('Native frontend producer is missing from the completed workflow run');
-    return { ready: false, reason: 'producer job has not been registered yet' };
+    return { ready: false, queued: true, reason: 'producer job has not been registered yet' };
   }
 
   const [producer] = producerJobs;
   if (producer.status === 'completed' && producer.conclusion !== 'success') {
     throw new Error(`Native frontend producer failed (${producer.conclusion || 'unknown'}); refusing fallback`);
   }
-  if (producer.status !== 'completed') return { ready: false, reason: `producer job is ${producer.status}` };
+  if (producer.status !== 'completed') {
+    return {
+      ready: false,
+      queued: producer.status !== 'in_progress',
+      reason: `producer job is ${producer.status}`,
+    };
+  }
 
   const artifacts = validatePage(artifactsPage, 'workflow artifacts');
   const expected = frontendArtifactNames(sourceSha);
@@ -62,7 +68,7 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   for (const artifact of [dist, manifest]) {
     if (artifact?.expired) throw new Error('Native frontend artifact has expired; refusing fallback');
   }
-  if (!dist || !manifest) return { ready: false, reason: 'exact-SHA artifact pair is not yet listed' };
+  if (!dist || !manifest) return { ready: false, queued: false, reason: 'exact-SHA artifact pair is not yet listed' };
   return { ready: true, names: expected };
 }
 
@@ -99,20 +105,28 @@ export async function waitForNativeFrontendArtifacts({
   fetchImpl = fetch,
   sleep = delay,
   timeoutMs = 600_000,
+  queueTimeoutMs = Math.max(timeoutMs, 1_800_000),
   pollIntervalMs = 5_000,
   now = Date.now,
 }) {
   const endpoint = assertInputs({ repository, runId, sourceSha, token, apiUrl });
-  const names = frontendArtifactNames(sourceSha);
+  frontendArtifactNames(sourceSha);
   const runPath = `repos/${repository}/actions/runs/${runId}`;
   const started = now();
-  const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
+  let sawQueued = false;
+  let activeStarted = null;
+  let lastReason = null;
+  const deadline = () => {
+    if (activeStarted !== null) return Math.min(started + queueTimeoutMs, activeStarted + timeoutMs);
+    return started + (sawQueued ? queueTimeoutMs : timeoutMs);
+  };
+  const remainingMs = () => Math.max(1, deadline() - now());
   const pause = async () => {
-    const left = timeoutMs - (now() - started);
+    const left = deadline() - now();
     if (left > 0) await sleep(Math.min(pollIntervalMs, left));
   };
   const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
-  while (now() - started < timeoutMs) {
+  while (now() < deadline()) {
     const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (runResult.retry) {
       await pause();
@@ -137,9 +151,16 @@ export async function waitForNativeFrontendArtifacts({
       artifactsPage: artifactsResult.value,
     });
     if (state.ready) return state.names;
+    lastReason = state.reason;
+    if (state.queued) {
+      sawQueued = true;
+    } else if (activeStarted === null) {
+      activeStarted = now();
+    }
     await pause();
   }
-  throw new Error(`Timed out waiting for native frontend artifacts for source ${sourceSha} in run ${runId}; no fallback used`);
+  const detail = lastReason ? ` (${lastReason})` : '';
+  throw new Error(`Timed out waiting for native frontend artifacts for source ${sourceSha} in run ${runId}${detail}; no fallback used`);
 }
 
 async function main() {
