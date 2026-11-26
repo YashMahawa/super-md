@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -555,18 +555,31 @@ child.wait()
         w2_release = self.root / "stop-w2.release"
         w2_child_file = self.root / "stop-w2-child.pid"
 
-        code_c0 = f"""
+        def _build_c0_code(child_path: str, grand_path: str) -> str:
+            return f"""
 import pathlib, subprocess, sys
-helper = f'''
+helper = '''
 import pathlib, subprocess, sys
 grand = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-pathlib.Path({str(c0_grand_file)!r}).write_text(str(grand.pid), encoding="utf-8")
+pathlib.Path(sys.argv[1]).write_text(str(grand.pid), encoding="utf-8")
 grand.wait()
 '''
-child = subprocess.Popen([sys.executable, "-c", helper])
-pathlib.Path({str(c0_child_file)!r}).write_text(str(child.pid), encoding="utf-8")
+child = subprocess.Popen([sys.executable, "-c", helper, {grand_path!r}])
+pathlib.Path({child_path!r}).write_text(str(child.pid), encoding="utf-8")
 child.wait()
 """
+
+        # Regression check for Windows temp paths containing \U escapes (e.g. C:\Users\runneradmin\...).
+        win_probe_ns: dict[str, object] = {}
+        win_snippet = _build_c0_code(
+            str(PureWindowsPath(r"C:\Users\runneradmin\AppData\Local\Temp\stop-c0-child.pid")),
+            str(PureWindowsPath(r"C:\Users\runneradmin\AppData\Local\Temp\stop-c0-grand.pid")),
+        )
+        compile(win_snippet, "<win-code-c0>", "exec")
+        exec(win_snippet.split("child = subprocess.Popen", 1)[0], win_probe_ns)
+        compile(str(win_probe_ns["helper"]), "<win-helper>", "exec")
+
+        code_c0 = _build_c0_code(str(c0_child_file), str(c0_grand_file))
         code_c1 = f"""
 import pathlib, subprocess, sys, time
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])

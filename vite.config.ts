@@ -60,7 +60,9 @@ export function renderSandboxDocument(iifeScript: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script>${escaped}</script></body></html>`;
 }
 
-function mermaidSandboxPlugin(): Plugin {
+export function mermaidSandboxPlugin(
+  buildSandboxScript?: () => Promise<string>,
+): Plugin {
   const virtualId = "virtual:mermaid-sandbox-url";
   const resolvedId = "\0" + virtualId;
   const devRoute = "/@mermaid-sandbox.html";
@@ -72,27 +74,34 @@ function mermaidSandboxPlugin(): Plugin {
   const getSandboxBundle = () => {
     if (!cachedBundlePromise) {
       cachedBundlePromise = (async () => {
-        const esbuild = await import("esbuild");
-        const entry = fileURLToPath(new URL("./src/mermaidSandboxEntry.ts", import.meta.url));
-        const bundled = await esbuild.build({
-          entryPoints: [entry],
-          bundle: true,
-          write: false,
-          format: "iife",
-          platform: "browser",
-          target: "es2020",
-          charset: "ascii",
-          legalComments: "none",
-          minify: true,
-          alias: {
-            "decode-named-character-reference": fileURLToPath(
-              new URL("./node_modules/decode-named-character-reference/index.js", import.meta.url),
-            ),
-          },
-        });
-        const script = bundled.outputFiles[0]?.text ?? "";
+        const script = buildSandboxScript
+          ? await buildSandboxScript()
+          : await (async () => {
+              const esbuild = await import("esbuild");
+              const entry = fileURLToPath(new URL("./src/mermaidSandboxEntry.ts", import.meta.url));
+              const bundled = await esbuild.build({
+                entryPoints: [entry],
+                bundle: true,
+                write: false,
+                format: "iife",
+                platform: "browser",
+                target: "es2020",
+                charset: "ascii",
+                legalComments: "none",
+                minify: true,
+                alias: {
+                  "decode-named-character-reference": fileURLToPath(
+                    new URL("./node_modules/decode-named-character-reference/index.js", import.meta.url),
+                  ),
+                },
+              });
+              return bundled.outputFiles[0]?.text ?? "";
+            })();
         return { script, html: renderSandboxDocument(script) };
-      })();
+      })().catch((error) => {
+        cachedBundlePromise = null;
+        throw error;
+      });
     }
     return cachedBundlePromise;
   };
@@ -108,6 +117,16 @@ function mermaidSandboxPlugin(): Plugin {
       return null;
     },
     configureServer(server) {
+      const invalidateIfSandboxSource = (filePath: string) => {
+        if (/[\\/]mermaidSandbox/i.test(filePath)) {
+          cachedBundlePromise = null;
+        }
+      };
+      server.watcher?.on("change", invalidateIfSandboxSource);
+      server.watcher?.on("add", invalidateIfSandboxSource);
+      server.watcher?.on("unlink", invalidateIfSandboxSource);
+      void getSandboxBundle().catch(() => {});
+
       server.middlewares.use(async (req, res, next) => {
         const requestPath = req.url?.split("?", 1)[0];
         if (
@@ -118,7 +137,6 @@ function mermaidSandboxPlugin(): Plugin {
           return;
         }
         try {
-          cachedBundlePromise = null;
           const bundle = await getSandboxBundle();
           const isScript = requestPath === devScriptRoute;
           res.statusCode = 200;
@@ -218,7 +236,10 @@ export default defineConfig(({mode}) => ({
   // These imports are reached only through the lazy writing worker. Discover
   // them before serving a page so first use cannot trigger an optimizer reload
   // and discard the native reader's in-memory workspace.
-  optimizeDeps: {include: ["nspell", "retext-english", "retext-repeated-words", "retext-indefinite-article", "vfile"]},
+  optimizeDeps: {
+    include: ["nspell", "retext-english", "retext-repeated-words", "retext-indefinite-article", "vfile", "pele/lazy", "dompurify"],
+    exclude: ["mermaid"],
+  },
   // The package's browser default allocates a DOM element at import time.
   // Its equivalent table decoder also works in the offline writing worker.
   resolve: {alias:{"decode-named-character-reference":fileURLToPath(new URL("./node_modules/decode-named-character-reference/index.js",import.meta.url))}},

@@ -62,9 +62,11 @@ interface ScopedActiveRun {
 const activeScopedRuns = new Map<string, ScopedActiveRun>();
 
 export default function PythonCell({ source, python, highlighted, context, sourceStart, sourceEnd }: { source: string; python: string; highlighted?: ReactNode; context?: PythonContext; sourceStart?: number; sourceEnd?: number }) {
+  const desktopQt = isDesktopQtHost();
+  const trackScopedRuns = desktopQt && Boolean(context);
   const identity = context ? pythonContextKey(source, context) : JSON.stringify([source]);
-  const docScope = context ? JSON.stringify([context.document, context.interpreter]) : "legacy";
-  const inFlightOnMount = context ? activeScopedRuns.get(identity) ?? null : null;
+  const docScope = context ? JSON.stringify([context.document, context.cell, context.interpreter]) : "legacy";
+  const inFlightOnMount = trackScopedRuns ? activeScopedRuns.get(identity) ?? null : null;
   const cachedOnMount = cachedPythonOutput(source, context) || null;
   const initial = cachedOnMount ?? inFlightOnMount?.retained?.result ?? null;
   const initialSource = cachedOnMount ? source : (inFlightOnMount?.retained?.source ?? "");
@@ -94,7 +96,8 @@ export default function PythonCell({ source, python, highlighted, context, sourc
   useEffect(() => (result ? retainVisiblePython(executedSource.current, result, executedContext.current) : undefined), [result]);
 
   useEffect(() => {
-    const current = activeRunRef.current ?? (context ? activeScopedRuns.get(identity) ?? null : null);
+    if (!trackScopedRuns) return;
+    const current = activeRunRef.current ?? activeScopedRuns.get(identity) ?? null;
     if (!current) return;
     activeRunRef.current = current;
     if (activeScopedRuns.get(current.key) === current) {
@@ -145,13 +148,42 @@ export default function PythonCell({ source, python, highlighted, context, sourc
     return () => {
       current.listeners.delete(listener);
     };
-  }, [context, identity]);
+  }, [trackScopedRuns, identity]);
 
   useEffect(() => {
     let active = true;
-    const prevDocScope = executedContext.current ? JSON.stringify([executedContext.current.document, executedContext.current.interpreter]) : "legacy";
+    const prevDocScope = executedContext.current ? JSON.stringify([executedContext.current.document, executedContext.current.cell, executedContext.current.interpreter]) : "legacy";
     const docChanged = prevDocScope !== docScope;
-    const scopedActive = context ? activeScopedRuns.get(identity) ?? null : null;
+    if (!desktopQt) {
+      const initialRun = ++runId.current;
+      localRunningRef.current = false;
+      localJobIdRef.current = null;
+      setRunning(false);
+      setStopping(false);
+      if (docChanged) {
+        executedSource.current = "";
+        executedIdentity.current = "";
+        executedContext.current = context;
+        lastVerifiedRef.current = null;
+        setResult(null);
+        setStored(false);
+      }
+      void loadPythonOutput(source, context).then(output => {
+        if (active && output && runId.current === initialRun) {
+          executedSource.current = source;
+          executedContext.current = context;
+          executedIdentity.current = identity;
+          const isStored = pythonStored(source, context);
+          if (output.provenance?.verified) {
+            lastVerifiedRef.current = { result: output, source, context, identity, stored: isStored };
+          }
+          setResult(output);
+          setStored(isStored);
+        }
+      });
+      return () => { active = false; };
+    }
+    const scopedActive = trackScopedRuns ? activeScopedRuns.get(identity) ?? null : null;
     if (docChanged) {
       ++runId.current;
       activeRunRef.current = scopedActive;
@@ -195,7 +227,7 @@ export default function PythonCell({ source, python, highlighted, context, sourc
       }
     });
     return () => { active = false; };
-  }, [source, identity, docScope]);
+  }, [desktopQt, trackScopedRuns, source, identity, docScope]);
 
   useEffect(() => {
     const pending = pendingStore.current;
@@ -223,7 +255,7 @@ export default function PythonCell({ source, python, highlighted, context, sourc
     if (stored && !running) cell.current?.dispatchEvent(new Event("supermd-output-stored", { bubbles: true }));
   }, [stored, running]);
 
-  const canStop = isDesktopQtHost();
+  const canStop = desktopQt;
 
   const restoreLastVerifiedIfNeeded = () => {
     const verified = lastVerifiedRef.current;
@@ -250,15 +282,21 @@ export default function PythonCell({ source, python, highlighted, context, sourc
     setStopping(false);
 
     if (currentContext) {
-      const entry: ScopedActiveRun = {
-        key: currentIdentity,
-        jobId,
-        stopping: false,
-        retained: lastVerifiedRef.current,
-        listeners: new Set(),
-      };
-      activeScopedRuns.set(currentIdentity, entry);
-      activeRunRef.current = entry;
+      const entry: ScopedActiveRun | null = desktopStop
+        ? {
+            key: currentIdentity,
+            jobId,
+            stopping: false,
+            retained: lastVerifiedRef.current,
+            listeners: new Set(),
+          }
+        : null;
+      if (entry) {
+        activeScopedRuns.set(currentIdentity, entry);
+        activeRunRef.current = entry;
+      } else {
+        localRunningRef.current = true;
+      }
       try {
         const output = await invoke<PythonResult>("run_python", {
           python,
@@ -273,7 +311,9 @@ export default function PythonCell({ source, python, highlighted, context, sourc
         };
         const freshExecution = !nativeVerified;
         rememberPythonOutput(currentSource, scopedOutput, currentContext);
-        entry.completed = { result: scopedOutput, source: currentSource, context: currentContext, identity: currentIdentity, freshExecution };
+        if (entry) {
+          entry.completed = { result: scopedOutput, source: currentSource, context: currentContext, identity: currentIdentity, freshExecution };
+        }
         if (currentRun === runId.current) {
           executedSource.current = currentSource;
           executedContext.current = currentContext;
@@ -287,8 +327,8 @@ export default function PythonCell({ source, python, highlighted, context, sourc
         }
       } catch (error) {
         if (error instanceof Error && error.message === "Python cell cancelled") {
-          entry.cancelled = true;
-          if (currentRun === runId.current) restoreLastVerifiedIfNeeded();
+          if (entry) entry.cancelled = true;
+          if (currentRun === runId.current && desktopStop) restoreLastVerifiedIfNeeded();
           return;
         }
         const failure: PythonResult = {
@@ -299,7 +339,9 @@ export default function PythonCell({ source, python, highlighted, context, sourc
           provenance: { verified: false, reason: "Execution failed before output was recorded" },
         };
         rememberPythonOutput(currentSource, failure, currentContext);
-        entry.completed = { result: failure, source: currentSource, context: currentContext, identity: currentIdentity, freshExecution: false };
+        if (entry) {
+          entry.completed = { result: failure, source: currentSource, context: currentContext, identity: currentIdentity, freshExecution: false };
+        }
         if (currentRun === runId.current) {
           executedSource.current = currentSource;
           executedContext.current = currentContext;
@@ -309,17 +351,23 @@ export default function PythonCell({ source, python, highlighted, context, sourc
           setResult(failure);
         }
       } finally {
-        if (activeScopedRuns.get(currentIdentity) === entry) {
-          activeScopedRuns.delete(currentIdentity);
-        }
-        if (activeRunRef.current === entry) {
-          activeRunRef.current = null;
+        if (entry) {
+          if (activeScopedRuns.get(currentIdentity) === entry) {
+            activeScopedRuns.delete(currentIdentity);
+          }
+          if (activeRunRef.current === entry) {
+            activeRunRef.current = null;
+          }
+        } else {
+          localRunningRef.current = false;
         }
         if (currentRun === runId.current) {
           setRunning(false);
           setStopping(false);
         }
-        for (const listener of [...entry.listeners]) listener();
+        if (entry) {
+          for (const listener of [...entry.listeners]) listener();
+        }
       }
       return;
     }
@@ -344,7 +392,7 @@ export default function PythonCell({ source, python, highlighted, context, sourc
       }
     } catch (error) {
       if (error instanceof Error && error.message === "Python cell cancelled") {
-        if (currentRun === runId.current) restoreLastVerifiedIfNeeded();
+        if (currentRun === runId.current && desktopStop) restoreLastVerifiedIfNeeded();
         return;
       }
       const failure: PythonResult = {
@@ -374,7 +422,7 @@ export default function PythonCell({ source, python, highlighted, context, sourc
   };
 
   const stop = async () => {
-    const activeScoped = activeRunRef.current ?? (context ? activeScopedRuns.get(identity) ?? null : null);
+    const activeScoped = activeRunRef.current ?? (trackScopedRuns ? activeScopedRuns.get(identity) ?? null : null);
     const jobId = activeScoped ? activeScoped.jobId : localJobIdRef.current;
     if (!running || stopping || !jobId) return;
     setStopping(true);

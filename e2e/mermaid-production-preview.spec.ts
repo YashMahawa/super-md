@@ -1,9 +1,13 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { test, expect } from "@playwright/test";
 import { mediaContrast } from "../src/mediaAppearance";
+
+const execFileAsync = promisify(execFile);
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -103,13 +107,18 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
 
   test.beforeAll(async ({}, testInfo) => {
     testInfo.setTimeout(120_000);
-    const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
     const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
-    execFileSync(npmCmd, ["run", "build"], {
-      cwd: repoRoot,
-      stdio: "pipe",
-      env: { ...process.env },
-    });
+    const hasPrebuiltDist =
+      process.env.SUPERMD_PREBUILT_DIST === "1" &&
+      fs.existsSync(path.join(repoRoot, "dist", "index.html")) &&
+      fs.existsSync(path.join(repoRoot, "dist", "android-reader.html"));
+    if (!hasPrebuiltDist) {
+      await execFileAsync(npxCmd, ["vite", "build"], {
+        cwd: repoRoot,
+        env: { ...process.env },
+        maxBuffer: 16 * 1024 * 1024,
+      });
+    }
 
     const port = await getFreePort();
     previewOrigin = `http://127.0.0.1:${port}`;

@@ -4,6 +4,7 @@ import { afterEach, expect, it } from 'vitest';
 import {
   buildHtmlEntries,
   htmlCspPlugin,
+  mermaidSandboxPlugin,
   renderSandboxDocument,
   stripLegacyMathFontFallbacks,
   woff2MathFontsPlugin,
@@ -114,3 +115,73 @@ it('strips legacy .woff and .ttf fallback sources from KaTeX @font-face rules wh
   });
   expect(transform?.call({} as never, katexCss, '/app/src/styles.css')).toBeNull();
 });
+
+it('caches the Mermaid sandbox bundle across dev-server requests and invalidates on sandbox source changes', async () => {
+  let buildCount = 0;
+  const plugin = mermaidSandboxPlugin(async () => `window.__sandboxGen = ${++buildCount};`);
+  const watcherHandlers = new Map<string, Array<(filePath: string) => void>>();
+  let middleware: ((req: { url?: string; method?: string }, res: Record<string, unknown>, next: (err?: unknown) => void) => Promise<void>) | null = null;
+
+  const configureServer = typeof plugin.configureServer === 'function' ? plugin.configureServer : plugin.configureServer?.handler;
+  configureServer?.call(
+    {} as never,
+    {
+      watcher: {
+        on(event: string, cb: (filePath: string) => void) {
+          watcherHandlers.set(event, [...(watcherHandlers.get(event) ?? []), cb]);
+        },
+      },
+      middlewares: {
+        use(fn: typeof middleware) {
+          middleware = fn;
+        },
+      },
+    } as never,
+  );
+
+  const requestRoute = async (url: string) => {
+    let body = '';
+    const headers = new Map<string, string>();
+    await middleware!(
+      { url, method: 'GET' },
+      {
+        statusCode: 0,
+        setHeader(k: string, v: string) {
+          headers.set(k, v);
+        },
+        end(chunk?: string) {
+          body = chunk ?? '';
+        },
+      },
+      (err) => {
+        if (err) throw err;
+      },
+    );
+    return { body, contentType: headers.get('Content-Type') };
+  };
+
+  const firstHtml = await requestRoute('/@mermaid-sandbox.html');
+  const secondScript = await requestRoute('/@mermaid-sandbox.js');
+  expect(buildCount).toBe(1);
+  expect(firstHtml.contentType).toContain('text/html');
+  expect(firstHtml.body).toContain('window.__sandboxGen = 1;');
+  expect(secondScript.contentType).toContain('application/javascript');
+  expect(secondScript.body).toBe('window.__sandboxGen = 1;');
+
+  // Unrelated file edits keep the cached Mermaid sandbox bundle warm.
+  for (const cb of watcherHandlers.get('change') ?? []) {
+    cb('/repo/src/components/PythonCell.tsx');
+  }
+  const thirdScript = await requestRoute('/@mermaid-sandbox.js');
+  expect(buildCount).toBe(1);
+  expect(thirdScript.body).toBe('window.__sandboxGen = 1;');
+
+  // Editing a mermaidSandbox source file invalidates the cache on next request.
+  for (const cb of watcherHandlers.get('change') ?? []) {
+    cb('/repo/src/mermaidSandboxWorker.ts');
+  }
+  const fourthScript = await requestRoute('/@mermaid-sandbox.js');
+  expect(buildCount).toBe(2);
+  expect(fourthScript.body).toBe('window.__sandboxGen = 2;');
+});
+

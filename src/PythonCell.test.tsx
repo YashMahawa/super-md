@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 const { nativeInvoke } = vi.hoisted(() => ({ nativeInvoke: vi.fn() }));
 vi.mock("./nativeBridge", () => ({ invoke: nativeInvoke }));
 
+import MarkdownPreview from "./components/MarkdownPreview";
 import PythonCell from "./components/PythonCell";
 import { cachedPythonOutput, pythonResults } from "./renderedOutputs";
 import type { PythonContext } from "./types";
@@ -306,6 +307,87 @@ describe("PythonCell execution and cancellation", () => {
     await act(async () => {
       resolveAndroid({ ok: true, stdout: "android\n", stderr: "", images: [] });
     });
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("unmounts prior PythonCell figures in MarkdownPreview when note code is replaced on Android before re-execution", async () => {
+    delete document.documentElement.dataset.host;
+    document.documentElement.dataset.platform = "android";
+
+    const png1x1 =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2ZkAAAAASUVORK5CYII=";
+    let resolve3dRun!: (value: unknown) => void;
+
+    nativeInvoke.mockImplementation((command: string, args: Record<string, any> = {}) => {
+      if (command === "load_python_output") {
+        if (String(args.source || "").includes("sample_2d")) {
+          return Promise.resolve({
+            result: { ok: true, stdout: "", stderr: "", images: [png1x1] },
+            provenance: { verified: true, document: "welcome", cell: "0", interpreter: "embedded" },
+          });
+        }
+        return Promise.resolve(null);
+      }
+      if (command === "store_python_output" || command === "cache_python_output") {
+        return Promise.resolve(true);
+      }
+      if (command === "run_python") {
+        return new Promise(resolve => {
+          resolve3dRun = resolve;
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const root = createRoot(host);
+
+    await act(async () => {
+      root.render(
+        <MarkdownPreview
+          markdown={"# Welcome\n\n```python\nprint('sample_2d')\n```\n"}
+          documentPath="welcome"
+          python="embedded"
+          dark={false}
+        />,
+      );
+    });
+    expect(host.querySelector(".cell-output img")).not.toBeNull();
+
+    // Replacing the note content with a new 3D matplotlib snippet must not keep the old figure mounted.
+    await act(async () => {
+      root.render(
+        <MarkdownPreview
+          markdown={"# Surface\n\n```python\nprint('plot_surface_3d')\n```\n"}
+          documentPath="welcome"
+          python="embedded"
+          dark={false}
+        />,
+      );
+    });
+    expect(host.querySelector(".cell-output img")).toBeNull();
+
+    const runBtn = host.querySelector<HTMLButtonElement>("button.python-run")!;
+    await act(async () => {
+      runBtn.click();
+    });
+    // Still null until the new 3D execution actually finishes.
+    expect(host.querySelector(".cell-output img")).toBeNull();
+
+    await act(async () => {
+      resolve3dRun({
+        ok: true,
+        stdout: "",
+        stderr: "",
+        images: [png1x1],
+        provenance: { verified: true, document: "welcome", cell: "0", interpreter: "embedded" },
+      });
+    });
+    expect(host.querySelector(".cell-output img")).not.toBeNull();
+
     await act(async () => {
       root.unmount();
     });
