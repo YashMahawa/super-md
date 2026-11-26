@@ -543,30 +543,29 @@ private class EntryPointDocumentProvider(
         selectionArgs: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
-        val cols = projection?.toList() ?: listOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
-        if (uri.pathSegments.lastOrNull() == "children") {
-            val parentId = uri.pathSegments.let { segs ->
-                val idx = segs.lastIndexOf("document")
-                if (idx >= 0 && idx + 1 < segs.lastIndex) segs[idx + 1] else ""
-            }
-            val children = if (parentId == "vault") {
-                listOf(
-                    "vault/Note.md" to firstFile,
-                    "vault/Second.md" to secondFile,
-                    "vault/Archive.smd" to portableFile,
-                )
-            } else {
-                emptyList()
-            }
+        val segments = uri.pathSegments
+        if (segments.lastOrNull() == "children" && segments.size >= 2) {
+            val cols = projection?.toList() ?: listOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_FLAGS,
+            )
+            val entries = listOf(
+                "vault/Note.md" to firstFile,
+                "vault/Second.md" to secondFile,
+                "vault/Archive.smd" to portableFile,
+            )
             return MatrixCursor(cols.toTypedArray()).apply {
-                for ((docId, childFile) in children) {
+                for ((docId, child) in entries) {
                     addRow(
                         cols.map { col ->
                             when (col) {
                                 DocumentsContract.Document.COLUMN_DOCUMENT_ID -> docId
-                                OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> childFile.name
-                                OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> childFile.length()
-                                DocumentsContract.Document.COLUMN_MIME_TYPE -> if (childFile.name.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
+                                OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> child.name
+                                OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> child.length()
+                                DocumentsContract.Document.COLUMN_MIME_TYPE ->
+                                    if (child.name.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
                                 DocumentsContract.Document.COLUMN_FLAGS -> 0
                                 else -> null
                             }
@@ -576,16 +575,16 @@ private class EntryPointDocumentProvider(
             }
         }
         val file = fileFor(uri)
-        val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+        val cols = projection?.toList() ?: listOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
         return MatrixCursor(cols.toTypedArray()).apply {
             addRow(
                 cols.map { col ->
                     when (col) {
-                        DocumentsContract.Document.COLUMN_DOCUMENT_ID -> docId
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID ->
+                            runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
                         OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> file.name
                         OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> file.length()
                         DocumentsContract.Document.COLUMN_MIME_TYPE -> if (file.name.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
-                        DocumentsContract.Document.COLUMN_FLAGS -> 0
                         else -> null
                     }
                 }.toTypedArray<Any?>(),
