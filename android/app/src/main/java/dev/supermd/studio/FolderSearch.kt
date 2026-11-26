@@ -9,7 +9,13 @@ import java.io.InputStream
 import java.nio.file.Files
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 
 private val SEARCHABLE_EXTENSIONS = setOf("md", "smd", "fmd", "markdown", "txt")
 private const val MAX_WALK_ENTRIES = 10_000
@@ -18,6 +24,8 @@ private const val MAX_SEARCH_MATCHES = 500
 private const val MAX_MATCHES_PER_NOTE = 50
 private const val SNIPPET_MAX_CHARS = 140
 private const val BATCH_SIZE = 20
+private const val SEARCH_WINDOW_CONCURRENCY = 6
+private const val WALK_DIR_CONCURRENCY = 4
 
 private val FENCE_REGEX = Regex("""^[ \t]{0,3}(`{3,}|~{3,})(.*)$""")
 private val INLINE_SVG_OPEN = Regex("""<svg\b[^>]*>""", RegexOption.IGNORE_CASE)
@@ -87,7 +95,9 @@ internal sealed interface SearchTreeNode {
         override val name: String,
         override val isDirectory: Boolean,
     ) : SearchTreeNode {
-        override val uriString: String = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
+        override val uriString: String by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
+        }
 
         override suspend fun listChildren(): List<SearchTreeNode> {
             coroutineContext.ensureActive()
@@ -154,7 +164,7 @@ internal fun resolveSearchRoot(context: Context, folderUri: Uri?): SearchTreeNod
             context = context,
             treeUri = folderUri,
             documentId = treeDocId,
-            name = DocumentFile.fromTreeUri(context, folderUri)?.name.orEmpty(),
+            name = "",
             isDirectory = true,
         )
     }
@@ -165,38 +175,63 @@ internal suspend fun walkFolderTree(
     root: SearchTreeNode?,
     maxEntries: Int = MAX_WALK_ENTRIES,
 ): List<FileEntry> {
-    if (root == null || !root.isDirectory) return emptyList()
+    if (root == null || !root.isDirectory || maxEntries <= 0) return emptyList()
     val results = ArrayList<FileEntry>()
-    val stack = ArrayDeque<Triple<SearchTreeNode, String, Int>>()
-    stack.addLast(Triple(root, "", 0))
+    val entryCount = java.util.concurrent.atomic.AtomicInteger(0)
+    coroutineScope {
+        val dirSemaphore = Semaphore(WALK_DIR_CONCURRENCY)
 
-    while (stack.isNotEmpty() && results.size < maxEntries) {
-        coroutineContext.ensureActive()
-        val (node, prefix, depth) = stack.removeLast()
-        if (depth > MAX_FOLDER_DEPTH) continue
-        val children = node.listChildren()
-        val dirs = ArrayList<Pair<SearchTreeNode, String>>()
-        val files = ArrayList<FileEntry>()
-        for (child in children) {
+        suspend fun visit(node: SearchTreeNode, prefix: String, depth: Int, prefetched: List<SearchTreeNode>? = null) {
             coroutineContext.ensureActive()
-            val childName = child.name
-            if (childName.isEmpty() || childName.startsWith('.')) continue
-            val rel = if (prefix.isEmpty()) childName else "$prefix/$childName"
-            if (child.isDirectory) {
-                dirs.add(child to rel)
-            } else if (isSearchableNoteName(childName)) {
-                files.add(FileEntry(childName, child.uriString, directory = false, relative = rel))
+            if (depth > MAX_FOLDER_DEPTH || entryCount.get() >= maxEntries) return
+            val children = prefetched ?: node.listChildren()
+            val dirs = ArrayList<Pair<SearchTreeNode, String>>()
+            val files = ArrayList<FileEntry>()
+            for (child in children) {
+                coroutineContext.ensureActive()
+                val childName = child.name
+                if (childName.isEmpty() || childName.startsWith('.')) continue
+                val rel = if (prefix.isEmpty()) childName else "$prefix/$childName"
+                if (child.isDirectory) {
+                    dirs.add(child to rel)
+                } else if (isSearchableNoteName(childName)) {
+                    files.add(FileEntry(childName, child.uriString, directory = false, relative = rel))
+                }
+            }
+            files.sortBy { it.name.lowercase(Locale.ROOT) }
+            for (entry in files) {
+                if (entryCount.get() >= maxEntries) return
+                results.add(entry)
+                entryCount.incrementAndGet()
+            }
+            if (dirs.isEmpty() || depth + 1 > MAX_FOLDER_DEPTH || entryCount.get() >= maxEntries) return
+            dirs.sortBy { it.first.name.lowercase(Locale.ROOT) }
+            if (dirs.size == 1) {
+                val (dirNode, rel) = dirs[0]
+                visit(dirNode, rel, depth + 1)
+                return
+            }
+            val prefetchedDirs: List<Deferred<List<SearchTreeNode>>> = dirs.map { (dirNode, _) ->
+                async(Dispatchers.IO) {
+                    dirSemaphore.withPermit {
+                        if (entryCount.get() >= maxEntries) emptyList() else dirNode.listChildren()
+                    }
+                }
+            }
+            try {
+                for (i in dirs.indices) {
+                    if (entryCount.get() >= maxEntries) break
+                    val (dirNode, rel) = dirs[i]
+                    visit(dirNode, rel, depth + 1, prefetchedDirs[i].await())
+                }
+            } finally {
+                for (job in prefetchedDirs) {
+                    if (!job.isCompleted) job.cancel()
+                }
             }
         }
-        files.sortBy { it.name.lowercase(Locale.ROOT) }
-        for (entry in files) {
-            if (results.size >= maxEntries) break
-            results.add(entry)
-        }
-        dirs.sortByDescending { it.first.name.lowercase(Locale.ROOT) }
-        for ((dirNode, rel) in dirs) {
-            stack.addLast(Triple(dirNode, rel, depth + 1))
-        }
+
+        visit(root, "", 0)
     }
     return results
 }
@@ -329,6 +364,20 @@ internal fun foldWithOffsets(source: String): FoldedText {
     var outLen = 0
     var i = 0
     while (i < source.length) {
+        val ch = source[i]
+        if (ch.code < 128) {
+            if (outLen >= starts.size) {
+                val nextCap = maxOf(starts.size * 2, outLen + 1)
+                starts = starts.copyOf(nextCap)
+                ends = ends.copyOf(nextCap)
+            }
+            sb.append(if (ch in 'A'..'Z') (ch.code + 32).toChar() else ch)
+            starts[outLen] = i
+            ends[outLen] = i + 1
+            outLen++
+            i++
+            continue
+        }
         val cp = source.codePointAt(i)
         val charCount = Character.charCount(cp)
         val folded = foldCodePoint(cp)
@@ -346,6 +395,33 @@ internal fun foldWithOffsets(source: String): FoldedText {
         i += charCount
     }
     return FoldedText(sb.toString(), starts.copyOf(outLen), ends.copyOf(outLen))
+}
+
+private fun mightContainNeedle(
+    markdown: String,
+    query: String,
+    foldedNeedle: String,
+    caseSensitive: Boolean,
+): Boolean {
+    if ('\u0000' in query || '\u0000' in foldedNeedle) return true
+    if (caseSensitive) return markdown.indexOf(query) >= 0
+    if (isAsciiOnly(foldedNeedle) && isAsciiOnly(markdown)) {
+        return markdown.contains(foldedNeedle, ignoreCase = true)
+    }
+    val sb = StringBuilder(markdown.length)
+    var i = 0
+    while (i < markdown.length) {
+        val ch = markdown[i]
+        if (ch.code < 128) {
+            sb.append(if (ch in 'A'..'Z') (ch.code + 32).toChar() else ch)
+            i++
+        } else {
+            val cp = markdown.codePointAt(i)
+            i += Character.charCount(cp)
+            sb.append(foldCodePoint(cp))
+        }
+    }
+    return sb.indexOf(foldedNeedle) >= 0
 }
 
 internal data class SnippetSlice(
@@ -461,6 +537,7 @@ private suspend fun searchMarkdownLines(
     remainingBudget: Int,
 ): Pair<List<FolderSearchMatch>, Boolean> {
     if (markdown.isEmpty() || query.isEmpty() || remainingBudget <= 0) return emptyList<FolderSearchMatch>() to false
+    if (!mightContainNeedle(markdown, query, foldedNeedle, caseSensitive)) return emptyList<FolderSearchMatch>() to false
     val masked = if (excludeDiagrams) maskDiagramSpans(markdown) else markdown
     val origLines = markdown.split('\n')
     val searchLines = masked.split('\n')
@@ -520,13 +597,12 @@ internal suspend fun streamTextSearch(
         return FolderSearchState(query = query, caseSensitive = caseSensitive, includeDiagrams = !excludeDiagrams)
     }
 
-    val seenUris = ArrayList<Uri>()
-    fun markSeen(uriStr: String?): Boolean {
-        if (uriStr.isNullOrBlank()) return false
-        val parsed = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return false
-        if (seenUris.any { runCatching { sameDocument(it, parsed) }.getOrDefault(it == parsed) }) return true
-        seenUris.add(parsed)
-        return false
+    val seenKeys = HashSet<String>(maxOf(16, tabs.size * 2))
+    fun markSeenUri(uriStr: String?): Uri? {
+        if (uriStr.isNullOrBlank()) return null
+        val parsed = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return null
+        if (!seenKeys.add(canonicalDocumentKey(parsed))) return null
+        return parsed
     }
 
     val foldedNeedle = if (caseSensitive) query else foldWithOffsets(query).text
@@ -547,7 +623,7 @@ internal suspend fun streamTextSearch(
     for (tab in orderedTabs) {
         coroutineContext.ensureActive()
         if (tab.id.isEmpty()) continue
-        markSeen(tab.uri)
+        markSeenUri(tab.uri)
         scannedFiles++
         val (found, hitCap) = searchMarkdownLines(
             markdown = tab.content,
@@ -592,38 +668,73 @@ internal suspend fun streamTextSearch(
         }
     }
 
+    val dedupedCandidates = ArrayList<Pair<FileEntry, Uri>>(candidates.size)
     for (entry in candidates) {
         coroutineContext.ensureActive()
-        if (markSeen(entry.uri)) continue
-        val parsedUri = runCatching { Uri.parse(entry.uri) }.getOrNull() ?: continue
-        val markdown = runCatching {
-            openUriStream(parsedUri)?.use { stream -> media.readSearchableNote(stream) }
-        }.getOrNull() ?: continue
+        val parsedUri = markSeenUri(entry.uri) ?: continue
+        dedupedCandidates.add(entry to parsedUri)
+    }
 
-        scannedFiles++
-        val (found, hitCap) = searchMarkdownLines(
-            markdown = markdown,
-            query = query,
-            foldedNeedle = foldedNeedle,
-            caseSensitive = caseSensitive,
-            excludeDiagrams = excludeDiagrams,
-            keyPrefix = entry.uri,
-            tabId = null,
-            uri = entry.uri,
-            name = entry.name,
-            relative = entry.relative.ifBlank { entry.name },
-            dirty = false,
-            isOpen = false,
-            remainingBudget = maxMatches - allMatches.size,
-        )
-        if (found.isNotEmpty()) {
-            allMatches.addAll(found)
-            pending.addAll(found)
-            if (pending.size >= BATCH_SIZE) flush(done = false)
-        }
-        if (hitCap || allMatches.size >= maxMatches) {
-            truncated = true
-            break
+    if (dedupedCandidates.isNotEmpty()) {
+        coroutineScope {
+            val inflight = ArrayDeque<Deferred<Pair<List<FolderSearchMatch>, Boolean>?>>(SEARCH_WINDOW_CONCURRENCY)
+            var nextToSubmit = 0
+
+            fun submitNext() {
+                while (inflight.size < SEARCH_WINDOW_CONCURRENCY && nextToSubmit < dedupedCandidates.size) {
+                    val (entry, parsedUri) = dedupedCandidates[nextToSubmit++]
+                    inflight.addLast(
+                        async(Dispatchers.IO) {
+                            coroutineContext.ensureActive()
+                            val markdown = runCatching {
+                                openUriStream(parsedUri)?.use { stream -> media.readSearchableNote(stream) }
+                            }.getOrNull() ?: return@async null
+                            searchMarkdownLines(
+                                markdown = markdown,
+                                query = query,
+                                foldedNeedle = foldedNeedle,
+                                caseSensitive = caseSensitive,
+                                excludeDiagrams = excludeDiagrams,
+                                keyPrefix = entry.uri,
+                                tabId = null,
+                                uri = entry.uri,
+                                name = entry.name,
+                                relative = entry.relative.ifBlank { entry.name },
+                                dirty = false,
+                                isOpen = false,
+                                remainingBudget = MAX_MATCHES_PER_NOTE,
+                            )
+                        },
+                    )
+                }
+            }
+
+            try {
+                submitNext()
+                while (inflight.isNotEmpty()) {
+                    coroutineContext.ensureActive()
+                    val task = inflight.removeFirst()
+                    submitNext()
+                    val scannedResult = task.await() ?: continue
+                    scannedFiles++
+                    val (found, _) = scannedResult
+                    val remaining = maxMatches - allMatches.size
+                    if (found.isNotEmpty() && remaining > 0) {
+                        val accepted = if (found.size > remaining) found.subList(0, remaining) else found
+                        allMatches.addAll(accepted)
+                        pending.addAll(accepted)
+                        if (pending.size >= BATCH_SIZE) flush(done = false)
+                    }
+                    if (found.size > remaining || allMatches.size >= maxMatches) {
+                        truncated = true
+                        break
+                    }
+                }
+            } finally {
+                for (task in inflight) {
+                    if (!task.isCompleted) task.cancel()
+                }
+            }
         }
     }
 

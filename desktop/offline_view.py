@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from core.paths import DESKTOP_DIR
 
 
 DEFAULT_PREVIEW_TIMEOUT = 55.0
@@ -528,7 +529,7 @@ def _format_preview_failure(stdout_path: Path, stderr_path: Path) -> str:
 def _agent_cli_command() -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, "agent"]
-    return [sys.executable, str(Path(__file__).with_name("agent_cli.py"))]
+    return [sys.executable, str(DESKTOP_DIR / "agent_cli.py")]
 
 
 def _run_preview_helper(

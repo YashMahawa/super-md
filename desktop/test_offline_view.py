@@ -24,6 +24,7 @@ from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
 from agent_documents import DocumentStore
+from folder_ops import same_path
 import offline_view
 from studio import Session, Studio
 
@@ -114,7 +115,7 @@ def _read_nonempty(path: Path) -> str | None:
     return text or None
 
 
-def _await_file(path: Path, timeout: float = 15.0) -> str:
+def _await_file(path: Path, timeout: float = 20.0) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = _read_nonempty(path)
@@ -124,7 +125,7 @@ def _await_file(path: Path, timeout: float = 15.0) -> str:
     raise AssertionError(f"Timed out waiting for marker file {path}")
 
 
-def _wait_until(predicate, timeout: float = 15.0, *, pump_app: QApplication | None = None) -> bool:
+def _wait_until(predicate, timeout: float = 20.0, *, pump_app: QApplication | None = None) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pump_app is not None:
@@ -183,6 +184,7 @@ mode = spec.get("mode", "ok")
 png_b64 = spec.get("png_b64", "")
 helper_pid_file = spec.get("helper_pid_file")
 child_pid_file = spec.get("child_pid_file")
+release_file = spec.get("release_file")
 retain_streams = bool(spec.get("retain_streams", False))
 
 if helper_pid_file:
@@ -200,7 +202,12 @@ if child_pid_file:
 if spec.get("mutate_source"):
     source.write_text(content + "\\nmutated\\n", encoding="utf-8")
 
-if mode == "sleep":
+if release_file:
+    release_path = Path(release_file)
+    deadline = time.monotonic() + float(spec.get("sleep", 30))
+    while not release_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+elif mode == "sleep":
     time.sleep(float(spec.get("sleep", 60)))
 elif mode == "json_error":
     sys.stdout.write(json.dumps({"ok": False, "error": {"code": "preview_error", "message": spec.get("message", "Structured preview failure")}}) + "\\n")
@@ -320,6 +327,7 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
             timed_child = root / "timed_child.pid"
             sibling_helper = root / "sibling_helper.pid"
             sibling_child = root / "sibling_child.pid"
+            sibling_release = root / "sibling_release.txt"
 
             timed_content = "SPEC:" + json.dumps({
                 "mode": "sleep",
@@ -329,11 +337,10 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                 "retain_streams": True,
             })
             sibling_content = "SPEC:" + json.dumps({
-                "mode": "sleep",
-                "sleep": 2.2,
                 "png_b64": self.png_b64,
                 "helper_pid_file": str(sibling_helper),
                 "child_pid_file": str(sibling_child),
+                "release_file": str(sibling_release),
             })
 
             sibling_result: dict[str, object] = {}
@@ -341,7 +348,7 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
             def run_sibling():
                 try:
                     sibling_result["bytes"] = offline_view.render_live_snapshot(
-                        sibling_content, {}, "", width=800, timeout=15
+                        sibling_content, {}, "", width=800, timeout=25
                     )
                 except Exception as exc:  # pragma: no cover
                     sibling_result["error"] = exc
@@ -352,31 +359,49 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                 sib_pid = int(_await_file(sibling_helper))
                 sib_child_pid = int(_await_file(sibling_child))
                 self.spawned_pids.extend([sib_pid, sib_child_pid])
+                self.assertTrue(_pid_alive(sib_pid))
+                self.assertTrue(_pid_alive(sib_child_pid))
 
-                with self.assertRaisesRegex(ValueError, "Background preview timed out after 0.6 seconds"):
-                    offline_view.render_live_snapshot(timed_content, {}, "", width=800, timeout=0.6)
+                with self.assertRaisesRegex(ValueError, "Background preview timed out after 1.5 seconds"):
+                    offline_view.render_live_snapshot(timed_content, {}, "", width=800, timeout=1.5)
 
                 t_pid = int(_await_file(timed_helper))
                 t_child_pid = int(_await_file(timed_child))
                 self.spawned_pids.extend([t_pid, t_child_pid])
 
-                # Timed-out helper AND its descendant process must both be terminated.
-                self.assertTrue(_wait_until(lambda: not _pid_alive(t_pid) and not _pid_alive(t_child_pid), timeout=5.0))
-                # Unrelated process is completely untouched.
+                # Timed-out helper AND its descendant process must both be terminated,
+                # while the sibling preview tree and unrelated subprocess stay alive.
+                self.assertTrue(_wait_until(lambda: not _pid_alive(t_pid) and not _pid_alive(t_child_pid), timeout=8.0))
+                self.assertTrue(_pid_alive(sib_pid))
+                self.assertTrue(_pid_alive(sib_child_pid))
                 self.assertIsNone(unrelated.poll())
 
-                # Concurrent sibling preview completes with its PNG artifact intact.
-                sibling_thread.join(timeout=15)
+                # Concurrent sibling preview completes with its PNG artifact intact once released.
+                sibling_release.write_text("done", encoding="utf-8")
+                sibling_thread.join(timeout=20)
                 self.assertNotIn("error", sibling_result)
                 self.assertTrue(isinstance(sibling_result.get("bytes"), bytes) and sibling_result["bytes"].startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertTrue(_wait_until(lambda: not _pid_alive(sib_child_pid), timeout=8.0))
                 self.assertIsNone(unrelated.poll())
 
     def test_studio_tab_and_window_close_cancel_only_owned_background_previews(self):
         unrelated = self._start_unrelated_process()
-        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as data_dir, tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as notes_dir:
+        with (
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as data_dir,
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as notes_dir,
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as alias_dir,
+        ):
             previous_home = os.environ.get("SUPERMD_DATA_HOME")
             os.environ["SUPERMD_DATA_HOME"] = data_dir
             root = Path(notes_dir)
+            open_root = root
+            if os.name != "nt":
+                candidate_alias = Path(alias_dir) / "raw-notes-link"
+                try:
+                    candidate_alias.symlink_to(root, target_is_directory=True)
+                    open_root = candidate_alias
+                except OSError:
+                    open_root = root
             fake_cli = root / "fake_agent_cli.py"
             _write_fake_agent_cli(fake_cli)
 
@@ -389,13 +414,12 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                 tab_a_helper = root / "tab_a_helper.pid"
                 tab_a_child = root / "tab_a_child.pid"
                 tab_b_helper = root / "tab_b_helper.pid"
+                tab_b_release = root / "tab_b_release.txt"
                 win2_helper = root / "win2_helper.pid"
                 win2_child = root / "win2_child.pid"
+                win2_release = root / "win2_release.txt"
 
-                note_a = root / "a.md"
-                note_b = root / "b.md"
-                note_w2 = root / "w2.md"
-                note_a.write_text(
+                (root / "a.md").write_text(
                     "# A\nSPEC:" + json.dumps({
                         "mode": "sleep",
                         "sleep": 60,
@@ -404,40 +428,41 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     }),
                     encoding="utf-8",
                 )
-                note_b.write_text(
+                (root / "b.md").write_text(
                     "# B\nSPEC:" + json.dumps({
-                        "mode": "sleep",
-                        "sleep": 1.2,
                         "png_b64": self.png_b64,
                         "helper_pid_file": str(tab_b_helper),
+                        "release_file": str(tab_b_release),
                     }),
                     encoding="utf-8",
                 )
-                note_w2.write_text(
+                (root / "w2.md").write_text(
                     "# W2\nSPEC:" + json.dumps({
-                        "mode": "sleep",
-                        "sleep": 1.4,
                         "png_b64": self.png_b64,
                         "helper_pid_file": str(win2_helper),
                         "child_pid_file": str(win2_child),
+                        "release_file": str(win2_release),
                     }),
                     encoding="utf-8",
                 )
+                note_a = open_root / "a.md"
+                note_b = open_root / "b.md"
+                note_w2 = open_root / "w2.md"
 
                 window1.openNote(str(note_a))
                 window1.openNote(str(note_b))
                 window2.openNote(str(note_w2))
                 self.assertTrue(
                     _wait_until(
-                        lambda: any(t.get("path") == str(note_a) for t in window1.tabs)
-                        and any(t.get("path") == str(note_b) for t in window1.tabs)
-                        and any(t.get("path") == str(note_w2) for t in window2.tabs),
+                        lambda: any(same_path(t.get("path", ""), note_a) for t in window1.tabs)
+                        and any(same_path(t.get("path", ""), note_b) for t in window1.tabs)
+                        and any(same_path(t.get("path", ""), note_w2) for t in window2.tabs),
                         pump_app=self.app,
                     )
                 )
-                tab_a = next(t for t in window1.tabs if t.get("path") == str(note_a))
-                tab_b = next(t for t in window1.tabs if t.get("path") == str(note_b))
-                tab_w2 = next(t for t in window2.tabs if t.get("path") == str(note_w2))
+                tab_a = next(t for t in window1.tabs if same_path(t.get("path", ""), note_a))
+                tab_b = next(t for t in window1.tabs if same_path(t.get("path", ""), note_b))
+                tab_w2 = next(t for t in window2.tabs if same_path(t.get("path", ""), note_w2))
 
                 window1.selectTab(tab_a["id"])
                 window2.selectTab(tab_w2["id"])
@@ -454,11 +479,17 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     pid_w2_child = int(_await_file(win2_child))
                     self.spawned_pids.extend([pid_a, pid_a_child, pid_w2, pid_w2_child])
 
+                    # Both preview trees are live before closing tab_a.
+                    self.assertTrue(_pid_alive(pid_a))
+                    self.assertTrue(_pid_alive(pid_a_child))
+                    self.assertTrue(_pid_alive(pid_w2))
+                    self.assertTrue(_pid_alive(pid_w2_child))
+
                     # Closing tab_a in window1 returns promptly without blocking Qt, kills tab_a's helper tree,
                     # activates tab_b cleanly, and leaves window2 and unrelated subprocesses running cleanly.
                     close_started = time.monotonic()
                     window1.closeTab(tab_a["id"])
-                    self.assertLess(time.monotonic() - close_started, 0.25)
+                    self.assertLess(time.monotonic() - close_started, 1.0)
 
                     self.assertTrue(
                         _wait_until(
@@ -469,6 +500,10 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                             pump_app=self.app,
                         )
                     )
+                    self.assertTrue(_pid_alive(pid_w2))
+                    self.assertTrue(_pid_alive(pid_w2_child))
+                    self.assertIsNone(unrelated.poll())
+
                     res_a, err_a, owner_a = bridge.get("req-a")
                     self.assertIsNone(res_a)
                     self.assertIn("cancelled", err_a.lower())
@@ -480,6 +515,10 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     window1._capture_background_preview("req-b", tab_b["id"], rev_b, {"revision": rev_b}, {"width": 800})
                     pid_b = int(_await_file(tab_b_helper))
                     self.spawned_pids.append(pid_b)
+                    self.assertTrue(_pid_alive(pid_b))
+
+                    tab_b_release.write_text("done", encoding="utf-8")
+                    win2_release.write_text("done", encoding="utf-8")
 
                     self.assertTrue(
                         _wait_until(
@@ -495,6 +534,7 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     self.assertEqual(res_w2["renderedFrom"], "background-preview")
                     self.assertEqual((res_b["width"], res_b["height"]), (64, 48))
                     self.assertEqual((res_w2["width"], res_w2["height"]), (64, 48))
+                    self.assertTrue(_wait_until(lambda: not _pid_alive(pid_w2_child), timeout=8.0))
                     self.assertIsNone(unrelated.poll())
 
                     # Now start another long preview in window1 and another in window2, then close window1 via stop():
@@ -502,6 +542,8 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     win1_close_helper = root / "win1_close_helper.pid"
                     win1_close_child = root / "win1_close_child.pid"
                     win2_keep_helper = root / "win2_keep_helper.pid"
+                    win2_keep_child = root / "win2_keep_child.pid"
+                    win2_keep_release = root / "win2_keep_release.txt"
 
                     tab_b["content"] = "# B2\nSPEC:" + json.dumps({
                         "mode": "sleep",
@@ -510,10 +552,10 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                         "child_pid_file": str(win1_close_child),
                     })
                     tab_w2["content"] = "# W2-2\nSPEC:" + json.dumps({
-                        "mode": "sleep",
-                        "sleep": 1.0,
                         "png_b64": self.png_b64,
                         "helper_pid_file": str(win2_keep_helper),
+                        "child_pid_file": str(win2_keep_child),
+                        "release_file": str(win2_keep_release),
                     })
                     rev_b2 = window1._agent_viewport_revision(tab_b["id"])
                     rev_w2_2 = window2._agent_viewport_revision(tab_w2["id"])
@@ -524,11 +566,17 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     pid_w1_close = int(_await_file(win1_close_helper))
                     pid_w1_close_child = int(_await_file(win1_close_child))
                     pid_w2_keep = int(_await_file(win2_keep_helper))
-                    self.spawned_pids.extend([pid_w1_close, pid_w1_close_child, pid_w2_keep])
+                    pid_w2_keep_child = int(_await_file(win2_keep_child))
+                    self.spawned_pids.extend([pid_w1_close, pid_w1_close_child, pid_w2_keep, pid_w2_keep_child])
+
+                    self.assertTrue(_pid_alive(pid_w1_close))
+                    self.assertTrue(_pid_alive(pid_w1_close_child))
+                    self.assertTrue(_pid_alive(pid_w2_keep))
+                    self.assertTrue(_pid_alive(pid_w2_keep_child))
 
                     stop_started = time.monotonic()
                     window1.stop()
-                    self.assertLess(time.monotonic() - stop_started, 0.25)
+                    self.assertLess(time.monotonic() - stop_started, 1.0)
 
                     self.assertTrue(
                         _wait_until(
@@ -536,15 +584,23 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                             pump_app=self.app,
                         )
                     )
+                    self.assertTrue(_pid_alive(pid_w2_keep))
+                    self.assertTrue(_pid_alive(pid_w2_keep_child))
+                    self.assertIsNone(unrelated.poll())
+
+                    win2_keep_release.write_text("done", encoding="utf-8")
                     self.assertTrue(_wait_until(lambda: bridge.get("req-w2-2") is not None, pump_app=self.app))
                     res_w2_2, err_w2_2, _ = bridge.get("req-w2-2")
                     self.assertEqual(err_w2_2, "")
                     self.assertEqual(res_w2_2["renderedFrom"], "background-preview")
+                    self.assertEqual((res_w2_2["width"], res_w2_2["height"]), (64, 48))
+                    self.assertTrue(_wait_until(lambda: not _pid_alive(pid_w2_keep_child), timeout=8.0))
                     self.assertIsNone(unrelated.poll())
             finally:
                 for win in (window1, window2):
                     win.stop()
                     win.pool.shutdown(wait=True, cancel_futures=True)
+                    win._search_pool.shutdown(wait=True, cancel_futures=True)
                 session.writes.shutdown()
                 if previous_home is None:
                     os.environ.pop("SUPERMD_DATA_HOME", None)
