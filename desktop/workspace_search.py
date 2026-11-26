@@ -3,10 +3,12 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
+from dataclasses import dataclass, field
 import os
 import threading
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from agent_documents import diagram_spans
 import documents
@@ -182,31 +184,29 @@ def _build_snippet(raw_line: str, match_start: int, match_end: int) -> tuple[str
     return snippet, utf16_offset(snippet, cp_start), utf16_offset(snippet, cp_end)
 
 
+def _find_direct_line_matches(haystack: str, needle: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    nlen = len(needle)
+    step = max(1, nlen)
+    cursor = 0
+    while len(spans) < MAX_MATCHES_PER_NOTE:
+        pos = haystack.find(needle, cursor)
+        if pos < 0:
+            break
+        spans.append((pos, pos + nlen))
+        cursor = pos + step
+    return spans
+
+
 def _find_line_matches(search_line: str, query: str, *, folded_needle: str, case_sensitive: bool) -> list[tuple[int, int]]:
     """Return non-overlapping `(orig_start, orig_end)` code-point spans in `search_line`."""
-    spans: list[tuple[int, int]] = []
     if case_sensitive:
-        qlen = len(query)
-        cursor = 0
-        while len(spans) < MAX_MATCHES_PER_NOTE:
-            pos = search_line.find(query, cursor)
-            if pos < 0:
-                break
-            spans.append((pos, pos + qlen))
-            cursor = pos + max(1, qlen)
-        return spans
+        return _find_direct_line_matches(search_line, query)
 
     if search_line.isascii() and folded_needle.isascii():
-        haystack = search_line.lower()
-        nlen = len(folded_needle)
-        cursor = 0
-        while len(spans) < MAX_MATCHES_PER_NOTE:
-            pos = haystack.find(folded_needle, cursor)
-            if pos < 0:
-                break
-            spans.append((pos, pos + nlen))
-            cursor = pos + max(1, nlen)
-        return spans
+        return _find_direct_line_matches(search_line.lower(), folded_needle)
+
+    spans: list[tuple[int, int]] = []
 
     haystack, starts, ends = fold_with_offsets(search_line)
     if not folded_needle or not haystack:
@@ -299,6 +299,245 @@ def _scan_note_lines(
     return matches, truncated
 
 
+def _resolve_folder_root(folder_root: Path | None) -> Path | None:
+    if folder_root is None:
+        return None
+    try:
+        if (
+            not folder_root.is_symlink()
+            and not getattr(folder_root, "is_junction", lambda: False)()
+            and folder_root.is_dir()
+        ):
+            return folder_root.resolve()
+    except OSError:
+        pass
+    return None
+
+
+def _relative_note_label(path_str: str, fallback: str, resolved_root: Path | None) -> str:
+    if not path_str:
+        return fallback
+    if resolved_root is not None:
+        try:
+            return Path(path_str).resolve(strict=False).relative_to(resolved_root).as_posix()
+        except (OSError, ValueError):
+            pass
+    return Path(path_str).name or fallback
+
+
+def _note_meta(
+    *,
+    key: str,
+    name: str,
+    relative: str,
+    tab_id: str = "",
+    path: str = "",
+    dirty: bool = False,
+    is_open: bool = False,
+) -> dict:
+    return {
+        "key": key,
+        "tabId": tab_id,
+        "path": path,
+        "name": name,
+        "relative": relative,
+        "dirty": dirty,
+        "isOpen": is_open,
+    }
+
+
+def _iter_searchable_notes(
+    tabs_snapshot: list[dict],
+    recent_snapshot: list[dict],
+    resolved_root: Path | None,
+    *,
+    active_id: str,
+    cancel_event: threading.Event | None = None,
+) -> Iterator[tuple[str, dict]]:
+    """Yield `(markdown, note_meta)` in search precedence order: active tab, open tabs, then folder or recents."""
+    ordered_tabs = sorted(tabs_snapshot, key=lambda t: (0 if t.get("id") == active_id else 1))
+    seen_paths: set[str] = set()
+
+    for tab in ordered_tabs:
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        path = tab.get("path") or ""
+        note_key = canonical_note_key(path) if path else ""
+        if note_key:
+            seen_paths.add(note_key)
+        tab_id = tab.get("id") or ""
+        name = tab.get("name") or (Path(path).name if path else "Untitled.md")
+        yield (
+            tab.get("content") or "",
+            _note_meta(
+                key=note_key if path else f"tab:{tab_id}",
+                tab_id=tab_id,
+                path=path,
+                name=name,
+                relative=_relative_note_label(path, name, resolved_root),
+                dirty=bool(tab.get("dirty")),
+                is_open=True,
+            ),
+        )
+
+    if cancel_event is not None and cancel_event.is_set():
+        return
+
+    disk_candidates: list[dict] = []
+    if resolved_root is not None:
+        disk_candidates = walk_folder_notes(resolved_root, cancel_event=cancel_event)
+    else:
+        for recent in sorted(recent_snapshot, key=lambda x: (0 if x.get("pinned") else 1)):
+            rpath = recent.get("path") or ""
+            if rpath:
+                disk_candidates.append({
+                    "path": rpath,
+                    "name": recent.get("name") or Path(rpath).name,
+                    "relative": Path(rpath).name,
+                })
+
+    deduped_candidates: list[dict] = []
+    for entry in disk_candidates:
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        epath = entry["path"]
+        key = entry.get("canonicalKey") or canonical_note_key(epath)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped_candidates.append(
+            _note_meta(
+                key=key,
+                path=epath,
+                name=entry["name"],
+                relative=entry.get("relative") or entry["name"],
+            )
+        )
+
+    if not deduped_candidates:
+        return
+    if len(deduped_candidates) == 1:
+        meta = deduped_candidates[0]
+        markdown = documents.read_searchable_markdown(meta["path"])
+        if markdown is not None:
+            yield markdown, meta
+        return
+
+    stop_workers = threading.Event()
+
+    def _read_disk_chunk(chunk: list[dict]) -> list[tuple[str | None, dict]]:
+        out: list[tuple[str | None, dict]] = []
+        for meta in chunk:
+            if stop_workers.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                break
+            out.append((documents.read_searchable_markdown(meta["path"]), meta))
+        return out
+
+    chunks: list[list[dict]] = []
+    cursor_idx = 0
+    ramp = (2, 4, 8)
+    step_idx = 0
+    total_candidates = len(deduped_candidates)
+    while cursor_idx < total_candidates:
+        step = ramp[step_idx] if step_idx < len(ramp) else SEARCH_CHUNK_SIZE
+        step_idx += 1
+        chunks.append(deduped_candidates[cursor_idx : cursor_idx + step])
+        cursor_idx += step
+
+    inflight: deque[Future[list[tuple[str | None, dict]]]] = deque()
+    next_chunk_idx = 0
+
+    def _submit_window() -> None:
+        nonlocal next_chunk_idx
+        while len(inflight) < SEARCH_WINDOW_CHUNKS and next_chunk_idx < len(chunks):
+            if stop_workers.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                break
+            chunk = chunks[next_chunk_idx]
+            next_chunk_idx += 1
+            inflight.append(_SEARCH_EXECUTOR.submit(_read_disk_chunk, chunk))
+
+    try:
+        _submit_window()
+        while inflight:
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            fut = inflight.popleft()
+            _submit_window()
+            for markdown, meta in fut.result():
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if markdown is None:
+                    continue
+                yield markdown, meta
+    finally:
+        stop_workers.set()
+        for pending_fut in inflight:
+            pending_fut.cancel()
+        for pending_fut in inflight:
+            if not pending_fut.cancelled():
+                try:
+                    pending_fut.result()
+                except Exception:
+                    pass
+
+
+@dataclass
+class _SearchStream:
+    query: str
+    folded_needle: str
+    case_sensitive: bool
+    exclude_diagrams: bool
+    max_matches: int
+    cancel_event: threading.Event | None = None
+    on_batch: Callable[[list[dict], int, bool, bool], None] | None = None
+    all_matches: list[dict] = field(default_factory=list)
+    pending_batch: list[dict] = field(default_factory=list)
+    scanned_files: int = 0
+    truncated: bool = False
+
+    def is_cancelled(self) -> bool:
+        return self.cancel_event is not None and self.cancel_event.is_set()
+
+    def flush(self, *, done: bool = False) -> None:
+        if self.on_batch is not None and (self.pending_batch or done):
+            batch = self.pending_batch
+            self.pending_batch = []
+            self.on_batch(batch, self.scanned_files, self.truncated, done)
+
+    def scan_note(self, markdown: str, note_meta: dict) -> bool:
+        """Scan one note, emit full batches, and return True when `max_matches` is reached."""
+        self.scanned_files += 1
+        found, hit_cap = _scan_note_lines(
+            markdown,
+            self.query,
+            folded_needle=self.folded_needle,
+            case_sensitive=self.case_sensitive,
+            exclude_diagrams=self.exclude_diagrams,
+            note_meta=note_meta,
+            remaining_budget=self.max_matches - len(self.all_matches),
+            cancel_event=self.cancel_event,
+        )
+        if found:
+            self.all_matches.extend(found)
+            self.pending_batch.extend(found)
+            if len(self.pending_batch) >= BATCH_SIZE:
+                self.flush(done=False)
+        if hit_cap or len(self.all_matches) >= self.max_matches:
+            self.truncated = True
+            return True
+        return False
+
+    def finish(self, *, cancelled: bool = False) -> dict:
+        if not cancelled:
+            self.flush(done=True)
+        return {
+            "matches": self.all_matches,
+            "scannedFiles": self.scanned_files,
+            "truncated": self.truncated,
+            "cancelled": cancelled,
+        }
+
+
 def stream_text_search(
     query: str,
     tabs_snapshot: list[dict],
@@ -318,200 +557,29 @@ def stream_text_search(
             on_batch([], 0, False, True)
         return {"matches": [], "scannedFiles": 0, "truncated": False, "cancelled": False}
 
-    resolved_root: Path | None = None
-    if folder_root is not None:
-        try:
-            if (
-                not folder_root.is_symlink()
-                and not getattr(folder_root, "is_junction", lambda: False)()
-                and folder_root.is_dir()
-            ):
-                resolved_root = folder_root.resolve()
-        except OSError:
-            resolved_root = None
-
-    def rel_label(path_str: str, fallback: str) -> str:
-        if not path_str:
-            return fallback
-        if resolved_root is not None:
-            try:
-                return Path(path_str).resolve(strict=False).relative_to(resolved_root).as_posix()
-            except (OSError, ValueError):
-                pass
-        return Path(path_str).name or fallback
-
-    ordered_tabs = sorted(tabs_snapshot, key=lambda t: (0 if t.get("id") == active_id else 1))
-    seen_paths: set[str] = set()
-    all_matches: list[dict] = []
-    pending_batch: list[dict] = []
-    scanned_files = 0
-    truncated = False
-    folded_needle = query if case_sensitive else query.casefold()
-
-    def flush(done: bool = False) -> None:
-        nonlocal pending_batch
-        if on_batch is not None and (pending_batch or done):
-            batch = pending_batch
-            pending_batch = []
-            on_batch(batch, scanned_files, truncated, done)
-
-    for tab in ordered_tabs:
-        if cancel_event is not None and cancel_event.is_set():
-            return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
-        path = tab.get("path") or ""
-        if path:
-            seen_paths.add(canonical_note_key(path))
-        tab_id = tab.get("id") or ""
-        name = tab.get("name") or (Path(path).name if path else "Untitled.md")
-        meta = {
-            "key": canonical_note_key(path) if path else f"tab:{tab_id}",
-            "tabId": tab_id,
-            "path": path,
-            "name": name,
-            "relative": rel_label(path, name),
-            "dirty": bool(tab.get("dirty")),
-            "isOpen": True,
-        }
-        scanned_files += 1
-        found, hit_cap = _scan_note_lines(
-            tab.get("content") or "",
-            query,
-            folded_needle=folded_needle,
-            case_sensitive=case_sensitive,
-            exclude_diagrams=exclude_diagrams,
-            note_meta=meta,
-            remaining_budget=max_matches - len(all_matches),
+    resolved_root = _resolve_folder_root(folder_root)
+    stream = _SearchStream(
+        query=query,
+        folded_needle=query if case_sensitive else query.casefold(),
+        case_sensitive=case_sensitive,
+        exclude_diagrams=exclude_diagrams,
+        max_matches=max_matches,
+        cancel_event=cancel_event,
+        on_batch=on_batch,
+    )
+    with closing(
+        _iter_searchable_notes(
+            tabs_snapshot,
+            recent_snapshot,
+            resolved_root,
+            active_id=active_id,
             cancel_event=cancel_event,
         )
-        if found:
-            all_matches.extend(found)
-            pending_batch.extend(found)
-            if len(pending_batch) >= BATCH_SIZE:
-                flush(done=False)
-        if hit_cap or len(all_matches) >= max_matches:
-            truncated = True
-            flush(done=True)
-            return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": True, "cancelled": False}
-
-    disk_candidates: list[dict] = []
-    if resolved_root is not None:
-        disk_candidates = walk_folder_notes(resolved_root, cancel_event=cancel_event)
-    else:
-        for r in sorted(recent_snapshot, key=lambda x: (0 if x.get("pinned") else 1)):
-            rpath = r.get("path") or ""
-            if rpath:
-                disk_candidates.append({
-                    "path": rpath,
-                    "name": r.get("name") or Path(rpath).name,
-                    "relative": Path(rpath).name,
-                })
-
-    deduped_candidates: list[dict] = []
-    for entry in disk_candidates:
-        if cancel_event is not None and cancel_event.is_set():
-            return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
-        epath = entry["path"]
-        key = entry.get("canonicalKey") or canonical_note_key(epath)
-        if key in seen_paths:
-            continue
-        seen_paths.add(key)
-        deduped_candidates.append({
-            "key": key,
-            "tabId": "",
-            "path": epath,
-            "name": entry["name"],
-            "relative": entry.get("relative") or entry["name"],
-            "dirty": False,
-            "isOpen": False,
-        })
-
-    stop_workers = threading.Event()
-
-    def _scan_disk_chunk(chunk: list[dict]) -> list[list[dict] | None]:
-        out: list[list[dict] | None] = []
-        for meta in chunk:
-            if stop_workers.is_set() or (cancel_event is not None and cancel_event.is_set()):
+    ) as searchable_notes:
+        for markdown, meta in searchable_notes:
+            if stream.scan_note(markdown, meta) or stream.is_cancelled():
                 break
-            markdown = documents.read_searchable_markdown(meta["path"])
-            if markdown is None:
-                out.append(None)
-                continue
-            found, _ = _scan_note_lines(
-                markdown,
-                query,
-                folded_needle=folded_needle,
-                case_sensitive=case_sensitive,
-                exclude_diagrams=exclude_diagrams,
-                note_meta=meta,
-                remaining_budget=MAX_MATCHES_PER_NOTE,
-                cancel_event=cancel_event,
-            )
-            out.append(found)
-        return out
 
-    if deduped_candidates:
-        chunks: list[list[dict]] = []
-        cursor_idx = 0
-        ramp = (4, 4, 8)
-        step_idx = 0
-        total_candidates = len(deduped_candidates)
-        while cursor_idx < total_candidates:
-            step = ramp[step_idx] if step_idx < len(ramp) else SEARCH_CHUNK_SIZE
-            step_idx += 1
-            chunks.append(deduped_candidates[cursor_idx : cursor_idx + step])
-            cursor_idx += step
-        inflight: deque[Future[list[list[dict] | None]]] = deque()
-        next_chunk_idx = 0
-
-        def _submit_window() -> None:
-            nonlocal next_chunk_idx
-            while len(inflight) < SEARCH_WINDOW_CHUNKS and next_chunk_idx < len(chunks):
-                if cancel_event is not None and cancel_event.is_set():
-                    break
-                chunk = chunks[next_chunk_idx]
-                next_chunk_idx += 1
-                inflight.append(_SEARCH_EXECUTOR.submit(_scan_disk_chunk, chunk))
-
-        try:
-            _submit_window()
-            stop_scan = False
-            while inflight and not stop_scan:
-                if cancel_event is not None and cancel_event.is_set():
-                    return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
-                fut = inflight.popleft()
-                _submit_window()
-                chunk_results = fut.result()
-                for found in chunk_results:
-                    if cancel_event is not None and cancel_event.is_set():
-                        return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
-                    if found is None:
-                        continue
-                    scanned_files += 1
-                    remaining = max_matches - len(all_matches)
-                    if found and remaining > 0:
-                        accepted = found[:remaining] if len(found) > remaining else found
-                        all_matches.extend(accepted)
-                        pending_batch.extend(accepted)
-                        if len(pending_batch) >= BATCH_SIZE:
-                            flush(done=False)
-                            if cancel_event is not None and cancel_event.is_set():
-                                return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
-                    if len(found) > remaining or len(all_matches) >= max_matches:
-                        truncated = True
-                        stop_scan = True
-                        break
-        finally:
-            stop_workers.set()
-            for pending_fut in inflight:
-                pending_fut.cancel()
-            for pending_fut in inflight:
-                if not pending_fut.cancelled():
-                    try:
-                        pending_fut.result()
-                    except Exception:
-                        pass
-
-    if cancel_event is not None and cancel_event.is_set():
-        return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
-    flush(done=True)
-    return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": False}
+    if stream.is_cancelled():
+        return stream.finish(cancelled=True)
+    return stream.finish()

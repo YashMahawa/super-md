@@ -140,8 +140,8 @@ internal class DocumentAccess(
 
     fun hasReadGrant(
         uri: Uri,
-        activeFolderUri: Uri? = null,
-        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = null,
+        activeFolderUri: Uri? = activeFolderUriProvider?.invoke(),
+        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = isConfirmedTreeChildProvider,
     ): Boolean = when (val access = resolveReadAccess(uri, activeFolderUri, isConfirmedTreeChild)) {
         is SafReadAccess.InGrantedTree,
         is SafReadAccess.StandaloneDocument -> true
