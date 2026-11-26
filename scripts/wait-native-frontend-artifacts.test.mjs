@@ -111,3 +111,74 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
     pollIntervalMs: 10,
   }), /Timed out waiting/);
 });
+
+it('backs off on GitHub HTTP 403 rate limits and still fails immediately on permission HTTP 403', async () => {
+  let clock = 1_700_000_000_000;
+  const sleeps = [];
+  let calls = 0;
+  const rateLimitedFetch = async input => {
+    calls++;
+    if (calls === 1) {
+      return new Response(
+        JSON.stringify({ message: 'API rate limit exceeded for installation ID 12345.' }),
+        {
+          status: 403,
+          headers: {
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': '1700000015',
+          },
+        },
+      );
+    }
+    if (calls === 2) {
+      return new Response(
+        JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }),
+        {
+          status: 403,
+          headers: { 'retry-after': '8' },
+        },
+      );
+    }
+    const url = new URL(input);
+    const body = url.pathname.endsWith('/jobs')
+      ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'completed', conclusion: 'success' }] }
+      : url.pathname.endsWith('/artifacts')
+        ? { total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }
+        : run;
+    return { ok: true, status: 200, json: async () => body };
+  };
+
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: rateLimitedFetch,
+    sleep: async ms => { sleeps.push(ms); clock += ms; },
+    now: () => clock,
+    timeoutMs: 60_000,
+    pollIntervalMs: 5_000,
+  });
+  assert.deepEqual(result, names);
+  assert.deepEqual(sleeps, [15_000, 8_000]);
+
+  const forbiddenFetch = async () => new Response(
+    JSON.stringify({ message: 'Resource not accessible by integration' }),
+    {
+      status: 403,
+      headers: { 'x-ratelimit-remaining': '999' },
+    },
+  );
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: forbiddenFetch,
+    sleep: async () => { throw new Error('must not retry permission failure'); },
+    now: () => clock,
+    timeoutMs: 60_000,
+    pollIntervalMs: 5_000,
+  }), /GitHub Actions API request failed with HTTP 403/);
+});
+
