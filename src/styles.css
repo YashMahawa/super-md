@@ -314,6 +314,9 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .katex-display::-webkit-scrollbar-track { background:transparent; }
 .katex-display::-webkit-scrollbar-thumb { border:2px solid transparent;border-radius:12px;background:transparent;background-clip:padding-box; }
 .katex-display:hover::-webkit-scrollbar-thumb,.katex-display.scroll-indicator-active::-webkit-scrollbar-thumb { background-color:color-mix(in srgb,var(--primary) 60%,transparent); }
+.math-equation-anchor { position: relative; scroll-margin-top: 24px; }
+.equation-ref { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.equation-ref.is-unresolved { color: var(--muted); }
 .android-reading.is-panning { cursor:grabbing;user-select:none; }
 .callout { --callout-accent: var(--primary); display: flow-root; position: relative; margin: 1.55em 0; padding: 12px 20px 13px 22px; border: 1px solid color-mix(in srgb, var(--callout-accent) 36%, var(--outline)); border-radius: 14px; background: color-mix(in srgb, var(--callout-accent) 8%, var(--surface)); }
 .callout::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 4px; border-radius: 0 4px 4px 0; background: var(--callout-accent); }
