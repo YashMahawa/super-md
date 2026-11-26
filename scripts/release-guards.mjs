@@ -88,11 +88,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   const [command, tag, input] = process.argv.slice(2);
   if (command === "versions") {
     const android = readFileSync("android/app/build.gradle.kts", "utf8");
-    const rust = readFileSync("src-tauri/Cargo.toml", "utf8");
+    const rust = readFileSync("smd-core/Cargo.toml", "utf8");
     validateReadmeReleaseLinks(readFileSync("README.md", "utf8"));
     console.log(validateVersions(tag, {
       package: JSON.parse(readFileSync("package.json", "utf8")).version,
-      tauri: JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8")).version,
       rust: rust.match(/^version\s*=\s*"([^"]+)"/m)?.[1],
       android: android.match(/versionName\s*=\s*"([^"]+)"/)?.[1],
     }));
