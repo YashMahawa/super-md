@@ -188,3 +188,95 @@ test('Android Back dismisses active Live edits and Source search synchronously w
   const dismissibleSignals=await page.evaluate(()=>((window as any).__bridgeEvents as Array<{command:string;args:{open:boolean}}>).filter(e=>e.command==='reader_dismissible_changed').map(e=>e.args.open));
   expect(dismissibleSignals).toEqual([true,false,true,false]);
 });
+
+test('reader dismissal stays scoped to the current tab across relative link navigation and open-tab reuse while keeping drafts',async({page})=>{
+  await page.setViewportSize({width:390,height:844});
+  await page.addInitScript(()=>{
+    (window as any).__bridgeEvents=[];
+    (window as any).__notes={
+      'tab-index':'# Course Index\n\nJump to [[Lecture 2#Bayes]].\n\nEditable summary block.',
+      'tab-lecture':'# Lecture 2\n\n## Bayes\n\nPosterior probability notes.',
+    };
+    window.SuperMD={post:(id,command,raw)=>{
+      const args=JSON.parse(raw);
+      (window as any).__bridgeEvents.push({command,args});
+      if(command==='document_changed'&&typeof args.id==='string'&&typeof args.content==='string'){
+        (window as any).__notes[args.id]=args.content;
+      }
+      queueMicrotask(()=>window.supermdReply?.(id,command==='load_python_output'?null:command==='open_workspace_link'?{opened:true}:true,null));
+    }};
+  });
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+
+  const loadTab=async(id:'tab-index'|'tab-lecture',mode:'live'|'editor',pendingHeading?:{heading:string;token:string}|null)=>{
+    await page.evaluate(({id,mode,pendingHeading})=>{
+      document.documentElement.dataset.platform='android';
+      window.supermdLoad?.({
+        id,
+        path:`/course/${id==='tab-index'?'Index.md':'Lecture 2.md'}`,
+        content:(window as any).__notes[id],
+        mode,
+        dark:false,
+        fullscreen:false,
+        colors:{primary:'#42669e','on-primary':'#ffffff','primary-container':'#d7e3ff','on-primary-container':'#162c4c',surface:'#f7f9fd','surface-low':'#f0f3fa','surface-high':'#e5ebf5',text:'#191c20',muted:'#56647c',outline:'#c4c6d0'},
+        font:'Manrope',
+        size:16,
+        zoom:100,
+        restorePosition:false,
+        pendingHeading:pendingHeading??null,
+      });
+    },{id,mode,pendingHeading});
+  };
+
+  // 1. Open Live block in tab-index with uncommitted textarea draft, then navigate via supermdBeforeNavigate -> tab-lecture#Bayes.
+  await loadTab('tab-index','live');
+  await page.locator('.live-block').filter({hasText:'Editable summary block.'}).dblclick();
+  const liveTextarea=page.locator('.live-active-block textarea');
+  await expect(liveTextarea).toBeVisible();
+  await liveTextarea.evaluate((area:HTMLTextAreaElement)=>{
+    area.value='Editable summary block with uncommitted draft before link jump.';
+    area.setSelectionRange(area.value.length,area.value.length);
+  });
+  expect(await page.evaluate(()=>({id:document.documentElement.dataset.readerNoteId,dismissible:document.documentElement.dataset.readerDismissible}))).toEqual({id:'tab-index',dismissible:'true'});
+
+  await page.evaluate(async()=>{await window.supermdBeforeNavigate?.();});
+  await loadTab('tab-lecture','live',{heading:'Bayes',token:'jump-1'});
+  expect(await page.evaluate(()=>({
+    id:document.documentElement.dataset.readerNoteId,
+    dismissible:document.documentElement.dataset.readerDismissible,
+    savedIndex:(window as any).__notes['tab-index'],
+  }))).toEqual({
+    id:'tab-lecture',
+    dismissible:'false',
+    savedIndex:'# Course Index\n\nJump to [[Lecture 2#Bayes]].\n\nEditable summary block with uncommitted draft before link jump.',
+  });
+  // Pressing Back on tab-lecture has nothing to dismiss on tab-lecture (returns false).
+  expect(await page.evaluate(()=>Boolean(window.supermdDismiss?.()))).toBe(false);
+
+  // 2. Open CodeMirror .cm-search on tab-lecture in Source mode, switch back to reused tab-index, then return to tab-lecture.
+  await loadTab('tab-lecture','editor');
+  await page.evaluate(()=>{window.dispatchEvent(new Event('supermd-find'));});
+  await expect(page.locator('.cm-search')).toBeVisible();
+  expect(await page.evaluate(()=>({id:document.documentElement.dataset.readerNoteId,dismissible:document.documentElement.dataset.readerDismissible}))).toEqual({id:'tab-lecture',dismissible:'true'});
+
+  await loadTab('tab-index','editor');
+  await expect(page.locator('.cm-search')).toHaveCount(0);
+  expect(await page.evaluate(()=>({id:document.documentElement.dataset.readerNoteId,dismissible:document.documentElement.dataset.readerDismissible}))).toEqual({id:'tab-index',dismissible:'false'});
+  expect(await page.evaluate(()=>Boolean(window.supermdDismiss?.()))).toBe(false);
+
+  // Returning to reused tab-lecture restores its cached .cm-search panel and re-arms tab-specific dismissal.
+  await loadTab('tab-lecture','editor');
+  await expect(page.locator('.cm-search')).toBeVisible();
+  expect(await page.evaluate(()=>({id:document.documentElement.dataset.readerNoteId,dismissible:document.documentElement.dataset.readerDismissible}))).toEqual({id:'tab-lecture',dismissible:'true'});
+  expect(await page.evaluate(()=>Boolean(window.supermdDismiss?.()))).toBe(true);
+  await expect(page.locator('.cm-search')).toHaveCount(0);
+  expect(await page.evaluate(()=>document.documentElement.dataset.readerDismissible)).toBe('false');
+
+  const taggedSignals=await page.evaluate(()=>((window as any).__bridgeEvents as Array<{command:string;args:{id?:string;open:boolean}}>).filter(e=>e.command==='reader_dismissible_changed').map(e=>e.args));
+  expect(taggedSignals).toEqual([
+    {id:'tab-index',open:true},
+    {id:'tab-lecture',open:true},
+    {id:'tab-lecture',open:true},
+    {id:'tab-lecture',open:false},
+  ]);
+});

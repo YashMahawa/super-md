@@ -537,4 +537,124 @@ class AndroidBackHandlingUnitTest {
             shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
         }
     }
+
+    @Test fun readerDismissibleIsTabScopedAcrossWorkspaceLinkNavigationAndTabReuse() {
+        val tempDir = File(app.cacheDir, "back-tabs-${java.util.UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            val indexFile = File(tempDir, "Index.md").apply {
+                writeText("# Index\n\n## Overview\n\nSee [[Lecture 2#Bayes]].\n")
+            }
+            val lectureFile = File(tempDir, "Lecture 2.md").apply {
+                writeText("# Lecture 2\n\n## Bayes\n\nReturn to [[Index#Overview]].\n")
+            }
+            val indexUri = android.net.Uri.fromFile(indexFile)
+            val lectureUri = android.net.Uri.fromFile(lectureFile)
+
+            val model = newModel()
+            model.welcomeDone()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate).also(scopes::add)
+            val web = object : WebView(app) {
+                override fun post(action: Runnable?): Boolean =
+                    action?.let { Handler(Looper.getMainLooper()).post(it) } ?: false
+
+                override fun evaluateJavascript(script: String, resultCallback: android.webkit.ValueCallback<String>?) {
+                    resultCallback?.onReceiveValue("null")
+                }
+            }
+            val bridge = ReaderBridge(web, model, scope, ready = {}, assetCapabilities = ReaderAssetCapabilities())
+
+            model.open(indexUri)
+            idleUntil { model.state.value.active.uri == indexUri.toString() && !model.state.value.busy }
+            val indexId = model.state.value.active.id
+
+            bridge.post(
+                "dismissible-index-open",
+                "reader_dismissible_changed",
+                JSONObject().put("id", indexId).put("open", true).toString(),
+            )
+            idleUntil { model.state.value.readerDismissible }
+            assertFalse("Inline dismissibles must never block native external drops", shouldBlockNativeDrop(model.state.value))
+
+            // Navigate to Lecture 2#Bayes via #72 native workspace link RPC: active tab switches,
+            // pendingHeading is queued, and Index's readerDismissible does not leak onto Lecture 2.
+            bridge.post(
+                "open-lecture",
+                "open_workspace_link",
+                JSONObject()
+                    .put("documentPath", indexUri.toString())
+                    .put("target", "Lecture 2")
+                    .put("fragment", "Bayes")
+                    .put("wikilink", true)
+                    .toString(),
+            )
+            idleUntil { model.state.value.active.uri == lectureUri.toString() }
+            val lectureId = model.state.value.active.id
+            val tabCountWithBothOpen = model.state.value.tabs.size
+            assertFalse("Switching tabs via workspace link must clear readerDismissible for the new tab", model.state.value.readerDismissible)
+            assertEquals(lectureId, model.state.value.pendingHeading?.noteId)
+            assertEquals("Bayes", model.state.value.pendingHeading?.heading)
+            model.consumePendingHeading(model.state.value.pendingHeading!!.token)
+
+            // A stale open=true signal from inactive Index must be ignored while Lecture 2 is active.
+            bridge.post(
+                "stale-index-open",
+                "reader_dismissible_changed",
+                JSONObject().put("id", indexId).put("open", true).toString(),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
+            assertFalse(model.state.value.readerDismissible)
+
+            // Open an active edit/search on Lecture 2 and verify a late open=false or Back callback from Index cannot clobber it.
+            model.fullscreen(true)
+            bridge.post(
+                "lecture-open",
+                "reader_dismissible_changed",
+                JSONObject().put("id", lectureId).put("open", true).toString(),
+            )
+            idleUntil { model.state.value.readerDismissible }
+
+            bridge.post(
+                "late-index-close",
+                "reader_dismissible_changed",
+                JSONObject().put("id", indexId).put("open", false).toString(),
+            )
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
+            assertTrue("Late close signal from previous tab must not clear active tab's readerDismissible", model.state.value.readerDismissible)
+
+            applyReaderDismissResult(
+                model,
+                JSONObject.quote(
+                    JSONObject()
+                        .put("id", indexId)
+                        .put("dismissed", false)
+                        .put("overlay", false)
+                        .put("image", false)
+                        .put("dismissible", false)
+                        .toString(),
+                ),
+                expectedNoteId = indexId,
+            )
+            assertTrue(model.state.value.readerDismissible)
+            assertTrue("Stale cross-tab Back callback must not exit fullscreen on the active tab", model.state.value.fullscreen)
+
+            // Navigate back to [[Index#Overview]]: #64 reuses the existing Index tab, queues pendingHeading, and clears Lecture 2's dismissible.
+            bridge.post(
+                "reopen-index",
+                "open_workspace_link",
+                JSONObject()
+                    .put("documentPath", lectureUri.toString())
+                    .put("target", "Index")
+                    .put("fragment", "Overview")
+                    .put("wikilink", true)
+                    .toString(),
+            )
+            idleUntil { model.state.value.active.id == indexId }
+            assertEquals("Open-tab reuse (#64) must not duplicate Index.md", tabCountWithBothOpen, model.state.value.tabs.size)
+            assertFalse(model.state.value.readerDismissible)
+            assertEquals(indexId, model.state.value.pendingHeading?.noteId)
+            assertEquals("Overview", model.state.value.pendingHeading?.heading)
+        } finally {
+            tempDir.deleteRecursively()
+        }
+    }
 }

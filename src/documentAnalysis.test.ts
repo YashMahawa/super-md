@@ -1,6 +1,6 @@
 import {describe,it,expect} from 'vitest';
 import {analyzeDocument} from './documentAnalysis';
-import {hasCallouts,maskCode,normalizeMarkdownSource} from './markdownSource';
+import {hasCallouts,maskCode,normalizeCallouts,normalizeMarkdownSource} from './markdownSource';
 
 describe('shared source analysis',()=>{
   it('nests container callouts and keeps literal delimiters inside variable-length code fences',()=>{
@@ -187,6 +187,41 @@ describe('shared source analysis',()=>{
     expect(hasCallouts('> ```markdown\n> :::callout note QuotedFenced\n> :::\n> ```')).toBe(false);
     expect(hasCallouts('---\ntitle: x\n---\n```md\n:::callout note Fenced\n:::\n```\n:::callout tip Real\nOk\n:::')).toBe(true);
   });
+  it('normalizes spaced, aliased, portable, and section wikilinks while preserving sparse UTF-16 source offsets',()=>{
+    expect(normalizeCallouts('[[Task Note]]')).toBe('[Task Note](Task%20Note.md)');
+    expect(normalizeCallouts('[[Lecture 2#Bayes Law|Bayes]]')).toBe('[Bayes](Lecture%202.md#bayes-law)');
+    expect(normalizeCallouts('[[Lecture 2#Bayes]]')).toBe('[Lecture 2#Bayes](Lecture%202.md#bayes)');
+    expect(normalizeCallouts('[[study.smd]]')).toBe('[study.smd](study.smd)');
+    expect(normalizeCallouts('[[Study Deck.smd#Card 1|First card]]')).toBe('[First card](Study%20Deck.smd#card-1)');
+    expect(normalizeCallouts('[[archive.fmd]]')).toBe('[archive.fmd](archive.fmd)');
+    expect(normalizeCallouts('[[notes.markdown#Intro]]')).toBe('[notes.markdown#Intro](notes.markdown#intro)');
+    expect(normalizeCallouts('![[DM Images/proof.svg|300]]')).toBe('![DM Images/proof.svg](DM%20Images/proof.svg){width=300}');
+    expect(normalizeCallouts('[[   ]]')).toBe('[[   ]]');
+    expect(normalizeCallouts('Keep `[[Task Note]]` and $P([[A]]) = 1$ literal.')).toBe('Keep `[[Task Note]]` and $P([[A]]) = 1$ literal.');
+
+    const source=[
+      '---',
+      'title: Study Index',
+      '---',
+      '# Study 🧠 Index',
+      '',
+      'Open [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], and [[study.smd]].',
+      '',
+      '- [ ] Review after wikilinks',
+      '',
+      '## Follow-up Section',
+    ].join('\n');
+    const stage=normalizeMarkdownSource(source,{encodeLinkDestinations:true});
+    const tailMarker='## Follow-up Section';
+    expect(stage.originalOffset(stage.value.indexOf(tailMarker))).toBe(source.indexOf(tailMarker));
+    const analysis=analyzeDocument(source);
+    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1]);
+    expect(analysis.outline.map(item=>[item.id,item.offset])).toEqual([
+      ['study--index',source.indexOf('# Study 🧠 Index')],
+      ['follow-up-section',source.indexOf('## Follow-up Section')],
+    ]);
+    for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
+  });
   it('rewrites numeric Obsidian pipe widths to {width=...} while preserving non-numeric captions and offsets',()=>{
     const source='![[diagram.png|300]] and ![[diagram.png|300x180]] and ![[diagram.png|Caption|240]] vs ![[diagram.png|Architecture]]\n\n# Heading After\n';
     const normalized=normalizeMarkdownSource(source);
@@ -250,5 +285,148 @@ describe('shared source analysis',()=>{
     ]);
     expect(analysis.blocks.map(b=>b.text).join('')).toBe(source);
     for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
+  });
+  it('preserves escapes, code fences, and interleaved inline/display math boundaries without blank lines',()=>{
+    const source=[
+      'Item 1 costs $50 %%stripped_before_flow_math%% and keeps \\%%escaped_one\\%% plus \\$50.',
+      '$$',
+      '%% kept_flow_tex_comment',
+      'a_1 + b_1 = 1',
+      '$$',
+      'Item 2 has $x_2 %% kept_inline_math$, \\\\%%stripped_after_slash%%, \\\\$y_2 %% kept_after_slash$, and costs $75 %%stripped_before_fence%%.',
+      '```python',
+      '%%timeit x = 1',
+      '```',
+      '~~~markdown',
+      '%%kept_tilde_fence%%',
+      '~~~',
+      '> ````markdown',
+      '> ```',
+      '> %%kept_quoted_fence%%',
+      '> ```',
+      '> ````',
+      'Item 3 has $z_3 = 1$, costs $90, and has $$c_3 %% kept_compact_display$$ %%stripped_after_compact%% plus \\$\\$not_math\\$\\$ %%stripped_after_escaped_display%%.',
+      '$$d_4 %% kept_line_display$$ %%stripped_line_display%%',
+      '# Final Section',
+    ].join('\n');
+
+    const normalized=normalizeMarkdownSource(source);
+    expect(normalized.value).not.toContain('stripped_before_flow_math');
+    expect(normalized.value).not.toContain('stripped_before_fence');
+    expect(normalized.value).not.toContain('stripped_after_slash');
+    expect(normalized.value).not.toContain('stripped_after_compact');
+    expect(normalized.value).not.toContain('stripped_after_escaped_display');
+    expect(normalized.value).not.toContain('stripped_line_display');
+    expect(normalized.value).toContain('\\%%escaped_one\\%%');
+    expect(normalized.value).toContain('kept_flow_tex_comment');
+    expect(normalized.value).toContain('$x_2 %% kept_inline_math$');
+    expect(normalized.value).toContain('\\\\$y_2 %% kept_after_slash$');
+    expect(normalized.value).toContain('%%timeit x = 1');
+    expect(normalized.value).toContain('%%kept_tilde_fence%%');
+    expect(normalized.value).toContain('%%kept_quoted_fence%%');
+    expect(normalized.value).toContain('$$c_3 %% kept_compact_display$$');
+    expect(normalized.value).toContain('$$d_4 %% kept_line_display$$');
+    expect(normalized.originalOffset(normalized.value.indexOf('# Final Section'))).toBe(source.indexOf('# Final Section'));
+
+    const analysis=analyzeDocument(source);
+    expect(analysis.outline).toEqual([
+      {id:'final-section',title:'Final Section',level:1,offset:source.indexOf('# Final Section')},
+    ]);
+    expect(analysis.blocks.map(b=>b.text).join('')).toBe(source);
+  });
+  it('retains wikilink labels, spaces, fragments, math-masked brackets, and original source offsets alongside percent-comment stripping',()=>{
+    const source=[
+      '---',
+      'title: Combined Study Links',
+      '---',
+      '%%leading draft comment%%',
+      '# Combined Overview',
+      '',
+      'Before %%inline comment%%[[Lecture 2#Bayes Law|Bayes]] and [[Task Note]] plus [[Study Deck.smd#Card 1|First card]] and [guide](Study Notes/guide.md#intro).',
+      'Math keeps $P([[A]]) = 1 %% kept_inline$ and $$Q([[B]]) = 2 %% kept_display$$ literal, while budget $50 to $99 %%stripped_tail%% stays linear.',
+      '',
+      '- [ ] Check [[Reference Note#Section Two|Ref Label]] after comments',
+      '',
+      '## Follow-up Heading',
+    ].join('\n');
+
+    const normalized=normalizeMarkdownSource(source,{encodeLinkDestinations:true});
+    expect(normalized.value).not.toContain('leading draft comment');
+    expect(normalized.value).not.toContain('inline comment');
+    expect(normalized.value).not.toContain('stripped_tail');
+    expect(normalized.value).toContain('[Bayes](Lecture%202.md#bayes-law)');
+    expect(normalized.value).toContain('[Task Note](Task%20Note.md)');
+    expect(normalized.value).toContain('[First card](Study%20Deck.smd#card-1)');
+    expect(normalized.value).toContain('[guide](Study%20Notes/guide.md#intro)');
+    expect(normalized.value).toContain('$P([[A]]) = 1 %% kept_inline$');
+    expect(normalized.value).toContain('$$Q([[B]]) = 2 %% kept_display$$');
+    expect(normalized.originalOffset(normalized.value.indexOf('## Follow-up Heading'))).toBe(source.indexOf('## Follow-up Heading'));
+
+    const analysis=analyzeDocument(source);
+    expect(analysis.tasks).toEqual([source.indexOf('[ ]')+1]);
+    expect(analysis.outline).toEqual([
+      {id:'combined-overview',title:'Combined Overview',level:1,offset:source.indexOf('# Combined Overview')},
+      {id:'follow-up-heading',title:'Follow-up Heading',level:2,offset:source.indexOf('## Follow-up Heading')},
+    ]);
+    const links:Array<{slice:string;wikilink?:string;fragment?:string}>=[];
+    const collectLinks=(node:any)=>{
+      if(node?.type==='link'&&node.position?.start?.offset!==undefined&&node.position?.end?.offset!==undefined){
+        const props=(node.data as any)?.hProperties||{};
+        links.push({
+          slice:source.slice(node.position.start.offset,node.position.end.offset),
+          wikilink:props['data-wikilink'],
+          fragment:props['data-heading-fragment'],
+        });
+      }
+      if(Array.isArray(node?.children))for(const child of node.children)collectLinks(child);
+    };
+    collectLinks(analysis.tree);
+    expect(links).toEqual([
+      {slice:'[[Lecture 2#Bayes Law|Bayes]]',wikilink:'Lecture 2',fragment:'Bayes Law'},
+      {slice:'[[Task Note]]',wikilink:'Task Note',fragment:undefined},
+      {slice:'[[Study Deck.smd#Card 1|First card]]',wikilink:'Study Deck.smd',fragment:'Card 1'},
+      {slice:'[guide](Study Notes/guide.md#intro)',wikilink:undefined,fragment:undefined},
+      {slice:'[[Reference Note#Section Two|Ref Label]]',wikilink:'Reference Note',fragment:'Section Two'},
+    ]);
+    expect(analysis.blocks.map(b=>b.text).join('')).toBe(source);
+    for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
+  });
+  it('scales linearly on large notes with interleaved inline math, display math, percent comments, escapes, and code fences',()=>{
+    const sections:string[]=[];
+    for(let i=0;i<300;i++){
+      sections.push(
+        `Paragraph ${i}: inline $a_${i} + b_${i} = 100\\%$ and $p_${i} %% kept_inline_${i}$ %%strip_inline_${i}%% with budget $50 (\\$escaped, \\%%kept_lit_${i}\\%%) and $$m_${i} %% kept_compact_${i}$$.\n`+
+        `$$\n%% kept_display_${i}\n\\sum_{k=1}^{n} x_k = ${i}\n$$\n`+
+        (i%2===0
+          ?`\`\`\`python\n%%timeit total = ${i}\n\`\`\``
+          :`~~~markdown\n%%kept_fenced_${i}%%\n~~~`),
+      );
+    }
+    const ledger:string[]=[];
+    for(let j=0;j<2400;j++){
+      ledger.push(`Ledger ${j}: allocation $50 to $99 per node (\\$fee, \\%%lit_${j}\\%%) %%strip_ledger_${j}%%`);
+    }
+    sections.push(ledger.join('\n'));
+    sections.push('# Tail Heading');
+    const largeDoc=sections.join('\n\n');
+
+    const start=performance.now();
+    const normalized=normalizeMarkdownSource(largeDoc);
+    const elapsedMs=performance.now()-start;
+
+    // Reverted O(N^2) math lookahead takes >5,000 ms on 2,400 unmatched-$ lines (~260 KB) and corrupts interleaved $$ blocks.
+    expect(elapsedMs).toBeLessThan(800);
+    expect(normalized.value).toContain('kept_inline_0');
+    expect(normalized.value).toContain('kept_compact_299');
+    expect(normalized.value).toContain('kept_display_299');
+    expect(normalized.value).toContain('%%timeit total = 298');
+    expect(normalized.value).toContain('%%kept_fenced_299%%');
+    expect(normalized.value).toContain('\\%%kept_lit_150\\%%');
+    expect(normalized.value).toContain('\\%%lit_2399\\%%');
+    expect(normalized.value).not.toContain('strip_inline_0');
+    expect(normalized.value).not.toContain('strip_inline_299');
+    expect(normalized.value).not.toContain('strip_ledger_0');
+    expect(normalized.value).not.toContain('strip_ledger_2399');
+    expect(normalized.originalOffset(normalized.value.indexOf('# Tail Heading'))).toBe(largeDoc.indexOf('# Tail Heading'));
   });
 });

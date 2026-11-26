@@ -8,7 +8,7 @@ import Editor from "./components/Editor";
 import LiveEditor from "./components/LiveEditor";
 import ReadingSearch from "./components/ReadingSearch";
 import { invoke } from "./nativeBridge";
-import { dismissReaderOverlay, setReaderDismissible, setReaderOverlay } from "./readerOverlays";
+import { dismissReaderOverlay, setActiveReaderNoteId, setReaderDismissible, setReaderOverlay } from "./readerOverlays";
 
 vi.mock("./nativeBridge", () => ({
   invoke: vi.fn(async () => true),
@@ -38,17 +38,21 @@ describe("Android Back / dismissReaderOverlay for active Live edits and Source s
     document.body.append(host);
     root = createRoot(host);
     document.documentElement.dataset.platform = "android";
+    setActiveReaderNoteId(null);
     setReaderOverlay("search", false);
     setReaderDismissible("live-edit", false);
     setReaderDismissible("cm-search", false);
+    vi.clearAllMocks();
     window.supermdDismiss = () => flushSync(() => dismissReaderOverlay());
   });
 
   afterEach(() => {
     act(() => root.unmount());
     host.remove();
+    setActiveReaderNoteId(null);
     delete window.supermdDismiss;
     delete document.documentElement.dataset.platform;
+    delete document.documentElement.dataset.readerNoteId;
     delete document.documentElement.dataset.readerOverlay;
     delete document.documentElement.dataset.readerImageOverlay;
     delete document.documentElement.dataset.readerDismissible;
@@ -277,5 +281,89 @@ describe("Android Back / dismissReaderOverlay for active Live edits and Source s
 
     // Second Back returns false so native Android preserves system Back.
     expect(window.supermdDismiss!()).toBe(false);
+  });
+
+  it("scopes readerDismissible to the active tab and restores cached Source .cm-search when returning to an open tab", async () => {
+    const tabA = `tab-a-${Date.now()}`;
+    const tabB = `tab-b-${Date.now()}`;
+
+    setActiveReaderNoteId(tabA);
+    await act(async () => {
+      root.render(
+        <Editor
+          key={tabA}
+          sessionId={tabA}
+          value="# Tab A\n\nNeedle in tab A."
+          onChange={() => {}}
+          dark={false}
+          focusMode={false}
+        />,
+      );
+    });
+    expect(document.documentElement.dataset.readerNoteId).toBe(tabA);
+    expect(document.documentElement.dataset.readerDismissible).toBe("false");
+
+    // Open CodeMirror .cm-search in Tab A -> emits tab-scoped { id: tabA, open: true }.
+    act(() => {
+      window.dispatchEvent(new Event("supermd-find"));
+    });
+    expect(host.querySelector(".cm-search")).toBeTruthy();
+    expect(document.documentElement.dataset.readerDismissible).toBe("true");
+    expect(invoke).toHaveBeenCalledWith("reader_dismissible_changed", { id: tabA, open: true });
+
+    // Switch to Tab B in Live mode: Tab A's .cm-search unmount must not leak onto Tab B or clobber Tab B's own Live edit.
+    vi.clearAllMocks();
+    setActiveReaderNoteId(tabB);
+    await act(async () => {
+      root.render(
+        <LiveEditor
+          key={tabB}
+          markdown="# Tab B\n\nParagraph in tab B."
+          onChange={() => {}}
+          documentPath={null}
+          python="embedded"
+          dark={false}
+        />,
+      );
+    });
+    expect(document.documentElement.dataset.readerNoteId).toBe(tabB);
+    expect(document.documentElement.dataset.readerDismissible).toBe("false");
+
+    const tabBBlock = Array.from(host.querySelectorAll<HTMLElement>(".live-block")).find((el) =>
+      el.textContent?.includes("Paragraph in tab B."),
+    )!;
+    act(() => {
+      tabBBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+    expect(document.documentElement.dataset.readerDismissible).toBe("true");
+    expect(invoke).toHaveBeenCalledWith("reader_dismissible_changed", { id: tabB, open: true });
+
+    // Reuse already-open Tab A: cached CodeMirror session still has .cm-search open and re-reports { id: tabA, open: true }.
+    vi.clearAllMocks();
+    setActiveReaderNoteId(tabA);
+    await act(async () => {
+      root.render(
+        <Editor
+          key={tabA}
+          sessionId={tabA}
+          value="# Tab A\n\nNeedle in tab A."
+          onChange={() => {}}
+          dark={false}
+          focusMode={false}
+        />,
+      );
+    });
+    expect(host.querySelector(".cm-search")).toBeTruthy();
+    expect(document.documentElement.dataset.readerNoteId).toBe(tabA);
+    expect(document.documentElement.dataset.readerDismissible).toBe("true");
+    expect(invoke).toHaveBeenCalledWith("reader_dismissible_changed", { id: tabA, open: true });
+
+    let dismissedOnReturn = false;
+    act(() => {
+      dismissedOnReturn = window.supermdDismiss!();
+    });
+    expect(dismissedOnReturn).toBe(true);
+    expect(document.documentElement.dataset.readerDismissible).toBe("false");
+    expect(invoke).toHaveBeenCalledWith("reader_dismissible_changed", { id: tabA, open: false });
   });
 });

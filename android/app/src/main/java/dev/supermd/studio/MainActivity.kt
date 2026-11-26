@@ -567,7 +567,7 @@ private object NoMotionScheme : MotionScheme {
 }
 
 internal const val READER_DISMISS_SCRIPT =
-    "(() => { const dismissed = Boolean(window.supermdDismiss?.()); const d = document.documentElement.dataset; return JSON.stringify({ dismissed, overlay: d.readerOverlay === 'true', image: d.readerImageOverlay === 'true', dismissible: d.readerDismissible === 'true' }); })()"
+    "(() => { const d = document.documentElement.dataset; const id = d.readerNoteId || ''; const dismissed = Boolean(window.supermdDismiss?.()); return JSON.stringify({ id, dismissed, overlay: d.readerOverlay === 'true', image: d.readerImageOverlay === 'true', dismissible: d.readerDismissible === 'true' }); })()"
 
 internal fun shouldInterceptStudioBack(
     contentsShown: Boolean,
@@ -577,7 +577,12 @@ internal fun shouldInterceptStudioBack(
     readerDismissible: Boolean,
 ): Boolean = contentsShown || fullscreen || drawerOpen || readerOverlay || readerDismissible
 
-internal fun applyReaderDismissResult(model: StudioViewModel, rawResult: String?) {
+internal fun applyReaderDismissResult(model: StudioViewModel, rawResult: String?, expectedNoteId: String? = null) {
+    val targetExpected = expectedNoteId?.takeIf { it.isNotEmpty() }
+    if (targetExpected != null && model.state.value.active.id != targetExpected) {
+        model.readerDismissible(false, targetExpected)
+        return
+    }
     val parsed = rawResult?.let { raw ->
         runCatching {
             val jsonText = if (raw.startsWith("\"")) org.json.JSONArray("[$raw]").getString(0) else raw
@@ -585,8 +590,16 @@ internal fun applyReaderDismissResult(model: StudioViewModel, rawResult: String?
         }.getOrNull()
     }
     if (parsed != null) {
+        val resultNoteId = parsed.optString("id").takeIf { it.isNotEmpty() }
+        if (resultNoteId != null && resultNoteId != model.state.value.active.id) {
+            model.readerDismissible(false, resultNoteId)
+            if (!parsed.optBoolean("dismissed", false) && !model.state.value.readerOverlay && !model.state.value.readerDismissible && model.state.value.fullscreen) {
+                model.fullscreen(false)
+            }
+            return
+        }
         model.overlay(parsed.optBoolean("overlay", false), parsed.optBoolean("image", false))
-        model.readerDismissible(parsed.optBoolean("dismissible", false))
+        model.readerDismissible(parsed.optBoolean("dismissible", false), resultNoteId ?: targetExpected)
         if (!parsed.optBoolean("dismissed", false) && model.state.value.fullscreen) {
             model.fullscreen(false)
         }
@@ -595,21 +608,22 @@ internal fun applyReaderDismissResult(model: StudioViewModel, rawResult: String?
     val dismissed = rawResult == "true"
     if (!dismissed) {
         model.overlay(false, false)
-        model.readerDismissible(false)
+        model.readerDismissible(false, targetExpected)
         if (model.state.value.fullscreen) model.fullscreen(false)
     }
 }
 
 private fun dismissReaderOrFullscreen(web: WebView?, model: StudioViewModel) {
     val reader = web
+    val expectedNoteId = model.state.value.active.id
     if (reader == null) {
         model.overlay(false, false)
-        model.readerDismissible(false)
+        model.readerDismissible(false, expectedNoteId)
         if (model.state.value.fullscreen) model.fullscreen(false)
         return
     }
     reader.evaluateJavascript(READER_DISMISS_SCRIPT) { rawResult ->
-        applyReaderDismissResult(model, rawResult)
+        applyReaderDismissResult(model, rawResult, expectedNoteId)
     }
 }
 
@@ -682,6 +696,7 @@ internal fun shouldBlockNativeDrop(
         state.readerOverlay ||
         folderSearchVisible ||
         accessRequestOpen ||
+        state.folderAccessPrompt != null ||
         state.pendingCloseNoteId != null ||
         state.pendingSaveConflictNoteId != null ||
         settingsOpen ||
@@ -839,7 +854,20 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
             else (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlush(noteId) ?: false
         }
-        onDispose { model.readerFlushRequester = null }
+        model.readerFlushStatusRequester = { noteId ->
+            val current = web
+            if (!readerReady || current == null) {
+                if (model.readerStateIsNativeAuthoritative(noteId)) ReaderFlushStatus.ACKNOWLEDGED
+                else ReaderFlushStatus.FAILED
+            } else {
+                (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlushStatus(noteId)
+                    ?: ReaderFlushStatus.FAILED
+            }
+        }
+        onDispose {
+            model.readerFlushRequester = null
+            model.readerFlushStatusRequester = null
+        }
     }
     DisposableEffect(activity, model, readerReady) {
         val handler = if (readerReady) {
@@ -1184,6 +1212,12 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
     val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> model.setFolder(uri) } }
+    var workspaceFolderPickerShowing by rememberSaveable { mutableStateOf(false) }
+    val workspaceFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        workspaceFolderPickerShowing = false
+        if (uri != null) model.grantWorkspaceFolderForLink(uri)
+        else model.dismissWorkspaceFolderPrompt()
+    }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
@@ -1306,18 +1340,23 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             }
         }
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
+        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
             if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active
+                val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
                 val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
                 val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                if (pendingHeading != null) {
+                    payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
+                }
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 if (matchingSeed != null) {
                     payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
                 }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
                 if (matchingSeed != null) {
                     model.consumeSeededFind(matchingSeed.nonce)
                 }
@@ -1676,6 +1715,27 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             } },
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
+    }
+    if (!workspaceFolderPickerShowing) state.folderAccessPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = model::dismissWorkspaceFolderPrompt,
+            title = { Text("Allow folder access for note links") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(prompt.noteName, style = MaterialTheme.typography.titleSmall)
+                    Text("Super MD needs permission for the folder containing this note to open linked notes like \"${prompt.target}\". Your current note and edits remain untouched.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspaceFolderPickerShowing = true
+                    workspaceFolderPicker.launch(prompt.initialUri)
+                }) { Text("Choose folder") }
+            },
+            dismissButton = {
+                TextButton(onClick = model::dismissWorkspaceFolderPrompt) { Text("Not now") }
+            },
+        )
     }
     if (folderSearch.visible) {
         BackHandler { model.cancelWorkspaceSearch() }
@@ -2185,17 +2245,6 @@ internal fun buildHighlightedSnippet(
     }
 }
 private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
-internal class NoteDestination(private val mime: String, private val preferred: () -> String): ActivityResultContracts.CreateDocument(mime) {
-    override fun createIntent(context: android.content.Context, input: String): Intent {
-        val expected = NativeExportFormat.fromMime(mime)
-        val suggested = ExportFilename.suggestedName(input, expected)
-        val location = preferred().takeIf { it.isNotBlank() }?.let { tree ->
-            val uri=android.net.Uri.parse(tree)
-            android.provider.DocumentsContract.buildDocumentUriUsingTree(uri, android.provider.DocumentsContract.getTreeDocumentId(uri))
-        } ?: android.net.Uri.parse("content://com.android.externalstorage.documents/document/primary%3ADownload")
-        return super.createIntent(context,suggested).putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,location)
-    }
-}
 
 @Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, section: String?, onSection: (String?)->Unit, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, showThemeGuide:()->Unit, themeGuideReady:Boolean, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
@@ -2594,7 +2643,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     SearchableChoice(label, selectedKey, summary, choices, "Search themes", "No matching themes", topPadding = 8.dp, change = change)
 }
 
-@Composable private fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+@Composable internal fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
     SearchableChoice(label, value, choices.find { it.first == value }?.second ?: value, choices, "Search fonts", "No matching fonts", change = change)
 }
 
@@ -2641,75 +2690,15 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
 }
 
-@Composable private fun Choice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+@Composable internal fun Choice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
     Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { choices.forEach { (key, name) -> FilterChip(selected = value == key, onClick = { change(key) }, label = { Text(name) }) } }
 }
 
-@Composable private fun StudySlider(value: Float, valueRange: ClosedFloatingPointRange<Float>, onCommit: (Float) -> Unit) {
+@Composable internal fun StudySlider(value: Float, valueRange: ClosedFloatingPointRange<Float>, onCommit: (Float) -> Unit) {
     val slider = rememberSliderState(value = value, trackRange = valueRange)
     LaunchedEffect(value) { slider.value = value }
     // Material's gesture state handles every drag frame locally. Persisting
     // preferences and updating the document bridge happen once on release.
     Slider(state = slider, onValueChange = { slider.value = it }, onValueChangeFinished = { onCommit(slider.value) })
-}
-
-@Composable private fun PdfOptions(options: JSONObject, fonts: List<String> = emptyList(), update: (String, Any) -> Unit) {
-    Choice("Paper", options.optString("pageSize", "a4"), listOf("a3" to "A3","a4" to "A4", "a5" to "A5","a6" to "A6","iso-b4" to "B4 (ISO)","iso-b5" to "B5 (ISO)","iso-b6" to "B6 (ISO)", "letter" to "Letter", "legal" to "Legal","tabloid" to "Tabloid","executive" to "Executive")) { update("pageSize", it) }
-    FontChoice("Document font", options.optString("fontFamily", "Manrope"), (listOf("Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono","Libertinus Serif","New Computer Modern","DejaVu Sans Mono")+fonts).distinct().map {it to it}) { update("fontFamily", it) }
-    Text("Margins · ${options.optDouble("margin",18.0).toInt()} mm", Modifier.padding(top = 16.dp)); StudySlider(value = options.optDouble("margin",18.0).toFloat(), onCommit = { update("margin", it.toInt()) }, valueRange = 4f..60f)
-    Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.0))} pt"); StudySlider(value = options.optDouble("fontSize",10.0).toFloat(), onCommit = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 5f..24f)
-    Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.45))}"); StudySlider(value = options.optDouble("lineHeight",1.45).toFloat(), onCommit = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
-    Text("Paragraph spacing · ${"%.1f".format(options.optDouble("paragraphSpacing",1.2))}"); StudySlider(value = options.optDouble("paragraphSpacing",1.2).toFloat(), onCommit = { update("paragraphSpacing", it.toDouble()) }, valueRange = 0f..3f)
-    Row(verticalAlignment = Alignment.CenterVertically) { Text("Page numbers", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Switch(checked = options.optBoolean("pageNumbers",true), onCheckedChange = { update("pageNumbers", it) }) }
-    Row(verticalAlignment = Alignment.CenterVertically) {Text("Light Material theme", Modifier.weight(1f)); Switch(checked = options.optBoolean("themed",false), onCheckedChange = {update("themed", it)})}
-    Text("Off uses plain paper. On uses your accent with light surfaces, even in dark mode.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-}
-
-internal fun exportPrimaryActionLabel(format: String, sharing: Boolean): String = when {
-    sharing -> "Prepare & share"
-    format == "md" -> "Export Markdown"
-    format == "mdzip" -> "Export ZIP"
-    else -> "Choose destination & export"
-}
-
-@Composable internal fun ExportSettings(raw: String, onChange: (String) -> Unit, sharing: Boolean = false, fonts:List<String> = emptyList(), noteLocation: String = "", export: (String) -> Unit) {
-    var format by rememberSaveable { mutableStateOf("pdf") }
-    var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
-    fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
-    val directSaveCopy = if (noteLocation.isBlank()) "Saves directly to Downloads/Super MD." else "Saves directly to your configured note folder."
-    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
-        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
-            Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
-                Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
-                val formats = listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD", "mdzip" to "ZIP")
-                Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
-                    formats.chunked(2).forEach { row ->
-                        Row(Modifier.fillMaxWidth()) {
-                            row.forEach { (key, label) ->
-                                FilterChip(selected = format == key, onClick = { format = key }, label = { Text(label) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp, vertical = 2.dp).heightIn(min = 48.dp))
-                            }
-                        }
-                    }
-                }
-                if (format == "pdf") {
-                    Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
-                    PdfOptions(options, fonts, ::update)
-                } else if (format == "mdzip") {
-                    Text("Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images.", style = MaterialTheme.typography.bodyMedium)
-                    if (!sharing) Text(directSaveCopy, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
-                } else if (format == "md") {
-                    Text("SVGs and diagram sources are embedded in the Markdown. Images and GIFs keep readable relative filenames.", style = MaterialTheme.typography.bodyMedium)
-                    if (!sharing) Text(directSaveCopy, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
-                } else {
-                    Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
-                    Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
-                }
-            }
-            Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp).heightIn(min = 48.dp)) {
-                Icon(painterResource(if (sharing) R.drawable.symbol_share else R.drawable.symbol_export), null)
-                Text(exportPrimaryActionLabel(format, sharing), Modifier.padding(start = 8.dp))
-            }
-        }
-    }
 }
