@@ -28,8 +28,14 @@ class NativeTabsTest(unittest.TestCase):
 import QtQuick
 import QtQuick.Controls
 ApplicationWindow {
+    id: host
     width: 700; height: 180; visible: true
-    TabStrip { width: parent.width; viewState: JSON.parse(studio.snapshot) }
+    property var viewState: JSON.parse(studio.snapshot)
+    Connections {
+        target: studio
+        function onChanged() { host.viewState = JSON.parse(studio.snapshot) }
+    }
+    TabStrip { width: parent.width; viewState: host.viewState }
 }
 ''', QUrl.fromLocalFile(str(Path(__file__).parent / "qml/tab-test.qml")))
         self.assertFalse(self.component.isError(), str(self.component.errors()))
@@ -43,6 +49,7 @@ ApplicationWindow {
         self.engine.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.studio.stop(); self.studio.pool.shutdown(wait=True)
+        self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
 
     def drop(self, payload):
@@ -105,3 +112,163 @@ ApplicationWindow {
         self.assertEqual(plus.property("glyph"), "Plus")
         for item in [*tabs, plus]:
             self.assertAlmostEqual(item.y() + item.height() / 2, 24, delta=.5)
+
+    def _strip_and_active_tab(self):
+        strip = self.window.findChild(QQuickItem, "tabStrip")
+        self.assertIsNotNone(strip)
+        items = [strip]
+        active_item = None
+        while items:
+            item = items.pop()
+            if item.objectName() == "noteTab" and item.property("isActive"):
+                active_item = item
+                break
+            items.extend(item.childItems())
+        self.assertIsNotNone(active_item)
+        return strip, strip.property("contentItem"), active_item
+
+    def _assert_active_tab_revealed(self, context):
+        strip, flickable, active_item = self._strip_and_active_tab()
+        content_x = float(flickable.property("contentX"))
+        viewport_width = float(strip.property("availableWidth") or strip.width())
+        self.assertGreaterEqual(
+            active_item.x() + 0.5,
+            content_x,
+            f"Active tab left edge clipped ({context}): x={active_item.x()}, contentX={content_x}",
+        )
+        self.assertLessEqual(
+            active_item.x() + active_item.width() - 0.5,
+            content_x + viewport_width,
+            f"Active tab right edge clipped ({context}): right={active_item.x() + active_item.width()}, viewportRight={content_x + viewport_width}",
+        )
+
+    def test_overflowing_strip_reveals_active_tab_on_create_switch_move_reopen_and_resize(self):
+        # Create enough wide tabs to overflow the 700px window horizontally.
+        for index in range(8):
+            self.studio.newNote()
+            self.studio.renameNote(self.studio.active, f"Chapter {index + 1} Architecture Overview")
+        QTest.qWait(60)
+        strip, flickable, _ = self._strip_and_active_tab()
+        self.assertGreater(float(flickable.property("contentWidth")), strip.width())
+        self.assertGreater(float(flickable.property("contentX")), 0)
+        self._assert_active_tab_revealed("after creating overflowing rightmost tab")
+
+        # Switching to tab 1 via tabNumber scrolls all the way back to the left.
+        self.studio.tabNumber(1)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after switching to tab 1")
+        self.assertLessEqual(float(flickable.property("contentX")), 20)
+
+        # Cycling backward from tab 1 wraps to the rightmost tab and reveals it.
+        self.studio.cycleTab(-1)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after cycling wrap to last tab")
+
+        # Moving the active tab repeatedly to the left keeps it inside the viewport.
+        for _ in range(7):
+            self.studio.moveActiveTab(-1)
+            QTest.qWait(30)
+            self._assert_active_tab_revealed("while moving active tab left")
+
+        # Jump to the last tab, close it, then reopen it and confirm both stay visible.
+        self.studio.selectTab(self.studio.tabs[-1]["id"])
+        QTest.qWait(50)
+        self._assert_active_tab_revealed("after selecting last tab")
+        self.studio.closeTabSafely(self.studio.active)
+        QTest.qWait(50)
+        self._assert_active_tab_revealed("after closing rightmost tab")
+        self.studio.reopenTab()
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after reopening closed tab")
+
+        # Narrowing the window while on a right-side tab re-reveals the active tab.
+        self.window.resize(460, 180)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after narrowing window")
+
+    def test_overflowing_strip_reveals_active_tab_across_folder_create_open_and_rename(self):
+        import shutil
+        import tempfile
+        import time
+        from PySide6.QtCore import QMetaObject, QObject, Q_ARG
+
+        folder_dir = Path(tempfile.mkdtemp(prefix="supermd-tab-folder-reveal-"))
+        self.addCleanup(lambda: shutil.rmtree(folder_dir, ignore_errors=True))
+
+        def wait_until(predicate, timeout=5.0):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                self.app.processEvents()
+                if predicate():
+                    return
+                QTest.qWait(10)
+            self.assertTrue(predicate())
+
+        self.studio.openFolder(str(folder_dir))
+        wait_until(lambda: bool(self.studio.folder))
+
+        # Create enough folder-backed notes via #87 createFolderNote to overflow horizontally.
+        for index in range(7):
+            title = f"1.{index + 1} Module Overview"
+            self.studio.createFolderNote(str(folder_dir), title, "md")
+            wait_until(lambda expected=f"{title}.md": self.studio.busy == 0 and self.studio._current()["name"] == expected)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after creating overflowing folder-backed note")
+
+        # Activating the first folder note via openNote reveals it at the left edge.
+        first_note = folder_dir / "1.1 Module Overview.md"
+        self.studio.openNote(str(first_note))
+        wait_until(lambda: self.studio._current()["name"] == "1.1 Module Overview.md")
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after activating first folder note via openNote")
+
+        # Activate a note near the right edge of the current viewport and rename it via #87 renameEntry so it widens past the viewport.
+        self.studio.tabNumber(4)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("before renaming folder-backed active tab")
+        target_path = self.studio._current()["path"]
+        self.studio.renameEntry(target_path, "1.2 Comprehensive Distributed Consensus Architecture")
+        wait_until(
+            lambda: self.studio.busy == 0
+            and self.studio._current()["name"] == "1.2 Comprehensive Distributed Consensus Architecture.md"
+        )
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after widening active tab via folder renameEntry")
+
+        # Verify TabStrip's renameDialog still selects only the dotted stem (without .md) from #87.
+        self.window.requestActivate()
+        strip = self.window.findChild(QQuickItem, "tabStrip")
+        self.assertTrue(
+            QMetaObject.invokeMethod(
+                strip,
+                "openRename",
+                Q_ARG("QVariant", self.studio.active),
+                Q_ARG("QVariant", self.studio._current()["name"]),
+            )
+        )
+        rename_field = self.window.findChild(QObject, "renameField")
+        self.assertIsNotNone(rename_field)
+        wait_until(lambda: bool(rename_field.property("selectedText")))
+        self.assertEqual(
+            rename_field.property("selectedText"),
+            "1.2 Comprehensive Distributed Consensus Architecture",
+        )
+        rename_dialog = self.window.findChild(QObject, "renameDialog")
+        rename_dialog.close()
+        QTest.qWait(20)
+
+        # Opening dropped external notes (#118 _open_dropped_notes) appends and reveals the activated dropped tab.
+        drop_dir = Path(tempfile.mkdtemp(prefix="supermd-tab-drop-reveal-"))
+        self.addCleanup(lambda: shutil.rmtree(drop_dir, ignore_errors=True))
+        dropped_a = drop_dir / "Dropped Appendix A.md"
+        dropped_b = drop_dir / "Dropped Appendix B Final Summary.md"
+        dropped_a.write_text("# Appendix A\n", encoding="utf-8")
+        dropped_b.write_text("# Appendix B\n", encoding="utf-8")
+        self.studio._open_dropped_notes([dropped_a, dropped_b])
+        wait_until(
+            lambda: self.studio.busy == 0
+            and self.studio._current()["name"] == "Dropped Appendix B Final Summary.md"
+        )
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after opening multi-note workspace drop")
+

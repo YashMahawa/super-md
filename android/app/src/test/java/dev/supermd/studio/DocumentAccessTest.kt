@@ -15,6 +15,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModelStore
 import java.io.File
 import java.nio.file.Files
+import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -649,6 +650,151 @@ class DocumentAccessTest {
         model.restoreDocumentAccess(recoveryRequest, cleanMdUri)
         await { model.documentAccessRequests.value == null && !model.documentWriteNeedsAccess(cleanMdId) }
         assertFalse(model.state.value.writeNeedsAccess(cleanMdId))
+    }
+
+    @Test
+    fun restoredAccessStatePreservesGrantedNativeLinkResolutionAndPendingHeadingHandoff() {
+        val extProvider = StartupGuardDocumentProvider(root).also {
+            it.attach(app, EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY)
+        }
+        ShadowContentResolver.registerProviderInternal(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, extProvider)
+
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val persistedUris = mutableMapOf<Uri, Int>()
+        val enforcingApp = StartupEnforcingApplication(app, grantedUris, persistedUris)
+        extProvider.permissionChecker = { uri, required ->
+            enforcingApp.checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(), required) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+
+        val persistRw = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+
+        val vaultTreeUri = DocumentsContract.buildTreeDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:course")
+        val vaultIndexUri = extProvider.putDoc(
+            "primary:course/Index.md",
+            "# Index\n\n[[Lecture 2#bayes]]\n",
+            parentId = "primary:course",
+        )
+        val vaultLectureUri = extProvider.putDoc(
+            "primary:course/Lecture 2.md",
+            "# Lecture 2\n\n## Bayes\n",
+            parentId = "primary:course",
+        )
+        val standaloneIndexUri = extProvider.putDoc(
+            "primary:standalone/Hub.md",
+            "# Hub\n\n[Draft](RevokedDraft.md#proof)\n[Unopened](UnopenedSibling.md#lemma)\n",
+        )
+        val revokedDraftUri = extProvider.putDoc(
+            "primary:standalone/RevokedDraft.md",
+            "# Baseline\n\n## Proof\n",
+        )
+        val unopenedSiblingUri = extProvider.putDoc(
+            "primary:standalone/UnopenedSibling.md",
+            "# Sibling\n\n## Lemma\n",
+        )
+
+        listOf(vaultTreeUri, vaultIndexUri, vaultLectureUri, standaloneIndexUri, revokedDraftUri).forEach {
+            enforcingApp.grantPersistable(it, persistRw)
+        }
+
+        val workspaceKey = "link-handoff-${System.nanoTime()}".also(workspaceKeys::add)
+        val initialStore = ViewModelStore().also(viewModels::add)
+        val initialModel = StudioViewModel(enforcingApp, workspaceKey).also {
+            it.readerFlushRequester = { true }
+            initialStore.put("initial", it)
+        }
+        initialModel.reading(autosave = false)
+        for (uri in listOf(vaultIndexUri, standaloneIndexUri, revokedDraftUri)) {
+            initialModel.open(uri)
+            await { initialModel.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), uri) } }
+        }
+        val draftId = initialModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), revokedDraftUri) }.id
+        val draftText = "# Baseline\n\n## Proof\n\nUnsaved local derivation.\n"
+        initialModel.edit(draftId, draftText)
+        assertTrue(kotlinx.coroutines.runBlocking { initialModel.flushRecoveryAndAwait() })
+        initialStore.clear()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // Revoke individual note grants while keeping vaultTreeUri and standaloneIndexUri valid.
+        enforcingApp.revokeAll(vaultIndexUri)
+        enforcingApp.revokeAll(vaultLectureUri)
+        enforcingApp.revokeAll(revokedDraftUri)
+
+        val restoredStore = ViewModelStore().also(viewModels::add)
+        val restoredModel = StudioViewModel(enforcingApp, workspaceKey).also {
+            it.readerFlushRequester = { true }
+            restoredStore.put("restored", it)
+        }
+        await { restoredModel.documentWriteNeedsAccess(draftId) }
+        val vaultIndexId = restoredModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), vaultIndexUri) }.id
+        assertFalse("Containing-folder grant keeps restored note unblocked", restoredModel.documentWriteNeedsAccess(vaultIndexId))
+
+        fun callLink(docPath: String, target: String, fragment: String, wikilink: Boolean): org.json.JSONObject {
+            val outcome = java.util.concurrent.atomic.AtomicReference<Result<org.json.JSONObject>?>()
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO).launch {
+                outcome.set(runCatching { restoredModel.openWorkspaceLink(docPath, target, fragment, wikilink) })
+            }
+            await { outcome.get() != null }
+            return outcome.get()!!.getOrThrow()
+        }
+
+        // 1. Granted containing-folder native link resolution opens sibling note and hands off pendingHeading.
+        val treeReply = callLink(vaultIndexUri.toString(), "Lecture 2", "bayes", wikilink = true)
+        assertTrue(treeReply.getBoolean("opened"))
+        await { restoredModel.state.value.active.uri?.let { sameDocument(Uri.parse(it), vaultLectureUri) } == true }
+        val lectureNote = restoredModel.state.value.active
+        assertFalse(restoredModel.documentWriteNeedsAccess(lectureNote.id))
+        val lectureHeading = restoredModel.state.value.pendingHeading
+        assertNotNull(lectureHeading)
+        assertEquals(lectureNote.id, lectureHeading!!.noteId)
+        assertEquals("bayes", lectureHeading.heading)
+        restoredModel.consumePendingHeading(lectureHeading.token)
+        assertNull(restoredModel.state.value.pendingHeading)
+
+        // 2. Link to restored tab with revoked grant prompts for access, then restoreDocumentAccess preserves
+        // unchanged cached draft text, activates the tab, and hands off pendingHeading.
+        val draftReply = callLink(standaloneIndexUri.toString(), "RevokedDraft.md", "proof", wikilink = false)
+        assertFalse(draftReply.getBoolean("opened"))
+        val draftRequest = restoredModel.documentAccessRequests.value
+        assertNotNull(draftRequest)
+        assertEquals(draftId, draftRequest!!.noteId)
+        assertFalse(draftRequest.writing)
+
+        // Granting read-only first keeps write blocked while still preserving draft + handing off heading.
+        enforcingApp.downgradeToReadOnly(revokedDraftUri)
+        restoredModel.restoreDocumentAccess(draftRequest, revokedDraftUri)
+        await { restoredModel.documentAccessRequests.value == null && restoredModel.state.value.active.id == draftId }
+        assertEquals(draftText, restoredModel.state.value.active.content)
+        assertEquals("# Baseline\n\n## Proof\n", restoredModel.state.value.active.saved)
+        assertTrue("Read-only restore must preserve blocked-write state", restoredModel.documentWriteNeedsAccess(draftId))
+        val draftHeading = restoredModel.state.value.pendingHeading
+        assertNotNull(draftHeading)
+        assertEquals(draftId, draftHeading!!.noteId)
+        assertEquals("proof", draftHeading.heading)
+        restoredModel.consumePendingHeading(draftHeading.token)
+
+        // Upgrading to read-write clears blocked-write state while keeping draft text intact.
+        restoredModel.requestWriteAccessIfBlocked(draftId, explicit = true)
+        val writeRequest = restoredModel.documentAccessRequests.value!!
+        enforcingApp.grantPersistable(revokedDraftUri, persistRw)
+        restoredModel.restoreDocumentAccess(writeRequest, revokedDraftUri)
+        await { restoredModel.documentAccessRequests.value == null && !restoredModel.documentWriteNeedsAccess(draftId) }
+        assertEquals(draftText, restoredModel.state.value.tabs.single { it.id == draftId }.content)
+
+        // 3. Link to unopened sibling without folder grant prompts and hands off pendingHeading on restoreDocumentAccess.
+        val unopenedReply = callLink(standaloneIndexUri.toString(), "UnopenedSibling.md", "lemma", wikilink = false)
+        assertFalse(unopenedReply.getBoolean("opened"))
+        val unopenedRequest = restoredModel.documentAccessRequests.value!!
+        assertNull(unopenedRequest.noteId)
+        enforcingApp.grantPersistable(unopenedSiblingUri, persistRw)
+        restoredModel.restoreDocumentAccess(unopenedRequest, unopenedSiblingUri)
+        await { restoredModel.state.value.active.uri?.let { sameDocument(Uri.parse(it), unopenedSiblingUri) } == true }
+        val siblingHeading = restoredModel.state.value.pendingHeading
+        assertNotNull(siblingHeading)
+        assertEquals(restoredModel.state.value.active.id, siblingHeading!!.noteId)
+        assertEquals("lemma", siblingHeading.heading)
     }
 
     private fun newModel(): StudioViewModel {

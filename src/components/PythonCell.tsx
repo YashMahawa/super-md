@@ -68,6 +68,7 @@ export default function PythonCell({ source, python, highlighted, context, sourc
       rememberPythonOutput(currentSource,scopedOutput,context);
       if (currentRun === runId.current) { executedSource.current = currentSource;executedContext.current=context;executedIdentity.current=identity;pendingStore.current={source:currentSource,context,freshExecution:!!context&&!nativeVerified};setStored(false); setResult(scopedOutput); }
     } catch (error) {
+      if (error instanceof Error && error.message === "Python cell cancelled") return;
       const failure:PythonResult = { stdout: "", stderr: String(error), images: [], ok: false,provenance:{verified:false,reason:'Execution failed before output was recorded'} };
       rememberPythonOutput(currentSource, failure,context);
       if (currentRun === runId.current) { executedSource.current = currentSource;executedContext.current=context;executedIdentity.current=identity;pendingStore.current=null;setStored(false); setResult(failure); }
