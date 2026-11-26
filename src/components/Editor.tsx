@@ -246,8 +246,9 @@ export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:st
   return changed?cached.state.doc.toString():undefined;
 }
 import { scrollRectIntoSearchScroller, type VerticalBandRect } from "../searchScroll";
-export function editorFindQuery(id:string,query:string,caseSensitive:boolean) {
-  visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,literal:true}))});
+export function editorFindQuery(id:string,query:string,caseSensitive:boolean,options?:{wholeWord?:boolean;regexp?:boolean}) {
+  const wholeWord=!!options?.wholeWord,regexp=!!options?.regexp;
+  visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,wholeWord,regexp,literal:!regexp}))});
 }
 function readEditorMatchRect(view:EditorView,from:number,to:number):VerticalBandRect|null {
   try {
