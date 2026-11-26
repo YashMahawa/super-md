@@ -61,6 +61,38 @@ class InstallSkillReplaceRollbackTests(unittest.TestCase):
             self.assertEqual(_snapshot_tree(dest), expected_snapshot)
             self.assertEqual([entry.name for entry in temp_root.iterdir()], [dest.name])
 
+    def test_replace_restores_previous_bundle_when_real_copytree_fails_on_bundle_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            dest = temp_root / "super-md"
+            expected_snapshot = _seed_previous_skill_bundle(dest)
+            copied_bundle_files = 0
+            real_copyfile = install_skill.shutil.copyfile
+
+            def failing_second_bundle_file(src, dst, *args, **kwargs):
+                nonlocal copied_bundle_files
+                dst_path = Path(dst)
+                if dest in dst_path.parents:
+                    if copied_bundle_files >= 1:
+                        raise OSError("simulated mid-bundle file copy failure")
+                    copied_bundle_files += 1
+                return real_copyfile(src, dst, *args, **kwargs)
+
+            stdout = io.StringIO()
+            with (
+                patch.object(install_skill.shutil, "copyfile", side_effect=failing_second_bundle_file),
+                redirect_stdout(stdout),
+            ):
+                with self.assertRaises(install_skill.shutil.Error) as raised:
+                    install_skill.main(["--destination", str(dest), "--replace"])
+
+            self.assertIn("simulated mid-bundle file copy failure", str(raised.exception))
+            self.assertEqual(copied_bundle_files, 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertTrue(dest.is_dir())
+            self.assertEqual(_snapshot_tree(dest), expected_snapshot)
+            self.assertEqual([entry.name for entry in temp_root.iterdir()], [dest.name])
+
     def test_replace_restores_previous_bundle_and_local_preferences_when_bundle_copy_fails_before_creating_dest(self):
         with tempfile.TemporaryDirectory() as directory:
             temp_root = Path(directory)
