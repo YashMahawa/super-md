@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import http.client
 import json
 import queue
 import sys
@@ -606,6 +605,105 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.assertFalse(self.bridge.enabled)
         with self.assertRaises(agent_live.LiveBridgeError):
             agent_live.read_discovery(discovery_path)
+
+
+class AgentLiveExtractionTests(unittest.TestCase):
+    def test_facade_symbol_identity_matches_extracted_submodules(self):
+        import agent_live_client
+        from agent import live_client, qt_bridge
+
+        for name in (
+            "EXPORT_TIMEOUT", "MAX_BODY", "MAX_EXPORT_CHUNK_BYTES", "MAX_PATCH_BYTES",
+            "MAX_RELAY_ASSET_BYTES", "MAX_RESPONSE", "MAX_SEARCH_CONTEXT",
+            "MAX_SOURCE_PAGE", "REQUEST_TIMEOUT", "LiveBridgeError", "LiveTabClient",
+            "read_discovery",
+        ):
+            self.assertIs(getattr(agent_live, name), getattr(live_client, name), name)
+        self.assertIs(agent_live.create_qt_bridge, qt_bridge.create_qt_bridge)
+        self.assertIs(agent_live._qt_bridge_class, qt_bridge._qt_bridge_class)
+        self.assertIs(agent_live_client.LiveTabClient, live_client.LiveTabClient)
+        self.assertIs(agent_live_client.read_discovery, live_client.read_discovery)
+
+    def test_headless_import_loads_neither_pyside6_nor_mcp(self):
+        import subprocess
+
+        desktop_dir = Path(__file__).resolve().parent
+        code = (
+            "import sys; "
+            "import agent_live, agent_live_client; "
+            "from agent import validators, live_client, cloud_rpc, live_native, qt_bridge; "
+            "assert 'PySide6' not in sys.modules, 'PySide6 eagerly imported'; "
+            "assert 'mcp' not in sys.modules, 'mcp eagerly imported'; "
+            "print('OK')"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=desktop_dir, check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(completed.stdout.strip(), "OK")
+
+    def test_validators_bounds_and_error_class_parameterization(self):
+        from agent import validators
+        from agent.live_client import LiveBridgeError
+
+        valid_rev = "a" * 64
+        self.assertEqual(validators.require_sha256_revision(valid_rev), valid_rev)
+        self.assertIsNone(validators.require_optional_sha256_revision(None))
+        for bad_rev in ("short", "A" * 64, "g" * 64, 123):
+            with self.assertRaises(LiveBridgeError):
+                validators.require_sha256_revision(bad_rev, error_cls=LiveBridgeError)
+            with self.assertRaises(ValueError):
+                validators.require_sha256_revision(bad_rev, error_cls=ValueError)
+        self.assertEqual(validators.require_sha256_revision("x" * 64, hex_only=False), "x" * 64)
+
+        for bad_int in (True, False, -1, "0", 1.5):
+            with self.assertRaises(LiveBridgeError):
+                validators.require_nonneg_int(bad_int, error_cls=LiveBridgeError)
+            with self.assertRaises(ValueError):
+                validators.require_int_range(bad_int, 1, 80, error_cls=ValueError)
+        with self.assertRaisesRegex(LiveBridgeError, "between 1 and 80"):
+            validators.require_int_range(81, 1, 80, error_cls=LiveBridgeError)
+        with self.assertRaisesRegex(LiveBridgeError, "between 1 and 524,288"):
+            validators.require_int_range(600_000, 1, 524_288, error_cls=LiveBridgeError,
+                                         message="limit must be between 1 and 524,288 bytes")
+        with self.assertRaisesRegex(LiveBridgeError, "500 characters"):
+            validators.require_search_params("x" * 501, error_cls=LiveBridgeError)
+        with self.assertRaisesRegex(LiveBridgeError, "image_format must be png or jpeg"):
+            validators.require_image_format("webp", error_cls=LiveBridgeError)
+        with self.assertRaisesRegex(ValueError, "imageFormat must be png or jpeg"):
+            validators.require_image_format("webp", field="imageFormat", error_cls=ValueError)
+        with self.assertRaises(ValueError):
+            validators.require_diagram_id("diagram:" + "a" * 93)
+        self.assertEqual(validators.require_diagram_id("diagram:" + "a" * 92), "diagram:" + "a" * 92)
+        with self.assertRaises(ValueError):
+            validators.require_export_params("mdzip")
+        self.assertEqual(validators.require_export_params("pdf")[0], "pdf")
+
+    def test_live_native_prefers_read_source_when_present(self):
+        from unittest.mock import patch
+
+        import agent_documents
+        from agent import live_native
+
+        studio = SimpleNamespace(
+            window_id="win-1", active="tab-1",
+            tabs=[{"id": "tab-1", "name": "Note.md", "path": "/tmp/Note.md",
+                   "content": "# Heading\nBody\n", "saved": "# Heading\nBody\n", "assets": {}}],
+        )
+        fake_page = {
+            "start": 0, "end": 5, "total_chars": 15, "next_offset": 5, "truncated": True,
+            "view": "prose", "text": "# Hea", "returned_chars": 5, "svg_omissions": [],
+            "sectionStart": 0, "sectionEnd": 15, "documentLength": 15,
+        }
+        with patch.object(agent_documents, "read_source", return_value=fake_page, create=True) as mocked:
+            result = live_native.native_result({"action": "read_tab", "tabId": "tab-1", "limit": 5}, studio)
+            mocked.assert_called_once_with("# Heading\nBody\n", offset=0, limit=5, heading=None, view="prose")
+            self.assertEqual(result["markdown"], "# Hea")
+        with patch.object(
+            agent_documents, "read_source",
+            side_effect=agent_documents.AgentDocumentError("bad heading"), create=True,
+        ), self.assertRaisesRegex(ValueError, "bad heading"):
+            live_native.native_result({"action": "read_tab", "tabId": "tab-1", "heading": "missing"}, studio)
 
 
 if __name__ == "__main__":
