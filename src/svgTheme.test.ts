@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import {expect,it,vi} from 'vitest';
 import {adaptSvg,adaptSvgData} from './svgTheme';
-import {presentSvg} from './svgImage';
+import {presentSvg,parseValidatedSvg,svgContrastBackdrop,svgDataBackdrop,svgImage} from './svgImage';
 import {mediaContrast} from './mediaAppearance';
 const light={surface:'#f0e1d0',primary:'#80502d'},dark={surface:'#211d2d',primary:'#dfb1e0'};
 const parse=(s:string)=>new DOMParser().parseFromString(s,'image/svg+xml');
@@ -158,6 +158,72 @@ it('parses and serializes synthetic SVGs once per adaptation or presentation whi
     expect(serializeSpy).toHaveBeenCalledTimes(1);
     expect(mono.mode).toBe('mono');
     expect(mono.svg).toContain('xmlns="http://www.w3.org/2000/svg"');
+  }finally{
+    parseSpy.mockRestore();
+    serializeSpy.mockRestore();
+  }
+});
+
+it('preserves decoded SVG paint values in one-parse contrast decisions with plain-versus-escaped output parity and intact guards',()=>{
+  const parseSpy=vi.spyOn(DOMParser.prototype,'parseFromString');
+  const serializeSpy=vi.spyOn(XMLSerializer.prototype,'serializeToString');
+  try{
+    const plain='<svg viewBox="0 0 100 100"><path d="M10 10 C 20 0, 30 0, 40 10 Z" fill="#fff"/><circle cx="70" cy="50" r="15" fill="#fff"/></svg>';
+    const escaped='<svg viewBox="0 0 100 100"><path d="M10 10 C 20 0, 30 0, 40 10 Z" fill="&#x23;fff"/><circle cx="70" cy="50" r="15" fill="#fff"/></svg>';
+    expect(svgImage(escaped)).toBe(svgImage(plain));
+    expect(svgContrastBackdrop(escaped)).toBe('#222026');
+    expect(svgContrastBackdrop(escaped)).toBe(svgContrastBackdrop(plain));
+
+    const plainUri='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(plain);
+    const escapedUri='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(escaped);
+    expect(svgDataBackdrop(escapedUri)).toBe('#222026');
+    expect(svgDataBackdrop(escapedUri)).toBe(svgDataBackdrop(plainUri));
+
+    parseSpy.mockClear();serializeSpy.mockClear();
+    const validatedEscaped=parseValidatedSvg(escaped);
+    expect(parseSpy).toHaveBeenCalledTimes(1);
+    expect(serializeSpy).not.toHaveBeenCalled();
+    expect(validatedEscaped.backing).toBe('#222026');
+
+    for(const colors of [light,dark]){
+      const isDark=colors===dark;
+      for(const monochrome of [false,true]){
+        parseSpy.mockClear();serializeSpy.mockClear();
+        const adaptedEscaped=adaptSvg(escaped,colors,isDark,monochrome);
+        expect(parseSpy).toHaveBeenCalledTimes(1);
+        expect(serializeSpy).toHaveBeenCalledTimes(1);
+        const adaptedPlain=adaptSvg(plain,colors,isDark,monochrome);
+        expect(adaptedEscaped).toBe(adaptedPlain);
+        if(!monochrome){
+          const xml=parse(adaptedEscaped);
+          expect(xml.querySelector('path')!.getAttribute('fill')).toBe(colors.primary);
+          expect(xml.querySelector('circle')!.getAttribute('fill')).toBe(colors.primary);
+        }
+        expect(adaptSvgData(escapedUri,colors,isDark,monochrome)).toBe(adaptSvgData(plainUri,colors,isDark,monochrome));
+      }
+    }
+    expect(presentSvg(escaped,'#e6e0e9')).toEqual(presentSvg(plain,'#e6e0e9'));
+
+    const styledPlain='<svg viewBox="0 0 100 100"><style>.p{fill:#fff;stroke:none}</style><path class="p" d="M10 10 C 20 0, 30 0, 40 10 Z"/><circle cx="70" cy="50" r="15" style="fill:#fff;stroke:none"/></svg>';
+    const styledEscaped='<svg viewBox="0 0 100 100"><style>.p{fill:&#x23;fff;stroke:&#x6e;one}</style><path class="p" d="M10 10 C 20 0, 30 0, 40 10 Z"/><circle cx="70" cy="50" r="15" style="fill:&#35;fff;stroke:none"/></svg>';
+    parseSpy.mockClear();serializeSpy.mockClear();
+    const adaptedStyledEscaped=adaptSvg(styledEscaped,light,false);
+    expect(parseSpy).toHaveBeenCalledTimes(1);
+    expect(serializeSpy).toHaveBeenCalledTimes(1);
+    expect(adaptedStyledEscaped).toBe(adaptSvg(styledPlain,light,false));
+    expect(svgContrastBackdrop(styledEscaped)).toBe('#222026');
+
+    // Retain namespace, size, and decoded sanitizer guards.
+    expect(()=>parseValidatedSvg('<svg xmlns="http://evil.example/ns"><path fill="&#x23;fff"/></svg>')).toThrow();
+    expect(svgContrastBackdrop('<svg xmlns="http://evil.example/ns"><path fill="&#x23;fff"/></svg>')).toBe('#fdfdfc');
+    expect(()=>adaptSvg('<svg><image href="&#x68;ttps://evil.example/a.png"/></svg>',light,false)).toThrow();
+    expect(()=>adaptSvg('<svg><rect style="fill:url(&#x68;ttps://evil.example/p)"/></svg>',light,false)).toThrow();
+    expect(()=>adaptSvg('<svg><style>@&#x69;mport "https://evil.example/a.css";</style></svg>',light,false)).toThrow();
+
+    const oversized=`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><!--${'x'.repeat(1_000_005)}--><path fill="&#x23;fff" d="M0 0h5v5z"/></svg>`;
+    expect(svgContrastBackdrop(oversized)).toBe('#fdfdfc');
+    expect(parseValidatedSvg(oversized).backing).toBe('#fdfdfc');
+    expect(adaptSvg(oversized,light,false)).toContain('fill="#fff"');
   }finally{
     parseSpy.mockRestore();
     serializeSpy.mockRestore();

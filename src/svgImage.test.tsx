@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
-import { presentSvg,svgContrastBackdrop } from "./svgImage";
+import { presentSvg,svgContrastBackdrop,svgDataBackdrop } from "./svgImage";
 import { remarkSvgBlocks } from "./svgBlocks";
 import { DocumentAppearance } from "./documentAppearance";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -16,6 +16,8 @@ describe("inline SVG", () => {
     expect(svgContrastBackdrop('<svg><path stroke="white" fill="none"/></svg>')).toBe('#222026');
     expect(svgContrastBackdrop('<svg><path stroke="black" fill="none"/></svg>')).toBe('#fdfdfc');
     expect(svgContrastBackdrop('<svg><path style="fill:#fff;stroke:none"/></svg>')).toBe('#222026');
+    expect(svgContrastBackdrop('<svg><path fill="&#x23;fff" d="M0 0h4v4z"/><circle cx="8" cy="8" r="2" fill="#fff"/></svg>')).toBe('#222026');
+    expect(svgDataBackdrop('data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg><path style="fill:&#35;fff;stroke:none"/></svg>'))).toBe('#222026');
   });
   it("lifts raw svg blocks, one-line svg and untagged fences into svg blocks", () => {
     for (const markdown of [
@@ -183,6 +185,69 @@ describe("inline SVG", () => {
       parseSpy.mockRestore();
       serializeSpy.mockRestore();
       await act(async () => root.unmount());
+    }
+  });
+
+  it("matches plain and XML character-escaped white paint across SvgDiagram and MarkdownPreview in one parse", async () => {
+    const { createRoot } = await import("react-dom/client");
+    const { act } = await import("react");
+    (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
+    const plainSvg = '<svg viewBox="0 0 100 100"><path d="M10 10 C 20 0, 30 0, 40 10 Z" fill="#fff"/><circle cx="70" cy="50" r="15" fill="#fff"/></svg>';
+    const escapedSvg = '<svg viewBox="0 0 100 100"><path d="M10 10 C 20 0, 30 0, 40 10 Z" fill="&#x23;fff"/><circle cx="70" cy="50" r="15" fill="#fff"/></svg>';
+    const lightColors = { surface: "#f0e1d0", primary: "#80502d", text: "#1c2635" };
+    const plainHost = document.createElement("div");
+    const escapedHost = document.createElement("div");
+    const plainRoot = createRoot(plainHost);
+    const escapedRoot = createRoot(escapedHost);
+    const parseSpy = vi.spyOn(DOMParser.prototype, "parseFromString");
+    try {
+      parseSpy.mockClear();
+      await act(async () => {
+        plainRoot.render(<SvgDiagram source={plainSvg} appearance="auto" colors={lightColors} preserveOriginal />);
+        escapedRoot.render(<SvgDiagram source={escapedSvg} appearance="auto" colors={lightColors} preserveOriginal />);
+      });
+      expect(parseSpy).toHaveBeenCalledTimes(2);
+      const plainImg = plainHost.querySelector("img")!;
+      const escapedImg = escapedHost.querySelector("img")!;
+      expect(escapedImg.getAttribute("data-light-ink")).toBe("true");
+      expect(escapedImg.getAttribute("src")).toBe(plainImg.getAttribute("src"));
+
+      parseSpy.mockClear();
+      await act(async () => {
+        plainRoot.render(<SvgDiagram source={plainSvg} appearance="contrast" colors={lightColors} preserveOriginal />);
+        escapedRoot.render(<SvgDiagram source={escapedSvg} appearance="contrast" colors={lightColors} preserveOriginal />);
+      });
+      expect(parseSpy).not.toHaveBeenCalled();
+      expect(escapedHost.querySelector("img")!.style.backgroundColor).toBe("rgb(34, 32, 38)");
+      expect(escapedHost.querySelector("img")!.getAttribute("src")).toBe(plainHost.querySelector("img")!.getAttribute("src"));
+
+      const plainUri = `data:image/svg+xml;base64,${btoa(plainSvg)}`;
+      const escapedUri = `data:image/svg+xml;base64,${btoa(escapedSvg)}`;
+      parseSpy.mockClear();
+      await act(async () => {
+        plainRoot.render(
+          <DocumentAppearance.Provider value={{ dark: false, svgAppearance: "auto", ink: "#80502d", text: "#1c2635", colors: lightColors }}>
+            <MarkdownPreview documentPath={null} python="" dark={false} markdown={`![Plain](${plainUri})`} />
+          </DocumentAppearance.Provider>,
+        );
+        escapedRoot.render(
+          <DocumentAppearance.Provider value={{ dark: false, svgAppearance: "auto", ink: "#80502d", text: "#1c2635", colors: lightColors }}>
+            <MarkdownPreview documentPath={null} python="" dark={false} markdown={`![Escaped](${escapedUri})`} />
+          </DocumentAppearance.Provider>,
+        );
+      });
+      expect(parseSpy).toHaveBeenCalledTimes(2);
+      const plainNoteImg = plainHost.querySelector("img")!;
+      const escapedNoteImg = escapedHost.querySelector("img")!;
+      expect(escapedNoteImg.getAttribute("data-light-ink")).toBe("true");
+      expect(escapedNoteImg.style.getPropertyValue("--svg-contrast-backing")).toBe("#222026");
+      expect(escapedNoteImg.getAttribute("src")).toBe(plainNoteImg.getAttribute("src"));
+    } finally {
+      parseSpy.mockRestore();
+      await act(async () => {
+        plainRoot.unmount();
+        escapedRoot.unmount();
+      });
     }
   });
 });
