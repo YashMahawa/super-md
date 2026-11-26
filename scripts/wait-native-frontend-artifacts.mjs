@@ -66,7 +66,27 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   return { ready: true, names: expected };
 }
 
-async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
+function headerValue(headers, name) {
+  if (!headers) return '';
+  if (typeof headers.get === 'function') return String(headers.get(name) || '').trim();
+  const key = Object.keys(headers).find(entry => entry.toLowerCase() === name.toLowerCase());
+  return key ? String(headers[key] || '').trim() : '';
+}
+
+function parseRateLimitDelayMs(headers, currentTimeMs) {
+  const retryAfter = Number(headerValue(headers, 'retry-after'));
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.ceil(retryAfter * 1_000);
+  if (headerValue(headers, 'x-ratelimit-remaining') === '0') {
+    const resetEpochSeconds = Number(headerValue(headers, 'x-ratelimit-reset'));
+    if (Number.isFinite(resetEpochSeconds) && resetEpochSeconds > 0) {
+      return Math.max(1_000, (resetEpochSeconds * 1_000) - currentTimeMs);
+    }
+    return 60_000;
+  }
+  return 0;
+}
+
+async function githubJson(url, token, fetchImpl, requestTimeoutMs, currentTimeMs) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -79,12 +99,20 @@ async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
     });
   } catch (error) {
     if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || error instanceof TypeError) {
-      return { retry: true, status: error.name || 'network-error' };
+      return { retry: true, status: error.name || 'network-error', retryAfterMs: 0 };
     }
     throw error;
   }
   if (!response.ok) {
-    if (response.status >= 500 || response.status === 429) return { retry: true, status: response.status };
+    const rateLimitDelayMs = parseRateLimitDelayMs(response.headers, currentTimeMs);
+    let isRateLimited = response.status === 429 || (response.status === 403 && rateLimitDelayMs > 0);
+    if (!isRateLimited && response.status === 403 && typeof response.text === 'function') {
+      const bodyText = await response.text().catch(() => '');
+      if (/rate limit/i.test(bodyText)) isRateLimited = true;
+    }
+    if (response.status >= 500 || isRateLimited) {
+      return { retry: true, status: response.status, retryAfterMs: rateLimitDelayMs };
+    }
     throw new Error(`GitHub Actions API request failed with HTTP ${response.status}`);
   }
   return { value: await response.json() };
@@ -107,25 +135,25 @@ export async function waitForNativeFrontendArtifacts({
   const runPath = `repos/${repository}/actions/runs/${runId}`;
   const started = now();
   const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
-  const pause = async () => {
+  const pause = async (delayMs = pollIntervalMs) => {
     const left = timeoutMs - (now() - started);
-    if (left > 0) await sleep(Math.min(pollIntervalMs, left));
+    if (left > 0) await sleep(Math.min(Math.max(delayMs || 0, pollIntervalMs), left));
   };
-  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
+  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()), now());
   while (now() - started < timeoutMs) {
     const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (runResult.retry) {
-      await pause();
+      await pause(runResult.retryAfterMs);
       continue;
     }
     const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (jobsResult.retry) {
-      await pause();
+      await pause(jobsResult.retryAfterMs);
       continue;
     }
     const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (artifactsResult.retry) {
-      await pause();
+      await pause(artifactsResult.retryAfterMs);
       continue;
     }
     const state = inspectFrontendArtifactReadiness({
