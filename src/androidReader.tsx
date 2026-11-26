@@ -71,7 +71,7 @@ interface PendingAgentEdit {seq:number;before:string;after:string}
 interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView; pendingAgentEdits?: PendingAgentEdit[]; agentUnreviewed?: boolean }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (initialQuery?: string, options?: { caseSensitive?: boolean }) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
@@ -122,8 +122,10 @@ function Reader() {
   const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
+  const [searchReplace,setSearchReplace] = useState(false);
   const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
   const searchSeedNonce = useRef(0);
+  const searchingRef = useRef(false); searchingRef.current = searching;
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
   const cancelPdfExport=useCallback(async()=>{
@@ -204,7 +206,7 @@ function Reader() {
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
-  useEffect(() => {
+  useLayoutEffect(() => {
     const nativeScroll=new FrameScrollQueue((scroller,dx,dy)=>{
       const reading=scroller.matches('.android-reading');
       if(reading){cancelHeadingNavigation(scroller);rememberWindowedScrollSource(scroller,dy);if(Math.abs(dy)>2)requestChrome('hide');}
@@ -233,8 +235,9 @@ function Reader() {
         if(seededFind&&typeof seededFind.query==='string'){
           searchSeedNonce.current+=1;
           setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchReplace(false);
           setSearching(true);
-          requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));
+          requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:false}})));
         }
       };
       if (Array.isArray(pendingAgentEdits) && pendingAgentEdits.length > 0 && typeof rest.id === "string") {
@@ -416,16 +419,31 @@ function Reader() {
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
-    window.supermdFind = (initialQuery, options) => {
+    window.supermdFind = (replaceOrQuery, options) => {
       if(document.querySelector('.theme-guide-dialog'))return;
+      const requestedReplace=typeof replaceOrQuery==="boolean"?replaceOrQuery:Boolean(options?.replace);
+      const openReplace=requestedReplace&&reference.current?.mode!=="reader";
       flushSync(()=>{
-        if(typeof initialQuery==='string'){
+        if(typeof replaceOrQuery==='string'){
           searchSeedNonce.current+=1;
-          setSearchSeed({query:initialQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:replaceOrQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchReplace(openReplace);
+        } else if(!searchingRef.current) {
+          setSearchReplace(openReplace);
         }
         setSearching(true);
       });
-      window.dispatchEvent(new Event("supermd-find-focus"));
+      window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:openReplace}}));
+    };
+    window.supermdFindStep = (direction = 1) => {
+      if(document.querySelector('.theme-guide-dialog'))return;
+      const step=direction<0?-1:1;
+      if(!searchingRef.current){
+        flushSync(()=>{setSearchReplace(false);setSearching(true);});
+        requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-step",{detail:step})));
+        return;
+      }
+      window.dispatchEvent(new CustomEvent("supermd-find-step",{detail:step}));
     };
     const flushExportNote = async (current: ReaderState) => {
       if (current.editProtocol === 1) await edits.current!.flush(current.id);
@@ -464,7 +482,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; delete window.supermdFindStep; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -607,8 +625,17 @@ function Reader() {
     scroll();
     return()=>{window.clearTimeout(timer);save();root.removeEventListener('scroll',scroll);window.removeEventListener('pagehide',save);document.removeEventListener('visibilitychange',save);savePosition.current=()=>{};};
   },[state?.id,state?.mode,state?.path,state?.restorePosition]);
-  useEffect(() => {
-    const find=(event:KeyboardEvent)=>{if(document.documentElement.dataset.host==='qt')return;if((event.ctrlKey || event.metaKey) && event.key.toLowerCase()==="f"){event.preventDefault();event.stopImmediatePropagation();window.supermdFind?.();}};
+  useLayoutEffect(() => {
+    const find=(event:KeyboardEvent)=>{
+      if(document.documentElement.dataset.host==='qt')return;
+      if(!event.ctrlKey&&!event.metaKey&&!event.altKey&&event.key==="F3"){
+        event.preventDefault();event.stopImmediatePropagation();window.supermdFindStep?.(event.shiftKey?-1:1);return;
+      }
+      if((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey){
+        const key=event.key.toLowerCase();
+        if(key==="f"||key==="h"){event.preventDefault();event.stopImmediatePropagation();window.supermdFind?.(key==="h");}
+      }
+    };
     const history=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt')return;
       if(!(event.ctrlKey||event.metaKey)||event.altKey)return;
@@ -1128,7 +1155,7 @@ function Reader() {
       </div>
     </div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed}/>}
+    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed} initialReplace={searchReplace}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
@@ -1137,4 +1164,5 @@ function Reader() {
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
-createRoot(document.getElementById("root")!).render(<Reader />);
+const mountReaderRoot = () => createRoot(document.getElementById("root")!).render(<Reader />);
+if ((globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT) mountReaderRoot(); else flushSync(mountReaderRoot);
