@@ -67,20 +67,26 @@ class InstallSkillReplaceRollbackTests(unittest.TestCase):
             dest = temp_root / "super-md"
             expected_snapshot = _seed_previous_skill_bundle(dest)
             copied_bundle_files = 0
-            real_copyfile = install_skill.shutil.copyfile
+            real_copytree = install_skill.shutil.copytree
+            real_copy2 = install_skill.shutil.copy2
 
             def failing_second_bundle_file(src, dst, *args, **kwargs):
                 nonlocal copied_bundle_files
-                dst_path = Path(dst)
-                if dest in dst_path.parents:
-                    if copied_bundle_files >= 1:
-                        raise OSError("simulated mid-bundle file copy failure")
-                    copied_bundle_files += 1
-                return real_copyfile(src, dst, *args, **kwargs)
+                if copied_bundle_files >= 1:
+                    raise OSError("simulated mid-bundle file copy failure")
+                copied_bundle_files += 1
+                copied = real_copy2(src, dst, *args, **kwargs)
+                self.assertTrue(Path(dst).is_file())
+                return copied
+
+            def copytree_with_failing_copy_function(*args, **kwargs):
+                if len(args) < 5 and "copy_function" not in kwargs:
+                    kwargs["copy_function"] = failing_second_bundle_file
+                return real_copytree(*args, **kwargs)
 
             stdout = io.StringIO()
             with (
-                patch.object(install_skill.shutil, "copyfile", side_effect=failing_second_bundle_file),
+                patch.object(install_skill.shutil, "copytree", side_effect=copytree_with_failing_copy_function),
                 redirect_stdout(stdout),
             ):
                 with self.assertRaises(install_skill.shutil.Error) as raised:
