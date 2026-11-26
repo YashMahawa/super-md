@@ -169,11 +169,7 @@ fn inspect_destination_path(output_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)
     }
     Ok((current, missing_dirs))
 }
-/// Portable no-overwrite publication: uses exclusive `create_new` (`O_CREAT | O_EXCL` on Unix,
-/// `CREATE_NEW` on Windows) directly at `path` instead of `hard_link` or overwriting `rename`.
-/// This supports removable FAT/exFAT output folders without hard-link support while refusing
-/// to overwrite existing files, and removes `path` immediately if writing or syncing fails.
-fn write_new_file(path: &Path, data: &[u8]) -> Result<()> {
+fn ensure_absent_non_symlink(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -181,9 +177,16 @@ fn write_new_file(path: &Path, data: &[u8]) -> Result<()> {
             }
             bail!("Output exists; choose an empty destination or another folder");
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
     }
+}
+/// Portable no-overwrite publication: uses exclusive `create_new` (`O_CREAT | O_EXCL` on Unix,
+/// `CREATE_NEW` on Windows) directly at `path` instead of `hard_link` or overwriting `rename`.
+/// This supports removable FAT/exFAT output folders without hard-link support while refusing
+/// to overwrite existing files, and removes `path` immediately if writing or syncing fails.
+fn write_new_file(path: &Path, data: &[u8]) -> Result<()> {
+    ensure_absent_non_symlink(path)?;
     let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -216,16 +219,7 @@ fn unpack_note(input_path: &Path, note: &PortableDocument, output_dir: &Path) ->
     let md_target = output_dir.join(&md_name);
     let checked_md_target = checked_output_dir.join(&md_name);
     if out_existed {
-        match std::fs::symlink_metadata(&checked_md_target) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
-                    bail!("Refusing to unpack through a symlink");
-                }
-                bail!("Output exists; choose an empty destination or another folder");
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
+        ensure_absent_non_symlink(&checked_md_target)?;
     }
     let mut staged_assets: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(note.assets.len());
     let mut seen_paths = std::collections::HashSet::new();
@@ -262,16 +256,7 @@ fn unpack_note(input_path: &Path, note: &PortableDocument, output_dir: &Path) ->
         if !seen_paths.insert(name.to_ascii_lowercase()) { bail!("Conflicting unpacked asset path: {name}"); }
         let target = checked_output_dir.join(rel);
         if assets_existed {
-            match std::fs::symlink_metadata(&target) {
-                Ok(meta) => {
-                    if meta.file_type().is_symlink() {
-                        bail!("Refusing to unpack through a symlink");
-                    }
-                    bail!("Output exists; choose an empty destination or another folder");
-                }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
+            ensure_absent_non_symlink(&target)?;
         }
         let (_mime, bytes) = portable::image_bytes(data)?;
         staged_assets.push((target, bytes));
