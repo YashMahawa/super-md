@@ -1,6 +1,7 @@
 """Tests for clean FolderSidebar chrome and default-on non-note subfolder filtering."""
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -29,8 +30,8 @@ class FolderSidebarCleanupTest(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["FolderSidebarCleanupTest"])
 
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp_dir.name)
+        self.temp_dir = Path(canonical_path_str(tempfile.mkdtemp(prefix="supermd-sidebar-cleanup-")))
+        self.root = self.temp_dir
         self.data_dir = self.root / "app-data"
         self.workspace = self.root / "Workspace"
         self.workspace.mkdir(parents=True)
@@ -41,8 +42,11 @@ class FolderSidebarCleanupTest(unittest.TestCase):
         self.studio.stop()
         self.studio.pool.shutdown(wait=True, cancel_futures=True)
         self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
+        self.studio.deleteLater()
         self.session.writes.shutdown(wait=True)
-        self.temp_dir.cleanup()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _wait_for(self, predicate, timeout: float = 4.0):
         deadline = time.monotonic() + timeout
@@ -197,6 +201,10 @@ ApplicationWindow {
         QTest.qWait(60)
         self._wait_for(lambda: self.studio.files == [])
 
+        # Collapsed/hidden subdirectories must not hold OS directory watches at rest (prevents Win32 rename locks)
+        watched_dirs = {canonical_path_str(d) for d in self.studio.note_watcher.directories()}
+        self.assertEqual(watched_dirs, {canonical_path_str(self.workspace)})
+
         # 1. Creating a note via createFolderNote reveals HiddenDrafts
         self.studio.createFolderNote(str(created_target), "First Idea", "md")
         self._wait_for(lambda: "HiddenDrafts" in self._rels() and "HiddenDrafts/First Idea.md" in self._rels())
@@ -209,11 +217,10 @@ ApplicationWindow {
         self.studio.toggleDirectory(str(self.workspace / "Research"))
         self._wait_for(lambda: "Research/Papers" in self._rels())
 
-        # 3. External note file added on disk inside watched hidden subfolder Inbox/Clipped reveals Inbox
+        # 3. External note file added on disk inside Inbox/Clipped reveals Inbox upon workspace change
         ext_file = Path(canonical_path_str(external_target)) / "WebClip.smd"
         ext_file.write_bytes(b"{}")
-        # Trigger watcher path in case offscreen container FS notifications coalesce slowly
-        self.studio._external_note_changed(str(external_target))
+        self.studio._external_note_changed(str(self.workspace))
         self._wait_for(lambda: "Inbox" in self._rels())
         self.studio.toggleDirectory(str(self.workspace / "Inbox"))
         self._wait_for(lambda: "Inbox/Clipped" in self._rels())

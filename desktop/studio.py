@@ -75,7 +75,6 @@ def _directory_has_visible_note(
     max_depth: int = MAX_FOLDER_DEPTH,
     budget: list[int] | None = None,
     memo: dict[str, bool] | None = None,
-    hidden_dirs: list[str] | None = None,
 ) -> bool:
     if depth > max_depth:
         return False
@@ -121,14 +120,11 @@ def _directory_has_visible_note(
                 max_depth=max_depth,
                 budget=budget,
                 memo=memo,
-                hidden_dirs=hidden_dirs,
             ):
                 found = True
                 break
     if memo is not None:
         memo[key] = found
-    if not found and hidden_dirs is not None and len(hidden_dirs) < 128:
-        hidden_dirs.append(folder_ops.canonical_path_str(dir_path))
     return found
 
 
@@ -1389,14 +1385,13 @@ class Studio(QObject):
     def _watch_notes(self,force=False):
         if self.retired:return
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
-        hidden_dirs=tuple(sorted(getattr(self,"_hidden_watched_dirs",())))
-        signature=(paths,self.folder,tuple(sorted(self.expanded)),hidden_dirs)
+        signature=(paths,self.folder,tuple(sorted(self.expanded)))
         if not force and signature==self.note_watch_paths:return
         self.note_watch_paths=signature
         self.note_file_stamps={path:stamp for path,stamp in self.note_file_stamps.items() if path in paths}
         self.note_identities={path:file_events.identity(path) or self.note_identities.get(path) for path in paths}
         targets={str(target) for path in paths for target in (Path(path),Path(path).parent) if target.exists()}
-        targets.update(path for path in ({self.folder}|set(self.expanded)|set(hidden_dirs)) if path and Path(path).is_dir())
+        targets.update(path for path in ({self.folder}|set(self.expanded)) if path and Path(path).is_dir())
         watched=set(self.note_watcher.files()+self.note_watcher.directories())
         if watched-targets:self.note_watcher.removePaths(list(watched-targets))
         if targets-watched:self.note_watcher.addPaths(list(targets-watched))
@@ -3620,7 +3615,6 @@ class Studio(QObject):
         self._tree_generation = getattr(self, "_tree_generation", 0) + 1
         generation = self._tree_generation
         if not self.folder:
-            self._hidden_watched_dirs = set()
             self.files = []
             return
         if self.folder_filter.strip():
@@ -3632,7 +3626,6 @@ class Studio(QObject):
         def scan():
             entries: list[dict[str, object]] = []
             note_memo: dict[str, bool] = {}
-            hidden_dirs: list[str] = []
             scan_budget = [25000]
             def visit(path, depth):
                 if depth > MAX_FOLDER_DEPTH:
@@ -3654,7 +3647,6 @@ class Studio(QObject):
                             max_depth=MAX_FOLDER_DEPTH,
                             budget=scan_budget,
                             memo=note_memo,
-                            hidden_dirs=hidden_dirs,
                         ):
                             continue
                         child_str = folder_ops.canonical_path_str(child)
@@ -3666,12 +3658,10 @@ class Studio(QObject):
                         child_str = folder_ops.canonical_path_str(child)
                         entries.append({"name": child.name, "path": child_str, "directory": False, "depth": depth, "expanded": False})
             visit(folder, 0)
-            return entries, hidden_dirs
+            return entries
         def finished(result, error):
             if not error and result is not None and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder) and not self.folder_filter.strip():
-                entries, hidden_dirs = result
-                self._hidden_watched_dirs = set(hidden_dirs)
-                self.files = entries
+                self.files = result
                 self._watch_notes()
         self._submit(scan, finished, False)
 
@@ -3696,7 +3686,6 @@ class Studio(QObject):
     def closeFolder(self):
         self._tree_generation = getattr(self, "_tree_generation", 0) + 1
         self._clear_folder_filter()
-        self._hidden_watched_dirs = set()
         self.folder = ""
         self.files = []
         self.expanded.clear()
@@ -6173,7 +6162,10 @@ class Studio(QObject):
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
                     self.pending_save_as_tab = ""
-                elif command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                elif command.startswith("export_"):
+                    self.message = f"Exported {Path(result['path']).name}"
+                    if isinstance(result, dict) and result.get("path"):
+                        self._refresh_open_folders_for_path(result["path"])
                 if agent_export_info:
                     record = self._agent_job_records.get(agent_export_info.get("jobId"))
                     if record:

@@ -167,7 +167,7 @@ ApplicationWindow {
             save_as = win.findChild(QObject, "saveAsAction")
             search = win.findChild(QObject, "compactSearchFolderAction")
             self.assertIsNone(search, "Compact overflow menu must not duplicate Search across notes")
-            self.assertNotIn("folderSearchButton", MAIN.read_text(), "Toolbar must not duplicate Search across notes")
+            self.assertNotIn("folderSearchButton", MAIN.read_text(encoding="utf-8"), "Toolbar must not duplicate Search across notes")
             self.assertEqual(reopen.property("text"), "Reopen closed tab")
             self.assertTrue(reopen.property("hasShortcutHint"))
             self.assertEqual(reopen.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Shift+T")
