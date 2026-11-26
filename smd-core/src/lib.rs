@@ -953,6 +953,74 @@ fn collect_footnote_definitions<'a>(events: &[Event<'a>]) -> HashMap<String, Vec
     }
     defs
 }
+fn collect_emitted_targets<'a>(
+    events: &[Event<'a>],
+    footnote_defs: &HashMap<String, Vec<Event<'a>>>,
+    visited_footnotes: &mut HashSet<String>,
+    headings: &mut HashMap<String, usize>,
+    equations: &mut HashMap<String, equations::EquationTarget>,
+) {
+    let mut i = 0usize;
+    while i < events.len() {
+        match &events[i] {
+            Event::Start(Tag::FootnoteDefinition(_)) => {
+                i += 1;
+                let mut depth = 1usize;
+                while i < events.len() && depth > 0 {
+                    match &events[i] {
+                        Event::Start(Tag::FootnoteDefinition(_)) => depth += 1,
+                        Event::End(TagEnd::FootnoteDefinition) => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            Event::Start(Tag::Image { .. }) => {
+                i += 1;
+                let mut depth = 1usize;
+                while i < events.len() && depth > 0 {
+                    match &events[i] {
+                        Event::Start(Tag::Image { .. }) => depth += 1,
+                        Event::End(TagEnd::Image) => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            Event::Start(Tag::Heading { .. }) => {
+                let plain: String = events[i + 1..]
+                    .iter()
+                    .take_while(|e| !matches!(e, Event::End(TagEnd::Heading(_))))
+                    .filter_map(|e| match e {
+                        Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => Some(v.as_ref()),
+                        _ => None,
+                    })
+                    .collect();
+                let slug = heading_slug(&plain);
+                let count = headings.get(&slug).copied().unwrap_or(0);
+                if count > 0 {
+                    headings.insert(format!("{slug}-{count}"), 1);
+                }
+                headings.insert(slug, count + 1);
+            }
+            Event::DisplayMath(v) => {
+                equations::analyze_display_equation(v, equations);
+            }
+            Event::FootnoteReference(name) => {
+                let key = normalize_footnote_id(name);
+                if visited_footnotes.insert(key.clone()) {
+                    if let Some(def_events) = footnote_defs.get(&key) {
+                        collect_emitted_targets(def_events, footnote_defs, visited_footnotes, headings, equations);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
 fn heading_slug(value: &str) -> String {
     let value = value.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_').collect::<String>();
     let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
@@ -1081,9 +1149,11 @@ impl<'a> Renderer<'a> {
                         self.emitted_footnotes.insert(key, label_id.clone());
                         let saved_events = std::mem::replace(&mut self.events, def_events.into_iter().peekable());
                         let saved_in_footnote = std::mem::replace(&mut self.in_footnote, true);
+                        let saved_link_depth = std::mem::replace(&mut self.link_depth, 0);
                         let rendered = self.render(None);
                         self.events = saved_events;
                         self.in_footnote = saved_in_footnote;
+                        self.link_depth = saved_link_depth;
                         let body = rendered?;
                         out.push_str(&format!("#footnote[{}]<{label_id}>", body.trim()));
                     } else {
@@ -1139,7 +1209,14 @@ impl<'a> Renderer<'a> {
                             out.push_str(&format!("\n#smd-code({code_arg}, lang: {lang_arg})\n\n"));
                         },
                         Tag::Image { dest_url, .. } => {
-                            let _alt = self.render(Some(close))?;
+                            let mut img_depth = 1usize;
+                            while img_depth > 0 {
+                                match self.events.next() {
+                                    Some(Event::Start(Tag::Image { .. })) => img_depth += 1,
+                                    Some(Event::End(TagEnd::Image)) | None => img_depth = img_depth.saturating_sub(1),
+                                    _ => {}
+                                }
+                            }
                             let key = dest_url.to_string();
                             validate_asset_path(&key)?;
                             if is_font_asset(&key) || !self.assets.contains_key(&key) { bail!("Image unavailable for PDF: {key}"); }
@@ -1311,16 +1388,10 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     let stripped = strip_percent_comments(raw_body);
     let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES);
-    let mut headings = HashMap::new(); let mut current = None::<String>;
-    let mut equations = HashMap::new();
-    for event in &events { match event {
-        Event::Start(Tag::Heading { .. }) => current = Some(String::new()),
-        Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => { if let Some(text) = &mut current { text.push_str(v); } },
-        Event::End(TagEnd::Heading(_)) => { if let Some(text) = current.take() { let slug = heading_slug(&text); let count = headings.get(&slug).copied().unwrap_or(0); if count > 0 { headings.insert(format!("{slug}-{count}"), 1); } headings.insert(slug, count + 1); } },
-        Event::DisplayMath(v) => { equations::analyze_display_equation(v, &mut equations); },
-        _ => {}
-    } }
     let footnote_defs = collect_footnote_definitions(&events);
+    let mut headings = HashMap::new();
+    let mut equations = HashMap::new();
+    collect_emitted_targets(&events, &footnote_defs, &mut HashSet::new(), &mut headings, &mut equations);
     let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnote_defs, emitted_footnotes: HashMap::new(), in_footnote: false, headings, heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 };
     let body = renderer.render(None)?;
     let template: &str = if options.page_numbers { include_str!("document.typ") } else { &typesetter::UNNUMBERED_DOCUMENT_TEMPLATE };
