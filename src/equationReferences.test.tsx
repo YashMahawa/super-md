@@ -26,7 +26,7 @@ afterEach(() => {
 describe("explicit equation tags and resolved references", () => {
   it("renders explicit \\tag and \\tag* with \\label and resolves forward/backward/repeated \\eqref and \\ref in prose and math", async () => {
     const markdown = [
-      "Forward references: \\eqref{eq:energy}, Theorem \\ref{eq:energy}, starred \\eqref{eq:star} / \\ref{eq:star}, and inline math $x + \\eqref{eq:energy} = \\ref{eq:sub}$.",
+      "Forward references: \\eqref{eq:energy}, Theorem \\ref{eq:energy}, starred \\eqref{eq:star} / \\ref{eq:star}, and inline math $x + \\eqref{eq:energy} + \\eqref{eq:star} = \\ref{eq:sub}$.",
       "",
       "$$",
       "E = mc^2 \\tag{1.1}\\label{eq:energy}\\label{eq:einstein}",
@@ -51,54 +51,63 @@ describe("explicit equation tags and resolved references", () => {
       "Reference to untagged equation degrades cleanly: \\eqref{eq:untagged} and \\ref{eq:untagged}.",
     ].join("\n");
 
-    const host = document.createElement("div");
-    document.body.append(host);
-    root = createRoot(host);
-    await act(async () => {
-      root?.render(
-        <div className="reading-scroll">
-          <div className="document-page">
-            <MarkdownPreview markdown={markdown} documentPath="/notes/physics.md" python="" dark={false} />
-          </div>
-        </div>,
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const host = document.createElement("div");
+      document.body.append(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <div className="reading-scroll">
+            <div className="document-page">
+              <MarkdownPreview markdown={markdown} documentPath="/notes/physics.md" python="" dark={false} />
+            </div>
+          </div>,
+        );
+      });
+
+      const katexWarnings = warnSpy.mock.calls
+        .map((args) => args.map(String).join(" "))
+        .filter((msg) => /LaTeX-incompatible|unknownSymbol|strict/i.test(msg));
+      expect(katexWarnings).toEqual([]);
+      expect(host.querySelectorAll(".katex-error")).toHaveLength(0);
+      expect(host.querySelectorAll('.katex [style*="cc0000"]')).toHaveLength(0);
+
+      const tags = Array.from(
+        host.querySelectorAll<HTMLElement>(".katex-display .katex-tag, .katex-display .tag"),
+      ).map((el) => (el.textContent || "").replace(/\s+/g, " ").trim());
+      expect(tags).toEqual(["(1.1)", "†", "(A.2)"]);
+
+      const links = Array.from(host.querySelectorAll<HTMLAnchorElement>("a.equation-ref"));
+      expect(links.map((a) => a.textContent)).toEqual(["(1.1)", "1.1", "(†)", "†", "(1.1)"]);
+      for (const link of links) {
+        const id = link.getAttribute("href")!.slice(1);
+        expect(host.querySelector(`[id="${id}"]`)).not.toBeNull();
+      }
+
+      const inMathLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>(".katex a[href^='#smd-eq-']"));
+      expect(inMathLinks.map((a) => (a.textContent || "").trim())).toEqual(["(1.1)", "(†)", "A.2"]);
+
+      const mdLink = Array.from(host.querySelectorAll<HTMLAnchorElement>("a")).find(
+        (a) => a.textContent === "Einstein relation",
       );
-    });
+      expect(mdLink?.getAttribute("href")).toMatch(/^#smd-eq-/);
 
-    expect(host.querySelectorAll(".katex-error")).toHaveLength(0);
-    expect(host.querySelectorAll('.katex [style*="cc0000"]')).toHaveLength(0);
+      const unresolved = Array.from(host.querySelectorAll<HTMLElement>(".equation-ref.is-unresolved")).map(
+        (el) => el.textContent,
+      );
+      expect(unresolved).toEqual(["(??)", "??", "(??)", "??"]);
 
-    const tags = Array.from(host.querySelectorAll<HTMLElement>(".katex-display .tag")).map((el) =>
-      (el.textContent || "").replace(/\s+/g, " ").trim(),
-    );
-    expect(tags).toEqual(["(1.1)", "†", "(A.2)"]);
+      const inlineCode = host.querySelector("p code");
+      expect(inlineCode?.textContent).toBe("\\eqref{eq:energy}");
 
-    const links = Array.from(host.querySelectorAll<HTMLAnchorElement>("a.equation-ref"));
-    expect(links.map((a) => a.textContent)).toEqual(["(1.1)", "1.1", "(†)", "†", "(1.1)"]);
-    for (const link of links) {
-      const id = link.getAttribute("href")!.slice(1);
-      expect(host.querySelector(`[id="${id}"]`)).not.toBeNull();
+      act(() => {
+        links[0].dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      });
+      expect(links[0].dataset.visited).toBeUndefined();
+    } finally {
+      warnSpy.mockRestore();
     }
-
-    const inMathLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>(".katex a[href^='#smd-eq-']"));
-    expect(inMathLinks.map((a) => (a.textContent || "").trim())).toEqual(["(1.1)", "A.2"]);
-
-    const mdLink = Array.from(host.querySelectorAll<HTMLAnchorElement>("a")).find(
-      (a) => a.textContent === "Einstein relation",
-    );
-    expect(mdLink?.getAttribute("href")).toMatch(/^#smd-eq-/);
-
-    const unresolved = Array.from(host.querySelectorAll<HTMLElement>(".equation-ref.is-unresolved")).map(
-      (el) => el.textContent,
-    );
-    expect(unresolved).toEqual(["(??)", "??", "(??)", "??"]);
-
-    const inlineCode = host.querySelector("p code");
-    expect(inlineCode?.textContent).toBe("\\eqref{eq:energy}");
-
-    act(() => {
-      links[0].dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
-    });
-    expect(links[0].dataset.visited).toBeUndefined();
   });
 
   it("preserves original LaTeX \\label, \\eqref, and \\ref when copying rendered selections and editing in LiveEditor", async () => {

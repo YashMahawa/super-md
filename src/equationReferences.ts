@@ -49,11 +49,28 @@ const UNWRAP_TAG_MACROS = new Set([
 
 const TAG_SYMBOL_MACROS: Record<string, string> = {
   dagger: "†",
+  textdagger: "†",
   ddagger: "‡",
+  textdaggerdbl: "‡",
   star: "⋆",
   ast: "*",
   S: "§",
   P: "¶",
+};
+
+const KATEX_TEXT_MODE_MACROS: Record<string, string> = {
+  dagger: "\\textdagger{}",
+  ddagger: "\\textdaggerdbl{}",
+  star: "$\\star$",
+  ast: "*",
+};
+
+const KATEX_TEXT_UNICODE_ESCAPES: Record<string, string> = {
+  "†": "\\textdagger{}",
+  "‡": "\\textdaggerdbl{}",
+  "⋆": "$\\star$",
+  "§": "\\S{}",
+  "¶": "\\P{}",
 };
 
 export function equationAnchorId(label: string): string {
@@ -124,6 +141,10 @@ export function normalizeTagPlainText(raw: string): string {
     const ch = raw[i];
     if (ch === "~") {
       out += " ";
+      i++;
+      continue;
+    }
+    if (ch === "$") {
       i++;
       continue;
     }
@@ -284,7 +305,49 @@ function scanLatexCommands(
 }
 
 function normalizeKatexTagArg(raw: string): string {
-  return raw.replace(/\\(dagger|ddagger|star|ast)(?![A-Za-z])/g, (_, name: string) => TAG_SYMBOL_MACROS[name] || _);
+  let out = "";
+  let i = 0;
+  let inMath = false;
+  while (i < raw.length) {
+    const ch = raw[i];
+    if (ch === "\\") {
+      if (i + 1 >= raw.length) {
+        out += ch;
+        i++;
+        continue;
+      }
+      const next = raw[i + 1];
+      if (!isAsciiAlpha(next.charCodeAt(0))) {
+        out += raw.slice(i, i + 2);
+        i += 2;
+        continue;
+      }
+      let end = i + 2;
+      while (end < raw.length && isAsciiAlpha(raw.charCodeAt(end))) end++;
+      const name = raw.slice(i + 1, end);
+      if (!inMath && name in KATEX_TEXT_MODE_MACROS) {
+        out += KATEX_TEXT_MODE_MACROS[name];
+      } else {
+        out += raw.slice(i, end);
+      }
+      i = end;
+      continue;
+    }
+    if (ch === "$") {
+      inMath = !inMath;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (!inMath && ch in KATEX_TEXT_UNICODE_ESCAPES) {
+      out += KATEX_TEXT_UNICODE_ESCAPES[ch];
+      i++;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
 }
 
 export function extractDisplayEquationMetadata(tex: string): {
@@ -350,6 +413,13 @@ function escapeLatexText(value: string): string {
         break;
       case "^":
         out += "\\textasciicircum{}";
+        break;
+      case "†":
+      case "‡":
+      case "⋆":
+      case "§":
+      case "¶":
+        out += KATEX_TEXT_UNICODE_ESCAPES[ch];
         break;
       default:
         out += ch;
