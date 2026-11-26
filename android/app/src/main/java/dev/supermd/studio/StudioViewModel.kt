@@ -89,7 +89,7 @@ data class PendingSeededFind(
     val targetTabId: String? = null,
     val targetUri: String? = null,
 )
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
@@ -172,6 +172,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         },
         onConfirmedTreeKeys = { keys -> confirmedTreeDocumentKeys.addAll(keys) },
     )
+    internal var workspaceLinks = WorkspaceLinkCache(ContentResolverTreeLister(app))
     private val accessRequestsMutable = MutableStateFlow<DocumentAccessRequest?>(null)
     val documentAccessRequests = accessRequestsMutable.asStateFlow()
     private val blockedDocumentWrites: MutableSet<String> = java.util.Collections.synchronizedSet(linkedSetOf())
@@ -878,6 +879,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     /** Notification-driven SAF updates. A failed query is not proof of deletion. */
     fun refreshMetadata() {
         metadataJob?.cancel()
+        workspaceLinks.invalidate()
         metadataJob=viewModelScope.launch {
             delay(200)
             val beforeIo=mutable.value
@@ -2248,6 +2250,57 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value = mutable.value.copy(pendingHeading = null)
         }
     }
+    fun dismissWorkspaceFolderPrompt() {
+        mutable.value = mutable.value.copy(folderAccessPrompt = null)
+    }
+    private suspend fun applyWorkspaceFolder(uri: Uri, clearPrompt: Boolean = false) {
+        withContext(Dispatchers.IO) { documentAccess.persist(uri) }
+        workspaceLinks.invalidate()
+        listedRelative = ""
+        windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
+        change {
+            if (clearPrompt) it.copy(folder = uri.toString(), folderRelative = "", folderAccessPrompt = null)
+            else it.copy(folder = uri.toString(), folderRelative = "")
+        }
+        val listJob = listFolder(uri, "")
+        if (synchronized(blockedDocumentWrites) { blockedDocumentWrites.isNotEmpty() }) {
+            listJob.join()
+            val candidates = synchronized(blockedDocumentWrites) { blockedDocumentWrites.toList() }
+            val unblocked = withContext(Dispatchers.IO) {
+                if (!documentAccess.hasWriteGrant(uri)) emptyList()
+                else {
+                    val selectedRoot = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()
+                    candidates.filter { raw ->
+                        val parsedRaw = Uri.parse(raw)
+                        val resolved = documentAccess.resolve(parsedRaw, writing = true)
+                        val inSelectedTree = resolved.toString() != raw ||
+                            (DocumentsContract.isTreeUri(parsedRaw) &&
+                                parsedRaw.authority == uri.authority &&
+                                selectedRoot != null &&
+                                runCatching { DocumentsContract.getTreeDocumentId(parsedRaw) == selectedRoot }.getOrDefault(false))
+                        inSelectedTree &&
+                            documentAccess.hasWriteGrant(resolved) &&
+                            runCatching { resolver.openFileDescriptor(resolved, "rw")?.use { true } == true }.getOrDefault(false)
+                    }
+                }
+            }
+            unblocked.forEach(::clearDocumentAccessFailure)
+        }
+    }
+    fun grantWorkspaceFolderForLink(uri: Uri) = viewModelScope.launch {
+        val prompt = mutable.value.folderAccessPrompt
+        try {
+            applyWorkspaceFolder(uri, clearPrompt = true)
+            if (prompt != null) {
+                openWorkspaceLink(prompt.noteId, prompt.target, prompt.fragment, prompt.wikilink, allowFolderPrompt = false)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            mutable.value = mutable.value.copy(folderAccessPrompt = null)
+            fail("Could not open folder: ${error.message}")
+        }
+    }
     private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
         documentAccess.persist(uri)
         val target = documentAccess.resolve(uri)
@@ -2822,38 +2875,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
-        try {
-            withContext(Dispatchers.IO) { documentAccess.persist(uri) }
-            listedRelative = ""
-            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
-            change { it.copy(folder = uri.toString(), folderRelative = "") }
-            val listJob = listFolder(uri, "")
-            if (synchronized(blockedDocumentWrites) { blockedDocumentWrites.isNotEmpty() }) {
-                listJob.join()
-                val candidates = synchronized(blockedDocumentWrites) { blockedDocumentWrites.toList() }
-                val unblocked = withContext(Dispatchers.IO) {
-                    if (!documentAccess.hasWriteGrant(uri)) emptyList()
-                    else {
-                        val selectedRoot = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()
-                        candidates.filter { raw ->
-                            val parsedRaw = Uri.parse(raw)
-                            val resolved = documentAccess.resolve(parsedRaw, writing = true)
-                            val inSelectedTree = resolved.toString() != raw ||
-                                (DocumentsContract.isTreeUri(parsedRaw) &&
-                                    parsedRaw.authority == uri.authority &&
-                                    selectedRoot != null &&
-                                    runCatching { DocumentsContract.getTreeDocumentId(parsedRaw) == selectedRoot }.getOrDefault(false))
-                            inSelectedTree &&
-                                documentAccess.hasWriteGrant(resolved) &&
-                                runCatching { resolver.openFileDescriptor(resolved, "rw")?.use { true } == true }.getOrDefault(false)
-                        }
-                    }
-                }
-                unblocked.forEach(::clearDocumentAccessFailure)
-            }
-        } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
+        try { applyWorkspaceFolder(uri) } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
+        workspaceLinks.invalidate()
         listFolderSeq++
         listFolderJob?.cancel()
         listedRelative = ""
@@ -3062,6 +3087,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
 
         liveStudioViewModels(this).forEach { vm ->
+            vm.workspaceLinks.invalidate()
             if (oldFolderPrefix != null) vm.readerFolderIndex.clear()
             vm.change { currentState ->
                 val nextTabs = currentState.tabs.map { tab ->
@@ -3181,6 +3207,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     }
                 }
                 createdDirCleanup = null
+                workspaceLinks.invalidate()
                 // Expand and display the parent folder before activating the tab so state.files and folderRelative are already in sync.
                 listFolder(folderUri, cleanParent).join()
                 val accepted = performReaderBarrier(expectedActiveId) {
@@ -3237,6 +3264,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         FileEntry(actualName, createdUri.toString(), true, childRelativePath(cleanParent, actualName))
                     }
                 }
+                workspaceLinks.invalidate()
                 listFolder(folderUri, cleanParent).join()
                 mutable.value = mutable.value.copy(message = "Created folder ${entry.name}")
                 onComplete?.invoke(entry)
@@ -3611,6 +3639,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         target: String,
         fragment: String,
         wikilink: Boolean,
+        allowFolderPrompt: Boolean = true,
     ): JSONObject {
         val trimmedTarget = target.trim()
         val trimmedFragment = fragment.trim()
@@ -3626,7 +3655,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             stateSnapshot.active
         }
         val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
-        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
+        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf {
+            DocumentsContract.isTreeUri(it) && documentAccess.hasReadGrant(it)
+        }
         val rawNoteUri = sourceNote.uri
         if (rawNoteUri.isNullOrBlank()) {
             if (explicitRelative || openFolder == null) {
@@ -3636,19 +3667,60 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
         }
 
+        val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
         val resolved = try {
             withContext(Dispatchers.IO) {
                 val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
-                val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
                 if (sourceUri != null && sourceUri.scheme == "file") {
                     return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
                 }
+                fun firstReadableRankedCandidate(candidates: List<WorkspaceResolvedNote>): WorkspaceResolvedNote? {
+                    for (candidate in candidates) {
+                        canonicalTreeDocumentKey(candidate.uri)?.let(confirmedTreeDocumentKeys::add)
+                        val targetUri = documentAccess.resolve(candidate.uri)
+                        if (documentAccess.hasReadGrant(targetUri) &&
+                            runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
+                        ) {
+                            return candidate.copy(uri = targetUri)
+                        }
+                    }
+                    return null
+                }
                 val treeMatch = when {
                     sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
+                        ?: run {
+                            val candidateTrees = buildList {
+                                if (openFolder != null) add(openFolder)
+                                (
+                                    resolver.persistedUriPermissions.map { StoredUriGrant(it.uri, it.isReadPermission, it.isWritePermission) } +
+                                        TestAuthorityGrants.persistedSnapshot()
+                                    )
+                                    .filter {
+                                        it.isReadPermission &&
+                                            DocumentsContract.isTreeUri(it.uri) &&
+                                            it.uri.authority == sourceUri.authority &&
+                                            documentAccess.resolveReadableTreeRoot(it.uri) != null
+                                    }
+                                    .mapTo(this) { it.uri }
+                            }.distinctBy { it.toString() }
+                            candidateTrees.firstNotNullOfOrNull { folderUri ->
+                                val rel = runCatching {
+                                    workspaceLinks.noteRelativeInTree(folderUri, sourceUri, knownRelative = sourceNote.relative)
+                                }.getOrNull()
+                                if (rel != null) SafTreeMatch(folderUri, DocumentsContract.getTreeDocumentId(folderUri), rel) else null
+                            }
+                        }
                     openFolder != null -> SafTreeMatch(openFolder, DocumentsContract.getTreeDocumentId(openFolder), "")
                     else -> null
                 }
                 if (treeMatch != null) {
+                    if (!explicitRelative) {
+                        val noteRel = if (sourceUri == null) null else treeMatch.relativePath
+                        val ranked = runCatching {
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = noteRel, rawTarget = cleaned, wikilink = true)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(ranked)?.let { return@withContext it }
+                    }
                     val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
                     val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
                     var deniedTreeCandidate: Uri? = null
@@ -3696,10 +3768,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
                         }
                     }
+                    if (explicitRelative && sourceUri != null) {
+                        val rankedRel = runCatching {
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = treeMatch.relativePath, rawTarget = cleaned, wikilink = false)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(rankedRel)?.let { return@withContext it }
+                    }
                     if (deniedTreeCandidate != null) {
                         throw PromptWorkspaceNoteAccessException(deniedTreeCandidate)
                     }
                     throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+                }
+                if (!explicitRelative && openFolder != null) {
+                    val ranked = runCatching {
+                        workspaceLinks.resolveCandidates(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
+                    }.getOrDefault(emptyList())
+                    firstReadableRankedCandidate(ranked)?.let { return@withContext it }
                 }
 
                 val nonNullSourceUri = sourceUri ?: throw WorkspaceLinkException("Save this note before opening linked notes.")
@@ -3748,6 +3832,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
                     }
                 }
+                if (!explicitRelative) {
+                    return@withContext null
+                }
                 if (deniedCandidate != null) {
                     throw PromptWorkspaceNoteAccessException(deniedCandidate)
                 }
@@ -3768,6 +3855,26 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val msg = error.message ?: "Invalid relative note path."
             mutable.value = mutable.value.copy(busy = false, message = msg)
             return JSONObject().put("opened", false).put("message", msg)
+        }
+
+        if (resolved == null) {
+            val notice = if (allowFolderPrompt) {
+                "Folder permission is needed to follow links from ${sourceNote.name}. Choose its containing folder."
+            } else {
+                "Choose the folder containing ${sourceNote.name} to follow relative links."
+            }
+            val prompt = if (allowFolderPrompt && sourceUri != null) {
+                WorkspaceFolderPrompt(
+                    noteId = sourceNote.id,
+                    noteName = sourceNote.name,
+                    initialUri = sourceUri,
+                    target = trimmedTarget,
+                    fragment = trimmedFragment,
+                    wikilink = wikilink,
+                )
+            } else null
+            mutable.value = mutable.value.copy(folderAccessPrompt = prompt, message = notice)
+            return JSONObject().put("opened", false).put("promptedFolderAccess", prompt != null).put("message", notice)
         }
 
         return openNoteInternal(
