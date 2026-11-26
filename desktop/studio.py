@@ -2078,12 +2078,10 @@ class Studio(QObject):
                      "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
                      "## MCP client configuration\n\n```json\n" + self.agentSetupInstructions + "\n```\n\n"
                      "Live access is off by default. Enable it in Super MD Settings → AI agents before starting the MCP server. "
-                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n")
-            if self.cloudAgentConfigured and self.cloudConnectorUrl:
-                guide += ("\n## Cloud relay connector\n\n"
-                          "Use this Streamable HTTP MCP endpoint with the intended MCP client. It is a bearer capability; "
-                          "keep this guide private and share it only with that client.\n\n"
-                          "```text\n" + self.cloudConnectorUrl + "\n```\n")
+                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n\n"
+                     "## Cloud relay connector\n\n"
+                     "Cloud relay connector URLs are secret bearer credentials and are not included in saved setup guides. "
+                     "To connect a cloud MCP client, open Super MD Settings → AI agents and use Copy MCP connector URL to get your own connector.\n")
             atomic_write(path, guide.encode("utf-8"))
             self._agent_error = ""
             self.message = f"Setup guide saved to {path}"
