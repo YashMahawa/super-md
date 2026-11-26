@@ -479,7 +479,7 @@ fn parse_positive_number_str(s: &str) -> Option<&str> {
 fn parse_obsidian_pipe_spec<'a>(path: &'a str, spec: Option<&'a str>) -> (&'a str, Option<&'a str>) {
     let Some(spec) = spec else { return (path, None) };
     let (caption_opt, dim_candidate) = match spec.rsplit_once('|') {
-        Some((cap, last)) => (Some(cap.trim()), last.trim()),
+        Some((cap, last)) => (Some(cap.strip_suffix('\\').unwrap_or(cap).trim()), last.trim()),
         None => (None, spec.trim()),
     };
     let width_part = match dim_candidate.split_once(['x', 'X']) {
@@ -508,10 +508,16 @@ fn normalize_obsidian_slice(slice: &str) -> String {
         if let Some(close) = after_open.find("]]") {
             let inner = &after_open[..close];
             if !inner.is_empty() && !inner.contains(['[', ']', '\r', '\n']) {
-                let (path, spec) = match inner.split_once('|') {
+                let (raw_path, spec) = match inner.split_once('|') {
                     Some((p, s)) => (p, Some(s)),
                     None => (inner, None),
                 };
+                let path = if spec.is_some() && raw_path.ends_with('\\') {
+                    &raw_path[..raw_path.len() - 1]
+                } else {
+                    raw_path
+                }
+                .trim();
                 if !path.is_empty() {
                     let (alt_raw, width) = parse_obsidian_pipe_spec(path, spec);
                     let alt = alt_raw.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]");
@@ -579,7 +585,7 @@ fn normalize_obsidian_embeds(input: &str) -> String {
 pub fn image_sources(markdown: &str) -> Vec<String> {
     let body = frontmatter::strip_frontmatter(markdown);
     let stripped = strip_percent_comments(body);
-    let normalized = normalize_obsidian_embeds(&normalize_callouts_body(&stripped));
+    let normalized = normalize_callouts_body(&stripped);
     let mut sources = Vec::new();
     let options = Options::ENABLE_TABLES | Options::ENABLE_FOOTNOTES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH;
     let mut events = Parser::new_ext(&normalized, options);
@@ -621,7 +627,7 @@ pub fn image_sources(markdown: &str) -> Vec<String> {
     sources
 }
 
-/// Normalize both Obsidian and Super MD callouts before parsing ordinary Markdown.
+/// Normalize Obsidian/Super MD callouts and wikilinks outside code before parsing Markdown.
 pub fn normalize_callouts(input: &str) -> String {
     if let Some(fm) = frontmatter::parse_frontmatter(input) {
         let rest = &input[fm.end..];
@@ -629,10 +635,12 @@ pub fn normalize_callouts(input: &str) -> String {
         if !out.ends_with('\n') && !rest.is_empty() {
             out.push('\n');
         }
-        out.push_str(&normalize_callouts_body(rest));
+        let stripped = strip_percent_comments(rest);
+        out.push_str(&normalize_callouts_body(&stripped));
         return out;
     }
-    normalize_callouts_body(input)
+    let stripped = strip_percent_comments(input);
+    normalize_callouts_body(&stripped)
 }
 
 fn normalize_callouts_body(input: &str) -> String {
@@ -643,13 +651,14 @@ fn normalize_callouts_body(input: &str) -> String {
         let body=line.trim_start_matches(' ');
         let code=body.chars().next().filter(|ch| matches!(ch,'`'|'~')).and_then(|ch| {
             let count=body.chars().take_while(|value| *value==ch).count();
-            (line.len()-body.len()<=3 && count>=3).then_some((ch,count))
+            let valid_open = !(fence.is_none() && ch == '`' && body[count..].contains('`'));
+            (line.len()-body.len()<=3 && count>=3 && valid_open).then_some((ch,count))
         });
         let inside_fence=fence.is_some();
         if let Some((ch,count))=code {
             if let Some((marker,length))=fence {
                 if ch==marker && count>=length && body[count..].trim().is_empty() { fence=None; }
-            } else { fence=Some((ch,count)); }
+            } else if ch != '`' || !body[count..].contains('`') { fence=Some((ch,count)); }
         }
         let start=if !inside_fence && code.is_none() {
             line.strip_prefix(":::callout").filter(|spec| spec.chars().next().is_some_and(char::is_whitespace))
@@ -667,7 +676,210 @@ fn normalize_callouts_body(input: &str) -> String {
             depth-=1;output.push_str("> ".repeat(depth).trim_end());output.push('\n');
         } else { output.push_str(&"> ".repeat(depth));output.push_str(line);output.push('\n'); }
     }
-    output
+    normalize_prose_links(&normalize_obsidian_embeds(&output))
+}
+
+fn encode_md_destination(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            ' ' => out.push_str("%20"),
+            '\t' => out.push_str("%09"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_md_link_label(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for ch in label.chars() {
+        if matches!(ch, '[' | ']') { out.push('\\'); }
+        out.push(ch);
+    }
+    out
+}
+
+fn has_supported_note_extension(path: &str) -> bool {
+    let clean = path.split(['?', '#']).next().unwrap_or("").trim().to_ascii_lowercase();
+    [".md", ".smd", ".fmd", ".markdown", ".txt"].iter().any(|ext| clean.ends_with(ext))
+}
+
+fn format_wikilink_markdown(inner: &str) -> Option<String> {
+    if inner.is_empty() || inner.contains(['\r', '\n']) { return None; }
+    let (raw_left, raw_alias) = match inner.split_once('|') {
+        Some((left, alias)) => (left, Some(alias)),
+        None => (inner, None),
+    };
+    let cleaned_left = if raw_alias.is_some() && raw_left.ends_with('\\') { &raw_left[..raw_left.len() - 1] } else { raw_left };
+    let trimmed_left = cleaned_left.trim();
+    if trimmed_left.is_empty() { return None; }
+    if let Some(rest) = trimmed_left.strip_prefix('#') {
+        let fragment = rest.trim();
+        if fragment.is_empty() { return None; }
+        let label = raw_alias.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(fragment);
+        return Some(format!("[{}](#{})", escape_md_link_label(label), heading_slug(fragment)));
+    }
+    let (target, fragment) = match trimmed_left.split_once('#') {
+        Some((t, f)) => (t.trim(), f.trim()),
+        None => (trimmed_left, ""),
+    };
+    if target.is_empty() { return None; }
+    let label = raw_alias.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(trimmed_left);
+    let dest_path = if has_supported_note_extension(target) { target.to_string() } else { format!("{target}.md") };
+    let slug_frag = if fragment.is_empty() { String::new() } else { heading_slug(fragment) };
+    let dest_frag = if fragment.is_empty() {
+        String::new()
+    } else if !slug_frag.is_empty() {
+        format!("#{slug_frag}")
+    } else {
+        format!("#{}", encode_md_destination(fragment))
+    };
+    Some(format!("[{}]({}{})", escape_md_link_label(label), encode_md_destination(&dest_path), dest_frag))
+}
+
+fn is_likely_link_destination(dest: &str) -> bool {
+    let trimmed = dest.trim();
+    if trimmed.is_empty() || !trimmed.contains([' ', '\t']) { return false; }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with('#') || lower.starts_with("./") || lower.starts_with("../") || lower.starts_with('/') || lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:") {
+        return true;
+    }
+    let clean = lower.split(['?', '#']).next().unwrap_or("").trim();
+    [".md", ".smd", ".fmd", ".markdown", ".txt", ".pdf"].iter().any(|ext| clean.ends_with(ext))
+}
+
+fn rewrite_prose_segment(segment: &str) -> String {
+    let mut after_wiki = String::with_capacity(segment.len());
+    let bytes = segment.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'[' && bytes[i + 1] == b'[' && (i == 0 || !matches!(bytes[i - 1], b'!' | b'\\')) {
+            let start = i + 2;
+            let mut end = start;
+            let mut found = None;
+            while end < bytes.len() && !matches!(bytes[end], b'\r' | b'\n' | b'[') {
+                if bytes[end] == b']' {
+                    if end + 1 < bytes.len() && bytes[end + 1] == b']' && end > start {
+                        found = Some(end);
+                    }
+                    break;
+                }
+                end += 1;
+            }
+            if let Some(close_idx) = found {
+                if let Some(formatted) = format_wikilink_markdown(&segment[start..close_idx]) {
+                    after_wiki.push_str(&formatted);
+                    i = close_idx + 2;
+                    continue;
+                }
+            }
+        }
+        let ch = segment[i..].chars().next().unwrap();
+        after_wiki.push(ch);
+        i += ch.len_utf8();
+    }
+
+    let mut out = String::with_capacity(after_wiki.len());
+    let wbytes = after_wiki.as_bytes();
+    let mut j = 0usize;
+    while j < wbytes.len() {
+        if wbytes[j] == b'[' && (j == 0 || !matches!(wbytes[j - 1], b'!' | b'\\')) {
+            let mut k = j + 1;
+            let mut escaped = false;
+            let mut label_close = None;
+            while k < wbytes.len() && !matches!(wbytes[k], b'\r' | b'\n') {
+                if escaped { escaped = false; k += 1; continue; }
+                if wbytes[k] == b'\\' { escaped = true; k += 1; continue; }
+                if wbytes[k] == b'[' { break; }
+                if wbytes[k] == b']' { label_close = Some(k); break; }
+                k += 1;
+            }
+            if let Some(close_bracket) = label_close {
+                if close_bracket + 1 < wbytes.len() && wbytes[close_bracket + 1] == b'(' {
+                    let dest_start = close_bracket + 2;
+                    let mut p = dest_start;
+                    let mut dest_close = None;
+                    while p < wbytes.len() && !matches!(wbytes[p], b'\r' | b'\n' | b'<' | b'>' | b'(') {
+                        if wbytes[p] == b')' { dest_close = Some(p); break; }
+                        p += 1;
+                    }
+                    if let Some(close_paren) = dest_close {
+                        let raw_inside = &after_wiki[dest_start..close_paren];
+                        let (dest_part, title_part) = split_optional_link_title(raw_inside);
+                        if is_likely_link_destination(dest_part) {
+                            out.push_str(&after_wiki[j..dest_start]);
+                            out.push_str(&encode_md_destination(dest_part));
+                            out.push_str(title_part);
+                            out.push(')');
+                            j = close_paren + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        let ch = after_wiki[j..].chars().next().unwrap();
+        out.push(ch);
+        j += ch.len_utf8();
+    }
+    out
+}
+
+fn split_optional_link_title(inside: &str) -> (&str, &str) {
+    let trimmed = inside.trim_end_matches([' ', '\t']);
+    if let Some(quote) = trimmed.chars().last().filter(|c| matches!(c, '"' | '\'')) {
+        if let Some(open_pos) = trimmed[..trimmed.len() - 1].rfind(quote) {
+            if open_pos > 0 && matches!(trimmed.as_bytes()[open_pos - 1], b' ' | b'\t') {
+                let mut ws_start = open_pos - 1;
+                while ws_start > 0 && matches!(trimmed.as_bytes()[ws_start - 1], b' ' | b'\t') {
+                    ws_start -= 1;
+                }
+                return (&inside[..ws_start], &inside[ws_start..]);
+            }
+        }
+    }
+    (inside, "")
+}
+
+/// Normalize prose wikilinks and spaced Markdown link destinations while
+/// leaving fenced code, indented code, inline code, HTML, and math untouched.
+fn normalize_prose_links(input: &str) -> String {
+    if !input.contains("[[") && !input.contains("](") { return input.to_string(); }
+    let mut protected = Vec::new();
+    for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
+        if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) | Event::Html(_) | Event::InlineHtml(_)) {
+            protected.push(range);
+        }
+    }
+    protected.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in protected {
+        if let Some(last) = merged.last_mut() {
+            if range.start <= last.end {
+                last.end = last.end.max(range.end);
+                continue;
+            }
+        }
+        merged.push(range);
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    for range in merged {
+        if cursor < range.start {
+            out.push_str(&rewrite_prose_segment(&input[cursor..range.start]));
+        }
+        out.push_str(&input[range.start..range.end]);
+        cursor = range.end;
+    }
+    if cursor < input.len() {
+        out.push_str(&rewrite_prose_segment(&input[cursor..]));
+    }
+    out
 }
 
 /// Protect complete math spans on actual table rows before GFM splits columns.
@@ -925,8 +1137,19 @@ impl<'a> Renderer<'a> {
                                 Tag::Item => out.push_str(&format!("[{body}],\n")),
                                 Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
                                     let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
-                                    let slug = heading_slug(&decoded);
-                                    if self.headings.contains_key(&slug) { format!("#link(label({}))[{body}]", string(&format!("smd-{slug}"))) } else { body }
+                                    let trimmed = decoded.trim();
+                                    let slug = heading_slug(trimmed);
+                                    let resolved = if self.headings.contains_key(trimmed) {
+                                        Some(trimmed.to_string())
+                                    } else if self.headings.contains_key(&slug) {
+                                        Some(slug)
+                                    } else if let Some((prefix, suffix)) = trimmed.rsplit_once('-') {
+                                        let numbered = format!("{}-{suffix}", heading_slug(prefix));
+                                        (suffix.chars().all(|c| c.is_ascii_digit()) && self.headings.contains_key(&numbered)).then_some(numbered)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(id) = resolved { format!("#link(label({}))[{body}]", string(&format!("smd-{id}"))) } else { body }
                                 } else if dest_url.starts_with("https:") || dest_url.starts_with("http:") || dest_url.starts_with("mailto:") { format!("#link({})[{body}]", string(&dest_url)) } else { body }),
                                 _ => out.push_str(&body),
                             }
@@ -942,7 +1165,7 @@ impl<'a> Renderer<'a> {
 pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
     let body = frontmatter::strip_frontmatter(markdown);
     let stripped = strip_percent_comments(body);
-    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(&stripped)));
+    let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
     Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
 }
@@ -954,7 +1177,7 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
         None => (String::new(), markdown.strip_prefix('\u{feff}').unwrap_or(markdown)),
     };
     let stripped = strip_percent_comments(raw_body);
-    let normalized = normalize_table_math(&normalize_obsidian_embeds(&normalize_callouts_body(&stripped)));
+    let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES);
     let mut headings = HashMap::new(); let mut current = None::<String>;
     for event in &events { match event {
@@ -1469,6 +1692,48 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
         let pdf_bytes = export(md, &PdfOptions::default(), &HashMap::new()).unwrap();
         assert!(pdf_bytes.starts_with(b"%PDF-"));
     }
+    #[test]
+    fn normalizes_wikilinks_outside_code_and_exports_clean_pdf_labels() {
+        let md = [
+            "# Bayes Overview",
+            "",
+            "Follow [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], [[study.smd]], [Deck](study.smd), and [[#Bayes Overview|Back to overview]].",
+            "",
+            "| Link | Code |",
+            "| --- | --- |",
+            "| [[Lecture 2#Bayes|Bayes cell]] | `[[Task Note]]` and `` `![[raw.png]]` `` |",
+            "",
+            "```python",
+            "arr = [[1, 2], [3, 4]]",
+            "note = '[[Literal]]'",
+            "```",
+            "",
+        ].join("\n");
+        let normalized = normalize_callouts(&md);
+        assert!(normalized.contains("[Task Note](Task%20Note.md)"), "{normalized}");
+        assert!(normalized.contains("[Bayes](Lecture%202.md#bayes-law)"), "{normalized}");
+        assert!(normalized.contains("[study.smd](study.smd)"), "{normalized}");
+        assert!(normalized.contains("[Back to overview](#bayes-overview)"), "{normalized}");
+        assert!(normalized.contains("[Bayes cell](Lecture%202.md#bayes)"), "{normalized}");
+        assert!(normalized.contains("`[[Task Note]]`"), "{normalized}");
+        assert!(normalized.contains("`` `![[raw.png]]` ``"), "{normalized}");
+        assert!(normalized.contains("arr = [[1, 2], [3, 4]]"), "{normalized}");
+        assert!(normalized.contains("note = '[[Literal]]'"), "{normalized}");
+
+        let typst = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst.contains("#text(\"Task Note\")"), "{typst}");
+        assert!(typst.contains("#text(\"Bayes\")"), "{typst}");
+        assert!(typst.contains("#text(\"Deck\")"), "{typst}");
+        assert!(typst.contains("#link(label(\"smd-bayes-overview\"))[#text(\"Back to overview\")]"), "{typst}");
+        assert!(!typst.contains("#text(\"[["), "No prose wikilink brackets in Typst output: {typst}");
+        assert!(!typst.contains("\\["), "No escaped brackets in Typst output: {typst}");
+        assert!(typst.contains("#raw(\"[[Task Note]]\")"), "{typst}");
+
+        let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        assert!(pdf.len() > 2_000);
+    }
+
     #[test]
     fn frontmatter_omits_yaml_from_page_body_and_populates_pdf_properties() {
         let note = "\u{feff}---  \ntitle: \"Relativistic Quantum Theory\"\nauthor:\n  - Paul Dirac\n  - Emmy Noether\ndescription: \"Spinors, symmetries, and conservation laws\"\ntags: [spinors, symmetry]\ndate: 2026-03-15\n...  \n\n# Spinor Algebra\n\nBody text.\n";

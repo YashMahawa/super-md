@@ -678,7 +678,7 @@ ApplicationWindow {
                         if (window.readerRecoveryLoading && target === "about:blank") return
                         if (target.split("#")[0] !== readerUrl.toString()) {
                             request.reject()
-                            if (target.startsWith("https://") || target.startsWith("http://")) Qt.openUrlExternally(request.url)
+                            if (target.startsWith("https://") || target.startsWith("http://") || target.startsWith("mailto:")) Qt.openUrlExternally(request.url)
                         }
                     }
                     }
