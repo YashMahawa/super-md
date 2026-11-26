@@ -572,6 +572,92 @@ private object NoMotionScheme : MotionScheme {
     override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
 }
 
+internal fun shouldAcceptExternalDrag(localState: Any?, description: android.content.ClipDescription?): Boolean {
+    if (localState != null || description == null) return false
+    val count = description.mimeTypeCount
+    if (count <= 0) return false
+    var hasExternalPayload = false
+    for (index in 0 until count) {
+        val mime = description.getMimeType(index)?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+        if (mime.startsWith("chromium/")) return false
+        if (mime.isNotEmpty() && mime != "text/plain" && mime != "text/html") {
+            hasExternalPayload = true
+        }
+    }
+    return hasExternalPayload
+}
+
+internal class ExternalDropDragController(
+    private val onExternalDrop: (android.view.DragEvent) -> Unit,
+) : android.view.View.OnDragListener {
+    private var acceptingExternalDrag = false
+
+    override fun onDrag(view: android.view.View?, event: android.view.DragEvent): Boolean =
+        onDragAction(
+            action = event.action,
+            localState = event.localState,
+            description = event.clipDescription,
+            event = event,
+        )
+
+    internal fun onDragAction(
+        action: Int,
+        localState: Any?,
+        description: android.content.ClipDescription?,
+        event: android.view.DragEvent? = null,
+    ): Boolean {
+        return when (action) {
+            android.view.DragEvent.ACTION_DRAG_STARTED -> {
+                acceptingExternalDrag = shouldAcceptExternalDrag(localState, description)
+                acceptingExternalDrag
+            }
+            android.view.DragEvent.ACTION_DROP -> {
+                if (!acceptingExternalDrag) return false
+                if (event != null) onExternalDrop(event)
+                true
+            }
+            android.view.DragEvent.ACTION_DRAG_ENDED -> {
+                val handled = acceptingExternalDrag
+                acceptingExternalDrag = false
+                handled
+            }
+            else -> acceptingExternalDrag
+        }
+    }
+}
+
+internal fun shouldBlockNativeDrop(
+    state: StudioState,
+    folderSearchVisible: Boolean = false,
+    accessRequestOpen: Boolean = false,
+    settingsOpen: Boolean = false,
+    exporting: Boolean = false,
+    renaming: Boolean = false,
+    contentsShown: Boolean = false,
+    drawerOpen: Boolean = false,
+): Boolean =
+    !state.welcomed ||
+        state.busy ||
+        state.readerOverlay ||
+        folderSearchVisible ||
+        accessRequestOpen ||
+        state.pendingCloseNoteId != null ||
+        state.pendingSaveConflictNoteId != null ||
+        settingsOpen ||
+        exporting ||
+        renaming ||
+        contentsShown ||
+        drawerOpen
+
+internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<android.net.Uri> {
+    if (clip == null) return emptyList()
+    return (0 until clip.itemCount).mapNotNull { index ->
+        clip.getItemAt(index)?.uri?.takeIf { uri ->
+            uri.scheme?.lowercase() in setOf("content", "file")
+        }
+    }
+}
+
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
@@ -1024,6 +1110,8 @@ private object NoMotionScheme : MotionScheme {
         activity.setAgentRequestHandlers(bridge, null)
         onDispose { activity.setAgentRequestHandlers(null, null) }
     }
+    var createFolderRequest by remember { mutableStateOf<CreateFolderRequest?>(null) }
+    var renameFolderTarget by remember { mutableStateOf<FileEntry?>(null) }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
     val folderSearch by model.folderSearch.collectAsStateWithLifecycle()
@@ -1071,7 +1159,7 @@ private object NoMotionScheme : MotionScheme {
             val format = args.optString("format", "pdf")
             check(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
             val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
-                ?: args.optString("id").takeIf { it.isNotBlank() } ?: state.active.name.substringBeforeLast('.')
+                ?: args.optString("id").takeIf { it.isNotBlank() } ?: noteStem(state.active.name).ifBlank { "Untitled" }
             activity.updateAgentExportJob(jobId, "preparing")
             model.busy(true)
             scope.launch {
@@ -1110,11 +1198,12 @@ private object NoMotionScheme : MotionScheme {
         }
         onDispose { activity.setAgentUiHandler(null) }
     }
-    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
+    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(noteStem(state.active.name).ifBlank { "Untitled" } + ".smd") }; onDispose { model.requestPortable = null } }
     DisposableEffect(save, portableSaveAs, model) {
         model.requestSaveAs = { note ->
-            if (note.portable) portableSaveAs.launch(note.name.substringBeforeLast('.') + ".smd")
-            else save.launch(note.name.substringBeforeLast('.') + ".md")
+            val stem = noteStem(note.name).ifBlank { "Untitled" }
+            if (note.portable) portableSaveAs.launch("$stem.smd")
+            else save.launch("$stem.md")
         }
         onDispose { model.requestSaveAs = null }
     }
@@ -1238,8 +1327,11 @@ private object NoMotionScheme : MotionScheme {
                     folderRelative = state.folderRelative,
                     onOpenNote = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } },
                     onOpenFolder = { folder.launch(state.folder?.let(android.net.Uri::parse)) },
-                    onCloseFolder = { model.closeFolder() },
+                    onCloseFolder = model::closeFolder,
                     onFolderRoot = { model.navigateFolderUp() },
+                    onNavigateFolderRelative = { rel -> state.folder?.let { model.listFolder(android.net.Uri.parse(it), rel) } },
+                    onCreateInFolder = { req -> createFolderRequest = req },
+                    onRenameEntry = { entry -> renameFolderTarget = entry },
                     onFolderSearch = { scope.launch { drawer.close() }; model.openFolderSearch() },
                     onActivateEntry = { entry ->
                         if (entry.directory) {
@@ -1321,6 +1413,38 @@ private object NoMotionScheme : MotionScheme {
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
+                val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
+                    if (shouldBlockNativeDrop(
+                            model.state.value,
+                            folderSearchVisible = model.folderSearch.value.visible,
+                            accessRequestOpen = model.documentAccessRequests.value != null,
+                            settingsOpen = settings,
+                            exporting = exporting,
+                            renaming = renaming,
+                            contentsShown = contentsShown,
+                            drawerOpen = drawer.isOpen,
+                        )) {
+                        return@rememberUpdatedState
+                    }
+                    val permissions = activity.requestDragAndDropPermissions(event)
+                    val uris = extractDroppedFileUris(event.clipData)
+                    if (uris.isNotEmpty()) {
+                        val id = model.state.value.active.id
+                        val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
+                        val x = event.x / currentDensity
+                        val y = event.y / currentDensity
+                        reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
+                        model.importDropped(uris, id) { images ->
+                            permissions?.release()
+                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                        }
+                    } else {
+                        permissions?.release()
+                        if ((event.clipData?.itemCount ?: 0) > 0) {
+                            model.importDropped(emptyList(), model.state.value.active.id) {}
+                        }
+                    }
+                }
                 Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
                     key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -1402,26 +1526,9 @@ private object NoMotionScheme : MotionScheme {
                                     imagePicker.launch(arrayOf("image/*")); return true
                                 }
                             }
-                            setOnDragListener { _, event ->
-                                when(event.action) {
-                                    android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
-                                    android.view.DragEvent.ACTION_DROP -> {
-                                        if (model.state.value.readerOverlay || model.state.value.busy) return@setOnDragListener true
-                                        val permissions = activity.requestDragAndDropPermissions(event)
-                                        val clip = event.clipData
-                                        val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
-                                        if (uris.isNotEmpty()) {
-                                            val id = model.state.value.active.id
-                                            val x = event.x / density.density
-                                            val y = event.y / density.density
-                                            evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                                            model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
-                                        } else permissions?.release()
-                                        true
-                                    }
-                                    else -> true
-                                }
-                            }
+                            setOnDragListener(ExternalDropDragController { event ->
+                                handleExternalDrop.value(this, event)
+                            })
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
@@ -1445,10 +1552,52 @@ private object NoMotionScheme : MotionScheme {
             Settings(state, model, activity, noteLocation, settingsSection, { settingsSection = it }, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false;settingsSection=null}, {themePicker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}, {themeExport.launch("My theme.supermd-theme.json")}, {settings=false;settingsSection=null;web?.evaluateJavascript("window.supermdThemeGuide?.()",null)}, readerReady) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
         } }
     }
+    FolderActionDialogs(
+        state = state,
+        model = model,
+        createRequest = createFolderRequest,
+        onDismissCreate = { createFolderRequest = null },
+        onNoteCreated = { scope.launch { drawer.close() } },
+        renameTarget = renameFolderTarget,
+        onDismissRename = { renameFolderTarget = null },
+    )
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
-        var name by remember(state.active.id) {mutableStateOf(state.active.name)}
-        AlertDialog(onDismissRequest={renaming=false},title={Text("Rename note")},text={OutlinedTextField(value=name,onValueChange={name=it},singleLine=true,label={Text("Note name")})},confirmButton={TextButton(onClick={model.rename(state.active.id,name);renaming=false},enabled=name.isNotBlank()){Text("Rename")}},dismissButton={TextButton(onClick={renaming=false}){Text("Cancel")}})
+        val initialStem = remember(state.active.id, state.active.name) {
+            if (noteExtension(state.active.name).isNotEmpty()) noteStem(state.active.name) else state.active.name
+        }
+        var name by rememberSaveable(state.active.id, state.active.name) { mutableStateOf(initialStem) }
+        var renameError by remember(state.active.id, state.active.name) { mutableStateOf<String?>(null) }
+        var renameBusy by remember(state.active.id, state.active.name) { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { if (!renameBusy) renaming = false },
+            title = { Text("Rename note") },
+            text = {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it; renameError = null },
+                    enabled = !renameBusy,
+                    singleLine = true,
+                    isError = renameError != null,
+                    label = { Text("Note name") },
+                    supportingText = renameError?.let { err -> { Text(err, color = MaterialTheme.colorScheme.error) } },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        renameBusy = true
+                        renameError = null
+                        model.rename(state.active.id, name, showGlobalError = false) { ok, err ->
+                            renameBusy = false
+                            if (ok) renaming = false else renameError = err
+                        }
+                    },
+                    enabled = !renameBusy && name.isNotBlank(),
+                ) { Text("Rename") }
+            },
+            dismissButton = { TextButton(enabled = !renameBusy, onClick = { renaming = false }) { Text("Cancel") } },
+        )
     }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
         exporting = false
@@ -1460,7 +1609,10 @@ private object NoMotionScheme : MotionScheme {
                 if (format == "pdf") readerPdfOwnsProgress = true
                 when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
             }
-        } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
+        } else {
+            val stem = noteStem(state.active.name).ifBlank { "Untitled" }
+            if (format == "smd") portable.launch("$stem.smd") else pdf.launch("$stem.pdf")
+        }
     } }
     if (!accessPickerShowing) accessRequest?.let { request ->
         AlertDialog(onDismissRequest = model::dismissDocumentAccess,
@@ -1980,6 +2132,9 @@ internal suspend fun scrollFolderSearchItemIntoView(listState: LazyListState, ta
     onClearRecent: () -> Unit,
     onOpenRecent: (RecentNote) -> Unit,
     onPinRecent: (RecentNote) -> Unit,
+    onNavigateFolderRelative: (String) -> Unit = { onFolderRoot() },
+    onCreateInFolder: (CreateFolderRequest) -> Unit = {},
+    onRenameEntry: (FileEntry) -> Unit = {},
     modifier: Modifier = Modifier,
     onFolderSearch: () -> Unit = {},
 ) {
@@ -2005,31 +2160,24 @@ internal suspend fun scrollFolderSearchItemIntoView(listState: LazyListState, ta
                     Text("Search across notes", maxLines = 1)
                 }
                 if (state.folder != null) {
-                    TextButton(onClick = onCloseFolder, modifier = Modifier.heightIn(min = 48.dp)) {
-                        Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp))
-                    }
+                    FolderDrawerHeader(
+                        folderUriRaw = state.folder,
+                        folderRelative = folderRelative,
+                        onNavigateRelative = onNavigateFolderRelative,
+                        onRequestCreate = onCreateInFolder,
+                        onCloseFolder = onCloseFolder,
+                    )
                 }
                 Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
-                if (state.folder != null && folderRelative.isNotEmpty()) {
-                    val parentRel = parentFolderRelative(folderRelative)
-                    TextButton(onClick = onFolderRoot, modifier = Modifier.heightIn(min = 48.dp)) {
-                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Navigate up")
-                        Spacer(Modifier.width(4.dp))
-                        Text(if (parentRel.isEmpty()) "Folder root" else parentRel.substringAfterLast('/'))
-                    }
-                }
             }
         }
-        items(state.files, key = { "file:${it.uri}:${it.relative}" }) { entry ->
-            ListItem(
-                leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) },
-                trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) },
-                colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable { onActivateEntry(entry) },
-            ) {
-                Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
-        }
+        folderFileItems(
+            files = state.files,
+            activeUri = state.active.uri,
+            onActivate = onActivateEntry,
+            onCreateInFolder = onCreateInFolder,
+            onRename = onRenameEntry,
+        )
         if (recent.isNotEmpty()) {
             item(key = "recent-header") {
                 Column {
