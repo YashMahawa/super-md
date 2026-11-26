@@ -267,6 +267,23 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         studio_assets_rename.create_subfolder(lightweight, str(self.open_root), "DoubleSub")
         studio_assets_rename.create_folder_note(lightweight, str(self.open_root), "DoubleNote", "md")
         self.assertTrue((self.open_root / "DoubleSub").is_dir() and (self.open_root / "DoubleNote.md").is_file())
+        src_retry, dst_retry = self.open_root / "DoubleNote.md", self.open_root / "RetriedNote.md"
+        real_rename, attempts = Path.rename, []
+
+        def flaky_win_rename(p, target):
+            attempts.append(p)
+            if len(attempts) == 1:
+                err = PermissionError("sharing violation")
+                err.winerror = 32
+                raise err
+            return real_rename(p, target)
+
+        with patch("studio._is_windows", return_value=True), patch.object(Path, "rename", flaky_win_rename):
+            evt = self.studio._suspend_watches_for_prefix(str(src_retry), is_dir=False, new_path=str(dst_retry))
+            self.assertFalse(evt.is_set())
+            studio_assets_rename.rename_path_with_windows_retry(src_retry, dst_retry)
+            self.studio._sync_path_change(str(src_retry), str(dst_retry), is_dir=False, on_rebound=evt.set)
+        self.assertTrue(evt.is_set() and dst_retry.is_file() and len(attempts) == 2)
         _, saved_assets, is_portable = open_note(smd_path)
         self.assertTrue(is_portable)
         self.assertEqual(set(saved_assets), {"assets/diagram.svg", "assets/pixel.png"})
