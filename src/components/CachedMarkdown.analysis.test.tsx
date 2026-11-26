@@ -86,7 +86,9 @@ describe("CachedMarkdown supplied source analysis", () => {
       "",
       "<script>alert('xss')</script>",
       "",
-      "![Dot](data:image/png;base64,iVBORw0KGgo=) [Unsafe](javascript:alert(1))",
+      "![Dot](data:image/png;base64,iVBORw0KGgo=) ![Vector](data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=) ![HtmlImg](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)",
+      "",
+      "[Relative](./notes/chapter-2.md#summary) [Anchor](#analysis-heading) [Mail](mailto:reader@example.org) [Unsafe](javascript:alert(1)) [UnsafeVb](vbscript:msgbox(1)) [UnsafeData](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)",
       "",
       "```python",
       "total = 40 + 2",
@@ -154,7 +156,14 @@ describe("CachedMarkdown supplied source analysis", () => {
     expect(htmlFromSupplied).toContain("<kbd>Esc</kbd><br/>line two.");
     expect(htmlFromSupplied).not.toContain("onclick");
     expect(htmlFromSupplied).not.toContain("javascript:");
+    expect(htmlFromSupplied).not.toContain("vbscript:");
+    expect(htmlFromSupplied).not.toContain("data:text/html");
     expect(htmlFromSupplied).not.toContain("<script");
+    expect(htmlFromSupplied).toContain('src="data:image/png;base64,iVBORw0KGgo="');
+    expect(htmlFromSupplied).toContain('src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4="');
+    expect(htmlFromSupplied).toContain('href="./notes/chapter-2.md#summary"');
+    expect(htmlFromSupplied).toContain('href="#analysis-heading"');
+    expect(htmlFromSupplied).toContain('href="mailto:reader@example.org"');
     expect(htmlFromSupplied).toContain('href="https://example.org/parity"');
     expect(htmlFromSupplied).toContain("Footnote from pre-parsed tree.");
     expect(htmlFromSupplied).toContain('class="python-cell"');
