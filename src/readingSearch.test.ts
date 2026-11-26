@@ -774,5 +774,79 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
     cleanups.forEach(fn=>fn());
     act(()=>root.unmount());
   });
+
+  it("maps displayed frontmatter metadata across BOM, out-of-order, quoted, folded, flow, and duplicate source spans while preserving regex replacement semantics",()=>{
+    const content=[
+      "\uFEFF---",
+      'description: "hidden needle"',
+      "tags: [needle, alpha, needle]",
+      "authors:",
+      "  - >",
+      "    Ada",
+      "    needle",
+      'title: "needle \\"one\\""',
+      "---",
+      "Body needle.",
+    ].join("\n");
+    const bodyStart=content.indexOf("Body needle.");
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const props=document.createElement("header");
+    props.className="document-properties";
+    props.setAttribute("data-frontmatter-properties","");
+    props.innerHTML=[
+      '<h1 data-frontmatter-field="title">needle "one"</h1>',
+      '<span data-frontmatter-field="author">Ada needle</span>',
+      '<span data-frontmatter-field="secret">hidden needle</span>',
+      '<span data-frontmatter-field="tag">needle</span>',
+      '<span data-frontmatter-field="tag">alpha</span>',
+    ].join("");
+    const bodyP=document.createElement("p");
+    bodyP.setAttribute("data-source-start",String(bodyStart));
+    bodyP.setAttribute("data-source-end",String(content.length));
+    bodyP.textContent="Body needle.";
+    host.append(props,bodyP);
+
+    const ranges=sourceMatches(content,"needle");
+    // Source indices: 0=hidden description, 1=first flow tag, 2=duplicate flow tag (deduplicated in DOM), 3=folded author, 4=quoted title, 5=body.
+    expect(ranges).toHaveLength(6);
+
+    // Calling resolveSourceHighlightRange before connecting host must not poison connected calls.
+    const preConnect=resolveSourceHighlightRange(host,content,ranges,4,"needle");
+    document.body.append(host);
+    const postConnect=resolveSourceHighlightRange(host,content,ranges,4,"needle");
+    expect(preConnect?.toString()).toBe("needle");
+    expect(postConnect?.startContainer.isConnected).toBe(true);
+
+    // Rendered DOM order is title (source 4), author (source 3), tag (source 1), body (source 5); hidden secret & deduplicated tag #2 do not map.
+    const domMatches=readingMatches(host,"needle");
+    expect(domMatches).toHaveLength(4);
+    expect(translateRenderedIndexToSource(host,content,ranges,0,"needle",false,null,domMatches)).toBe(4);
+    expect(translateRenderedIndexToSource(host,content,ranges,1,"needle",false,null,domMatches)).toBe(3);
+    expect(translateRenderedIndexToSource(host,content,ranges,2,"needle",false,null,domMatches)).toBe(1);
+    expect(translateRenderedIndexToSource(host,content,ranges,3,"needle",false,null,domMatches)).toBe(5);
+    expect(translateSourceIndexToRendered(host,content,ranges,0,"needle",false,null,domMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,2,"needle",false,null,domMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,4,"needle",false,null,domMatches)).toBe(0);
+    expect(translateSourceIndexToRendered(host,content,ranges,3,"needle",false,null,domMatches)).toBe(1);
+    expect(translateSourceIndexToRendered(host,content,ranges,1,"needle",false,null,domMatches)).toBe(2);
+    expect(translateSourceIndexToRendered(host,content,ranges,5,"needle",false,null,domMatches)).toBe(3);
+
+    // Exact source-span single Replace targets the folded author value without touching hidden description or title.
+    const replacedAuthor=replaceSourceMatches(content,"needle","spark",false,3);
+    expect(replacedAuthor).toContain('description: "hidden needle"');
+    expect(replacedAuthor).toContain("    Ada\n    spark");
+    expect(replacedAuthor).toContain('title: "needle \\"one\\""');
+
+    // Overridden inline style -> hidden invalidates cached DOM matches even if oldValue also contained "display: none".
+    bodyP.setAttribute("style","display: none; display: block");
+    expect(readingMatches(host,"needle")).toHaveLength(4);
+    bodyP.setAttribute("style","display: none");
+    expect(readingMatches(host,"needle")).toHaveLength(3);
+
+    // Named capture groups replace unknown $<missing> with "" (matching String.prototype.replace), while unnamed regexes preserve literal $<missing>.
+    expect(replaceSourceMatches("foo bar","(?<w>foo)","[$<w>:$<missing>]",{regexp:true})).toBe("[foo:] bar");
+    expect(replaceSourceMatches("foo bar","(foo)","[$1:$<missing>]",{regexp:true})).toBe("[foo:$<missing>] bar");
+  });
 });
 

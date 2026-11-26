@@ -21,7 +21,7 @@ type DomVersionEntry = { observer: MutationObserver | null; version: number };
 type RangeLike = { startContainer: Node; startOffset: number; endContainer: Node; endOffset: number };
 const domVersions = new WeakMap<Element, DomVersionEntry>();
 const readingMatchesCache = new WeakMap<Element, { root: Element; version: number; key: string; connected: boolean; ranges: Range[] }>();
-const sourceHighlightCache = new WeakMap<Element, { root: Element; version: number; content: string; ranges: SourceRange[]; activeIndex: number; key: string; range: Range | null }>();
+const sourceHighlightCache = new WeakMap<Element, { root: Element; version: number; connected: boolean; content: string; ranges: SourceRange[]; activeIndex: number; key: string; range: Range | null }>();
 const highlightSyncCache = new WeakMap<HighlightRegistry, { allRef?: Range[]; allSnaps?: RangeLike[]; current?: RangeLike | null }>();
 let cachedFmContent: string | null = null, cachedFmResult: ParsedFrontmatter | null = null;
 
@@ -39,7 +39,7 @@ function hasRelevantSearchMutation(records: MutationRecord[]): boolean {
   return records.some(r => {
     if (r.type !== "attributes" || r.attributeName !== "style") return true;
     const style = (r.target as HTMLElement).style, nowHidden = Boolean(style && (style.display === "none" || style.visibility === "hidden"));
-    return nowHidden !== Boolean(r.oldValue && /(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b/i.test(r.oldValue));
+    return nowHidden || Boolean(r.oldValue && /(?:none|hidden)/i.test(r.oldValue));
   });
 }
 
@@ -113,7 +113,7 @@ function expandRegexReplacement(replacement: string, match: RegExpExecArray, sou
       if (digits.length === 2 && two > 0 && two < match.length) return match[two] ?? "";
       return one > 0 && one < match.length ? (match[one] ?? "") + digits.slice(1) : token;
     }
-    return groupName !== undefined && match.groups && Object.prototype.hasOwnProperty.call(match.groups, groupName) ? (match.groups[groupName] ?? "") : token;
+    return groupName !== undefined && match.groups ? (Object.prototype.hasOwnProperty.call(match.groups, groupName) ? (match.groups[groupName] ?? "") : "") : token;
   });
 }
 
@@ -394,10 +394,10 @@ export function resolveSourceHighlightRange(host: Element, content: string, rang
   const target = ranges[activeIndex];
   if (!target) return null;
   const { root, version } = getSearchDomVersion(host), key = searchOptionKey(query, options), cached = sourceHighlightCache.get(host);
-  if (cached && cached.root === root && cached.version === version && cached.content === content && cached.ranges === ranges && cached.activeIndex === activeIndex && cached.key === key) return cached.range;
+  if (cached && cached.root === root && cached.version === version && cached.connected === host.isConnected && cached.content === content && cached.ranges === ranges && cached.activeIndex === activeIndex && cached.key === key) return cached.range;
   const block = knownBlock ?? findContainingBlock(host, target, content);
   const range = block ? mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options) : mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
-  if (!Number.isNaN(version)) sourceHighlightCache.set(host, { root, version, content, ranges, activeIndex, key, range });
+  if (!Number.isNaN(version)) sourceHighlightCache.set(host, { root, version, connected: host.isConnected, content, ranges, activeIndex, key, range });
   return range;
 }
 
