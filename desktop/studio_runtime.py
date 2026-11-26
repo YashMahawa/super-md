@@ -1,14 +1,10 @@
 """Runtime domain helpers for Studio: app updates, desktop integration, storage, and Python setup."""
 from __future__ import annotations
 import json
-import sys
 import threading
 from pathlib import Path
 
 def _studio_module():
-    mod = sys.modules.get("studio") or sys.modules.get("desktop.studio")
-    if mod is not None:
-        return mod
     if __package__:
         from . import studio as mod
     else:

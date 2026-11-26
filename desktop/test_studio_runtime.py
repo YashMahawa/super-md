@@ -212,10 +212,9 @@ class StudioRuntimeTest(unittest.TestCase):
                     open_url.assert_called_once_with(QUrl.fromLocalFile(self.studio.update_path))
 
     def test_python_folders_default_refresh_install_setup_and_shutdown_guards(self):
-        note_dir = Path(self.studio.data, "other", "dir")
-        self.studio.folder = str(Path(self.studio.data, "notes"))
-        self.studio.tabs = [self.studio._note("a.md", path=str(note_dir / "a.md")), self.studio._note("Untitled.md")]
-        self.assertEqual(self.studio._python_folders(), [self.studio.folder, str(note_dir)])
+        self.studio.folder = "/workspace/notes"
+        self.studio.tabs = [self.studio._note("a.md", path="/other/dir/a.md"), self.studio._note("Untitled.md")]
+        self.assertEqual(self.studio._python_folders(), ["/workspace/notes", str(Path("/other/dir/a.md").parent)])
         proxy = SimpleNamespace(retired=False, settings={"python": ""}, data=self.studio.data, _preferences=lambda notify=True: None, _emit=lambda *_a: None)
         with patch("python_runtime.default_python", return_value="/venv/bin/python"):
             Studio._choose_default_python(proxy)
