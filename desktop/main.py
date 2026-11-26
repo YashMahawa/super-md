@@ -34,33 +34,19 @@ if __name__ == "__main__":
                 "--version", "--help", "-h"}
     if len(sys.argv) == 1 or sys.argv[1] not in commands:
         configure(safe="--safe-graphics" in sys.argv)
-from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, Signal, QPointF
+from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QMetaObject, Q_ARG, QObject, QEvent, QPointF
 from PySide6.QtGui import QGuiApplication, QIcon, QFont, QFontDatabase
-from PySide6.QtWidgets import QApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
 from agent_live import create_qt_bridge
+from external_open import ExternalOpenRouter, StudioApplication
 from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes
 from instance import InstanceBroker
 from reader_gestures import ReaderGestures
 import native_frame
-
-class StudioApplication(QApplication):
-    openRequested = Signal(str)
-
-    def event(self, event):
-        # Native macOS open events target the application. Do not install a
-        # Python global event filter over Qt Quick/WebEngine's internal objects:
-        # PySide's wrapper creation can itself send events and recurse.
-        if event.type() == QEvent.Type.FileOpen:
-            path = event.file() or (event.url().toLocalFile() if event.url().isLocalFile() else "")
-            if path:
-                self.openRequested.emit(path)
-                return True
-        return super().event(event)
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme"):
@@ -235,6 +221,7 @@ def main():
             sync_frame()
         engines.append(engine)
         studios.append(studio)
+        external_router.register_window(studio, activated=show_window)
         if args.smoke:
             import time
             smoke_deadline = time.monotonic() + 30
@@ -484,13 +471,8 @@ def main():
             studio.openPath(str(note))
         return studio
     app.aboutToQuit.connect(lambda:setattr(session,"quitting",True))
-    def open_from_service(note=None):
-        hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
-        if hidden is not None:
-            hidden.host_window.show();hidden.host_window.raise_();hidden.host_window.requestActivate()
-            if note:hidden.openNote(str(note))
-            return
-        create_window(note)
+    external_router = ExternalOpenRouter(studios, lambda note=None: create_window(note), app=app)
+    open_from_service = external_router.open_requested
     from background_service import BackgroundService
     session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
     create_window(args.note,show_window=not args.background)

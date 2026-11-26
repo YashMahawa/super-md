@@ -1042,18 +1042,27 @@ class Studio(QObject):
             tab.setdefault("conflict", False)
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
+        self._startup_placeholder_ids = set()
+        self._welcome_placeholder_id = None
+        self._touched_tab_ids = set()
+        self._opening_paths: dict[str, int] = {}
         if not self.tabs:
-            self.tabs.append(self._note("Untitled.md") if self.settings["welcomed"] else self._note("Welcome.md", SAMPLE, saved=SAMPLE))
+            if self.settings["welcomed"]:
+                placeholder = self._note("Untitled.md")
+                self.tabs.append(placeholder)
+                self._startup_placeholder_ids.add(placeholder["id"])
+            else:
+                placeholder = self._note("Welcome.md", SAMPLE, saved=SAMPLE)
+                self.tabs.append(placeholder)
+                self._welcome_placeholder_id = placeholder["id"]
         elif self.settings["startup"]=="new":
-            self.tabs.insert(0,self._note("Untitled.md"))
+            placeholder = self._note("Untitled.md")
+            self.tabs.insert(0, placeholder)
+            self._startup_placeholder_ids.add(placeholder["id"])
         self.active = self.tabs[0]["id"]
         target_active_id = win_spec["activeId"] if win_spec is not None else self.session.startup_active_id
         if restore_enabled and any(t["id"]==target_active_id for t in self.tabs):self.active=target_active_id
         self._activation_generation = 0
-        self._startup_placeholder_ids = {
-            tab["id"] for tab in self.tabs
-            if tab["name"] == "Untitled.md" and not tab["path"] and not tab["content"] and not tab["saved"] and not tab["assets"]
-        }
         self._restoring_paths=set()
         self._startup_order=[]
         if win_spec is not None:
@@ -1167,6 +1176,53 @@ class Studio(QObject):
         if tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}):
             return True
         return False
+
+    def _mark_tab_touched(self, tab_id: str | None) -> None:
+        if not tab_id:
+            return
+        self._touched_tab_ids.add(tab_id)
+        self._startup_placeholder_ids.discard(tab_id)
+        if self._welcome_placeholder_id == tab_id:
+            self._welcome_placeholder_id = None
+
+    def _is_untouched_startup_placeholder(self, tab: dict, *, allow_welcome_sample: bool) -> bool:
+        tab_id = tab.get("id")
+        if not tab_id or tab_id in self._touched_tab_ids:
+            return False
+        if self._is_dirty(tab) or tab.get("path") or tab.get("assets") or tab.get("conflict"):
+            return False
+        session_entry = self.reader_edits.sessions.get(tab_id)
+        if session_entry is not None and session_entry[1] > 0:
+            return False
+        if tab_id in self._startup_placeholder_ids:
+            return tab.get("name") == "Untitled.md" and tab.get("content") == "" and tab.get("saved") == ""
+        if allow_welcome_sample and tab_id == self._welcome_placeholder_id:
+            return tab.get("name") == "Welcome.md" and tab.get("content") == SAMPLE and tab.get("saved") == SAMPLE
+        return False
+
+    def _remove_untouched_startup_placeholders(self, *, keep_tab_id: str, allow_welcome_sample: bool) -> bool:
+        removable_ids = {
+            tab["id"]
+            for tab in self.tabs
+            if tab.get("id") != keep_tab_id
+            and self._is_untouched_startup_placeholder(tab, allow_welcome_sample=allow_welcome_sample)
+        }
+        if not removable_ids:
+            return False
+        remaining = [tab for tab in self.tabs if tab["id"] not in removable_ids]
+        if not remaining:
+            return False
+        for removed_id in removable_ids:
+            self._python_jobs.cancel_tab(removed_id)
+            self.reader_edits.clear(removed_id)
+            self.session.reader_assets.revoke_tab(self.window_id, removed_id)
+            self._startup_placeholder_ids.discard(removed_id)
+            if self._welcome_placeholder_id == removed_id:
+                self._welcome_placeholder_id = None
+        self.tabs = remaining
+        if not any(tab["id"] == self.active for tab in self.tabs):
+            self.active = keep_tab_id if any(tab["id"] == keep_tab_id for tab in self.tabs) else self.tabs[0]["id"]
+        return True
 
     @Property("QStringList",notify=sidebarChanged)
     def pinnedRecent(self):return list(self.session.pinned)
@@ -1510,6 +1566,7 @@ class Studio(QObject):
             except (OSError, TypeError, KeyError):
                 pass
         self._agent_exports.clear()
+        self._opening_paths.clear()
         if self.position_timer.isActive():self._save_positions()
         self.position_timer.stop()
         if self.preference_timer.isActive():self._preferences(False)
@@ -3310,8 +3367,39 @@ class Studio(QObject):
         path = local_path(value)
         if path.is_dir():
             self.openFolder(str(path))
+            if self.folder and folder_ops.same_path(self.folder, path):
+                self.workspaceFolderDropped.emit()
+                if self.host_window is not None:
+                    self.host_window.raise_()
+                    self.host_window.requestActivate()
         else:
-            self.openNote(str(path))
+            self._open_note(str(path), explicit=True, replace_startup_placeholder=True)
+
+    @staticmethod
+    def _same_open_tab_path(tab_path: str, path: Path) -> bool:
+        if not tab_path:
+            return False
+        if tab_path == str(path) or folder_ops.same_path(tab_path, path):
+            return True
+        try:
+            return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
+        except OSError:
+            return False
+
+    def has_open_tab_for_path(self, value) -> bool:
+        if self.retired:
+            return False
+        path = value if isinstance(value, Path) else local_path(str(value))
+        if path.is_dir():
+            return False
+        if any(self._same_open_tab_path(tab.get("path", ""), path) for tab in self.tabs):
+            return True
+        if any(folder_ops.same_path(restoring, path) for restoring in self._restoring_paths):
+            return True
+        return any(
+            count > 0 and folder_ops.same_path(opening, path)
+            for opening, count in self._opening_paths.items()
+        )
 
     @Slot()
     def chooseFolder(self):
@@ -3362,6 +3450,7 @@ class Studio(QObject):
         batch_insert=None,
         should_activate_fn=None,
         pending_heading=None,
+        replace_startup_placeholder=False,
     ):
         if self.retired:
             if completion_callback: completion_callback(None, "The document window is no longer available")
@@ -3371,6 +3460,7 @@ class Studio(QObject):
             self.openFolder(str(path))
             if completion_callback: completion_callback(None, "A folder cannot be opened as a document")
             return
+        had_unwelcomed_placeholder = not bool(self.settings.get("welcomed"))
         if explicit and activation_generation is None:
             self._activation_generation += 1
             activation_generation = self._activation_generation
@@ -3378,6 +3468,16 @@ class Studio(QObject):
             activation_generation = self._activation_generation
         restoring = not explicit and str(path) in self._restoring_paths
         def activate_existing(target_tab):
+            placeholder_removed = False
+            was_unwelcomed = False
+            if replace_startup_placeholder:
+                placeholder_removed = self._remove_untouched_startup_placeholders(
+                    keep_tab_id=target_tab["id"],
+                    allow_welcome_sample=had_unwelcomed_placeholder,
+                )
+                was_unwelcomed = not bool(self.settings.get("welcomed"))
+                if was_unwelcomed:
+                    self.settings["welcomed"] = True
             if explicit and activation_generation == self._activation_generation:
                 if should_activate_fn is None or should_activate_fn(target_tab):
                     if pending_heading:
@@ -3388,23 +3488,26 @@ class Studio(QObject):
                         canon_existing_path = folder_ops.canonical_path_str(path)
                         self.recent = [canon_existing_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_existing_path)][:29]
                         self._preferences(notify=False)
+                    elif was_unwelcomed:
+                        self._preferences(notify=False)
+                    if placeholder_removed:
+                        self.recovery_timer.start(800)
                     was_active = self.active == target_tab["id"]
                     self._select_tab_from_open(target_tab["id"], activation_generation)
                     if was_active:
-                        self._emit(bool(pending_heading))
+                        self._emit(bool(pending_heading) or was_unwelcomed)
                     for window in list(self.session.windows.values()):
                         if window is not self and not window.retired:
                             window._emit(False)
                     self._focus_open_target(activation_generation)
+            elif placeholder_removed or was_unwelcomed:
+                if was_unwelcomed:
+                    self._preferences(notify=False)
+                if placeholder_removed:
+                    self.recovery_timer.start(800)
+                self._emit(False)
         def same_open_tab_path(tab_path: str) -> bool:
-            if not tab_path:
-                return False
-            if tab_path == str(path) or folder_ops.same_path(tab_path, path):
-                return True
-            try:
-                return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
-            except OSError:
-                return False
+            return self._same_open_tab_path(tab_path, path)
         found = next((t for t in self.tabs if same_open_tab_path(t["path"])), None)
         if found:
             self._agent_open_paths.add(folder_ops.canonical_path_str(path))
@@ -3414,7 +3517,16 @@ class Studio(QObject):
             activate_existing(found)
             if completion_callback: completion_callback(found, None)
             return
+        canon_opening = folder_ops.canonical_path_str(path)
+        if canon_opening:
+            self._opening_paths[canon_opening] = self._opening_paths.get(canon_opening, 0) + 1
         def finished(result, error):
+            if canon_opening and canon_opening in self._opening_paths:
+                remaining_opens = self._opening_paths[canon_opening] - 1
+                if remaining_opens > 0:
+                    self._opening_paths[canon_opening] = remaining_opens
+                else:
+                    self._opening_paths.pop(canon_opening, None)
             self._restoring_paths.discard(str(path))
             if error:
                 if completion_callback: completion_callback(None, error)
@@ -3437,6 +3549,11 @@ class Studio(QObject):
                 batch_insert(note)
             else:
                 self.tabs.append(note)
+            if replace_startup_placeholder:
+                self._remove_untouched_startup_placeholders(
+                    keep_tab_id=note["id"],
+                    allow_welcome_sample=had_unwelcomed_placeholder,
+                )
             if restoring:
                 keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
@@ -3447,9 +3564,9 @@ class Studio(QObject):
             if restoring and activation_generation == self._activation_generation:
                 target_active = self._startup_active or self.session.startup_active
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
-            if should_activate:
+            if should_activate or not any(t["id"] == self.active for t in self.tabs):
                 self.active = note["id"]
-                if pending_heading:
+                if should_activate and pending_heading:
                     note["pendingHeading"] = pending_heading
             self.settings["welcomed"] = True
             canon_note_path = folder_ops.canonical_path_str(path)
@@ -3904,6 +4021,8 @@ class Studio(QObject):
         if key == "widthPercent": value = max(50,min(150,float(value)))
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
         self.settings[key] = value
+        if key == "welcomed" and value is True:
+            self._welcome_placeholder_id = None
         if key == "shortcuts": self._notify_shortcuts()
         self._preferences()
         self._emit()
@@ -5949,6 +6068,7 @@ class Studio(QObject):
             if command in ("document_sync", "document_patch", "document_resync"):
                 target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
                 def commit_edit(content):
+                    self._mark_tab_touched(target["id"])
                     was_dirty=target["content"]!=target["saved"]
                     target["content"] = content
                     if target["id"] == self.active:self._last_reader_text=(target["id"],content)
@@ -5970,7 +6090,9 @@ class Studio(QObject):
             if command == "document_changed":
                 target = next((t for t in self.tabs if t["id"] == args["id"]), None)
                 self.reader_edits.clear(args["id"])
-                if target: target["content"] = args["content"]
+                if target:
+                    self._mark_tab_touched(target["id"])
+                    target["content"] = args["content"]
                 if target and target["id"]==self.active:self._last_reader_text=(target["id"],target["content"])
                 self.recovery_timer.start(800)
                 self.autosave_timer.start(900)
