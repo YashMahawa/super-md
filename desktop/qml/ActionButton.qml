@@ -43,5 +43,5 @@ Button {
     }
     scale: down ? .96 : 1
     Behavior on scale { enabled: studio.motionEnabled; SpringAnimation { spring: 5; damping: .75 } }
-    Hint { requested: control.hovered && control.ToolTip.text.length > 0; text: control.ToolTip.text }
+    Hint { objectName: "actionHint"; requested: control.hovered && control.ToolTip.text.length > 0; text: control.ToolTip.text }
 }

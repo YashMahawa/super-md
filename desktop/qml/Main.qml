@@ -9,6 +9,12 @@ import QtWebChannel
 ApplicationWindow {
     id: window
     signal readerViewChanged(var readerView)
+    onReaderViewChanged: function(view) {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view)
+    }
+    Component.onCompleted: {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader)
+    }
     width: 1320
     height: 880
     minimumWidth: 760
@@ -120,6 +126,27 @@ ApplicationWindow {
             if (window.reader === target) target.forceActiveFocus()
         })
     }
+    function hintWithShortcut(label, key, fallback) {
+        const map = window.shortcutLabels || {}
+        const raw = map[key] !== undefined ? map[key] : (fallback || "")
+        return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
+    }
+    function fullscreenHint() {
+        const map = window.shortcutLabels || {}
+        const full = map.fullscreen && map.fullscreen !== "Disabled" ? map.fullscreen : ""
+        const exitKey = map.dismiss && map.dismiss !== "Disabled" ? map.dismiss + " to exit" : ""
+        const parts = [full, exitKey].filter(Boolean)
+        return parts.length > 0 ? "Fullscreen (" + parts.join(" · ") + ")" : "Fullscreen"
+    }
+    function modeChoices(includeSplit) {
+        const items = [
+            { key: "live", label: "Live", tooltip: window.hintWithShortcut("Live mode", "mode_live") },
+            { key: "editor", label: "Source", tooltip: window.hintWithShortcut("Source mode", "mode_editor") },
+            { key: "reader", label: "Read", tooltip: window.hintWithShortcut("Read mode", "mode_reader") },
+        ]
+        if (includeSplit) items.push({ key: "split", label: "Split", tooltip: window.hintWithShortcut("Split mode", "mode_split") })
+        return items
+    }
     function nativeTextEditorFocused() {
         // Application-level shortcuts must leave real Qt settings fields to
         // their own platform editing commands. WebEngine's DOM inputs are
@@ -141,6 +168,8 @@ ApplicationWindow {
             return !modalDialogCount && !window.nativeTextEditorFocused() && !viewState.readerOverlay && viewState.mode !== "reader"
         }
         if (action === "undo" || action === "redo") return !modalDialogCount && !viewState.readerOverlay
+        if (action === "mode_live" || action === "mode_editor" || action === "mode_reader" || action === "mode_split")
+            return !modalDialogCount && !viewState.fullscreen && !viewState.readerOverlay && !viewState.imageOverlay && (action !== "mode_split" || window.width >= 1000)
         if (action === "close_tab") return !modalDialogCount
         if (action === "dismiss") return !modalDialogCount && !contentsPopup.visible
         return true
@@ -209,6 +238,13 @@ ApplicationWindow {
         case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
         case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
         case "typewriter_scroll": studio.setting("typewriterScroll", JSON.stringify(!viewState.settings.typewriterScroll)); break
+        case "new_folder_note": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewFolderNote(); break
+        case "new_subfolder": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewSubfolder(); break
+        case "rename_entry": folderSidebar.triggerRenameSelectedOrActive(); break
+        case "mode_live": studio.setMode("live"); break
+        case "mode_editor": studio.setMode("editor"); break
+        case "mode_reader": studio.setMode("reader"); break
+        case "mode_split": if (window.width >= 1000) studio.setMode("split"); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
@@ -238,6 +274,15 @@ ApplicationWindow {
         readerRecoveryExhausted = false
         readerRecoveryMessage = "Reopening the document reader…"
         scheduleReaderRemount(0)
+    }
+    function chooseSaveDestination(dialogTitle, folderUrl, fileUrl) {
+        const dialog = saveDestinationComponent.createObject(window, {
+            title: dialogTitle,
+            portableNote: Boolean(viewState.portable),
+            currentFolder: folderUrl,
+            selectedFile: fileUrl
+        })
+        dialog.open()
     }
     function showExport(share) { sharing = share; outputFormat = "pdf"; exportDialog.open() }
     function chooseExportDestination() {
@@ -274,15 +319,15 @@ ApplicationWindow {
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
-        function onSaveRequested(name) { saveDialog.title = "Save note"; saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
-        function onSaveAsRequested(name) { saveDialog.title = "Save as"; saveDialog.selectedFile = studio.defaultSaveAsLocation(name); saveDialog.open() }
+        function onSaveRequested(name) { window.chooseSaveDestination("Save note", studio.defaultSaveFolder(), studio.defaultSaveLocation(name)) }
+        function onSaveAsRequested(name) { window.chooseSaveDestination("Save as", studio.defaultSaveAsFolder(), studio.defaultSaveAsLocation(name)) }
         function onSaveConflictRequested(name) { flushDialog.close(); closeDialog.close(); saveConflictDialog.title = name + " changed on disk"; if (!saveConflictDialog.visible) saveConflictDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
         function onThemePickerRequested() { themeDialog.open() }
-        function onThemeExportRequested() { themeExportDialog.open() }
+        function onThemeExportRequested() { themeExportDialog.selectedFile = studio.defaultThemeExportLocation("My theme.supermd-theme.json"); themeExportDialog.open() }
         function onReaderLoad(payload) {
             const script = "(function(){if(!window.supermdLoad)return false;window.supermdLoad(" + payload + ");window.supermdChromeInset?.(" + (studio.readerFullscreen ? 56 : 0) + ");document.documentElement.style.setProperty('--native-visible-chrome-inset','" + window.readerVisibleChromeInset + "px');return true})()"
             window.runDocumentScript(script)
@@ -294,6 +339,10 @@ ApplicationWindow {
         function onWorkspaceSearchChanged() {
             if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
             else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
+        }
+        function onWorkspaceFolderDropped() {
+            window.sidebar = true
+            window.sidebarSection = "folder"
         }
     }
     onViewStateChanged: {
@@ -350,7 +399,7 @@ ApplicationWindow {
     }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     FileDialog { id:themeDialog;title:"Import a Super MD theme";fileMode:FileDialog.OpenFile;nameFilters:["Theme files (*.json)"];onAccepted:studio.importCustomTheme(selectedFile.toString()) }
-    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
+    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultThemeExportLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
 
     header: Column {
@@ -366,10 +415,10 @@ ApplicationWindow {
                 spacing: 8
                 SidebarToggle { expanded: sidebar; onClicked: sidebar = !sidebar }
                 ActionButton { glyph: "FolderOpen"; ToolTip.text: "Open folder"; Accessible.name: "Open folder"; onClicked: studio.chooseFolder() }
-                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: "Open note (" + window.shortcutLabels.open + ")"; onClicked: openDialog.open() }
-                ActionButton { glyph: "FloppyDisk"; ToolTip.text: "Save note (" + window.shortcutLabels.save + ")"; onClicked: studio.saveSafely(); enabled: !viewState.busy }
-                ActionButton { glyph: "Undo"; ToolTip.text: "Undo (" + window.shortcutLabels.undo + ")"; onClicked: studio.command("undo") }
-                ActionButton { glyph: "Redo"; ToolTip.text: "Redo (" + window.shortcutLabels.redo + ")"; onClicked: studio.command("redo") }
+                ActionButton { text: window.width < 1060 ? "" : "Open note"; glyph: "File"; ToolTip.text: window.hintWithShortcut("Open note", "open"); onClicked: openDialog.open() }
+                ActionButton { glyph: "FloppyDisk"; ToolTip.text: window.hintWithShortcut("Save note", "save"); onClicked: studio.saveSafely(); enabled: !viewState.busy }
+                ActionButton { glyph: "Undo"; ToolTip.text: window.hintWithShortcut("Undo", "undo"); onClicked: studio.command("undo") }
+                ActionButton { glyph: "Redo"; ToolTip.text: window.hintWithShortcut("Redo", "redo"); onClicked: studio.command("redo") }
                 Item {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
@@ -383,8 +432,8 @@ ApplicationWindow {
                         onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
                     }
                 }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: "Find in note (" + window.shortcutLabels.find + ")"; onClicked: window.openFind() }
-                ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
+                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
+                ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Search across notes", "search_folder"); onClicked: studio.openFolderSearch() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -394,16 +443,16 @@ ApplicationWindow {
                         id: noteActions
                         objectName: "compactNoteActions"
                         implicitWidth: 250
-                        NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
-                        NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
-                        NoteMenuItem { text: "Search across notes"; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
+                        NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.reopen_tab || "") : ""; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
+                        NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.save_as || "") : ""; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
+                        NoteMenuItem { objectName: "compactSearchFolderAction"; text: "Search across notes"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.search_folder || "") : ""; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
                         NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; actionVisible: window.width < 1060; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
                     }
                 }
                 ActionButton { text: window.width < 1060 ? "" : "Export"; glyph: "Export"; ToolTip.text: "Export note"; prominent: true; enabled: !viewState.busy; onClicked: window.showExport(false) }
-                ActionButton { glyph: "GearSix"; ToolTip.text: "Settings"; onClicked: settingsOpen = !settingsOpen }
+                ActionButton { objectName: "settingsButton"; glyph: "GearSix"; ToolTip.text: window.hintWithShortcut("Settings", "settings"); onClicked: settingsOpen = !settingsOpen }
                 WindowControls { visible: studio.showToolbarWindowControls; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
@@ -430,81 +479,13 @@ ApplicationWindow {
                 spacing: 12
                 Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
-                ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
-                ActionButton { objectName: "sidebarFolderSearchButton"; visible: sidebarSection === "folder"; text: "Search across notes"; glyph: "MagnifyingGlass"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
-                RowLayout {
-                    visible: sidebarSection === "folder" && !!viewState.folder
-                    Layout.fillWidth: true
-                    Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
-                    ActionButton { glyph: "X"; compact: true; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; onClicked: studio.closeFolder() }
-                }
-                TextField {
-                    id: filter
-                    objectName: "folderFilterField"
-                    property string backendFilter: viewState.folderFilter || ""
-                    visible: sidebarSection === "folder" && !!viewState.folder
-                    Layout.fillWidth: true
-                    placeholderText: "Filter files"
-                    selectByMouse: true
-                    onTextChanged: {
-                        if (text !== backendFilter)
-                            studio.setFolderFilter(text)
-                    }
-                    onBackendFilterChanged: {
-                        if (backendFilter === "" && text !== "")
-                            text = ""
-                        else if (!activeFocus && text !== backendFilter)
-                            text = backendFilter
-                    }
-                }
-                Item {
+                FolderSidebar {
+                    id: folderSidebar
                     visible: sidebarSection === "folder"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    ListView {
-                        id: folderFilesView
-                        objectName: "folderFilesView"
-                        anchors.fill: parent
-                        visible: viewState.files.length > 0
-                        clip: true
-                        model: viewState.files
-                        delegate: ItemDelegate {
-                            id: fileEntry
-                            required property var modelData
-                            width: ListView.view.width - 20
-                            height: 42
-                            leftPadding: 8 + modelData.depth * 16
-                            text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
-                            onClicked: modelData.directory ? (!((viewState.folderFilter || "").trim()) && studio.toggleDirectory(modelData.path)) : studio.openNote(modelData.path)
-                            Hint { requested: fileEntry.hovered; text: modelData.path }
-                        }
-                        ScrollBar.vertical: ExpressiveScrollBar { }
-                    }
-                    ColumnLayout {
-                        objectName: "folderEmptyState"
-                        anchors.centerIn: parent
-                        width: parent.width - 16
-                        spacing: 4
-                        visible: !!viewState.folder && viewState.files.length === 0 && !viewState.folderSearching
-                        Label {
-                            objectName: "folderEmptyLabel"
-                            Layout.fillWidth: true
-                            horizontalAlignment: Text.AlignHCenter
-                            wrapMode: Text.WordWrap
-                            font.weight: Font.Medium
-                            color: viewState.colors.text
-                            text: (viewState.folderFilter || "").trim().length > 0 ? "No matching notes found" : "No notes in this folder"
-                        }
-                        Label {
-                            visible: (viewState.folderFilter || "").trim().length > 0
-                            Layout.fillWidth: true
-                            horizontalAlignment: Text.AlignHCenter
-                            wrapMode: Text.WordWrap
-                            font.pixelSize: 12
-                            color: viewState.colors.muted
-                            text: "Try another filename or clear the filter."
-                        }
-                    }
+                    viewState: window.viewState
+                    shortcutLabels: window.shortcutLabels
                 }
                 OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
@@ -520,7 +501,7 @@ ApplicationWindow {
                 }
                 Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
-                ActionButton { text: "New window"; tonal: true; Layout.fillWidth: true; onClicked: studio.command("window") }
+                ActionButton { objectName: "newWindowButton"; text: "New window"; tonal: true; Layout.fillWidth: true; ToolTip.text: window.hintWithShortcut("New window", "new_window"); onClicked: studio.command("window") }
             }
         }
         Item {
@@ -535,7 +516,7 @@ ApplicationWindow {
                     background: ThemeSurface { area:"toolbar"; Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .4 } }
                     RowLayout {
                     anchors.fill: parent
-                    ModeGroup { choices: window.width < 1000 ? [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"}] : [{key:"live",label:"Live"},{key:"editor",label:"Source"},{key:"reader",label:"Read"},{key:"split",label:"Split"}]; selected: viewState.mode; onChosen: key => studio.setMode(key) }
+                    ModeGroup { objectName: "documentModeGroup"; choices: window.modeChoices(window.width >= 1000); selected: viewState.mode; onChosen: key => studio.setMode(key) }
                     Item { Layout.fillWidth: true }
                     ExpressiveSlider { visible: window.width >= 1000; Layout.preferredWidth: 140; from: 40; to: 300; value: viewState.zoom; onMoved: studio.setZoom(value); Accessible.name: "Content zoom" }
                     TextField {
@@ -556,7 +537,7 @@ ApplicationWindow {
                         background: Rectangle { radius: 12; antialiasing: true; color: viewState.colors["surface-high"]; border.width: parent.activeFocus ? 2 : 0; border.color: viewState.colors.primary }
                         Accessible.name: "Zoom percentage"
                     }
-                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: "Fullscreen (" + window.shortcutLabels.fullscreen + " · " + window.shortcutLabels.dismiss + " to exit)"; onClicked: windowModes.setFullscreen(true) }
+                    ActionButton { objectName: "fullscreenButton"; glyph: "Fullscreen"; icon.width: 24; icon.height: 24; compact: true; tonal: true; ToolTip.text: window.fullscreenHint(); onClicked: windowModes.setFullscreen(true) }
                     ActionButton { objectName: "centerLockButton"; glyph: viewState.settings.centerLock ? "Lock" : "LockOpen"; compact: true; tonal: viewState.settings.centerLock; ToolTip.text: viewState.settings.centerLock ? "Centre locked · click to allow horizontal movement" : "Lock document to centre"; onClicked: studio.setting("centerLock",JSON.stringify(!viewState.settings.centerLock)) }
                     }
                 }
@@ -664,26 +645,28 @@ ApplicationWindow {
                         property string selectionText: ""
                         property int editFlags: 0
                         property bool hasLink: false
-                        NoteMenuItem { text: "Undo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
-                        NoteMenuItem { text: "Redo"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
-                        NoteMenuItem { text: "Cut"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
-                        NoteMenuItem { text: "Copy"; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy) || readerContextMenu.selectionText.trim().length > 0; onTriggered: { window.reader.forceActiveFocus(); window.reader.triggerWebAction(WebEngineView.Copy) } }
-                        NoteMenuItem { text: "Paste"; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
+                        NoteMenuItem { text: "Undo"; shortcutText: window.shortcutLabels.undo || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanUndo); onTriggered: window.reader.triggerWebAction(WebEngineView.Undo) }
+                        NoteMenuItem { text: "Redo"; shortcutText: window.shortcutLabels.redo || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanRedo); onTriggered: window.reader.triggerWebAction(WebEngineView.Redo) }
+                        NoteMenuItem { text: "Cut"; shortcutText: window.shortcutLabels.cut || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCut); onTriggered: window.reader.triggerWebAction(WebEngineView.Cut) }
+                        NoteMenuItem { text: "Copy"; shortcutText: window.shortcutLabels.copy || ""; enabled: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanCopy) || readerContextMenu.selectionText.trim().length > 0; onTriggered: { window.reader.forceActiveFocus(); window.reader.triggerWebAction(WebEngineView.Copy) } }
+                        NoteMenuItem { text: "Paste"; shortcutText: window.shortcutLabels.paste || ""; actionVisible: Boolean(readerContextMenu.editFlags & ContextMenuRequest.CanPaste); onTriggered: window.reader.triggerWebAction(WebEngineView.Paste) }
                         NoteMenuItem { text: "Copy link address"; actionVisible: readerContextMenu.hasLink; onTriggered: window.reader.triggerWebAction(WebEngineView.CopyLinkToClipboard) }
-                        NoteMenuItem { text: "Select all"; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
+                        NoteMenuItem { text: "Select all"; shortcutText: window.shortcutLabels.select_all || ""; onTriggered: window.reader.triggerWebAction(WebEngineView.SelectAll) }
                         MenuSeparator {}
                         NoteMenuItem { objectName: "reloadMenuItem"; text: "Reload"; enabled: viewState.readerReady && !viewState.busy; onTriggered: studio.reloadReaderSafely() }
                         MenuSeparator { visible: readerContextMenu.selectionText.trim().length > 0; height: visible ? implicitHeight : 0 }
                         NoteMenuItem { text: "Search Google"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("google", readerContextMenu.selectionText) }
                         NoteMenuItem { text: "Ask " + (studio.selectionAssistantLabel || "ChatGPT") + "…"; actionVisible: readerContextMenu.selectionText.trim().length > 0; onTriggered: studio.selectionAction("assistant", readerContextMenu.selectionText) }
                     }
-                    WheelHandler {
-                        target: null
-                        acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                    MouseArea {
+                        objectName: "readerWheelOverlay"
+                        anchors.fill: parent
+                        z: 1
+                        acceptedButtons: Qt.NoButton
                         onWheel: function(event) {
-                            // Qt retains the device's pixel deltas. DOM wheel
-                            // events lose that distinction, so route touchpad
-                            // movement without guessing from notch magnitude.
+                            // Stack above QtWebEngine's internal Chromium child item so Qt
+                            // retains the device's pixel deltas before Chromium consumes them,
+                            // while acceptedButtons: Qt.NoButton leaves clicks/drags/menus untouched.
                             if (event.modifiers & (Qt.ControlModifier | Qt.MetaModifier)) {
                                 // Consume before Chromium applies browser zoom:
                                 // resetting zoomFactor afterward flashes a stale scale.
@@ -694,8 +677,9 @@ ApplicationWindow {
                                 event.accepted = true
                                 // The reader gives text drags priority over held-button zoom.
                                 const held = Boolean(event.buttons & Qt.LeftButton)
-                                const dx = event.pixelDelta.x || event.angleDelta.x
-                                const dy = event.pixelDelta.y || event.angleDelta.y
+                                const hasPixelDelta = Boolean(event.pixelDelta.x || event.pixelDelta.y)
+                                const dx = hasPixelDelta ? event.pixelDelta.x : event.angleDelta.x
+                                const dy = hasPixelDelta ? event.pixelDelta.y : event.angleDelta.y
                                 reader.runJavaScript("window.supermdNativeWheel?.(" + (-dx) + "," + (-dy) + "," + JSON.stringify({x:event.x,y:event.y}) + "," + held + ")")
                             } else event.accepted = false
                         }
@@ -733,7 +717,7 @@ ApplicationWindow {
                         if (window.readerRecoveryLoading && target === "about:blank") return
                         if (target.split("#")[0] !== readerUrl.toString()) {
                             request.reject()
-                            if (target.startsWith("https://") || target.startsWith("http://")) Qt.openUrlExternally(request.url)
+                            if (target.startsWith("https://") || target.startsWith("http://") || target.startsWith("mailto:")) Qt.openUrlExternally(request.url)
                         }
                     }
                     }
@@ -813,7 +797,18 @@ ApplicationWindow {
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
-    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    Component {
+        id: saveDestinationComponent
+        FileDialog {
+            property bool portableNote: false
+            objectName: "saveDestination"
+            title: "Save note"
+            fileMode: FileDialog.SaveFile
+            nameFilters: portableNote ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]
+            onAccepted: { studio.saveAs(selectedFile.toString()); destroy() }
+            onRejected: { studio.resolveClose("cancel"); destroy() }
+        }
+    }
     Component {
         id: exportDestinationComponent
         FileDialog {
