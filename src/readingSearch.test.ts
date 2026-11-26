@@ -6,6 +6,7 @@ import {getSearchQuery} from "@codemirror/search";
 import {EditorView} from "@codemirror/view";
 import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
 import ReadingSearch,{nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceBlock,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
+import {syncSearchHighlights,translateRenderedIndexToSource,translateSourceIndexToRendered} from "./readingSearchDom";
 import Editor,{editorFindQuery} from "./components/Editor";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -543,6 +544,118 @@ describe("DOM-order windowed search and hidden subtree pruning",()=>{
 
     compareSpy.mockRestore();
     cleanups.forEach(fn=>fn());
+  });
+});
+
+describe("readingSearchDom ordinal translation and highlight sync",()=>{
+  afterEach(()=>{
+    document.body.replaceChildren();
+    vi.restoreAllMocks();
+  });
+
+  it("translates ordinals bidirectionally across mounted and unmounted windowed blocks while skipping hidden link URLs",()=>{
+    const b0="Read [Guide](https://example.com/hit) and hit alpha.";
+    const b1="Unmounted [Ref](https://example.com/hit) first hit and second hit.";
+    const fm="---\ntitle: hit frontmatter\n---\n\n";
+    const content=`${fm}${b0}\n\n${b1}`;
+    const start0=fm.length,end0=start0+b0.length;
+    const start1=end0+2,end1=start1+b1.length;
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.setAttribute("data-source-start",String(start0));
+    s0.setAttribute("data-source-end",String(end0));
+    s0.innerHTML=`<p data-source-start="${start0}" data-source-end="${end0}">Read <a href="https://example.com/hit" data-source-start="${start0+5}" data-source-end="${start0+37}">Guide</a> and hit alpha.</p>`;
+    const s1=document.createElement("section");
+    s1.setAttribute("data-windowed-block","");
+    s1.setAttribute("data-windowed-mounted","false");
+    s1.setAttribute("data-source-start",String(start1));
+    s1.setAttribute("data-source-end",String(end1));
+    s1.innerHTML='<span aria-hidden="true"></span>';
+    host.append(s0,s1);
+    document.body.append(host);
+
+    const cleanups=[
+      registerWindowedText(s0,"Read Guide and hit alpha."),
+      registerWindowedText(s1,"Unmounted Ref first hit and second hit."),
+    ];
+    const ranges=sourceMatches(content,"hit");
+    // Source indices: 0=frontmatter, 1=s0 hidden URL, 2=s0 visible, 3=s1 hidden URL, 4=s1 visible #1, 5=s1 visible #2.
+    expect(ranges).toHaveLength(6);
+    const wMatches=windowedMatches(host,"hit")!;
+    expect(wMatches).toHaveLength(3);
+
+    expect(translateSourceIndexToRendered(host,content,ranges,0,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,1,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,2,"hit",false,wMatches)).toBe(0);
+    expect(translateSourceIndexToRendered(host,content,ranges,3,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,4,"hit",false,wMatches)).toBe(1);
+    expect(translateSourceIndexToRendered(host,content,ranges,5,"hit",false,wMatches)).toBe(2);
+
+    expect(translateRenderedIndexToSource(host,content,ranges,0,"hit",false,wMatches)).toBe(2);
+    expect(translateRenderedIndexToSource(host,content,ranges,1,"hit",false,wMatches)).toBe(4);
+    expect(translateRenderedIndexToSource(host,content,ranges,2,"hit",false,wMatches)).toBe(5);
+    expect(translateRenderedIndexToSource(host,content,ranges,9,"hit",false,wMatches)).toBe(-1);
+    cleanups.forEach(fn=>fn());
+  });
+
+  it("synchronizes CSS.highlights selectively and refreshes active highlight on supermd-window-change",async()=>{
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","false");
+    s0.setAttribute("data-source-start","0");
+    s0.setAttribute("data-source-end","11");
+    s0.innerHTML='<span aria-hidden="true"></span>';
+    const searchRootEl=document.createElement("div");
+    host.append(s0);
+    document.body.append(searchRootEl,host);
+    const cleanup=registerWindowedText(s0,"Alpha token");
+
+    const dummyNode=document.createTextNode("Alpha");
+    const r=document.createRange();
+    r.setStart(dummyNode,0);
+    r.setEnd(dummyNode,5);
+    syncSearchHighlights({all:()=>[r],current:()=>r});
+    expect(highlights.get("smd-search")?.ranges).toEqual([r]);
+    expect(highlights.get("smd-search-current")?.ranges).toEqual([r]);
+    // Leaving `all` undefined preserves smd-search while clearing smd-search-current.
+    syncSearchHighlights({current:null});
+    expect(highlights.has("smd-search")).toBe(true);
+    expect(highlights.has("smd-search-current")).toBe(false);
+    syncSearchHighlights({all:null,current:null});
+    expect(highlights.size).toBe(0);
+
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{content:"Alpha token",close:()=>{},onChange:()=>{},initialReplace:true,seed:{query:"Alpha",nonce:1}}));
+    });
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,20));});
+    expect(highlights.get("smd-search")?.ranges).toHaveLength(0);
+    expect(highlights.has("smd-search-current")).toBe(false);
+
+    // Simulate virtualized block mounting into viewport and firing supermd-window-change.
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.innerHTML='<p data-source-start="0" data-source-end="11">Alpha token</p>';
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(highlights.get("smd-search")?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
+    expect(highlights.get("smd-search-current")?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
+
+    cleanup();
+    act(()=>root.unmount());
   });
 });
 
