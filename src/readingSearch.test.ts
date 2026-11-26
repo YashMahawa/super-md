@@ -19,7 +19,6 @@ class MockHighlight {
     this.ranges=ranges;
   }
 }
-
 describe("source search",()=>{
   let mountedRoot: Root|null=null;
   let hostContainer: HTMLDivElement|null=null;
@@ -414,3 +413,136 @@ describe("source search",()=>{
     expect(searchHost.querySelector(".reading-search output")?.textContent).toBe("1 / 1");
   });
 });
+
+describe("DOM-order windowed search and hidden subtree pruning",()=>{
+  it("uses DOM order directly for mounted blocks after out-of-order re-registration and at the 5,000-match cap without compareDocumentPosition",()=>{
+    const host=document.createElement("div");
+    const otherHost=document.createElement("div");
+    const a=document.createElement("section");
+    const b=document.createElement("section");
+    const c=document.createElement("section");
+    const foreign=document.createElement("section");
+    for(const el of [a,b,c,foreign])el.setAttribute("data-windowed-block","");
+    host.append(a,b,c);
+    otherHost.append(foreign);
+
+    const cleanups=[
+      registerWindowedText(a,"token tokens alpha item-1"),
+      registerWindowedText(b,"token beta token item-20"),
+      registerWindowedText(c,"token gamma item-300"),
+      registerWindowedText(foreign,"token outside item-999"),
+    ];
+    // Simulate editing block `a` in Live mode so its registration moves after `b` and `c`.
+    cleanups.push(registerWindowedText(a,"token tokens edited-first item-1"));
+
+    const compareSpy=vi.spyOn(Node.prototype,"compareDocumentPosition");
+    expect(windowedMatches(host,"token",{wholeWord:true})).toEqual([
+      {element:a,ordinal:0},
+      {element:b,ordinal:0},
+      {element:b,ordinal:1},
+      {element:c,ordinal:0},
+    ]);
+    expect(windowedMatches(host,"item-\\d+",{regexp:true})).toEqual([
+      {element:a,ordinal:0},
+      {element:b,ordinal:0},
+      {element:c,ordinal:0},
+    ]);
+    expect(compareSpy).not.toHaveBeenCalled();
+
+    // Verify 5,000-match cap still truncates in true DOM order even when `a` was re-registered last.
+    cleanups.push(registerWindowedText(b,"hit ".repeat(3000)));
+    cleanups.push(registerWindowedText(c,"hit ".repeat(3000)));
+    cleanups.push(registerWindowedText(a,"hit ".repeat(10)));
+    const capped=windowedMatches(host,"hit",{wholeWord:true})!;
+    expect(capped).toHaveLength(5000);
+    expect(capped[0]).toEqual({element:a,ordinal:0});
+    expect(capped[9]).toEqual({element:a,ordinal:9});
+    expect(capped[10]).toEqual({element:b,ordinal:0});
+    expect(capped[3009]).toEqual({element:b,ordinal:2999});
+    expect(capped[3010]).toEqual({element:c,ordinal:0});
+    expect(compareSpy).not.toHaveBeenCalled();
+
+    compareSpy.mockRestore();
+    cleanups.forEach(fn=>fn());
+  });
+
+  it("skips hidden, inert, offstage, unmounted, MathML, and control subtrees while preserving visible KaTeX HTML and closed details disclosures",()=>{
+    const host=document.createElement("article");
+    host.className="markdown-body";
+    host.innerHTML=[
+      '<div data-frontmatter-properties="true"><span>needle-1 frontmatter</span></div>',
+      '<p>needle-1 needles-1 visible</p>',
+      '<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="mord">needle-2</span></span><span class="katex-mathml"><math><semantics><mrow><mi>needle-2</mi></mrow><annotation encoding="application/x-tex">needle-2</annotation></semantics></math></span></span></p>',
+      '<details class="callout"><summary>Summary</summary><p>needle-3 in closed callout</p></details>',
+      '<div class="step-cards-figure is-offstage" aria-hidden="true" inert=""><p>needle-4 offstage</p></div>',
+      '<section data-windowed-block="" data-windowed-mounted="false"><span>needle-5 unmounted</span></section>',
+      '<p hidden>needle-6 hidden-attr</p>',
+      '<p inert>needle-7 inert-attr</p>',
+      '<span aria-hidden="true">needle-8 aria-hidden</span>',
+      '<span style="display: none">needle-9 display-none</span>',
+      '<span style="visibility: hidden">needle-10 visibility-hidden</span>',
+      '<svg><text>needle-11 svg</text></svg>',
+      '<button type="button">needle-12 button</button>',
+      '<iframe>needle-13 iframe</iframe>',
+      '<script>const needle = "needle-14";</script>',
+      '<style>.needle-15 { color: red; }</style>',
+    ].join("");
+
+    const hits=readingMatches(host,"needle-\\d+",{regexp:true,wholeWord:true});
+    expect(hits.map(r=>r.toString())).toEqual(["needle-1","needle-2","needle-3"]);
+    expect(hits[0].startContainer.parentElement?.tagName).toBe("P");
+    expect(hits[1].startContainer.parentElement?.closest(".katex-html")).not.toBeNull();
+    expect(hits[2].startContainer.parentElement?.closest("details.callout")).not.toBeNull();
+
+    // Block boundaries still prevent false cross-paragraph matches.
+    const boundary=document.createElement("div");
+    boundary.innerHTML="<p>foo</p><p>bar</p><li>item <p>nested</p> end</li>";
+    expect(readingMatches(boundary,"foobar")).toEqual([]);
+    expect(readingMatches(boundary,"itemnested")).toEqual([]);
+    expect(readingMatches(boundary,"nestedend")).toEqual([]);
+  });
+
+  it("benchmarks DOM-order windowed search and dense hidden-subtree pruning without compareDocumentPosition",()=>{
+    const windowedHost=document.createElement("div");
+    const cleanups:Array<()=>void>=[];
+    const blocks:HTMLElement[]=[];
+    for(let i=0;i<1000;i++){
+      const section=document.createElement("section");
+      section.setAttribute("data-windowed-block","");
+      section.setAttribute("data-windowed-mounted",i<24?"true":"false");
+      if(i<24){
+        section.innerHTML=`<h2>Chapter ${i}</h2><p>Readable chapter ${i} with Readable prose and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="mord">Readable</span></span><span class="katex-mathml"><math><semantics><mrow><mi>Readable</mi></mrow><annotation>Readable</annotation></semantics></math></span></span></p>`;
+      }else{
+        section.innerHTML='<span aria-hidden="true"></span>';
+      }
+      windowedHost.append(section);
+      blocks.push(section);
+    }
+    // Register in scrambled Live-edit order so legacy registration order differs from DOM tree order.
+    for(let i=blocks.length-1;i>=0;i--){
+      cleanups.push(registerWindowedText(blocks[i],`Chapter ${i}\nReadable chapter ${i} with Readable prose and Readable\n`));
+    }
+
+    const compareSpy=vi.spyOn(Node.prototype,"compareDocumentPosition");
+    const t0=performance.now();
+    const wHits=windowedMatches(windowedHost,"Readable",{wholeWord:true})!;
+    const windowedMs=performance.now()-t0;
+    expect(wHits).toHaveLength(3000);
+    expect(wHits[0]).toEqual({element:blocks[0],ordinal:0});
+    expect(wHits[3]).toEqual({element:blocks[1],ordinal:0});
+    expect(wHits[2999]).toEqual({element:blocks[999],ordinal:2});
+    expect(compareSpy).not.toHaveBeenCalled();
+
+    const t1=performance.now();
+    const domHits=readingMatches(windowedHost,"Readable",{wholeWord:true});
+    const domMs=performance.now()-t1;
+    // 24 mounted blocks * 3 visible "Readable" tokens (duplicate .katex-mathml and 976 unmounted blocks pruned).
+    expect(domHits).toHaveLength(72);
+    expect(windowedMs).toBeGreaterThanOrEqual(0);
+    expect(domMs).toBeGreaterThanOrEqual(0);
+
+    compareSpy.mockRestore();
+    cleanups.forEach(fn=>fn());
+  });
+});
+
