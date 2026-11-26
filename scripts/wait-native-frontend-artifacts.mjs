@@ -33,7 +33,7 @@ function validatePage(page, label) {
   return list;
 }
 
-export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
+function inspectProducerReadiness({ repository, runId, run, jobsPage }) {
   const expectedRunId = Number(runId);
   if (run?.id !== expectedRunId) throw new Error(`GitHub returned workflow run ${run?.id}, expected ${runId}`);
   if (run?.repository?.full_name?.toLowerCase() !== repository.toLowerCase()) {
@@ -53,6 +53,12 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
     throw new Error(`Native frontend producer failed (${producer.conclusion || 'unknown'}); refusing fallback`);
   }
   if (producer.status !== 'completed') return { ready: false, reason: `producer job is ${producer.status}` };
+  return { ready: true };
+}
+
+export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
+  const producerState = inspectProducerReadiness({ repository, runId, run, jobsPage });
+  if (!producerState.ready) return producerState;
 
   const artifacts = validatePage(artifactsPage, 'workflow artifacts');
   const expected = frontendArtifactNames(sourceSha);
@@ -66,7 +72,65 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   return { ready: true, names: expected };
 }
 
-async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
+function getHeader(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === 'function') return headers.get(name);
+  const lower = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === lower && value != null) return String(value);
+  }
+  return null;
+}
+
+function parseRetryDelayMs(headers, nowMs) {
+  const retryAfter = getHeader(headers, 'retry-after')?.trim();
+  if (retryAfter) {
+    if (/^\d+(\.\d+)?$/.test(retryAfter)) {
+      return Math.ceil(Number(retryAfter) * 1_000);
+    }
+    const retryDateMs = Date.parse(retryAfter);
+    if (Number.isFinite(retryDateMs)) {
+      return Math.max(0, retryDateMs - nowMs);
+    }
+  }
+  const remaining = getHeader(headers, 'x-ratelimit-remaining')?.trim();
+  const reset = getHeader(headers, 'x-ratelimit-reset')?.trim();
+  if (remaining === '0' && reset && /^\d+$/.test(reset)) {
+    return Math.max(0, Number(reset) * 1_000 - nowMs + 1_000);
+  }
+  return null;
+}
+
+async function readErrorMessage(response) {
+  try {
+    if (typeof response.text === 'function') {
+      const raw = await response.text();
+      if (!raw) return '';
+      try {
+        const parsed = JSON.parse(raw);
+        if (typeof parsed?.message === 'string') return parsed.message.trim();
+      } catch {
+        // Non-JSON error body
+      }
+      return raw.trim().slice(0, 300);
+    }
+    if (typeof response.json === 'function') {
+      const parsed = await response.json();
+      if (typeof parsed?.message === 'string') return parsed.message.trim();
+    }
+  } catch {
+    // Ignore error-body read failures
+  }
+  return '';
+}
+
+function isRateLimitForbidden(headers, message) {
+  if (getHeader(headers, 'retry-after')?.trim()) return true;
+  if (getHeader(headers, 'x-ratelimit-remaining')?.trim() === '0') return true;
+  return /\brate limit\b/i.test(message);
+}
+
+async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -79,13 +143,31 @@ async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
     });
   } catch (error) {
     if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || error instanceof TypeError) {
-      return { retry: true, status: error.name || 'network-error' };
+      return { retry: true, status: error.name || 'network-error', retryAfterMs: null, rateLimited: false };
     }
     throw error;
   }
   if (!response.ok) {
-    if (response.status >= 500 || response.status === 429) return { retry: true, status: response.status };
-    throw new Error(`GitHub Actions API request failed with HTTP ${response.status}`);
+    const retryAfterMs = parseRetryDelayMs(response.headers, nowMs);
+    if (response.status >= 500 || response.status === 429) {
+      return {
+        retry: true,
+        status: response.status,
+        retryAfterMs,
+        rateLimited: response.status === 429,
+      };
+    }
+    const message = await readErrorMessage(response);
+    if (response.status === 403 && isRateLimitForbidden(response.headers, message)) {
+      return {
+        retry: true,
+        status: 403,
+        retryAfterMs,
+        rateLimited: true,
+      };
+    }
+    const detail = message ? `: ${message}` : '';
+    throw new Error(`GitHub Actions API request failed with HTTP ${response.status}${detail}`);
   }
   return { value: await response.json() };
 }
@@ -98,36 +180,64 @@ export async function waitForNativeFrontendArtifacts({
   apiUrl,
   fetchImpl = fetch,
   sleep = delay,
-  timeoutMs = 600_000,
+  timeoutMs = 900_000,
   pollIntervalMs = 5_000,
   now = Date.now,
 }) {
   const endpoint = assertInputs({ repository, runId, sourceSha, token, apiUrl });
-  const names = frontendArtifactNames(sourceSha);
+  frontendArtifactNames(sourceSha);
+  const baseHref = endpoint.href.replace(/\/?$/, '/');
   const runPath = `repos/${repository}/actions/runs/${runId}`;
   const started = now();
+  let consecutiveRateLimits = 0;
+  let lastTransientStatus = null;
   const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
-  const pause = async () => {
+  const pause = async (requestedDelayMs = pollIntervalMs) => {
     const left = timeoutMs - (now() - started);
-    if (left > 0) await sleep(Math.min(pollIntervalMs, left));
+    if (left > 0) await sleep(Math.min(Math.max(0, requestedDelayMs), left));
   };
-  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
+  const pauseForRetry = async result => {
+    lastTransientStatus = result.status;
+    if (result.rateLimited) {
+      consecutiveRateLimits += 1;
+    }
+    const backoffMs = result.rateLimited
+      ? Math.min(60_000, pollIntervalMs * (2 ** Math.min(consecutiveRateLimits - 1, 4)))
+      : pollIntervalMs;
+    const waitMs = result.retryAfterMs != null
+      ? Math.max(pollIntervalMs, result.retryAfterMs)
+      : backoffMs;
+    await pause(waitMs);
+  };
+  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()), now());
   while (now() - started < timeoutMs) {
-    const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
+    const runResult = await request(new URL(runPath, baseHref));
     if (runResult.retry) {
-      await pause();
+      await pauseForRetry(runResult);
       continue;
     }
-    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
+    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, baseHref));
     if (jobsResult.retry) {
+      await pauseForRetry(jobsResult);
+      continue;
+    }
+    const producerState = inspectProducerReadiness({
+      repository,
+      runId,
+      run: runResult.value,
+      jobsPage: jobsResult.value,
+    });
+    if (!producerState.ready) {
+      consecutiveRateLimits = 0;
       await pause();
       continue;
     }
-    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
+    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, baseHref));
     if (artifactsResult.retry) {
-      await pause();
+      await pauseForRetry(artifactsResult);
       continue;
     }
+    consecutiveRateLimits = 0;
     const state = inspectFrontendArtifactReadiness({
       repository,
       runId,
@@ -139,7 +249,8 @@ export async function waitForNativeFrontendArtifacts({
     if (state.ready) return state.names;
     await pause();
   }
-  throw new Error(`Timed out waiting for native frontend artifacts for source ${sourceSha} in run ${runId}; no fallback used`);
+  const transientSuffix = lastTransientStatus != null ? ` (last transient status: ${lastTransientStatus})` : '';
+  throw new Error(`Timed out waiting for native frontend artifacts for source ${sourceSha} in run ${runId}${transientSuffix}; no fallback used`);
 }
 
 async function main() {
