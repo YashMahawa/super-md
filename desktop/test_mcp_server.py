@@ -1002,5 +1002,105 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                     )
 
 
+class AgentMCPExtractionTest(unittest.TestCase):
+    def test_mcp_server_facade_reexports_split_modules(self):
+        import mcp_server
+        from agent import mcp_http, mcp_tools
+
+        self.assertIs(mcp_server.BearerAuth, mcp_http.BearerAuth)
+        self.assertIs(mcp_server.build_mcp_server, mcp_tools.build_mcp_server)
+        self.assertIs(mcp_server._token, mcp_http._token)
+        self.assertIs(mcp_server.main, mcp_http.main)
+
+    def test_headless_imports_load_neither_pyside6_nor_mcp(self):
+        import subprocess
+
+        desktop_dir = Path(__file__).resolve().parent
+        check = (
+            "import sys; "
+            "import agent_cli, agent_live_cli, mcp_server; "
+            "from agent import validators, context_normalizer, mcp_live_helpers, mcp_tools, mcp_http, cli_common; "
+            "assert 'PySide6' not in sys.modules and 'mcp' not in sys.modules"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", check],
+            cwd=desktop_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_context_normalizer_bounds_and_viewport_coherence(self):
+        from agent.context_normalizer import (
+            bounded_active_step,
+            bounded_diagrams,
+            bounded_python_cells,
+            normalize_initial_reading_context,
+            normalize_reading_context,
+            viewport_contexts,
+        )
+
+        normalized = normalize_reading_context({
+            "sourceLength": 100,
+            "visibleSource": {"text": "# Heading", "start": 0, "end": 9},
+        })
+        self.assertEqual(normalized["visibleSource"]["total_chars"], 100)
+        self.assertEqual(normalized["visibleSource"]["next_offset"], 9)
+        self.assertTrue(normalized["visibleSource"]["truncated"])
+
+        diagrams = bounded_diagrams([
+            {"id": "diagram:1", "kind": "mermaid", "sourceStart": 10, "sourceEnd": 30,
+             "assetReference": "data:image/png;base64,secret"},
+            {"id": "diagram:2", "kind": "svg", "assetReference": "assets/fig.svg", "activeStep": True},
+        ])
+        self.assertEqual(len(diagrams), 2)
+        self.assertNotIn("assetReference", diagrams[0])
+        self.assertEqual(diagrams[1]["assetReference"], "assets/fig.svg")
+
+        self.assertIsNone(bounded_active_step({"deckTitle": "Deck", "stepIndex": -1, "stepCount": 2}))
+        step = bounded_active_step({"deckTitle": "Deck", "stepIndex": 1, "stepCount": 3, "expanded": False})
+        self.assertEqual(step, {"deckTitle": "Deck", "stepIndex": 1, "stepCount": 3, "activeStep": True, "expanded": False})
+
+        cells = bounded_python_cells([
+            {"ok": True, "ordinal": 0, "stdout": "x" * 505, "stderr": "",
+             "figureIds": ["diagram:python:10:0", "diagram:other:1"]},
+        ])
+        self.assertEqual(cells[0]["stdout"], "x" * 500)
+        self.assertTrue(cells[0]["stdoutTruncated"])
+        self.assertEqual(cells[0]["figureIds"], ["diagram:python:10:0"])
+
+        rev = "a" * 64
+        initial = normalize_initial_reading_context(
+            {"tabId": "raw-tab", "revision": rev, "sourceLength": 20,
+             "visibleSource": {"text": "hello", "start": 0, "end": 5},
+             "activeStep": {"bad": True}},
+            resolved_tab="sess:win:raw-tab",
+            target="tab:sess:win:raw-tab",
+        )
+        self.assertEqual(initial["nativeTabId"], "raw-tab")
+        self.assertEqual(initial["tabId"], "sess:win:raw-tab")
+        self.assertNotIn("activeStep", initial)
+
+        cap_ctx, captured_reading = viewport_contexts(
+            {"tabId": "raw-tab", "revision": rev, "sourceLength": 20,
+             "visibleSource": {"text": "hello", "start": 0, "end": 5}},
+            "sess:win:raw-tab",
+            rev,
+        )
+        self.assertTrue(cap_ctx["contextRevisionMatches"])
+        self.assertIsNotNone(captured_reading)
+        self.assertEqual(captured_reading["visibleSource"]["next_offset"], 5)
+
+        mismatch_ctx, mismatch_reading = viewport_contexts(
+            {"tabId": "raw-tab", "revision": "b" * 64, "sourceLength": 20,
+             "visibleSource": {"text": "hello", "start": 0, "end": 5}},
+            "sess:win:raw-tab",
+            rev,
+        )
+        self.assertFalse(mismatch_ctx["contextRevisionMatches"])
+        self.assertIsNone(mismatch_reading)
+
+
 if __name__ == "__main__":
     unittest.main()

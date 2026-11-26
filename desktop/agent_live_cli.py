@@ -12,11 +12,23 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from .agent.cli_common import (
+        MAX_CLI_OUTPUT,
+        emit_json,
+        heading_selector,
+        make_json_argument_parser,
+    )
     from .agent_stdio import configure_stdio
 except ImportError:  # python desktop/agent_live_cli.py
+    from agent.cli_common import (
+        MAX_CLI_OUTPUT,
+        emit_json,
+        heading_selector,
+        make_json_argument_parser,
+    )
     from agent_stdio import configure_stdio
 
-MAX_OUTPUT = 64_000
+MAX_OUTPUT = MAX_CLI_OUTPUT
 MAX_INPUT = 64_000
 MAX_CONTENT = 20_000_000
 MAX_IMAGE = 8 * 1024 * 1024
@@ -31,17 +43,12 @@ class _CLIError(ValueError):
     pass
 
 
-class _JSONArgumentParser(argparse.ArgumentParser):
-    def error(self, message):
-        raise _CLIError(message)
+_JSONArgumentParser = make_json_argument_parser(_CLIError)
 
 
 def _emit(value: dict[str, Any]) -> None:
-    configure_stdio(stdin=False, stderr=False)
-    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if len(encoded.encode("utf-8")) > MAX_OUTPUT:
-        raise _CLIError("Response exceeded 64 KB; request a smaller page")
-    sys.stdout.write(encoded + "\n")
+    emit_json(value, max_bytes=MAX_OUTPUT, error_cls=_CLIError,
+              message="Response exceeded 64 KB; request a smaller page")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -208,15 +215,10 @@ def _native_id(value: str) -> str:
     # before they reach the authenticated native bridge.
     if not isinstance(value, str) or not value or len(value) > 400:
         raise _CLIError("A live tab ID from `agent live list` is required")
-    return value[4:] if value.startswith("tab:") else value
+    return value.removeprefix("tab:")
 
 
-def _heading_selector(value: str | None) -> int | str | None:
-    if value is None:
-        return None
-    if value.isascii() and value.isdecimal():
-        return int(value)
-    return value
+_heading_selector = heading_selector
 
 
 def _write_image(path: str, image: dict[str, Any]) -> dict[str, Any]:
@@ -500,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
         except _CLIError:
             sys.stdout.write('{"ok":false,"error":{"type":"CLIError","message":"Response exceeded output bound"}}\n')
         return 2
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001
         # Bridge and network adapters use their own exception classes. Keep
         # failures machine-readable without a traceback or transport details.
         try:

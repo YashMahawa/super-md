@@ -18,10 +18,48 @@ class AgentStdioTests(unittest.TestCase):
     def test_cli_imports_remain_free_of_qt(self):
         cli = Path(__file__).with_name("agent_cli.py")
         result = subprocess.run(
-            [sys.executable, "-c", "import agent_cli, agent_live_cli, sys; assert 'PySide6' not in sys.modules"],
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import agent_cli, agent_live_cli, mcp_server, sys; "
+                    "from agent import validators, context_normalizer, mcp_live_helpers, mcp_tools, mcp_http, cli_common; "
+                    "assert 'PySide6' not in sys.modules and 'mcp' not in sys.modules"
+                ),
+            ],
             cwd=cli.parent, capture_output=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+
+    def test_cli_common_helpers_and_subparser_error_propagation(self):
+        from agent import cli_common
+        from agent_documents import AgentDocumentError
+
+        self.assertIsNone(cli_common.heading_selector(None))
+        self.assertEqual(cli_common.heading_selector("0"), 0)
+        self.assertEqual(cli_common.heading_selector("14"), 14)
+        self.assertEqual(cli_common.heading_selector("7.4"), "7.4")
+        self.assertEqual(cli_common.heading_selector("Intro"), "Intro")
+
+        self.assertEqual(agent_cli._emit.__module__, "agent_cli")
+        self.assertEqual(agent_live_cli._emit.__module__, "agent_live_cli")
+        with patch("sys.stdout", io.StringIO()):
+            with self.assertRaises(AgentDocumentError):
+                agent_cli._emit({"payload": "x" * 65_000})
+            with self.assertRaises(agent_live_cli._CLIError):
+                agent_live_cli._emit({"payload": "x" * 65_000})
+
+        with patch("sys.stdout", io.StringIO()) as cli_out:
+            with self.assertRaises(agent_cli._UsageError):
+                agent_cli._parser().parse_args(["--root", "/tmp", "read"])
+            emitted = json.loads(cli_out.getvalue())
+            self.assertFalse(emitted["ok"])
+            self.assertEqual(emitted["error"]["type"], "UsageError")
+
+        with patch("sys.stdout", io.StringIO()) as live_out:
+            with self.assertRaises(agent_live_cli._CLIError):
+                agent_live_cli._parser().parse_args(["--sessions-dir", "/tmp", "read"])
+            self.assertEqual(live_out.getvalue(), "")
 
     def test_emitters_reconfigure_cp1252_pipes_to_utf8(self):
         for emitter in (agent_cli._emit, agent_live_cli._emit):

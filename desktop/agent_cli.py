@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
-from pathlib import Path
 
 try:
+    from .agent.cli_common import emit_json, heading_selector, make_json_argument_parser
     from .agent_documents import AgentDocumentError, DocumentStore
     from .agent_stdio import configure_stdio
 except ImportError:  # python desktop/agent_cli.py
+    from agent.cli_common import emit_json, heading_selector, make_json_argument_parser
     from agent_documents import AgentDocumentError, DocumentStore
     from agent_stdio import configure_stdio
 
@@ -19,18 +19,8 @@ class _UsageError(Exception):
     pass
 
 
-class _JSONArgumentParser(argparse.ArgumentParser):
-    def error(self, message):
-        sys.stdout.write(json.dumps({"ok": False, "error": {"type": "UsageError", "message": message[:1000]}},
-                                     separators=(",", ":")) + "\n")
-        raise _UsageError(message)
-
-
-def _heading_selector(value: str) -> int | str:
-    try:
-        return int(value)
-    except ValueError:
-        return value
+_JSONArgumentParser = make_json_argument_parser(_UsageError, emit_error=True)
+_heading_selector = heading_selector
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -104,12 +94,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _emit(value: dict) -> None:
-    # Exactly one bounded JSON record is written to stdout on success or failure.
-    configure_stdio(stdin=False, stderr=False)
-    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if len(encoded.encode("utf-8")) > 64_000:
-        raise AgentDocumentError("Response exceeded the 64 KB output limit; request a smaller page")
-    sys.stdout.write(encoded + "\n")
+    emit_json(value, error_cls=AgentDocumentError,
+              message="Response exceeded the 64 KB output limit; request a smaller page")
 
 
 def main(argv: list[str] | None = None) -> int:
