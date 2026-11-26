@@ -1035,4 +1035,173 @@ describe("ReadingSearch DOM behavior", () => {
       host.remove();
     }
   });
+
+  it("re-aligns offscreen source reveals across multi-wave window layout changes and cancels on newer selection or manual scroll", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const part0 = "## Intro\n\ntoken-01 start.";
+    const part1 = "## Middle\n\ntoken-25 middle.";
+    const part2 = "## Tail\n\ntoken-45 tail.";
+    let current = `${part0}\n\n${part1}\n\n${part2}`;
+    const computeOffsets = (text: string) => {
+      const blocks = text.split("\n\n## ").map((chunk, idx) => (idx === 0 ? chunk : `## ${chunk}`));
+      const starts: number[] = [];
+      const ends: number[] = [];
+      let cursor = 0;
+      for (const b of blocks) {
+        starts.push(cursor);
+        ends.push(cursor + b.length);
+        cursor += b.length + 2;
+      }
+      return { starts, ends };
+    };
+
+    const scrollTargets: Element[] = [];
+    const origScrollIntoView = Element.prototype.scrollIntoView;
+    let simulatedScrollHeight = 12000;
+    let simulatedScrollTop = 0;
+
+    const renderScene = () => {
+      const { starts, ends } = computeOffsets(current);
+      root.render(
+        <div className="android-document">
+          <ReadingSearch
+            content={current}
+            close={() => {}}
+            initialReplace
+            onChange={(next) => {
+              current = next;
+              renderScene();
+            }}
+          />
+          <section className="android-reading">
+            <div className="document-page">
+              <div className="markdown-body">
+                <section data-windowed-block="" data-windowed-mounted="true" data-source-start={starts[0]} data-source-end={ends[0]}>
+                  <h2>Intro</h2><p>{current.slice(starts[0], ends[0]).split("\n\n")[1]}</p>
+                </section>
+                <section data-windowed-block="" data-windowed-mounted="false" data-source-start={starts[1]} data-source-end={ends[1]}>
+                  <span aria-hidden="true" />
+                </section>
+                <section data-windowed-block="" data-windowed-mounted="false" data-source-start={starts[2]} data-source-end={ends[2]}>
+                  <span aria-hidden="true" />
+                </section>
+              </div>
+            </div>
+          </section>
+        </div>
+      );
+    };
+
+    try {
+      await act(async () => { renderScene(); });
+      const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => simulatedScrollHeight });
+      Object.defineProperty(scroller, "scrollTop", {
+        configurable: true,
+        get: () => simulatedScrollTop,
+        set: (v: number) => { simulatedScrollTop = v; },
+      });
+      Element.prototype.scrollIntoView = function () {
+        scrollTargets.push(this);
+        simulatedScrollTop = 5000;
+      };
+
+      const sections = () => Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      const attachReveal = (idx: number, heading: string, bodyFn: () => string) => {
+        const el = sections()[idx];
+        el.addEventListener("supermd-reveal-window", () => {
+          el.setAttribute("data-windowed-mounted", "true");
+          el.innerHTML = `<h2>${heading}</h2><p>${bodyFn()}</p>`;
+        });
+      };
+      attachReveal(1, "Middle", () => "token-25 middle.");
+      attachReveal(2, "Tail", () => "token-45 tail.");
+
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      act(() => setInputValue(searchInput, "token-\\d+"));
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      act(() => regexBtn.click());
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      // Step to 1 / 3 (Intro), then 2 / 3 (offscreen Middle / token-25).
+      act(() => nextBtn.click());
+      scrollTargets.length = 0;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      expect(sections()[1].getAttribute("data-windowed-mounted")).toBe("true");
+      expect(scrollTargets.length).toBeGreaterThanOrEqual(1);
+
+      // Drain initial RAF chain, then simulate delayed multi-wave WindowedBlock shrinkage.
+      for (let i = 0; i < 5; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+      scrollTargets.length = 0;
+      simulatedScrollHeight = 11100;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(1);
+      expect(scrollTargets[0].textContent).toContain("token-25");
+
+      // Wave 2 shrinkage also re-aligns token-25.
+      scrollTargets.length = 0;
+      simulatedScrollHeight = 10400;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(1);
+      expect(scrollTargets[0].textContent).toContain("token-25");
+
+      // Manual wheel scroll cancels further settle passes immediately.
+      scrollTargets.length = 0;
+      act(() => { scroller.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 120 })); });
+      simulatedScrollHeight = 9900;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(0);
+
+      // Single Replace on 2 / 3 advances to 2 / 2 (Tail / token-45), settles across window changes,
+      // and cancels if the user manually scrolls scroller.scrollTop.
+      const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+      act(() => setInputValue(replaceInput, "item-done"));
+      const replaceSingle = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+      await act(async () => { replaceSingle.click(); });
+      attachReveal(2, "Tail", () => "token-45 tail.");
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+      expect(sections()[2].getAttribute("data-windowed-mounted")).toBe("true");
+
+      for (let i = 0; i < 5; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+      scrollTargets.length = 0;
+      simulatedScrollHeight = 9200;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(1);
+      expect(scrollTargets[0].textContent).toContain("token-45");
+
+      // Newer selection (stepping to 1 / 2) cancels Tail settling and switches target to Intro.
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+      for (let i = 0; i < 5; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+      scrollTargets.length = 0;
+      // Direct manual scrollTop change + scroll event cancels active Intro settle.
+      simulatedScrollTop = 1234;
+      act(() => { scroller.dispatchEvent(new Event("scroll")); });
+      simulatedScrollHeight = 8800;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(0);
+    } finally {
+      Element.prototype.scrollIntoView = origScrollIntoView;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 });

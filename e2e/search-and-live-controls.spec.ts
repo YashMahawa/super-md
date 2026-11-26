@@ -358,7 +358,7 @@ test("Seeded folder-search handoff reveals exact offscreen windowed occurrences 
     Array.from({ length: 50 }, (_, i) => {
       if (i === 18) return `## Section ${i}\n\nMidway AuroraPin occurrence two.\n\n${filler}`;
       if (i === 35) return `## Section ${i}\n\nDeep offscreen AuroraPin occurrence three.\n\n${filler}`;
-      if (i === 42) return `## Section ${i}\n\nUnicode Hauptstraße offscreen target.\n\n${filler}`;
+      if (i === 42) return `## Section ${i}\n\n💡 Unicode Hauptstraße offscreen target.\n\n${filler}`;
       if (i === 46) return `## Section ${i}\n\nHidden [portal link](https://example.org/AuroraHiddenUrl) target.\n\n${filler}`;
       return `## Section ${i}\n\n${filler}`;
     }).join("");
@@ -371,7 +371,93 @@ test("Seeded folder-search handoff reveals exact offscreen windowed occurrences 
   const hiddenStart = content.indexOf("AuroraHiddenUrl");
 
   for (const mode of ["reader", "live"] as const) {
-    // 1. Fresh load seeded directly to the 3rd (offscreen unmounted windowed) occurrence -> 3 / 3 in viewport.
+    // 1. Fresh load with a #116 shared source anchor on Section 18 + seededFind to the 3rd occurrence -> seededFind wins (3 / 3 in viewport).
+    await page.evaluate(
+      ({ content, mode, secondStart, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          viewState: {
+            top: 4200,
+            anchor: { offset: secondStart, mode, zoom: 100, readingTop: 4200 },
+          },
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { content, mode, secondStart, thirdStart }
+    );
+
+    await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+    const section35 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Deep offscreen AuroraPin occurrence three." });
+    await expect(section35).toBeVisible();
+    await expect(section35).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
+
+    // 2. Unicode casefold + astral emoji UTF-16 offscreen occurrence ("strasse" -> "straße" after 💡) -> mounted & in viewport.
+    await page.evaluate(
+      ({ unicodeStart }) =>
+        window.supermdFind?.("strasse", {
+          caseSensitive: false,
+          sourceStart: unicodeStart,
+          sourceEnd: unicodeStart + "straße".length,
+          matchText: "straße",
+        }),
+      { unicodeStart }
+    );
+    const section42 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "💡 Unicode Hauptstraße offscreen target." });
+    await expect(section42).toBeVisible();
+    await expect(section42).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
+
+    // 3. Offscreen hidden Markdown URL hit -> mounts & scrolls enclosing block into viewport with "In Markdown source".
+    await page.evaluate(
+      ({ hiddenStart }) =>
+        window.supermdFind?.("AuroraHiddenUrl", {
+          caseSensitive: true,
+          sourceStart: hiddenStart,
+          sourceEnd: hiddenStart + "AuroraHiddenUrl".length,
+          matchText: "AuroraHiddenUrl",
+        }),
+      { hiddenStart }
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("In Markdown source");
+    const section46 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Hidden portal link target." });
+    await expect(section46).toBeVisible();
+    await expect(section46).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+
+    // 4. #72 pendingHeading link destination followed by same-note supermdLoad seededFind -> neither pendingHeading nor anchored() overrides seeded occurrence.
+    await page.evaluate(() => window.supermdDismiss?.());
+    await page.evaluate(
+      ({ content, mode }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          pendingHeading: { heading: "Section 18", token: `heading-${mode}-1` },
+        }),
+      { content, mode }
+    );
     await page.evaluate(
       ({ content, mode, thirdStart }) =>
         window.supermdLoad?.({
@@ -395,47 +481,10 @@ test("Seeded folder-search handoff reveals exact offscreen windowed occurrences 
         }),
       { content, mode, thirdStart }
     );
-
     await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
-    const section35 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Deep offscreen AuroraPin occurrence three." });
-    await expect(section35).toBeVisible();
     await expect(section35).toBeInViewport();
-    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
 
-    // 2. Unicode casefold offscreen occurrence ("strasse" -> "straße" inside "Hauptstraße") -> mounted & in viewport.
-    await page.evaluate(
-      ({ unicodeStart }) =>
-        window.supermdFind?.("strasse", {
-          caseSensitive: false,
-          sourceStart: unicodeStart,
-          sourceEnd: unicodeStart + "straße".length,
-          matchText: "straße",
-        }),
-      { unicodeStart }
-    );
-    const section42 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Unicode Hauptstraße offscreen target." });
-    await expect(section42).toBeVisible();
-    await expect(section42).toBeInViewport();
-    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
-
-    // 3. Offscreen hidden Markdown URL hit -> mounts & scrolls enclosing block into viewport with "In Markdown source".
-    await page.evaluate(
-      ({ hiddenStart }) =>
-        window.supermdFind?.("AuroraHiddenUrl", {
-          caseSensitive: true,
-          sourceStart: hiddenStart,
-          sourceEnd: hiddenStart + "AuroraHiddenUrl".length,
-          matchText: "AuroraHiddenUrl",
-        }),
-      { hiddenStart }
-    );
-    await expect(page.locator(".reading-search output")).toHaveText("In Markdown source");
-    const section46 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Hidden portal link target." });
-    await expect(section46).toBeVisible();
-    await expect(section46).toBeInViewport();
-    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
-
-    // 4. Stale-result fallback: third occurrence edited out before handoff -> falls back to 1 / 2 and brings 1st match into viewport.
+    // 5. Stale-result fallback: third occurrence edited out before handoff -> falls back to 1 / 2 and brings 1st match into viewport.
     const editedContent = content.slice(0, thirdStart) + "EditedOut" + content.slice(thirdStart + "AuroraPin".length);
     await page.evaluate(
       ({ editedContent, mode, thirdStart }) =>

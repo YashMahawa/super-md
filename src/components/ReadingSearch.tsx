@@ -10,6 +10,8 @@ export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
 
 const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
+const MANUAL_SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+const SEARCH_SETTLE_WINDOW_MS = 800;
 type HighlightRegistry = Map<string, unknown>;
 type SourceRange = { from: number; to: number };
 const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
@@ -642,11 +644,116 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const input = useRef<HTMLInputElement>(null);
   const closeRef = useRef(close); closeRef.current = close;
   const prevState = useRef({ query, content, caseSensitive, wholeWord, regexp });
-  const settleFrames = useRef<[number, number]>([0, 0]);
+  const settleCleanup = useRef<(() => void) | null>(null);
   const clearSettleFrames = () => {
-    cancelAnimationFrame(settleFrames.current[0]);
-    cancelAnimationFrame(settleFrames.current[1]);
-    settleFrames.current = [0, 0];
+    settleCleanup.current?.();
+    settleCleanup.current = null;
+  };
+  const scheduleSearchSettle = (anchorHost: Element | null, step: () => boolean) => {
+    clearSettleFrames();
+    const scroller = anchorHost?.matches(".android-reading,.reading-scroll")
+      ? (anchorHost as HTMLElement)
+      : anchorHost?.closest<HTMLElement>(".android-reading,.reading-scroll")
+        ?? document.querySelector<HTMLElement>(".android-reading,.reading-scroll");
+    const eventHost = scroller ?? anchorHost;
+    if (!eventHost) return;
+    let active = true;
+    let frame = 0;
+    let remainingFrames = 4;
+    let layoutMutating = false;
+    let recordedScrollTop = scroller?.scrollTop ?? 0;
+    let recordedScrollHeight = scroller?.scrollHeight ?? 0;
+    const recordScrollerState = () => {
+      if (!scroller) return;
+      recordedScrollTop = scroller.scrollTop;
+      recordedScrollHeight = scroller.scrollHeight;
+    };
+    const inSearchUi = (target: EventTarget | null) =>
+      target instanceof Element && Boolean(target.closest(".reading-search"));
+    const stop = () => {
+      if (!active) return;
+      active = false;
+      cancelAnimationFrame(frame);
+      frame = 0;
+      window.clearTimeout(timer);
+      observer?.disconnect();
+      eventHost.removeEventListener("supermd-window-change", onWindowChange);
+      scroller?.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", onUserGesture, { capture: true });
+      window.removeEventListener("touchstart", onUserGesture, { capture: true });
+      window.removeEventListener("touchmove", onUserGesture, { capture: true });
+      window.removeEventListener("pointerdown", onUserGesture, { capture: true });
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
+      window.removeEventListener("supermd-goto-offset", stop);
+      if (settleCleanup.current === stop) settleCleanup.current = null;
+    };
+    const runPass = () => {
+      frame = 0;
+      if (!active) return;
+      if (!step()) {
+        stop();
+        return;
+      }
+      recordScrollerState();
+      if (remainingFrames > 0) {
+        remainingFrames--;
+        frame = requestAnimationFrame(runPass);
+      }
+    };
+    const schedulePass = () => {
+      if (!active || frame) return;
+      frame = requestAnimationFrame(runPass);
+    };
+    const onUserGesture = (event: Event) => {
+      if (!inSearchUi(event.target)) stop();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!inSearchUi(event.target) && MANUAL_SCROLL_KEYS.has(event.key)) stop();
+    };
+    const onWindowChange = () => {
+      if (!active) return;
+      layoutMutating = true;
+      queueMicrotask(() => {
+        layoutMutating = false;
+        if (active) recordScrollerState();
+      });
+      schedulePass();
+    };
+    const onScroll = () => {
+      if (!active || !scroller || layoutMutating) return;
+      if (scroller.scrollHeight !== recordedScrollHeight) {
+        recordScrollerState();
+        schedulePass();
+        return;
+      }
+      if (Math.abs(scroller.scrollTop - recordedScrollTop) > 2) stop();
+    };
+    const page = scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body")
+      ?? (eventHost instanceof HTMLElement ? eventHost : null);
+    let lastPageHeight = page?.getBoundingClientRect().height ?? 0;
+    const observer = page && typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(entries => {
+          if (!active) return;
+          const nextHeight = entries[0]?.borderBoxSize?.[0]?.blockSize ?? entries[0]?.contentRect.height ?? page.getBoundingClientRect().height;
+          if (Math.abs(nextHeight - lastPageHeight) <= 0.5) return;
+          lastPageHeight = nextHeight;
+          if (scroller && scroller.scrollHeight !== recordedScrollHeight) recordScrollerState();
+          schedulePass();
+        })
+      : undefined;
+    if (page && observer) observer.observe(page);
+    eventHost.addEventListener("supermd-window-change", onWindowChange);
+    scroller?.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("touchstart", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("touchmove", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("pointerdown", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("keydown", onKeyDown, { capture: true, passive: true });
+    window.addEventListener("supermd-goto-offset", stop);
+    const timer = window.setTimeout(stop, SEARCH_SETTLE_WINDOW_MS);
+    settleCleanup.current = stop;
+    remainingFrames--;
+    frame = requestAnimationFrame(runPass);
   };
   const sourceCacheRef = useRef<{
     content: string;
@@ -777,35 +884,40 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner;
       scrollTargetIntoView(scrollEl ?? block, host);
     }
+    const customSliceMatch = matchQuery !== query || matchOptions !== filterOptions;
     if (registry && HighlightClass) {
-      if (wasUnmounted || scroll) registry.set("smd-search", new HighlightClass(...readingMatches(host, matchQuery, matchOptions)));
+      if (wasUnmounted || scroll) {
+        const visible = readingMatches(host, query, filterOptions);
+        registry.set("smd-search", new HighlightClass(...(customSliceMatch && domRange ? [...visible, domRange] : visible)));
+      }
       registry.delete("smd-search-current");
       if (domRange) registry.set("smd-search-current", new HighlightClass(domRange));
     }
-    if (scroll && wasUnmounted) {
+    if (scroll) {
       const expectedIndex = indexRef.current;
-      settleFrames.current[0] = requestAnimationFrame(() => {
-        settleFrames.current[1] = requestAnimationFrame(() => {
-          settleFrames.current = [0, 0];
-          if (indexRef.current !== expectedIndex) return;
-          const liveHost = findReadingHost();
-          if (!liveHost || !liveHost.isConnected) return;
-          const initialLiveBlock = findContainingBlock(liveHost, range, sourceText);
-          if (!initialLiveBlock || !initialLiveBlock.isConnected) return;
-          revealMountedBlock(initialLiveBlock);
-          const liveBlock = findContainingBlock(liveHost, range, sourceText) ?? initialLiveBlock;
-          const liveOwner = deepestSourceOwner(liveBlock, range, sourceText) ?? liveBlock;
-          openDisclosuresFor(liveOwner, liveBlock, null, range);
-          const liveDomRange = mapSourceRangeToDomRange(liveBlock, sourceText, ranges, targetIndex, matchQuery, matchOptions);
-          openDisclosuresFor(liveOwner, liveBlock, liveDomRange, range);
-          const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveOwner;
-          scrollTargetIntoView(liveScrollEl ?? liveBlock, liveHost);
-          if (registry && HighlightClass) {
-            registry.set("smd-search", new HighlightClass(...readingMatches(liveHost, matchQuery, matchOptions)));
-            registry.delete("smd-search-current");
-            if (liveDomRange) registry.set("smd-search-current", new HighlightClass(liveDomRange));
-          }
-        });
+      scheduleSearchSettle(host, () => {
+        if (!sourceSearchRef.current || indexRef.current !== expectedIndex) return false;
+        const liveHost = findReadingHost();
+        if (!liveHost) return false;
+        const currentBlock = findContainingBlock(liveHost, range, sourceText);
+        if (!currentBlock) return false;
+        revealMountedBlock(currentBlock);
+        const settledBlock = findContainingBlock(liveHost, range, sourceText) ?? currentBlock;
+        const settledOwner = deepestSourceOwner(settledBlock, range, sourceText) ?? settledBlock;
+        openDisclosuresFor(settledOwner, settledBlock, null, range);
+        const settledDomRange = mapSourceRangeToDomRange(settledBlock, sourceText, ranges, targetIndex, matchQuery, matchOptions);
+        openDisclosuresFor(settledOwner, settledBlock, settledDomRange, range);
+        const settledScrollEl = settledDomRange
+          ? (settledDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? settledDomRange.startContainer as Element : settledDomRange.startContainer.parentElement)
+          : settledOwner;
+        scrollTargetIntoView(settledScrollEl ?? settledBlock, liveHost);
+        if (registry && HighlightClass) {
+          const visible = readingMatches(liveHost, query, filterOptions);
+          registry.set("smd-search", new HighlightClass(...(customSliceMatch && settledDomRange ? [...visible, settledDomRange] : visible)));
+          registry.delete("smd-search-current");
+          if (settledDomRange) registry.set("smd-search-current", new HighlightClass(settledDomRange));
+        }
+        return true;
       });
     }
   };
@@ -826,29 +938,28 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry.delete("smd-search-current");
       if (range) registry.set("smd-search-current", new HighlightClass(range));
     }
-    settleFrames.current[0] = requestAnimationFrame(() => {
-      settleFrames.current[1] = requestAnimationFrame(() => {
-        settleFrames.current = [0, 0];
-        if (indexRef.current !== next || !match.element.isConnected) return;
-        revealMountedBlock(match.element);
-        const liveHost = findReadingHost();
-        openDisclosuresFor(match.element, match.element);
-        let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-        if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-        const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
-        scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
-        if (registry && HighlightClass) {
-          registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
-          registry.delete("smd-search-current");
-          if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
-        }
-      });
+    scheduleSearchSettle(host ?? match.element, () => {
+      if (sourceSearchRef.current || indexRef.current !== next || !match.element.isConnected) return false;
+      revealMountedBlock(match.element);
+      const liveHost = findReadingHost();
+      openDisclosuresFor(match.element, match.element);
+      let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
+      scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
+      if (registry && HighlightClass) {
+        registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
+        registry.delete("smd-search-current");
+        if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
+      }
+      return true;
     });
   };
 
   const selectDomMatch = (next: number, activeMatches: Range[], host: HTMLElement | null) => {
     const range = activeMatches[next];
     if (!range) return;
+    clearSettleFrames();
     const element = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
     openDisclosuresFor(element, element?.closest(".code-container,details") ?? element, range);
     scrollTargetIntoView(element, host);
@@ -937,6 +1048,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     // Search is a new deliberate navigation, just like pan/zoom. A briefly
     // observing heading jump must not pull the viewport back after this move.
     cancelSettlingHeading();
+    clearSettleFrames();
     pendingAutoSelect.current = false;
     pendingSeedRange.current = null;
     pendingSeedMatchText.current = undefined;
@@ -1240,6 +1352,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             selectDomMatch(insertAt, augmented, host);
             return;
           } else {
+            clearSettleFrames();
             const scrollEl = domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement;
             openDisclosuresFor(scrollEl, block, domRange, targetRange);
             scrollTargetIntoView(scrollEl ?? owner, host);
@@ -1253,52 +1366,36 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
               const sliceText = content.slice(targetRange.from, targetRange.to);
               const sliceRanges = sliceText ? sourceMatches(content, sliceText, true) : [];
               const sliceIdx = sliceRanges.length ? findMatchingSourceRangeIndex(sliceRanges, targetRange) : -1;
-              settleFrames.current[0] = requestAnimationFrame(() => {
-                settleFrames.current[1] = requestAnimationFrame(() => {
-                  settleFrames.current = [0, 0];
-                  if (indexRef.current !== -1) return;
-                  const liveHost = findReadingHost();
-                  if (!liveHost || !liveHost.isConnected) return;
-                  const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
-                  if (!initialLiveBlock || !initialLiveBlock.isConnected) return;
-                  revealMountedBlock(initialLiveBlock);
-                  const liveBlock = findContainingBlock(liveHost, targetRange, content) ?? initialLiveBlock;
-                  const liveOwner = deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock;
-                  openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
-                  const liveDomRange = sliceIdx >= 0 ? mapSourceRangeToDomRange(liveBlock, content, sliceRanges, sliceIdx, sliceText, true) : null;
-                  const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveOwner;
-                  openDisclosuresFor(liveScrollEl, liveBlock, liveDomRange, targetRange);
-                  scrollTargetIntoView(liveScrollEl ?? liveOwner, liveHost);
-                  if (registry && HighlightClass) {
-                    const visible = activeWindowed.length ? readingMatches(liveHost, query, filterOptions) : [];
-                    if (liveDomRange) {
-                      registry.set("smd-search", new HighlightClass(...visible, liveDomRange));
-                      registry.set("smd-search-current", new HighlightClass(liveDomRange));
-                    }
+              scheduleSearchSettle(host, () => {
+                if (sourceSearchRef.current || indexRef.current !== -1) return false;
+                const liveHost = findReadingHost();
+                if (!liveHost || !liveHost.isConnected) return false;
+                const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
+                if (!initialLiveBlock || !initialLiveBlock.isConnected) return false;
+                revealMountedBlock(initialLiveBlock);
+                const liveBlock = findContainingBlock(liveHost, targetRange, content) ?? initialLiveBlock;
+                const liveOwner = deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock;
+                openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
+                const liveDomRange = sliceIdx >= 0 ? mapSourceRangeToDomRange(liveBlock, content, sliceRanges, sliceIdx, sliceText, true) : null;
+                const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveOwner;
+                openDisclosuresFor(liveScrollEl, liveBlock, liveDomRange, targetRange);
+                scrollTargetIntoView(liveScrollEl ?? liveOwner, liveHost);
+                if (registry && HighlightClass) {
+                  const visible = activeWindowed.length ? readingMatches(liveHost, query, filterOptions) : [];
+                  if (liveDomRange) {
+                    registry.set("smd-search", new HighlightClass(...visible, liveDomRange));
+                    registry.set("smd-search-current", new HighlightClass(liveDomRange));
                   }
-                });
+                }
+                return true;
               });
             }
             return;
           }
         } else {
+          clearSettleFrames();
           openDisclosuresFor(owner, block, null, targetRange);
           scrollTargetIntoView(owner ?? block, host);
-          if (wasUnmounted) {
-            settleFrames.current[0] = requestAnimationFrame(() => {
-              settleFrames.current[1] = requestAnimationFrame(() => {
-                settleFrames.current = [0, 0];
-                if (indexRef.current !== -1) return;
-                const liveHost = findReadingHost();
-                const initialLiveBlock = liveHost ? findContainingBlock(liveHost, targetRange, content) : null;
-                if (initialLiveBlock) revealMountedBlock(initialLiveBlock);
-                const liveBlock = (liveHost && initialLiveBlock ? findContainingBlock(liveHost, targetRange, content) : null) ?? initialLiveBlock;
-                const liveOwner = liveBlock ? (deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock) : null;
-                if (liveBlock) openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
-                scrollTargetIntoView(liveOwner ?? liveBlock ?? owner ?? block, liveHost ?? host);
-              });
-            });
-          }
           updateIndex(-1);
           setHiddenSourceHit(true);
           hiddenSourceAnchorRef.current = targetRange;
@@ -1306,6 +1403,20 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             const visible = activeWindowed !== null ? (activeWindowed.length ? readingMatches(host, query, filterOptions) : []) : activeResult;
             registry.set("smd-search", new HighlightClass(...visible));
             registry.delete("smd-search-current");
+          }
+          if (wasUnmounted) {
+            scheduleSearchSettle(host, () => {
+              if (sourceSearchRef.current || indexRef.current !== -1 || hiddenSourceAnchorRef.current !== targetRange) return false;
+              const liveHost = findReadingHost();
+              if (!liveHost || !liveHost.isConnected) return false;
+              const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
+              if (initialLiveBlock) revealMountedBlock(initialLiveBlock);
+              const liveBlock = (initialLiveBlock ? findContainingBlock(liveHost, targetRange, content) : null) ?? initialLiveBlock;
+              const liveOwner = liveBlock ? (deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock) : null;
+              if (liveBlock) openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
+              scrollTargetIntoView(liveOwner ?? liveBlock ?? owner ?? block, liveHost);
+              return true;
+            });
           }
           return;
         }
