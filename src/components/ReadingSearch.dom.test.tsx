@@ -374,10 +374,26 @@ describe("ReadingSearch DOM behavior", () => {
     expect(host.querySelector("output")?.textContent).toBe("2 / 3");
 
     const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
-    const replaceSingle = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+    const replaceSingle = () => host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
     act(() => setInputValue(replaceInput, "Updated"));
-    act(() => replaceSingle.click());
+    act(() => replaceSingle().click());
     expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nTarget gamma.");
+
+    // Also verify #83 regex + capture-group replacement across the remaining unmounted block in DOM order.
+    await act(async () => { renderWindowed(); });
+    const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+    const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
+    act(() => regexBtn.click());
+    act(() => wholeWordBtn.click());
+    act(() => setInputValue(searchInput, "Target (\\w+)"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+    expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+    const prevBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Previous match"]')!;
+    act(() => prevBtn.click());
+    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+    act(() => setInputValue(replaceInput, "Rewritten-$1"));
+    act(() => replaceSingle().click());
+    expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nRewritten-gamma.");
 
     cleanups.forEach((fn) => fn());
     act(() => root.unmount());
