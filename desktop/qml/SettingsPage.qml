@@ -244,8 +244,29 @@ Pane {
                 ChoiceField { Layout.fillWidth: true; model: ["Restore previous tabs","Open a new blank note"]; currentIndex: viewState.settings.startup === "new" ? 1 : 0; onActivated: page.save("startup", currentIndex === 1 ? "new" : "restore") }
                 Label { text: "Unsaved drafts are recovered in either mode. Welcome is shown only on first use."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "New note location"; font.weight: Font.DemiBold }
-                ActionButton { Layout.fillWidth: true; text: viewState.settings.newNoteLocation || "Downloads"; glyph: "FolderOpen"; tonal: true; onClicked: studio.chooseNoteLocation(); ToolTip.text: viewState.settings.newNoteLocation || "Downloads" }
-                Label { text: "New notes stay recoverable until you choose a file. Empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+                    ActionButton {
+                        objectName: "newNoteLocationButton"
+                        Layout.fillWidth: true
+                        text: viewState.settings.newNoteLocation || "Downloads"
+                        glyph: "FolderOpen"
+                        tonal: true
+                        onClicked: studio.chooseNoteLocation()
+                        ToolTip.text: viewState.settings.newNoteLocation || "Downloads"
+                    }
+                    ActionButton {
+                        objectName: "clearNewNoteLocationButton"
+                        visible: !!viewState.settings.newNoteLocation
+                        text: "Reset"
+                        compact: true
+                        tonal: true
+                        Accessible.name: "Reset new note location to Downloads"
+                        onClicked: studio.clearNoteLocation()
+                    }
+                }
+                Label { text: "Used when no workspace folder is open in this window. New notes stay recoverable until you choose a file; empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Writing assistance"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }
                 Switch { text: "Grammar check"; checked: viewState.settings.grammarCheck; onToggled: page.save("grammarCheck", checked) }

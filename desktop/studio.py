@@ -2712,6 +2712,12 @@ class Studio(QObject):
             self.settings["newNoteLocation"] = str(directory)
             self._preferences(); self._emit(False)
 
+    @Slot()
+    def clearNoteLocation(self):
+        if self.settings.get("newNoteLocation"):
+            self.settings["newNoteLocation"] = ""
+            self._preferences(); self._emit(False)
+
     @Slot(str)
     def importFont(self,value):
         try:
@@ -3825,7 +3831,9 @@ class Studio(QObject):
                 except OSError:
                     pass
                 if str(path) != original_path:
-                    self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+                    self.recent = [str(path)] + [p for p in self.recent if not folder_ops.same_path(p, str(path))][:29]
+                    self._watch_notes(force=True)
+                    self._refresh_open_folder_trees_for_saved_path(path)
                     self._preferences()
                 if automatic and self._is_dirty(target): self.autosave_timer.start(900)
             self.message = "Autosaved" if automatic else "Saved"
@@ -4176,24 +4184,99 @@ class Studio(QObject):
             self._sync_path_change(folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after), is_dir=False, message=f"Renamed to {final_name}")
         self._submit(work,finished,executor=self.writes)
 
-    @Slot(str,result=QUrl)
-    def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
-        return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
+    def _refresh_open_folder_trees_for_saved_path(self, saved_path: str | os.PathLike[str]) -> None:
+        saved_canon = folder_ops.canonical_path_str(saved_path)
+        if not saved_canon:
+            return
+        saved_parent = Path(saved_canon).parent
+        for win in list(self.session.windows.values()):
+            if win.retired or not win.folder:
+                continue
+            win_root = self._existing_save_directory(win.folder, reject_links=True)
+            if win_root is not None and folder_ops.matches_path_prefix(saved_canon, str(win_root), is_directory=True):
+                win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, saved_parent))
+                win._load_tree()
 
-    @Slot(str,result=QUrl)
-    def defaultSaveAsLocation(self,name):
-        current_path = self._current().get("path")
+    @staticmethod
+    def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw_path or "").strip())
+        if not cleaned:
+            return None
+        try:
+            candidate = Path(cleaned).expanduser()
+            if reject_links and folder_ops._is_link_or_junction(candidate):
+                return None
+            if reject_links:
+                resolved = Path(folder_ops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
+                return Path(folder_ops.canonical_path_str(resolved)) if resolved.is_dir() else None
+            return candidate if candidate.is_dir() else None
+        except OSError:
+            return None
+
+    @classmethod
+    def _downloads_fallback_directory(cls) -> Path:
+        raw_downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        downloads = cls._existing_save_directory(raw_downloads)
+        if downloads is not None:
+            return downloads
+        home = cls._existing_save_directory(Path.home())
+        if home is not None:
+            return home
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw_downloads or "").strip()) or str(Path.home())
+        return Path(cleaned).expanduser()
+
+    def _configured_fallback_directory(self) -> Path:
+        configured = self._existing_save_directory(self.settings.get("newNoteLocation"))
+        if configured is not None:
+            return configured
+        return self._downloads_fallback_directory()
+
+    def _untitled_note_save_directory(self) -> Path:
+        open_folder = self._existing_save_directory(self.folder, reject_links=True)
+        if open_folder is not None:
+            return open_folder
+        return self._configured_fallback_directory()
+
+    def _save_as_directory(self) -> Path:
+        current_path = self._current().get("path") if self.tabs else ""
         if current_path:
-            parent = Path(current_path).parent
-            if parent.is_dir():
-                return QUrl.fromLocalFile(str(parent / Path(name).name))
-        return self.defaultSaveLocation(name)
+            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path).strip())
+            if cleaned_current:
+                parent = self._existing_save_directory(Path(cleaned_current).expanduser().parent)
+                if parent is not None:
+                    return parent
+        return self._untitled_note_save_directory()
+
+    def _default_save_leaf(self, name: str) -> str:
+        fallback = "Untitled.smd" if (self.tabs and self._current().get("portable")) else "Untitled.md"
+        return folder_ops._pure_path(str(name or "")).name or fallback
+
+    @Slot(result=QUrl)
+    def defaultSaveFolder(self):
+        return QUrl.fromLocalFile(str(self._untitled_note_save_directory()))
+
+    @Slot(str, result=QUrl)
+    def defaultSaveLocation(self, name):
+        return QUrl.fromLocalFile(str(self._untitled_note_save_directory() / self._default_save_leaf(name)))
+
+    @Slot(result=QUrl)
+    def defaultSaveAsFolder(self):
+        return QUrl.fromLocalFile(str(self._save_as_directory()))
+
+    @Slot(str, result=QUrl)
+    def defaultSaveAsLocation(self, name):
+        return QUrl.fromLocalFile(str(self._save_as_directory() / self._default_save_leaf(name)))
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
         suffix = "zip" if format == "mdzip" else format
-        return self.defaultSaveLocation((folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix)
+        filename = (folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix
+        return QUrl.fromLocalFile(str(self._configured_fallback_directory() / folder_ops._pure_path(filename).name))
+
+    @Slot(str, result=QUrl)
+    def defaultThemeExportLocation(self, name):
+        leaf = folder_ops._pure_path(str(name or "")).name or "My theme.supermd-theme.json"
+        return QUrl.fromLocalFile(str(self._configured_fallback_directory() / leaf))
 
     @Slot(str)
     def closeTab(self, id):
@@ -5854,7 +5937,10 @@ class Studio(QObject):
                             self._agent_open_paths.add(str(Path(save_as).resolve()))
                         except OSError:
                             pass
-                        self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
+                        self.recent = [save_as] + [p for p in self.recent if not folder_ops.same_path(p, save_as)][:29]
+                        if path_changed:
+                            self._watch_notes(force=True)
+                            self._refresh_open_folder_trees_for_saved_path(save_as)
                         self._preferences()
                         self.message = "Saved"
                         self._recover()
