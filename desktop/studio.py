@@ -25,15 +25,21 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 import zipfile
 from pathlib import Path
+try:
+    import shiboken6
+except ImportError:  # pragma: no cover
+    shiboken6 = None
 from network_tls import client_context
-from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
+from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
+import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
@@ -52,7 +58,8 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_search import MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
+from workspace_links import WorkspaceLinkError, resolve_workspace_link
+from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -297,7 +304,202 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
 
 def local_path(value: str) -> Path:
     url = QUrl(value)
-    return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+    return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
+
+
+def _extract_local_drop_paths(values) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw in values or ():
+        if raw is None:
+            continue
+        if isinstance(raw, QUrl):
+            if not raw.isLocalFile():
+                continue
+            local_str = raw.toLocalFile()
+        elif isinstance(raw, Path):
+            local_str = str(raw)
+        else:
+            text = str(raw).strip()
+            if not text:
+                continue
+            url = QUrl(text)
+            if url.isLocalFile():
+                local_str = url.toLocalFile()
+            elif not url.scheme() or (len(url.scheme()) == 1 and sys.platform == "win32"):
+                local_str = text
+            else:
+                continue
+        if not local_str:
+            continue
+        try:
+            resolved = Path(local_str).expanduser().resolve()
+            resolved = Path(folder_ops.strip_extended_length_prefix(str(resolved)))
+        except (OSError, RuntimeError):
+            continue
+        key = canonical_note_key(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(resolved)
+    return paths
+
+
+def _classify_drop_paths(paths: list[Path]) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    folders: list[Path] = []
+    notes: list[Path] = []
+    images: list[Path] = []
+    unsupported: list[Path] = []
+    for path in paths:
+        try:
+            is_dir = path.is_dir()
+            is_file = False if is_dir else path.is_file()
+        except OSError:
+            unsupported.append(path)
+            continue
+        if is_dir:
+            folders.append(path)
+        elif is_file:
+            suffix = path.suffix.lower()
+            if suffix in KNOWN_NOTE_SUFFIXES:
+                notes.append(path)
+            elif suffix.lstrip(".") in MIMES:
+                images.append(path)
+            else:
+                unsupported.append(path)
+        else:
+            unsupported.append(path)
+    return folders, notes, images, unsupported
+
+
+class WorkspaceDropFilter(QObject):
+    """Window-level drag/drop router preserving TabStrip drags and WebEngine image drops."""
+
+    def __init__(self, studio: Studio, window: QObject, reader: QObject | None = None):
+        super().__init__(window)
+        self.studio = studio
+        self.window = window
+        self.reader = reader
+        self._intercepting_drag = False
+        self._forwarding = False
+        window.installEventFilter(self)
+
+    def set_reader(self, reader: QObject | None) -> None:
+        self.reader = reader
+
+    def _over_active_reader(self, scene_pos: QPointF) -> bool:
+        reader = self.reader
+        if (
+            reader is None
+            or not self.studio.settings.get("welcomed")
+            or not self.studio.ready
+            or self.studio.reader_overlay
+            or self.studio.image_overlay
+        ):
+            return False
+        try:
+            if not reader.isVisible() or reader.width() <= 0 or reader.height() <= 0:
+                return False
+            local = reader.mapFromScene(scene_pos)
+            return 0 <= local.x() <= reader.width() and 0 <= local.y() <= reader.height()
+        except RuntimeError:
+            return False
+
+    def _modal_blocked(self) -> bool:
+        if self.studio.dropBlocked:
+            return True
+        try:
+            count = self.window.property("modalDialogCount")
+            return bool(count and int(count) > 0)
+        except (RuntimeError, TypeError, ValueError):
+            return False
+
+    def _forward_enter_to_scene(self, event) -> None:
+        app = QGuiApplication.instance()
+        if app is None:
+            return
+        enter = QDragEnterEvent(
+            event.position().toPoint(),
+            event.possibleActions(),
+            event.mimeData(),
+            event.buttons(),
+            event.modifiers(),
+        )
+        self._forwarding = True
+        try:
+            app.sendEvent(self.window, enter)
+        finally:
+            self._forwarding = False
+
+    def _send_leave_to_scene(self) -> None:
+        app = QGuiApplication.instance()
+        if app is None:
+            return
+        leave = QDragLeaveEvent()
+        self._forwarding = True
+        try:
+            app.sendEvent(self.window, leave)
+        finally:
+            self._forwarding = False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is not self.window or self._forwarding:
+            return False
+        etype = event.type()
+        if etype not in (
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.DragLeave,
+            QEvent.Type.Drop,
+        ):
+            return False
+
+        if etype == QEvent.Type.DragLeave:
+            if self._intercepting_drag:
+                self._intercepting_drag = False
+                event.accept()
+                return True
+            return False
+
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls() or mime.hasFormat("application/x-supermd-tab"):
+            return False
+
+        if self._modal_blocked():
+            if not self._intercepting_drag and etype == QEvent.Type.DragMove:
+                self._send_leave_to_scene()
+            self._intercepting_drag = etype != QEvent.Type.Drop
+            event.setDropAction(Qt.DropAction.IgnoreAction)
+            event.ignore()
+            return True
+
+        scene_pos = event.position()
+        over_reader = self._over_active_reader(scene_pos)
+        urls = mime.urls()
+        intercept = self.studio.shouldInterceptExternalDrop(urls, over_reader)
+
+        if not intercept:
+            if self._intercepting_drag:
+                self._intercepting_drag = False
+                if etype in (QEvent.Type.DragMove, QEvent.Type.Drop):
+                    self._forward_enter_to_scene(event)
+            return False
+
+        if not self._intercepting_drag and etype == QEvent.Type.DragMove:
+            self._send_leave_to_scene()
+
+        if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            self._intercepting_drag = True
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return True
+
+        self._intercepting_drag = False
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        self.studio.handleExternalDrop(urls, over_reader)
+        return True
 
 def export_destination(value: str, format: str) -> Path:
     suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
@@ -356,6 +558,33 @@ def _snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -> dict:
 
 def _asset_identity(value):
     return id(value)
+
+
+def _noop_done(*_):
+    pass
+
+
+class _StoppedFileWatcher:
+    def files(self) -> list[str]:
+        return []
+
+    def directories(self) -> list[str]:
+        return []
+
+    def addPath(self, _path: str) -> bool:
+        return False
+
+    def addPaths(self, paths) -> list[str]:
+        return list(paths)
+
+    def removePath(self, _path: str) -> bool:
+        return False
+
+    def removePaths(self, paths) -> list[str]:
+        return list(paths)
+
+
+_STOPPED_WATCHER = _StoppedFileWatcher()
 
 
 def _matches_media_signature(mime: str, data: bytes) -> bool:
@@ -605,6 +834,7 @@ class Studio(QObject):
     detachedWindowRequested = Signal(str, str)
     exportRequested = Signal(str)
     folderPickerRequested = Signal()
+    workspaceFolderDropped = Signal()
     fontPickerRequested = Signal()
     themePickerRequested = Signal()
     themeExportRequested = Signal()
@@ -622,8 +852,19 @@ class Studio(QObject):
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
         self.session = session or Session(isolated)
-        self.session.changed.connect(lambda:self._emit())
-        self.session.locationChanged.connect(self._location_changed)
+        weak_self = weakref.ref(self)
+        def _on_session_changed():
+            inst = weak_self()
+            if inst is not None and not inst.retired:
+                inst._emit()
+        def _on_location_changed(old, new):
+            inst = weak_self()
+            if inst is not None and not inst.retired:
+                inst._location_changed(old, new)
+        self._session_changed_slot = _on_session_changed
+        self._location_changed_slot = _on_location_changed
+        self.session.changed.connect(self._session_changed_slot)
+        self.session.locationChanged.connect(self._location_changed_slot)
         self.writes = self.session.writes
         self.window_id = uuid.uuid4().hex
         self.session.windows[self.window_id] = self
@@ -659,7 +900,8 @@ class Studio(QObject):
         self.python_choices=[]
         self.python_busy=False
         self.pythonProgress.connect(self._python_progress)
-        if not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
+        if not self.settings.get("python"):
+            self._choose_default_python(emit=False)
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
@@ -708,6 +950,7 @@ class Studio(QObject):
         self.ready = False
         self._last_reader_text = None
         self._export_jobs = ExportJobRegistry()
+        self._python_jobs = python_runtime.PythonJobRegistry()
         self._agent_exports: dict[str, dict] = {}
         self._agent_owned_files: set[str] = getattr(self.session, "agent_owned_files", None) or set()
         self.session.agent_owned_files = self._agent_owned_files
@@ -723,7 +966,12 @@ class Studio(QObject):
         self.theme_debounce = QTimer(self)
         self.theme_debounce.setSingleShot(True)
         self.theme_debounce.timeout.connect(self._refresh_theme)
-        QGuiApplication.styleHints().colorSchemeChanged.connect(self._schedule_theme)
+        def _on_color_scheme_changed(*args):
+            inst = weak_self()
+            if inst is not None and not inst.retired:
+                inst._schedule_theme(*args)
+        self._color_scheme_slot = _on_color_scheme_changed
+        QGuiApplication.styleHints().colorSchemeChanged.connect(self._color_scheme_slot)
         self.palette_watcher = QFileSystemWatcher(self)
         self.palette_watcher.fileChanged.connect(self._palette_changed)
         self.palette_watcher.directoryChanged.connect(self._palette_changed)
@@ -875,9 +1123,14 @@ class Studio(QObject):
 
     @Slot(str)
     def pinRecent(self,path):
-        if path not in self.recent:return
-        if path in self.session.pinned:self.session.pinned.remove(path)
-        else:self.session.pinned.append(path)
+        matched_recent = next((item for item in self.recent if folder_ops.same_path(item, path)), None)
+        if matched_recent is None:
+            return
+        matched_pinned = next((item for item in self.session.pinned if folder_ops.same_path(item, matched_recent)), None)
+        if matched_pinned is not None:
+            self.session.pinned = [item for item in self.session.pinned if not folder_ops.same_path(item, matched_recent)]
+        else:
+            self.session.pinned.append(matched_recent)
         self.recent=self.recent
         self._preferences()
 
@@ -927,6 +1180,9 @@ class Studio(QObject):
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
             payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            pending_heading = tab.pop("pendingHeading", None)
+            if pending_heading:
+                payload["pendingHeading"] = pending_heading
             seeded_find = self._consume_seeded_find(tab)
             if seeded_find is not None:
                 payload["seededFind"] = seeded_find
@@ -1059,6 +1315,7 @@ class Studio(QObject):
             if not window.retired: window.shortcutsChanged.emit()
 
     def _watch_notes(self,force=False):
+        if self.retired:return
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
         signature=(paths,self.folder,tuple(sorted(self.expanded)))
         if not force and signature==self.note_watch_paths:return
@@ -1070,6 +1327,29 @@ class Studio(QObject):
         watched=set(self.note_watcher.files()+self.note_watcher.directories())
         if watched-targets:self.note_watcher.removePaths(list(watched-targets))
         if targets-watched:self.note_watcher.addPaths(list(targets-watched))
+
+    def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool):
+        parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
+        for win in list(self.session.windows.values()):
+            if win.retired:
+                continue
+            watched = list(win.note_watcher.files() + win.note_watcher.directories())
+            to_remove = [
+                watched_path
+                for watched_path in watched
+                if folder_ops.matches_path_prefix(watched_path, target_path, is_directory=is_dir)
+                or (parent_str and folder_ops.same_path(watched_path, parent_str))
+            ]
+            if to_remove:
+                win.note_watcher.removePaths(to_remove)
+                win.note_watch_paths = None
+            if win.external_paths:
+                win.external_paths = {
+                    ext_path
+                    for ext_path in win.external_paths
+                    if not folder_ops.matches_path_prefix(ext_path, target_path, is_directory=is_dir)
+                    and not (parent_str and folder_ops.same_path(ext_path, parent_str))
+                }
 
     def _external_note_changed(self,path):
         if self.retired:return
@@ -1153,6 +1433,7 @@ class Studio(QObject):
         self.theme_debounce.start(150)
 
     def _watch_palette(self):
+        if self.retired:return
         watched = set(self.palette_watcher.files()+self.palette_watcher.directories())
         for path in system_palette_paths():
             for target in (path,path.parent):
@@ -1191,6 +1472,7 @@ class Studio(QObject):
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
+        self._python_jobs.cancel_all(retire=True)
         for agent_export in tuple(self._agent_exports.values()):
             try:
                 reserved = Path(agent_export["path"])
@@ -1211,10 +1493,29 @@ class Studio(QObject):
         self.flush_timer.stop()
         self.external_timer.stop()
         self.filter_timer.stop()
-        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
+        for attr in ("note_watcher", "palette_watcher", "custom_theme_watcher"):
+            watcher = getattr(self, attr, None)
+            if watcher is None or watcher is _STOPPED_WATCHER:
+                continue
             watched = watcher.files() + watcher.directories()
             if watched:
                 watcher.removePaths(watched)
+            setattr(self, attr, _STOPPED_WATCHER)
+            if shiboken6 is not None and shiboken6.isValid(watcher):
+                watcher.setParent(None)
+                shiboken6.delete(watcher)
+            else:
+                watcher.deleteLater()
+        for signal, slot in (
+            (QGuiApplication.styleHints().colorSchemeChanged, getattr(self, "_color_scheme_slot", None)),
+            (self.session.changed, getattr(self, "_session_changed_slot", None)),
+            (self.session.locationChanged, getattr(self, "_location_changed_slot", None)),
+        ):
+            if slot is not None:
+                try:
+                    signal.disconnect(slot)
+                except (RuntimeError, TypeError):
+                    pass
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
@@ -2004,15 +2305,15 @@ class Studio(QObject):
     def _python_folders(self):
         return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
 
-    def _choose_default_python(self):
-        if self.retired:return
-        managed = self.data/"python-env"
-        def done(path,error):
-            if path and not self.settings.get("python"):
-                self.settings["python"] = path
-                self._preferences()
+    def _choose_default_python(self, emit: bool = True):
+        if self.retired or self.settings.get("python"):
+            return
+        path = python_runtime.default_python(self.data / "python-env")
+        if path:
+            self.settings["python"] = path
+            self._preferences(notify=emit)
+        if emit:
             self._emit(False)
-        self._submit(lambda: python_runtime.preferred(managed), done, False)
 
     @Slot(str)
     def _python_progress(self, text):
@@ -2021,7 +2322,9 @@ class Studio(QObject):
 
     @Slot()
     def refreshPython(self):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
+        managed = self.data / "python-env"
+        folders = tuple(self._python_folders())
         self.python_busy = True
         self.python_status = "Looking for Python installations"
         self._emit(False)
@@ -2033,11 +2336,11 @@ class Studio(QObject):
             elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but numpy and matplotlib are missing. Set up Python installs both in a private environment."
             else: self.python_status = ""
             self._emit(False)
-        self._submit(lambda: python_runtime.discover(self.data/"python-env", self._python_folders()), done, False)
+        self._submit(lambda: python_runtime.discover(managed, folders), done, False)
 
     @Slot(str)
     def installPythonPackages(self, path):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
         self.python_busy = True
         self.python_status = "Preparing to install numpy and matplotlib"
         self._emit(False)
@@ -2054,7 +2357,8 @@ class Studio(QObject):
 
     @Slot()
     def setupPython(self):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
+        managed = self.data / "python-env"
         self.python_busy = True
         self.python_status = "Preparing Python setup"
         self._emit(False)
@@ -2071,7 +2375,7 @@ class Studio(QObject):
             self.python_busy = False
             self.refreshPython()
             self.python_status = "Python with numpy and matplotlib is ready"
-        self._submit(lambda: python_runtime.setup_environment(self.data/"python-env", self.pythonProgress.emit), done, False)
+        self._submit(lambda: python_runtime.setup_environment(managed, self.pythonProgress.emit), done, False)
 
     @Slot(int, int, bool)
     def rememberWindow(self, width, height, maximized):
@@ -2245,6 +2549,7 @@ class Studio(QObject):
             self._preferences(False)
 
     def _watch_custom_theme(self):
+        if self.retired:return
         watcher=self.custom_theme_watcher
         paths=watcher.files()+watcher.directories()
         if paths:watcher.removePaths(paths)
@@ -2510,7 +2815,7 @@ class Studio(QObject):
                 value,error=f.result(),None
             except Exception as reason:
                 value,error=None,str(reason)
-            if self.retired:return
+            if self.retired or (done is _noop_done and not busy and error is None):return
             try:self.completed.emit((done,value,error,busy))
             except RuntimeError:pass  # The QObject may have been retired meanwhile.
         future.add_done_callback(completed)
@@ -2587,12 +2892,12 @@ class Studio(QObject):
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
         data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
-        self._submit(lambda: atomic_write(self.data / "settings.json", data), lambda *_: None, False,self.writes)
+        self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 
     def _save_positions(self):
         data=json.dumps(self.session.locations).encode()
-        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),lambda *_:None,False,self.writes)
+        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
 
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
@@ -2648,6 +2953,171 @@ class Studio(QObject):
         elif self.message==notice:self.message=""
         self._emit(False)
 
+    @Property(bool, notify=changed)
+    def dropBlocked(self):
+        return bool(self.retired or self.pending_close or self.flush_operation)
+
+    @Slot(QObject)
+    @Slot(QObject, QObject)
+    def attachWindowDropFilter(self, window: QObject | None, reader: QObject | None = None):
+        if window is None or self.retired:
+            return
+        existing = getattr(self, "_workspace_drop_filter", None)
+        if existing is not None and existing.window is window:
+            existing.set_reader(reader)
+            return
+        if existing is not None:
+            try:
+                existing.window.removeEventFilter(existing)
+            except RuntimeError:
+                pass
+        self._workspace_drop_filter = WorkspaceDropFilter(self, window, reader)
+
+    @Slot("QVariantList", bool, result=bool)
+    def shouldInterceptExternalDrop(self, urls, over_reader: bool = False) -> bool:
+        paths = _extract_local_drop_paths(urls)
+        if not paths:
+            return False
+        if self.dropBlocked:
+            return True
+        folders, notes, images, unsupported = _classify_drop_paths(paths)
+        if (
+            over_reader
+            and self.settings.get("welcomed")
+            and self.ready
+            and not self.reader_overlay
+            and not self.image_overlay
+            and images
+            and not folders
+            and not notes
+            and not unsupported
+        ):
+            return False
+        return True
+
+    @Slot("QVariantList")
+    def openDroppedUrls(self, urls):
+        self.handleExternalDrop(urls, False)
+
+    @Slot("QVariantList", bool)
+    def handleExternalDrop(self, urls, over_reader: bool = False):
+        del over_reader
+        if self.dropBlocked:
+            return
+        paths = _extract_local_drop_paths(urls)
+        if not paths:
+            return
+        folders, notes, images, unsupported = _classify_drop_paths(paths)
+        if not folders and not notes:
+            if images:
+                self.message = "Drop images inside an open note to insert them."
+            else:
+                self.message = "Only Markdown notes (.md, .smd, .fmd, .markdown, .txt) and folders can be opened by dropping."
+            self._emit(False)
+            return
+
+        notices: list[str] = []
+        if len(folders) > 1:
+            skipped_folders = len(folders) - 1
+            notices.append(f"opened folder {folders[-1].name} ({skipped_folders} other folder{'s' if skipped_folders != 1 else ''} skipped)")
+        skipped_files = len(images) + len(unsupported)
+        if skipped_files:
+            if images and not unsupported:
+                notices.append("drop images inside an open note separately to insert them")
+            else:
+                notices.append(f"skipped {skipped_files} unsupported item{'s' if skipped_files != 1 else ''}")
+
+        formatted_notice = ""
+        if notices:
+            joined = "; ".join(notices)
+            formatted_notice = joined[0].upper() + joined[1:] + "."
+
+        if folders:
+            self.openFolder(str(folders[-1]))
+            self.workspaceFolderDropped.emit()
+            if not notes and self.host_window is not None:
+                self.host_window.raise_()
+                self.host_window.requestActivate()
+
+        if notes:
+            self._open_dropped_notes(notes, notice=formatted_notice)
+        elif formatted_notice:
+            self.message = formatted_notice
+            self._emit(False)
+
+    def _open_dropped_notes(self, note_paths: list[Path], *, notice: str = ""):
+        if not note_paths or self.retired:
+            return
+        self._activation_generation += 1
+        batch_generation = self._activation_generation
+        highest_activated_index = -1
+        batch_new_tab_indices: dict[str, int] = {}
+        opened_paths_by_index: dict[int, str] = {}
+        errors: list[str] = []
+        remaining = len(note_paths)
+
+        def make_batch_insert(index: int):
+            def insert_note(note: dict):
+                batch_new_tab_indices[note["id"]] = index
+                insert_at = next(
+                    (
+                        pos
+                        for pos, existing in enumerate(self.tabs)
+                        if existing["id"] in batch_new_tab_indices and batch_new_tab_indices[existing["id"]] > index
+                    ),
+                    None,
+                )
+                if insert_at is None:
+                    self.tabs.append(note)
+                else:
+                    self.tabs.insert(insert_at, note)
+            return insert_note
+
+        def make_should_activate(index: int):
+            def check(_tab: dict) -> bool:
+                nonlocal highest_activated_index
+                if index >= highest_activated_index:
+                    highest_activated_index = index
+                    return True
+                return False
+            return check
+
+        def make_done(index: int, path: Path):
+            def done(tab: dict | None, error: str | None):
+                nonlocal remaining
+                if error:
+                    errors.append(f"{path.name}: {error}")
+                elif tab is not None:
+                    opened_paths_by_index[index] = folder_ops.canonical_path_str(path)
+                remaining -= 1
+                if remaining == 0 and not self.retired:
+                    if len(opened_paths_by_index) > 1:
+                        ordered = [opened_paths_by_index[i] for i in sorted(opened_paths_by_index, reverse=True)]
+                        self.recent = (
+                            ordered
+                            + [p for p in self.recent if not any(folder_ops.same_path(p, o) for o in ordered)]
+                        )[:30]
+                        self._preferences()
+                    parts: list[str] = []
+                    if errors:
+                        parts.append("Could not open " + "; ".join(errors))
+                    if notice:
+                        parts.append(notice)
+                    if parts:
+                        self.message = " ".join(parts)
+                    self._emit(False)
+            return done
+
+        for idx, note_path in enumerate(note_paths):
+            self._open_note(
+                str(note_path),
+                explicit=True,
+                activation_generation=batch_generation,
+                completion_callback=make_done(idx, note_path),
+                batch_insert=make_batch_insert(idx),
+                should_activate_fn=make_should_activate(idx),
+            )
+
     @Slot(str)
     def openPath(self, value):
         path = local_path(value)
@@ -2695,7 +3165,17 @@ class Studio(QObject):
         QTimer.singleShot(0, lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
                           if generation == self._activation_generation and not self.retired else None)
 
-    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None):
+    def _open_note(
+        self,
+        value,
+        *,
+        explicit,
+        activation_generation=None,
+        completion_callback=None,
+        batch_insert=None,
+        should_activate_fn=None,
+        pending_heading=None,
+    ):
         if self.retired:
             if completion_callback: completion_callback(None, "The document window is no longer available")
             return
@@ -2704,21 +3184,31 @@ class Studio(QObject):
             self.openFolder(str(path))
             if completion_callback: completion_callback(None, "A folder cannot be opened as a document")
             return
-        if explicit:
+        if explicit and activation_generation is None:
             self._activation_generation += 1
             activation_generation = self._activation_generation
         elif activation_generation is None:
             activation_generation = self._activation_generation
         restoring = not explicit and str(path) in self._restoring_paths
+        def activate_existing(target_tab):
+            if explicit and activation_generation == self._activation_generation:
+                if should_activate_fn is None or should_activate_fn(target_tab):
+                    if pending_heading:
+                        target_tab["pendingHeading"] = pending_heading
+                    else:
+                        target_tab.pop("pendingHeading", None)
+                    was_active = self.active == target_tab["id"]
+                    self._select_tab_from_open(target_tab["id"], activation_generation)
+                    if was_active and pending_heading:
+                        self._emit()
+                    self._focus_open_target(activation_generation)
         found = next((t for t in self.tabs if t["path"] == str(path)), None)
         if found:
-            self._agent_open_paths.add(str(path.resolve()))
+            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             self._restoring_paths.discard(str(path))
             if restoring and activation_generation == self._activation_generation and str(path) == (self._startup_active or self.session.startup_active):
                 self._select_tab_from_open(found["id"], activation_generation)
-            if explicit and activation_generation == self._activation_generation:
-                self._select_tab_from_open(found["id"], activation_generation)
-                self._focus_open_target(activation_generation)
+            activate_existing(found)
             if completion_callback: completion_callback(found, None)
             return
         def finished(result, error):
@@ -2731,32 +3221,44 @@ class Studio(QObject):
             # Keep one tab and let only an explicit, still-current request focus it.
             existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
             if existing:
-                if explicit and activation_generation == self._activation_generation:
-                    self._select_tab_from_open(existing["id"], activation_generation)
-                    self._focus_open_target(activation_generation)
+                activate_existing(existing)
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
-            self._agent_open_paths.add(str(path.resolve()))
+            self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             if restoring:
                 if activation_generation == self._activation_generation:
                     self.tabs=[t for t in self.tabs if t["id"] not in self._startup_placeholder_ids]
                     self._startup_placeholder_ids.clear()
-            self.tabs.append(note)
+            if batch_insert is not None:
+                batch_insert(note)
+            else:
+                self.tabs.append(note)
             if restoring:
                 keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
-            should_activate = (explicit and activation_generation == self._activation_generation)
+            if should_activate_fn is not None:
+                should_activate = bool(explicit and activation_generation == self._activation_generation and should_activate_fn(note))
+            else:
+                should_activate = (explicit and activation_generation == self._activation_generation)
             if restoring and activation_generation == self._activation_generation:
                 target_active = self._startup_active or self.session.startup_active
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
             if should_activate:
                 self.active = note["id"]
+                if pending_heading:
+                    note["pendingHeading"] = pending_heading
             self.settings["welcomed"] = True
-            self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
-            self._preferences()
+            canon_note_path = folder_ops.canonical_path_str(path)
+            self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
+            self._preferences(notify=False)
             self.recovery_timer.start(800)
-            self._emit()
+            emit_load = should_activate if (should_activate_fn is not None or explicit) else True
+            for window in list(self.session.windows.values()):
+                if window is self:
+                    window._emit(emit_load)
+                else:
+                    window._emit()
             if explicit and should_activate:
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(note, None)
@@ -2775,6 +3277,8 @@ class Studio(QObject):
     def selectTab(self, id):
         if any(t["id"] == id for t in self.tabs):
             self._activation_generation += 1
+            for tab in self.tabs:
+                tab.pop("pendingHeading", None)
         self._select_tab_from_open(id, self._activation_generation)
 
     def _select_tab_from_open(self, id, generation):
@@ -2846,30 +3350,36 @@ class Studio(QObject):
         if not folder_path:
             return
         try:
-            candidate_root = Path(folder_path).expanduser()
-            if candidate_root.is_symlink():
+            candidate_root = Path(folder_ops.strip_extended_length_prefix(str(folder_path))).expanduser()
+            if folder_ops._is_link_or_junction(candidate_root):
                 return
-            root = candidate_root.resolve()
+            root = Path(folder_ops.strip_extended_length_prefix(str(candidate_root.resolve(strict=True))))
         except OSError:
             return
         if not root.is_dir():
             return
-        root_str = str(root)
+        root_str = folder_ops.canonical_path_str(root)
         valid_expanded = {root_str}
         for raw in expanded_paths or []:
             if not raw:
                 continue
             try:
-                candidate = Path(raw).expanduser()
-                if candidate.is_symlink():
+                candidate = Path(folder_ops.strip_extended_length_prefix(str(raw))).expanduser()
+                if folder_ops._is_link_or_junction(candidate):
                     continue
-                resolved = candidate.resolve()
-                if (resolved == root or root in resolved.parents) and resolved.is_dir():
-                    valid_expanded.add(str(resolved))
+                resolved = Path(folder_ops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
+                if folder_ops.matches_path_prefix(str(resolved), root_str, is_directory=True) and resolved.is_dir():
+                    valid_expanded.add(folder_ops.canonical_path_str(resolved))
             except OSError:
                 continue
         self.folder = root_str
         self.expanded = valid_expanded
+        self.session.window_workspaces[self.window_id] = {
+            "folder": self.folder,
+            "expanded": sorted(self.expanded),
+            "active": self._current()["path"],
+            "activeId": self.active,
+        }
         self._watch_notes()
         self._load_tree()
 
@@ -2953,14 +3463,14 @@ class Studio(QObject):
                             if name.startswith("."):
                                 continue
                             try:
-                                if entry.is_symlink():
+                                if entry.is_symlink() or folder_ops._is_link_or_junction(Path(entry.path)):
                                     continue
                                 is_dir = entry.is_dir(follow_symlinks=False)
                                 is_file = False if is_dir else entry.is_file(follow_symlinks=False)
                             except OSError:
                                 continue
                             if is_dir or (is_file and is_searchable_note_name(name)):
-                                raw_entries.append((is_dir, name, entry.path))
+                                raw_entries.append((is_dir, name, folder_ops.canonical_path_str(entry.path)))
                 except OSError:
                     return []
                 if cancel.is_set():
@@ -3005,7 +3515,7 @@ class Studio(QObject):
             return walk_dir(folder, 0)
 
         def finished(result, error):
-            if self.retired or cancel.is_set() or generation != self._search_generation or folder != self.folder:
+            if self.retired or cancel.is_set() or generation != self._search_generation or not folder_ops.same_path(folder, self.folder):
                 return
             self._folder_searching = False
             if not error and result is not None:
@@ -3021,7 +3531,7 @@ class Studio(QObject):
             self._emit(False)
             return
         self._clear_folder_filter()
-        self.folder = str(path)
+        self.folder = folder_ops.canonical_path_str(path)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
@@ -3030,6 +3540,8 @@ class Studio(QObject):
         self._load_tree()
 
     def _load_tree(self):
+        self._tree_generation = getattr(self, "_tree_generation", 0) + 1
+        generation = self._tree_generation
         if not self.folder:
             self.files = []
             return
@@ -3037,8 +3549,9 @@ class Studio(QObject):
             self._start_subfolder_search()
             return
         folder, expanded = self.folder, set(self.expanded)
+        expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
         def scan():
-            entries = []
+            entries: list[dict[str, object]] = []
             def visit(path, depth):
                 try:
                     children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
@@ -3047,17 +3560,19 @@ class Studio(QObject):
                 for child in children:
                     if len(entries) >= 3000:
                         return
-                    if child.name.startswith(".") or child.is_symlink():
+                    if child.name.startswith(".") or folder_ops._is_link_or_junction(child):
                         continue
                     directory = child.is_dir()
                     if directory or is_searchable_note_name(child.name):
-                        entries.append({"name": child.name, "path": str(child), "directory": directory, "depth": depth, "expanded": str(child) in expanded})
-                        if directory and str(child) in expanded:
+                        child_str = folder_ops.canonical_path_str(child)
+                        is_expanded = folder_ops.normalize_path_key(child_str) in expanded_keys
+                        entries.append({"name": child.name, "path": child_str, "directory": directory, "depth": depth, "expanded": is_expanded})
+                        if directory and is_expanded:
                             visit(child, depth + 1)
             visit(folder, 0)
             return entries
         def finished(result, error):
-            if not error and folder == self.folder and not self.folder_filter.strip():
+            if not error and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder) and not self.folder_filter.strip():
                 self.files = result
         self._submit(scan, finished, False)
 
@@ -3065,14 +3580,22 @@ class Studio(QObject):
     def toggleDirectory(self, path):
         if not self.folder:
             return
-        resolved = str(local_path(path))
-        self.expanded.symmetric_difference_update({resolved})
+        canon = folder_ops.canonical_path_str(local_path(path))
+        if not canon:
+            return
+        existing = [item for item in self.expanded if folder_ops.same_path(item, canon)]
+        if existing:
+            for item in existing:
+                self.expanded.discard(item)
+        else:
+            self.expanded.add(canon)
         self._recover()
         self._emit(False)
         self._load_tree()
 
     @Slot()
     def closeFolder(self):
+        self._tree_generation = getattr(self, "_tree_generation", 0) + 1
         self._clear_folder_filter()
         self.folder = ""
         self.files = []
@@ -3431,28 +3954,314 @@ class Studio(QObject):
             if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and tab["id"] not in self.saving:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
+    def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = ""):
+        for win in list(self.session.windows.values()):
+            if win.retired:
+                continue
+            for tab in win.tabs:
+                if tab["path"] and folder_ops.matches_path_prefix(tab["path"], old_path, is_directory=is_dir):
+                    updated = folder_ops.remap_path_prefix(tab["path"], old_path, new_path, is_directory=is_dir)
+                    tab.update(path=updated, name=Path(updated).name)
+        for path_set in (self._agent_open_paths, self._agent_owned_files):
+            remapped = {folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in path_set}
+            path_set.clear()
+            path_set.update(remapped)
+        for loc_key in list(self.session.locations.keys()):
+            if folder_ops.matches_path_prefix(loc_key, old_path, is_directory=is_dir):
+                value = self.session.locations.pop(loc_key)
+                self.session.locations[folder_ops.remap_path_prefix(loc_key, old_path, new_path, is_directory=is_dir)] = value
+        self.session.pinned = list(dict.fromkeys(
+            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+            for p in self.session.pinned
+        ))
+        self.recent = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in self.recent]
+        for entries in self.session.workspace.values():
+            for entry in entries:
+                if entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
+                    entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
+        for ws in getattr(self.session, "window_workspaces", {}).values():
+            if isinstance(ws, dict):
+                if ws.get("folder") and folder_ops.matches_path_prefix(ws["folder"], old_path, is_directory=is_dir):
+                    ws["folder"] = folder_ops.remap_path_prefix(ws["folder"], old_path, new_path, is_directory=is_dir)
+                if isinstance(ws.get("expanded"), list):
+                    ws["expanded"] = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in ws["expanded"]]
+        if getattr(self.session, "startup_folder", ""):
+            self.session.startup_folder = folder_ops.remap_path_prefix(
+                self.session.startup_folder, old_path, new_path, is_directory=is_dir
+            )
+        if getattr(self.session, "startup_expanded", None):
+            self.session.startup_expanded = [
+                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+                for p in self.session.startup_expanded
+            ]
+        for spec_list_attr in ("startup_windows", "_pending_startup_windows"):
+            for spec in getattr(self.session, spec_list_attr, ()):
+                if not isinstance(spec, dict):
+                    continue
+                if spec.get("folder") and folder_ops.matches_path_prefix(spec["folder"], old_path, is_directory=is_dir):
+                    spec["folder"] = folder_ops.remap_path_prefix(spec["folder"], old_path, new_path, is_directory=is_dir)
+                if isinstance(spec.get("expanded"), list):
+                    spec["expanded"] = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in spec["expanded"]]
+                if isinstance(spec.get("paths"), list):
+                    spec["paths"] = [folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in spec["paths"]]
+                if spec.get("active"):
+                    spec["active"] = folder_ops.remap_path_prefix(spec["active"], old_path, new_path, is_directory=is_dir)
+                for entry in spec.get("tabs", ()):
+                    if isinstance(entry, dict) and entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
+                        entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
+        self.session.startup_paths = [
+            folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+            for p in self.session.startup_paths
+        ]
+        if self.session.startup_active:
+            self.session.startup_active = folder_ops.remap_path_prefix(
+                self.session.startup_active, old_path, new_path, is_directory=is_dir
+            )
+        for entry in self.session.startup_entries:
+            if entry.get("path") and folder_ops.matches_path_prefix(entry["path"], old_path, is_directory=is_dir):
+                entry["path"] = folder_ops.remap_path_prefix(entry["path"], old_path, new_path, is_directory=is_dir)
+        if message:
+            self.message = message
+        self._save_positions()
+        self._preferences(notify=False)
+        for win in list(self.session.windows.values()):
+            if win.retired:
+                continue
+            if win.folder and folder_ops.matches_path_prefix(win.folder, old_path, is_directory=is_dir):
+                win.folder = folder_ops.remap_path_prefix(win.folder, old_path, new_path, is_directory=is_dir)
+            win.expanded = {
+                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+                for p in win.expanded
+            }
+            if win._pending_seeded_find and win._pending_seeded_find.get("path"):
+                seeded_path = win._pending_seeded_find["path"]
+                if folder_ops.matches_path_prefix(seeded_path, old_path, is_directory=is_dir):
+                    win._pending_seeded_find["path"] = folder_ops.remap_path_prefix(
+                        seeded_path, old_path, new_path, is_directory=is_dir
+                    )
+            win._watch_notes(force=True)
+            win._recover()
+            if win.folder:
+                win._load_tree()
+            if win._folder_search_open and win._folder_search_query.strip():
+                win._start_folder_search()
+            win._emit()
+
+    @Slot(str)
+    def notifyMessage(self, text):
+        self.message = str(text or "")
+        self._emit(False)
+
+    @Slot(str, str, str)
+    def createFolderNote(self, parent_path, name, fmt="md"):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        kind = (fmt or "md").strip().lower().lstrip(".")
+        if kind not in ("md", "smd"):
+            self.message = "Choose Markdown (.md) or portable Super MD (.smd)."
+            self._emit(False)
+            return
+        try:
+            target_dir = folder_ops.resolve_within_open_folder(self.folder, parent_path or self.folder, allow_root=True, must_exist=True)
+            if not target_dir.is_dir():
+                raise ValueError("Choose an existing target folder.")
+            filename = folder_ops.validate_entry_name(name, is_directory=False, current_ext="." + kind)
+            target = target_dir / filename
+            folder_ops.resolve_within_open_folder(self.folder, target, allow_root=False, must_exist=False)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+        self._activation_generation += 1
+        generation = self._activation_generation
+
+        def work():
+            if target.exists() or folder_ops._is_link_or_junction(target):
+                raise ValueError("An item with that name already exists.")
+            if kind == "smd":
+                write_portable(target, "", {})
+            else:
+                atomic_write(target, b"")
+            return folder_ops.canonical_path_str(target.resolve(strict=True))
+
+        def finished(created_path, error):
+            if error or not created_path:
+                return
+            created = Path(created_path)
+            for win in list(self.session.windows.values()):
+                if not win.retired and win.folder:
+                    try:
+                        win_root = Path(folder_ops.canonical_path_str(win.folder))
+                        if folder_ops.matches_path_prefix(created_path, str(win_root), is_directory=True):
+                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created.parent))
+                            win._load_tree()
+                    except OSError:
+                        pass
+            existing = next((t for t in self.tabs if folder_ops.same_path(t["path"], created_path)), None)
+            if existing is None:
+                note = self._note(created.name, "", created_path, "", {}, kind == "smd")
+                self._agent_open_paths.add(created_path)
+                self.tabs.append(note)
+            else:
+                note = existing
+            if generation == self._activation_generation:
+                self.active = note["id"]
+            self.settings["welcomed"] = True
+            self.recent = [created_path] + [p for p in self.recent if not folder_ops.same_path(p, created_path)][:29]
+            self.message = f"Created {created.name}"
+            self._watch_notes(force=True)
+            self._preferences()
+            self.recovery_timer.start(800)
+            self._emit()
+            if generation == self._activation_generation:
+                self._focus_open_target(generation)
+
+        self._submit(work, finished, executor=self.writes)
+
+    @Slot(str, str)
+    def createSubfolder(self, parent_path, name):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        try:
+            target_dir = folder_ops.resolve_within_open_folder(self.folder, parent_path or self.folder, allow_root=True, must_exist=True)
+            if not target_dir.is_dir():
+                raise ValueError("Choose an existing target folder.")
+            dirname = folder_ops.validate_entry_name(name, is_directory=True)
+            target = target_dir / dirname
+            folder_ops.resolve_within_open_folder(self.folder, target, allow_root=False, must_exist=False)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+
+        def work():
+            if target.exists() or folder_ops._is_link_or_junction(target):
+                raise ValueError("An item with that name already exists.")
+            target.mkdir(parents=False, exist_ok=False)
+            return folder_ops.canonical_path_str(target.resolve(strict=True))
+
+        def finished(created_dir, error):
+            if error or not created_dir:
+                return
+            created = Path(created_dir)
+            for win in list(self.session.windows.values()):
+                if not win.retired and win.folder:
+                    try:
+                        win_root = Path(folder_ops.canonical_path_str(win.folder))
+                        if folder_ops.matches_path_prefix(created_dir, str(win_root), is_directory=True):
+                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created))
+                            win._recover()
+                            win._load_tree()
+                    except OSError:
+                        pass
+            self.message = f"Created folder {created.name}"
+            self._emit(False)
+
+        self._submit(work, finished, executor=self.writes)
+
+    @Slot(str, str)
+    def renameEntry(self, entry_path, name):
+        if not self.folder:
+            self.message = "Open a folder first."
+            self._emit(False)
+            return
+        try:
+            before = folder_ops.resolve_within_open_folder(self.folder, entry_path, allow_root=False, must_exist=True)
+            is_dir = before.is_dir()
+            final_name = folder_ops.validate_entry_name(
+                name,
+                is_directory=is_dir,
+                current_ext="" if is_dir else folder_ops.note_extension(before.name),
+                has_saved_target=True,
+            )
+            after = before.with_name(final_name)
+            if not folder_ops.same_path(after, before):
+                folder_ops.resolve_within_open_folder(self.folder, after, allow_root=False, must_exist=False)
+        except ValueError as error:
+            self.message = str(error)
+            self._emit(False)
+            return
+        if before.name == final_name:
+            return
+        for win in list(self.session.windows.values()):
+            for tab in win.tabs:
+                if tab["id"] in win.saving and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
+                    self.message = "Wait for the current save to finish."
+                    self._emit(False)
+                    return
+
+        self._suspend_watches_for_prefix(str(before), is_dir=is_dir)
+
+        def work():
+            if folder_ops._is_link_or_junction(after):
+                raise ValueError("Symlinks are not allowed inside the open folder.")
+            if after.exists():
+                same_inode = False
+                if before.name.casefold() == final_name.casefold():
+                    try:
+                        same_inode = os.path.samestat(before.stat(), after.stat())
+                    except OSError:
+                        same_inode = False
+                if not same_inode:
+                    raise ValueError("An item with that name already exists.")
+            before.rename(after)
+            return folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after.resolve(strict=True)), is_dir
+
+        def finished(result, error):
+            if error or not result:
+                for win in list(self.session.windows.values()):
+                    if not win.retired:
+                        win._watch_notes(force=True)
+                return
+            old_str, new_str, was_dir = result
+            self._sync_path_change(old_str, new_str, is_dir=was_dir, message=f"Renamed to {Path(new_str).name}")
+
+        self._submit(work, finished, executor=self.writes)
+
     @Slot(str, str)
     def renameNote(self, id, name):
         tab = next((t for t in self.tabs if t["id"] == id),None)
         if not tab or id in self.saving: return
-        name = name.strip()
-        if not name or name in (".","..") or any(c in name for c in '/\\\x00'):
-            self.message = "Choose a filename without path separators."; self._emit(False); return
-        suffix = Path(tab["name"]).suffix or ".md"
-        if not Path(name).suffix: name += suffix
-        if Path(name).suffix.lower() != suffix.lower():
-            self.message = "Rename keeps the note format. Use Export to change formats."; self._emit(False); return
-        if not tab["path"]: tab["name"] = name; self._recover(); self._emit(False); return
-        before = Path(tab["path"]); after = before.with_name(name)
-        if before == after: return
+        try:
+            has_saved = bool(tab.get("path"))
+            existing_ext = folder_ops.note_extension(tab["name"])
+            current_ext = existing_ext if has_saved else (existing_ext or (".smd" if tab.get("portable") else ".md"))
+            final_name = folder_ops.validate_entry_name(
+                name,
+                is_directory=False,
+                current_ext=current_ext,
+                has_saved_target=has_saved,
+            )
+        except ValueError as error:
+            self.message = str(error); self._emit(False); return
+        if not tab["path"]: tab["name"] = final_name; self._recover(); self._emit(False); return
+        before = Path(tab["path"]); after = before.with_name(final_name)
+        if before.name == final_name: return
+        if self.folder and folder_ops.matches_path_prefix(str(before), self.folder, is_directory=True):
+            self.renameEntry(str(before), final_name)
+            return
+        self._suspend_watches_for_prefix(str(before), is_dir=False)
         def work():
-            if after.exists(): raise ValueError("A file with that name already exists.")
+            if folder_ops._is_link_or_junction(after): raise ValueError("Symlinks are not allowed.")
+            if after.exists():
+                same_inode = False
+                if before.name.casefold() == final_name.casefold():
+                    try: same_inode = os.path.samestat(before.stat(), after.stat())
+                    except OSError: same_inode = False
+                if not same_inode:
+                    raise ValueError("A file with that name already exists.")
             before.rename(after)
         def finished(_,error):
-            if error: return
-            tab.update(path=str(after),name=name)
-            self.recent = [str(after) if p == str(before) else p for p in self.recent]
-            self._preferences(); self._recover(); self._emit(); self._load_tree()
+            if error:
+                for win in list(self.session.windows.values()):
+                    if not win.retired:
+                        win._watch_notes(force=True)
+                return
+            self._sync_path_change(folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after), is_dir=False, message=f"Renamed to {final_name}")
         self._submit(work,finished,executor=self.writes)
 
     @Slot(str,result=QUrl)
@@ -3472,7 +4281,7 @@ class Studio(QObject):
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
         suffix = "zip" if format == "mdzip" else format
-        return self.defaultSaveLocation(Path(self._current()["name"]).stem + "." + suffix)
+        return self.defaultSaveLocation((folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix)
 
     @Slot(str)
     def closeTab(self, id):
@@ -3493,6 +4302,7 @@ class Studio(QObject):
         if removed["content"].strip() or removed["path"] or removed.get("assets"):
             if id in self._closing_tabs:return
             self._closing_tabs.add(id)
+            self._python_jobs.cancel_tab(id)
             # Strings and encoded assets are immutable; snapshot small mutable
             # metadata/asset mappings without walking large base64 strings.
             captured=_snapshot_tab_state(removed)
@@ -3519,6 +4329,7 @@ class Studio(QObject):
         self._finish_remove_tab(id)
 
     def _finish_remove_tab(self,id):
+        self._python_jobs.cancel_tab(id)
         self.reader_edits.clear(id)
         current_index=next((i for i,tab in enumerate(self.tabs) if tab["id"]==id),None)
         if current_index is None:return
@@ -4684,6 +5495,7 @@ class Studio(QObject):
 
     def _post(self, id, command, raw):
         if self.retired:return
+        python_job = None
         try:
             if command == "save_media_native":
                 if not isinstance(raw, str) or len(raw) > 36_100_000:
@@ -4850,7 +5662,7 @@ class Studio(QObject):
                 source = args.get("source")
                 if not isinstance(document, str) or not isinstance(source, str):
                     raise ValueError("Invalid reader asset request")
-                tab = next((item for item in self.tabs if document in (item["id"], item["path"])), None)
+                tab = self._find_open_tab(document)
                 if tab is None:
                     raise ValueError("The note for this image is no longer open")
                 captured = dict(tab)
@@ -4881,6 +5693,86 @@ class Studio(QObject):
                 self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
                 self.preference_timer.start(500)
                 self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "open_external_url":
+                url = args.get("url")
+                if not isinstance(url, str) or len(url) > 4096:
+                    raise ValueError("Invalid external URL")
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme.lower() not in ("http", "https", "mailto"):
+                    raise ValueError("Unsupported external URL scheme")
+                QDesktopServices.openUrl(QUrl(url))
+                self.replied.emit(id, "true", "")
+                return
+            if command in ("open_workspace_link", "open_relative_note"):
+                raw_target = args.get("target")
+                raw_fragment = args.get("fragment")
+                if not raw_fragment:
+                    raw_fragment = args.get("heading", "")
+                if raw_fragment is None:
+                    raw_fragment = ""
+                wikilink = bool(args.get("wikilink", False)) if command == "open_workspace_link" else False
+                doc_ref = args.get("documentPath", "")
+                if (not isinstance(raw_target, str) or len(raw_target) > 4096
+                        or not isinstance(raw_fragment, str) or len(raw_fragment) > 1024):
+                    raise ValueError("Invalid workspace link")
+                source_tab = self._find_open_tab(doc_ref, canonicalize_local=True) if doc_ref else self._current()
+                if source_tab is None:
+                    raise ValueError("The note for this link is no longer open.")
+                note_path = source_tab["path"]
+                folder = self.folder
+                if self.recovery_timer.isActive():
+                    self.recovery_timer.stop()
+                self._recover()
+                if self.autosave_timer.isActive() or (
+                    self.settings.get("autosave") and note_path and self._is_dirty(source_tab)
+                ):
+                    self.autosave_timer.stop()
+                    self._autosave()
+                self._activation_generation += 1
+                link_generation = self._activation_generation
+                def resolve_work():
+                    return resolve_workspace_link(
+                        raw_target,
+                        wikilink=wikilink,
+                        note_path=note_path,
+                        workspace_folder=folder,
+                    )
+                def resolve_done(resolved_path, error):
+                    if self.retired:
+                        self.replied.emit(id, json.dumps({"opened": False}), "")
+                        return
+                    if error:
+                        self.message = str(error)
+                        self._emit(False)
+                        self.replied.emit(id, json.dumps({"opened": False, "message": str(error)}), "")
+                        return
+                    fragment = raw_fragment.strip()
+                    heading_payload = {"heading": fragment, "token": uuid.uuid4().hex} if fragment else None
+                    def opened(opened_tab, open_error):
+                        if open_error or opened_tab is None:
+                            if open_error:
+                                self.message = str(open_error)
+                                self._emit(False)
+                            self.replied.emit(
+                                id,
+                                json.dumps({"opened": False, "message": str(open_error or "Could not open note")}),
+                                "",
+                            )
+                            return
+                        self.replied.emit(
+                            id,
+                            json.dumps({"opened": True, "id": opened_tab["id"], "path": opened_tab["path"]}),
+                            "",
+                        )
+                    self._open_note(
+                        str(resolved_path),
+                        explicit=True,
+                        activation_generation=link_generation,
+                        completion_callback=opened,
+                        pending_heading=heading_payload,
+                    )
+                self._submit(resolve_work, resolve_done, False)
+                return
             if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             context=args.get("context")
@@ -4889,7 +5781,7 @@ class Studio(QObject):
                 if context["interpreter"] != (self.settings["python"] or "embedded"):raise ValueError("Python runtime changed; retry this operation")
             reference = args.get("id") or args.get("documentPath") or (context.get("document") if context else None)
             if reference:
-                tab = next((t for t in self.tabs if reference in (t["id"],t["path"])),None)
+                tab = self._find_open_tab(reference)
                 if tab is None: raise ValueError("The note for this operation is no longer open")
             if context and context["document"] not in (tab["id"],tab["path"]):raise ValueError("Python output belongs to another note")
             captured = dict(tab)
@@ -4920,11 +5812,16 @@ class Studio(QObject):
                 self.saving.add(saving_tab_id)
             python = self.settings["python"]
             export_job = None
+            python_job = None
             if command == "export_pdf_native":
                 if not output: raise ValueError("Choose a PDF destination before exporting")
                 job_id = args.get("jobId")
                 if job_id is None: job_id = uuid.uuid4().hex
                 export_job = self._export_jobs.register(job_id)
+            elif command == "run_python":
+                if self.retired or captured["id"] in self._closing_tabs:
+                    raise ValueError("The note for this operation is no longer open")
+                python_job = self._python_jobs.register(captured["id"])
             def export_result(path):
                 if agent_export_info:
                     return self._agent_export_metadata(Path(path), agent_export_info["format"])
@@ -4953,7 +5850,15 @@ class Studio(QObject):
                         results.append({"source":name,"alt":Path(image["name"]).stem})
                     return results
                 if command == "run_python":
-                    result=self._python(python,args["code"],str(Path(captured["path"]).parent) if captured.get("path") else None)
+                    assert python_job is not None
+                    try:
+                        result=self._python(python,args["code"],str(Path(captured["path"]).parent) if captured.get("path") else None,job=python_job)
+                    except python_runtime.PythonCellCancelled:
+                        return {"_cancelled": True}
+                    finally:
+                        self._python_jobs.discard(python_job)
+                    if python_job.cancelled.is_set():
+                        return {"_cancelled": True}
                     if context:
                         try:
                             self.session.python_outputs.store(args["code"],result,context)
@@ -5073,6 +5978,9 @@ class Studio(QObject):
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
+                if command == "run_python" and isinstance(result, dict) and result.get("_cancelled"):
+                    self.replied.emit(id, "null", "Python cell cancelled")
+                    return
                 if command == "export_fmd_native" and isinstance(result, dict) and result.get("_conflict"):
                     target_tab = next((t for t in self.tabs if t["id"] == captured["id"]), None)
                     if target_tab:
@@ -5172,8 +6080,13 @@ class Studio(QObject):
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
                 self.saving.discard(saving_tab_id)
                 return
+            if python_job is not None and (self.retired or getattr(self.pool, "_shutdown", False)):
+                self._python_jobs.discard(python_job)
+                return
             self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
         except Exception as error:
+            if python_job is not None:
+                self._python_jobs.discard(python_job)
             agent_export = self._agent_exports.pop(id, None)
             if agent_export:
                 if self.pending_export == agent_export.get("path"):
@@ -5224,6 +6137,20 @@ class Studio(QObject):
         if path.stat().st_size > 2_000_000: raise ValueError("Diagram source exceeds 2 MB")
         return path.read_text(encoding="utf-8")
 
+    def _find_open_tab(self, reference, *, canonicalize_local: bool = False):
+        if not isinstance(reference, str) or not reference:
+            return None
+        match = next((item for item in self.tabs if reference in (item["id"], item["path"])), None)
+        if match is not None or not canonicalize_local or "\x00" in reference:
+            return match
+        try:
+            if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
+                canonical = str(local_path(reference))
+                return next((item for item in self.tabs if item["path"] == canonical), None)
+        except OSError:
+            pass
+        return None
+
     def _fetch(self, args):
         url = args["url"]
         self._public_url(url)
@@ -5256,6 +6183,14 @@ class Studio(QObject):
             if path.is_file(): return path
         raise ValueError("Native PDF engine is not installed. Build smd-core's smd-engine binary.")
 
-    def _python(self, executable, code, folder=None):
+    def _python(self, executable, code, folder=None, job=None):
         # Explicit Run only. Python is trusted local code, not a sandbox.
-        return python_runtime.run(executable or self.settings["python"], code, cwd=folder)
+        owned_job = None
+        if job is None and hasattr(self, "_python_jobs"):
+            owned_job = self._python_jobs.register("")
+            job = owned_job
+        try:
+            return python_runtime.run(executable or self.settings["python"], code, cwd=folder, job=job)
+        finally:
+            if owned_job is not None:
+                self._python_jobs.discard(owned_job)

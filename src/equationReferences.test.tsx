@@ -163,4 +163,70 @@ describe("explicit equation tags and resolved references", () => {
     expect(prepared.content).toContain("\\ref{eq:gauss}");
     expect(prepared.content).toContain("\\tag{3.1}\\label{eq:gauss}");
   });
+
+  it("coexists with braced Python fences and native relative-link routing in MarkdownPreview", async () => {
+    invoke.mockResolvedValue({ opened: true });
+    const markdown = [
+      "Compare \\eqref{eq:helmholtz} and $E = \\eqref{eq:helmholtz}$ with [Next lecture](./Lecture2.md#derivations) and [[Appendix#Proof]]:",
+      "",
+      "$$",
+      "(\\nabla^2 + k^2) u = 0 \\tag{4.2}\\label{eq:helmholtz}",
+      "$$",
+      "",
+      "```{python, echo=false}",
+      "k = 2 * 3.14159",
+      "```",
+    ].join("\n");
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <div className="reading-scroll">
+          <div className="document-page">
+            <MarkdownPreview markdown={markdown} documentPath="/notes/Lecture1.md" python="" dark={false} />
+          </div>
+        </div>,
+      );
+    });
+
+    const eqLink = host.querySelector<HTMLAnchorElement>("a.equation-ref")!;
+    const mathEqLink = host.querySelector<HTMLAnchorElement>(".katex a[href^='#smd-eq-']")!;
+    expect(eqLink.textContent).toBe("(4.2)");
+    expect((mathEqLink.textContent || "").trim()).toBe("(4.2)");
+    expect(host.querySelector(".python-cell")).not.toBeNull();
+
+    await act(async () => {
+      eqLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      mathEqLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(invoke).not.toHaveBeenCalledWith("open_workspace_link", expect.anything());
+
+    const relLink = Array.from(host.querySelectorAll<HTMLAnchorElement>("a")).find(
+      (a) => a.textContent === "Next lecture",
+    )!;
+    await act(async () => {
+      relLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(invoke).toHaveBeenCalledWith("open_workspace_link", {
+      documentPath: "/notes/Lecture1.md",
+      target: "./Lecture2.md",
+      fragment: "derivations",
+      wikilink: false,
+    });
+
+    const wikiLink = Array.from(host.querySelectorAll<HTMLAnchorElement>("a")).find(
+      (a) => a.textContent === "Appendix#Proof",
+    )!;
+    await act(async () => {
+      wikiLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    expect(invoke).toHaveBeenCalledWith("open_workspace_link", {
+      documentPath: "/notes/Lecture1.md",
+      target: "Appendix",
+      fragment: "Proof",
+      wikilink: true,
+    });
+  });
 });

@@ -329,55 +329,127 @@ class DocumentsTest(unittest.TestCase):
 
     def test_balanced_gzip_opens_across_desktop_and_cli_readers_and_speeds_up_repeat_saves(self):
         import gzip
+        import statistics
         import time
         import agent_documents
-        from documents import decode_note_bytes
+        from documents import _B64_DECODE_CHUNK, _replace_with_windows_sharing_retry, decode_note_bytes
 
-        # Structured diagram payload representative of embedded SVG/PNG figures (~6 MB).
-        pattern = (b"<svg xmlns='http://www.w3.org/2000/svg'>" + b"<rect x='1' y='2' width='30' height='40'/>" * 12_000 + b"</svg>")
+        # Structured diagram payload representative of embedded SVG/PNG figures (~6 MB)
+        # with varied vector coordinates so compresslevel=9 exercises real LZ77 hash chains.
+        svg_paths = b"".join(
+            f"<path d='M {i % 997} {(i * 37) % 791} L {(i * 73) % 1193} {(i * 53) % 787}' "
+            f"stroke='#{(i * 2654435761) & 0xffffff:06x}' stroke-width='{(i % 4) + 1}' fill='none'/>".encode("ascii")
+            for i in range(5_000)
+        )
+        pattern = b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 800'>" + svg_paths + b"</svg>"
         assets = {
             f"assets/diagram-{idx}.svg": "data:image/svg+xml;base64," + base64.b64encode(pattern + f"<!--{idx}-->".encode()).decode("ascii")
             for idx in range(10)
         }
         markdown = "# Portable Archive Compatibility\n\n" + "\n".join(f"![Diagram {i}](assets/diagram-{i}.svg)" for i in range(10)) + "\n"
+        expected_md = markdown + "\nUpdated paragraph.\n"
+
+        def write_legacy_level9(target_path: Path, body: str, raw_assets: dict[str, str]) -> float:
+            for raw_url in raw_assets.values():
+                base64.b64decode(raw_url.split(",", 1)[1], validate=True)
+            envelope = {"format": "supermd-smd", "version": 1, "markdown": body, "assets": raw_assets}
+            fd, temporary = tempfile.mkstemp(prefix=f".{target_path.name}.", suffix=".tmp", dir=target_path.parent)
+            try:
+                with os.fdopen(fd, "wb", buffering=_B64_DECODE_CHUNK) as handle:
+                    if os.name != "nt" and hasattr(os, "fchmod"):
+                        try:
+                            st_mode = target_path.stat().st_mode
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            os.fchmod(handle.fileno(), stat.S_IMODE(st_mode))
+
+                    class _LegacyWriter:
+                        def write(self, text):
+                            stream.write(text.encode("utf-8"))
+                            return len(text)
+
+                    with gzip.GzipFile(fileobj=handle, mode="wb", filename="", mtime=0, compresslevel=9) as stream:
+                        json.dump(envelope, _LegacyWriter(), ensure_ascii=False, separators=(",", ":"))
+                    handle.flush()
+                    t_sync = time.perf_counter()
+                    os.fsync(handle.fileno())
+                _replace_with_windows_sharing_retry(temporary, target_path)
+                return (time.perf_counter() - t_sync) * 1000
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy_path = root / "legacy-lvl9.smd"
             fast_path = root / "balanced.smd"
+            sample_count = 5
+            legacy_targets = [
+                legacy_path if idx == sample_count - 1 else root / f"legacy-lvl9-{idx}.smd"
+                for idx in range(sample_count)
+            ]
+            fast_targets = [
+                fast_path if idx == sample_count - 1 else root / f"balanced-{idx}.smd"
+                for idx in range(sample_count)
+            ]
 
-            # Warm OS directory page cache, then time legacy level-9 + uncached decode save.
-            envelope = {"format": "supermd-smd", "version": 1, "markdown": markdown, "assets": assets}
-            t0 = time.perf_counter()
-            for raw_url in assets.values():
-                base64.b64decode(raw_url.split(",", 1)[1], validate=True)
-            class _LegacyWriter:
-                def write(self, text):
-                    stream.write(text.encode("utf-8"))
-                    return len(text)
+            # Warm validation cache and pre-seed per-round target files so every timed save
+            # performs an identical atomic overwrite without 0 ms same-inode AV/indexer lock overlap.
+            write_legacy_level9(legacy_targets[0], markdown, assets)
+            seed_legacy = legacy_targets[0].read_bytes()
+            for target in legacy_targets[1:]:
+                target.write_bytes(seed_legacy)
 
-            with legacy_path.open("wb") as handle:
-                with gzip.GzipFile(fileobj=handle, mode="wb", filename="", mtime=0, compresslevel=9) as stream:
-                    json.dump(envelope, _LegacyWriter(), ensure_ascii=False, separators=(",", ":"))
-                handle.flush()
-                os.fsync(handle.fileno())
-            legacy_ms = (time.perf_counter() - t0) * 1000
+            write_portable(fast_targets[0], markdown, assets)
+            seed_fast = fast_targets[0].read_bytes()
+            for target in fast_targets[1:]:
+                target.write_bytes(seed_fast)
 
-            # Prime validation once (as happens when opening or first saving the note), then time repeat save.
-            write_portable(fast_path, markdown, assets)
-            t1 = time.perf_counter()
-            write_portable(fast_path, markdown + "\nUpdated paragraph.\n", assets)
-            fast_ms = (time.perf_counter() - t1) * 1000
+            pairs: list[tuple[float, float, float]] = []
+            for idx in range(sample_count):
+                body = expected_md if idx == sample_count - 1 else f"{markdown}\nUpdated paragraph {idx}.\n"
+                leg_target = legacy_targets[idx]
+                fst_target = fast_targets[idx]
+                if idx % 2 == 0:
+                    t0 = time.perf_counter()
+                    leg_io_ms = write_legacy_level9(leg_target, body, assets)
+                    legacy_ms = (time.perf_counter() - t0) * 1000
+                    t1 = time.perf_counter()
+                    write_portable(fst_target, body, assets)
+                    fast_ms = (time.perf_counter() - t1) * 1000
+                else:
+                    t1 = time.perf_counter()
+                    write_portable(fst_target, body, assets)
+                    fast_ms = (time.perf_counter() - t1) * 1000
+                    t0 = time.perf_counter()
+                    leg_io_ms = write_legacy_level9(leg_target, body, assets)
+                    legacy_ms = (time.perf_counter() - t0) * 1000
+                pairs.append((legacy_ms, fast_ms, leg_io_ms))
 
-            self.assertLess(fast_ms, legacy_ms * 0.60,
-                            f"Expected >=40% save-time reduction vs compresslevel=9 (got {fast_ms:.1f} ms vs {legacy_ms:.1f} ms)")
+            median_legacy_ms = statistics.median(leg for leg, _, _ in pairs)
+            median_fast_ms = statistics.median(fst for _, fst, _ in pairs)
+            pair_summary = ", ".join(
+                f"#{idx + 1}(legacy={leg:.1f}ms [io={leg_io:.1f}ms], fast={fst:.1f}ms, ratio={fst / max(leg, 0.001):.2f})"
+                for idx, (leg, fst, leg_io) in enumerate(pairs)
+            )
+            self.assertLess(
+                median_fast_ms,
+                median_legacy_ms * 0.60,
+                f"Expected >=40% save-time reduction vs compresslevel=9 "
+                f"(median {median_fast_ms:.1f} ms vs {median_legacy_ms:.1f} ms; pairs=[{pair_summary}])",
+            )
 
             raw_bytes = fast_path.read_bytes()
             self.assertEqual(raw_bytes[:2], b"\x1f\x8b")
-            # mtime bytes [4:8] in RFC 1952 header must be 0 for deterministic output.
+            # mtime bytes [4:8] in RFC 1952 header must be 0 and OS byte [9] must be 255 for deterministic output.
             self.assertEqual(raw_bytes[4:8], b"\x00\x00\x00\x00")
+            self.assertEqual(raw_bytes[9], 255)
+            self.assertEqual(
+                json.loads(zlib.decompress(raw_bytes, 16 + zlib.MAX_WBITS).decode("utf-8")),
+                {"format": "supermd-smd", "version": 1, "markdown": expected_md, "assets": assets},
+            )
 
-            expected_md = markdown + "\nUpdated paragraph.\n"
             self.assertEqual(open_note(fast_path), (expected_md, assets, True))
             self.assertEqual(decode_note_bytes(raw_bytes, fast_path), (expected_md, assets, True))
 
@@ -392,5 +464,106 @@ class DocumentsTest(unittest.TestCase):
             self.assertEqual(listed["total"], 10)
             extracted = workspace.read_asset(str(fast_path), "assets/diagram-0.svg", expected_revision=inspected["revision"])
             self.assertEqual(extracted["data"], pattern + b"<!--0-->")
+
+    def test_windows_sharing_retry_uses_progressive_backoff_and_preserves_non_sharing_errors(self):
+        import documents
+        from unittest.mock import patch
+
+        sleeps: list[float] = []
+        attempts = 0
+
+        def flaky_replace(_src, _dst):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 4:
+                err = PermissionError("Sharing violation")
+                err.winerror = 32
+                raise err
+
+        with patch.object(documents.os, "name", "nt"), \
+             patch.object(documents.os, "replace", side_effect=flaky_replace), \
+             patch("time.sleep", side_effect=sleeps.append):
+            documents._replace_with_windows_sharing_retry("tmp.smd", Path("note.smd"))
+
+        self.assertEqual(attempts, 4)
+        self.assertEqual(sleeps, [0.005, 0.01, 0.02])
+
+        fatal = PermissionError("Other permission error")
+        fatal.winerror = 13
+        with patch.object(documents.os, "name", "nt"), \
+             patch.object(documents.os, "replace", side_effect=fatal), \
+             patch("time.sleep") as sleep_spy:
+            with self.assertRaises(PermissionError):
+                documents._replace_with_windows_sharing_retry("tmp.smd", Path("note.smd"))
+            sleep_spy.assert_not_called()
+
+    def test_streamed_large_recovery_drafts_release_gil(self):
+        import hashlib
+        import threading
+        import time
+
+        png = b"\x89PNG\r\n\x1a\n" + (b"\xab\xcd\xef\x01" * (24_500_000 // 4))
+        asset_url = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+        assets = {"assets/hero.png": asset_url}
+        bundle("# Draft\n![Hero](assets/hero.png)\n", assets)
+        unicode_tail = ("café — π " * 70_000) + "\ud800"
+        drafts = [{
+            "id": "tab-1",
+            "name": "large.smd",
+            "content": "# Draft\n![Hero](assets/hero.png)\n",
+            "saved": "# Saved\n![Hero](assets/hero.png)\n",
+            "assets": assets,
+            "saved_assets": dict(assets),
+            "notes": unicode_tail,
+            "flags": [True, False, None, 42, 3.5],
+        }]
+
+        with tempfile.TemporaryDirectory() as directory:
+            recovery_path = Path(directory) / "recovery.json"
+            done = threading.Event()
+            errors: list[BaseException] = []
+            gil_probe = b"x" * 4096  # >= HASHLIB_GIL_MINSIZE (2048): releases and re-acquires the GIL in C without OS sleep
+
+            def writer():
+                try:
+                    atomic_json(recovery_path, drafts)
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    done.set()
+
+            worker = threading.Thread(target=writer)
+            max_stall_ms = 0.0
+            worker.start()
+            while not done.is_set():
+                t0 = time.perf_counter()
+                hashlib.sha256(gil_probe).digest()
+                stall_ms = (time.perf_counter() - t0) * 1000.0
+                if stall_ms > max_stall_ms:
+                    max_stall_ms = stall_ms
+                time.sleep(0.0005)
+            worker.join(timeout=10)
+
+            self.assertEqual(errors, [])
+            self.assertLess(
+                max_stall_ms,
+                50.0,
+                f"Expected atomic_json on 25 MB recovery draft to release GIL cleanly (< 50 ms), got {max_stall_ms:.2f} ms",
+            )
+
+            loaded = json.loads(recovery_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded[0]["assets"], assets)
+            self.assertEqual(loaded[0]["saved_assets"], assets)
+            self.assertEqual(loaded[0]["flags"], [True, False, None, 42, 3.5])
+            self.assertEqual(loaded[0]["notes"], unicode_tail)
+
+            before = recovery_path.read_bytes()
+            with self.assertRaises(TypeError):
+                atomic_json(recovery_path, {"bad": object()})
+            cycle: list = []
+            cycle.append(cycle)
+            with self.assertRaises(ValueError):
+                atomic_json(recovery_path, cycle)
+            self.assertEqual(recovery_path.read_bytes(), before)
 
 if __name__ == "__main__": unittest.main()
