@@ -573,28 +573,23 @@ export function resolveActiveHighlightRange(host: Element | null, activeIndex: n
   const match = windowed[activeIndex];
   return match && !match.element.closest('[data-windowed-mounted="false"]') ? (readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null) : null;
 }
-
 const snapshotRange = (r: Range): RangeLike => ({ startContainer: r.startContainer, startOffset: r.startOffset, endContainer: r.endContainer, endOffset: r.endOffset });
 export function syncSearchHighlights(update: { all?: Range[] | (() => Range[]) | null; current?: Range | (() => Range | null) | null }): void {
   const registry = typeof CSS === "undefined" ? undefined : (CSS as typeof CSS & { highlights?: HighlightRegistry }).highlights;
-  if (!registry) return;
   const HighlightClass = typeof window === "undefined" ? undefined : (window as typeof window & { Highlight?: new (...ranges: Range[]) => unknown }).Highlight;
+  if (!registry) return;
   let state = highlightSyncCache.get(registry);
   if (!state) highlightSyncCache.set(registry, (state = {}));
   if (update.all === null) { registry.delete("smd-search"); state.allRef = undefined; state.allSnaps = undefined; }
   else if (update.all !== undefined && HighlightClass) {
     const allRanges = typeof update.all === "function" ? update.all() : update.all;
-    if (!(registry.has("smd-search") && (state.allRef === allRanges || (state.allSnaps?.length === allRanges.length && allRanges.every((r, i) => sameDomRange(state!.allSnaps![i], r)))))) {
-      registry.set("smd-search", new HighlightClass(...allRanges)); state.allSnaps = allRanges.map(snapshotRange);
-    }
+    if (!(registry.has("smd-search") && (state.allRef === allRanges || (state.allSnaps?.length === allRanges.length && allRanges.every((r, i) => sameDomRange(state!.allSnaps![i], r)))))) { registry.set("smd-search", new HighlightClass(...allRanges)); state.allSnaps = allRanges.map(snapshotRange); }
     state.allRef = allRanges;
   }
   if (update.current === null) { registry.delete("smd-search-current"); state.current = null; }
   else if (update.current !== undefined && HighlightClass) {
     const currentRange = typeof update.current === "function" ? update.current() : update.current;
     if (!currentRange) { registry.delete("smd-search-current"); state.current = null; }
-    else if (!registry.has("smd-search-current") || !state.current || !sameDomRange(state.current, currentRange)) {
-      registry.delete("smd-search-current"); registry.set("smd-search-current", new HighlightClass(currentRange)); state.current = snapshotRange(currentRange);
-    }
+    else if (!registry.has("smd-search-current") || !state.current || !sameDomRange(state.current, currentRange)) { registry.delete("smd-search-current"); registry.set("smd-search-current", new HighlightClass(currentRange)); state.current = snapshotRange(currentRange); }
   }
 }
