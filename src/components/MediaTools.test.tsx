@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import MediaTools from "./MediaTools";
+import MediaTools, { STALE_INSERTION_MESSAGE, SWITCHED_NOTE_IMPORT_MESSAGE } from "./MediaTools";
 import ImageViewer from "./ImageViewer";
 import LiveEditor from "./LiveEditor";
 import Editor from "./Editor";
@@ -484,5 +484,160 @@ describe("live cursor offsets, coordinate drops, and overlay registration", () =
     } finally {
       outsideShell.remove();
     }
+  });
+
+  it("remaps delayed image imports across preceding edits and cancels with clear feedback on stale ranges or tab switches", async () => {
+    let noteId = "note-delay";
+    let noteContent = "# Intro\n\nTarget paragraph.\n\nConclusion.";
+    const originalFromPoint = document.elementFromPoint;
+    vi.mocked(invoke).mockImplementation(async (command) => (command === "load_asset" ? "data:image/svg+xml,%3Csvg/%3E" : true));
+    const appliedInsert = vi.fn((text: string, point?: { from: number; to: number }) => {
+      const from = point?.from ?? noteContent.length;
+      const to = point?.to ?? from;
+      noteContent = noteContent.slice(0, from) + text + noteContent.slice(to);
+    });
+
+    const renderDelayedScene = async () => {
+      await act(async () => root.render(<div className="android-document">
+        <MediaTools documentId={noteId} content={noteContent} documentPath="/notes/delay.md" onInsert={appliedInsert} onNotice={notice} />
+        <section className="android-reading">
+          <LiveEditor key={noteId} markdown={noteContent} documentPath="/notes/delay.md" dark={false} python="" onChange={(next) => { noteContent = next; }} />
+        </section>
+      </div>));
+    };
+    await renderDelayedScene();
+
+    // 1. Delayed drop + typing BEFORE the drop point while importImageFiles awaits -> remaps offset and keeps edit intact.
+    let resolveFirstImport!: (images: Array<{ source: string; alt: string }>) => void;
+    vi.mocked(importImageFiles).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveFirstImport = resolve; }),
+    );
+
+    const introBlock = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
+    act(() => introBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+    const targetParagraphEl = host.querySelectorAll<HTMLElement>(".live-block")[1]!.querySelector("p")!;
+    await act(async () => {
+      const dropEvent = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(dropEvent, "dataTransfer", { value: { files: [file], types: ["Files"] } });
+      Object.defineProperty(dropEvent, "clientX", { value: 140 });
+      Object.defineProperty(dropEvent, "clientY", { value: 180 });
+      targetParagraphEl.dispatchEvent(dropEvent);
+    });
+    expect(importImageFiles).toHaveBeenCalledTimes(1);
+    expect(appliedInsert).not.toHaveBeenCalled();
+
+    // User continues typing in "# Intro" BEFORE Target paragraph while importImageFiles is in flight.
+    const activeArea = host.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(activeArea, "# Intro — typed while importing");
+      activeArea.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await renderDelayedScene();
+
+    const expectedRemappedOffset = noteContent.indexOf("Target paragraph.") + "Target paragraph.".length;
+    await act(async () => {
+      resolveFirstImport([{ source: "assets/delayed-live.svg", alt: "Delayed live" }]);
+    });
+    expect(appliedInsert).toHaveBeenCalledExactlyOnceWith("\n\n![Delayed live](<assets/delayed-live.svg>)\n", {
+      from: expectedRemappedOffset,
+      to: expectedRemappedOffset,
+    });
+    expect(noteContent).toContain("# Intro — typed while importing\n\nTarget paragraph.\n\n![Delayed live](<assets/delayed-live.svg>)\n\n\nConclusion.");
+    expect(notice).not.toHaveBeenCalled();
+
+    // 2. Delayed drop + overwriting across the drop point while importImageFiles awaits -> cancels safely, keeps edit intact.
+    appliedInsert.mockClear();
+    notice.mockClear();
+    await renderDelayedScene();
+
+    let resolveStaleImport!: (images: Array<{ source: string; alt: string }>) => void;
+    vi.mocked(importImageFiles).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveStaleImport = resolve; }),
+    );
+    const secondTargetEl = host.querySelectorAll<HTMLElement>(".live-block")[1]!.querySelector("p")!;
+    await act(async () => {
+      const dropEvent = new Event("drop", { bubbles: true, cancelable: true });
+      Object.defineProperty(dropEvent, "dataTransfer", { value: { files: [file], types: ["Files"] } });
+      Object.defineProperty(dropEvent, "clientX", { value: 140 });
+      Object.defineProperty(dropEvent, "clientY", { value: 180 });
+      secondTargetEl.dispatchEvent(dropEvent);
+    });
+
+    const overwrittenNote = "# Intro — typed while importing\n\nEntire middle section replaced.\n";
+    noteContent = overwrittenNote;
+    await renderDelayedScene();
+
+    await act(async () => {
+      resolveStaleImport([{ source: "assets/stale.svg", alt: "Stale" }]);
+    });
+    expect(appliedInsert).not.toHaveBeenCalled();
+    expect(noteContent).toBe(overwrittenNote);
+    expect(notice).toHaveBeenCalledExactlyOnceWith(STALE_INSERTION_MESSAGE);
+
+    // 3. Delayed drop + switching tabs before importImageFiles completes -> cancels with clear notice, keeps new tab intact.
+    appliedInsert.mockClear();
+    notice.mockClear();
+    let resolveTabSwitchImport!: (images: Array<{ source: string; alt: string }>) => void;
+    vi.mocked(importImageFiles).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveTabSwitchImport = resolve; }),
+    );
+    const firstBlockEl = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
+    await act(async () => {
+      drag(firstBlockEl, "drop", [file]);
+    });
+
+    noteId = "second-tab";
+    noteContent = "# Second tab stays untouched";
+    await renderDelayedScene();
+
+    await act(async () => {
+      resolveTabSwitchImport([{ source: "assets/wrong-tab.svg", alt: "Wrong tab" }]);
+    });
+    expect(appliedInsert).not.toHaveBeenCalled();
+    expect(noteContent).toBe("# Second tab stays untouched");
+    expect(notice).toHaveBeenCalledExactlyOnceWith(SWITCHED_NOTE_IMPORT_MESSAGE);
+
+    // 4. Native supermdCaptureInsertion -> intervening preceding edit remaps supermdInsertImages; tab switch cancels safely.
+    appliedInsert.mockClear();
+    notice.mockClear();
+    noteId = "native-capture-tab";
+    noteContent = "# Native\n\nBody paragraph.\n\nFooter.";
+    await renderDelayedScene();
+
+    const bodyBlock = host.querySelectorAll<HTMLElement>(".live-block")[1]!;
+    document.elementFromPoint = vi.fn(() => bodyBlock.querySelector("p")!);
+    await act(async () => {
+      window.supermdCaptureInsertion?.(100, 120);
+    });
+    noteContent = "Preface.\n\n" + noteContent;
+    await renderDelayedScene();
+    const expectedNativeOffset = noteContent.indexOf("Body paragraph.") + "Body paragraph.".length;
+    await act(async () => {
+      window.supermdInsertImages?.([{ source: "assets/native-remapped.png", alt: "Native remapped" }]);
+    });
+    expect(appliedInsert).toHaveBeenCalledExactlyOnceWith("\n\n![Native remapped](<assets/native-remapped.png>)\n", {
+      from: expectedNativeOffset,
+      to: expectedNativeOffset,
+    });
+
+    appliedInsert.mockClear();
+    notice.mockClear();
+    await renderDelayedScene();
+    document.elementFromPoint = vi.fn(() => host.querySelector<HTMLElement>(".live-block p")!);
+    await act(async () => {
+      window.supermdCaptureInsertion?.(100, 120);
+    });
+    noteId = "native-other-tab";
+    noteContent = "# Native Other Tab";
+    await renderDelayedScene();
+    await act(async () => {
+      window.supermdInsertImages?.([{ source: "assets/native-cancelled.png", alt: "Native cancelled" }]);
+    });
+    expect(appliedInsert).not.toHaveBeenCalled();
+    expect(noteContent).toBe("# Native Other Tab");
+    expect(notice).toHaveBeenCalledExactlyOnceWith(SWITCHED_NOTE_IMPORT_MESSAGE);
+
+    document.elementFromPoint = originalFromPoint;
   });
 });
