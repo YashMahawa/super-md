@@ -63,6 +63,10 @@ import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
+if __package__:
+    from . import studio_watchers
+else:
+    import studio_watchers
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 from core.paths import DESKTOP_DIR, resource_root
 
@@ -578,27 +582,8 @@ def _noop_done(*_):
     pass
 
 
-class _StoppedFileWatcher:
-    def files(self) -> list[str]:
-        return []
-
-    def directories(self) -> list[str]:
-        return []
-
-    def addPath(self, _path: str) -> bool:
-        return False
-
-    def addPaths(self, paths) -> list[str]:
-        return list(paths)
-
-    def removePath(self, _path: str) -> bool:
-        return False
-
-    def removePaths(self, paths) -> list[str]:
-        return list(paths)
-
-
-_STOPPED_WATCHER = _StoppedFileWatcher()
+_StoppedFileWatcher = studio_watchers._StoppedFileWatcher
+_STOPPED_WATCHER = studio_watchers._STOPPED_WATCHER
 
 
 def _matches_media_signature(mime: str, data: bytes) -> bool:
@@ -1447,223 +1432,31 @@ class Studio(QObject):
         return studio_assets_rename.active_watch_suspensions(self.session)
 
     def _is_path_suspended(self, candidate: str, suspensions=None) -> bool:
-        if not candidate:
-            return False
-        items = self._active_watch_suspensions() if suspensions is None else suspensions
-        for item in items:
-            susp_target, _susp_parent, susp_is_dir = item[0], item[1], item[2]
-            susp_new = item[4] if len(item) > 4 else ""
-            if folder_ops.matches_path_prefix(candidate, susp_target, is_directory=susp_is_dir):
-                return True
-            if susp_new and folder_ops.matches_path_prefix(candidate, susp_new, is_directory=susp_is_dir):
-                return True
-        return False
+        return studio_watchers.is_path_suspended(self, candidate, suspensions=suspensions)
 
     def _is_watch_target_suspended(self, candidate: str, suspensions=None) -> bool:
-        if not candidate:
-            return False
-        items = self._active_watch_suspensions() if suspensions is None else suspensions
-        for item in items:
-            susp_target, susp_parent, susp_is_dir = item[0], item[1], item[2]
-            susp_new = item[4] if len(item) > 4 else ""
-            if folder_ops.matches_path_prefix(candidate, susp_target, is_directory=susp_is_dir):
-                return True
-            if susp_new and folder_ops.matches_path_prefix(candidate, susp_new, is_directory=susp_is_dir):
-                return True
-            if susp_parent and folder_ops.same_path(candidate, susp_parent):
-                return True
-        return False
+        return studio_watchers.is_watch_target_suspended(self, candidate, suspensions=suspensions)
 
     def _has_session_path_reference(self, candidate: str) -> bool:
-        if not candidate:
-            return False
-        if any(folder_ops.same_path(p, candidate) for p in self.note_identities):
-            return True
-        if any(folder_ops.same_path(p, candidate) for p in self.session.pinned):
-            return True
-        if any(folder_ops.same_path(p, candidate) for p in self.recent):
-            return True
-        if any(folder_ops.same_path(k, candidate) for k in self.session.locations):
-            return True
-        for win in list(self.session.windows.values()):
-            if win.retired:
-                continue
-            if any(t["path"] and folder_ops.same_path(t["path"], candidate) for t in win.tabs):
-                return True
-        for entries in self.session.workspace.values():
-            if any(entry.get("path") and folder_ops.same_path(entry["path"], candidate) for entry in entries):
-                return True
-        return False
+        return studio_watchers.has_session_path_reference(self, candidate)
 
-    def _watch_notes(self,force=False):
-        if self.retired:return
-        active_suspensions = self._active_watch_suspensions()
-        paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
-        signature=(paths,self.folder,tuple(sorted(self.expanded)))
-        if not force and not active_suspensions and signature==self.note_watch_paths:return
-        self.note_watch_paths = None if active_suspensions else signature
-        self.note_file_stamps={path:stamp for path,stamp in self.note_file_stamps.items() if path in paths}
-        self.note_identities={
-            path: (
-                self.note_identities.get(path)
-                if self._is_path_suspended(path, active_suspensions)
-                else (file_events.identity(path) or self.note_identities.get(path))
-            )
-            for path in paths
-        }
-        targets={
-            str(target)
-            for path in paths
-            if not self._is_path_suspended(path, active_suspensions)
-            for target in (Path(path),Path(path).parent)
-            if target.exists()
-        }
-        targets.update(
-            path
-            for path in ({self.folder}|set(self.expanded))
-            if path and not self._is_watch_target_suspended(path, active_suspensions) and Path(path).is_dir()
-        )
-        if active_suspensions:
-            targets = {
-                candidate
-                for candidate in targets
-                if not self._is_watch_target_suspended(candidate, active_suspensions)
-            }
-        watched=set(self.note_watcher.files()+self.note_watcher.directories())
-        if watched-targets:self.note_watcher.removePaths(list(watched-targets))
-        if targets-watched:self.note_watcher.addPaths(list(targets-watched))
+    def _watch_notes(self, force=False):
+        return studio_watchers.watch_notes(self, force=force)
 
     def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool, new_path: str = "") -> threading.Event:
         return studio_assets_rename.suspend_watches_for_prefix(self, target_path, is_dir=is_dir, new_path=new_path)
 
-    def _external_note_changed(self,path):
-        if self.retired:return
-        local_str = str(local_path(path))
-        if self._is_watch_target_suspended(local_str):
-            return
-        self.external_paths.add(local_str)
-        self.external_timer.start(250)
+    def _external_note_changed(self, path):
+        return studio_watchers.external_note_changed(self, path)
 
     def _refresh_external_notes(self):
-        if self.retired:return
-        changed,self.external_paths=self.external_paths,set()
-        active_suspensions = self._active_watch_suspensions()
-        known = {
-            path: ident
-            for path, ident in self.note_identities.items()
-            if not self._is_path_suspended(path, active_suspensions)
-        }
-        unsuspended_changed = {
-            path for path in changed if not self._is_watch_target_suspended(path, active_suspensions)
-        }
-        if not known and not unsuspended_changed:
-            return
-        def reconciled(result,error):
-            if self.retired or error:return
-            current_suspensions = self._active_watch_suspensions()
-            reconciled_any = False
-            for old,new in result.items():
-                if self._is_path_suspended(old, current_suspensions) or (
-                    new and self._is_path_suspended(new, current_suspensions)
-                ):
-                    continue
-                if not self._has_session_path_reference(old):
-                    continue
-                reconciled_any = True
-                self.session.locationChanged.emit(old,new or "")
-            effective_changed = {
-                path for path in changed if not self._is_watch_target_suspended(path, current_suspensions)
-            }
-            self._reload_changed_content(effective_changed)
-            if self.folder and (effective_changed or reconciled_any):
-                self.session.workspace_links.invalidate(self.folder)
-            if self.folder and effective_changed and (
-                any(folder_ops.same_path(self.folder, p) for p in effective_changed)
-                or any(folder_ops.same_path(exp, p) for exp in self.expanded for p in effective_changed)
-            ):
-                self._load_tree()
-        self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
+        return studio_watchers.refresh_external_notes(self)
 
-    def _location_changed(self,old,new):
-        if self.retired:return
-        active_suspensions = self._active_watch_suspensions()
-        if self._is_path_suspended(old, active_suspensions) or (
-            new and self._is_path_suspended(new, active_suspensions)
-        ):
-            return
-        if Path(old).exists() and not (new and old!=new and old.casefold()==new.casefold()):return  # A temporary atomic-replace gap has healed.
-        if new and not Path(new).is_file():return
-        if new:
-            location = None
-            for loc_key in [k for k in list(self.session.locations) if folder_ops.same_path(k, old)]:
-                popped = self.session.locations.pop(loc_key, None)
-                if location is None and popped is not None:
-                    location = popped
-            if location:self.session.locations[new]=location
-            for tab in self.tabs:
-                if tab["path"] and folder_ops.same_path(tab["path"], old):tab.update(path=new,name=Path(new).name)
-            self.session.pinned=[new if folder_ops.same_path(path, old) else path for path in self.session.pinned]
-            self.recent=[new if folder_ops.same_path(path, old) else path for path in self.recent]
-            for paths in self.session.workspace.values():
-                for entry in paths:
-                    if entry["path"] and folder_ops.same_path(entry["path"], old):entry["path"]=new
-            self.message="Renamed note: "+Path(new).name
-        else:
-            for loc_key in [k for k in list(self.session.locations) if folder_ops.same_path(k, old)]:
-                self.session.locations.pop(loc_key, None)
-            self.session.pinned=[path for path in self.session.pinned if not folder_ops.same_path(path, old)]
-            self.recent=[path for path in self.recent if not folder_ops.same_path(path, old)]
-            for tab in list(self.tabs):
-                if not tab["path"] or not folder_ops.same_path(tab["path"], old):continue
-                if self._is_dirty(tab):
-                    draft={**tab,"path":"","name":"Recovered "+tab["name"],"saved":"","conflict":False}
-                    self.session.drafts.setdefault("deleted-notes",[]).append(draft)
-                    tab.update(path="",name=draft["name"],conflict=False)
-                self._remove_tab(tab["id"])
-            self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
-        if self.folder:
-            self.session.workspace_links.invalidate(self.folder)
-        self._preferences();self._recover();self._emit()
+    def _location_changed(self, old, new):
+        return studio_watchers.location_changed(self, old, new)
 
-    def _reload_changed_content(self,changed):
-        self._watch_notes(force=True)
-        active_suspensions = self._active_watch_suspensions()
-        for tab in self.tabs:
-            path=tab["path"]
-            if (
-                not path
-                or self._is_path_suspended(path, active_suspensions)
-                or not ({path,str(Path(path).parent)} & changed)
-                or tab["id"] in self.saving
-            ):
-                continue
-            was_dirty=self._is_dirty(tab)
-            try:
-                stat_result=Path(path).stat();stamp=(stat_result.st_mtime_ns,stat_result.st_size)
-            except OSError:continue
-            if not was_dirty and self.note_file_stamps.get(path)==stamp:continue
-            id,expected=tab["id"],tab["saved"]
-            def finished(result,error,id=id,expected=expected,path=path,stamp=stamp,was_dirty=was_dirty):
-                current=next((note for note in self.tabs if note["id"]==id),None)
-                if error or not current:return
-                self.note_file_stamps[path]=stamp
-                content,assets,portable=result
-                if was_dirty or self._is_dirty(current) or current.get("conflict"):
-                    if content!=current["saved"] or assets!=current.get("saved_assets",{}):
-                        current["conflict"]=True
-                        self.message="This file changed outside Super MD. Autosave is paused for this tab."
-                        self._emit(False)
-                    return
-                if current["content"]!=expected:return
-                if content==expected and assets==current["assets"]:return
-                old_assets=current["assets"]
-                assets_changed=assets!=old_assets
-                merged_assets=_preserve_unchanged_assets(old_assets,assets)
-                current.update(content=content,saved=content,assets=merged_assets,saved_assets=dict(merged_assets),assets_dirty=False,portable=portable,conflict=False)
-                if assets_changed:self.session.reader_assets.revoke_tab(self.window_id, id)
-                self.message="Reloaded externally updated note"
-                self._emit(load=id==self.active)
-            self._submit(lambda path=path:open_note(Path(path)),finished,False)
+    def _reload_changed_content(self, changed):
+        return studio_watchers.reload_changed_content(self, changed)
 
     def _schedule_theme(self,*_):
         self.theme_debounce.start(150)
