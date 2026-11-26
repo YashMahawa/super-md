@@ -60,8 +60,9 @@ from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
+from core.paths import DESKTOP_DIR, resource_root
 
-ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
+ROOT = resource_root()
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
@@ -127,7 +128,7 @@ def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen
             console_python = executable_path.with_name("python.exe")
             if console_python.is_file():
                 executable_path = console_python
-        script = Path(cli_script or Path(__file__).with_name("agent_cli.py")).expanduser().resolve()
+        script = Path(cli_script or DESKTOP_DIR / "agent_cli.py").expanduser().resolve()
         command = str(executable_path)
         args = [str(script), "mcp"]
     for root_path in _normalize_mcp_roots(roots):
@@ -2114,12 +2115,10 @@ class Studio(QObject):
                      "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
                      "## MCP client configuration\n\n```json\n" + self.agentSetupInstructions + "\n```\n\n"
                      "Live access is off by default. Enable it in Super MD Settings → AI agents before starting the MCP server. "
-                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n")
-            if self.cloudAgentConfigured and self.cloudConnectorUrl:
-                guide += ("\n## Cloud relay connector\n\n"
-                          "Use this Streamable HTTP MCP endpoint with the intended MCP client. It is a bearer capability; "
-                          "keep this guide private and share it only with that client.\n\n"
-                          "```text\n" + self.cloudConnectorUrl + "\n```\n")
+                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n\n"
+                     "## Cloud relay connector\n\n"
+                     "Cloud relay connector URLs are secret bearer credentials and are not included in saved setup guides. "
+                     "To connect a cloud MCP client, open Super MD Settings → AI agents and use Copy MCP connector URL to get your own connector.\n")
             atomic_write(path, guide.encode("utf-8"))
             self._agent_error = ""
             self.message = f"Setup guide saved to {path}"
@@ -4326,24 +4325,90 @@ class Studio(QObject):
             self._sync_path_change(folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after), is_dir=False, message=f"Renamed to {final_name}")
         self._submit(work,finished,executor=self.writes)
 
-    @Slot(str,result=QUrl)
-    def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
-        return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
+    @staticmethod
+    def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw_path or "").strip())
+        if not cleaned:
+            return None
+        try:
+            candidate = Path(cleaned).expanduser()
+            if reject_links and folder_ops._is_link_or_junction(candidate):
+                return None
+            if reject_links:
+                resolved = Path(folder_ops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
+                return Path(folder_ops.canonical_path_str(resolved)) if resolved.is_dir() else None
+            return candidate if candidate.is_dir() else None
+        except OSError:
+            return None
 
-    @Slot(str,result=QUrl)
-    def defaultSaveAsLocation(self,name):
-        current_path = self._current().get("path")
+    @classmethod
+    def _downloads_fallback_directory(cls) -> Path:
+        raw_downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        downloads = cls._existing_save_directory(raw_downloads)
+        if downloads is not None:
+            return downloads
+        home = cls._existing_save_directory(Path.home())
+        if home is not None:
+            return home
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw_downloads or "").strip()) or str(Path.home())
+        return Path(cleaned).expanduser()
+
+    def _default_output_directory(self) -> Path:
+        raw = (
+            self.settings.get("newNoteLocation")
+            or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+            or str(Path.home())
+        )
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw or "").strip()) or str(Path.home())
+        return Path(cleaned).expanduser()
+
+    def _note_save_directory(self) -> Path:
+        configured = self._existing_save_directory(self.settings.get("newNoteLocation"))
+        if configured is not None:
+            return configured
+        open_folder = self._existing_save_directory(self.folder, reject_links=True)
+        if open_folder is not None:
+            return open_folder
+        return self._downloads_fallback_directory()
+
+    def _save_as_directory(self) -> Path:
+        current_path = self._current().get("path") if self.tabs else ""
         if current_path:
-            parent = Path(current_path).parent
-            if parent.is_dir():
-                return QUrl.fromLocalFile(str(parent / Path(name).name))
-        return self.defaultSaveLocation(name)
+            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path).strip())
+            if cleaned_current:
+                parent = self._existing_save_directory(Path(cleaned_current).expanduser().parent)
+                if parent is not None:
+                    return parent
+        return self._note_save_directory()
+
+    @Slot(result=QUrl)
+    def defaultSaveFolder(self):
+        return QUrl.fromLocalFile(str(self._note_save_directory()))
+
+    @Slot(str, result=QUrl)
+    def defaultSaveLocation(self, name):
+        leaf = folder_ops._pure_path(str(name or "")).name or "Untitled.md"
+        return QUrl.fromLocalFile(str(self._note_save_directory() / leaf))
+
+    @Slot(result=QUrl)
+    def defaultSaveAsFolder(self):
+        return QUrl.fromLocalFile(str(self._save_as_directory()))
+
+    @Slot(str, result=QUrl)
+    def defaultSaveAsLocation(self, name):
+        leaf = folder_ops._pure_path(str(name or "")).name or "Untitled.md"
+        return QUrl.fromLocalFile(str(self._save_as_directory() / leaf))
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
         suffix = "zip" if format == "mdzip" else format
-        return self.defaultSaveLocation((folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix)
+        filename = (folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix
+        return QUrl.fromLocalFile(str(self._default_output_directory() / folder_ops._pure_path(filename).name))
+
+    @Slot(str, result=QUrl)
+    def defaultThemeExportLocation(self, name):
+        leaf = folder_ops._pure_path(str(name or "")).name or "My theme.supermd-theme.json"
+        return QUrl.fromLocalFile(str(self._default_output_directory() / leaf))
 
     @Slot(str)
     def closeTab(self, id):
