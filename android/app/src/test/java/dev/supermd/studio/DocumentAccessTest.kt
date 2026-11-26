@@ -1076,6 +1076,199 @@ class DocumentAccessTest {
         assertTrue("ExternalStorage outside note must remain write-blocked", model.documentWriteNeedsAccess(outsideId))
     }
 
+    @Test
+    fun unconfirmedTreeCandidateFromWriteResolutionCannotSelfPromoteOrAffectLaterGrants() {
+        val opaqueAuthority = "dev.supermd.test.opaque.unconfirmed.${System.nanoTime()}"
+        val opaqueProvider = StartupGuardDocumentProvider(root).also {
+            it.attach(app, opaqueAuthority)
+        }
+        ShadowContentResolver.registerProviderInternal(opaqueAuthority, opaqueProvider)
+
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val persistedUris = mutableMapOf<Uri, Int>()
+        val enforcingApp = StartupEnforcingApplication(app, grantedUris, persistedUris)
+        opaqueProvider.permissionChecker = { uri, required ->
+            enforcingApp.checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(), required) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+
+        val persistRw = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+
+        val vaultTreeUri = DocumentsContract.buildTreeDocumentUri(opaqueAuthority, "vault_root")
+        val confirmedChildPlainUri = opaqueProvider.putDoc("confirmed_member", "# Confirmed Member\n", parentId = "vault_root")
+        val unconfirmedRegrantPlainUri = opaqueProvider.putDoc("outside_regrant_doc", "# Regrant Baseline\n", parentId = null)
+        val unconfirmedOpenPlainUri = opaqueProvider.putDoc("outside_open_doc", "# Open Baseline\n", parentId = null)
+        val unconfirmedProbePlainUri = opaqueProvider.putDoc("outside_probe_doc", "# Probe Baseline\n", parentId = null)
+
+        val unconfirmedRegrantTreeUri = DocumentsContract.buildDocumentUriUsingTree(vaultTreeUri, "outside_regrant_doc")
+        val unconfirmedOpenTreeUri = DocumentsContract.buildDocumentUriUsingTree(vaultTreeUri, "outside_open_doc")
+        val unconfirmedProbeTreeUri = DocumentsContract.buildDocumentUriUsingTree(vaultTreeUri, "outside_probe_doc")
+
+        val workspaceKey = "unconfirmed-tree-isolation-${System.nanoTime()}".also(workspaceKeys::add)
+        val store = ViewModelStore().also(viewModels::add)
+        val model = StudioViewModel(enforcingApp, workspaceKey).also {
+            it.readerFlushRequester = { true }
+            store.put("model", it)
+        }
+        model.reading(autosave = false)
+
+        // Open confirmed_member, outside_regrant_doc, and outside_probe_doc with standalone RW first, then revoke.
+        listOf(confirmedChildPlainUri, unconfirmedRegrantPlainUri, unconfirmedProbePlainUri).forEach {
+            enforcingApp.grantPersistable(it, persistRw)
+            model.open(it)
+            await { model.state.value.tabs.any { tab -> tab.uri != null && sameDocument(Uri.parse(tab.uri), it) } }
+        }
+        val confirmedTabId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), confirmedChildPlainUri) }.id
+        val regrantTabId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), unconfirmedRegrantPlainUri) }.id
+        val probeTabId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), unconfirmedProbePlainUri) }.id
+
+        val regrantDraft = "# Regrant Baseline\nUnsaved local draft during read regrant.\n"
+        val probeDraft = "# Probe Baseline\nUnsaved local draft during failed probe.\n"
+        model.edit(regrantTabId, regrantDraft)
+        model.edit(probeTabId, probeDraft)
+
+        enforcingApp.revokeAll(confirmedChildPlainUri)
+        enforcingApp.revokeAll(unconfirmedRegrantPlainUri)
+        enforcingApp.revokeAll(unconfirmedProbePlainUri)
+        model.refreshExternal(immediate = true)
+        await {
+            !model.isRefreshExternalActive() &&
+                model.documentWriteNeedsAccess(confirmedTabId) &&
+                model.documentWriteNeedsAccess(regrantTabId) &&
+                model.documentWriteNeedsAccess(probeTabId)
+        }
+
+        // 1. Failed write probe on both note-open and read-regrant (including provider rw rejection):
+        //    write resolution returns the unconfirmed tree-qualified URI; failed verification must retain blocked
+        //    state AND leave zero poisoned membership entries behind for when vaultTreeUri is later granted.
+        enforcingApp.downgradeToReadOnly(unconfirmedProbePlainUri)
+        opaqueProvider.writeFailureDocIds.add("outside_probe_doc")
+
+        // Trigger read-regrant request on probeTabId, then supply unconfirmedProbeTreeUri while plain doc is read-only.
+        model.open(unconfirmedProbePlainUri)
+        await { model.state.value.active.id == probeTabId }
+        assertTrue("Read-only reopen must keep probe note write-blocked", model.documentWriteNeedsAccess(probeTabId))
+
+        enforcingApp.revokeAll(unconfirmedProbePlainUri)
+        model.open(unconfirmedProbePlainUri)
+        await { model.documentAccessRequests.value?.noteId == probeTabId }
+        val probeReadRequest = model.documentAccessRequests.value!!
+        assertFalse(probeReadRequest.writing)
+
+        enforcingApp.downgradeToReadOnly(unconfirmedProbePlainUri)
+        // Verify DocumentAccess write resolution on unconfirmedProbeTreeUri returns the unconfirmed tree-qualified URI.
+        val standaloneProbeAccess = DocumentAccess(enforcingApp)
+        assertEquals(unconfirmedProbeTreeUri, standaloneProbeAccess.resolve(unconfirmedProbeTreeUri, writing = true))
+
+        model.restoreDocumentAccess(probeReadRequest, unconfirmedProbeTreeUri)
+        await { model.documentAccessRequests.value == null }
+        assertEquals(probeDraft, model.state.value.tabs.single { it.id == probeTabId }.content)
+        assertTrue(
+            "Failed write probe during read-regrant must retain blocked write state",
+            model.documentWriteNeedsAccess(probeTabId),
+        )
+
+        // Also run note-open on unconfirmedProbeTreeUri while blocked and read-only (write probe fails).
+        model.open(unconfirmedProbeTreeUri)
+        await { model.state.value.active.id == probeTabId }
+        assertTrue(
+            "Failed write probe during blocked note-open must retain blocked write state",
+            model.documentWriteNeedsAccess(probeTabId),
+        )
+
+        // 2. Now grant RW to vaultTreeUri and clear the provider rw rejection! Even though OS URI permission
+        //    checks allow tree/vault_root/*, unconfirmed candidates must NOT promote themselves in either
+        //    note-open or read-regrant, AND the earlier failed probes on outside_probe_doc must NOT affect
+        //    this new vaultTreeUri grant!
+        opaqueProvider.writeFailureDocIds.remove("outside_probe_doc")
+        enforcingApp.grantPersistable(vaultTreeUri, persistRw)
+
+        // 2a. Note-open path with unconfirmedOpenTreeUri: write resolution returns unconfirmedOpenTreeUri,
+        //     which must NOT self-promote into confirmed tree membership or unblocked write state (both on
+        //     initial open and when reopening an already-blocked draft across failed and open probes).
+        assertEquals(unconfirmedOpenTreeUri, standaloneProbeAccess.resolve(unconfirmedOpenTreeUri, writing = true))
+        model.open(unconfirmedOpenTreeUri)
+        await { model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), unconfirmedOpenPlainUri) } }
+        val openTabId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), unconfirmedOpenPlainUri) }.id
+        assertTrue(
+            "Unconfirmed tree-qualified URI opened under RW folder grant must not self-promote to writable",
+            model.documentWriteNeedsAccess(openTabId),
+        )
+        val openDraft = "# Open Baseline\nDraft kept while unconfirmed tree URI remains blocked.\n"
+        model.edit(openTabId, openDraft)
+        opaqueProvider.writeFailureDocIds.add("outside_open_doc")
+        model.open(unconfirmedOpenTreeUri)
+        await { model.state.value.active.id == openTabId }
+        assertEquals(openDraft, model.state.value.tabs.single { it.id == openTabId }.content)
+        assertTrue(
+            "Blocked note-open with failed rw probe on unconfirmed tree URI must retain blocked state",
+            model.documentWriteNeedsAccess(openTabId),
+        )
+        opaqueProvider.writeFailureDocIds.remove("outside_open_doc")
+        model.open(unconfirmedOpenTreeUri)
+        await { model.state.value.active.id == openTabId }
+        assertTrue(
+            "Blocked note-open on unconfirmed tree URI must still retain blocked state without tree enumeration proof",
+            model.documentWriteNeedsAccess(openTabId),
+        )
+        assertTrue(model.requestWriteAccessIfBlocked(openTabId, explicit = true))
+        val explicitWriteRequest = model.documentAccessRequests.value!!
+        assertTrue(explicitWriteRequest.writing)
+        model.restoreDocumentAccess(explicitWriteRequest, unconfirmedOpenTreeUri)
+        await { model.documentAccessRequests.value?.detail != null }
+        assertTrue(
+            "Write-regrant with unconfirmed tree URI must reject self-promotion and retain blocked state",
+            model.documentWriteNeedsAccess(openTabId),
+        )
+        model.dismissDocumentAccess()
+
+        // 2b. Read-regrant path with unconfirmedRegrantTreeUri while vaultTreeUri holds RW:
+        //     write resolution returns unconfirmedRegrantTreeUri, which must NOT self-promote or clear blocked state.
+        model.open(unconfirmedRegrantPlainUri)
+        await { model.documentAccessRequests.value?.noteId == regrantTabId }
+        val regrantReadRequest = model.documentAccessRequests.value!!
+        assertFalse(regrantReadRequest.writing)
+
+        enforcingApp.downgradeToReadOnly(unconfirmedRegrantPlainUri)
+        assertEquals(unconfirmedRegrantTreeUri, standaloneProbeAccess.resolve(unconfirmedRegrantTreeUri, writing = true))
+        model.restoreDocumentAccess(regrantReadRequest, unconfirmedRegrantTreeUri)
+        await { model.documentAccessRequests.value == null }
+        assertEquals(regrantDraft, model.state.value.tabs.single { it.id == regrantTabId }.content)
+        assertTrue(
+            "Unconfirmed tree-qualified writeCandidate during read-regrant must not self-promote or unblock",
+            model.documentWriteNeedsAccess(regrantTabId),
+        )
+
+        // 2c. Applying vaultTreeUri as the workspace folder unblocks ONLY truly enumerated children (confirmed_member),
+        //     confirming none of the unconfirmed candidates poisoned the membership cache to affect vaultTreeUri.
+        enforcingApp.revokeAll(unconfirmedProbePlainUri)
+        enforcingApp.revokeAll(unconfirmedRegrantPlainUri)
+        model.setFolder(vaultTreeUri)
+        await {
+            model.state.value.folder == vaultTreeUri.toString() &&
+                !model.documentWriteNeedsAccess(confirmedTabId)
+        }
+        assertTrue(
+            "Earlier failed probe on outside_probe_doc must not affect later vaultTreeUri grant",
+            model.documentWriteNeedsAccess(probeTabId),
+        )
+        assertTrue(
+            "Earlier unconfirmed read-regrant on outside_regrant_doc must not affect vaultTreeUri grant",
+            model.documentWriteNeedsAccess(regrantTabId),
+        )
+        assertTrue(
+            "Earlier unconfirmed note-open on outside_open_doc must not affect vaultTreeUri grant",
+            model.documentWriteNeedsAccess(openTabId),
+        )
+
+        // Attempting to open plain outside_probe_doc after revoking its standalone grant must NOT resolve via vaultTreeUri.
+        model.open(unconfirmedProbePlainUri)
+        await { model.documentAccessRequests.value?.noteId == probeTabId }
+        assertEquals(probeDraft, model.state.value.tabs.single { it.id == probeTabId }.content)
+    }
+
     private fun newModel(): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = "document-access-${System.nanoTime()}".also(workspaceKeys::add)
@@ -1247,6 +1440,7 @@ private class StartupGuardDocumentProvider(private val rootDirectory: File) : Co
     private lateinit var providerAuthority: String
     private val docs = linkedMapOf<String, DocEntry>()
     val ordinaryFailureByDocId = linkedMapOf<String, () -> Throwable>()
+    val writeFailureDocIds = linkedSetOf<String>()
     var permissionChecker: ((Uri, Int) -> Boolean)? = null
 
     fun attach(context: Context, authority: String) {
@@ -1352,6 +1546,9 @@ private class StartupGuardDocumentProvider(private val rootDirectory: File) : Co
             }
         }
         val docId = DocumentsContract.getDocumentId(uri)
+        if (mode != "r" && docId in writeFailureDocIds) {
+            throw SecurityException("Provider denied write probe for $uri")
+        }
         ordinaryFailureByDocId[docId]?.invoke()?.let { throw it }
         val entry = docs[docId] ?: throw java.io.FileNotFoundException("Missing $docId")
         val flags = when (mode) {

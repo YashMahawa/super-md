@@ -311,6 +311,12 @@ internal class DocumentAccess(
         is SafReadAccess.PendingTreeMembership -> access.directDocumentUri != null
         SafReadAccess.Denied -> false
     }
+
+    fun hasAnyReadOrPendingGrant(
+        uri: Uri,
+        activeFolderUri: Uri? = activeFolderUriProvider?.invoke(),
+        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = isConfirmedTreeChildProvider,
+    ): Boolean = resolveReadAccess(uri, activeFolderUri, isConfirmedTreeChild) != SafReadAccess.Denied
     fun persist(uri: Uri) {
         if (uri.scheme == "content") synchronized(persistPermissionsLock) {
             if (TestAuthorityGrants.isRegistered(uri.authority)) {

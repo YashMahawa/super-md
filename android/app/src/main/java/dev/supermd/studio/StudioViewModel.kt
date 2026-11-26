@@ -156,6 +156,13 @@ private val pythonExecution = kotlinx.coroutines.sync.Mutex()
 class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
     private val confirmedTreeDocumentKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private fun isConfirmedTreeChild(treeUri: Uri, documentId: String): Boolean {
+        val rootId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+        if (rootId != null && documentId == rootId) return true
+        val key = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
+        return key in confirmedTreeDocumentKeys ||
+            runCatching { mutable.value.files.any { !it.directory && it.uri == key } }.getOrDefault(false)
+    }
     private val documentAccess = DocumentAccess(
         context = app,
         activeFolderUriProvider = { runCatching { mutable.value.folder?.let(Uri::parse) }.getOrNull() },
@@ -165,11 +172,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     ?: recentMutable.value.firstOrNull { !it.relative.isNullOrEmpty() && sameDocument(Uri.parse(it.uri), target) }?.relative
             }.getOrNull()
         },
-        isConfirmedTreeChildProvider = { treeUri, documentId ->
-            val key = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
-            key in confirmedTreeDocumentKeys ||
-                runCatching { mutable.value.files.any { !it.directory && it.uri == key } }.getOrDefault(false)
-        },
+        isConfirmedTreeChildProvider = ::isConfirmedTreeChild,
         onConfirmedTreeKeys = { keys -> confirmedTreeDocumentKeys.addAll(keys) },
     )
     internal var workspaceLinks = WorkspaceLinkCache(ContentResolverTreeLister(app))
@@ -315,15 +318,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val target = documentAccess.resolve(chosen, request.writing)
                 // Verify without truncating or writing any bytes. The existing
                 // draft and its saved baseline remain authoritative.
+                if (request.writing && DocumentsContract.isTreeUri(target) && !documentAccess.hasWriteGrant(target)) {
+                    throw SecurityException("Android did not grant write access to this file")
+                }
                 resolver.openFileDescriptor(target, if (request.writing) "rw" else "r")?.use { }
                     ?: error("Android did not grant access to this file")
                 if (request.writing) {
-                    canonicalTreeDocumentKey(target)?.let(confirmedTreeDocumentKeys::add)
                     target to true
                 } else {
-                    canonicalTreeDocumentKey(target)?.let(confirmedTreeDocumentKeys::add)
                     val writeCandidate = documentAccess.resolve(chosen, writing = true)
-                    canonicalTreeDocumentKey(writeCandidate)?.let(confirmedTreeDocumentKeys::add)
                     val canWrite = documentAccess.hasWriteGrant(writeCandidate) &&
                         runCatching { resolver.openFileDescriptor(writeCandidate, "rw")?.use { true } == true }.getOrDefault(false)
                     (if (canWrite) writeCandidate else target) to canWrite
@@ -365,20 +368,33 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         )
                     }
                 }
-                if (writeRestored) clearDocumentAccessFailure(request.uri)
-                else promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) }
+                if (writeRestored) {
+                    clearDocumentAccessFailure(request.uri)
+                    clearDocumentAccessFailure(resolved.toString())
+                } else {
+                    markDocumentWriteBlocked(resolved.toString())
+                    promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) || sameDocumentUri(it, resolved.toString()) }
+                }
                 accessRequestsMutable.value = null
                 mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
                 if (barrierRejected) readerBarrierFailed()
                 if (note.dirty && writeRestored) scheduleAutosave(note.id)
             } else {
-                if (writeRestored) clearDocumentAccessFailure(request.uri)
-                else promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) }
+                if (writeRestored) {
+                    clearDocumentAccessFailure(request.uri)
+                    clearDocumentAccessFailure(resolved.toString())
+                } else {
+                    markDocumentWriteBlocked(resolved.toString())
+                    promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) || sameDocumentUri(it, resolved.toString()) }
+                }
                 accessRequestsMutable.value = null
                 open(resolved, pendingHeading = carriedHeading)
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
         catch (error: Exception) {
+            if (request.writing) {
+                markDocumentWriteBlocked(request.uri)
+            }
             val detail = if (isDocumentAccessFailure(error)) "This file is still read-only. Your draft is safe; choose the original file with write access or save a copy." else error.message ?: "Access could not be restored"
             accessRequestsMutable.value = request.copy(detail = detail)
         }
@@ -520,7 +536,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun remember(note: Note) {
         val uri = note.uri ?: return
-        canonicalTreeDocumentKey(Uri.parse(uri))?.let(confirmedTreeDocumentKeys::add)
         storeRecent(listOf(RecentNote(note.name,uri,note.relative,recentMutable.value.any {sameDocumentUri(it.uri,uri)&&it.pinned}))+recentMutable.value.filterNot {sameDocumentUri(it.uri,uri)})
     }
     private fun storeRecent(notes:List<RecentNote>) {
@@ -971,9 +986,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         activeStudioViewModels.add(this)
         listedRelative = mutable.value.folderRelative
         val restoredFromSnapshot = snapshot.exists()
-        if (restoredFromSnapshot) {
-            mutable.value.tabs.mapNotNull { it.uri?.let(Uri::parse)?.let(::canonicalTreeDocumentKey) }.forEach(confirmedTreeDocumentKeys::add)
-        }
         mutable.value.tabs.filter { it.portable && it.uri != null && !it.assetsDirty }.forEach { recordPortableBaseline(it.id, it.assetDirectory) }
         prefs.registerOnSharedPreferenceChangeListener(preferencesChanged)
         observeActive()
@@ -2227,8 +2239,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         rawRenamed
                     }
                     documentAccess.persist(effectiveRenamed)
-                    canonicalTreeDocumentKey(parsedUri)?.let(confirmedTreeDocumentKeys::remove)
-                    canonicalTreeDocumentKey(effectiveRenamed)?.let(confirmedTreeDocumentKeys::add)
+                    val hadConfirmedSource = listOfNotNull(
+                        canonicalTreeDocumentKey(parsedUri),
+                        canonicalTreeDocumentKey(target),
+                    ).any(confirmedTreeDocumentKeys::remove)
+                    if (hadConfirmedSource) {
+                        canonicalTreeDocumentKey(effectiveRenamed)?.let(confirmedTreeDocumentKeys::add)
+                    }
                     effectiveRenamed.toString()
                 }
             }
@@ -2326,7 +2343,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                 )
                         }
                         if (!inSelectedTree) return@mapNotNull null
-                        canonicalTreeDocumentKey(scopedTarget)?.let(confirmedTreeDocumentKeys::add)
+                        if (passLazy.isInitialized()) {
+                            confirmedTreeDocumentKeys.addAll(passLazy.value.confirmedTreeKeys)
+                        }
                         val writable = documentAccess.hasWriteGrant(scopedTarget) &&
                             runCatching { resolver.openFileDescriptor(scopedTarget, "rw")?.use { true } == true }.getOrDefault(false)
                         if (writable) raw to scopedTarget else null
@@ -2471,9 +2490,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 var loaded = loadNoteForOpen(uri, relative, externalIntentFlags, externalCaller)
                 val loadedUriStr = loaded.uri
                 val parsedLoaded = loadedUriStr?.let(Uri::parse)
-                if (externalIntentFlags == null && parsedLoaded != null) {
-                    canonicalTreeDocumentKey(parsedLoaded)?.let(confirmedTreeDocumentKeys::add)
-                }
                 val wasBlocked = writeIsBlocked(uri.toString()) || (loadedUriStr != null && writeIsBlocked(loadedUriStr))
                 if (parsedLoaded == null || !parsedLoaded.scheme.equals("content", ignoreCase = true)) {
                     loaded to DocumentWriteOpenState.UNCHANGED
@@ -2484,9 +2500,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         documentAccess.resolve(parsedLoaded, writing = true)
                     } else {
                         parsedLoaded
-                    }
-                    if (externalIntentFlags == null) {
-                        canonicalTreeDocumentKey(writeTarget)?.let(confirmedTreeDocumentKeys::add)
                     }
                     val writeVerified = callerAllowsWrite &&
                         documentAccess.hasWriteGrant(writeTarget) &&
@@ -2506,25 +2519,37 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     } else {
                         parsedLoaded
                     }
-                    if (externalIntentFlags == null) {
-                        canonicalTreeDocumentKey(writeTarget)?.let(confirmedTreeDocumentKeys::add)
-                    }
-                    val readOnlyGrant = parsedLoaded.authority != ownShareAuthority &&
-                        documentAccess.hasReadGrant(parsedLoaded) &&
+                    val readOnlyOrUnconfirmedGrant = parsedLoaded.authority != ownShareAuthority &&
+                        documentAccess.hasAnyReadOrPendingGrant(parsedLoaded) &&
                         !documentAccess.hasWriteGrant(writeTarget)
-                    if (readOnlyGrant) {
+                    if (readOnlyOrUnconfirmedGrant) {
                         loaded to DocumentWriteOpenState.BLOCKED
-                    } else {
-                        if (externalIntentFlags == null && documentAccess.hasWriteGrant(writeTarget) && writeTarget.toString() != loadedUriStr) {
+                    } else if (externalIntentFlags == null && documentAccess.hasWriteGrant(writeTarget) && writeTarget.toString() != loadedUriStr) {
+                        val writeVerified = runCatching {
+                            resolver.openFileDescriptor(writeTarget, "rw")?.use { true } == true
+                        }.getOrDefault(false)
+                        if (writeVerified) {
                             loaded = loaded.copy(uri = writeTarget.toString())
+                            loaded to DocumentWriteOpenState.UNCHANGED
+                        } else if (parsedLoaded.authority != ownShareAuthority && !documentAccess.hasWriteGrant(parsedLoaded)) {
+                            loaded to DocumentWriteOpenState.BLOCKED
+                        } else {
+                            loaded to DocumentWriteOpenState.UNCHANGED
                         }
+                    } else {
                         loaded to DocumentWriteOpenState.UNCHANGED
                     }
                 }
             }
             when (writeOpenState) {
-                DocumentWriteOpenState.RESTORED -> clearDocumentAccessFailure(note.uri ?: uri.toString())
-                DocumentWriteOpenState.BLOCKED -> markDocumentWriteBlocked(note.uri ?: uri.toString())
+                DocumentWriteOpenState.RESTORED -> {
+                    clearDocumentAccessFailure(uri.toString())
+                    note.uri?.let(::clearDocumentAccessFailure)
+                }
+                DocumentWriteOpenState.BLOCKED -> {
+                    markDocumentWriteBlocked(uri.toString())
+                    note.uri?.let(::markDocumentWriteBlocked)
+                }
                 DocumentWriteOpenState.UNCHANGED -> Unit
             }
             if (!openRequests.isCurrent(request)) {
