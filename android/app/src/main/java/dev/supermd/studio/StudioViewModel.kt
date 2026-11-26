@@ -1746,6 +1746,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             else -> closeAfterSaveNoteId = null
         }
     }
+    private fun isDiscardableEmptyTab(note: Note): Boolean =
+        note.uri == null && note.content.isBlank() && (
+            note.assetDirectory == null ||
+                (!note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false))
+        )
     private fun discardEmptyTab(id: String) {
         readerEcho.remove(id)
         clearReaderEditProtocol(id)
@@ -1807,10 +1812,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 return@performCurrentReaderBarrier
             }
             if (!closingNoteIds.add(id)) return@performCurrentReaderBarrier
-            if (note.uri == null && note.content.isBlank() && note.assetDirectory == null) {
-                discardEmptyTab(id)
-                closingNoteIds.remove(id)
-            } else if (note.uri == null && note.content.isBlank() && !note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false)) {
+            if (isDiscardableEmptyTab(note)) {
                 discardEmptyTab(id)
                 closingNoteIds.remove(id)
             } else preserve = true
@@ -1850,7 +1852,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             // document writes. The reader barrier completed before this lock.
             documentWrites.lock(); documentLocked = true
             val noteToClose = mutable.value.tabs.find { it.id == id } ?: return
-            if (noteToClose.uri == null && noteToClose.content.isBlank() && noteToClose.assetDirectory == null) {
+            if (isDiscardableEmptyTab(noteToClose)) {
                 discardEmptyTab(id)
                 return
             }
@@ -1885,6 +1887,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
                     message = "Tab closed. Reopen from the menu to recover edits.")
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
         } catch (error: Exception) {
             mutable.value = mutable.value.copy(message = "Could not preserve the closed note: ${error.message}")
         } finally {
@@ -2488,17 +2492,28 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         closeAfterSaveNoteId = null
     }
     private suspend fun synchronizeNoteForSave(noteId: String): Boolean {
-        val synchronized = if (noteId != mutable.value.active.id && mutable.value.tabs.any { it.id == noteId }) {
-            val prevActive = mutable.value.active.id
-            performReaderBarrier(prevActive) { change { it.copy(activeId = noteId) } }
-        } else {
-            performReaderBarrier(noteId) { }
+        var targetOpen = false
+        val barrierAccepted = try {
+            performCurrentReaderBarrier { currentActiveId ->
+                targetOpen = mutable.value.tabs.any { it.id == noteId }
+                if (targetOpen && currentActiveId != noteId) {
+                    change { it.copy(activeId = noteId) }
+                }
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            closeAfterSaveNoteId = null
+            throw cancelled
         }
-        if (!synchronized) {
+        if (!barrierAccepted) {
             readerBarrierFailed()
             closeAfterSaveNoteId = null
+            return false
         }
-        return synchronized
+        if (!targetOpen) {
+            closeAfterSaveNoteId = null
+            return false
+        }
+        return true
     }
     private fun launchPortableWriteOrFallback(noteId: String, save: Boolean) {
         if (requestPortableWrite?.invoke(save) == true) return
@@ -2516,6 +2531,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val assets = withContext(Dispatchers.IO) { collectNativePortableAssets(note) }
                 writePortable(note.id, note.content, assets, save = save, originalContent = note.content)
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                if (!save) portableSaveAsNoteId = null
+                portableForceOverwrite = false
+                closeAfterSaveNoteId = null
+                mutable.value = mutable.value.copy(busy = false)
                 throw cancelled
             } catch (error: Exception) {
                 if (!save) portableSaveAsNoteId = null

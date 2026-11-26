@@ -363,4 +363,72 @@ class DraftSafetyConflictTest {
             lockHolderDir?.let { File(RuntimeEnvironment.getApplication().filesDir, "portable-assets/$it").deleteRecursively() }
         }
     }
+
+    @Test
+    fun saveAndSaveAsHandoffPreservesDraftTitleAndSucceedsAcrossPreSupermdLoadReaderFlush() = withWorkspace { app, temp, model ->
+        val backgroundMd = File(temp, "Background.md").apply { writeText("v1\n", Charsets.UTF_8) }
+        model.open(Uri.fromFile(backgroundMd))
+        waitUntil { model.state.value.active.uri == Uri.fromFile(backgroundMd).toString() }
+        val backgroundId = model.state.value.active.id
+        model.edit(backgroundId, "v2\n")
+
+        model.newNote(format = "smd")
+        waitUntil { model.state.value.active.id != backgroundId && model.state.value.active.name == "Untitled.smd" }
+        val draftId = model.state.value.active.id
+        var draftAssetDir: String? = model.state.value.active.assetDirectory
+        val savedSmd = File(temp, "Derived Draft.smd")
+        try {
+            model.edit(draftId, "# Derived Draft\n\nBody\n")
+            model.outline(
+                draftId,
+                org.json.JSONArray().put(
+                    JSONObject().put("id", "h-0").put("title", "Derived Draft").put("level", 1).put("offset", 0),
+                ),
+            )
+            assertEquals("Derived Draft.smd", model.state.value.active.name)
+            assertEquals(draftId, model.lastOutlineNoteId)
+
+            // Pre-supermdLoad handoff (#130): readerFlushStatusRequester reports WRONG_ACTIVE_NOTE while native state is authoritative.
+            model.readerFlushStatusRequester = { ReaderFlushStatus.WRONG_ACTIVE_NOTE }
+            var requestedSaveAsName: String? = null
+            model.requestSaveAs = { note ->
+                requestedSaveAsName = note.name
+                model.completePortableSaveAs(Uri.fromFile(savedSmd), note.id)
+            }
+
+            model.requestClose(draftId)
+            waitUntil { model.state.value.pendingCloseNoteId == draftId }
+            model.resolveCloseConfirmation("save")
+            waitUntil { !model.state.value.tabs.any { it.id == draftId } && savedSmd.exists() && !model.state.value.busy }
+
+            assertEquals("Derived Draft.smd", requestedSaveAsName)
+            val savedPortable = savedSmd.inputStream().use(model.media::openFmd)
+            try {
+                assertEquals("# Derived Draft\n\nBody\n", savedPortable.markdown)
+            } finally {
+                File(app.filesDir, "portable-assets/${savedPortable.directory}").deleteRecursively()
+            }
+
+            // Make backgroundId inactive, then saveManual(noteId = backgroundId) across WRONG_ACTIVE_NOTE handoff.
+            model.newNote()
+            waitUntil { model.state.value.active.id != backgroundId }
+            model.saveManual(noteId = backgroundId)
+            waitUntil { model.state.value.active.id == backgroundId && !model.state.value.active.dirty && !model.state.value.busy }
+            assertEquals("v2\n", backgroundMd.readText(Charsets.UTF_8))
+
+            // Failed reader barrier aborts save-on-close cleanly and clears closeAfterSaveNoteId.
+            model.edit(backgroundId, "v3\n")
+            model.requestClose(backgroundId)
+            waitUntil { model.state.value.pendingCloseNoteId == backgroundId }
+            val closeAfterSaveField = StudioViewModel::class.java.getDeclaredField("closeAfterSaveNoteId").apply { isAccessible = true }
+            model.readerFlushStatusRequester = { ReaderFlushStatus.FAILED }
+            model.resolveCloseConfirmation("save")
+            waitUntil { closeAfterSaveField.get(model) == null && model.state.value.pendingCloseNoteId == null }
+            assertTrue(model.state.value.tabs.any { it.id == backgroundId })
+            assertEquals("v2\n", backgroundMd.readText(Charsets.UTF_8))
+        } finally {
+            draftAssetDir = draftAssetDir ?: model.state.value.tabs.find { it.id == draftId }?.assetDirectory
+            draftAssetDir?.let { File(app.filesDir, "portable-assets/$it").deleteRecursively() }
+        }
+    }
 }

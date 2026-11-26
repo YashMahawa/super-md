@@ -514,9 +514,33 @@ class PortableAgentSaveSafetyTest {
         assertTrue("Unexpected message: ${restoreFailure?.message}", restoreFailure?.message.orEmpty().contains("document changed while the image was being attached"))
         assertArrayEquals("Rollback must restore original backup when disk still matches stagedBytes", backupBytes, smdFile.readBytes())
 
-        // Reset tab back to clean baseline so we can exercise LEAVE_CONCURRENT_BYTES.
+        // Reset tab back to clean baseline so we can exercise cancellation rollback and LEAVE_CONCURRENT_BYTES.
         model.reloadFromDisk(noteId)
         awaitCondition { !model.state.value.active.dirty && model.state.value.active.content == markdown }
+
+        // 1b. Cancellation after staged write restores backupBytes via NonCancellable recovery and propagates CancellationException.
+        val cancelEntered = CompletableDeferred<Unit>()
+        val cancelRelease = CompletableDeferred<Unit>()
+        model.portablePostWriteObserver = {
+            cancelEntered.complete(Unit)
+            cancelRelease.await()
+        }
+        val cancelAttempt = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default).launch {
+            model.agentAssetAction(
+                JSONObject().put("tabId", noteId).put("assetAction", "attach")
+                    .put("assetName", "attached-cancel.svg").put("mimeType", "image/svg+xml")
+                    .put("body", Base64.encodeToString(svgB, Base64.NO_WRAP))
+                    .put("expectedRevision", agentContentRevision(markdown)),
+            )
+        }
+        awaitCondition { cancelEntered.isCompleted }
+        assertFalse("Staged bytes should be on disk before cancellation rollback", smdFile.readBytes().contentEquals(backupBytes))
+        cancelAttempt.cancel()
+        model.portablePostWriteObserver = null
+        cancelRelease.complete(Unit)
+        awaitJob(cancelAttempt)
+        assertTrue("Expected attach coroutine to remain cancelled", cancelAttempt.isCancelled)
+        assertArrayEquals("Cancellation after staged write must restore original backupBytes", backupBytes, smdFile.readBytes())
 
         // 2. LEAVE_CONCURRENT_BYTES: external writer updates .smd after staged write and before rollback -> concurrent bytes preserved.
         val concurrentBytes = java.io.ByteArrayOutputStream().also { out ->
