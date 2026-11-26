@@ -1,13 +1,23 @@
 package dev.supermd.studio
 
+import android.os.Looper
 import android.util.Base64
+import okhttp3.*
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.ByteString
+import org.json.JSONArray
 import org.json.JSONObject
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertThrows
+import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows
 import org.robolectric.annotation.Config
+import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -15,6 +25,54 @@ class AgentRelayClientTest {
     private val client = AgentRelayClient()
     private val revision = "a".repeat(64)
     private val svg = "<svg xmlns='http://www.w3.org/2000/svg'/>".toByteArray()
+
+    private fun contractJson(): JSONObject = listOf("../../docs/agent-contract.json", "../docs/agent-contract.json", "docs/agent-contract.json")
+        .map(::File).first { it.exists() }.readText(Charsets.UTF_8).let(::JSONObject)
+
+    private fun JSONArray.strings(): List<String> = (0 until length()).map(::getString)
+    private fun assertRejected(request: JSONObject) { assertThrows(IllegalArgumentException::class.java) { client.validateRequest(request) } }
+
+    private fun testConfig() = AgentAccessConfig(
+        serverOrigin = "https://relay.example.test", groupId = "group-1", deviceId = "device-1",
+        deviceKey = "device-secret", pairingKey = "pairing-secret", connectorKey = "connector-secret",
+        displayName = "Android", platform = "android",
+    )
+
+    private class RecordingWebSocket(private val initialRequest: Request) : WebSocket {
+        val sent = mutableListOf<String>()
+        var closedCode: Int? = null
+        override fun request(): Request = initialRequest
+        override fun queueSize(): Long = 0L
+        override fun send(text: String): Boolean = sent.add(text)
+        override fun send(bytes: ByteString): Boolean = false
+        override fun close(code: Int, reason: String?): Boolean { closedCode = code; return true }
+        override fun cancel() = Unit
+    }
+
+    private fun connectTestSession(
+        config: AgentAccessConfig = testConfig(),
+        handler: (JSONObject, (Any?, String?) -> Unit) -> Unit = { _, reply -> reply(JSONObject().put("ok", true), null) },
+    ): Triple<AgentRelayClient, RecordingWebSocket, WebSocketListener> {
+        val relay = AgentRelayClient()
+        val socketRef = AtomicReference<RecordingWebSocket>()
+        val listenerRef = AtomicReference<WebSocketListener>()
+        val opened = CountDownLatch(1)
+        relay.client = OkHttpClient.Builder().addInterceptor { chain ->
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("OK")
+                .body(JSONObject().put("groupId", config.groupId).toString().toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        relay.webSocketFactory = WebSocket.Factory { req, listener ->
+            RecordingWebSocket(req).also { socketRef.set(it); listenerRef.set(listener); opened.countDown() }
+        }
+        relay.connect(config, handler)
+        assertTrue(opened.await(5, TimeUnit.SECONDS))
+        val socket = socketRef.get()
+        val listener = listenerRef.get()
+        listener.onMessage(socket, JSONObject().put("type", "registered").put("groupId", config.groupId).put("deviceId", config.deviceId).toString())
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(AgentRelayClient.State.CONNECTED, relay.currentState())
+        return Triple(relay, socket, listener)
+    }
 
     private fun request(action: String = "attach", body: String = Base64.encodeToString(svg, Base64.NO_WRAP)) = JSONObject()
         .put("requestId", "asset_1").put("action", "asset_action").put("tabId", "tab:device:workspace:1")
@@ -170,5 +228,141 @@ class AgentRelayClientTest {
             JSONObject(chunk.toString()).put("offset", -1),
             JSONObject(chunk.toString()).put("path", "/arbitrary/file.pdf"),
         ).forEach { invalid -> assertThrows(IllegalArgumentException::class.java) { client.validateRequest(invalid) } }
+    }
+
+    @Test fun conformsToSharedAgentContractManifestBounds() {
+        val contract = contractJson()
+        val revLen = contract.getJSONObject("revision").getInt("length")
+        val ids = contract.getJSONObject("identifiers")
+        val exports = contract.getJSONObject("exportFormats")
+        val search = contract.getJSONObject("search")
+        val mutations = contract.getJSONObject("mutations")
+        val viewport = contract.getJSONObject("viewport")
+        val reqMax = ids.getInt("requestIdMax")
+        val jobMax = ids.getInt("jobIdMax")
+        val diagPrefix = ids.getString("diagramIdPrefix")
+        val diagMin = ids.getInt("diagramIdMin")
+        val diagMax = ids.getInt("diagramIdMax")
+        val mixedRev = "aB09".repeat(revLen / 4)
+
+        client.validateRequest(JSONObject().put("requestId", "r".repeat(reqMax)).put("action", "list_tabs"))
+        for (badReq in listOf("", "r".repeat(reqMax + 1), "bad id")) assertRejected(JSONObject().put("requestId", badReq).put("action", "list_tabs"))
+        client.validateRequest(JSONObject().put("requestId", "job_ok").put("action", "document_action").put("documentAction", "open").put("jobId", "j".repeat(jobMax)))
+        for (badJob in listOf("", "j".repeat(jobMax + 1))) {
+            assertRejected(JSONObject().put("requestId", "job_bad").put("action", "document_action").put("documentAction", "open").put("jobId", badJob))
+        }
+
+        val minDiag = diagPrefix + "x".repeat(diagMin - diagPrefix.length)
+        val maxDiag = diagPrefix + "x".repeat(diagMax - diagPrefix.length)
+        val badDiagIds = listOf(diagPrefix + "x".repeat(diagMin - diagPrefix.length - 1), diagPrefix + "x".repeat(diagMax - diagPrefix.length + 1), "figure:12345")
+        for (diagramAction in listOf("get_diagram", "get_diagram_image", "list_diagrams")) {
+            for (validId in listOf(minDiag, maxDiag)) {
+                client.validateRequest(JSONObject().put("requestId", "diag_ok").put("action", diagramAction).put("tabId", "tab:1").put("expectedRevision", mixedRev).put("diagramId", validId))
+            }
+            for (badId in badDiagIds) {
+                assertRejected(JSONObject().put("requestId", "diag_bad").put("action", diagramAction).put("tabId", "tab:1").put("expectedRevision", mixedRev).put("diagramId", badId))
+            }
+        }
+        for (badRev in listOf("a".repeat(revLen - 1), "a".repeat(revLen + 1), "g".repeat(revLen))) {
+            assertRejected(JSONObject().put("requestId", "rev_bad").put("action", "get_diagram").put("tabId", "tab:1").put("expectedRevision", badRev).put("diagramId", minDiag))
+        }
+
+        val liveFormats = exports.getJSONArray("live").strings()
+        val createSaveFormats = exports.getJSONArray("createAndSave").strings()
+        assertTrue(liveFormats.contains("mdzip"))
+        for (fmt in liveFormats) {
+            client.validateRequest(JSONObject().put("requestId", "exp_1").put("action", "document_action")
+                .put("documentAction", "export").put("tabId", "tab:1").put("options", JSONObject().put("format", fmt).put("archive", fmt == "mdzip")))
+        }
+        assertRejected(JSONObject().put("requestId", "exp_bad").put("action", "document_action").put("documentAction", "export").put("tabId", "tab:1").put("format", "docx"))
+        assertRejected(JSONObject().put("requestId", "arc_bad").put("action", "document_action").put("documentAction", "export").put("tabId", "tab:1").put("options", JSONObject().put("archive", "yes")))
+        for (docAct in listOf("create", "save")) {
+            for (fmt in createSaveFormats) {
+                client.validateRequest(JSONObject().put("requestId", "cs_ok").put("action", "document_action").put("documentAction", docAct).put("tabId", "tab:1").put("expectedRevision", revision).put("format", fmt))
+            }
+            for (disallowed in liveFormats - createSaveFormats.toSet()) {
+                assertRejected(JSONObject().put("requestId", "cs_bad").put("action", "document_action").put("documentAction", docAct).put("tabId", "tab:1").put("expectedRevision", revision).put("format", disallowed))
+            }
+        }
+
+        val baseSearch = JSONObject().put("requestId", "s_1").put("action", "search_tab").put("tabId", "tab:1")
+            .put("query", "q".repeat(search.getInt("queryMaxChars"))).put("limit", search.getInt("limitMax")).put("context", search.getInt("contextMax"))
+        search.getJSONArray("booleanFlags").strings().forEach { baseSearch.put(it, true) }
+        client.validateRequest(baseSearch)
+        client.validateRequest(JSONObject(baseSearch.toString()).put("query", "q".repeat(search.getInt("queryMinChars"))).put("limit", search.getInt("limitMin")).put("context", search.getInt("contextMin")))
+        listOf(
+            JSONObject(baseSearch.toString()).put("query", ""),
+            JSONObject(baseSearch.toString()).put("limit", search.getInt("limitMin") - 1),
+            JSONObject(baseSearch.toString()).put("limit", search.getInt("limitMax") + 1),
+            JSONObject(baseSearch.toString()).put("context", search.getInt("contextMax") + 1),
+            JSONObject(baseSearch.toString()).put(search.getJSONArray("booleanFlags").getString(0), "true"),
+        ).forEach(::assertRejected)
+
+        val maxOps = mutations.getInt("maxPatchOperations")
+        val op = JSONObject().put("type", "insert").put("line", 1).put("text", "x")
+        client.validateRequest(JSONObject().put("requestId", "p_ok").put("action", "patch_tab").put("tabId", "tab:1").put("expectedRevision", revision).put("operations", JSONArray((0 until maxOps).map { op })))
+        assertRejected(JSONObject().put("requestId", "p_bad").put("action", "patch_tab").put("tabId", "tab:1").put("expectedRevision", revision).put("operations", JSONArray((0..maxOps).map { op })))
+        val maxRepairs = mutations.getInt("repairIndicesMax")
+        client.validateRequest(JSONObject().put("requestId", "r_ok").put("action", "latex_apply").put("tabId", "tab:1").put("expectedRevision", revision).put("repairIndices", JSONArray((0 until maxRepairs).toList())))
+        for (badCount in listOf(0, maxRepairs + 1)) {
+            assertRejected(JSONObject().put("requestId", "r_bad").put("action", "latex_apply").put("tabId", "tab:1").put("expectedRevision", revision).put("repairIndices", JSONArray((0 until badCount).toList())))
+        }
+        for (fmt in viewport.getJSONArray("imageFormats").strings()) {
+            for (w in listOf(viewport.getInt("rpcMinWidth"), viewport.getInt("minWidth"), viewport.getInt("maxWidth"))) {
+                client.validateRequest(JSONObject().put("requestId", "v_ok").put("action", "render_tab").put("tabId", "tab:1").put("imageFormat", fmt).put("width", w))
+            }
+        }
+        for (badWidth in listOf(0, viewport.getInt("maxWidth") + 1)) assertRejected(JSONObject().put("requestId", "v_bad").put("action", "render_tab").put("tabId", "tab:1").put("width", badWidth))
+    }
+
+    @Test fun parameterValidationFailuresSendErrorRepliesKeepSocketOpenAndClearActiveRequests() {
+        val handled = mutableListOf<JSONObject>()
+        val (relay, socket, listener) = connectTestSession { req, reply -> handled += req; reply(JSONObject().put("exported", req.optString("format")), null) }
+        try {
+            for (index in 1..10) {
+                val frame = if (index % 2 == 1) {
+                    JSONObject().put("type", "request").put("requestId", "bad_exp_$index").put("deviceId", "device-1")
+                        .put("action", "document_action").put("documentAction", "export").put("tabId", "tab:1").put("format", "docx")
+                } else {
+                    JSONObject().put("type", "request").put("requestId", "bad_diag_$index").put("deviceId", "device-1")
+                        .put("action", "get_diagram").put("tabId", "tab:1").put("expectedRevision", revision).put("diagramId", "bad")
+                }
+                listener.onMessage(socket, frame.toString())
+            }
+            assertNull(socket.closedCode)
+            assertTrue(handled.isEmpty())
+            assertEquals(10, socket.sent.size)
+            socket.sent.forEachIndexed { i, raw ->
+                val reply = JSONObject(raw)
+                assertEquals("reply", reply.getString("type"))
+                assertEquals(if ((i + 1) % 2 == 1) "bad_exp_${i + 1}" else "bad_diag_${i + 1}", reply.getString("requestId"))
+                assertTrue(reply.getString("error").isNotBlank() && !reply.getString("error").contains("Too many"))
+                assertFalse(reply.has("result"))
+            }
+            listener.onMessage(socket, JSONObject().put("type", "request").put("requestId", "valid_mdzip").put("deviceId", "device-1")
+                .put("action", "document_action").put("documentAction", "export").put("tabId", "tab:1")
+                .put("options", JSONObject().put("format", "mdzip").put("archive", true)).toString())
+            Shadows.shadowOf(Looper.getMainLooper()).idle()
+            assertNull(socket.closedCode)
+            assertEquals(1, handled.size)
+            val validReply = JSONObject(socket.sent.last())
+            assertEquals("valid_mdzip", validReply.getString("requestId"))
+            assertEquals("mdzip", validReply.getJSONObject("result").getString("exported"))
+        } finally {
+            relay.disconnect()
+        }
+    }
+
+    @Test fun envelopeViolationsCloseWebSocketWithPolicyCode1008() {
+        for (badFrame in listOf(
+            JSONObject().put("type", "request").put("requestId", "wrong_dev").put("deviceId", "other-device").put("action", "list_tabs"),
+            JSONObject().put("type", "request").put("requestId", "bad_action").put("deviceId", "device-1").put("action", "unsupported_action"),
+        )) {
+            val (relay, socket, listener) = connectTestSession()
+            listener.onMessage(socket, badFrame.toString())
+            assertEquals(1008, socket.closedCode)
+            assertTrue(socket.sent.isEmpty())
+            relay.disconnect()
+        }
     }
 }

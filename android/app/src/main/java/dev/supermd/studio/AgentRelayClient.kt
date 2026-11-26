@@ -21,9 +21,10 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
     enum class State { DISCONNECTED, CONNECTING, CONNECTED }
 
     private val main = Handler(Looper.getMainLooper())
-    private val client = OkHttpClient.Builder().connectTimeout(12, TimeUnit.SECONDS)
+    internal var client = OkHttpClient.Builder().connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(25, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true).build()
+    internal var webSocketFactory: WebSocket.Factory = client
     @Volatile private var stopped = true
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var state = State.DISCONNECTED
@@ -110,7 +111,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
 
     private fun openSocket(current: AgentAccessConfig) {
         val request = authenticatedWebSocketRequest(current)
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+        webSocket = webSocketFactory.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (stopped) webSocket.close(1000, "Disabled")
             }
@@ -166,8 +167,12 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
             require(activeRequests.size < MAX_ACTIVE_REQUESTS) { "Too many app requests are active" }
             require(activeRequests.add(requestId)) { "Duplicate request id" }
         }
-        val request = JSONObject(message.toString()).apply { remove("type"); remove("deviceId") }
-        validateRequest(request)
+        val request = try {
+            JSONObject(message.toString()).apply { remove("type"); remove("deviceId") }.also(::validateRequest)
+        } catch (error: Exception) {
+            finish(socket, requestId, null, error.message ?: "Invalid request")
+            return
+        }
         main.post {
             if (stopped || socket !== webSocket) { finish(socket, requestId, null, "The app is offline"); return@post }
             val currentHandler = handler
@@ -212,7 +217,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (action in setOf("outline_tab", "latex_review", "latex_apply", "get_context")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
         if (action in setOf("list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
         if (action in setOf("get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
-        if (action in setOf("get_diagram", "get_diagram_image")) require(request.optString("diagramId").startsWith("diagram:") && request.optString("diagramId").length <= 100) { "A listed diagramId is required" }
+        if (action in setOf("get_diagram", "get_diagram_image")) require(request.optString("diagramId").let { it.startsWith("diagram:") && it.length in 9..128 }) { "A listed diagramId is required" }
         if (action == "asset_action") {
             val kind = request.optString("assetAction")
             require(kind in setOf("list", "source", "attach")) { "Invalid assetAction" }
@@ -261,9 +266,9 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("content")) require(request.getString("content").toByteArray(Charsets.UTF_8).size <= MAX_TEXT_BYTES) { "Document content is too large" }
         if (request.has("options")) require(request.getJSONObject("options").toString().toByteArray(Charsets.UTF_8).size <= 16 * 1024) { "Document options are too large" }
         if (request.has("view")) require(request.getString("view") in setOf("source", "prose")) { "Invalid document view" }
-        if (request.has("diagramId")) require(request.getString("diagramId").length in 1..100) { "Invalid diagram id" }
-        if (request.has("jobId")) require(request.getString("jobId").length in 1..128) { "Invalid job id" }
-        if (request.has("format")) require(request.getString("format") in setOf("pdf", "smd", "md")) { "Invalid export format" }
+        if (request.has("diagramId")) require(request.get("diagramId") is String && request.getString("diagramId").let { it.startsWith("diagram:") && it.length in 9..128 }) { "Invalid diagram id" }
+        if (request.has("jobId")) require(request.get("jobId") is String && request.getString("jobId").length in 1..128) { "Invalid job id" }
+        if (request.has("format")) require(request.get("format") is String && request.getString("format") in setOf("pdf", "smd", "md", "mdzip")) { "Invalid export format" }
         if (request.has("repairIndices")) {
             val indices = request.getJSONArray("repairIndices")
             val values = (0 until indices.length()).map { indices.optInt(it, -1) }
@@ -279,6 +284,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("format")) require(request.get("format") is String) { "Invalid format" }
         if (request.has("query")) require(request.getString("query").length in 1..2048) { "Invalid query" }
         if (action == "search_tab") require(request.optString("query").length in 1..500) { "Search query must contain 1–500 characters" }
+        if (action == "search_tab" && request.has("limit")) require(request.getInt("limit") in 1..25) { "Search limit must be 1–25" }
         if (request.has("caseSensitive")) require(request.get("caseSensitive") is Boolean) { "caseSensitive must be a boolean" }
         if (request.has("wholeWord")) require(request.get("wholeWord") is Boolean) { "wholeWord must be a boolean" }
         if (request.has("regex")) require(request.get("regex") is Boolean) { "regex must be a boolean" }
@@ -336,7 +342,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         val TAB_DOCUMENT_ACTIONS = setOf("export", "latexfix", "latex_review", "latex_apply", "save", "snapshot", "get_context", "activate", "close", "outline")
         val DOCUMENT_ACTIONS = setOf("create", "export", "latexfix", "latex_review", "latex_apply", "open", "save", "snapshot", "job_status", "get_context", "activate", "close", "outline", "export_chunk")
         val REVISIONED_DOCUMENT_ACTIONS = setOf("save", "close", "latex_apply")
-        val BOOLEAN_OPTIONS = setOf("background", "saveAs", "discardChanges")
+        val BOOLEAN_OPTIONS = setOf("background", "saveAs", "discardChanges", "archive")
         const val MAX_ASSET_BYTES = 1024 * 1024
         const val MAX_ASSET_BASE64 = 1_400_000
         const val MAX_EXPORT_CHUNK_BYTES = 524_288
