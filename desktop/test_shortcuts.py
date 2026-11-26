@@ -13,7 +13,19 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(normalized, defaults)
         self.assertEqual(defaults["save"], ["Ctrl+S"])
         self.assertEqual(defaults["save_as"], ["Ctrl+Shift+S"])
+        self.assertEqual(defaults["new_folder_note"], ["Ctrl+Alt+N"])
+        self.assertEqual(defaults["new_subfolder"], ["Ctrl+Alt+Shift+N"])
+        self.assertEqual(defaults["rename_entry"], ["F2"])
+        self.assertEqual(defaults["mode_live"], ["Ctrl+Alt+1"])
+        self.assertEqual(defaults["mode_editor"], ["Ctrl+Alt+2"])
+        self.assertEqual(defaults["mode_reader"], ["Ctrl+Alt+3"])
+        self.assertEqual(defaults["mode_split"], ["Ctrl+Alt+4"])
         self.assertTrue(native_label(defaults["find"][0]))
+        self.assertTrue(native_label(defaults["mode_live"][0]))
+        self.assertEqual(defaults["replace"], ["Ctrl+H"])
+        self.assertIn("F3", defaults["find_next"])
+        self.assertIn("Shift+F3", defaults["find_previous"])
+        self.assertEqual(defaults["search_folder"], ["Ctrl+Shift+F"])
         self.assertEqual(parse_sequence("Ctrl+PageDown"), "Ctrl+PgDown")
 
     def test_macos_defaults_use_portable_command_modifiers_and_fullscreen_chord(self):
@@ -34,10 +46,20 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(defaults["quote"], ["Ctrl+Alt+Q"])
         self.assertEqual(defaults["inline_math"], ["Ctrl+Shift+M"])
         self.assertEqual(defaults["find"], ["Ctrl+F"])
+        self.assertEqual(defaults["replace"], ["Ctrl+H"])
+        self.assertEqual(defaults["find_next"], ["F3", "Ctrl+G"])
+        self.assertEqual(defaults["find_previous"], ["Shift+F3", "Ctrl+Shift+G"])
         self.assertEqual(defaults["new_note"], ["Ctrl+T"])
         self.assertEqual(defaults["undo"], ["Ctrl+Z"])
         self.assertEqual(defaults["redo"], ["Ctrl+Shift+Z"])
         self.assertEqual(defaults["typewriter_scroll"], ["Ctrl+Alt+T"])
+        self.assertEqual(defaults["new_folder_note"], ["Ctrl+Alt+N"])
+        self.assertEqual(defaults["new_subfolder"], ["Ctrl+Alt+Shift+N"])
+        self.assertEqual(defaults["rename_entry"], ["F2"])
+        self.assertEqual(defaults["mode_live"], ["Ctrl+Alt+1"])
+        self.assertEqual(defaults["mode_editor"], ["Ctrl+Alt+2"])
+        self.assertEqual(defaults["mode_reader"], ["Ctrl+Alt+3"])
+        self.assertEqual(defaults["mode_split"], ["Ctrl+Alt+4"])
         self.assertEqual(defaults["fullscreen"], ["F11", "Meta+Ctrl+F"])
         self.assertTrue(native_label(defaults["copy"][0]))
         if sys.platform == "darwin":
@@ -56,17 +78,61 @@ class ShortcutValidationTest(unittest.TestCase):
         _, error = normalize_shortcuts(earlier, edited_action="bold")
         self.assertIn("Italic", error)
 
+        mode_conflict = default_shortcuts()
+        mode_conflict["mode_reader"] = ["Ctrl+Alt+1"]
+        _, mode_error = normalize_shortcuts(mode_conflict)
+        self.assertIn("Live mode", mode_error)
+
+        folder_conflict = default_shortcuts()
+        folder_conflict["mode_live"] = ["Ctrl+Alt+N"]
+        _, folder_error = normalize_shortcuts(folder_conflict, edited_action="mode_live")
+        self.assertIn("New note in folder", folder_error)
+
 
     def test_recorder_captures_modified_combinations_and_rejects_plain_letters(self):
         from PySide6.QtCore import Qt
 
         sequence, error = capture_sequence(int(Qt.Key.Key_F), int(Qt.KeyboardModifier.ControlModifier.value))
         self.assertEqual((sequence, error), ("Ctrl+F", ""))
+        sequence, error = capture_sequence(int(Qt.Key.Key_H), int(Qt.KeyboardModifier.ControlModifier.value))
+        self.assertEqual((sequence, error), ("Ctrl+H", ""))
+        sequence, error = capture_sequence(int(Qt.Key.Key_F3), int(Qt.KeyboardModifier.NoModifier.value))
+        self.assertEqual((sequence, error), ("F3", ""))
+        sequence, error = capture_sequence(int(Qt.Key.Key_F3), int(Qt.KeyboardModifier.ShiftModifier.value))
+        self.assertEqual((sequence, error), ("Shift+F3", ""))
         sequence, error = capture_sequence(int(Qt.Key.Key_F11), int(Qt.KeyboardModifier.NoModifier.value))
         self.assertEqual((sequence, error), ("F11", ""))
         sequence, error = capture_sequence(int(Qt.Key.Key_A), int(Qt.KeyboardModifier.NoModifier.value))
         self.assertEqual(sequence, "")
         self.assertIn("Use Ctrl", error)
+
+    def test_studio_command_routes_find_replace_and_match_stepping(self):
+        from studio import Session
+        from test_studio import QuietStudio
+
+        session = Session(True)
+        session.settings["python"] = sys.executable
+        studio = QuietStudio(True, session)
+        calls: list[str] = []
+        studio.readerCall.connect(calls.append)
+        try:
+            studio.command("find")
+            studio.command("replace")
+            studio.command("find_next")
+            studio.command("find_previous")
+            self.assertEqual(
+                calls,
+                [
+                    "window.supermdFind?.()",
+                    "window.supermdFind?.(true)",
+                    "window.supermdFindStep?.(1)",
+                    "window.supermdFindStep?.(-1)",
+                ],
+            )
+        finally:
+            studio.stop()
+            studio.pool.shutdown(wait=True)
+            session.writes.shutdown(wait=True)
 
 
 if __name__ == "__main__":

@@ -326,6 +326,372 @@ ApplicationWindow {{
         self.assertIsNotNone(recorder)
         self.assertEqual(self.studio.shortcutSequences("typewriter_scroll"), ["Ctrl+Alt+T"])
 
+    def test_direct_mode_shortcuts_appear_in_settings_and_gate_split_below_1000px(self):
+        from PySide6.QtCore import QMetaObject, Q_ARG, Q_RETURN_ARG
+
+        def enabled(action):
+            return QMetaObject.invokeMethod(
+                self.window,
+                "shortcutEnabled",
+                Q_RETURN_ARG("QVariant"),
+                Q_ARG("QVariant", action),
+            )
+
+        self.choose_shortcut_settings()
+        for action_id, expected in (
+            ("new_folder_note", ["Ctrl+Alt+N"]),
+            ("new_subfolder", ["Ctrl+Alt+Shift+N"]),
+            ("rename_entry", ["F2"]),
+            ("mode_live", ["Ctrl+Alt+1"]),
+            ("mode_editor", ["Ctrl+Alt+2"]),
+            ("mode_reader", ["Ctrl+Alt+3"]),
+            ("mode_split", ["Ctrl+Alt+4"]),
+        ):
+            self.assertIsNotNone(self.named_item("shortcutRecorder_" + action_id))
+            self.assertEqual(self.studio.shortcutSequences(action_id), expected)
+
+        # At 960px (< 1000px), Live/Source/Read and folder actions are enabled while Split is gated off.
+        self.assertEqual(self.window.width(), 960)
+        self.assertTrue(enabled("new_folder_note"))
+        self.assertTrue(enabled("new_subfolder"))
+        self.assertTrue(enabled("rename_entry"))
+        self.assertTrue(enabled("mode_live"))
+        self.assertTrue(enabled("mode_editor"))
+        self.assertTrue(enabled("mode_reader"))
+        self.assertFalse(enabled("mode_split"))
+
+        # Widening >= 1000px enables Split mode shortcut.
+        self.window.resize(1120, 700)
+        QTest.qWait(30)
+        self.assertTrue(enabled("mode_split"))
+
+        # Modal dialogs (including folder create/rename dialogs) and reader/fullscreen overlays suppress direct mode shortcuts.
+        self.window.setProperty("modalDialogCount", 1)
+        self.assertFalse(enabled("new_folder_note"))
+        self.assertFalse(enabled("rename_entry"))
+        self.assertFalse(enabled("mode_live"))
+        self.assertFalse(enabled("mode_split"))
+        self.window.setProperty("modalDialogCount", 0)
+
+        overlay_state = json.loads(self.studio.snapshot)
+        overlay_state["readerOverlay"] = True
+        self.window.setProperty("viewState", overlay_state)
+        self.assertFalse(enabled("mode_reader"))
+        overlay_state["readerOverlay"] = False
+        overlay_state["fullscreen"] = True
+        self.window.setProperty("viewState", overlay_state)
+        self.assertFalse(enabled("mode_editor"))
+
+        # Clearing a mode shortcut marks its label Disabled cleanly and remapping updates it without touching folder shortcuts.
+        self.assertEqual(self.studio.setShortcut("mode_reader", ""), "")
+        self.assertEqual(self.studio.shortcutLabel("mode_reader"), "Disabled")
+        self.assertEqual(self.studio.setShortcut("mode_reader", "Ctrl+Alt+9"), "")
+        self.assertIn("9", self.studio.shortcutLabel("mode_reader"))
+        self.assertEqual(self.studio.shortcutSequences("new_folder_note"), ["Ctrl+Alt+N"])
+        self.assertEqual(self.studio.shortcutSequences("rename_entry"), ["F2"])
+
+    def test_python_discovery_waits_for_visible_python_section_and_rescans_on_demand(self):
+        from unittest.mock import patch
+
+        session = Session(True)
+        studio = QuietStudio(True, session)
+        engine = QQmlEngine()
+        engine.rootContext().setContextProperty("studio", studio)
+        source = '''import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+import "."
+ApplicationWindow {
+    id: host
+    width: 960; height: 700; visible: true
+    property var viewState: JSON.parse(studio.snapshot)
+    property bool settingsOpen: false
+    property int modalDialogCount: 0
+    onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
+    Material.theme: viewState.dark ? Material.Dark : Material.Light
+    AppDialog {
+        id: settingsDialog
+        objectName: "settingsDialog"
+        width: Math.min(840, host.width - 48)
+        height: Math.min(760, host.height - 48)
+        padding: 0
+        onClosed: host.settingsOpen = false
+        SettingsPage { ownerPopup: settingsDialog; viewState: host.viewState; anchors.fill: parent; onBack: host.settingsOpen = false }
+    }
+}'''
+        component = QQmlComponent(engine)
+        component.setData(source.encode(), QUrl.fromLocalFile(str(QML_DIR / "deferred-python-settings-smoke.qml")))
+        self.assertFalse(component.isError(), "\n".join(error.toString() for error in component.errors()))
+        with patch.object(studio, "refreshPython", wraps=studio.refreshPython) as refresh_spy, patch(
+            "python_runtime.discover", return_value=[{"path": sys.executable, "label": "System Python 3.12", "detail": "ready", "matplotlib": True, "managed": False, "venv": False}]
+        ) as discover_mock:
+            dialog_window = component.create()
+            self.assertIsNotNone(dialog_window)
+            try:
+                QTest.qWait(40)
+                page = dialog_window.findChild(object, "settingsPage")
+                dialog = dialog_window.findChild(object, "settingsDialog")
+                self.assertIsNotNone(page)
+                self.assertIsNotNone(dialog)
+                self.assertFalse(dialog.property("visible"))
+                self.assertFalse(studio.pythonBusy)
+                self.assertEqual(refresh_spy.call_count, 0)
+                self.assertEqual(discover_mock.call_count, 0)
+
+                # Selecting "python" while settingsDialog remains closed must not scan.
+                page.setProperty("section", "python")
+                QTest.qWait(30)
+                self.assertEqual(refresh_spy.call_count, 0)
+                page.setProperty("section", "appearance")
+                QTest.qWait(20)
+
+                # Opening Settings on "appearance" and switching to "shortcuts" spawns 0 scans.
+                dialog_window.setProperty("settingsOpen", True)
+                QTest.qWait(40)
+                self.assertTrue(dialog.property("visible"))
+                self.assertEqual(refresh_spy.call_count, 0)
+                page.setProperty("section", "shortcuts")
+                QTest.qWait(30)
+                self.assertEqual(refresh_spy.call_count, 0)
+                self.assertEqual(discover_mock.call_count, 0)
+
+                # Switching section to "python" while visible calls studio.refreshPython() once.
+                page.setProperty("section", "python")
+                QTest.qWait(60)
+                self.assertEqual(refresh_spy.call_count, 1)
+                self.assertEqual(discover_mock.call_count, 1)
+
+                # Switching away and back does not trigger redundant automatic scans.
+                page.setProperty("section", "appearance")
+                QTest.qWait(20)
+                page.setProperty("section", "python")
+                QTest.qWait(40)
+                self.assertEqual(refresh_spy.call_count, 1)
+
+                # Clicking "Scan again" explicitly rescans.
+                scroll = dialog_window.findChild(object, "settingsScroll")
+                self.assertIsNotNone(scroll)
+                scroll_content = scroll.property("contentItem")
+                scroll_content.setProperty("contentY", max(0, scroll_content.property("contentHeight") - scroll.height()))
+                QTest.qWait(40)
+                rescan = dialog_window.findChild(object, "rescanPython")
+                self.assertIsNotNone(rescan)
+                self.assertTrue(rescan.property("enabled"))
+                point = rescan.mapToScene(QPointF(rescan.width() / 2, rescan.height() / 2)).toPoint()
+                QTest.mouseClick(dialog_window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+                QTest.qWait(60)
+                self.assertEqual(refresh_spy.call_count, 2)
+                self.assertEqual(discover_mock.call_count, 2)
+            finally:
+                dialog_window.close()
+                dialog_window.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                engine.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                studio.stop()
+                studio.pool.shutdown(wait=True)
+                session.writes.shutdown(wait=True)
+
+    def test_main_qml_with_closed_settings_spawns_zero_python_probes(self):
+        import subprocess
+
+        probe_code = r'''
+import json, os, sys
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
+
+from PySide6.QtCore import QFile, QIODevice, QObject, QUrl
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtTest import QTest
+from PySide6.QtWebEngineQuick import QtWebEngineQuick
+from PySide6.QtWidgets import QApplication
+
+QQuickStyle.setStyle("Material")
+QtWebEngineQuick.initialize()
+app = QApplication(["main qml startup python probe test"])
+
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+import python_runtime
+from studio import Session, Studio
+
+probes = []
+with patch("python_runtime.probe", side_effect=lambda *args, **kwargs: probes.append(args)):
+    for initial_python in ("", sys.executable):
+        session = Session(True)
+        session.settings["python"] = initial_python
+        studio = Studio(True, session)
+        channel = QFile(":/qtwebchannel/qwebchannel.js")
+        assert channel.open(QIODevice.OpenModeFlag.ReadOnly)
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("studio", studio)
+        engine.rootContext().setContextProperty("readerUrl", QUrl("about:blank"))
+        engine.rootContext().setContextProperty("channelScript", bytes(channel.readAll()).decode())
+        engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(root.parent / "public" / "brand-mark-fixed.svg")))
+        engine.load(QUrl.fromLocalFile(str(root / "qml" / "Main.qml")))
+        assert engine.rootObjects(), "Main.qml failed to load"
+        window = engine.rootObjects()[0]
+        assert window.property("settingsOpen") is False
+        assert window.findChild(QObject, "settingsPage") is not None
+        QTest.qWait(80)
+        assert studio.pythonBusy is False
+        assert bool(studio.settings["python"])
+        window.close()
+        del engine
+        studio.stop()
+        studio.pool.shutdown(wait=True, cancel_futures=True)
+        session.writes.shutdown(wait=True)
+
+print(json.dumps({"probes": len(probes)}), flush=True)
+os._exit(0)
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code, str(Path(__file__).resolve().parent)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, f"{completed.stdout}\n{completed.stderr}")
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["probes"], 0)
+
+    def test_main_qml_routes_mode_and_folder_shortcuts_and_suppresses_modes_in_folder_modals(self):
+        import subprocess
+
+        script = r'''
+import json, os, shutil, sys, tempfile
+from pathlib import Path
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
+
+from PySide6.QtCore import QFile, QIODevice, QMetaObject, QObject, QUrl, Q_ARG, Q_RETURN_ARG
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtTest import QTest
+from PySide6.QtWebEngineQuick import QtWebEngineQuick
+from PySide6.QtWidgets import QApplication
+
+QQuickStyle.setStyle("Material")
+QtWebEngineQuick.initialize()
+app = QApplication(["main qml mode + folder shortcuts test"])
+
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+from studio import Session, Studio
+
+temp_folder = Path(tempfile.mkdtemp(prefix="supermd-main-shortcuts-"))
+try:
+    session = Session(True)
+    session.settings["python"] = sys.executable
+    session.settings["welcomed"] = True
+    session.settings["motion"] = False
+    studio = Studio(True, session)
+    studio.openFolder(str(temp_folder))
+    channel = QFile(":/qtwebchannel/qwebchannel.js")
+    assert channel.open(QIODevice.OpenModeFlag.ReadOnly)
+    engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("studio", studio)
+    engine.rootContext().setContextProperty("readerUrl", QUrl("about:blank"))
+    engine.rootContext().setContextProperty("channelScript", bytes(channel.readAll()).decode())
+    engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(root.parent / "public" / "brand-mark-fixed.svg")))
+    engine.load(QUrl.fromLocalFile(str(root / "qml" / "Main.qml")))
+    assert engine.rootObjects(), "Main.qml failed to load"
+    window = engine.rootObjects()[0]
+    window.show()
+    QTest.qWait(60)
+
+    def activate(action):
+        assert QMetaObject.invokeMethod(window, "activateShortcut", Q_ARG("QVariant", action))
+
+    def is_enabled(action):
+        return bool(QMetaObject.invokeMethod(window, "shortcutEnabled", Q_RETURN_ARG("QVariant"), Q_ARG("QVariant", action)))
+
+    window.resize(1280, 820)
+    QTest.qWait(30)
+    for action, expected_mode in (("mode_editor", "editor"), ("mode_reader", "reader"), ("mode_split", "split"), ("mode_live", "live")):
+        assert is_enabled(action), action
+        activate(action)
+        QTest.qWait(20)
+        assert studio.mode == expected_mode, (action, studio.mode)
+
+    # Below 1000px, mode_split is disabled while other mode and folder shortcuts remain active.
+    window.resize(900, 720)
+    QTest.qWait(30)
+    assert not is_enabled("mode_split")
+    assert is_enabled("mode_reader")
+    assert is_enabled("new_folder_note")
+    assert is_enabled("new_subfolder")
+    assert is_enabled("rename_entry")
+
+    # Triggering #87 new_folder_note opens sidebar on folder section and opens createFolderItemDialog, gating mode shortcuts.
+    window.setProperty("sidebar", False)
+    window.setProperty("sidebarSection", "contents")
+    activate("new_folder_note")
+    QTest.qWait(40)
+    assert window.property("sidebar") is True
+    assert window.property("sidebarSection") == "folder"
+    create_dialog = window.findChild(QObject, "createFolderItemDialog")
+    assert create_dialog is not None and bool(create_dialog.property("visible"))
+    assert not is_enabled("mode_live")
+    create_dialog.close()
+    QTest.qWait(30)
+    assert is_enabled("mode_live")
+
+    # Triggering #87 rename_entry opens tabFallbackRenameDialog on the unsaved active tab and gates mode shortcuts while open.
+    activate("rename_entry")
+    QTest.qWait(40)
+    fallback_rename = window.findChild(QObject, "tabFallbackRenameDialog")
+    assert fallback_rename is not None and bool(fallback_rename.property("visible"))
+    assert not is_enabled("mode_editor")
+    fallback_rename.close()
+    QTest.qWait(30)
+
+    # Remapping and disabling mode + folder shortcuts updates Main.qml, FolderSidebar, and TabStrip hints live.
+    assert studio.setShortcut("mode_live", "Ctrl+Alt+9") == ""
+    assert studio.setShortcut("mode_reader", "") == ""
+    assert studio.setShortcut("new_folder_note", "Ctrl+Alt+M") == ""
+    assert studio.setShortcut("settings", "") == ""
+    QTest.qWait(40)
+    mode_group = window.findChild(QObject, "documentModeGroup")
+    choices = mode_group.property("choices").toVariant()
+    choice_tips = {entry["key"]: entry["tooltip"] for entry in choices}
+    assert "9" in choice_tips["live"], choice_tips
+    assert choice_tips["reader"] == "Read mode", choice_tips
+    settings_btn = window.findChild(QObject, "settingsButton")
+    assert settings_btn.findChild(QObject, "actionHint").property("text") == "Settings"
+    header_new_btn = window.findChild(QObject, "headerNewItemButton")
+    assert "M" in header_new_btn.findChild(QObject, "actionHint").property("text")
+
+    window.close()
+    del engine
+    studio.stop()
+    studio.pool.shutdown(wait=True, cancel_futures=True)
+    studio._search_pool.shutdown(wait=True, cancel_futures=True)
+    session.writes.shutdown(wait=True)
+finally:
+    shutil.rmtree(temp_folder, ignore_errors=True)
+
+print(json.dumps({"ok": True}), flush=True)
+os._exit(0)
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(Path(__file__).resolve().parent)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, f"{completed.stdout}\n{completed.stderr}")
+        self.assertTrue(json.loads(completed.stdout.strip().splitlines()[-1])["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

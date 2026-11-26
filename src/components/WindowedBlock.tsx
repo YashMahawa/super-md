@@ -1,4 +1,4 @@
-import {useEffect,useLayoutEffect,useRef,useState,useSyncExternalStore,type ReactNode,type HTMLAttributes} from "react";
+import {useEffect,useLayoutEffect,useRef,useState,useSyncExternalStore,type ReactNode,type HTMLAttributes,type RefObject} from "react";
 import {registerWindowedText,preserveWindowedScroll,commitWindowedLayout} from "../windowedSearch";
 import {observeSharedIntersection} from "../sharedIntersectionObserver";
 import {flushSync} from 'react-dom';
@@ -9,7 +9,7 @@ export function useWindowing():boolean {
   return useSyncExternalStore(subscribe,()=>typeof IntersectionObserver!=="undefined",()=>false);
 }
 export interface WindowHeading {id:string;key:string}
-export default function WindowedBlock({enabled,estimate=120,text="",headings=[],blockRef,children,...props}:{enabled:boolean;estimate?:number;text?:string;headings?:WindowHeading[];blockRef?:React.MutableRefObject<HTMLElement|null>;children:ReactNode}&HTMLAttributes<HTMLElement>) {
+export default function WindowedBlock({enabled,estimate=120,text="",headings=[],blockRef,children,...props}:{enabled:boolean;estimate?:number;text?:string;headings?:WindowHeading[];blockRef?:RefObject<HTMLElement|null>;children:ReactNode}&HTMLAttributes<HTMLElement>) {
   const supported=useWindowing(),active=enabled&&supported;
   const [shown,setShown]=useState(!active),[reserved,setReserved]=useState(false),height=useRef(estimate),measuredBefore=useRef(false),element=useRef<HTMLElement>(null);
   const setNodeRef=(node:HTMLElement|null)=>{element.current=node;if(blockRef)blockRef.current=node;};

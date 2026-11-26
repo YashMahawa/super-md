@@ -20,6 +20,8 @@ import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersona
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
+import {navigateExternalLink,navigateWorkspaceLink,resolveHeadingOffset} from '../documentNavigation';
+import {findSourceLinkAtOffset} from '../workspaceLinks';
 import {
   TYPEWRITER_SHORTCUT,
   centerCursorEffect,
@@ -29,12 +31,21 @@ import {
   typewriterScrollExtension,
   useTypewriterScroll,
 } from "../typewriterScroll";
+import {
+  consumePendingEditorAnchor,
+  markProgrammaticAnchorScroll,
+  primeEditorAnchor,
+  registerEditorAnchorAdapter,
+  revealEditorOffset,
+  type PendingEditorAnchor,
+} from "../sourceAnchor";
 
 interface Props extends WritingOptions {
   latexAutofix?:boolean;
   typewriterScroll?:boolean;
   onTypewriterChange?:(enabled:boolean)=>void;
   sessionId?: string;
+  documentPath?: string | null;
   value: string;
   onChange: (value: string, changes?:SourceChange[]) => void;
   dark: boolean;
@@ -198,10 +209,87 @@ export function editorKeyBindings(host: string | undefined = typeof document ===
     indentWithTab,
   ];
 }
+function firstContentOffsetOnLine(state:EditorState,pos:number):number {
+  const line=state.doc.lineAt(Math.max(0,Math.min(state.doc.length,pos)));
+  const indent=line.text.match(/^[ \t]*/)?.[0].length??0;
+  return Math.min(line.to,line.from+indent);
+}
 export function editorReadingOffset(id:string):number|undefined {
   const view=visibleEditors.get(id);if(!view)return;
-  const rect=view.scrollDOM.getBoundingClientRect();
-  return view.posAtCoords({x:rect.left+80,y:rect.top+16})??view.viewport.from;
+  const scroller=view.scrollDOM,rect=scroller.getBoundingClientRect();
+  if(rect.height>0&&scroller.scrollTop<=1)return 0;
+  if(rect.height>0&&rect.width>0){
+    const probeX=rect.left+Math.min(80,Math.max(12,rect.width*.25));
+    const probeY=rect.top+20;
+    const pos=view.posAtCoords({x:probeX,y:probeY});
+    if(pos!==null)return Math.max(firstContentOffsetOnLine(view.state,pos),pos);
+    const block=view.lineBlockAtHeight(Math.max(0,probeY-view.documentTop));
+    return firstContentOffsetOnLine(view.state,block.from);
+  }
+  return firstContentOffsetOnLine(view.state,view.viewport.from);
+}
+export function editorScrollTop(id:string):number|undefined {
+  return visibleEditors.get(id)?.scrollDOM.scrollTop??sessions.get(id)?.top;
+}
+export function editorCaretOffset(id:string):number|undefined {
+  const view=visibleEditors.get(id);if(!view)return;
+  const head=view.state.selection.main.head;
+  if(head<=0)return;
+  const scroller=view.scrollDOM,rect=scroller.getBoundingClientRect();
+  const focused=Boolean(document.activeElement&&view.dom.contains(document.activeElement));
+  if(!focused&&scroller.scrollTop>1)return;
+  if(rect.height>0){
+    const coords=view.coordsAtPos(head);
+    if(!coords||coords.bottom<=rect.top||coords.top>=rect.bottom)return;
+  }
+  return Math.max(firstContentOffsetOnLine(view.state,head),head);
+}
+export { primeEditorAnchor, revealEditorOffset, type PendingEditorAnchor };
+function applyAnchorToEditorView(editor:EditorView,anchor:PendingEditorAnchor,focus=false):void {
+  markProgrammaticAnchorScroll(editor.scrollDOM);
+  editor.requestMeasure({
+    read(){return null;},
+    write(_,targetView){markProgrammaticAnchorScroll(targetView.scrollDOM);},
+  });
+  if(anchor.top!==undefined){
+    editor.scrollDOM.scrollTop=Math.max(0,anchor.top);
+    if(focus)editor.focus();
+    return;
+  }
+  const docLen=editor.state.doc.length;
+  const target=Math.max(0,Math.min(docLen,Math.round(anchor.offset)));
+  const caret=anchor.caretOffset!==undefined?Math.max(0,Math.min(docLen,Math.round(anchor.caretOffset))):undefined;
+  const hasRangeSelection=!editor.state.selection.main.empty||Boolean(typeof window!=="undefined"&&window.getSelection()?.toString());
+  const canMoveSelection=anchor.updateSelection!==false&&!hasRangeSelection;
+  if(target<=0){
+    if(canMoveSelection&&caret!==undefined&&caret!==editor.state.selection.main.head){
+      editor.dispatch({selection:{anchor:caret},annotations:Transaction.addToHistory.of(false)});
+    }
+    editor.scrollDOM.scrollTop=0;
+    if(caret!==undefined&&caret>0){
+      const rect=editor.scrollDOM.getBoundingClientRect();
+      const coords=rect.height>0?editor.coordsAtPos(caret):null;
+      if(coords&&coords.bottom>rect.bottom-24){
+        editor.dispatch({effects:EditorView.scrollIntoView(caret,{y:"nearest",yMargin:24})});
+      }
+    }
+  }else{
+    editor.dispatch({
+      ...(canMoveSelection&&caret!==undefined?{selection:{anchor:caret}}:{}),
+      effects:EditorView.scrollIntoView(target,{y:"start",yMargin:16}),
+      annotations:Transaction.addToHistory.of(false),
+    });
+    if(canMoveSelection&&caret===undefined){
+      const head=editor.state.selection.main.head;
+      const rect=editor.scrollDOM.getBoundingClientRect();
+      const coords=rect.height>0?editor.coordsAtPos(head):null;
+      const visible=coords?coords.bottom>rect.top&&coords.top<rect.bottom:head>=editor.viewport.from&&head<=editor.viewport.to;
+      if(!visible){
+        editor.dispatch({selection:{anchor:target},annotations:Transaction.addToHistory.of(false)});
+      }
+    }
+  }
+  if(focus)editor.focus();
 }
 export function editorSelectedText(id:string):string|null {
   const view=visibleEditors.get(id);if(!view)return null;
@@ -245,8 +333,9 @@ export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:st
   const changed=(direction==='undo'?undo:redo)({state:cached.state,dispatch:transaction=>{cached.state=transaction.state;}});
   return changed?cached.state.doc.toString():undefined;
 }
-export function editorFindQuery(id:string,query:string,caseSensitive:boolean) {
-  visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,literal:true}))});
+export function editorFindQuery(id:string,query:string,caseSensitive:boolean,options?:{wholeWord?:boolean;regexp?:boolean}) {
+  const wholeWord=!!options?.wholeWord,regexp=!!options?.regexp;
+  visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,wholeWord,regexp,literal:!regexp}))});
 }
 export function editorFindRange(id:string,from:number,to:number) {
   const view=visibleEditors.get(id);if(!view)return;
@@ -270,11 +359,13 @@ export function importEditorSession(id: string, data: PortableEditorSession | un
   incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
   while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
-export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,onTypewriterChange }: Props) {
+export default function Editor({ sessionId = "default", documentPath = null, value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,onTypewriterChange }: Props) {
   pasteSettings.set(sessionId,latexAutofix);
   typewriterHandlers.set(sessionId,onTypewriterChange);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
+  const documentPathRef = useRef(documentPath);
+  documentPathRef.current = documentPath;
   const changeHandler = useRef(onChange);
   changeHandler.current = onChange;
   callbacks.set(sessionId, onChange);
@@ -366,7 +457,37 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         lineNumbers(),
         foldGutter(),
         history({ minDepth: 30 }),
-        EditorView.domEventHandlers({paste(event,editor){
+        EditorView.domEventHandlers({
+          mousedown(event, editor) {
+            if (event.button !== 0 || (!event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey) return false;
+            const pos = editor.posAtCoords({x: event.clientX, y: event.clientY});
+            if (pos === null) return false;
+            for (let node = syntaxTree(editor.state).resolveInner(pos, 0); node; node = node.parent!) {
+              if (['FencedCode', 'CodeBlock', 'InlineCode', 'HTMLBlock', 'Image'].includes(node.name)) return false;
+            }
+            const line = editor.state.doc.lineAt(pos);
+            const classified = findSourceLinkAtOffset(line.text, pos - line.from);
+            if (!classified || classified.kind === 'none') return false;
+            event.preventDefault();
+            if (classified.kind === 'same-note') {
+              const targetOffset = resolveHeadingOffset(editor.state.doc.toString(), classified.fragment);
+              if (targetOffset !== null) {
+                editor.dispatch({selection: {anchor: targetOffset}, effects: EditorView.scrollIntoView(targetOffset, {y: 'start'})});
+                editor.focus();
+              }
+              return true;
+            }
+            if (classified.kind === 'workspace') {
+              navigateWorkspaceLink(classified, documentPathRef.current);
+              return true;
+            }
+            if (classified.kind === 'external') {
+              navigateExternalLink(classified.url, true);
+              return true;
+            }
+            return true;
+          },
+          paste(event,editor){
           if(event.defaultPrevented||event.clipboardData?.files.length)return false;
           const text=event.clipboardData?.getData('text/plain');
           if(!text)return false;
@@ -480,17 +601,26 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         if (restored.doc.toString() === value) state = restored;
       } catch { /* Invalid/oversized optional view state must not block the note. */ }
     }
-    view.current = new EditorView({ state, parent: host.current });
-    visibleEditors.set(sessionId, view.current);
+    const mountedView = new EditorView({ state, parent: host.current });
+    view.current = mountedView;
+    visibleEditors.set(sessionId, mountedView);
+    registerEditorAnchorAdapter(sessionId, {
+      readingOffset: () => editorReadingOffset(sessionId),
+      caretOffset: () => editorCaretOffset(sessionId),
+      scrollTop: () => editorScrollTop(sessionId),
+      applyAnchor: (anchor, focus) => applyAnchorToEditorView(mountedView, anchor, focus),
+    });
     if (cached && state === cached.state && cached.typewriterActive !== initialTypewriter) {
-      view.current.dispatch({ effects: typewriter.current.reconfigure(typewriterScrollExtension(initialTypewriter)) });
+      mountedView.dispatch({ effects: typewriter.current.reconfigure(typewriterScrollExtension(initialTypewriter)) });
     }
     appliedTypewriter.current = initialTypewriter;
-    describeSelection(view.current.state);
-    if (cached) view.current.scrollDOM.scrollTop = cached.top;
-    if (incoming) view.current.scrollDOM.scrollTop = Math.max(0, incoming.top);
-    if (!cached && !incoming && initialTypewriter) view.current.dispatch({ effects: centerCursorEffect(view.current.state) });
-    if (view.current.state.doc.length > PROOFREADING_MAX_CHARS) setProofRange(sourceProofreadingRange(view.current));
+    describeSelection(mountedView.state);
+    const pending = consumePendingEditorAnchor(sessionId);
+    if (pending) applyAnchorToEditorView(mountedView, pending);
+    else if (incoming) mountedView.scrollDOM.scrollTop = Math.max(0, incoming.top);
+    else if (cached) mountedView.scrollDOM.scrollTop = cached.top;
+    if (!pending && !cached && !incoming && initialTypewriter) mountedView.dispatch({ effects: centerCursorEffect(mountedView.state) });
+    if (mountedView.state.doc.length > PROOFREADING_MAX_CHARS) setProofRange(sourceProofreadingRange(mountedView));
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
     const onScroll = () => {
       const instance = view.current;
@@ -510,6 +640,7 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
       clearTimeout(scrollTimer);
       view.current?.scrollDOM.removeEventListener("scroll", onScroll);
       visibleEditors.delete(sessionId);
+      registerEditorAnchorAdapter(sessionId, null, view.current?.scrollDOM.scrollTop);
       if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current,proofing:proofing.current, typewriter: typewriter.current, wrapped: wrapReference.current, typewriterActive: typewriterReference.current }); trimEditorSessions(); view.current.destroy(); }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

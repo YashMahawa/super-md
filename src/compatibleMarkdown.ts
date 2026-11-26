@@ -13,6 +13,7 @@ import {svgImage} from './svgImage';
 import {normalizeCalloutBlocks} from './markdownSource';
 import {maskFrontmatter,parseFrontmatter} from './frontmatter';
 import {looksLikeSvg,remarkSvgBlocks} from './svgBlocks';
+import {parseBracedFenceLanguage} from './fenceLanguage';
 import {pythonOutput} from './renderedOutputs';
 const svgUri=(source:string)=>'data:image/svg+xml;base64,'+btoa(Array.from(new TextEncoder().encode(svgImage(source)),v=>String.fromCharCode(v)).join(''));
 const label=(value:string)=>value.replace(/[\\[\]*_`]/g,'\\$&').replace(/[\r\n]+/g,' ');
@@ -30,7 +31,8 @@ export async function compatibleMarkdown(markdown:string,documentPath:string|nul
  const pythonOrdinals=new Map<string,number>();
  const edits:Array<{start:number;end:number;value:string}>=[];
  for(const node of blocks){
-  const lang=node.type==='html'?'svg':String(node.lang||'').toLowerCase();let value:string|undefined;
+  const bracedLang=node.type==='code'?parseBracedFenceLanguage(node.lang,node.meta):null;
+  const lang=node.type==='html'?'svg':(bracedLang??String(node.lang||'').toLowerCase());let value:string|undefined;
   if(lang==='smd-steps'){
    const deck=parseStepDeck(node.value);if(!deck)throw Error('Invalid step sequence; fix it before exporting.');
    const parts=[`**${label(deck.title)}**`];
@@ -58,6 +60,9 @@ export async function compatibleMarkdown(markdown:string,documentPath:string|nul
     const ext=name.split('.').pop();const mime=ext==='svg'?'svg+xml':ext==='jpg'?'jpeg':'png';
     value=value.replaceAll(name,'data:image/'+mime+';base64,'+body);
    }
+  }else if(bracedLang==='mermaid'){
+   const source=String(node.value||''),fence=codeFence(source);
+   value=`${fence}mermaid\n${source.replace(/\n$/,'')}\n${fence}`;
   }else if(lang==='python'||lang==='py'){
    const source=String(node.value||''),ordinal=pythonOrdinals.get(source)||0;
    pythonOrdinals.set(source,ordinal+1);
@@ -75,6 +80,9 @@ export async function compatibleMarkdown(markdown:string,documentPath:string|nul
     }
     for(const img of output.images)parts.push(image(img,'Matplotlib figure'));
     value=parts.join('\n\n').split('\n').map(line=>line?`> ${line}`:'>').join('\n');
+   }else if(bracedLang){
+    const fence=codeFence(source);
+    value=`${fence}${bracedLang}\n${source.replace(/\n$/,'')}\n${fence}`;
    }
   }
   else if(lang.startsWith('smd-'))throw Error(`Unsupported custom block ${lang}; replace it with a static figure before sharing.`);

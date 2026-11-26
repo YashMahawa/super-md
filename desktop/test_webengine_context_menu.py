@@ -21,7 +21,7 @@ MAIN_QML = ROOT / "qml" / "Main.qml"
 def _production_context_menu_block():
     source = MAIN_QML.read_text(encoding="utf-8")
     begin = source.index("                    onContextMenuRequested: function(request)")
-    end = source.index("                    WheelHandler {", begin)
+    end = source.index('                    MouseArea {\n                        objectName: "readerWheelOverlay"', begin)
     block = textwrap.dedent(source[begin:end]).rstrip()
     # The test imports the production component under an alias and adds only
     # object names needed to send pointer events to the two real menu actions.
