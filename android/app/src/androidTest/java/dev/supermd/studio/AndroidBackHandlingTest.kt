@@ -132,16 +132,68 @@ class AndroidBackHandlingTest {
             javascriptUntil(scenario, "document.documentElement.dataset.fullscreen") { it == "false" }
             assertEquals(Lifecycle.State.RESUMED, scenario.state)
 
-            // Re-open active Live edit in normal (non-fullscreen) mode and update uncommitted draft text.
+            // Open active Live edit in normal mode, then switch tabs to verify readerDismissible stays tab-scoped
+            // while flushing uncommitted textarea text on Tab A before re-opening Live edit for normal-mode Back.
+            val tabAId = modelState(scenario).active.id
+            val tabSwitchDraft = "Edited live draft flushed across tab switch."
+            val secondLiveContent = "# Second Live Tab\n\nClean live tab."
             openLiveBlockAndEdit(
                 scenario = scenario,
                 blockSnippet = "Edited live draft",
+                committedDraft = null,
+                finalTextareaValue = tabSwitchDraft,
+            )
+            waitUntil {
+                val s = modelState(scenario)
+                s.readerDismissible && s.readerDismissibleNoteId == tabAId && !s.readerOverlay && hasEnabledBackCallbacks(scenario)
+            }
+            scenario.onActivity { activity ->
+                ViewModelProvider(activity)[StudioViewModel::class.java].newNote(
+                    titleHint = "Second Live",
+                    content = secondLiveContent,
+                )
+            }
+            val expectedTabSwitchMarkdown = "# Live Back Test\n\n$tabSwitchDraft"
+            waitUntil {
+                val s = modelState(scenario)
+                s.active.id != tabAId &&
+                    s.message == null &&
+                    !s.readerDismissible &&
+                    s.readerDismissibleNoteId == null &&
+                    !hasEnabledBackCallbacks(scenario) &&
+                    s.tabs.firstOrNull { it.id == tabAId }?.content == expectedTabSwitchMarkdown &&
+                    isReaderSynchronized(scenario, secondLiveContent)
+            }
+            javascriptUntil(
+                scenario,
+                "!document.querySelector('.live-active-block textarea') && Boolean(document.querySelector('.live-document')?.textContent?.includes('Clean live tab.'))",
+            ) { it == "true" }
+
+            scenario.onActivity { activity ->
+                ViewModelProvider(activity)[StudioViewModel::class.java].select(tabAId)
+            }
+            waitUntil {
+                val s = modelState(scenario)
+                s.active.id == tabAId &&
+                    s.message == null &&
+                    !s.readerDismissible &&
+                    isReaderSynchronized(scenario, expectedTabSwitchMarkdown)
+            }
+            javascriptUntil(
+                scenario,
+                "document.querySelector('.live-document')?.textContent?.includes(${JSONObject.quote(tabSwitchDraft)})",
+            ) { it == "true" }
+
+            // Re-open active Live edit in normal (non-fullscreen) mode and update uncommitted draft text.
+            openLiveBlockAndEdit(
+                scenario = scenario,
+                blockSnippet = tabSwitchDraft,
                 committedDraft = null,
                 finalTextareaValue = normalDraft,
             )
             waitUntil {
                 val s = modelState(scenario)
-                s.readerDismissible && !s.readerOverlay && hasEnabledBackCallbacks(scenario)
+                s.readerDismissible && s.readerDismissibleNoteId == tabAId && !s.readerOverlay && hasEnabledBackCallbacks(scenario)
             }
 
             // 1st Back in normal mode: dismisses active Live edit, keeps draft text, and disables Studio BackHandler.
@@ -275,9 +327,57 @@ class AndroidBackHandlingTest {
                 scenario,
                 "(() => { if (document.activeElement instanceof HTMLElement) document.activeElement.blur(); return Boolean(document.querySelector('.cm-search')); })()",
             ) { it == "true" }
+            val tabAId = modelState(scenario).active.id
+            val secondSourceContent = "# Second Source Tab\n\nClean source tab."
             waitUntil {
                 val s = modelState(scenario)
-                s.readerDismissible && !s.readerOverlay && s.active.content == editedSecond && hasEnabledBackCallbacks(scenario)
+                s.readerDismissible && s.readerDismissibleNoteId == tabAId && !s.readerOverlay && s.active.content == editedSecond && hasEnabledBackCallbacks(scenario)
+            }
+
+            // Switch to a clean second tab and verify Tab A's .cm-search dismissal does not leak to Tab B,
+            // then return to Tab A and verify cached .cm-search re-arms readerDismissible on Tab A.
+            scenario.onActivity { activity ->
+                ViewModelProvider(activity)[StudioViewModel::class.java].newNote(
+                    titleHint = "Second Source",
+                    content = secondSourceContent,
+                )
+            }
+            waitUntil {
+                val s = modelState(scenario)
+                s.active.id != tabAId &&
+                    s.message == null &&
+                    !s.readerDismissible &&
+                    s.readerDismissibleNoteId == null &&
+                    !s.readerOverlay &&
+                    !hasEnabledBackCallbacks(scenario) &&
+                    s.tabs.firstOrNull { it.id == tabAId }?.content == editedSecond &&
+                    isReaderSynchronized(scenario, secondSourceContent)
+            }
+            javascriptUntil(
+                scenario,
+                "!document.querySelector('.cm-search') && Boolean(document.querySelector('.android-source .cm-content')?.textContent?.includes('Clean source tab.'))",
+            ) { it == "true" }
+
+            scenario.onActivity { activity ->
+                ViewModelProvider(activity)[StudioViewModel::class.java].select(tabAId)
+            }
+            javascriptUntil(
+                scenario,
+                "Boolean(document.querySelector('.cm-search')) && Boolean(document.querySelector('.android-source .cm-content')?.textContent?.includes('Draft kept after CodeMirror search and system Back.'))",
+            ) { it == "true" }
+            javascriptUntil(
+                scenario,
+                "(() => { if (document.activeElement instanceof HTMLElement) document.activeElement.blur(); return Boolean(document.querySelector('.cm-search')); })()",
+            ) { it == "true" }
+            waitUntil {
+                val s = modelState(scenario)
+                s.active.id == tabAId &&
+                    s.message == null &&
+                    s.readerDismissible &&
+                    s.readerDismissibleNoteId == tabAId &&
+                    !s.readerOverlay &&
+                    isReaderSynchronized(scenario, editedSecond) &&
+                    hasEnabledBackCallbacks(scenario)
             }
 
             // 1st Back in normal mode: dismisses .cm-search despite outside focus, keeps draft, releases BackHandler.
