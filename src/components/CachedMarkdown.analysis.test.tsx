@@ -1,6 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
 import * as documentAnalysis from "../documentAnalysis";
 import { cachedMarkdownTree } from "./CachedMarkdown";
+import MarkdownPreview, { PREVIEW_REHYPE_PLUGINS, PREVIEW_REMARK_PLUGINS } from "./MarkdownPreview";
 import { readerSourceAnalysis } from "../readerSourceAnalysis";
 
 afterEach(() => vi.restoreAllMocks());
@@ -63,5 +65,98 @@ describe("CachedMarkdown supplied source analysis", () => {
 
     expect(parse).toHaveBeenCalledOnce();
     expect(parse).toHaveBeenCalledWith(source);
+  });
+
+  it("renders identical preview output from supplied source analysis without invoking source parsing in CachedMarkdown", () => {
+    const richSource = [
+      "---",
+      "title: Supplied Source Parity",
+      "---",
+      "",
+      "# Analysis Heading",
+      "",
+      "> [!note] Callout with $x^2 + y^2 = z^2$",
+      "> Highlight ==term==, H~2~O, 10^3^, and <kbd onclick=\"alert(1)\">Esc</kbd><br/>line two.",
+      "",
+      "| Col | Math |",
+      "| --- | --- |",
+      "| Val | $P(X | Y)$ |",
+      "",
+      "- [ ] Task with [ref][target] and footnote[^n1]",
+      "",
+      "<script>alert('xss')</script>",
+      "",
+      "![Dot](data:image/png;base64,iVBORw0KGgo=) [Unsafe](javascript:alert(1))",
+      "",
+      "```python",
+      "total = 40 + 2",
+      "```",
+      "",
+      "[target]: https://example.org/parity",
+      "[^n1]: Footnote from pre-parsed tree.",
+    ].join("\n");
+
+    const supplied = readerSourceAnalysis("reader", richSource)!;
+    const parse = vi.spyOn(documentAnalysis, "analyzeDocument");
+
+    let registeredParser: unknown = "unset";
+    const inspectProcessor = function (this: { parser?: unknown }) {
+      registeredParser = this.parser;
+    };
+
+    const treeFromSupplied = cachedMarkdownTree(
+      richSource,
+      [inspectProcessor, ...PREVIEW_REMARK_PLUGINS],
+      PREVIEW_REHYPE_PLUGINS,
+      false,
+      supplied,
+    );
+    expect(registeredParser).toBeUndefined();
+    expect(parse).not.toHaveBeenCalled();
+
+    const htmlFromSupplied = renderToStaticMarkup(
+      <MarkdownPreview
+        markdown={richSource}
+        documentPath={null}
+        python="python3"
+        dark={false}
+        sourceAnalysis={supplied}
+      />,
+    );
+    expect(parse).not.toHaveBeenCalled();
+
+    const freshVariant = richSource.replace("Supplied Source Parity", "Fresh Source Parity");
+    const htmlFreshWithSupplied = renderToStaticMarkup(
+      <MarkdownPreview
+        markdown={freshVariant}
+        documentPath={null}
+        python="python3"
+        dark={false}
+        sourceAnalysis={readerSourceAnalysis("split", freshVariant) ?? undefined}
+      />,
+    );
+    expect(parse).toHaveBeenCalledOnce();
+
+    const htmlWithoutSupplied = renderToStaticMarkup(
+      <MarkdownPreview
+        markdown={richSource}
+        documentPath={null}
+        python="python3"
+        dark={false}
+      />,
+    );
+    expect(htmlFromSupplied).toBe(htmlWithoutSupplied);
+    expect(treeFromSupplied.children.length).toBeGreaterThan(0);
+    expect(htmlFromSupplied).toContain("Supplied Source Parity");
+    expect(htmlFreshWithSupplied).toContain("Fresh Source Parity");
+    expect(htmlFromSupplied).toContain('class="callout callout-note"');
+    expect(htmlFromSupplied).toContain("<mark>term</mark>");
+    expect(htmlFromSupplied).toContain("<kbd>Esc</kbd><br/>line two.");
+    expect(htmlFromSupplied).not.toContain("onclick");
+    expect(htmlFromSupplied).not.toContain("javascript:");
+    expect(htmlFromSupplied).not.toContain("<script");
+    expect(htmlFromSupplied).toContain('href="https://example.org/parity"');
+    expect(htmlFromSupplied).toContain("Footnote from pre-parsed tree.");
+    expect(htmlFromSupplied).toContain('class="python-cell"');
   });
 });
