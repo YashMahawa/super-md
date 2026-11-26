@@ -790,8 +790,10 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
           if (indexRef.current !== expectedIndex) return;
           const liveHost = findReadingHost();
           if (!liveHost || !liveHost.isConnected) return;
-          const liveBlock = findContainingBlock(liveHost, range, sourceText);
-          if (!liveBlock || !liveBlock.isConnected) return;
+          const initialLiveBlock = findContainingBlock(liveHost, range, sourceText);
+          if (!initialLiveBlock || !initialLiveBlock.isConnected) return;
+          revealMountedBlock(initialLiveBlock);
+          const liveBlock = findContainingBlock(liveHost, range, sourceText) ?? initialLiveBlock;
           const liveOwner = deepestSourceOwner(liveBlock, range, sourceText) ?? liveBlock;
           openDisclosuresFor(liveOwner, liveBlock, null, range);
           const liveDomRange = mapSourceRangeToDomRange(liveBlock, sourceText, ranges, targetIndex, matchQuery, matchOptions);
@@ -828,9 +830,11 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       settleFrames.current[1] = requestAnimationFrame(() => {
         settleFrames.current = [0, 0];
         if (indexRef.current !== next || !match.element.isConnected) return;
+        revealMountedBlock(match.element);
         const liveHost = findReadingHost();
-        const liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-        openDisclosuresFor(match.element, match.element, liveRange);
+        openDisclosuresFor(match.element, match.element);
+        let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+        if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
         const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
         scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
         if (registry && HighlightClass) {
@@ -1245,6 +1249,36 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
               registry.set("smd-search", new HighlightClass(...visible, domRange));
               registry.set("smd-search-current", new HighlightClass(domRange));
             }
+            if (wasUnmounted) {
+              const sliceText = content.slice(targetRange.from, targetRange.to);
+              const sliceRanges = sliceText ? sourceMatches(content, sliceText, true) : [];
+              const sliceIdx = sliceRanges.length ? findMatchingSourceRangeIndex(sliceRanges, targetRange) : -1;
+              settleFrames.current[0] = requestAnimationFrame(() => {
+                settleFrames.current[1] = requestAnimationFrame(() => {
+                  settleFrames.current = [0, 0];
+                  if (indexRef.current !== -1) return;
+                  const liveHost = findReadingHost();
+                  if (!liveHost || !liveHost.isConnected) return;
+                  const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
+                  if (!initialLiveBlock || !initialLiveBlock.isConnected) return;
+                  revealMountedBlock(initialLiveBlock);
+                  const liveBlock = findContainingBlock(liveHost, targetRange, content) ?? initialLiveBlock;
+                  const liveOwner = deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock;
+                  openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
+                  const liveDomRange = sliceIdx >= 0 ? mapSourceRangeToDomRange(liveBlock, content, sliceRanges, sliceIdx, sliceText, true) : null;
+                  const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveOwner;
+                  openDisclosuresFor(liveScrollEl, liveBlock, liveDomRange, targetRange);
+                  scrollTargetIntoView(liveScrollEl ?? liveOwner, liveHost);
+                  if (registry && HighlightClass) {
+                    const visible = activeWindowed.length ? readingMatches(liveHost, query, filterOptions) : [];
+                    if (liveDomRange) {
+                      registry.set("smd-search", new HighlightClass(...visible, liveDomRange));
+                      registry.set("smd-search-current", new HighlightClass(liveDomRange));
+                    }
+                  }
+                });
+              });
+            }
             return;
           }
         } else {
@@ -1254,9 +1288,13 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             settleFrames.current[0] = requestAnimationFrame(() => {
               settleFrames.current[1] = requestAnimationFrame(() => {
                 settleFrames.current = [0, 0];
+                if (indexRef.current !== -1) return;
                 const liveHost = findReadingHost();
-                const liveBlock = liveHost ? findContainingBlock(liveHost, targetRange, content) : null;
+                const initialLiveBlock = liveHost ? findContainingBlock(liveHost, targetRange, content) : null;
+                if (initialLiveBlock) revealMountedBlock(initialLiveBlock);
+                const liveBlock = (liveHost && initialLiveBlock ? findContainingBlock(liveHost, targetRange, content) : null) ?? initialLiveBlock;
                 const liveOwner = liveBlock ? (deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock) : null;
+                if (liveBlock) openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
                 scrollTargetIntoView(liveOwner ?? liveBlock ?? owner ?? block, liveHost ?? host);
               });
             });

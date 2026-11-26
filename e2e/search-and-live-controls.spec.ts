@@ -344,3 +344,125 @@ test("Desktop workspace (App.tsx) hides Replace in Read view, wraps Previous 0/N
   await imgBlock.getByRole("button", { name: "Edit block" }).click();
   await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue(`![Chart figure](${tinyPng})`);
 });
+
+test("Seeded folder-search handoff reveals exact offscreen windowed occurrences into the viewport and falls back cleanly on stale ranges", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.SuperMD = { post: () => {} };
+  });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const filler = "Windowed study prose paragraph with context for offscreen scrolling.\n\n".repeat(40);
+  const content =
+    `# Seeded Handoff\n\nIntro AuroraPin occurrence one.\n\n` +
+    Array.from({ length: 50 }, (_, i) => {
+      if (i === 18) return `## Section ${i}\n\nMidway AuroraPin occurrence two.\n\n${filler}`;
+      if (i === 35) return `## Section ${i}\n\nDeep offscreen AuroraPin occurrence three.\n\n${filler}`;
+      if (i === 42) return `## Section ${i}\n\nUnicode Hauptstraße offscreen target.\n\n${filler}`;
+      if (i === 46) return `## Section ${i}\n\nHidden [portal link](https://example.org/AuroraHiddenUrl) target.\n\n${filler}`;
+      return `## Section ${i}\n\n${filler}`;
+    }).join("");
+  expect(content.length).toBeGreaterThan(85_000);
+
+  const firstStart = content.indexOf("AuroraPin");
+  const secondStart = content.indexOf("AuroraPin", firstStart + 1);
+  const thirdStart = content.indexOf("AuroraPin", secondStart + 1);
+  const unicodeStart = content.indexOf("straße");
+  const hiddenStart = content.indexOf("AuroraHiddenUrl");
+
+  for (const mode of ["reader", "live"] as const) {
+    // 1. Fresh load seeded directly to the 3rd (offscreen unmounted windowed) occurrence -> 3 / 3 in viewport.
+    await page.evaluate(
+      ({ content, mode, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { content, mode, thirdStart }
+    );
+
+    await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+    const section35 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Deep offscreen AuroraPin occurrence three." });
+    await expect(section35).toBeVisible();
+    await expect(section35).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
+
+    // 2. Unicode casefold offscreen occurrence ("strasse" -> "straße" inside "Hauptstraße") -> mounted & in viewport.
+    await page.evaluate(
+      ({ unicodeStart }) =>
+        window.supermdFind?.("strasse", {
+          caseSensitive: false,
+          sourceStart: unicodeStart,
+          sourceEnd: unicodeStart + "straße".length,
+          matchText: "straße",
+        }),
+      { unicodeStart }
+    );
+    const section42 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Unicode Hauptstraße offscreen target." });
+    await expect(section42).toBeVisible();
+    await expect(section42).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
+
+    // 3. Offscreen hidden Markdown URL hit -> mounts & scrolls enclosing block into viewport with "In Markdown source".
+    await page.evaluate(
+      ({ hiddenStart }) =>
+        window.supermdFind?.("AuroraHiddenUrl", {
+          caseSensitive: true,
+          sourceStart: hiddenStart,
+          sourceEnd: hiddenStart + "AuroraHiddenUrl".length,
+          matchText: "AuroraHiddenUrl",
+        }),
+      { hiddenStart }
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("In Markdown source");
+    const section46 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Hidden portal link target." });
+    await expect(section46).toBeVisible();
+    await expect(section46).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+
+    // 4. Stale-result fallback: third occurrence edited out before handoff -> falls back to 1 / 2 and brings 1st match into viewport.
+    const editedContent = content.slice(0, thirdStart) + "EditedOut" + content.slice(thirdStart + "AuroraPin".length);
+    await page.evaluate(
+      ({ editedContent, mode, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-stale-${mode}`,
+          content: editedContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { editedContent, mode, thirdStart }
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("1 / 2");
+    const introMatch = page.locator("p").filter({ hasText: "Intro AuroraPin occurrence one." });
+    await expect(introMatch).toBeVisible();
+    await expect(introMatch).toBeInViewport();
+  }
+});
