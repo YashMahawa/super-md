@@ -49,6 +49,7 @@ ApplicationWindow {
         self.engine.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.studio.stop(); self.studio.pool.shutdown(wait=True)
+        self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
 
     def drop(self, payload):
@@ -184,3 +185,75 @@ ApplicationWindow {
         self.window.resize(460, 180)
         QTest.qWait(60)
         self._assert_active_tab_revealed("after narrowing window")
+
+    def test_overflowing_strip_reveals_active_tab_across_folder_create_open_and_rename(self):
+        import shutil
+        import tempfile
+        import time
+        from PySide6.QtCore import QMetaObject, QObject, Q_ARG
+
+        folder_dir = Path(tempfile.mkdtemp(prefix="supermd-tab-folder-reveal-"))
+        self.addCleanup(lambda: shutil.rmtree(folder_dir, ignore_errors=True))
+
+        def wait_until(predicate, timeout=5.0):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                self.app.processEvents()
+                if predicate():
+                    return
+                QTest.qWait(10)
+            self.assertTrue(predicate())
+
+        self.studio.openFolder(str(folder_dir))
+        wait_until(lambda: bool(self.studio.folder))
+
+        # Create enough folder-backed notes via #87 createFolderNote to overflow horizontally.
+        for index in range(7):
+            title = f"1.{index + 1} Module Overview"
+            self.studio.createFolderNote(str(folder_dir), title, "md")
+            wait_until(lambda expected=f"{title}.md": self.studio.busy == 0 and self.studio._current()["name"] == expected)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after creating overflowing folder-backed note")
+
+        # Activating the first folder note via openNote reveals it at the left edge.
+        first_note = folder_dir / "1.1 Module Overview.md"
+        self.studio.openNote(str(first_note))
+        wait_until(lambda: self.studio._current()["name"] == "1.1 Module Overview.md")
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after activating first folder note via openNote")
+
+        # Activate a note near the right edge of the current viewport and rename it via #87 renameEntry so it widens past the viewport.
+        self.studio.tabNumber(4)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("before renaming folder-backed active tab")
+        target_path = self.studio._current()["path"]
+        self.studio.renameEntry(target_path, "1.2 Comprehensive Distributed Consensus Architecture")
+        wait_until(
+            lambda: self.studio.busy == 0
+            and self.studio._current()["name"] == "1.2 Comprehensive Distributed Consensus Architecture.md"
+        )
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after widening active tab via folder renameEntry")
+
+        # Verify TabStrip's renameDialog still selects only the dotted stem (without .md) from #87.
+        self.window.requestActivate()
+        strip = self.window.findChild(QQuickItem, "tabStrip")
+        self.assertTrue(
+            QMetaObject.invokeMethod(
+                strip,
+                "openRename",
+                Q_ARG("QVariant", self.studio.active),
+                Q_ARG("QVariant", self.studio._current()["name"]),
+            )
+        )
+        rename_field = self.window.findChild(QObject, "renameField")
+        self.assertIsNotNone(rename_field)
+        wait_until(lambda: bool(rename_field.property("selectedText")))
+        self.assertEqual(
+            rename_field.property("selectedText"),
+            "1.2 Comprehensive Distributed Consensus Architecture",
+        )
+        rename_dialog = self.window.findChild(QObject, "renameDialog")
+        rename_dialog.close()
+        QTest.qWait(20)
+

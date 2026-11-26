@@ -18,12 +18,13 @@ ScrollView {
         return -1
     }
     property bool draggingTab: false
+    property bool rebuildingTabs: false
     property real lastContentWidth: 0
     height: 48
     contentHeight: 48
     contentWidth: {
         const current = Math.max(availableWidth, tabRow.implicitWidth)
-        if (tabRepeater.count < strip.tabCount && strip.lastContentWidth > current) {
+        if ((strip.rebuildingTabs || tabRepeater.count < strip.tabCount) && strip.lastContentWidth > current) {
             return strip.lastContentWidth
         }
         return current
@@ -36,6 +37,13 @@ ScrollView {
         repeat: false
         onTriggered: strip.revealActiveTab()
     }
+    function noteStem(name) {
+        const raw = name || ""
+        const known = raw.replace(/\.(markdown|smd|fmd|md|txt)$/i, "")
+        if (known !== raw && known.length > 0) return known
+        const custom = raw.replace(/\.[A-Za-z][A-Za-z0-9]{0,15}$/, "")
+        return custom.length > 0 ? custom : raw
+    }
     function shortcutHint(label, key, fallback) {
         const raw = strip.shortcutLabels && strip.shortcutLabels[key] !== undefined ? strip.shortcutLabels[key] : fallback
         return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
@@ -45,7 +53,10 @@ ScrollView {
         const flickable = strip.contentItem
         if (!flickable || typeof flickable.contentX !== "number") return
         const viewportWidth = strip.availableWidth > 0 ? strip.availableWidth : strip.width
-        if (viewportWidth <= 0 || strip.activeTabIndex < 0) return
+        if (viewportWidth <= 0 || strip.activeTabIndex < 0) {
+            strip.rebuildingTabs = false
+            return
+        }
         if (tabRepeater.count < strip.tabCount) {
             revealTimer.restart()
             return
@@ -65,10 +76,13 @@ ScrollView {
             revealTimer.restart()
             return
         }
+        strip.rebuildingTabs = false
         const margin = 16
-        const totalWidth = Math.max(viewportWidth, tabRow.implicitWidth, flickable.contentWidth)
+        const totalWidth = Math.max(viewportWidth, tabRow.implicitWidth)
         strip.lastContentWidth = totalWidth
-        if (flickable.contentWidth < totalWidth) flickable.contentWidth = totalWidth
+        if (flickable.contentWidth + 0.5 < totalWidth) {
+            revealTimer.restart()
+        }
         const maxScroll = Math.max(0, totalWidth - viewportWidth)
         const leftEdge = Math.max(0, activeItem.x - margin)
         const rightEdge = activeItem.x + activeItem.width + margin
@@ -79,13 +93,17 @@ ScrollView {
         if (Math.abs(flickable.contentX - nextX) > 0.5) flickable.contentX = nextX
     }
     function scheduleRevealActiveTab() {
-        strip.revealActiveTab()
+        if (!strip.rebuildingTabs) strip.revealActiveTab()
         Qt.callLater(strip.revealActiveTab)
         revealTimer.restart()
     }
     Connections {
         target: strip.contentItem
         function onContentWidthChanged() { Qt.callLater(strip.revealActiveTab) }
+    }
+    onViewStateChanged: {
+        strip.rebuildingTabs = true
+        scheduleRevealActiveTab()
     }
     onActiveTabIdChanged: scheduleRevealActiveTab()
     onActiveTabIndexChanged: scheduleRevealActiveTab()
@@ -128,7 +146,12 @@ ScrollView {
             }
             onAccepted: { if (text.trim().length) renameDialog.accept() }
         }
-        onOpened: { renameField.forceActiveFocus(); renameField.selectAll() }
+        onOpened: {
+            renameField.forceActiveFocus()
+            const stem = strip.noteStem(renameField.text)
+            if (stem.length > 0 && stem.length < renameField.text.length) renameField.select(0, stem.length)
+            else renameField.selectAll()
+        }
         onAccepted: studio.renameNote(noteId, renameField.text)
     }
     function receive(drop, index) {
@@ -197,7 +220,7 @@ ScrollView {
                 NoteContextMenu {
                     id: tabMenu
                     objectName: "tabContextMenu"
-                    NoteMenuItem { text: "Rename note"; icon.source: "../icons/Rename.svg"; onTriggered: strip.openRename(tab.modelData.id, tab.modelData.name) }
+                    NoteMenuItem { objectName: "renameTabAction"; text: "Rename note"; shortcutText: tab.isActive ? (strip.shortcutLabels.rename_entry || "") : ""; icon.source: "../icons/Rename.svg"; onTriggered: strip.openRename(tab.modelData.id, tab.modelData.name) }
                     NoteMenuItem { text: "Undo"; shortcutText: strip.shortcutLabels.undo || ""; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
                     NoteMenuItem { text: "Redo"; shortcutText: strip.shortcutLabels.redo || ""; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
                     MenuSeparator {}
