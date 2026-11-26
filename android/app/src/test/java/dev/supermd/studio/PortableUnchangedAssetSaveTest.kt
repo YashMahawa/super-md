@@ -567,4 +567,397 @@ class PortableUnchangedAssetSaveTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun providerAwareRenamePinnedRecentsAndSaveAsPreserveUnchangedAssetFastPath() = withStudioModel(autosave = false) { app, tempDir, bundlesRoot, _, model ->
+        val authority = "dev.supermd.test.portable.opaque.${UUID.randomUUID()}"
+        val provider = PortableOpaqueSafProvider(app, tempDir).also { it.attach(app, authority) }
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(authority, provider)
+        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, PortableOpaqueSafProvider.ROOT_ID)
+        app.grantUriPermission(
+            app.packageName,
+            treeUri,
+            android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+
+        val pngOne = syntheticPngBytes(32_000, 701L)
+        val svgOne = svgBytes("opaque-saf-diagram", 48)
+        val seedAssets = JSONObject()
+            .put("assets/chart.png", dataUrl("image/png", pngOne))
+            .put("assets/flow.svg", dataUrl("image/svg+xml", svgOne))
+        val initialMd = "# Workbook\n\n![Chart](assets/chart.png)\n![Flow](assets/flow.svg)\n"
+
+        val mathDir = File(tempDir, "Sem1/Math").apply { mkdirs() }
+        val seedFile = File(mathDir, "Workbook.smd")
+        seedFile.outputStream().use { MediaStorage(app).writeFmd(it, initialMd, seedAssets) }
+
+        val previousRecentJson = app.getSharedPreferences("studio", 0).getString("recent", "[]")
+        try {
+            model.setFolder(treeUri)
+            awaitCondition { model.state.value.folder == treeUri.toString() }
+            model.listFolder(treeUri, "Sem1/Math")
+            awaitCondition {
+                model.state.value.folderRelative == "Sem1/Math" &&
+                    model.state.value.files.any { it.name == "Workbook.smd" }
+            }
+            val workbookEntry = model.state.value.files.single { it.name == "Workbook.smd" }
+            val initialUri = Uri.parse(workbookEntry.uri)
+            assertFalse(
+                "Expected opaque documentId without path hierarchy",
+                android.provider.DocumentsContract.getDocumentId(initialUri).contains('/'),
+            )
+
+            awaitJob(model.open(initialUri, workbookEntry.relative))
+            val noteId = model.state.value.active.id
+            val initialAssetDir = model.state.value.active.assetDirectory!!
+            assertEquals("Sem1/Math/Workbook.smd", model.state.value.active.relative)
+
+            model.pinRecent(initialUri.toString())
+            assertTrue(model.recent.value.any { it.uri == initialUri.toString() && it.pinned && it.relative == "Sem1/Math/Workbook.smd" })
+
+            // 1. Provider-aware tab rename rotates opaque ID, keeps pin + relative, and preserves 0-decode portable save.
+            model.rename(noteId, "1.1 Linear Workbook")
+            awaitCondition {
+                model.state.value.active.name == "1.1 Linear Workbook.smd" &&
+                    model.state.value.active.relative == "Sem1/Math/1.1 Linear Workbook.smd" &&
+                    model.state.value.active.uri != initialUri.toString()
+            }
+            val renamedFileUri = model.state.value.active.uri!!
+            assertTrue(
+                "Pinned recent entry must track provider-rotated URI and relative path",
+                model.recent.value.any {
+                    it.uri == renamedFileUri &&
+                        it.pinned &&
+                        it.name == "1.1 Linear Workbook.smd" &&
+                        it.relative == "Sem1/Math/1.1 Linear Workbook.smd"
+                },
+            )
+
+            val afterTabRenameMd = "$initialMd\nAdded theorem notes after tab rename.\n"
+            model.edit(noteId, afterTabRenameMd)
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy }
+            assertNull(model.state.value.error)
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(0, model.media.portableAssetExtractions.get())
+            assertEquals(initialAssetDir, model.state.value.active.assetDirectory)
+            assertEquals("Sem1/Math/1.1 Linear Workbook.smd", model.state.value.active.relative)
+            assertTrue(
+                "Portable save must preserve pinned recent entry and relative path",
+                model.recent.value.any {
+                    it.uri == renamedFileUri &&
+                        it.pinned &&
+                        it.relative == "Sem1/Math/1.1 Linear Workbook.smd"
+                },
+            )
+
+            // 2. Provider-aware directory rename rotates subtree opaque IDs and preserves 0-decode portable save.
+            model.listFolder(treeUri, "Sem1")
+            awaitCondition {
+                model.state.value.folderRelative == "Sem1" &&
+                    model.state.value.files.any { it.directory && it.name == "Math" }
+            }
+            val mathUri = Uri.parse(model.state.value.files.single { it.directory && it.name == "Math" }.uri)
+            model.listFolder(treeUri, "Sem1/Math")
+            model.renameFolderEntry(mathUri, "Sem1/Math", isDirectory = true, requested = "PureMath")
+            awaitCondition {
+                model.state.value.folderRelative == "Sem1/PureMath" &&
+                    model.state.value.active.relative == "Sem1/PureMath/1.1 Linear Workbook.smd" &&
+                    model.state.value.active.uri != renamedFileUri
+            }
+            val rotatedDirNoteUri = model.state.value.active.uri!!
+            assertTrue(
+                "Directory rename must preserve pinned recent entry with rotated child URI",
+                model.recent.value.any {
+                    it.uri == rotatedDirNoteUri &&
+                        it.pinned &&
+                        it.relative == "Sem1/PureMath/1.1 Linear Workbook.smd"
+                },
+            )
+
+            val afterDirRenameMd = "$afterTabRenameMd\nAdded corollary after folder rename.\n"
+            model.edit(noteId, afterDirRenameMd)
+            val bridgeAssets = JSONObject()
+                .put("assets/chart.png", String(dataUrl("image/png", pngOne).toCharArray()))
+                .put("assets/flow.svg", String(dataUrl("image/svg+xml", svgOne).toCharArray()))
+            model.media.resetPortableCounters()
+            awaitSuspend {
+                model.writePortable(noteId, afterDirRenameMd, bridgeAssets, save = true, originalContent = afterDirRenameMd)
+            }
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(0, model.media.portableAssetExtractions.get())
+            assertEquals(initialAssetDir, model.state.value.active.assetDirectory)
+            assertEquals("Sem1/PureMath/1.1 Linear Workbook.smd", model.state.value.active.relative)
+            assertTrue(
+                model.recent.value.any {
+                    it.uri == rotatedDirNoteUri &&
+                        it.pinned &&
+                        it.relative == "Sem1/PureMath/1.1 Linear Workbook.smd"
+                },
+            )
+
+            // 3. Portable Save As inside the open opaque SAF folder resolves openRel without re-decoding unchanged assets.
+            val pureMathDocId = provider.docIdForExistingFile(File(tempDir, "Sem1/PureMath"))
+            val pureMathDocUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, pureMathDocId)
+            val saveAsTarget = android.provider.DocumentsContract.createDocument(
+                app.contentResolver,
+                pureMathDocUri,
+                "application/vnd.supermd.smd",
+                "Workbook Copy.smd",
+            )!!
+            val saveAsMd = "$afterDirRenameMd\nSaved as copy.\n"
+            model.edit(noteId, saveAsMd)
+            model.media.resetPortableCounters()
+            model.completePortableSaveAs(saveAsTarget, noteId)
+            awaitCondition {
+                model.state.value.active.uri == saveAsTarget.toString() &&
+                    !model.state.value.active.dirty &&
+                    !model.state.value.busy
+            }
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals("Workbook Copy.smd", model.state.value.active.name)
+            assertEquals("Sem1/PureMath/Workbook Copy.smd", model.state.value.active.relative)
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+
+            val verifyMedia = MediaStorage(app)
+            val reopenedCopy = File(tempDir, "Sem1/PureMath/Workbook Copy.smd").inputStream().use(verifyMedia::openFmd)
+            try {
+                assertEquals(saveAsMd, reopenedCopy.markdown)
+                assertArrayEquals(pngOne, verifyMedia.local("assets/chart.png", reopenedCopy.directory)!!.readBytes())
+                assertArrayEquals(svgOne, verifyMedia.local("assets/flow.svg", reopenedCopy.directory)!!.readBytes())
+            } finally {
+                File(bundlesRoot, reopenedCopy.directory).deleteRecursively()
+            }
+            File(bundlesRoot, initialAssetDir).deleteRecursively()
+        } finally {
+            app.getSharedPreferences("studio", 0).edit().putString("recent", previousRecentJson).apply()
+        }
+    }
+}
+
+private class PortableOpaqueSafProvider(
+    private val appContext: android.content.Context,
+    private val rootDir: File,
+) : android.content.ContentProvider() {
+    private var attachedAuthority: String = ""
+    private var nextSeq = 1
+    private val idToPath = linkedMapOf<String, String>()
+    private val pathToId = linkedMapOf<String, String>()
+    val unknownIdQueries = mutableListOf<String>()
+
+    init {
+        idToPath[ROOT_ID] = rootDir.canonicalPath
+        pathToId[rootDir.canonicalPath] = ROOT_ID
+    }
+
+    fun attach(context: android.content.Context, authority: String) {
+        attachedAuthority = authority
+        attachInfo(
+            context,
+            android.content.pm.ProviderInfo().apply {
+                this.authority = authority
+                exported = true
+                grantUriPermissions = true
+            },
+        )
+    }
+
+    override fun onCreate(): Boolean = true
+
+    @Synchronized
+    fun docIdForExistingFile(file: File): String = idForFile(file)
+
+    @Synchronized
+    private fun idForFile(file: File): String {
+        val canonical = file.canonicalPath
+        return pathToId.getOrPut(canonical) {
+            "opaque:item-${nextSeq++}".also { id -> idToPath[id] = canonical }
+        }
+    }
+
+    @Synchronized
+    private fun fileForId(documentId: String): File {
+        val path = idToPath[documentId] ?: run {
+            unknownIdQueries += documentId
+            throw java.io.FileNotFoundException("Unknown opaque documentId: $documentId")
+        }
+        return File(path)
+    }
+
+    @Synchronized
+    private fun rotateSubtreeIds(oldCanonicalRoot: String, newRoot: File) {
+        idToPath.entries.removeIf { (_, path) ->
+            path == oldCanonicalRoot || path.startsWith(oldCanonicalRoot + File.separator)
+        }
+        pathToId.keys.removeIf { path ->
+            path == oldCanonicalRoot || path.startsWith(oldCanonicalRoot + File.separator)
+        }
+        newRoot.walkTopDown().forEach { entry ->
+            val freshId = "opaque:rotated-${nextSeq++}"
+            val canonical = entry.canonicalPath
+            idToPath[freshId] = canonical
+            pathToId[canonical] = freshId
+            grantPermissions(treeUriForDocId(freshId))
+        }
+    }
+
+    private fun treeUriForDocId(docId: String): Uri {
+        val tree = android.provider.DocumentsContract.buildTreeDocumentUri(attachedAuthority, ROOT_ID)
+        return android.provider.DocumentsContract.buildDocumentUriUsingTree(tree, docId)
+    }
+
+    private fun mimeFor(file: File): String =
+        if (file.isDirectory) android.provider.DocumentsContract.Document.MIME_TYPE_DIR
+        else when (file.extension.lowercase()) {
+            "smd" -> "application/vnd.supermd.smd"
+            "md" -> "text/markdown"
+            else -> "application/octet-stream"
+        }
+
+    private fun includeFile(cursor: android.database.MatrixCursor, file: File) {
+        if (!file.exists()) throw java.io.FileNotFoundException(file.path)
+        val flags = if (file.isDirectory) {
+            android.provider.DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE or
+                android.provider.DocumentsContract.Document.FLAG_SUPPORTS_RENAME
+        } else {
+            android.provider.DocumentsContract.Document.FLAG_SUPPORTS_WRITE or
+                android.provider.DocumentsContract.Document.FLAG_SUPPORTS_RENAME
+        }
+        val docId = idForFile(file)
+        val cols = cursor.columnNames
+        val row = arrayOfNulls<Any>(cols.size)
+        val displayName = if (file.canonicalPath == rootDir.canonicalPath) "OpaqueNotes" else file.name
+        val size = if (file.isFile) file.length() else 0L
+        for (i in cols.indices) {
+            row[i] = when (cols[i]) {
+                android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID -> docId
+                android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                android.provider.OpenableColumns.DISPLAY_NAME -> displayName
+                android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE -> mimeFor(file)
+                android.provider.DocumentsContract.Document.COLUMN_SIZE,
+                android.provider.OpenableColumns.SIZE -> size
+                android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED -> file.lastModified()
+                android.provider.DocumentsContract.Document.COLUMN_FLAGS -> flags
+                else -> null
+            }
+        }
+        cursor.addRow(row)
+    }
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?,
+    ): android.database.Cursor {
+        val cols = projection ?: DEFAULT_DOC_PROJECTION
+        val segments = uri.pathSegments
+        if (segments.lastOrNull() == "children" && segments.size >= 2) {
+            val parentDocId = Uri.decode(segments[segments.size - 2])
+            val parent = fileForId(parentDocId)
+            if (!parent.isDirectory) throw java.io.FileNotFoundException(parentDocId)
+            return android.database.MatrixCursor(cols).also { cursor ->
+                parent.listFiles()?.forEach { child -> includeFile(cursor, child) }
+            }
+        }
+        val docId = android.provider.DocumentsContract.getDocumentId(uri)
+        return android.database.MatrixCursor(cols).also { includeFile(it, fileForId(docId)) }
+    }
+
+    override fun getType(uri: Uri): String =
+        runCatching { mimeFor(fileForId(android.provider.DocumentsContract.getDocumentId(uri))) }
+            .getOrDefault("application/octet-stream")
+
+    override fun insert(uri: Uri, values: android.content.ContentValues?): Uri? = null
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    override fun update(uri: Uri, values: android.content.ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+    override fun call(method: String, arg: String?, extras: android.os.Bundle?): android.os.Bundle {
+        val inExtras = extras ?: android.os.Bundle.EMPTY
+        val docUri = inExtras.getParcelable("uri", Uri::class.java)
+        val out = android.os.Bundle()
+        when (method) {
+            "android:createDocument" -> {
+                val parentId = android.provider.DocumentsContract.getDocumentId(requireNotNull(docUri))
+                val mimeType = inExtras.getString(android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE).orEmpty()
+                val displayName = requireNotNull(inExtras.getString(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME))
+                val parent = fileForId(parentId)
+                val target = File(parent, displayName)
+                if (mimeType == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
+                    check(target.mkdirs() || target.isDirectory)
+                } else {
+                    check(target.createNewFile())
+                }
+                val outUri = treeUriForDocId(idForFile(target))
+                grantPermissions(outUri)
+                out.putParcelable("uri", outUri)
+            }
+            "android:renameDocument" -> {
+                val docId = android.provider.DocumentsContract.getDocumentId(requireNotNull(docUri))
+                val displayName = requireNotNull(inExtras.getString(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME))
+                val source = fileForId(docId)
+                val oldCanonical = source.canonicalPath
+                val wasDir = source.isDirectory
+                val dest = File(source.parentFile, displayName)
+                check(source.renameTo(dest))
+                val newId = if (wasDir) {
+                    rotateSubtreeIds(oldCanonical, dest)
+                    idForFile(dest)
+                } else {
+                    synchronized(this) {
+                        idToPath.remove(docId)
+                        pathToId.remove(oldCanonical)
+                        idForFile(dest)
+                    }
+                }
+                val outUri = treeUriForDocId(newId)
+                grantPermissions(outUri)
+                out.putParcelable("uri", outUri)
+            }
+        }
+        return out
+    }
+
+    override fun openFile(uri: Uri, mode: String): android.os.ParcelFileDescriptor {
+        val file = fileForId(android.provider.DocumentsContract.getDocumentId(uri))
+        val flags = when (mode) {
+            "r" -> android.os.ParcelFileDescriptor.MODE_READ_ONLY
+            "rw" -> android.os.ParcelFileDescriptor.MODE_READ_WRITE
+            "wt", "w" -> android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or
+                android.os.ParcelFileDescriptor.MODE_CREATE or
+                android.os.ParcelFileDescriptor.MODE_TRUNCATE
+            else -> android.os.ParcelFileDescriptor.parseMode(mode)
+        }
+        return android.os.ParcelFileDescriptor.open(file, flags)
+    }
+
+    private fun grantPermissions(docUri: Uri) {
+        appContext.grantUriPermission(
+            appContext.packageName,
+            docUri,
+            android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+    }
+
+    companion object {
+        const val ROOT_ID = "opaque:root-0"
+        private val DEFAULT_DOC_PROJECTION = arrayOf(
+            android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE,
+            android.provider.DocumentsContract.Document.COLUMN_SIZE,
+            android.provider.DocumentsContract.Document.COLUMN_LAST_MODIFIED,
+            android.provider.DocumentsContract.Document.COLUMN_FLAGS,
+        )
+    }
 }
