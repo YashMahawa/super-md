@@ -17,6 +17,7 @@ class ShortcutValidationTest(unittest.TestCase):
         self.assertEqual(defaults["replace"], ["Ctrl+H"])
         self.assertIn("F3", defaults["find_next"])
         self.assertIn("Shift+F3", defaults["find_previous"])
+        self.assertEqual(defaults["quick_switcher"], ["Ctrl+P"])
         self.assertEqual(defaults["search_folder"], ["Ctrl+Shift+F"])
         self.assertEqual(parse_sequence("Ctrl+PageDown"), "Ctrl+PgDown")
 

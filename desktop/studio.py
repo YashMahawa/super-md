@@ -53,6 +53,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
+from quick_switcher import FolderNoteIndex, build_quick_switcher_candidates, coalesce_walk_roots, normalize_workspace_roots, rank_quick_switcher_items
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
@@ -682,6 +683,7 @@ class Session(QObject):
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
+        self.folder_note_index = FolderNoteIndex()
 
     def is_quitting(self) -> bool:
         background = getattr(self, "background", None)
@@ -787,6 +789,8 @@ class Session(QObject):
 class Studio(QObject):
     changed = Signal()
     shortcutsChanged = Signal()
+    quickSwitcherChanged = Signal()
+    quickSwitcherIndexed = Signal(int, object)
     workspaceSearchChanged = Signal()
     workspaceSearchBatch = Signal(int, object, int, bool, bool)
     readerLoad = Signal(str)
@@ -822,6 +826,7 @@ class Studio(QObject):
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
+        self.quickSwitcherIndexed.connect(self._on_quick_switcher_indexed)
         self.session = session or Session(isolated)
         self.session.changed.connect(lambda:self._emit())
         self.session.locationChanged.connect(self._location_changed)
@@ -898,6 +903,13 @@ class Studio(QObject):
         self._folder_search_generation = 0
         self._folder_search_cancel: threading.Event | None = None
         self._folder_search_tabs_sig: list[tuple[str, str, bool]] | None = None
+        self._quick_switcher_open = False
+        self._quick_switcher_query = ""
+        self._quick_switcher_items: list[dict] = []
+        self._quick_switcher_candidates: list[dict] = []
+        self._quick_switcher_loading = False
+        self._quick_switcher_generation = 0
+        self._quick_switcher_cancel: threading.Event | None = None
         self._pending_seeded_find: dict | None = None
         self.mode = self.settings.get("readingMode", "live")
         self.fullscreen = False
@@ -1314,6 +1326,8 @@ class Studio(QObject):
             if self.retired or error:return
             for old,new in result.items():self.session.locationChanged.emit(old,new or "")
             self._reload_changed_content(changed)
+            for changed_path in changed:
+                self._invalidate_folder_index(changed_path)
             if self.folder and (self.folder in changed or set(self.expanded)&changed):self._load_tree()
         self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
 
@@ -1344,6 +1358,9 @@ class Studio(QObject):
                     tab.update(path="",name=draft["name"],conflict=False)
                 self._remove_tab(tab["id"])
             self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
+        self._invalidate_folder_index(old)
+        if new:
+            self._invalidate_folder_index(new)
         self._preferences();self._recover();self._emit()
 
     def _reload_changed_content(self,changed):
@@ -1418,6 +1435,7 @@ class Studio(QObject):
         if self.retired: return
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
         self._cancel_subfolder_search()
+        self._cancel_quick_switcher(close=True)
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
@@ -1642,6 +1660,206 @@ class Studio(QObject):
             "caseSensitive": bool(case_sensitive),
         })
         self._flush("open_search_match", target_payload)
+
+    def _quick_switcher_roots(self) -> list[Path]:
+        windows = [self]
+        if hasattr(self, "session") and hasattr(self.session, "windows"):
+            windows.extend(
+                win for win in self.session.windows.values()
+                if win is not self and not getattr(win, "retired", False)
+            )
+        raw_roots: list[str | Path] = []
+        for win in windows:
+            folder = getattr(win, "folder", "")
+            if folder:
+                raw_roots.append(folder)
+        location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else None
+        if location:
+            raw_roots.append(location)
+        return normalize_workspace_roots(raw_roots)
+
+    def _quick_switcher_snapshots(self):
+        tabs_snap = [
+            {
+                "id": t["id"],
+                "name": t["name"],
+                "path": t["path"],
+                "dirty": self._is_dirty(t),
+            }
+            for t in self.tabs
+        ]
+        recent_paths = [p for p in self.recent if p]
+        pinned_paths = [p for p in self.session.pinned if p]
+        roots = self._quick_switcher_roots()
+        return tabs_snap, recent_paths, pinned_paths, roots, self.active
+
+    def _invalidate_folder_index(self, target_path: str | Path | None = None):
+        index = getattr(self.session, "folder_note_index", None)
+        if index is not None:
+            index.invalidate(target_path)
+        for win in list(getattr(self.session, "windows", {}).values()):
+            if not getattr(win, "retired", False) and getattr(win, "_quick_switcher_open", False):
+                win._refresh_quick_switcher_candidates()
+
+    def _cancel_quick_switcher(self, close: bool = False):
+        if self._quick_switcher_cancel is not None:
+            self._quick_switcher_cancel.set()
+            self._quick_switcher_cancel = None
+        self._quick_switcher_generation += 1
+        self._quick_switcher_loading = False
+        if close:
+            self._quick_switcher_open = False
+            self._quick_switcher_query = ""
+            self._quick_switcher_items = []
+            self._quick_switcher_candidates = []
+
+    @Property("QVariantMap", notify=quickSwitcherChanged)
+    def quickSwitcherState(self):
+        return {
+            "open": self._quick_switcher_open,
+            "query": self._quick_switcher_query,
+            "items": self._quick_switcher_items,
+            "loading": self._quick_switcher_loading,
+            "hasFolder": bool(self.folder),
+        }
+
+    def _refresh_quick_switcher_candidates(self):
+        if self.retired or not self._quick_switcher_open:
+            return
+        if self._quick_switcher_cancel is not None:
+            self._quick_switcher_cancel.set()
+            self._quick_switcher_cancel = None
+        self._quick_switcher_generation += 1
+        generation = self._quick_switcher_generation
+
+        tabs_snap, recent_paths, pinned_paths, roots, active_id = self._quick_switcher_snapshots()
+        walk_roots = coalesce_walk_roots(roots)
+        folder_index: FolderNoteIndex = self.session.folder_note_index
+
+        warm_entries: dict[str, list[dict]] = {}
+        needs_cold_walk = False
+        for root in walk_roots:
+            root_key = folder_ops.normalize_path_key(root)
+            cached = folder_index.peek_entries(root)
+            if cached is None:
+                needs_cold_walk = True
+                warm_entries[root_key] = []
+            else:
+                warm_entries[root_key] = cached
+
+        self._quick_switcher_candidates = build_quick_switcher_candidates(
+            tabs_snap,
+            recent_paths,
+            pinned_paths,
+            roots,
+            warm_entries,
+            active_id=active_id,
+        )
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self._quick_switcher_loading = needs_cold_walk and bool(walk_roots)
+        self.quickSwitcherChanged.emit()
+
+        if not walk_roots:
+            return
+
+        cancel_event = threading.Event()
+        self._quick_switcher_cancel = cancel_event
+
+        def worker():
+            refreshed: dict[str, list[dict]] = {}
+            changed = needs_cold_walk
+            for root in walk_roots:
+                if cancel_event.is_set() or self.retired:
+                    return
+                root_key = folder_ops.normalize_path_key(root)
+                entries = folder_index.get_entries(root, cancel_event=cancel_event, revalidate=True)
+                if cancel_event.is_set() or self.retired:
+                    return
+                refreshed[root_key] = entries
+                if warm_entries.get(root_key) != entries:
+                    changed = True
+            if not cancel_event.is_set() and not self.retired and (changed or needs_cold_walk):
+                self.quickSwitcherIndexed.emit(generation, refreshed)
+
+        try:
+            self._search_pool.submit(worker)
+        except RuntimeError:
+            self._quick_switcher_loading = False
+            self.quickSwitcherChanged.emit()
+
+    def _on_quick_switcher_indexed(self, generation: int, root_entries):
+        if self.retired or not self._quick_switcher_open or generation != self._quick_switcher_generation:
+            return
+        tabs_snap, recent_paths, pinned_paths, roots, active_id = self._quick_switcher_snapshots()
+        self._quick_switcher_candidates = build_quick_switcher_candidates(
+            tabs_snap,
+            recent_paths,
+            pinned_paths,
+            roots,
+            dict(root_entries),
+            active_id=active_id,
+        )
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self._quick_switcher_loading = False
+        self.quickSwitcherChanged.emit()
+
+    @Slot()
+    def openQuickSwitcher(self):
+        if self.retired:
+            return
+        self._quick_switcher_open = True
+        self._quick_switcher_query = ""
+        self._refresh_quick_switcher_candidates()
+
+    @Slot(str)
+    def setQuickSwitcherQuery(self, query: str):
+        if self.retired:
+            return
+        next_query = query if isinstance(query, str) else ""
+        if not self._quick_switcher_open:
+            self._quick_switcher_open = True
+            self._quick_switcher_query = next_query
+            self._refresh_quick_switcher_candidates()
+            return
+        if next_query == self._quick_switcher_query:
+            return
+        self._quick_switcher_query = next_query
+        self._quick_switcher_items = rank_quick_switcher_items(
+            self._quick_switcher_candidates,
+            self._quick_switcher_query,
+        )
+        self.quickSwitcherChanged.emit()
+
+    @Slot()
+    def closeQuickSwitcher(self):
+        if not self._quick_switcher_open and not self._quick_switcher_loading:
+            return
+        self._cancel_quick_switcher(close=True)
+        self.quickSwitcherChanged.emit()
+
+    @Slot(str, str)
+    def activateQuickSwitcherItem(self, tab_id: str, path: str):
+        if self.retired:
+            return
+        self.closeQuickSwitcher()
+        if tab_id:
+            existing = next((t for t in self.tabs if t["id"] == tab_id), None)
+            if existing is not None:
+                if existing.get("path"):
+                    self.openNote(existing["path"])
+                else:
+                    self.selectTab(existing["id"])
+                    self._focus_open_target(self._activation_generation)
+                return
+        if path:
+            matched_tab = next((t for t in self.tabs if t.get("path") and folder_ops.same_path(t["path"], path)), None)
+            self.openNote(matched_tab["path"] if matched_tab is not None else path)
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -2709,7 +2927,11 @@ class Studio(QObject):
     def setNoteLocation(self, value):
         directory = local_path(value)
         if directory.is_dir():
+            old_location = self.settings.get("newNoteLocation")
             self.settings["newNoteLocation"] = str(directory)
+            if old_location:
+                self._invalidate_folder_index(old_location)
+            self._invalidate_folder_index(directory)
             self._preferences(); self._emit(False)
 
     @Slot(str)
@@ -3443,7 +3665,10 @@ class Studio(QObject):
             self._emit(False)
             return
         self._clear_folder_filter()
+        old_folder = self.folder
         self.folder = folder_ops.canonical_path_str(path)
+        if old_folder and not folder_ops.same_path(old_folder, self.folder):
+            self._invalidate_folder_index(old_folder)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
@@ -3509,9 +3734,12 @@ class Studio(QObject):
     def closeFolder(self):
         self._tree_generation = getattr(self, "_tree_generation", 0) + 1
         self._clear_folder_filter()
+        old_folder = self.folder
         self.folder = ""
         self.files = []
         self.expanded.clear()
+        if old_folder:
+            self._invalidate_folder_index(old_folder)
         self._recover()
         self._emit(False)
 
@@ -3825,6 +4053,9 @@ class Studio(QObject):
                 except OSError:
                     pass
                 if str(path) != original_path:
+                    if original_path:
+                        self._invalidate_folder_index(original_path)
+                    self._invalidate_folder_index(path)
                     self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                     self._preferences()
                 if automatic and self._is_dirty(target): self.autosave_timer.start(900)
@@ -3958,6 +4189,8 @@ class Studio(QObject):
             if win._folder_search_open and win._folder_search_query.strip():
                 win._start_folder_search()
             win._emit()
+        self._invalidate_folder_index(old_path)
+        self._invalidate_folder_index(new_path)
 
     @Slot(str)
     def notifyMessage(self, text):
@@ -4001,6 +4234,7 @@ class Studio(QObject):
         def finished(created_path, error):
             if error or not created_path:
                 return
+            self._invalidate_folder_index(created_path)
             created = Path(created_path)
             for win in list(self.session.windows.values()):
                 if not win.retired and win.folder:
@@ -4059,6 +4293,7 @@ class Studio(QObject):
         def finished(created_dir, error):
             if error or not created_dir:
                 return
+            self._invalidate_folder_index(created_dir)
             created = Path(created_dir)
             for win in list(self.session.windows.values()):
                 if not win.retired and win.folder:
