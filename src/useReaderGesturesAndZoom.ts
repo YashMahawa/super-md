@@ -139,7 +139,7 @@ export type ReaderGestureControls = ReturnType<typeof useReaderGestureControls>;
 
 export function useReaderGesturesAndZoom({ state, reference, controls }: { state: GesturesReaderState | null; reference: RefObject<GesturesReaderState | null>; controls: ReaderGestureControls }): void {
   const { zoomReference, zoomTarget, settleSelection, applyZoomStyle, cancelZoomGlide, zoomBy } = controls;
-  const { cursor, zoomFrame, zoomTimer, settleTimer, selectingText, gapSelection, nativeScroll, zoomGestureAt, requestChrome } = controls.refs;
+  const { cursor, settleTimer, selectingText, gapSelection, nativeScroll, zoomGestureAt, requestChrome } = controls.refs;
 
   useEffect(() => {
     const root = document.querySelector<HTMLElement>(".android-reading");
