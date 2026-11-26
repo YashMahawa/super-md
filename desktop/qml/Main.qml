@@ -219,6 +219,9 @@ ApplicationWindow {
         case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
         case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
         case "typewriter_scroll": studio.setting("typewriterScroll", JSON.stringify(!viewState.settings.typewriterScroll)); break
+        case "new_folder_note": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewFolderNote(); break
+        case "new_subfolder": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewSubfolder(); break
+        case "rename_entry": folderSidebar.triggerRenameSelectedOrActive(); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
@@ -442,81 +445,13 @@ ApplicationWindow {
                 spacing: 12
                 Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
-                ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
-                ActionButton { objectName: "sidebarFolderSearchButton"; visible: sidebarSection === "folder"; text: "Search across notes"; glyph: "MagnifyingGlass"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
-                RowLayout {
-                    visible: sidebarSection === "folder" && !!viewState.folder
-                    Layout.fillWidth: true
-                    Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
-                    ActionButton { glyph: "X"; compact: true; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; onClicked: studio.closeFolder() }
-                }
-                TextField {
-                    id: filter
-                    objectName: "folderFilterField"
-                    property string backendFilter: viewState.folderFilter || ""
-                    visible: sidebarSection === "folder" && !!viewState.folder
-                    Layout.fillWidth: true
-                    placeholderText: "Filter files"
-                    selectByMouse: true
-                    onTextChanged: {
-                        if (text !== backendFilter)
-                            studio.setFolderFilter(text)
-                    }
-                    onBackendFilterChanged: {
-                        if (backendFilter === "" && text !== "")
-                            text = ""
-                        else if (!activeFocus && text !== backendFilter)
-                            text = backendFilter
-                    }
-                }
-                Item {
+                FolderSidebar {
+                    id: folderSidebar
                     visible: sidebarSection === "folder"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    ListView {
-                        id: folderFilesView
-                        objectName: "folderFilesView"
-                        anchors.fill: parent
-                        visible: viewState.files.length > 0
-                        clip: true
-                        model: viewState.files
-                        delegate: ItemDelegate {
-                            id: fileEntry
-                            required property var modelData
-                            width: ListView.view.width - 20
-                            height: 42
-                            leftPadding: 8 + modelData.depth * 16
-                            text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
-                            onClicked: modelData.directory ? (!((viewState.folderFilter || "").trim()) && studio.toggleDirectory(modelData.path)) : studio.openNote(modelData.path)
-                            Hint { requested: fileEntry.hovered; text: modelData.path }
-                        }
-                        ScrollBar.vertical: ExpressiveScrollBar { }
-                    }
-                    ColumnLayout {
-                        objectName: "folderEmptyState"
-                        anchors.centerIn: parent
-                        width: parent.width - 16
-                        spacing: 4
-                        visible: !!viewState.folder && viewState.files.length === 0 && !viewState.folderSearching
-                        Label {
-                            objectName: "folderEmptyLabel"
-                            Layout.fillWidth: true
-                            horizontalAlignment: Text.AlignHCenter
-                            wrapMode: Text.WordWrap
-                            font.weight: Font.Medium
-                            color: viewState.colors.text
-                            text: (viewState.folderFilter || "").trim().length > 0 ? "No matching notes found" : "No notes in this folder"
-                        }
-                        Label {
-                            visible: (viewState.folderFilter || "").trim().length > 0
-                            Layout.fillWidth: true
-                            horizontalAlignment: Text.AlignHCenter
-                            wrapMode: Text.WordWrap
-                            font.pixelSize: 12
-                            color: viewState.colors.muted
-                            text: "Try another filename or clear the filter."
-                        }
-                    }
+                    viewState: window.viewState
+                    shortcutLabels: window.shortcutLabels
                 }
                 OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
