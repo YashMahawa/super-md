@@ -657,6 +657,7 @@ class BackgroundTests(unittest.TestCase):
         ), redirect_stdout(io.StringIO()):
             rc = background_cli.main(["start"])
         self.assertEqual(rc, 0)
+        self.assertEqual(Path(captured_darwin["cmd"][1]), background_cli.DESKTOP_DIR / "main.py")
         self.assertEqual(captured_darwin["kwargs"].get("creationflags"), 0)
         self.assertEqual(captured_darwin["kwargs"].get("process_group"), 0)
         self.assertFalse(captured_darwin["kwargs"].get("start_new_session", False))
@@ -681,9 +682,15 @@ class BackgroundTests(unittest.TestCase):
         ), redirect_stdout(io.StringIO()):
             rc_linux = background_cli.main(["start"])
         self.assertEqual(rc_linux, 0)
+        self.assertEqual(Path(captured_linux["cmd"][1]), background_cli.DESKTOP_DIR / "main.py")
         self.assertEqual(captured_linux["kwargs"].get("creationflags"), 0)
         self.assertNotIn("process_group", captured_linux["kwargs"])
         self.assertIs(captured_linux["kwargs"].get("start_new_session"), True)
+
+        main_qml_source = (QML_DIR / "Main.qml").read_text(encoding="utf-8")
+        self.assertIn("JSON.parse(studio.sidebarSnapshot)", main_qml_source)
+        self.assertIn('window.chooseSaveDestination("Save note"', main_qml_source)
+        self.assertIn("studio.backgroundEnabled && !studio.hasOtherOpenWindows()", main_qml_source)
 
 
 _HEADLESS_DAEMON_BOOTSTRAP = """
