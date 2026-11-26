@@ -360,6 +360,10 @@ def _asset_identity(value):
     return id(value)
 
 
+def _noop_done(*_):
+    pass
+
+
 def _matches_media_signature(mime: str, data: bytes) -> bool:
     head = data[:4096]
     if mime == "image/png":
@@ -661,7 +665,8 @@ class Studio(QObject):
         self.python_choices=[]
         self.python_busy=False
         self.pythonProgress.connect(self._python_progress)
-        if not self.settings.get("python"): QTimer.singleShot(0,self._choose_default_python)
+        if not self.settings.get("python"):
+            self._choose_default_python(emit=False)
         if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
@@ -2157,15 +2162,15 @@ class Studio(QObject):
     def _python_folders(self):
         return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
 
-    def _choose_default_python(self):
-        if self.retired:return
-        managed = self.data/"python-env"
-        def done(path,error):
-            if path and not self.settings.get("python"):
-                self.settings["python"] = path
-                self._preferences()
+    def _choose_default_python(self, emit: bool = True):
+        if self.retired or self.settings.get("python"):
+            return
+        path = python_runtime.default_python(self.data / "python-env")
+        if path:
+            self.settings["python"] = path
+            self._preferences(notify=emit)
+        if emit:
             self._emit(False)
-        self._submit(lambda: python_runtime.preferred(managed), done, False)
 
     @Slot(str)
     def _python_progress(self, text):
@@ -2174,7 +2179,9 @@ class Studio(QObject):
 
     @Slot()
     def refreshPython(self):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
+        managed = self.data / "python-env"
+        folders = tuple(self._python_folders())
         self.python_busy = True
         self.python_status = "Looking for Python installations"
         self._emit(False)
@@ -2186,11 +2193,11 @@ class Studio(QObject):
             elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but numpy and matplotlib are missing. Set up Python installs both in a private environment."
             else: self.python_status = ""
             self._emit(False)
-        self._submit(lambda: python_runtime.discover(self.data/"python-env", self._python_folders()), done, False)
+        self._submit(lambda: python_runtime.discover(managed, folders), done, False)
 
     @Slot(str)
     def installPythonPackages(self, path):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
         self.python_busy = True
         self.python_status = "Preparing to install numpy and matplotlib"
         self._emit(False)
@@ -2207,7 +2214,8 @@ class Studio(QObject):
 
     @Slot()
     def setupPython(self):
-        if self.python_busy: return
+        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
+        managed = self.data / "python-env"
         self.python_busy = True
         self.python_status = "Preparing Python setup"
         self._emit(False)
@@ -2224,7 +2232,7 @@ class Studio(QObject):
             self.python_busy = False
             self.refreshPython()
             self.python_status = "Python with numpy and matplotlib is ready"
-        self._submit(lambda: python_runtime.setup_environment(self.data/"python-env", self.pythonProgress.emit), done, False)
+        self._submit(lambda: python_runtime.setup_environment(managed, self.pythonProgress.emit), done, False)
 
     @Slot(int, int, bool)
     def rememberWindow(self, width, height, maximized):
@@ -2663,7 +2671,7 @@ class Studio(QObject):
                 value,error=f.result(),None
             except Exception as reason:
                 value,error=None,str(reason)
-            if self.retired:return
+            if self.retired or (done is _noop_done and not busy and error is None):return
             try:self.completed.emit((done,value,error,busy))
             except RuntimeError:pass  # The QObject may have been retired meanwhile.
         future.add_done_callback(completed)
@@ -2740,12 +2748,12 @@ class Studio(QObject):
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
         data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
-        self._submit(lambda: atomic_write(self.data / "settings.json", data), lambda *_: None, False,self.writes)
+        self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 
     def _save_positions(self):
         data=json.dumps(self.session.locations).encode()
-        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),lambda *_:None,False,self.writes)
+        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
 
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
