@@ -60,11 +60,6 @@ def default_export_location(studio_obj, format: str):
     )
 
 
-def default_theme_export_location(studio_obj, name: str):
-    leaf = folder_ops._pure_path(str(name or "")).name or "My theme.supermd-theme.json"
-    return _studio_module().QUrl.fromLocalFile(str(studio_obj._default_output_directory() / leaf))
-
-
 def export_to(studio_obj, value: str, format: str) -> None:
     if studio_obj.pending_export:
         studio_obj.message = "An export is already in progress; finish or cancel it before choosing another destination"

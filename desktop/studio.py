@@ -4565,7 +4565,8 @@ class Studio(QObject):
 
     @Slot(str, result=QUrl)
     def defaultThemeExportLocation(self, name):
-        return studio_exports.default_theme_export_location(self, name)
+        leaf = folder_ops._pure_path(str(name or "")).name or "My theme.supermd-theme.json"
+        return QUrl.fromLocalFile(str(self._default_output_directory() / leaf))
 
     @Slot(str)
     def closeTab(self, id):
