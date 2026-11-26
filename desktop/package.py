@@ -10,8 +10,12 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from core.paths import SOURCE_ROOT
-from scripts.package_runtime import wayland_dependencies
+if __package__:
+    from .core.paths import SOURCE_ROOT
+    from .scripts.package_runtime import wayland_dependencies
+else:
+    from core.paths import SOURCE_ROOT
+    from scripts.package_runtime import wayland_dependencies
 
 ROOT = SOURCE_ROOT
 OUTPUT = ROOT / "desktop/dist"

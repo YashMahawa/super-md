@@ -1,6 +1,7 @@
 import ast
 import importlib
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -132,6 +133,125 @@ class PackageRuntimeTest(unittest.TestCase):
             ]
             self.assertIn("scripts.package_runtime", imports, f"Expected scripts.package_runtime in {relative_path}")
             self.assertNotIn("package_runtime", imports, f"Unexpected bare package_runtime in {relative_path}")
+
+    def test_clean_subprocess_repository_root_and_flat_import_modes(self):
+        desktop_dir = Path(__file__).resolve().parent
+        repo_root = desktop_dir.parent
+        clean_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+
+        repo_root_probe = """
+import pathlib
+import runpy
+import sys
+import types
+from unittest import mock
+
+from desktop import package, package_runtime
+import desktop as desktop_ns
+import desktop.package_runtime as dotted_alias
+from desktop.package_runtime import wayland_dependencies
+from desktop.scripts import package_runtime as scripts_canonical
+
+assert package_runtime is dotted_alias
+assert package_runtime is scripts_canonical
+assert desktop_ns.package_runtime is scripts_canonical
+assert sys.modules["desktop.package_runtime"] is scripts_canonical
+assert pathlib.Path(scripts_canonical.__file__).resolve().name == "package_runtime.py"
+assert pathlib.Path(scripts_canonical.__file__).resolve().parent.name == "scripts"
+assert wayland_dependencies("deb") == ["libwayland-client0", "libwayland-cursor0", "libwayland-server0"]
+assert package.ROOT == pathlib.Path.cwd().resolve()
+
+with mock.patch("desktop.package_runtime.X11_SUPPORT", ("libxcb-test.so.0",)):
+    assert scripts_canonical.X11_SUPPORT == ("libxcb-test.so.0",)
+    assert scripts_canonical.linux_support_binaries(lambda n: "/usr/lib/" + n, "linux") == [
+        ("/usr/lib/libxcb-test.so.0", ".")
+    ]
+
+# Verify the flat PyInstaller hook also runs cleanly from repo root with PYTHONPATH cleared.
+pyinstaller = types.ModuleType("PyInstaller")
+utils = types.ModuleType("PyInstaller.utils")
+hooks = types.ModuleType("PyInstaller.utils.hooks")
+qt_hooks = types.ModuleType("PyInstaller.utils.hooks.qt")
+qt_hooks.os = __import__("os")
+qt_hooks.pyside6_library_info = types.SimpleNamespace(version=None, location={"LibrariesPath": ""})
+qt_hooks.add_qt6_dependencies = lambda _hook: ([], [], [])
+pyinstaller.utils = utils
+utils.hooks = hooks
+hooks.qt = qt_hooks
+with mock.patch.dict(
+    sys.modules,
+    {
+        "PyInstaller": pyinstaller,
+        "PyInstaller.utils": utils,
+        "PyInstaller.utils.hooks": hooks,
+        "PyInstaller.utils.hooks.qt": qt_hooks,
+    },
+):
+    hook_ns = runpy.run_path("desktop/pyinstaller_hooks/hook-PySide6.QtWebEngineCore.py")
+    assert callable(hook_ns["qtwebengine_framework_version"])
+    assert callable(hook_ns["qtwebengine_framework_entries"])
+"""
+        repo_completed = subprocess.run(
+            [sys.executable, "-c", repo_root_probe],
+            cwd=repo_root,
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(
+            repo_completed.returncode,
+            0,
+            repo_completed.stdout + "\n" + repo_completed.stderr,
+        )
+
+        flat_probe = """
+import pathlib
+import sys
+import tempfile
+from unittest import mock
+
+import package
+import package_runtime
+import scripts.package_runtime as scripts_canonical
+from package_runtime import wayland_dependencies
+
+assert package_runtime is scripts_canonical
+assert sys.modules["package_runtime"] is scripts_canonical
+assert wayland_dependencies("rpm") == [
+    "libwayland-client.so.0()(64bit)",
+    "libwayland-cursor.so.0()(64bit)",
+    "libwayland-server.so.0()(64bit)",
+]
+assert package.ROOT == pathlib.Path.cwd().resolve().parent
+
+with tempfile.TemporaryDirectory() as meipass:
+    with (
+        mock.patch.object(sys, "frozen", True, create=True),
+        mock.patch.object(sys, "_MEIPASS", meipass, create=True),
+    ):
+        from core.paths import resource_root
+
+        assert resource_root() == pathlib.Path(meipass) / "resources"
+        assert package_runtime.portable_binaries([("libQt6Core.so.6", "/b", "BINARY")], "linux") == [
+            ("libQt6Core.so.6", "/b", "BINARY")
+        ]
+"""
+        flat_completed = subprocess.run(
+            [sys.executable, "-c", flat_probe],
+            cwd=desktop_dir,
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(
+            flat_completed.returncode,
+            0,
+            flat_completed.stdout + "\n" + flat_completed.stderr,
+        )
 
 
 if __name__ == "__main__":
