@@ -13,6 +13,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+data class PendingSeededFind(
+    val query: String,
+    val caseSensitive: Boolean,
+    val nonce: Long = System.nanoTime(),
+    val targetTabId: String? = null,
+    val targetUri: String? = null,
+)
+
 internal class FolderSearchController(
     private val app: Application,
     private val scope: CoroutineScope,
