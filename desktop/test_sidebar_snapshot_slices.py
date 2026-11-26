@@ -2,10 +2,13 @@
 import copy
 import json
 import os
+import shutil
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -17,8 +20,27 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
 import folder_ops
+import studio
 from studio import Session
 from test_studio import QuietStudio
+
+
+def _unlink_path_with_windows_retry(target: Path) -> None:
+    is_win = getattr(studio, "_is_windows", lambda: os.name == "nt")
+    if not is_win():
+        target.unlink()
+        return
+    delay = 0.005
+    deadline = time.monotonic() + 1.5
+    while True:
+        try:
+            target.unlink()
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(0.05, delay * 2.0)
 
 
 MAIN_QML = Path(__file__).parent / "qml" / "Main.qml"
@@ -92,6 +114,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.session = Session(True)
         self.session.settings.update(theme="dark", accent="blue", motion=False, welcomed=True, autosave=False)
         self.studio = QuietStudio(True, self.session)
+        self.session.writes.flush(timeout=3)
         raw_workspace = self.studio.data / "NotesWorkspace"
         (raw_workspace / "Coursework").mkdir(parents=True)
         self.workspace = Path(folder_ops.canonical_path_str(raw_workspace))
@@ -113,16 +136,19 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self._polish()
 
     def tearDown(self):
+        self._settle_watchers()
         self.window.close()
         self.window.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.engine.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
         for window in list(self.session.windows.values()):
             window.stop()
-            window.pool.shutdown(wait=True)
+            window.pool.shutdown(wait=True, cancel_futures=True)
             window._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
+        shutil.rmtree(self.studio.data, ignore_errors=True)
 
     def items(self, item=None):
         item = item or self.window.contentItem()
@@ -142,7 +168,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
                 return found
         return None
 
-    def wait_until(self, predicate, timeout=3.0):
+    def wait_until(self, predicate, timeout=8.0):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.app.processEvents()
@@ -175,8 +201,18 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
     @staticmethod
     def _retire_window(window):
         window.stop()
-        window.pool.shutdown(wait=True)
+        window.pool.shutdown(wait=True, cancel_futures=True)
         window._search_pool.shutdown(wait=True, cancel_futures=True)
+
+    @staticmethod
+    def _same_path_list(actual, expected) -> bool:
+        return len(actual) == len(expected) and all(
+            folder_ops.same_path(a, b) for a, b in zip(actual, expected)
+        )
+
+    @staticmethod
+    def _contains_path(items, target) -> bool:
+        return any(folder_ops.same_path(item, target) for item in items)
 
     def _qml_dict(self, prop_name: str) -> dict:
         value = self.window.property(prop_name)
@@ -185,20 +221,30 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
     def _list_delegates(self, list_view):
         self._polish()
         content = list_view.property("contentItem")
-        return [
+        if content is None:
+            return []
+        delegates = [
             child
             for child in content.childItems()
             if child.metaObject().className() != "QQuickItem"
-            and child.property("width") > 0
-            and child.property("height") > 0
+            and bool(child.property("visible"))
+            and (child.property("width") or 0) > 0
+            and (child.property("height") or 0) > 0
         ]
+        delegates.sort(
+            key=lambda child: (
+                round(float(child.property("y") or 0.0), 2),
+                round(float(child.property("x") or 0.0), 2),
+            )
+        )
+        return delegates
 
     def test_unrelated_studio_changes_reuse_cached_slices_and_keep_sidebar_delegates_alive(self):
         overview = self.workspace / "Overview.md"
         self.studio.openFolder(str(self.workspace))
         self.wait_until(lambda: len(self.studio.files) == 3)
         self.studio.openNote(str(overview))
-        self.wait_until(lambda: self.studio._current()["path"] == str(overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
         self.studio.pinRecent(str(overview))
         active_id = self.studio.active
         self.studio.post(
@@ -312,7 +358,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.wait_until(lambda: len(self.studio.files) == 3)
 
         self.studio.openNote(str(overview))
-        self.wait_until(lambda: self.studio._current()["path"] == str(overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
         overview_id = self.studio.active
         self.studio.post(
             "out-overview",
@@ -321,7 +367,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         )
 
         self.studio.openNote(str(reading))
-        self.wait_until(lambda: self.studio._current()["path"] == str(reading))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], reading))
         reading_id = self.studio.active
         folder_cache_before_outline = self.studio._folder_slice_cache
         self.studio.post(
@@ -460,17 +506,29 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         # External rename and delete propagate to pinned & recent slices.
         self.studio.pinRecent(str(overview))
         ext_renamed = self.workspace / "Overview Renamed.md"
-        overview.rename(ext_renamed)
+        resume_ext_watch = self.studio._suspend_watches_for_prefix(str(overview), is_dir=False)
+        try:
+            rename_fn = getattr(studio, "_rename_path_with_windows_retry", lambda b, a: b.rename(a))
+            rename_fn(overview, ext_renamed)
+        finally:
+            if resume_ext_watch is not None:
+                resume_ext_watch.set()
         self.session.locationChanged.emit(str(overview), str(ext_renamed))
-        self.wait_until(lambda: self._qml_dict("sidebarState")["pinned"] == [str(ext_renamed)])
-        self.assertIn(str(ext_renamed), self._qml_dict("sidebarState")["recent"])
-        ext_renamed.unlink()
+        self.wait_until(lambda: self._same_path_list(self._qml_dict("sidebarState")["pinned"], [ext_renamed]))
+        self.assertTrue(self._contains_path(self._qml_dict("sidebarState")["recent"], ext_renamed))
+        resume_del_watch = self.studio._suspend_watches_for_prefix(str(ext_renamed), is_dir=False)
+        try:
+            _unlink_path_with_windows_retry(ext_renamed)
+        finally:
+            if resume_del_watch is not None:
+                resume_del_watch.set()
         self.session.locationChanged.emit(str(ext_renamed), "")
         self.wait_until(
-            lambda: all(t["path"] != str(ext_renamed) for t in self.studio.tabs)
+            lambda: all(not (t["path"] and folder_ops.same_path(t["path"], ext_renamed)) for t in self.studio.tabs)
             and self._qml_dict("sidebarState")["pinned"] == []
         )
-        self.assertNotIn(str(ext_renamed), self._qml_dict("sidebarState")["recent"])
+        self._settle_watchers()
+        self.assertFalse(self._contains_path(self._qml_dict("sidebarState")["recent"], ext_renamed))
 
     def test_preserves_updates_after_folder_operations_pins_and_startup_restore(self):
         # Open folder and expand nested directory.
@@ -532,11 +590,11 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             second_sidebar_signals = []
             second_studio.sidebarChanged.connect(lambda: second_sidebar_signals.append(1))
             self.studio.openNote(str(added))
-            self.wait_until(lambda: str(added) in self.studio.recent)
+            self.wait_until(lambda: self._contains_path(self.studio.recent, added))
             self.studio.pinRecent(str(added))
-            self.wait_until(lambda: self._qml_dict("sidebarState")["pinned"] == [str(added)])
-            self.assertEqual(self.studio.pinnedRecent, [str(added)])
-            self.assertEqual(json.loads(second_studio.sidebarSnapshot)["pinned"], [str(added)])
+            self.wait_until(lambda: self._same_path_list(self._qml_dict("sidebarState")["pinned"], [added]))
+            self.assertTrue(self._same_path_list(self.studio.pinnedRecent, [added]))
+            self.assertTrue(self._same_path_list(json.loads(second_studio.sidebarSnapshot)["pinned"], [added]))
             self.assertGreaterEqual(len(second_sidebar_signals), 1)
         finally:
             self._retire_window(second_studio)
@@ -549,7 +607,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         QTest.qWait(30)
         self.assertEqual(self._qml_dict("sidebarState")["folder"], "")
         self.assertEqual(self._qml_dict("sidebarState")["files"], [])
-        self.assertIn(str(added), self._qml_dict("sidebarState")["recent"])
+        self.assertTrue(self._contains_path(self._qml_dict("sidebarState")["recent"], added))
 
         # Startup workspace folder restoration populates sidebarSnapshot once tree scan finishes.
         restored_session = Session(True)
@@ -564,9 +622,10 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             self.assertIn("Week 2.md", [f["name"] for f in restored_sidebar["files"]])
         finally:
             restored_studio.stop()
-            restored_studio.pool.shutdown(wait=True)
+            restored_studio.pool.shutdown(wait=True, cancel_futures=True)
             restored_studio._search_pool.shutdown(wait=True, cancel_futures=True)
             restored_session.writes.shutdown(wait=True)
+            shutil.rmtree(restored_studio.data, ignore_errors=True)
 
     def test_folder_sidebar_create_rename_filter_pinned_recent_and_contents_integration(self):
         self.studio.openFolder(str(self.workspace))
@@ -584,9 +643,9 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         rename_field = self.named("renameEntryField")
 
         self.assertIsNotNone(folder_sidebar)
-        self.assertEqual(
-            [d.property("text") for d in self._list_delegates(files_view)],
-            ["▸ Coursework", "Overview.md", "Reading.md"],
+        self.wait_until(
+            lambda: [d.property("text") for d in self._list_delegates(files_view)]
+            == ["▸ Coursework", "Overview.md", "Reading.md"]
         )
 
         # Create a new subfolder through FolderSidebar's real dialog & model.
@@ -634,7 +693,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.studio.pinRecent(str(created_note))
         self.wait_until(
             lambda: len(self._qml_dict("sidebarState")["outline"]) == 2
-            and self._qml_dict("sidebarState")["pinned"] == [str(created_note)]
+            and self._same_path_list(self._qml_dict("sidebarState")["pinned"], [created_note])
         )
         outline_cache_before_rename = self.studio._outline_slice_cache
 
@@ -646,7 +705,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         renamed_note = labs_dir / "1.3 Systems.md"
         self.wait_until(
             lambda: renamed_note.is_file()
-            and self._qml_dict("sidebarState")["pinned"] == [str(renamed_note)]
+            and self._same_path_list(self._qml_dict("sidebarState")["pinned"], [renamed_note])
             and any(f["name"] == "1.3 Systems.md" for f in self._qml_dict("sidebarState")["files"])
         )
         self.wait_until(lambda: "1.3 Systems.md" in [d.property("text") for d in self._list_delegates(files_view)])
@@ -666,16 +725,59 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         folder_sidebar.openRenameFor(str(labs_dir), "Labs", True)
         self.wait_until(lambda: bool(rename_dialog.property("visible")))
         rename_field.setProperty("text", "ProblemSets")
-        rename_dialog.accept()
+        watched_during_dir_rename: list[list[str]] = []
+        orig_path_rename = Path.rename
+        dir_rename_attempts = 0
+        dir_attempt0_started = threading.Event()
+        dir_main_thread_emitted = threading.Event()
+
+        def spy_path_rename(self_path, target):
+            nonlocal dir_rename_attempts
+            if dir_rename_attempts == 0:
+                dir_rename_attempts += 1
+                watched_during_dir_rename.append(
+                    list(self.studio.note_watcher.files() + self.studio.note_watcher.directories())
+                )
+                dir_attempt0_started.set()
+                dir_main_thread_emitted.wait(timeout=2.0)
+                err = PermissionError(13, "Access is denied")
+                err.winerror = 5
+                raise err
+            watched_during_dir_rename.append(
+                list(self.studio.note_watcher.files() + self.studio.note_watcher.directories())
+            )
+            return orig_path_rename(self_path, target)
+
         renamed_dir = self.workspace / "ProblemSets"
         remapped_note = renamed_dir / "1.3 Systems.md"
-        self.wait_until(
-            lambda: remapped_note.is_file()
-            and not self.studio._folder_searching
-            and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["ProblemSets", "1.3 Systems.md"]
-            and self._qml_dict("sidebarState")["pinned"] == [str(remapped_note)]
-            and self._qml_dict("sidebarState")["recent"][0] == str(remapped_note)
-        )
+        with (
+            mock.patch.object(studio, "_is_windows", return_value=True, create=True),
+            mock.patch.object(Path, "rename", spy_path_rename),
+        ):
+            rename_dialog.accept()
+            self.assertTrue(dir_attempt0_started.wait(timeout=2.0))
+            # Even if an unrelated _emit/_watch_notes fires while the async folder rename is in flight,
+            # suspended paths must not be re-added to QFileSystemWatcher before rename finishes.
+            self.studio._emit(False)
+            dir_main_thread_emitted.set()
+            self.wait_until(
+                lambda: remapped_note.is_file()
+                and not self.studio._folder_searching
+                and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["ProblemSets", "1.3 Systems.md"]
+                and self._same_path_list(self._qml_dict("sidebarState")["pinned"], [remapped_note])
+                and folder_ops.same_path(self._qml_dict("sidebarState")["recent"][0], remapped_note)
+            )
+        self.assertEqual(len(watched_during_dir_rename), 2)
+        for attempt_watched in watched_during_dir_rename:
+            for watched_path in attempt_watched:
+                self.assertFalse(
+                    folder_ops.matches_path_prefix(watched_path, str(labs_dir), is_directory=True),
+                    f"Expected note_watcher to suspend {labs_dir} during folder rename, saw {attempt_watched}",
+                )
+                self.assertFalse(
+                    folder_ops.same_path(watched_path, str(self.workspace)),
+                    f"Expected note_watcher to suspend parent {self.workspace} during folder rename, saw {attempt_watched}",
+                )
         self.wait_until(
             lambda: [d.property("text") for d in self._list_delegates(files_view)] == ["▾ ProblemSets", "1.3 Systems.md"]
         )
@@ -696,7 +798,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.studio.openFolder(str(self.workspace))
         self.wait_until(lambda: len(self.studio.files) == 3)
         self.studio.openNote(str(overview))
-        self.wait_until(lambda: self.studio._current()["path"] == str(overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
         self.assertNotIn("outline", self.studio._current())
         self._settle_watchers()
 
@@ -733,7 +835,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
 
         # 3. Renaming a pinned note via renameNote updates both sidebarState.pinned and sidebarState.recent cleanly.
         self.studio.pinRecent(str(overview))
-        self.wait_until(lambda: self._qml_dict("sidebarState")["pinned"] == [str(overview)])
+        self.wait_until(lambda: self._same_path_list(self._qml_dict("sidebarState")["pinned"], [overview]))
 
         second_studio = QuietStudio(True, self.session)
         try:
@@ -741,15 +843,53 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             self.wait_until(lambda: len(second_studio.files) == 3)
 
             renamed_overview = self.workspace / "Course Overview.md"
-            self.studio.renameNote(active_id, "Course Overview.md")
-            self.wait_until(
-                lambda: renamed_overview.is_file()
-                and any(f["name"] == "Course Overview.md" for f in self._qml_dict("sidebarState")["files"])
-                and any(f["name"] == "Course Overview.md" for f in second_studio.files)
-                and self._qml_dict("sidebarState")["pinned"] == [str(renamed_overview)]
-            )
-            self.assertNotIn(str(overview), self._qml_dict("sidebarState")["recent"])
-            self.assertIn(str(renamed_overview), self._qml_dict("sidebarState")["recent"])
+            watched_across_windows: list[tuple[list[str], list[str]]] = []
+            orig_rename = Path.rename
+            transient_attempts = 0
+            file_attempt0_started = threading.Event()
+            file_main_thread_emitted = threading.Event()
+
+            def spy_multiwindow_rename(self_path, target):
+                nonlocal transient_attempts
+                if transient_attempts == 0:
+                    transient_attempts += 1
+                    watched_across_windows.append((
+                        list(self.studio.note_watcher.files() + self.studio.note_watcher.directories()),
+                        list(second_studio.note_watcher.files() + second_studio.note_watcher.directories()),
+                    ))
+                    file_attempt0_started.set()
+                    file_main_thread_emitted.wait(timeout=2.0)
+                    err = PermissionError(13, "Sharing violation")
+                    err.winerror = 32
+                    raise err
+                watched_across_windows.append((
+                    list(self.studio.note_watcher.files() + self.studio.note_watcher.directories()),
+                    list(second_studio.note_watcher.files() + second_studio.note_watcher.directories()),
+                ))
+                return orig_rename(self_path, target)
+
+            with (
+                mock.patch.object(studio, "_is_windows", return_value=True, create=True),
+                mock.patch.object(Path, "rename", spy_multiwindow_rename),
+            ):
+                self.studio.renameNote(active_id, "Course Overview.md")
+                self.assertTrue(file_attempt0_started.wait(timeout=2.0))
+                self.studio._emit(False)
+                second_studio._emit(False)
+                file_main_thread_emitted.set()
+                self.wait_until(
+                    lambda: renamed_overview.is_file()
+                    and any(f["name"] == "Course Overview.md" for f in self._qml_dict("sidebarState")["files"])
+                    and any(f["name"] == "Course Overview.md" for f in second_studio.files)
+                    and self._same_path_list(self._qml_dict("sidebarState")["pinned"], [renamed_overview])
+                )
+            self.assertEqual(len(watched_across_windows), 2)
+            for first_watched, second_watched in watched_across_windows:
+                for watched_path in first_watched + second_watched:
+                    self.assertFalse(folder_ops.same_path(watched_path, str(overview)))
+                    self.assertFalse(folder_ops.same_path(watched_path, str(self.workspace)))
+            self.assertFalse(self._contains_path(self._qml_dict("sidebarState")["recent"], overview))
+            self.assertTrue(self._contains_path(self._qml_dict("sidebarState")["recent"], renamed_overview))
             self.assertIn("Course Overview.md", [f["name"] for f in json.loads(second_studio.sidebarSnapshot)["files"]])
         finally:
             self._retire_window(second_studio)

@@ -71,6 +71,26 @@ def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str,
     """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
     return {k: old_assets[k] if old_assets.get(k) == v else v for k, v in new_assets.items()}
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+def _rename_path_with_windows_retry(before: Path, after: Path) -> None:
+    """Retry brief Windows sharing/access-denied locks (e.g. watcher teardown or indexer)."""
+    if not _is_windows():
+        before.rename(after)
+        return
+    delay = 0.005
+    deadline = time.monotonic() + 1.5
+    while True:
+        try:
+            before.rename(after)
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(0.05, delay * 2.0)
+
 def _normalize_mcp_roots(roots) -> list[str]:
     if not roots:
         return []
@@ -677,6 +697,7 @@ class Studio(QObject):
         self.note_watcher.directoryChanged.connect(self._external_note_changed)
         self.external_paths = set()
         self.note_watch_paths = None
+        self._watch_suspensions: list[tuple[str, str, bool, threading.Event]] = []
         self.note_file_stamps = {}
         self.note_identities = {}
         self.external_timer = QTimer(self)
@@ -1097,23 +1118,39 @@ class Studio(QObject):
             if not window.retired: window.shortcutsChanged.emit()
 
     def _watch_notes(self,force=False):
+        active_suspensions = [item for item in self._watch_suspensions if not item[3].is_set()]
+        self._watch_suspensions = active_suspensions
         paths=tuple(sorted({tab["path"] for tab in self.tabs if tab["path"]}|set(self.recent)))
         signature=(paths,self.folder,tuple(sorted(self.expanded)))
-        if not force and signature==self.note_watch_paths:return
-        self.note_watch_paths=signature
+        if not force and not active_suspensions and signature==self.note_watch_paths:return
+        self.note_watch_paths = None if active_suspensions else signature
         self.note_file_stamps={path:stamp for path,stamp in self.note_file_stamps.items() if path in paths}
         self.note_identities={path:file_events.identity(path) or self.note_identities.get(path) for path in paths}
         targets={str(target) for path in paths for target in (Path(path),Path(path).parent) if target.exists()}
         targets.update(path for path in ({self.folder}|set(self.expanded)) if path and Path(path).is_dir())
+        if active_suspensions:
+            targets = {
+                candidate
+                for candidate in targets
+                if not any(
+                    folder_ops.matches_path_prefix(candidate, susp_target, is_directory=susp_is_dir)
+                    or (susp_parent and folder_ops.same_path(candidate, susp_parent))
+                    for susp_target, susp_parent, susp_is_dir, _ in active_suspensions
+                )
+            }
         watched=set(self.note_watcher.files()+self.note_watcher.directories())
         if watched-targets:self.note_watcher.removePaths(list(watched-targets))
         if targets-watched:self.note_watcher.addPaths(list(targets-watched))
 
-    def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool):
+    def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool) -> threading.Event:
+        resume_event = threading.Event()
         parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
         for win in list(self.session.windows.values()):
             if win.retired:
                 continue
+            win._watch_suspensions = [item for item in win._watch_suspensions if not item[3].is_set()]
+            win._watch_suspensions.append((target_path, parent_str, is_dir, resume_event))
+            win.note_watch_paths = None
             watched = list(win.note_watcher.files() + win.note_watcher.directories())
             to_remove = [
                 watched_path
@@ -1123,7 +1160,6 @@ class Studio(QObject):
             ]
             if to_remove:
                 win.note_watcher.removePaths(to_remove)
-                win.note_watch_paths = None
             if win.external_paths:
                 win.external_paths = {
                     ext_path
@@ -1131,6 +1167,7 @@ class Studio(QObject):
                     if not folder_ops.matches_path_prefix(ext_path, target_path, is_directory=is_dir)
                     and not (parent_str and folder_ops.same_path(ext_path, parent_str))
                 }
+        return resume_event
 
     def _external_note_changed(self,path):
         if self.retired:return
@@ -1153,10 +1190,14 @@ class Studio(QObject):
         if Path(old).exists() and not (new and old!=new and old.casefold()==new.casefold()):return  # A temporary atomic-replace gap has healed.
         if new and not Path(new).is_file():return
         if new:
-            location=self.session.locations.pop(old,None)
+            location = None
+            for loc_key in [k for k in list(self.session.locations) if folder_ops.same_path(k, old)]:
+                popped = self.session.locations.pop(loc_key, None)
+                if location is None and popped is not None:
+                    location = popped
             if location:self.session.locations[new]=location
             for tab in self.tabs:
-                if tab["path"]==old:tab.update(path=new,name=Path(new).name)
+                if tab["path"] and folder_ops.same_path(tab["path"], old):tab.update(path=new,name=Path(new).name)
             self.session.pinned=[new if folder_ops.same_path(path, old) else path for path in self.session.pinned]
             self.recent=[new if folder_ops.same_path(path, old) else path for path in self.recent]
             for paths in self.session.workspace.values():
@@ -1164,11 +1205,12 @@ class Studio(QObject):
                     if entry["path"] and folder_ops.same_path(entry["path"], old):entry["path"]=new
             self.message="Renamed note: "+Path(new).name
         else:
-            self.session.locations.pop(old,None)
+            for loc_key in [k for k in list(self.session.locations) if folder_ops.same_path(k, old)]:
+                self.session.locations.pop(loc_key, None)
             self.session.pinned=[path for path in self.session.pinned if not folder_ops.same_path(path, old)]
             self.recent=[path for path in self.recent if not folder_ops.same_path(path, old)]
             for tab in list(self.tabs):
-                if tab["path"]!=old:continue
+                if not tab["path"] or not folder_ops.same_path(tab["path"], old):continue
                 if self._is_dirty(tab):
                     draft={**tab,"path":"","name":"Recovered "+tab["name"],"saved":"","conflict":False}
                     self.session.drafts.setdefault("deleted-notes",[]).append(draft)
@@ -2738,6 +2780,7 @@ class Studio(QObject):
             try:self.completed.emit((done,value,error,busy))
             except RuntimeError:pass  # The QObject may have been retired meanwhile.
         future.add_done_callback(completed)
+        return future
 
     @Slot(object)
     def _complete(self, result):
@@ -3953,24 +3996,31 @@ class Studio(QObject):
                     self._emit(False)
                     return
 
-        self._suspend_watches_for_prefix(str(before), is_dir=is_dir)
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            return
+        before_canon = folder_ops.canonical_path_str(before)
+        resume_event = self._suspend_watches_for_prefix(before_canon, is_dir=is_dir)
 
         def work():
-            if folder_ops._is_link_or_junction(after):
-                raise ValueError("Symlinks are not allowed inside the open folder.")
-            if after.exists():
-                same_inode = False
-                if before.name.casefold() == final_name.casefold():
-                    try:
-                        same_inode = os.path.samestat(before.stat(), after.stat())
-                    except OSError:
-                        same_inode = False
-                if not same_inode:
-                    raise ValueError("An item with that name already exists.")
-            before.rename(after)
-            return folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after.resolve(strict=True)), is_dir
+            try:
+                if folder_ops._is_link_or_junction(after):
+                    raise ValueError("Symlinks are not allowed inside the open folder.")
+                if after.exists():
+                    same_inode = False
+                    if before.name.casefold() == final_name.casefold():
+                        try:
+                            same_inode = os.path.samestat(before.stat(), after.stat())
+                        except OSError:
+                            same_inode = False
+                    if not same_inode:
+                        raise ValueError("An item with that name already exists.")
+                _rename_path_with_windows_retry(before, after)
+                return before_canon, folder_ops.canonical_path_str(after.resolve(strict=True)), is_dir
+            finally:
+                resume_event.set()
 
         def finished(result, error):
+            resume_event.set()
             if error or not result:
                 for win in list(self.session.windows.values()):
                     if not win.retired:
@@ -3979,7 +4029,11 @@ class Studio(QObject):
             old_str, new_str, was_dir = result
             self._sync_path_change(old_str, new_str, is_dir=was_dir, message=f"Renamed to {Path(new_str).name}")
 
-        self._submit(work, finished, executor=self.writes)
+        future = self._submit(work, finished, executor=self.writes)
+        if future is None:
+            resume_event.set()
+        else:
+            future.add_done_callback(lambda _f: resume_event.set())
 
     @Slot(str, str)
     def renameNote(self, id, name):
@@ -4003,26 +4057,37 @@ class Studio(QObject):
         if self.folder and folder_ops.matches_path_prefix(str(before), self.folder, is_directory=True):
             self.renameEntry(str(before), final_name)
             return
-        self._suspend_watches_for_prefix(str(before), is_dir=False)
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            return
+        before_canon = folder_ops.canonical_path_str(before)
+        resume_event = self._suspend_watches_for_prefix(before_canon, is_dir=False)
         def work():
-            if folder_ops._is_link_or_junction(after): raise ValueError("Symlinks are not allowed.")
-            if after.exists():
-                same_inode = False
-                if before.name.casefold() == final_name.casefold():
-                    try: same_inode = os.path.samestat(before.stat(), after.stat())
-                    except OSError: same_inode = False
-                if not same_inode:
-                    raise ValueError("A file with that name already exists.")
-            before.rename(after)
-            return folder_ops.canonical_path_str(after.resolve(strict=True))
+            try:
+                if folder_ops._is_link_or_junction(after): raise ValueError("Symlinks are not allowed.")
+                if after.exists():
+                    same_inode = False
+                    if before.name.casefold() == final_name.casefold():
+                        try: same_inode = os.path.samestat(before.stat(), after.stat())
+                        except OSError: same_inode = False
+                    if not same_inode:
+                        raise ValueError("A file with that name already exists.")
+                _rename_path_with_windows_retry(before, after)
+                return folder_ops.canonical_path_str(after.resolve(strict=True))
+            finally:
+                resume_event.set()
         def finished(resolved_after,error):
+            resume_event.set()
             if error or not resolved_after:
                 for win in list(self.session.windows.values()):
                     if not win.retired:
                         win._watch_notes(force=True)
                 return
-            self._sync_path_change(folder_ops.canonical_path_str(before), resolved_after, is_dir=False, message=f"Renamed to {final_name}")
-        self._submit(work,finished,executor=self.writes)
+            self._sync_path_change(before_canon, resolved_after, is_dir=False, message=f"Renamed to {final_name}")
+        future = self._submit(work,finished,executor=self.writes)
+        if future is None:
+            resume_event.set()
+        else:
+            future.add_done_callback(lambda _f: resume_event.set())
 
     @Slot(str,result=QUrl)
     def defaultSaveLocation(self,name):
