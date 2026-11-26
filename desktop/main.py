@@ -124,9 +124,11 @@ def main():
     global _TEARDOWN_COMPLETED
     _TEARDOWN_COMPLETED = False
     broker = None if args.test_state else InstanceBroker(app)
+    pending_open_requests = []
+    if broker:
+        broker.requested.connect(pending_open_requests.append)
     if broker and not broker.claim_or_forward(
         args.note,
-        defer_listen=True,
         open_existing=not (args.background and not args.note),
     ):
         return 0
@@ -142,7 +144,8 @@ def main():
     channel_script = bytes(channel.readAll()).decode()
     engines, studios = [], []
     session = Session(args.test_state)
-    if args.background:session.settings["keepInBackground"]=True
+    os.environ.pop("SUPERMD_FRESH_SERVICE_LOG", None)
+    cli_started_agent_access = bool(args.agent_access and not session.settings.get("agentAccessEnabled"))
     if args.agent_access:session.settings["agentAccessEnabled"]=True
     session.agent_bridge = create_qt_bridge(session, session.data)
     app.aboutToQuit.connect(session.agent_bridge.stop)
@@ -522,6 +525,7 @@ def main():
     from background_service import BackgroundService
     try:
         session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
+        session.background._cli_started_agent_access = cli_started_agent_access
         create_window(args.note,show_window=not args.background)
         if not args.note and not args.smoke and session.settings.get("startup") == "restore":
             while session.has_pending_startup_windows():
@@ -537,10 +541,17 @@ def main():
                     studio._agent_error = f"Could not enable live agent access ({type(error).__name__})."
                     studio._emit(False)
         if broker:
+            try:
+                broker.requested.disconnect(pending_open_requests.append)
+            except (RuntimeError, TypeError):
+                pass
             app.aboutToQuit.connect(broker.stop_accepting)
             broker.requested.connect(lambda note: open_from_service(note or None))
             broker.set_service_handler(session.background.handle_service_request)
             broker.start_listening()
+            for early_note in pending_open_requests:
+                open_from_service(early_note or None)
+            pending_open_requests.clear()
     except BaseException:
         if broker:
             broker.close()

@@ -440,6 +440,7 @@ class Session(QObject):
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
         had_explicit_keep_in_background = isinstance(stored_settings, dict) and "keepInBackground" in stored_settings
+        fresh_service_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
         migrated_keep_in_background = not had_explicit_keep_in_background and (
             (isinstance(stored_settings, dict) and any(
                 stored_settings.get(key) is True
@@ -447,8 +448,13 @@ class Session(QObject):
             ))
             or (self.data / "agent-sessions").is_dir()
             or (self.data / "agent-cloud.json").is_file()
-            or (self.data / "background-service.log").is_file()
-            or (self.data.name == "qt-studio" and (self.data.parent / "background-service.log").is_file())
+            or (
+                not fresh_service_log
+                and (
+                    (self.data / "background-service.log").is_file()
+                    or (self.data.name == "qt-studio" and (self.data.parent / "background-service.log").is_file())
+                )
+            )
         )
         # Local MCP access and cloud relay reconnection are explicit, persisted
         # opt-ins; each desktop launch mints a fresh temporary loopback token.
@@ -461,7 +467,7 @@ class Session(QObject):
         )
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
-        if migrated_keep_in_background and can_persist_migration:
+        if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
             try:
                 atomic_write(
                     settings_path,
@@ -2673,7 +2679,10 @@ class Studio(QObject):
 
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
-        data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
+        persisted_settings = dict(self.settings)
+        if getattr(getattr(self.session, "background", None), "_cli_started_agent_access", False):
+            persisted_settings["agentAccessEnabled"] = False
+        data = json.dumps({"settings": persisted_settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
         self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 

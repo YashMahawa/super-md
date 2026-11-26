@@ -82,9 +82,8 @@ class InstanceBroker(QObject):
         self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
         self.server.newConnection.connect(self.accept)
         self._should_listen = False
-        self._active_readers = {}
         self._listen_watchdog = QTimer(self)
-        self._listen_watchdog.setInterval(25)
+        self._listen_watchdog.setInterval(100)
         self._listen_watchdog.timeout.connect(self._ensure_listening)
 
     def hold_process_exit_lock(self, timeout: float = 15.0) -> None:
@@ -140,23 +139,8 @@ class InstanceBroker(QObject):
             QLocalServer.removeServer(self.name)
             if not self.server.listen(self.name):
                 return
-        # Under macOS offscreen QPA without an active WebEngineView pumping Chromium's message loop,
-        # QLocalServer's QSocketNotifier may not fire while QTimer ticks continue reliably. Poll the
-        # listening descriptor non-blockingly and recover in-place if XNU ECONNABORTED closes it.
-        for _ in range(8):
-            progressed = False
-            if self.server.isListening():
-                progressed = bool(self.server.waitForNewConnection(0)) or self.server.hasPendingConnections()
-            if not self.server.isListening() and self.server.errorString() and self._should_listen and self.lock.isLocked():
-                QLocalServer.removeServer(self.name)
-                self.server.listen(self.name)
-            if self.server.hasPendingConnections():
-                self.accept()
-                progressed = True
-            if not progressed:
-                break
-        for reader in list(self._active_readers.values()):
-            reader()
+        if self.server.hasPendingConnections():
+            self.accept()
 
     def claim_or_forward(self, note, *, defer_listen: bool = False, open_existing: bool = True):
         if self.lock.tryLock(0):
@@ -209,20 +193,13 @@ class InstanceBroker(QObject):
                 continue
             buffer = bytearray()
             state = {"handled": False, "reading": False}
-            def cleanup(socket=socket):
-                self._active_readers.pop(socket, None)
-            def finish(socket=socket, state=state):
+            def finish(state=state):
                 state["handled"] = True
-                self._active_readers.pop(socket, None)
             def read(socket=socket, buffer=buffer, state=state):
                 if state["handled"] or state["reading"]:
                     return
                 state["reading"] = True
                 try:
-                    if socket.state() == QLocalSocket.LocalSocketState.ConnectedState and socket.bytesAvailable() == 0 and b"\n" not in buffer:
-                        socket.waitForReadyRead(0)
-                    if state["handled"]:
-                        return
                     buffer.extend(bytes(socket.readAll()))
                     if len(buffer) > 16384:
                         finish()
@@ -268,9 +245,7 @@ class InstanceBroker(QObject):
                     socket.disconnectFromServer()
                 finally:
                     state["reading"] = False
-            self._active_readers[socket] = read
             socket.readyRead.connect(read)
-            socket.disconnected.connect(cleanup)
             socket.disconnected.connect(socket.deleteLater)
             QTimer.singleShot(5000, socket, socket.disconnectFromServer)
             read()
@@ -278,7 +253,6 @@ class InstanceBroker(QObject):
     def stop_accepting(self):
         self._should_listen = False
         self._listen_watchdog.stop()
-        self._active_readers.clear()
         self.server.close()
         while self.server.hasPendingConnections():
             pending = self.server.nextPendingConnection()

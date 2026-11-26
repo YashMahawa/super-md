@@ -126,7 +126,7 @@ def main(argv):
         print(json.dumps({'ok':True,'result':result}));return 0
     sessions_dir=str(root/'qt-studio'/'agent-sessions')
     if reply is not None and not reply.get('ok',False) and reply.get('error')=='Background service is unavailable':
-        wait_deadline=time.monotonic()+5
+        wait_deadline=time.monotonic()+15
         while time.monotonic()<wait_deadline and (reply is None or (not reply.get('ok',False) and reply.get('error')=='Background service is unavailable')):
             time.sleep(.05);reply=request('start',startup_poll=True)
     if reply is not None and reply.get('stopping'):
@@ -169,8 +169,11 @@ def main(argv):
         proc=None
         if not running:
             flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
-            with (root/'background-service.log').open('ab') as log:
-                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=os.name!='nt',creationflags=flags)
+            log_path=root/'background-service.log'
+            had_legacy_log=log_path.is_file()
+            spawn_env=None if had_legacy_log else {**os.environ,'SUPERMD_FRESH_SERVICE_LOG':'1'}
+            with log_path.open('ab') as log:
+                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=spawn_env,start_new_session=os.name!='nt',creationflags=flags)
             deadline=time.monotonic()+30
             while time.monotonic()<deadline:
                 status=request('status',startup_poll=True)

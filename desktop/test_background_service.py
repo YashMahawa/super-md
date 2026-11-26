@@ -605,6 +605,30 @@ class BackgroundTests(unittest.TestCase):
             finally:
                 corrupt_session.writes.shutdown(wait=True)
 
+        # 5. Fresh post-#41 CLI `service start` creates background-service.log with SUPERMD_FRESH_SERVICE_LOG=1:
+        #    even if the user stops the service immediately without saving any note, subsequent normal GUI
+        #    launches (without SUPERMD_FRESH_SERVICE_LOG) preserve keepInBackground=False and agentAccessEnabled=False.
+        appdata_fresh_cli = make_env("Profile Ε — Fresh Post-41 CLI Service")
+        (appdata_fresh_cli / "background-service.log").write_text("", encoding="utf-8")
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_fresh_cli: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
+        ):
+            with patch.dict(os.environ, {"SUPERMD_FRESH_SERVICE_LOG": "1"}):
+                first_cli_session = Session(False)
+                try:
+                    self.assertIs(first_cli_session.settings["keepInBackground"], False)
+                    self.assertIs(first_cli_session.settings["agentAccessEnabled"], False)
+                finally:
+                    first_cli_session.writes.shutdown(wait=True)
+            reopened_gui_session = Session(False)
+            try:
+                self.assertIs(reopened_gui_session.settings["keepInBackground"], False)
+                self.assertIs(reopened_gui_session.settings["agentAccessEnabled"], False)
+            finally:
+                reopened_gui_session.writes.shutdown(wait=True)
+
 
 _HEADLESS_DAEMON_BOOTSTRAP = """
 import os, sys, time
@@ -717,7 +741,7 @@ for raw in cin:
                 os.replace(tmp, path)
             def fake_popen(spawn_cmd, **kwargs):
                 if real_spawn:
-                    env = dict(os.environ)
+                    env = dict(kwargs.get("env") or os.environ)
                     env["SUPERMD_TEST_APPDATA"] = appdata
                     env["SUPERMD_TEST_DOWNLOADS"] = cmd["downloads"]
                     env["SUPERMD_TEST_DESKTOP_DIR"] = cmd["desktopDir"]
@@ -1803,6 +1827,19 @@ desktop_main._exit_process(rc)""",
                     break
             time.sleep(0.05)
         self.assertTrue(stopped, "Restarted daemon did not fully exit after final stop")
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda kind: str(occluded_appdata)
+            if kind == QStandardPaths.StandardLocation.AppDataLocation
+            else self._orig_writable(kind),
+        ):
+            fresh_reopened = Session(False)
+            try:
+                self.assertIs(fresh_reopened.settings["keepInBackground"], False)
+                self.assertIs(fresh_reopened.settings["agentAccessEnabled"], False)
+            finally:
+                fresh_reopened.writes.shutdown(wait=True)
 
     def test_lazy_reader_profile_teardown_and_vanished_closing_peer_start_handoff(self):
         # 1. Verify _run_teardown never touches QWebEngineProfile.defaultProfile() when a headless
@@ -1919,6 +1956,25 @@ desktop_main._exit_process(rc)""",
             with patch.object(deferred_broker.server, "errorString", return_value="QLocalServer::accept: Software caused connection abort"):
                 deferred_broker._ensure_listening()
             self.assertTrue(deferred_broker.server.isListening())
+
+            # _ensure_listening() must never drain listenSocket behind an already-queued macOS
+            # QCFSocketNotifier `_q_onNewConnection` activation (which would block in ::accept()).
+            from PySide6.QtCore import QMetaObject
+            from PySide6.QtNetwork import QLocalSocket
+            cfsock_client = QLocalSocket()
+            cfsock_client.connectToServer(deferred_broker.name)
+            self.assertTrue(cfsock_client.waitForConnected(500))
+            deferred_broker._ensure_listening()
+            QMetaObject.invokeMethod(deferred_broker.server, "_q_onNewConnection")
+            cfsock_client.write(b'{"service":"status"}\n')
+            cfsock_client.flush()
+            cfsock_client.waitForBytesWritten(500)
+            self.qt_app.processEvents()
+            cfsock_reply = bytes(cfsock_client.readAll())
+            while b"\n" not in cfsock_reply and cfsock_client.waitForReadyRead(500):
+                cfsock_reply += bytes(cfsock_client.readAll())
+            cfsock_client.disconnectFromServer()
+            self.assertEqual(json.loads(cfsock_reply.decode("utf-8"))["ok"], True)
 
             # Intentional server.close() (empty errorString) must stay closed until stop_accepting/close.
             deferred_broker.server.close()
