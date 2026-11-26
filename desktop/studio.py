@@ -28,8 +28,8 @@ import uuid
 import zipfile
 from pathlib import Path
 from network_tls import client_context
-from PySide6.QtCore import QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage
+from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
+from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
@@ -52,7 +52,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_search import MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
+from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
@@ -298,6 +298,199 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
 def local_path(value: str) -> Path:
     url = QUrl(value)
     return Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+
+
+def _extract_local_drop_paths(values) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw in values or ():
+        if raw is None:
+            continue
+        if isinstance(raw, QUrl):
+            if not raw.isLocalFile():
+                continue
+            local_str = raw.toLocalFile()
+        elif isinstance(raw, Path):
+            local_str = str(raw)
+        else:
+            text = str(raw).strip()
+            if not text:
+                continue
+            url = QUrl(text)
+            if url.isLocalFile():
+                local_str = url.toLocalFile()
+            elif not url.scheme() or (len(url.scheme()) == 1 and sys.platform == "win32"):
+                local_str = text
+            else:
+                continue
+        if not local_str:
+            continue
+        try:
+            resolved = Path(local_str).expanduser().resolve()
+        except (OSError, RuntimeError):
+            continue
+        key = canonical_note_key(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(resolved)
+    return paths
+
+
+def _classify_drop_paths(paths: list[Path]) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    folders: list[Path] = []
+    notes: list[Path] = []
+    images: list[Path] = []
+    unsupported: list[Path] = []
+    for path in paths:
+        try:
+            is_dir = path.is_dir()
+            is_file = False if is_dir else path.is_file()
+        except OSError:
+            unsupported.append(path)
+            continue
+        if is_dir:
+            folders.append(path)
+        elif is_file:
+            suffix = path.suffix.lower()
+            if suffix in KNOWN_NOTE_SUFFIXES:
+                notes.append(path)
+            elif suffix.lstrip(".") in MIMES:
+                images.append(path)
+            else:
+                unsupported.append(path)
+        else:
+            unsupported.append(path)
+    return folders, notes, images, unsupported
+
+
+class WorkspaceDropFilter(QObject):
+    """Window-level drag/drop router preserving TabStrip drags and WebEngine image drops."""
+
+    def __init__(self, studio: Studio, window: QObject, reader: QObject | None = None):
+        super().__init__(window)
+        self.studio = studio
+        self.window = window
+        self.reader = reader
+        self._intercepting_drag = False
+        self._forwarding = False
+        window.installEventFilter(self)
+
+    def set_reader(self, reader: QObject | None) -> None:
+        self.reader = reader
+
+    def _over_active_reader(self, scene_pos: QPointF) -> bool:
+        reader = self.reader
+        if (
+            reader is None
+            or not self.studio.settings.get("welcomed")
+            or not self.studio.ready
+            or self.studio.reader_overlay
+            or self.studio.image_overlay
+        ):
+            return False
+        try:
+            if not reader.isVisible() or reader.width() <= 0 or reader.height() <= 0:
+                return False
+            local = reader.mapFromScene(scene_pos)
+            return 0 <= local.x() <= reader.width() and 0 <= local.y() <= reader.height()
+        except RuntimeError:
+            return False
+
+    def _modal_blocked(self) -> bool:
+        if self.studio.dropBlocked:
+            return True
+        try:
+            count = self.window.property("modalDialogCount")
+            return bool(count and int(count) > 0)
+        except (RuntimeError, TypeError, ValueError):
+            return False
+
+    def _forward_enter_to_scene(self, event) -> None:
+        app = QGuiApplication.instance()
+        if app is None:
+            return
+        enter = QDragEnterEvent(
+            event.position().toPoint(),
+            event.possibleActions(),
+            event.mimeData(),
+            event.buttons(),
+            event.modifiers(),
+        )
+        self._forwarding = True
+        try:
+            app.sendEvent(self.window, enter)
+        finally:
+            self._forwarding = False
+
+    def _send_leave_to_scene(self) -> None:
+        app = QGuiApplication.instance()
+        if app is None:
+            return
+        leave = QDragLeaveEvent()
+        self._forwarding = True
+        try:
+            app.sendEvent(self.window, leave)
+        finally:
+            self._forwarding = False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is not self.window or self._forwarding:
+            return False
+        etype = event.type()
+        if etype not in (
+            QEvent.Type.DragEnter,
+            QEvent.Type.DragMove,
+            QEvent.Type.DragLeave,
+            QEvent.Type.Drop,
+        ):
+            return False
+
+        if etype == QEvent.Type.DragLeave:
+            if self._intercepting_drag:
+                self._intercepting_drag = False
+                event.accept()
+                return True
+            return False
+
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls() or mime.hasFormat("application/x-supermd-tab"):
+            return False
+
+        if self._modal_blocked():
+            if not self._intercepting_drag and etype == QEvent.Type.DragMove:
+                self._send_leave_to_scene()
+            self._intercepting_drag = etype != QEvent.Type.Drop
+            event.setDropAction(Qt.DropAction.IgnoreAction)
+            event.ignore()
+            return True
+
+        scene_pos = event.position()
+        over_reader = self._over_active_reader(scene_pos)
+        urls = mime.urls()
+        intercept = self.studio.shouldInterceptExternalDrop(urls, over_reader)
+
+        if not intercept:
+            if self._intercepting_drag:
+                self._intercepting_drag = False
+                if etype in (QEvent.Type.DragMove, QEvent.Type.Drop):
+                    self._forward_enter_to_scene(event)
+            return False
+
+        if not self._intercepting_drag and etype == QEvent.Type.DragMove:
+            self._send_leave_to_scene()
+
+        if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            self._intercepting_drag = True
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return True
+
+        self._intercepting_drag = False
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+        self.studio.handleExternalDrop(urls, over_reader)
+        return True
 
 def export_destination(value: str, format: str) -> Path:
     suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
@@ -605,6 +798,7 @@ class Studio(QObject):
     detachedWindowRequested = Signal(str, str)
     exportRequested = Signal(str)
     folderPickerRequested = Signal()
+    workspaceFolderDropped = Signal()
     fontPickerRequested = Signal()
     themePickerRequested = Signal()
     themeExportRequested = Signal()
@@ -2648,6 +2842,169 @@ class Studio(QObject):
         elif self.message==notice:self.message=""
         self._emit(False)
 
+    @Property(bool, notify=changed)
+    def dropBlocked(self):
+        return bool(self.retired or self.pending_close or self.flush_operation)
+
+    @Slot(QObject)
+    @Slot(QObject, QObject)
+    def attachWindowDropFilter(self, window: QObject | None, reader: QObject | None = None):
+        if window is None or self.retired:
+            return
+        existing = getattr(self, "_workspace_drop_filter", None)
+        if existing is not None and existing.window is window:
+            existing.set_reader(reader)
+            return
+        if existing is not None:
+            try:
+                existing.window.removeEventFilter(existing)
+            except RuntimeError:
+                pass
+        self._workspace_drop_filter = WorkspaceDropFilter(self, window, reader)
+
+    @Slot("QVariantList", bool, result=bool)
+    def shouldInterceptExternalDrop(self, urls, over_reader: bool = False) -> bool:
+        paths = _extract_local_drop_paths(urls)
+        if not paths:
+            return False
+        if self.dropBlocked:
+            return True
+        folders, notes, images, unsupported = _classify_drop_paths(paths)
+        if (
+            over_reader
+            and self.settings.get("welcomed")
+            and self.ready
+            and not self.reader_overlay
+            and not self.image_overlay
+            and images
+            and not folders
+            and not notes
+            and not unsupported
+        ):
+            return False
+        return True
+
+    @Slot("QVariantList")
+    def openDroppedUrls(self, urls):
+        self.handleExternalDrop(urls, False)
+
+    @Slot("QVariantList", bool)
+    def handleExternalDrop(self, urls, over_reader: bool = False):
+        del over_reader
+        if self.dropBlocked:
+            return
+        paths = _extract_local_drop_paths(urls)
+        if not paths:
+            return
+        folders, notes, images, unsupported = _classify_drop_paths(paths)
+        if not folders and not notes:
+            if images:
+                self.message = "Drop images inside an open note to insert them."
+            else:
+                self.message = "Only Markdown notes (.md, .smd, .fmd, .markdown, .txt) and folders can be opened by dropping."
+            self._emit(False)
+            return
+
+        notices: list[str] = []
+        if len(folders) > 1:
+            skipped_folders = len(folders) - 1
+            notices.append(f"opened folder {folders[-1].name} ({skipped_folders} other folder{'s' if skipped_folders != 1 else ''} skipped)")
+        skipped_files = len(images) + len(unsupported)
+        if skipped_files:
+            if images and not unsupported:
+                notices.append("drop images inside an open note separately to insert them")
+            else:
+                notices.append(f"skipped {skipped_files} unsupported item{'s' if skipped_files != 1 else ''}")
+
+        formatted_notice = ""
+        if notices:
+            joined = "; ".join(notices)
+            formatted_notice = joined[0].upper() + joined[1:] + "."
+
+        if folders:
+            self.openFolder(str(folders[-1]))
+            self.workspaceFolderDropped.emit()
+            if not notes and self.host_window is not None:
+                self.host_window.raise_()
+                self.host_window.requestActivate()
+
+        if notes:
+            self._open_dropped_notes(notes, notice=formatted_notice)
+        elif formatted_notice:
+            self.message = formatted_notice
+            self._emit(False)
+
+    def _open_dropped_notes(self, note_paths: list[Path], *, notice: str = ""):
+        if not note_paths or self.retired:
+            return
+        self._activation_generation += 1
+        batch_generation = self._activation_generation
+        highest_activated_index = -1
+        batch_new_tab_indices: dict[str, int] = {}
+        opened_paths_by_index: dict[int, str] = {}
+        errors: list[str] = []
+        remaining = len(note_paths)
+
+        def make_batch_insert(index: int):
+            def insert_note(note: dict):
+                batch_new_tab_indices[note["id"]] = index
+                insert_at = next(
+                    (
+                        pos
+                        for pos, existing in enumerate(self.tabs)
+                        if existing["id"] in batch_new_tab_indices and batch_new_tab_indices[existing["id"]] > index
+                    ),
+                    None,
+                )
+                if insert_at is None:
+                    self.tabs.append(note)
+                else:
+                    self.tabs.insert(insert_at, note)
+            return insert_note
+
+        def make_should_activate(index: int):
+            def check(_tab: dict) -> bool:
+                nonlocal highest_activated_index
+                if index >= highest_activated_index:
+                    highest_activated_index = index
+                    return True
+                return False
+            return check
+
+        def make_done(index: int, path: Path):
+            def done(tab: dict | None, error: str | None):
+                nonlocal remaining
+                if error:
+                    errors.append(f"{path.name}: {error}")
+                elif tab is not None:
+                    opened_paths_by_index[index] = str(path)
+                remaining -= 1
+                if remaining == 0 and not self.retired:
+                    if len(opened_paths_by_index) > 1:
+                        ordered = [opened_paths_by_index[i] for i in sorted(opened_paths_by_index, reverse=True)]
+                        ordered_set = set(ordered)
+                        self.recent = (ordered + [p for p in self.recent if p not in ordered_set])[:30]
+                        self._preferences()
+                    parts: list[str] = []
+                    if errors:
+                        parts.append("Could not open " + "; ".join(errors))
+                    if notice:
+                        parts.append(notice)
+                    if parts:
+                        self.message = " ".join(parts)
+                    self._emit(False)
+            return done
+
+        for idx, note_path in enumerate(note_paths):
+            self._open_note(
+                str(note_path),
+                explicit=True,
+                activation_generation=batch_generation,
+                completion_callback=make_done(idx, note_path),
+                batch_insert=make_batch_insert(idx),
+                should_activate_fn=make_should_activate(idx),
+            )
+
     @Slot(str)
     def openPath(self, value):
         path = local_path(value)
@@ -2695,7 +3052,16 @@ class Studio(QObject):
         QTimer.singleShot(0, lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
                           if generation == self._activation_generation and not self.retired else None)
 
-    def _open_note(self, value, *, explicit, activation_generation=None, completion_callback=None):
+    def _open_note(
+        self,
+        value,
+        *,
+        explicit,
+        activation_generation=None,
+        completion_callback=None,
+        batch_insert=None,
+        should_activate_fn=None,
+    ):
         if self.retired:
             if completion_callback: completion_callback(None, "The document window is no longer available")
             return
@@ -2704,7 +3070,7 @@ class Studio(QObject):
             self.openFolder(str(path))
             if completion_callback: completion_callback(None, "A folder cannot be opened as a document")
             return
-        if explicit:
+        if explicit and activation_generation is None:
             self._activation_generation += 1
             activation_generation = self._activation_generation
         elif activation_generation is None:
@@ -2717,8 +3083,9 @@ class Studio(QObject):
             if restoring and activation_generation == self._activation_generation and str(path) == (self._startup_active or self.session.startup_active):
                 self._select_tab_from_open(found["id"], activation_generation)
             if explicit and activation_generation == self._activation_generation:
-                self._select_tab_from_open(found["id"], activation_generation)
-                self._focus_open_target(activation_generation)
+                if should_activate_fn is None or should_activate_fn(found):
+                    self._select_tab_from_open(found["id"], activation_generation)
+                    self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(found, None)
             return
         def finished(result, error):
@@ -2732,8 +3099,9 @@ class Studio(QObject):
             existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
             if existing:
                 if explicit and activation_generation == self._activation_generation:
-                    self._select_tab_from_open(existing["id"], activation_generation)
-                    self._focus_open_target(activation_generation)
+                    if should_activate_fn is None or should_activate_fn(existing):
+                        self._select_tab_from_open(existing["id"], activation_generation)
+                        self._focus_open_target(activation_generation)
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
@@ -2742,11 +3110,17 @@ class Studio(QObject):
                 if activation_generation == self._activation_generation:
                     self.tabs=[t for t in self.tabs if t["id"] not in self._startup_placeholder_ids]
                     self._startup_placeholder_ids.clear()
-            self.tabs.append(note)
+            if batch_insert is not None:
+                batch_insert(note)
+            else:
+                self.tabs.append(note)
             if restoring:
                 keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
-            should_activate = (explicit and activation_generation == self._activation_generation)
+            if should_activate_fn is not None:
+                should_activate = bool(explicit and activation_generation == self._activation_generation and should_activate_fn(note))
+            else:
+                should_activate = (explicit and activation_generation == self._activation_generation)
             if restoring and activation_generation == self._activation_generation:
                 target_active = self._startup_active or self.session.startup_active
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
@@ -2756,7 +3130,7 @@ class Studio(QObject):
             self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
             self._preferences()
             self.recovery_timer.start(800)
-            self._emit()
+            self._emit(should_activate if should_activate_fn is not None else True)
             if explicit and should_activate:
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(note, None)
