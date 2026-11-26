@@ -109,12 +109,15 @@ def _report_ui_save_conflict(studio_obj: Any, target: dict | None, *, automatic:
         studio_obj._emit(False)
     if not automatic and target is not None: studio_obj.saveConflictRequested.emit(target["name"])
 
+def _refresh_open_folder_trees(studio_obj: Any, *candidates: Any) -> None:
+    _call_method(studio_obj, "_refresh_open_folder_trees", _studio_module().Studio._refresh_open_folder_trees, *candidates)
+
 def _commit_saved_tab_state(studio_obj: Any, target: dict | None, *, new_path: str | None = None,
                             saved_content: str, saved_assets: dict[str, str], portable: bool | None = None,
                             new_content: str | None = None, new_assets: dict[str, str] | None = None,
                             path_changed: bool = False, update_recent: bool = False,
                             restart_autosave: bool = False, ui_message: str | None = None,
-                            finish_pending_close: bool = False) -> bool:
+                            refresh_trees: tuple[Any, ...] = (), finish_pending_close: bool = False) -> bool:
     is_dirty = False
     if target is not None:
         target.update({
@@ -140,6 +143,7 @@ def _commit_saved_tab_state(studio_obj: Any, target: dict | None, *, new_path: s
     if ui_message is not None: studio_obj.message = ui_message
     if hasattr(studio_obj, "_recover"): studio_obj._recover()
     if hasattr(studio_obj, "_emit"): studio_obj._emit()
+    if refresh_trees: _refresh_open_folder_trees(studio_obj, *refresh_trees)
     if finish_pending_close and getattr(studio_obj, "pending_close", ""): studio_obj._finish_close()
     return is_dirty
 
@@ -309,10 +313,10 @@ def save_text(studio_obj: Any, tab: dict, path: Path, automatic: bool = False,
         _record_file_stamp(studio_obj, path, outcome.get("stamp") if isinstance(outcome, dict) else None)
         path_changed = bool(target is not None and str(path) != original_path)
         _commit_saved_tab_state(
-            studio_obj, target, new_path=str(path), saved_content=content, saved_assets=assets,
-            portable=portable, path_changed=path_changed, update_recent=path_changed,
-            restart_autosave=bool(automatic), ui_message="Autosaved" if automatic else "Saved",
-            finish_pending_close=True,
+            studio_obj, target, new_path=str(path), saved_content=content, saved_assets=assets, portable=portable,
+            path_changed=path_changed, update_recent=path_changed, restart_autosave=bool(automatic),
+            ui_message="Autosaved" if automatic else "Saved",
+            refresh_trees=(path, original_path) if str(path) != original_path else (), finish_pending_close=True,
         )
     def write():
         if (automatic or (not force_overwrite and same_path)) and _has_disk_conflict(
@@ -486,6 +490,7 @@ def prepare_save_document(studio_obj: Any, args: dict) -> tuple:
             studio_obj, target, new_path=str(resolved_path), saved_content=content_snapshot,
             saved_assets=assets_snapshot, portable=fmt == "smd", path_changed=path_changed,
             restart_autosave=bool(getattr(studio_obj, "settings", {}).get("autosave")),
+            refresh_trees=(resolved_path, old_canonical_path or old_path) if path_changed else (),
         )
         return {"tabId": tab_id, "windowId": studio_obj.window_id, "path": str(resolved_path),
                 "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
@@ -538,9 +543,13 @@ def finalize_export_fmd_result(studio_obj: Any, request_id: str, captured_id: st
             _commit_saved_tab_state(
                 studio_obj, save_target, new_path=save_as, saved_content=args["content"], saved_assets=merged,
                 portable=True, new_content=new_content, new_assets=merged, path_changed=path_changed,
-                update_recent=True, ui_message="Saved", finish_pending_close=True,
+                update_recent=True, ui_message="Saved", refresh_trees=(save_as,) if path_changed else (), finish_pending_close=True,
             )
         studio_obj.pending_save_as = studio_obj.pending_save_as_tab = ""
-    else:
-        studio_obj.message = f"Exported {Path(result['path']).name}"
+    else: finalize_export_file(studio_obj, result["path"])
     return True
+
+def finalize_export_file(studio_obj: Any, exported_path: str) -> None:
+    name = Path(exported_path).name
+    studio_obj.message = f"Exported {name}"
+    if _studio_module().is_searchable_note_name(name): _refresh_open_folder_trees(studio_obj, exported_path)

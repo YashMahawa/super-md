@@ -24,8 +24,13 @@ if __name__ == "__main__":
     suite_timeout = suite_watchdog_seconds()
     faulthandler.dump_traceback_later(suite_timeout, exit=True)
     try:
-        suite=unittest.defaultTestLoader.discover(str(Path(__file__).parent),pattern="test_*.py")
-        result=unittest.TextTestRunner(verbosity=2).run(suite)
+        desktop_dir = str(Path(__file__).resolve().parent)
+        suite = unittest.defaultTestLoader.discover(
+            start_dir=desktop_dir,
+            pattern="test_*.py",
+            top_level_dir=desktop_dir,
+        )
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
     finally:
         faulthandler.cancel_dump_traceback_later()
     sys.exit(0 if result.wasSuccessful() else 1)

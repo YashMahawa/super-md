@@ -143,7 +143,8 @@ class StudioSavesTests(unittest.TestCase):
         save_as_dir.mkdir()
         self.studio.settings["newNoteLocation"] = str(save_as_dir)
         with patch("studio.write_portable", side_effect=strict_three_arg_write_portable), \
-             patch.object(self.session.workspace_links, "invalidate", wraps=self.session.workspace_links.invalidate) as inv_spy:
+             patch.object(self.session.workspace_links, "invalidate", wraps=self.session.workspace_links.invalidate) as inv_spy, \
+             patch.object(self.studio, "_refresh_open_folder_trees", wraps=self.studio._refresh_open_folder_trees) as refresh_spy:
             res = Studio._run_prepared_write_sync(
                 self.studio,
                 Studio._prepare_save_document(self.studio, {"tabId": tab["id"], "expectedRevision": rev}),
@@ -151,6 +152,7 @@ class StudioSavesTests(unittest.TestCase):
             self.assertFalse(res["pathChanged"])
             self.assertEqual(three_arg_calls, [note_path.resolve()])
             inv_spy.assert_not_called()
+            refresh_spy.assert_not_called()
 
             res2 = Studio._run_prepared_write_sync(
                 self.studio,
@@ -161,8 +163,10 @@ class StudioSavesTests(unittest.TestCase):
             )
             self.assertTrue(res2["pathChanged"])
             inv_spy.assert_called_once_with(save_as_dir.resolve())
+            refresh_spy.assert_called_once_with(Path(res2["newPath"]), str(note_path.resolve()))
 
         proxy_md = self.root / "proxy.md"
+        proxy_copy = self.root / "proxy-copy.md"
         proxy_md.write_text("old", encoding="utf-8")
         proxy_tab = {
             "id": "t1", "name": "proxy.md", "path": str(proxy_md), "content": "new",
@@ -172,11 +176,18 @@ class StudioSavesTests(unittest.TestCase):
             window_id="w1", tabs=[proxy_tab], active="t1", saving=set(),
             note_file_stamps={}, _agent_open_paths=set(), _agent_owned_files=set(),
             settings={"autosave": False}, _recover=lambda: None, _emit=lambda *a, **k: None,
+            _agent_export_path=lambda _fn, _fmt, _tab: (proxy_copy.write_bytes(b""), proxy_copy)[1],
         )
         new_rev = hashlib.sha256(b"new").hexdigest()
         out = Studio._run_prepared_write_sync(proxy, Studio._prepare_save_document(proxy, {"tabId": "t1", "expectedRevision": new_rev}))
         self.assertEqual(proxy_md.read_text(encoding="utf-8"), "new")
         self.assertEqual(out["newPath"], str(proxy_md.resolve()))
+        out_copy = Studio._run_prepared_write_sync(
+            proxy,
+            Studio._prepare_save_document(proxy, {"tabId": "t1", "expectedRevision": new_rev, "saveAs": True, "filename": "proxy-copy.md"}),
+        )
+        self.assertTrue(out_copy["pathChanged"])
+        self.assertEqual(proxy_copy.read_text(encoding="utf-8"), "new")
 
     def test_export_fmd_native_conflict_overwrite_and_save_as_sync(self):
         note_path = self.root / "portable.smd"
@@ -234,15 +245,47 @@ class StudioSavesTests(unittest.TestCase):
         sub = self.root / "nested"
         sub.mkdir()
         dest = sub / "renamed.smd"
-        with patch.object(self.session.workspace_links, "invalidate", wraps=self.session.workspace_links.invalidate) as inv_spy:
+        with patch.object(self.session.workspace_links, "invalidate", wraps=self.session.workspace_links.invalidate) as inv_spy, \
+             patch.object(self.studio, "_refresh_open_folder_trees", wraps=self.studio._refresh_open_folder_trees) as refresh_spy:
             self.studio.saveAs(str(dest))
             self.studio._post("r4", "export_fmd_native", json.dumps(same_save_as_payload))
             self._pump_until(lambda: len(replies) == 4)
             inv_spy.assert_called_once_with(sub)
+            refresh_spy.assert_called_once_with(str(dest))
         self.assertEqual(tab["path"], str(dest))
         self.assertEqual(self.studio.recent[0], str(dest))
         self.assertIn(str(dest.resolve()), self.studio._agent_open_paths)
         self.assertEqual(self.studio.pending_save_as, "")
+
+        md_save_as = sub / "renamed-copy.md"
+        exported_smd = sub / "standalone.smd"
+        exported_md = sub / "standalone.md"
+        exported_zip = sub / "bundle.zip"
+        with patch.object(self.studio, "_refresh_open_folder_trees", wraps=self.studio._refresh_open_folder_trees) as refresh_spy:
+            self.studio._save_text(tab, md_save_as, automatic=False, force_overwrite=True)
+            self._pump_until(lambda: tab["id"] not in self.studio.saving and tab["path"] == str(md_save_as))
+            refresh_spy.assert_called_once_with(md_save_as, str(dest))
+            refresh_spy.reset_mock()
+
+            self.studio.exportTo(str(exported_smd), "smd")
+            self.studio._post("r5", "export_fmd_native", json.dumps({"save": False, "content": "# Export\n", "assets": {}}))
+            self._pump_until(lambda: len(replies) == 5)
+            refresh_spy.assert_called_once_with(str(exported_smd))
+            self.assertEqual(self.studio.message, "Exported standalone.smd")
+            refresh_spy.reset_mock()
+
+            self.studio.exportTo(str(exported_md), "md")
+            self.studio._post("r6", "export_markdown_native", json.dumps({"archive": False, "content": "# Export\n", "assets": {}}))
+            self._pump_until(lambda: len(replies) == 6)
+            refresh_spy.assert_called_once_with(str(exported_md))
+            self.assertEqual(self.studio.message, "Exported standalone.md")
+            refresh_spy.reset_mock()
+
+            self.studio.exportTo(str(exported_zip), "mdzip")
+            self.studio._post("r7", "export_markdown_native", json.dumps({"archive": True, "content": "# Export\n", "assets": {}}))
+            self._pump_until(lambda: len(replies) == 7)
+            refresh_spy.assert_not_called()
+            self.assertEqual(self.studio.message, "Exported bundle.zip")
 
     def test_export_destination_edge_cases_and_local_path_lookup(self):
         with self.assertRaisesRegex(ValueError, "Legacy .fmd"):
