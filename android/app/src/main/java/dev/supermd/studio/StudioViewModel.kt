@@ -87,7 +87,7 @@ data class PendingSeededFind(
     val targetTabId: String? = null,
     val targetUri: String? = null,
 )
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
@@ -164,6 +164,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         },
         onConfirmedTreeKeys = { keys -> confirmedTreeDocumentKeys.addAll(keys) },
     )
+    internal var workspaceLinks = WorkspaceLinkCache(ContentResolverTreeLister(app))
     private val accessRequestsMutable = MutableStateFlow<DocumentAccessRequest?>(null)
     val documentAccessRequests = accessRequestsMutable.asStateFlow()
     private val blockedDocumentWrites = mutableSetOf<String>()
@@ -338,6 +339,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         scheduleAutosave(id)
     }
     @Volatile internal var readerFlushRequester: (suspend (String) -> Boolean)? = null
+    @Volatile internal var readerFlushStatusRequester: (suspend (String) -> ReaderFlushStatus)? = null
     private val readerActionMutex = Mutex()
     private val openRequests = OpenRequestGate()
     private val openIntentDispatcher = OpenIntentDispatcher<OpenDocumentTarget> { left, right -> left.uri == right.uri }
@@ -381,23 +383,53 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>?) = openIntentDispatcher.attach(handler)
     internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>) = openIntentDispatcher.detach(handler)
-    private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
-        if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) {
-            action()
-            return@withLock true
+    private suspend fun flushActiveNoteLocked(expectedActiveId: String): Boolean {
+        if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) return true
+        if (mutable.value.active.id != expectedActiveId) return false
+        val statusRequester = readerFlushStatusRequester
+        if (statusRequester != null) {
+            val status = try {
+                statusRequester.invoke(expectedActiveId)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                ReaderFlushStatus.FAILED
+            }
+            return when (status) {
+                ReaderFlushStatus.ACKNOWLEDGED -> mutable.value.active.id == expectedActiveId
+                ReaderFlushStatus.WRONG_ACTIVE_NOTE ->
+                    // Compose delivers supermdLoad asynchronously after native switches
+                    // activeId. When the live reader confirms a different note is still
+                    // mounted (with no unacknowledged draft for expectedActiveId) and
+                    // native remains authoritative for expectedActiveId, there are no
+                    // pending reader edits on expectedActiveId to flush.
+                    mutable.value.active.id == expectedActiveId &&
+                        readerStateIsNativeAuthoritative(expectedActiveId)
+                ReaderFlushStatus.FAILED -> false
+            }
         }
-        if (mutable.value.active.id != expectedActiveId) return@withLock false
         // A missing bridge is not an implicit flush acknowledgement. Only
         // proceed when the native snapshot is already the last acknowledged
         // reader state (for example, before the reader has ever attached).
         val accepted = try {
             readerFlushRequester?.invoke(expectedActiveId)
                 ?: readerStateIsNativeAuthoritative(expectedActiveId)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            false
         }
-        catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-        catch (_: Exception) { false }
-        if (!accepted || mutable.value.active.id != expectedActiveId) return@withLock false
+        return accepted && mutable.value.active.id == expectedActiveId
+    }
+    private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
+        if (!flushActiveNoteLocked(expectedActiveId)) return@withLock false
         action()
+        true
+    }
+    private suspend fun performCurrentReaderBarrier(action: (String) -> Unit): Boolean = readerActionMutex.withLock {
+        val currentActiveId = mutable.value.active.id
+        if (!flushActiveNoteLocked(currentActiveId)) return@withLock false
+        action(currentActiveId)
         true
     }
     /** Waits until the reader reflects an already-selected native tab. This is
@@ -408,15 +440,31 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             while (true) {
                 val current = mutable.value
                 if (current.activeId != noteId || current.active.id != noteId) return@withTimeoutOrNull false
-                val acknowledged = try {
-                    readerFlushRequester?.invoke(noteId) ?: readerStateIsNativeAuthoritative(noteId)
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    false
+                val statusRequester = readerFlushStatusRequester
+                if (statusRequester != null) {
+                    val status = try {
+                        statusRequester.invoke(noteId)
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        ReaderFlushStatus.FAILED
+                    }
+                    when (status) {
+                        ReaderFlushStatus.ACKNOWLEDGED -> return@withTimeoutOrNull true
+                        ReaderFlushStatus.FAILED -> return@withTimeoutOrNull false
+                        ReaderFlushStatus.WRONG_ACTIVE_NOTE -> kotlinx.coroutines.delay(40)
+                    }
+                } else {
+                    val acknowledged = try {
+                        readerFlushRequester?.invoke(noteId) ?: readerStateIsNativeAuthoritative(noteId)
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (acknowledged) return@withTimeoutOrNull true
+                    kotlinx.coroutines.delay(40)
                 }
-                if (acknowledged) return@withTimeoutOrNull true
-                kotlinx.coroutines.delay(40)
             }
             @Suppress("UNREACHABLE_CODE")
             false
@@ -794,6 +842,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     /** Notification-driven SAF updates. A failed query is not proof of deletion. */
     fun refreshMetadata() {
         metadataJob?.cancel()
+        workspaceLinks.invalidate()
         metadataJob=viewModelScope.launch {
             delay(200)
             val beforeIo=mutable.value
@@ -940,16 +989,31 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     val headings = outlineMutable.asStateFlow()
     private val imageMutable = MutableStateFlow(false)
     val imageOverlay = imageMutable.asStateFlow()
+    @Volatile internal var lastOutlineNoteId: String = ""
+        private set
     fun outline(id: String, entries: JSONArray) {
         if (id != mutable.value.active.id) return
-        outlineMutable.value = (0 until minOf(entries.length(), 2000)).map { index ->
+        val parsed = (0 until minOf(entries.length(), 2000)).map { index ->
             val entry = entries.getJSONObject(index)
             OutlineHeading(entry.getString("id"), entry.getString("title"), entry.getInt("level").coerceIn(1,6), entry.getInt("offset").coerceAtLeast(0))
         }
-        val note = mutable.value.active
-        if (note.uri == null && note.name.startsWith("Untitled") && outlineMutable.value.isNotEmpty()) {
-            val title = outlineMutable.value.first().title.filter { it.code >= 32 && it !in "/\\:*?\"<>|" }.trim().trim('.').take(120)
-            if (title.isNotEmpty()) change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(name = title + if (it.portable) ".smd" else ".md") else it }) }
+        if (id != mutable.value.active.id) return
+        outlineMutable.value = parsed
+        lastOutlineNoteId = id
+        val note = mutable.value.tabs.firstOrNull { it.id == id } ?: return
+        if (note.uri == null && note.name.startsWith("Untitled") && parsed.isNotEmpty()) {
+            val title = parsed.first().title.filter { it.code >= 32 && it !in "/\\:*?\"<>|" }.trim().trim('.').take(120)
+            if (title.isNotEmpty()) {
+                change { s ->
+                    s.copy(
+                        tabs = s.tabs.map {
+                            if (it.id == id && it.uri == null && it.name.startsWith("Untitled")) {
+                                it.copy(name = title + if (it.portable) ".smd" else ".md")
+                            } else it
+                        },
+                    )
+                }
+            }
         }
     }
     private fun resolveDisplayName(target: Uri): String? =
@@ -1326,13 +1390,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun newNote(titleHint: String? = null, content: String? = null, background: Boolean = false, format: String = "md", onCreated: ((Note?) -> Unit)? = null) {
         if (format !in setOf("md", "smd")) { onCreated?.invoke(null); return }
         openRequests.invalidate()
-        val expected = mutable.value.active.id
         viewModelScope.launch {
             val nativeFormat = if (format == "smd") NativeExportFormat.PORTABLE_SMD else NativeExportFormat.MARKDOWN
             val title = ExportFilename.suggestedName(titleHint ?: "Untitled", nativeFormat)
             val assets = if (format == "smd") media.createEmptyPortableDirectory() else null
             val note = Note(name = title, content = content ?: "", assetDirectory = assets)
-            val accepted = performReaderBarrier(expected) {
+            val accepted = performCurrentReaderBarrier {
                     change { state ->
                         val preservedId = state.tabs.firstOrNull { it.id == state.activeId }?.id ?: state.tabs.firstOrNull()?.id ?: note.id
                         state.copy(tabs = state.tabs + note, activeId = if (background) preservedId else note.id)
@@ -1665,19 +1728,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun requestClose(id: String) {
         openRequests.invalidate()
-        viewModelScope.launch {
-            val activeId = mutable.value.active.id
-            if (id == activeId && !performReaderBarrier(activeId) { }) {
-                readerBarrierFailed()
-                return@launch
-            }
-            val note = mutable.value.tabs.find { it.id == id } ?: return@launch
-            if (note.requiresCloseConfirmation) {
-                change { state -> state.copy(activeId = if (state.tabs.any { it.id == id }) id else state.activeId, pendingCloseNoteId = id) }
-            } else {
-                close(id)
-            }
-        }
+        viewModelScope.launch { executeClose(id, confirmIfRequired = true) }
     }
     fun dismissCloseConfirmation() {
         closeAfterSaveNoteId = null
@@ -1719,50 +1770,78 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun close(id: String, expectedRevision: String? = null, refuseDirty: Boolean = false, discardChanges: Boolean = false, onComplete: ((String?) -> Unit)? = null) {
         openRequests.invalidate()
         viewModelScope.launch {
-            var preserve = false
-            var revisionError: String? = null
-            var closeError: String? = null
-            val activeId = mutable.value.active.id
-            val accepted = performReaderBarrier(activeId) {
-                val note = mutable.value.tabs.find { it.id == id } ?: return@performReaderBarrier
-                if (expectedRevision != null && !agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) {
-                    revisionError = "Revision conflict: the note changed since the supplied revision; it remains open"
-                    return@performReaderBarrier
-                }
-                if (refuseDirty && note.dirty && !discardChanges) {
-                    closeError = "The note has unsaved changes. Set options.discardChanges=true to close it; Android will retain its recovery copy."
-                    return@performReaderBarrier
-                }
-                if (!closingNoteIds.add(id)) return@performReaderBarrier
-                if (note.uri == null && note.content.isBlank() && note.assetDirectory == null) {
-                    discardEmptyTab(id)
-                    closingNoteIds.remove(id)
-                } else if (note.uri == null && note.content.isBlank() && !note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false)) {
-                    discardEmptyTab(id)
-                    closingNoteIds.remove(id)
-                } else preserve = true
-            }
-            if (!accepted) {
-                readerBarrierFailed()
-                onComplete?.invoke("The note draft could not be synchronized before closing")
-                return@launch
-            }
-            if (revisionError != null) { onComplete?.invoke(revisionError); return@launch }
-            if (closeError != null) { onComplete?.invoke(closeError); return@launch }
-            if (preserve) closeAfterReaderBarrier(id)
-            val afterClose = mutable.value
-            if (afterClose.tabs.any { it.id == id }) {
-                onComplete?.invoke("The note could not be closed; it remains open")
-                return@launch
-            }
-            if (afterClose.active.id != activeId && !awaitReaderSnapshot(afterClose.active.id)) {
-                val message = "The note was closed and preserved, but the active reader is still loading; refresh the tabs before the next action."
-                mutable.value = mutable.value.copy(message = message)
-                onComplete?.invoke(message)
-                return@launch
-            }
-            onComplete?.invoke(null)
+            executeClose(
+                id = id,
+                expectedRevision = expectedRevision,
+                refuseDirty = refuseDirty,
+                discardChanges = discardChanges,
+                confirmIfRequired = false,
+                onComplete = onComplete,
+            )
         }
+    }
+    private suspend fun executeClose(
+        id: String,
+        expectedRevision: String? = null,
+        refuseDirty: Boolean = false,
+        discardChanges: Boolean = false,
+        confirmIfRequired: Boolean = false,
+        onComplete: ((String?) -> Unit)? = null,
+    ) {
+        var previousActiveId = ""
+        var requestedConfirmation = false
+        var preserve = false
+        var revisionError: String? = null
+        var closeError: String? = null
+        val accepted = performCurrentReaderBarrier { currentActiveId ->
+            previousActiveId = currentActiveId
+            val note = mutable.value.tabs.find { it.id == id } ?: return@performCurrentReaderBarrier
+            if (confirmIfRequired && note.requiresCloseConfirmation) {
+                change { state -> state.copy(activeId = if (state.tabs.any { it.id == id }) id else state.activeId, pendingCloseNoteId = id) }
+                requestedConfirmation = true
+                return@performCurrentReaderBarrier
+            }
+            if (expectedRevision != null && !agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) {
+                revisionError = "Revision conflict: the note changed since the supplied revision; it remains open"
+                return@performCurrentReaderBarrier
+            }
+            if (refuseDirty && note.dirty && !discardChanges) {
+                closeError = "The note has unsaved changes. Set options.discardChanges=true to close it; Android will retain its recovery copy."
+                return@performCurrentReaderBarrier
+            }
+            if (!closingNoteIds.add(id)) return@performCurrentReaderBarrier
+            if (note.uri == null && note.content.isBlank() && note.assetDirectory == null) {
+                discardEmptyTab(id)
+                closingNoteIds.remove(id)
+            } else if (note.uri == null && note.content.isBlank() && !note.assetsDirty && runCatching { media.portableAssets(note.assetDirectory).length() == 0 }.getOrDefault(false)) {
+                discardEmptyTab(id)
+                closingNoteIds.remove(id)
+            } else preserve = true
+        }
+        if (!accepted) {
+            readerBarrierFailed()
+            onComplete?.invoke("The note draft could not be synchronized before closing")
+            return
+        }
+        if (requestedConfirmation) {
+            onComplete?.invoke(null)
+            return
+        }
+        if (revisionError != null) { onComplete?.invoke(revisionError); return }
+        if (closeError != null) { onComplete?.invoke(closeError); return }
+        if (preserve) closeAfterReaderBarrier(id)
+        val afterClose = mutable.value
+        if (afterClose.tabs.any { it.id == id }) {
+            onComplete?.invoke("The note could not be closed; it remains open")
+            return
+        }
+        if (afterClose.active.id != previousActiveId && !awaitReaderSnapshot(afterClose.active.id)) {
+            val message = "The note was closed and preserved, but the active reader is still loading; refresh the tabs before the next action."
+            mutable.value = mutable.value.copy(message = message)
+            onComplete?.invoke(message)
+            return
+        }
+        onComplete?.invoke(null)
     }
 
     private suspend fun closeAfterReaderBarrier(id: String) {
@@ -1819,15 +1898,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun reopen() {
         openRequests.invalidate()
-        val expectedActiveId = mutable.value.active.id
         val referenceNote=mutable.value.closedTabs.firstOrNull() ?: return
         val reference=closedNoteRefs.firstOrNull {it.id==referenceNote.id}
         viewModelScope.launch {
             val note=try {if(reference==null)referenceNote else withContext(Dispatchers.IO){closedNoteStore.load(reference)}}
                 catch(error:Exception) {mutable.value=mutable.value.copy(message="Could not reopen the closed note: ${error.message}");return@launch}
             var updatedRefs: List<ClosedNoteReference>? = null
-            val accepted = performReaderBarrier(expectedActiveId) {
-                if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performReaderBarrier
+            val accepted = performCurrentReaderBarrier {
+                if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performCurrentReaderBarrier
                 readerEcho.remove(note.id)
                 if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
                 closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
@@ -2007,6 +2085,46 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             mutable.value = mutable.value.copy(pendingHeading = null)
         }
     }
+    fun dismissWorkspaceFolderPrompt() {
+        mutable.value = mutable.value.copy(folderAccessPrompt = null)
+    }
+    private suspend fun applyWorkspaceFolder(uri: Uri, clearPrompt: Boolean = false) {
+        withContext(Dispatchers.IO) { documentAccess.persist(uri) }
+        workspaceLinks.invalidate()
+        listedRelative = ""
+        windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
+        change {
+            if (clearPrompt) it.copy(folder = uri.toString(), folderRelative = "", folderAccessPrompt = null)
+            else it.copy(folder = uri.toString(), folderRelative = "")
+        }
+        val listJob = listFolder(uri, "")
+        if (blockedDocumentWrites.isNotEmpty()) {
+            listJob.join()
+            val candidates = blockedDocumentWrites.toList()
+            val unblocked = withContext(Dispatchers.IO) {
+                if (!documentAccess.hasWriteGrant(uri)) emptyList()
+                else candidates.filter { raw ->
+                    val resolved = documentAccess.resolve(Uri.parse(raw), writing = true)
+                    resolved.toString() != raw && documentAccess.hasWriteGrant(resolved)
+                }
+            }
+            unblocked.forEach(::clearDocumentAccessFailure)
+        }
+    }
+    fun grantWorkspaceFolderForLink(uri: Uri) = viewModelScope.launch {
+        val prompt = mutable.value.folderAccessPrompt
+        try {
+            applyWorkspaceFolder(uri, clearPrompt = true)
+            if (prompt != null) {
+                openWorkspaceLink(prompt.noteId, prompt.target, prompt.fragment, prompt.wikilink, allowFolderPrompt = false)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            mutable.value = mutable.value.copy(folderAccessPrompt = null)
+            fail("Could not open folder: ${error.message}")
+        }
+    }
     private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
         documentAccess.persist(uri)
         val target = documentAccess.resolve(uri)
@@ -2102,11 +2220,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 retainOpenedNote(note, activate = false)
                 return JSONObject().put("opened", false)
             }
-            val expectedActiveId = mutable.value.active.id
             var openedTabId: String? = null
-            val accepted = performReaderBarrier(expectedActiveId) {
+            val accepted = performCurrentReaderBarrier { currentActiveId ->
                 if (scheduleDirtyAutosave) {
-                    mutable.value.tabs.firstOrNull { it.id == expectedActiveId }
+                    mutable.value.tabs.firstOrNull { it.id == currentActiveId }
                         ?.takeIf { it.dirty && it.uri != null }
                         ?.let { scheduleAutosave(it.id) }
                 }
@@ -2601,27 +2718,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     fun setFolder(uri: Uri) = viewModelScope.launch {
-        try {
-            withContext(Dispatchers.IO) { documentAccess.persist(uri) }
-            listedRelative = ""
-            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
-            change { it.copy(folder = uri.toString(), folderRelative = "") }
-            val listJob = listFolder(uri, "")
-            if (blockedDocumentWrites.isNotEmpty()) {
-                listJob.join()
-                val candidates = blockedDocumentWrites.toList()
-                val unblocked = withContext(Dispatchers.IO) {
-                    if (!documentAccess.hasWriteGrant(uri)) emptyList()
-                    else candidates.filter { raw ->
-                        val resolved = documentAccess.resolve(Uri.parse(raw), writing = true)
-                        resolved.toString() != raw && documentAccess.hasWriteGrant(resolved)
-                    }
-                }
-                unblocked.forEach(::clearDocumentAccessFailure)
-            }
-        } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
+        try { applyWorkspaceFolder(uri) } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
+        workspaceLinks.invalidate()
         listFolderSeq++
         listFolderJob?.cancel()
         listedRelative = ""
@@ -2830,6 +2930,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
 
         liveStudioViewModels(this).forEach { vm ->
+            vm.workspaceLinks.invalidate()
             if (oldFolderPrefix != null) vm.readerFolderIndex.clear()
             vm.change { currentState ->
                 val nextTabs = currentState.tabs.map { tab ->
@@ -2949,6 +3050,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     }
                 }
                 createdDirCleanup = null
+                workspaceLinks.invalidate()
                 // Expand and display the parent folder before activating the tab so state.files and folderRelative are already in sync.
                 listFolder(folderUri, cleanParent).join()
                 val accepted = performReaderBarrier(expectedActiveId) {
@@ -3005,6 +3107,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         FileEntry(actualName, createdUri.toString(), true, childRelativePath(cleanParent, actualName))
                     }
                 }
+                workspaceLinks.invalidate()
                 listFolder(folderUri, cleanParent).join()
                 mutable.value = mutable.value.copy(message = "Created folder ${entry.name}")
                 onComplete?.invoke(entry)
@@ -3372,6 +3475,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         target: String,
         fragment: String,
         wikilink: Boolean,
+        allowFolderPrompt: Boolean = true,
     ): JSONObject {
         val trimmedTarget = target.trim()
         val trimmedFragment = fragment.trim()
@@ -3387,7 +3491,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             stateSnapshot.active
         }
         val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
-        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
+        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf {
+            DocumentsContract.isTreeUri(it) && documentAccess.hasReadGrant(it)
+        }
         val rawNoteUri = sourceNote.uri
         if (rawNoteUri.isNullOrBlank()) {
             if (explicitRelative || openFolder == null) {
@@ -3397,19 +3503,52 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
         }
 
+        val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
         val resolved = try {
             withContext(Dispatchers.IO) {
                 val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
-                val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
                 if (sourceUri != null && sourceUri.scheme == "file") {
                     return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
                 }
+                fun firstReadableRankedCandidate(candidates: List<WorkspaceResolvedNote>): WorkspaceResolvedNote? {
+                    for (candidate in candidates) {
+                        canonicalTreeDocumentKey(candidate.uri)?.let(confirmedTreeDocumentKeys::add)
+                        val targetUri = documentAccess.resolve(candidate.uri)
+                        if (documentAccess.hasReadGrant(targetUri) &&
+                            runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
+                        ) {
+                            return candidate.copy(uri = targetUri)
+                        }
+                    }
+                    return null
+                }
                 val treeMatch = when {
                     sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
+                        ?: run {
+                            val candidateTrees = buildList {
+                                if (openFolder != null) add(openFolder)
+                                resolver.persistedUriPermissions
+                                    .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == sourceUri.authority }
+                                    .mapTo(this) { it.uri }
+                            }.distinctBy { it.toString() }
+                            candidateTrees.firstNotNullOfOrNull { folderUri ->
+                                val rel = runCatching {
+                                    workspaceLinks.noteRelativeInTree(folderUri, sourceUri, knownRelative = sourceNote.relative)
+                                }.getOrNull()
+                                if (rel != null) SafTreeMatch(folderUri, DocumentsContract.getTreeDocumentId(folderUri), rel) else null
+                            }
+                        }
                     openFolder != null -> SafTreeMatch(openFolder, DocumentsContract.getTreeDocumentId(openFolder), "")
                     else -> null
                 }
                 if (treeMatch != null) {
+                    if (!explicitRelative) {
+                        val noteRel = if (sourceUri == null) null else treeMatch.relativePath
+                        val ranked = runCatching {
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = noteRel, rawTarget = cleaned, wikilink = true)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(ranked)?.let { return@withContext it }
+                    }
                     val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
                     val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
                     var deniedTreeCandidate: Uri? = null
@@ -3457,10 +3596,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
                         }
                     }
+                    if (explicitRelative && sourceUri != null) {
+                        val rankedRel = runCatching {
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = treeMatch.relativePath, rawTarget = cleaned, wikilink = false)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(rankedRel)?.let { return@withContext it }
+                    }
                     if (deniedTreeCandidate != null) {
                         throw PromptWorkspaceNoteAccessException(deniedTreeCandidate)
                     }
                     throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+                }
+                if (!explicitRelative && openFolder != null) {
+                    val ranked = runCatching {
+                        workspaceLinks.resolveCandidates(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
+                    }.getOrDefault(emptyList())
+                    firstReadableRankedCandidate(ranked)?.let { return@withContext it }
                 }
 
                 val nonNullSourceUri = sourceUri ?: throw WorkspaceLinkException("Save this note before opening linked notes.")
@@ -3509,6 +3660,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
                     }
                 }
+                if (!explicitRelative) {
+                    return@withContext null
+                }
                 if (deniedCandidate != null) {
                     throw PromptWorkspaceNoteAccessException(deniedCandidate)
                 }
@@ -3529,6 +3683,26 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val msg = error.message ?: "Invalid relative note path."
             mutable.value = mutable.value.copy(busy = false, message = msg)
             return JSONObject().put("opened", false).put("message", msg)
+        }
+
+        if (resolved == null) {
+            val notice = if (allowFolderPrompt) {
+                "Folder permission is needed to follow links from ${sourceNote.name}. Choose its containing folder."
+            } else {
+                "Choose the folder containing ${sourceNote.name} to follow relative links."
+            }
+            val prompt = if (allowFolderPrompt && sourceUri != null) {
+                WorkspaceFolderPrompt(
+                    noteId = sourceNote.id,
+                    noteName = sourceNote.name,
+                    initialUri = sourceUri,
+                    target = trimmedTarget,
+                    fragment = trimmedFragment,
+                    wikilink = wikilink,
+                )
+            } else null
+            mutable.value = mutable.value.copy(folderAccessPrompt = prompt, message = notice)
+            return JSONObject().put("opened", false).put("promptedFolderAccess", prompt != null).put("message", notice)
         }
 
         return openNoteInternal(

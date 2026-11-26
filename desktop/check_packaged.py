@@ -13,10 +13,23 @@ import subprocess
 import sys
 import tempfile
 
+def macos_qtwebengine_process_path(app_bundle: Path) -> Path:
+    """Return the QtWebEngineProcess path searched by the frozen macOS app."""
+    return (Path(app_bundle) / "Contents/Frameworks/PySide6/Qt/lib/QtWebEngineCore.framework/"
+            "Helpers/QtWebEngineProcess.app/Contents/MacOS/QtWebEngineProcess")
+
+
+def require_macos_qtwebengine_process(app_bundle: Path) -> Path:
+    """Fail packaged-app checks when PyInstaller omitted Qt's WebEngine child."""
+    helper = macos_qtwebengine_process_path(app_bundle)
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        raise RuntimeError(f"Packaged macOS app is missing or has a non-executable QtWebEngineProcess at {helper}")
+    return helper
+
+
 def check(executable: Path, version: str, graphics: str) -> None:
     executable = executable.resolve()
     if sys.platform == "darwin":
-        from package_runtime import require_macos_qtwebengine_process
         require_macos_qtwebengine_process(executable.parents[2])
     with tempfile.TemporaryDirectory(prefix="supermd-packaged-check-") as folder:
         root = Path(folder)
