@@ -230,7 +230,7 @@ function Reader() {
       const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
       const applyIncomingFind=()=>{
         if(seededFind&&typeof seededFind.query==='string'){
-          if(seededFind.query){suppressRestoreForSeed.current=true;requestAnimationFrame(()=>markScrollInput());}
+          if(seededFind.query)requestAnimationFrame(()=>markScrollInput());
           searchSeedNonce.current+=1;
           setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,...normalizeSeedBounds(seededFind.sourceStart,seededFind.sourceEnd,seededFind.matchText),nonce:searchSeedNonce.current});
           setSearchReplace(false);
@@ -289,9 +289,20 @@ function Reader() {
         void invoke("zoom_changed",{zoom:loaded.zoom,fullscreen:true});
       }
       if(old && !sameViewport){window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;}
-      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; applyIncomingFind(); };
+      const load = () => {
+        if (seededFind && typeof seededFind.query === "string" && seededFind.query && (!old || old.id !== loaded.id || old.mode !== loaded.mode)) {
+          suppressRestoreForSeed.current = true;
+          modeOffset.current = null;
+        }
+        if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false });
+        reference.current = loaded;
+        setState(loaded);
+        zoomReference.current = loaded.zoom;
+        applyIncomingFind();
+      };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
-      if (old?.id === next.id && old.mode === next.mode && !typewriterChanged) anchored(load); else load();
+      const hasSeededQuery = Boolean(seededFind && typeof seededFind.query === "string" && seededFind.query);
+      if (old?.id === next.id && old.mode === next.mode && !typewriterChanged && !hasSeededQuery) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;

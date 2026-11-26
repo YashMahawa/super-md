@@ -611,9 +611,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       }
       const owner = deepestSourceOwner(block, sr, content);
       if (owner && !isDirectVisibleMatch(owner, content, sr)) return -1;
+      const b = sourceBounds(block, content);
+      let ordinal = 0;
+      if (b) {
+        for (let i = 0; i < sourceIdx; i++) {
+          const prev = sourceRanges[i];
+          if (prev.from >= b.start && prev.to <= b.end && isDirectVisibleMatch(owner ?? block, content, prev)) ordinal++;
+        }
+      }
       return liveWindowed.findIndex(w => {
-        const b = sourceBounds(w.element, content);
-        return b !== null && sr.from >= b.start && sr.to <= b.end;
+        const wb = sourceBounds(w.element, content);
+        return wb !== null && sr.from >= wb.start && sr.to <= wb.end && w.ordinal === ordinal;
       });
     }
     const liveMatches = matches.length && matches[0].startContainer.nodeType === Node.TEXT_NODE && host.contains(matches[0].startContainer) ? matches : readingMatches(host, query, filterOptions);
@@ -630,7 +638,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
   }, [canReplace, replacing]);
 
-  const revealAndHighlightSource = (targetIndex: number, ranges: SourceRange[], sourceText: string, scroll: boolean) => {
+  const revealAndHighlightSource = (targetIndex: number, ranges: SourceRange[], sourceText: string, scroll: boolean, matchQuery = query, matchOptions: SearchMatchConfig = filterOptions) => {
     const range = ranges[targetIndex];
     if (!range) return;
     if (scroll && sourceSession) {
@@ -653,14 +661,14 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const block = findContainingBlock(host, range, sourceText) ?? initialBlock;
     const owner = deepestSourceOwner(block, range, sourceText) ?? block;
     if (scroll) openDisclosuresFor(owner, block, null, range);
-    const domRange = mapSourceRangeToDomRange(block, sourceText, ranges, targetIndex, query, filterOptions);
+    const domRange = mapSourceRangeToDomRange(block, sourceText, ranges, targetIndex, matchQuery, matchOptions);
     if (scroll) {
       openDisclosuresFor(owner, block, domRange, range);
       const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner;
       scrollTargetIntoView(scrollEl ?? block, host);
     }
     if (registry && HighlightClass) {
-      if (wasUnmounted || scroll) registry.set("smd-search", new HighlightClass(...readingMatches(host, query, filterOptions)));
+      if (wasUnmounted || scroll) registry.set("smd-search", new HighlightClass(...readingMatches(host, matchQuery, matchOptions)));
       registry.delete("smd-search-current");
       if (domRange) registry.set("smd-search-current", new HighlightClass(domRange));
     }
@@ -963,7 +971,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             const sliceText = content.slice(seedRange.from, seedRange.to);
             const sliceRanges = sourceMatches(content, sliceText, true);
             const sliceIdx = findMatchingSourceRangeIndex(sliceRanges, seedRange);
-            if (sliceIdx >= 0) revealAndHighlightSource(sliceIdx, sliceRanges, content, true);
+            if (sliceIdx >= 0) revealAndHighlightSource(sliceIdx, sliceRanges, content, true, sliceText, true);
             return;
           } else {
             const targetRange = seedSourceIndex >= 0 ? nextSourceRanges[seedSourceIndex] : seedRange;

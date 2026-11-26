@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import LiveEditor from "./LiveEditor";
 import ReadingSearch, { resolveSourceBlock, resolveSourceHighlightRange, sourceMatches } from "./ReadingSearch";
+import { registerWindowedText } from "../windowedSearch";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => {};
@@ -687,6 +688,214 @@ describe("ReadingSearch DOM behavior", () => {
       });
       expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
       expect(highlightMap.get("smd-search-current")).toBeUndefined();
+    } finally {
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("composes exact-occurrence and stale-range checks with #83 shared regex/whole-word, native shortcuts, windowed blocks, and source mapping", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const origHighlight = (window as typeof window & { Highlight?: unknown }).Highlight;
+    const origCss = (globalThis as typeof globalThis & { CSS?: unknown }).CSS;
+
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) {
+        this.ranges = ranges;
+      }
+    }
+    const highlightMap = new Map<string, MockHighlight>();
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { highlights: highlightMap }, configurable: true, writable: true });
+
+    try {
+      let markdown = [
+        "---",
+        "title: a+b_header and SharedNeedle",
+        "---",
+        "",
+        "First a+b_one and SharedNeedle intro.",
+        "",
+        "Check [portal](https://example.com/SharedNeedle) before second A+B_two and SharedNeedle outro.",
+      ].join("\n");
+
+      const renderLive = async (
+        seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number } | null,
+        initialReplace = false,
+      ) => {
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch
+                content={markdown}
+                close={() => {}}
+                onChange={(next) => { markdown = next; }}
+                seed={seed}
+                initialReplace={initialReplace}
+              />
+              <section className="android-reading">
+                <LiveEditor markdown={markdown} onChange={(next) => { markdown = next; }} documentPath={null} python="" dark={false} />
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      };
+
+      // 1. Turn ON #83's Match whole word + Regular expression (even with an invalid regex), then deliver a targeted
+      //    folder-search occurrence for "a+b" inside "A+B_two" (2nd body match, non-whole-word + regex metacharacter).
+      await renderLive(null);
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      act(() => {
+        wholeWordBtn.click();
+        regexBtn.click();
+        setInputValue(searchInput, "([unclosed");
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("Invalid regular expression");
+
+      const abHits = sourceMatches(markdown, "a+b", false);
+      expect(abHits).toHaveLength(3); // 0: frontmatter, 1: a+b_one, 2: A+B_two
+      await renderLive({
+        query: "a+b",
+        caseSensitive: false,
+        sourceStart: abHits[2].from,
+        sourceEnd: abHits[2].to,
+        matchText: "A+B",
+        nonce: 201,
+      });
+      expect(wholeWordBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(regexBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("A+B");
+
+      // 2. Native shortcuts (F3 / Shift+F3 via supermd-find-step, and Ctrl+H via supermd-find-focus { replace: true })
+      //    compose cleanly with hidden-source anchors and YAML frontmatter source mapping.
+      const sharedHits = sourceMatches(markdown, "SharedNeedle", true);
+      expect(sharedHits).toHaveLength(4); // 0: frontmatter, 1: intro (rendered 1/2), 2: hidden link URL, 3: outro (rendered 2/2)
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from,
+        sourceEnd: sharedHits[2].to,
+        matchText: "SharedNeedle",
+        nonce: 202,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+
+      // Shift+F3 from hidden URL steps backward to preceding visible match 1 / 2.
+      act(() => { window.dispatchEvent(new CustomEvent("supermd-find-step", { detail: -1 })); });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+
+      // Re-seed hidden URL and press F3 -> steps forward to following visible match 2 / 2.
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from,
+        sourceEnd: sharedHits[2].to,
+        matchText: "SharedNeedle",
+        nonce: 203,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+      act(() => { window.dispatchEvent(new CustomEvent("supermd-find-step", { detail: 1 })); });
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+
+      // Re-seed hidden URL and press Ctrl+H (supermd-find-focus { replace: true }) -> opens Replace mapped to source 3 / 4!
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from,
+        sourceEnd: sharedHits[2].to,
+        matchText: "SharedNeedle",
+        nonce: 204,
+      });
+      act(() => { window.dispatchEvent(new CustomEvent("supermd-find-focus", { detail: { replace: true } })); });
+      expect(host.querySelector(".search-replace")).not.toBeNull();
+      expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+
+      // Stale folder-search range arriving while wholeWord + regexp + Replace are active resets filters and falls back to 1 / 4.
+      act(() => {
+        wholeWordBtn.click();
+        regexBtn.click();
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from + 2,
+        sourceEnd: sharedHits[2].to + 2,
+        matchText: "SharedNeedle",
+        nonce: 205,
+      }, true);
+      expect(wholeWordBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(regexBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(host.querySelector("output")?.textContent).toBe("1 / 4");
+
+      // 3. Unmounted windowed block occurrence handoff mounts the block, selects exact occurrence, and maps Ctrl+H to source.
+      const block0 = "Intro AuroraToken paragraph.";
+      const block1 = "Unmounted first AuroraToken and targeted second AuroraToken in windowed block.";
+      const windowedDoc = `${block0}\n\n${block1}`;
+      const block1Start = block0.length + 2;
+      const winHits = sourceMatches(windowedDoc, "AuroraToken", true);
+      expect(winHits).toHaveLength(3);
+
+      let unregisterWindowed0: (() => void) | null = null;
+      let unregisterWindowed1: (() => void) | null = null;
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={windowedDoc}
+              close={() => {}}
+              onChange={() => {}}
+              seed={{
+                query: "AuroraToken",
+                caseSensitive: true,
+                sourceStart: winHits[2].from,
+                sourceEnd: winHits[2].to,
+                matchText: "AuroraToken",
+                nonce: 206,
+              }}
+            />
+            <section className="android-reading">
+              <div className="markdown-body">
+                <div id="win-block-1" data-windowed-block="" data-windowed-mounted="true" data-source-start="0" data-source-end={String(block0.length)}>
+                  <p data-source-start="0" data-source-end={String(block0.length)}>{block0}</p>
+                </div>
+                <div id="win-block-2" data-windowed-block="" data-windowed-mounted="false" data-source-start={String(block1Start)} data-source-end={String(windowedDoc.length)} />
+              </div>
+            </section>
+          </div>
+        );
+      });
+      const winEl0 = host.querySelector<HTMLElement>("#win-block-1")!;
+      const winEl = host.querySelector<HTMLElement>("#win-block-2")!;
+      unregisterWindowed0 = registerWindowedText(winEl0, block0);
+      unregisterWindowed1 = registerWindowedText(winEl, block1);
+      winEl.addEventListener("supermd-reveal-window", () => {
+        winEl.setAttribute("data-windowed-mounted", "true");
+        winEl.innerHTML = `<p data-source-start="${block1Start}" data-source-end="${windowedDoc.length}">${block1}</p>`;
+      });
+      try {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+        expect(winEl.getAttribute("data-windowed-mounted")).toBe("true");
+        expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+        expect(highlightMap.get("smd-search-current")?.ranges[0]?.startOffset).toBe(block1.lastIndexOf("AuroraToken"));
+
+        // Ctrl+H preserves 3 / 3 across windowed -> source Replace mode.
+        act(() => { window.dispatchEvent(new CustomEvent("supermd-find-focus", { detail: { replace: true } })); });
+        expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+      } finally {
+        unregisterWindowed0?.();
+        unregisterWindowed1?.();
+      }
     } finally {
       Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
       Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
