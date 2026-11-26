@@ -209,6 +209,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun reportLinkedAssetFailure(document: String, source: String, error: Throwable): Boolean {
         if (!isDocumentAccessFailure(error)) return false
         val note = mutable.value.tabs.firstOrNull { it.id == document || it.uri?.let { uri -> sameDocumentUri(uri, document) } == true } ?: return false
+        clearPendingPortableWriteState()
         val key = "${note.id}\n$source"
         if (accessRequestsMutable.value == null && promptedAssetAccess.add(key)) {
             accessRequestsMutable.value = DocumentAccessRequest(note.uri ?: note.id, Uri.decode(source).substringAfterLast('/'), note.id, false, assetSource = source)
@@ -308,9 +309,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun loadRecent()=runCatching { val list=JSONArray(prefs.getString("recent","[]"));orderedRecents((0 until minOf(list.length(),100)).map {i->val n=list.getJSONObject(i);RecentNote(n.getString("name"),n.getString("uri"),n.optString("relative").takeIf {it.isNotBlank()},n.optBoolean("pinned"))}) }.getOrDefault(emptyList())
     private val recentMutable = MutableStateFlow(loadRecent())
     val recent = recentMutable.asStateFlow()
+    data class PortableWriteRequest(
+        val save: Boolean,
+        val noteId: String,
+        val localAssets: List<String> = emptyList(),
+    )
     var requestPortable: (() -> Unit)? = null
     var requestSaveAs: ((Note) -> Unit)? = null
-    var requestPortableWrite: ((Boolean) -> Boolean)? = null
+    var requestPortableWrite: ((PortableWriteRequest) -> Boolean)? = null
     private val savedPortableAssets = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
     private var closeAfterSaveNoteId: String? = null
     private var portableForceOverwrite = false
@@ -2018,7 +2024,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun welcomeDone() { change { it.copy(welcomed = true) }; prefs.edit().putBoolean("welcomed", true).apply() }
     fun dismissMessage() { mutable.value = mutable.value.copy(message = null) }
     fun dismissError() { mutable.value = mutable.value.copy(error = null) }
-    fun fail(message: String) { shareFile = null; mutable.value = mutable.value.copy(busy = false, error = message) }
+    internal fun clearPendingPortableWriteState() {
+        portableOutput = null
+        portableDestinationIsNew = false
+        portableSaveAsNoteId = null
+        portableForceOverwrite = false
+        closeAfterSaveNoteId = null
+    }
+    fun fail(message: String) { shareFile = null; clearPendingPortableWriteState(); mutable.value = mutable.value.copy(busy = false, error = message) }
     internal fun pdfExportCancelled() {
         shareFile = null
         outputUri = null
@@ -2203,7 +2216,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val (destination, savedName) = withContext(Dispatchers.IO) {
                 media.writeAgentDocument(filename, mime, location) { uri, output ->
-                    if (note.portable) media.writeFmd(output, note.content, assets)
+                    if (note.portable) media.writeFmd(output, note.content, assets, savedPortableAssets[note.id])
                     else {
                         copyAttachments(note, uri, locationTree)
                         output.write(note.content.toByteArray(Charsets.UTF_8))
@@ -2267,6 +2280,33 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             return uri to savedName
         } finally { staged.delete() }
     }
+    internal fun bundlePortableAssetKeys(directory: String?): List<String> =
+        runCatching { media.portableAssetKeys(directory) }.getOrDefault(emptyList())
+    private fun localPortableAssetKeys(note: Note): List<String> {
+        val keys = LinkedHashSet(bundlePortableAssetKeys(note.assetDirectory))
+        val sources = JSONArray(markdownImageSourcesJson(note.content))
+        for (i in 0 until sources.length()) {
+            val source = sources.getString(i)
+            if (!keys.contains(source) && media.validKey(source) && media.local(source, note.assetDirectory) != null) {
+                keys.add(source)
+            }
+        }
+        return keys.toList()
+    }
+    private fun canWritePortableNatively(note: Note): Boolean {
+        if (note.content.contains("![[")) return false
+        val directory = note.assetDirectory
+        if (directory != null) {
+            if (!Regex("[a-f0-9-]{36}").matches(directory)) return false
+            if (runCatching { media.portableAssetKeys(directory); true }.getOrDefault(false).not()) return false
+        }
+        val sources = JSONArray(markdownImageSourcesJson(note.content))
+        for (i in 0 until sources.length()) {
+            val source = sources.getString(i)
+            if (!media.validKey(source) || media.local(source, directory) == null) return false
+        }
+        return true
+    }
     private fun collectNativePortableAssets(note: Note): JSONObject {
         val existing = media.portableAssets(note.assetDirectory)
         val assets = JSONObject()
@@ -2281,9 +2321,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         return assets
     }
     fun cancelSaveAs() {
-        portableSaveAsNoteId = null
-        portableForceOverwrite = false
-        closeAfterSaveNoteId = null
+        clearPendingPortableWriteState()
     }
     fun beginSaveAs(noteId: String = mutable.value.active.id) {
         if (mutable.value.busy) return
@@ -2306,27 +2344,72 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     fun completePortableSaveAs(uri: Uri, noteId: String = portableSaveAsNoteId ?: mutable.value.active.id) {
-        portableOutput = uri
-        portableDestinationIsNew = true
-        portableSaveAsNoteId = noteId
-        portableForceOverwrite = true
-        if (requestPortableWrite?.invoke(false) == true) return
-        if (readerStateIsNativeAuthoritative(noteId)) {
-            viewModelScope.launch {
+        if (mutable.value.busy) return
+        viewModelScope.launch {
+            if (closingNoteIds.contains(noteId) || mutable.value.tabs.none { it.id == noteId }) {
+                clearPendingPortableWriteState()
+                fail("Could not save portable note: The note is no longer open")
+                return@launch
+            }
+            if (requestPortableWrite == null && readerFlushRequester == null && !readerStateIsNativeAuthoritative(noteId)) {
+                clearPendingPortableWriteState()
+                fail("The reader is not ready")
+                return@launch
+            }
+            promptedAssetAccess.removeAll { it.startsWith("$noteId\n") }
+            val switchedActiveTab = noteId != mutable.value.active.id && mutable.value.tabs.any { it.id == noteId }
+            if (switchedActiveTab) {
+                val prevActive = mutable.value.active.id
+                if (!performReaderBarrier(prevActive) { change { it.copy(activeId = noteId) } }) {
+                    clearPendingPortableWriteState()
+                    readerBarrierFailed()
+                    return@launch
+                }
+            } else if (!performReaderBarrier(noteId) { }) {
+                clearPendingPortableWriteState()
+                readerBarrierFailed()
+                return@launch
+            }
+            val note = mutable.value.tabs.find { it.id == noteId }
+            if (closingNoteIds.contains(noteId) || note == null) {
+                clearPendingPortableWriteState()
+                fail("Could not save portable note: The note is no longer open")
+                return@launch
+            }
+            portableOutput = uri
+            portableDestinationIsNew = true
+            portableSaveAsNoteId = note.id
+            portableForceOverwrite = true
+            val useNativeFastPath = withContext(Dispatchers.IO) { canWritePortableNatively(note) }
+            if (useNativeFastPath) {
                 busy(true)
                 try {
-                    val note = mutable.value.tabs.find { it.id == noteId } ?: error("The note is no longer open")
-                    val assets = withContext(Dispatchers.IO) { collectNativePortableAssets(note) }
-                    writePortable(note.id, note.content, assets, save = false, originalContent = note.content)
+                    val latest = mutable.value.tabs.find { it.id == note.id }
+                        ?.takeUnless { closingNoteIds.contains(note.id) }
+                        ?: error("The note is no longer open")
+                    require(latest.content == note.content) { "The note changed while preparing the portable save; try saving again" }
+                    val assets = withContext(Dispatchers.IO) { collectNativePortableAssets(latest) }
+                    writePortable(latest.id, latest.content, assets, save = false, originalContent = latest.content)
                 } catch (error: Exception) {
-                    portableSaveAsNoteId = null
-                    closeAfterSaveNoteId = null
+                    clearPendingPortableWriteState()
                     fail("Could not save portable note: ${error.message}")
                 }
+                return@launch
             }
-        } else {
-            portableSaveAsNoteId = null
-            closeAfterSaveNoteId = null
+            val localAssets = withContext(Dispatchers.IO) { localPortableAssetKeys(note) }
+            if (switchedActiveTab && readerFlushRequester != null && !awaitReaderSnapshot(note.id)) {
+                clearPendingPortableWriteState()
+                readerBarrierFailed()
+                return@launch
+            }
+            val current = mutable.value.tabs.find { it.id == note.id }
+            if (closingNoteIds.contains(note.id) || current == null || current.content != note.content) {
+                clearPendingPortableWriteState()
+                fail("Could not save portable note: ${if (current == null || closingNoteIds.contains(note.id)) "The note is no longer open" else "The note changed while preparing the portable save; try saving again"}")
+                return@launch
+            }
+            if (requestPortableWrite?.invoke(PortableWriteRequest(save = false, noteId = note.id, localAssets = localAssets)) == true) return@launch
+            clearPendingPortableWriteState()
             fail("The reader is not ready")
         }
     }
@@ -2337,7 +2420,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             return
         }
         viewModelScope.launch {
-            if (noteId != mutable.value.active.id && mutable.value.tabs.any { it.id == noteId }) {
+            promptedAssetAccess.removeAll { it.startsWith("$noteId\n") }
+            val switchedActiveTab = noteId != mutable.value.active.id && mutable.value.tabs.any { it.id == noteId }
+            if (switchedActiveTab) {
                 val prevActive = mutable.value.active.id
                 if (!performReaderBarrier(prevActive) { change { it.copy(activeId = noteId) } }) {
                     readerBarrierFailed()
@@ -2349,7 +2434,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 closeAfterSaveNoteId = null
                 return@launch
             }
-            val note = mutable.value.tabs.find { it.id == noteId } ?: return@launch
+            val note = mutable.value.tabs.find { it.id == noteId }
+            if (note == null || closingNoteIds.contains(noteId)) {
+                closeAfterSaveNoteId = null
+                return@launch
+            }
             if (note.uri == null) {
                 if (note.portable) portableSaveAsNoteId = note.id
                 val picker = requestSaveAs
@@ -2366,22 +2455,37 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (note.portable) {
                 portableSaveAsNoteId = null
                 portableForceOverwrite = forceOverwrite
-                if (requestPortableWrite?.invoke(true) == true) return@launch
-                if (readerStateIsNativeAuthoritative(note.id)) {
+                val useNativeFastPath = withContext(Dispatchers.IO) { canWritePortableNatively(note) }
+                if (useNativeFastPath) {
                     busy(true)
                     try {
-                        val assets = withContext(Dispatchers.IO) { collectNativePortableAssets(note) }
-                        writePortable(note.id, note.content, assets, save = true, originalContent = note.content)
+                        val latest = mutable.value.tabs.find { it.id == note.id }
+                            ?.takeUnless { closingNoteIds.contains(note.id) }
+                            ?: error("The note is no longer open")
+                        require(latest.content == note.content) { "The note changed while preparing the portable save; try saving again" }
+                        val assets = withContext(Dispatchers.IO) { collectNativePortableAssets(latest) }
+                        writePortable(latest.id, latest.content, assets, save = true, originalContent = latest.content)
                     } catch (error: Exception) {
-                        portableForceOverwrite = false
-                        closeAfterSaveNoteId = null
+                        clearPendingPortableWriteState()
                         reportDocumentSaveFailure(note.id, error, "Could not save portable note: ${error.message}")
                     }
-                } else {
-                    portableForceOverwrite = false
-                    closeAfterSaveNoteId = null
-                    fail("The reader is not ready")
+                    return@launch
                 }
+                val localAssets = withContext(Dispatchers.IO) { localPortableAssetKeys(note) }
+                if (switchedActiveTab && readerFlushRequester != null && !awaitReaderSnapshot(note.id)) {
+                    clearPendingPortableWriteState()
+                    readerBarrierFailed()
+                    return@launch
+                }
+                val current = mutable.value.tabs.find { it.id == note.id }
+                if (closingNoteIds.contains(note.id) || current == null || current.content != note.content) {
+                    clearPendingPortableWriteState()
+                    fail("Could not save portable note: ${if (current == null || closingNoteIds.contains(note.id)) "The note is no longer open" else "The note changed while preparing the portable save; try saving again"}")
+                    return@launch
+                }
+                if (requestPortableWrite?.invoke(PortableWriteRequest(save = true, noteId = note.id, localAssets = localAssets)) == true) return@launch
+                clearPendingPortableWriteState()
+                fail("The reader is not ready")
             } else {
                 save(uri = null, noteId = note.id, forceOverwrite = forceOverwrite, manualGuard = true)
             }
@@ -3629,12 +3733,31 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         readerFolderIndex.clear()
     }
     var portableOutput: Uri? = null
-    suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) {
+    suspend fun writePortable(
+        id: String,
+        content: String,
+        assets: JSONObject,
+        save: Boolean,
+        originalContent: String,
+        mergeLocalAssets: Boolean = false,
+    ) {
         var closeTargetId: String? = null
         withContext(Dispatchers.IO) { documentWrites.withLock {
             val rebindId = if (!save) portableSaveAsNoteId else null
             val effectiveId = rebindId ?: id
-            val note = mutable.value.tabs.find { it.id == effectiveId } ?: error("The note is no longer open")
+            if (rebindId != null && id.isNotEmpty() && id != rebindId) {
+                clearPendingPortableWriteState()
+                error("The export note changed")
+            }
+            val note = mutable.value.tabs.find { it.id == effectiveId }
+            if (closingNoteIds.contains(effectiveId) || note == null) {
+                clearPendingPortableWriteState()
+                error("The note is no longer open")
+            }
+            if (note.content != originalContent) {
+                clearPendingPortableWriteState()
+                error("The note changed while preparing the portable save; try saving again")
+            }
             val target = if (save) note.uri?.let { documentAccess.resolve(Uri.parse(it), writing = true) } else portableOutput
             require(target != null) { "Choose a portable file destination" }
             val force = portableForceOverwrite
@@ -3646,6 +3769,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
                 return@withLock
             }
+            val effectiveAssets = if (mergeLocalAssets) {
+                val combined = collectNativePortableAssets(note.copy(content = content))
+                assets.keys().forEach { key -> combined.put(key, assets.getString(key)) }
+                combined
+            } else assets
             val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
             val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
             var materializedDirectory: String? = null
@@ -3655,16 +3783,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val rebinding = save || rebindId != null
                 val nextDirectory = if (rebinding) {
                     val reuseExisting = save && rebindId == null && note.assetDirectory != null &&
-                        media.hasExactLocalPortableAssets(note.assetDirectory, assets)
+                        media.hasExactLocalPortableAssets(note.assetDirectory, effectiveAssets)
                     if (reuseExisting) {
                         note.assetDirectory!!
                     } else {
-                        media.materializePortableDirectory(assets, reuseFromDirectory = note.assetDirectory).also {
+                        media.materializePortableDirectory(effectiveAssets, reuseFromDirectory = note.assetDirectory).also {
                             materializedDirectory = it
                         }
                     }
                 } else null
-                staged.outputStream().use { media.writeFmd(it, content, assets, savedPortableAssets[effectiveId]) }
+                staged.outputStream().use { media.writeFmd(it, content, effectiveAssets, savedPortableAssets[effectiveId]) }
                 verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
                 resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
                 documentAccess.persist(destination)

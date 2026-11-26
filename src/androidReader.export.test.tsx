@@ -625,6 +625,99 @@ it("reports export_failed when the active tab switches during a pre-export editP
   }
 });
 
+it("forwards localAssets with mergeLocalAssets in supermdPortable and aborts on target mismatch or mid-prepare edits", async () => {
+  await mountReader();
+  native.mockImplementation(async (command: string) => {
+    if (command === "document_sync") return { accepted: true, revision: 0 };
+    return null;
+  });
+
+  await act(async () => {
+    window.supermdLoad!({
+      id: "portable-tab",
+      content: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](diagrams/new.png)\n",
+      path: "content://vault/Lecture.smd",
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      localAssets: ["assets/fig-1.png"],
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  // 1. Target note mismatch (e.g. Save As initiated on another tab) fails immediately before prepareFmd.
+  native.mockClear();
+  prepareFmdMock.mockReset();
+  await act(async () => {
+    await (window.supermdPortable!(false, { id: "other-tab", localAssets: ["assets/fig-1.png"], omitLocalAssets: true }) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).not.toHaveBeenCalled();
+  expect(native).toHaveBeenCalledWith("export_failed", { error: "Error: The export note changed" });
+  expect(native).not.toHaveBeenCalledWith("export_fmd_native", expect.anything());
+
+  // 2. Mixed save forwards localAssets + omitLocalAssets + consent hooks and sets mergeLocalAssets: true.
+  native.mockClear();
+  prepareFmdMock.mockReset().mockResolvedValue({
+    content: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](<assets/image-added.png>)\n",
+    assets: { "assets/image-added.png": "data:image/png;base64,aGVsbG8=" },
+  });
+  await act(async () => {
+    await (window.supermdPortable!(true, {
+      id: "portable-tab",
+      localAssets: ["assets/fig-1.png"],
+      omitLocalAssets: true,
+    }) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).toHaveBeenCalledWith(
+    "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](diagrams/new.png)\n",
+    "content://vault/Lecture.smd",
+    expect.objectContaining({
+      localAssets: ["assets/fig-1.png"],
+      omitLocalAssets: true,
+      trustedImageHosts: [],
+      resolveConsentedRemoteImage: expect.any(Function),
+    }),
+  );
+  expect(native).toHaveBeenCalledWith("export_fmd_native", {
+    id: "portable-tab",
+    content: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](<assets/image-added.png>)\n",
+    assets: { "assets/image-added.png": "data:image/png;base64,aGVsbG8=" },
+    originalContent: "# Lecture\n\n![Existing](assets/fig-1.png)\n![New](diagrams/new.png)\n",
+    save: true,
+    mergeLocalAssets: true,
+  });
+
+  // 3. Mid-prepare content change aborts before export_fmd_native.
+  native.mockClear();
+  let finishPrepare!: (value: { content: string; assets: Record<string, string> }) => void;
+  prepareFmdMock.mockReset().mockImplementation(
+    () =>
+      new Promise((resolve) => {
+        finishPrepare = resolve;
+      }),
+  );
+  const inFlight = window.supermdPortable!(true, {
+    id: "portable-tab",
+    localAssets: ["assets/fig-1.png"],
+    omitLocalAssets: true,
+  }) as unknown as Promise<void>;
+  await vi.waitFor(() => expect(prepareFmdMock).toHaveBeenCalledTimes(1));
+
+  await act(async () => {
+    editorBridge.onChange!("# Lecture\n\nConcurrent edit while preparing\n");
+  });
+  await act(async () => {
+    finishPrepare({ content: "# Stale prepared\n", assets: {} });
+    await inFlight;
+  });
+  expect(native).toHaveBeenCalledWith("export_failed", { error: "Error: The export note changed" });
+  expect(native).not.toHaveBeenCalledWith("export_fmd_native", expect.anything());
+});
+
 it("routes undo and redo through note history even when a reused task checkbox keeps focus", async () => {
   const host = await mountReader();
 

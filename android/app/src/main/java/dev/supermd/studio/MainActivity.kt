@@ -1202,9 +1202,13 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
         onDispose { model.requestSaveAs = null }
     }
     DisposableEffect(web, readerReady, model) {
-        model.requestPortableWrite = if (readerReady && web != null) { saveInPlace ->
+        model.requestPortableWrite = if (readerReady && web != null) { request ->
             model.busy(true)
-            web?.evaluateJavascript("window.supermdPortable?.($saveInPlace)", null)
+            val options = JSONObject()
+                .put("id", request.noteId)
+                .put("localAssets", org.json.JSONArray(request.localAssets))
+                .put("omitLocalAssets", true)
+            web?.evaluateJavascript("window.supermdPortable?.(${request.save},$options)", null)
             true
         } else null
         onDispose { model.requestPortableWrite = null }
@@ -1266,6 +1270,9 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
                 val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 payload.put("readingLocation",model.readingLocation(note.uri))
+                if (note.assetDirectory != null) {
+                    payload.put("localAssets", org.json.JSONArray(model.bundlePortableAssetKeys(note.assetDirectory)))
+                }
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 if (matchingSeed != null) {
                     payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))

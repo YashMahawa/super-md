@@ -5,7 +5,7 @@ import {FrameScrollQueue,zoomFrameStep} from './frameMotion';
 import {agentCharLength,agentCodePointOffset,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,agentUtf16Offset,applyAgentPatchesDetailed,countCodePointsRange} from './agentOperations';
 import {suggestMathRepairs,applyMathRepairs} from './mathRepair';
 import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange,type AgentDiagramOptions} from './agentView';
-import {mediaBytes} from './mediaExport';
+import {mediaAt,mediaBytes} from './mediaExport';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@fontsource-variable/manrope";
 import "@fontsource-variable/jetbrains-mono";
@@ -86,11 +86,12 @@ function parseImportedAnchor(raw: unknown): SharedSourceAnchor | undefined {
 }
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+export interface PortableWriteOptions { id?: string; localAssets?: string[]; omitLocalAssets?: boolean }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean, options?: PortableWriteOptions) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; localAssets?:string[]; seededFind?:{query:string;caseSensitive?:boolean}|null }
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
   if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
@@ -284,7 +285,7 @@ function Reader() {
           primeEditorAnchor(next.id,null);
         }
       }
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind();return;}
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="localAssets"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind();return;}
       if (old && old.id !== next.id) {
         savePosition.current();
         const outgoingAnchor=captureSharedAnchor({
@@ -470,17 +471,40 @@ function Reader() {
       }
       window.dispatchEvent(new CustomEvent("supermd-find-step",{detail:step}));
     };
+    const loadedReaderRemoteImage = (source: string): string | null => {
+      if (typeof document === "undefined") return null;
+      for (const element of document.querySelectorAll<HTMLElement>("[data-note-image-source]")) {
+        if (element.dataset.noteImageSource !== source) continue;
+        const uri = mediaAt(element.querySelector("img"))?.uri?.();
+        if (uri && /^data:image\//i.test(uri)) return uri;
+      }
+      return null;
+    };
     const flushExportNote = async (current: ReaderState) => {
       if (current.editProtocol === 1) await edits.current!.flush(current.id);
       const latest = reference.current;
       if (!latest || latest.id !== current.id) throw new Error('The export note changed');
       return latest;
     };
-    window.supermdPortable = async (save) => {
+    window.supermdPortable = async (save, options) => {
       const current = reference.current; if (!current) return;
       try {
+        if (options?.id && current.id !== options.id) throw new Error('The export note changed');
         const latest = await flushExportNote(current);
-        const prepared = await prepareFmd(latest.content, latest.path); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
+        if (options?.id && latest.id !== options.id) throw new Error('The export note changed');
+        const localAssets = options?.localAssets ?? latest.localAssets;
+        const omitLocalAssets = options?.omitLocalAssets ?? Boolean(localAssets?.length);
+        const needsPortableOptions = Boolean(options || localAssets?.length || trustedHostsRef.current.length || /[a-z][a-z\d+.-]*:|\/\/|<img\b/i.test(latest.content));
+        const prepared = needsPortableOptions
+          ? await prepareFmd(latest.content, latest.path, {
+              localAssets,
+              omitLocalAssets,
+              trustedImageHosts: trustedHostsRef.current,
+              resolveConsentedRemoteImage: loadedReaderRemoteImage,
+            })
+          : await prepareFmd(latest.content, latest.path);
+        if (reference.current?.id !== latest.id || reference.current.content !== latest.content) throw new Error('The export note changed');
+        await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save, ...(omitLocalAssets ? { mergeLocalAssets: true } : {}) }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
     window.supermdExport = async (options) => {
@@ -1234,7 +1258,7 @@ function Reader() {
         const archive=format==='mdzip'||rawArchive===true;
         const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
         const exportContent=section?.text??note.content,{section:_section,archive:_archive,...exportOptions}=suppliedOptions;
-        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
+        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path,{trustedImageHosts:trustedHostsRef.current,resolveConsentedRemoteImage:(source)=>{for(const element of document.querySelectorAll<HTMLElement>('[data-note-image-source]')){if(element.dataset.noteImageSource!==source)continue;const uri=mediaAt(element.querySelector('img'))?.uri?.();if(uri&&/^data:image\//i.test(uri))return uri;}return null;}}):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
         const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format:archive?'mdzip':format,...(archive?{archive:true}:{}),filename:request.filename,options:exportOptions});
         return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;

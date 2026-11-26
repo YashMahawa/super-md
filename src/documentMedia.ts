@@ -82,38 +82,201 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
   const images = await Promise.all(files.map(async (file) => ({ name: file.name, data: await readImage(file) })));
   return invoke<ImportedImage[]>("import_images", { images });
 }
+export interface PrepareFmdOptions {
+  localAssets?: Iterable<string>;
+  omitLocalAssets?: boolean;
+  trustedImageHosts?: readonly string[];
+  resolveConsentedRemoteImage?: (url: string) => string | null;
+}
+function remoteImageHost(url: string): string | null {
+  if (!/^https?:\/\//i.test(url)) return null;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password && parsed.host
+      ? parsed.host.toLowerCase()
+      : null;
+  } catch {
+    return null;
+  }
+}
+interface HtmlImgSrcSpan {
+  source: string;
+  valueStart: number;
+  valueEnd: number;
+  quoted: boolean;
+}
+function decodeBasicHtmlEntities(raw: string): string {
+  return raw.replace(/&(?:amp|lt|gt|quot|apos|#39|#x27);/gi, (entity) => {
+    switch (entity.toLowerCase()) {
+      case "&amp;": return "&";
+      case "&lt;": return "<";
+      case "&gt;": return ">";
+      case "&quot;": return '"';
+      case "&apos;":
+      case "&#39;":
+      case "&#x27;": return "'";
+      default: return entity;
+    }
+  });
+}
+function scanHtmlImgSrcSpans(raw: string, baseOffset: number): HtmlImgSrcSpan[] {
+  const spans: HtmlImgSrcSpan[] = [];
+  let pos = 0;
+  while (pos < raw.length) {
+    if (raw.startsWith("<!--", pos)) {
+      const endComment = raw.indexOf("-->", pos + 4);
+      if (endComment < 0) break;
+      pos = endComment + 3;
+      continue;
+    }
+    const lt = raw.indexOf("<", pos);
+    if (lt < 0) break;
+    let cursor = lt + 1;
+    if (!/^img(?=[\s/>])/i.test(raw.slice(cursor))) {
+      pos = lt + 1;
+      continue;
+    }
+    cursor += 3;
+    while (cursor < raw.length) {
+      while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++;
+      if (cursor >= raw.length) break;
+      if (raw[cursor] === ">") { cursor++; break; }
+      if (raw[cursor] === "/" && raw[cursor + 1] === ">") { cursor += 2; break; }
+      const attrStart = cursor;
+      while (cursor < raw.length && !/[\s"'=<>`/]/.test(raw[cursor])) cursor++;
+      if (cursor === attrStart) { cursor++; continue; }
+      const attrName = raw.slice(attrStart, cursor).toLowerCase();
+      while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++;
+      if (raw[cursor] !== "=") continue;
+      cursor++;
+      while (cursor < raw.length && /\s/.test(raw[cursor])) cursor++;
+      if (cursor >= raw.length) break;
+      let rawVal = "";
+      let valueStart = cursor;
+      let valueEnd = cursor;
+      let quoted = false;
+      const ch = raw[cursor];
+      if (ch === '"' || ch === "'") {
+        const closeQuote = raw.indexOf(ch, cursor + 1);
+        if (closeQuote < 0) { cursor = raw.length; break; }
+        quoted = true;
+        valueStart = cursor + 1;
+        valueEnd = closeQuote;
+        rawVal = raw.slice(valueStart, valueEnd);
+        cursor = closeQuote + 1;
+      } else {
+        valueStart = cursor;
+        while (cursor < raw.length && !/[\s"'=<>`]/.test(raw[cursor]) && !(raw[cursor] === "/" && raw[cursor + 1] === ">")) cursor++;
+        valueEnd = cursor;
+        rawVal = raw.slice(valueStart, valueEnd);
+      }
+      if (attrName === "src") {
+        const cleaned = decodeBasicHtmlEntities(rawVal).replace(/[\t\r\n]+/g, "").trim();
+        if (cleaned) {
+          spans.push({
+            source: cleaned,
+            valueStart: baseOffset + valueStart,
+            valueEnd: baseOffset + valueEnd,
+            quoted,
+          });
+        }
+      }
+    }
+    pos = cursor;
+  }
+  return spans;
+}
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
-export async function prepareFmd(markdown: string, documentPath: string | null) {
+export async function prepareFmd(markdown: string, documentPath: string | null, options?: PrepareFmdOptions) {
   const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
   const tree = processor.parse(maskFrontmatter(markdown));
   const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
   const shared = new Map<string, Promise<string>>();
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const definitions = new Map<string, any>(); const usedDefinitions = new Set<string>();
+  const localAssetSet = new Set(options?.localAssets ?? []);
+  const omitLocalAssets = Boolean(options?.omitLocalAssets);
+  const enforceRemoteConsent = options?.trustedImageHosts !== undefined;
+  const trustedHosts = new Set((options?.trustedImageHosts ?? []).map((host) => host.trim().toLowerCase()).filter(Boolean));
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
   const collect = (source: string, replace: (name: string) => void) => {
     if (!shared.has(source)) shared.set(source, (async () => {
-      const data = /^data:image\//.test(source) ? source : /^https?:/.test(source) ? (await invoke<{ body: string }>("fetch_resource", { url: source, image: true })).body : await invoke<string>("load_asset", { documentPath: documentPath || "", source });
-      const type = data.match(/^data:image\/([^;]+);base64,/)?.[1];
+      if (omitLocalAssets && localAssetSet.has(source)) {
+        return source;
+      }
+      let data: string;
+      if (/^data:/i.test(source)) {
+        if (!/^data:image\//i.test(source)) throw new Error(`Unsupported image ${source}`);
+        data = source;
+      } else if (/^https?:/i.test(source)) {
+        const consentedData = options?.resolveConsentedRemoteImage?.(source) ?? null;
+        if (consentedData) {
+          data = consentedData;
+        } else {
+          if (enforceRemoteConsent) {
+            const host = remoteImageHost(source);
+            if (!host || !trustedHosts.has(host)) {
+              throw new Error(`Remote image from ${host || source} requires explicit consent in the reader before saving a portable note.`);
+            }
+          }
+          data = (await invoke<{ body: string }>("fetch_resource", { url: source, image: true })).body;
+        }
+      } else if (enforceRemoteConsent && (source.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(source))) {
+        throw new Error(`Remote image ${source} requires explicit consent in the reader before saving a portable note.`);
+      } else {
+        data = await invoke<string>("load_asset", { documentPath: documentPath || "", source });
+      }
+      const type = data.match(/^data:image\/([^;]+);base64,/i)?.[1]?.toLowerCase();
       if (!type) throw new Error(`Unsupported image ${source}`);
-      const name = attachmentSource(source) ? source : `assets/image-${crypto.randomUUID()}.${type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type}`;
+      const name = attachmentSource(source) || localAssetSet.has(source) ? source : `assets/image-${crypto.randomUUID()}.${type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type}`;
       assets[name] = data;
       return name;
     })());
     work.push(shared.get(source)!.then(replace));
   };
   visit(tree, (node: any) => {
-    if (node.type === "image") collect(node.url, (name) => { edits.push({ start: node.position.start.offset, end: node.position.end.offset, value: `![${markdownLabel(node.alt || "")}](<${name}>${node.title ? ` "${node.title.replace(/["\\]/g, "\\$&")}"` : ""})` }); });
+    if (node.type === "image") collect(node.url, (name) => {
+      if (omitLocalAssets && localAssetSet.has(node.url) && name === node.url) return;
+      edits.push({ start: node.position.start.offset, end: node.position.end.offset, value: `![${markdownLabel(node.alt || "")}](<${name}>${node.title ? ` "${node.title.replace(/["\\]/g, "\\$&")}"` : ""})` });
+    });
     if (node.type === "imageReference" && !usedDefinitions.has(node.identifier)) {
       const definition = definitions.get(node.identifier); if (!definition) return;
       usedDefinitions.add(node.identifier);
-      collect(definition.url, (name) => { edits.push({ start: definition.position.start.offset, end: definition.position.end.offset, value: `[${definition.label || definition.identifier}]: <${name}>${definition.title ? ` "${definition.title.replace(/["\\]/g, "\\$&")}"` : ""}` }); });
+      collect(definition.url, (name) => {
+        if (omitLocalAssets && localAssetSet.has(definition.url) && name === definition.url) return;
+        edits.push({ start: definition.position.start.offset, end: definition.position.end.offset, value: `[${definition.label || definition.identifier}]: <${name}>${definition.title ? ` "${definition.title.replace(/["\\]/g, "\\$&")}"` : ""}` });
+      });
     }
-    // Wiki-image compatibility only in actual prose, never inside fenced code.
-    if (node.type === "text" && node.position) {
+    if (node.type === "html" && node.position && typeof node.value === "string" && /<img(?=[\s/>])/i.test(node.value)) {
       const raw = markdown.slice(node.position.start.offset, node.position.end.offset);
-      for (const match of raw.matchAll(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)) collect(encodeURI(match[1]), (name) => { edits.push({ start: node.position.start.offset + match.index!, end: node.position.start.offset + match.index! + match[0].length, value: imageMarkdown({ source: name, alt: match[2] || match[1] }) }); });
+      for (const span of scanHtmlImgSrcSpans(raw, node.position.start.offset)) {
+        collect(span.source, (name) => {
+          if (omitLocalAssets && localAssetSet.has(span.source) && name === span.source) return;
+          edits.push({ start: span.valueStart, end: span.valueEnd, value: span.quoted ? name : `"${name}"` });
+        });
+      }
+    }
+    // Wiki-image compatibility only in actual prose, never inside fenced or inline code.
+    if ((node.type === "paragraph" || node.type === "heading" || node.type === "tableCell") && node.position) {
+      const blockStart = node.position.start.offset;
+      const blockEnd = node.position.end.offset;
+      const chars = markdown.slice(blockStart, blockEnd).split("");
+      visit(node, (child: any) => {
+        if ((child.type === "inlineCode" || child.type === "inlineMath" || child.type === "math" || child.type === "code") && child.position) {
+          const from = Math.max(0, child.position.start.offset - blockStart);
+          const to = Math.min(chars.length, child.position.end.offset - blockStart);
+          for (let i = from; i < to; i++) chars[i] = " ";
+        }
+      });
+      const masked = chars.join("");
+      for (const match of masked.matchAll(/!\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g)) {
+        const rawTarget = match[1].trim();
+        const encodedTarget = /^[a-z][a-z\d+.-]*:/i.test(rawTarget) || rawTarget.startsWith("//") ? rawTarget : encodeURI(rawTarget);
+        collect(encodedTarget, (name) => {
+          edits.push({ start: blockStart + match.index!, end: blockStart + match.index! + match[0].length, value: imageMarkdown({ source: name, alt: match[2] || match[1] }) });
+        });
+      }
     }
   });
   // Fenced smd-steps JSON is deliberately opaque to the Markdown AST. Collect
@@ -132,14 +295,31 @@ export async function prepareFmd(markdown: string, documentPath: string | null) 
     const stepSources = new Set(deck.steps.map(step => step?.image).filter((image): image is string => typeof image === "string" && image.length > 0));
     if (!stepSources.size && !deck.steps.some(step=>typeof step.markdown==="string")) return;
     const rewritten = new Map<string, string>();
+    let markdownChanged = false;
     const offset = work.length;
     for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
-    for(const step of deck.steps) if(typeof step.markdown==='string') work.push(prepareFmd(step.markdown,documentPath).then(prepared=>{step.markdown=prepared.content;Object.assign(assets,prepared.assets);}));
+    for(const step of deck.steps) if(typeof step.markdown==='string') {
+      const originalStepMarkdown = step.markdown;
+      work.push(prepareFmd(originalStepMarkdown, documentPath, options).then(prepared=>{
+        if (prepared.content !== originalStepMarkdown) markdownChanged = true;
+        step.markdown=prepared.content;
+        Object.assign(assets,prepared.assets);
+      }));
+    }
     // All corresponding assets must finish loading before serializing this deck.
     const waiting = work.splice(offset);
     work.push(Promise.all(waiting).then(() => {
-      for (const step of deck.steps!) if (typeof step.image === "string" && rewritten.has(step.image)) step.image = rewritten.get(step.image);
-      edits.push({start: payloadStart, end: payloadEnd, value: JSON.stringify(deck, null, 2)});
+      let imageChanged = false;
+      for (const step of deck.steps!) {
+        if (typeof step.image === "string" && rewritten.has(step.image)) {
+          const nextImage = rewritten.get(step.image)!;
+          if (nextImage !== step.image) imageChanged = true;
+          step.image = nextImage;
+        }
+      }
+      if (!omitLocalAssets || imageChanged || markdownChanged) {
+        edits.push({start: payloadStart, end: payloadEnd, value: JSON.stringify(deck, null, 2)});
+      }
     }));
   });
   await Promise.all(work);

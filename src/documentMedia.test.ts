@@ -53,6 +53,114 @@ describe("portable media", () => {
     const result = await prepareFmd("# Keep\n\n![Proof][p]\n\n[p]: proof.png \"A title\"\n", "/notes/a.md");
     expect(result.content).toContain("![Proof][p]"); expect(result.content).toMatch(/\[p\]: <assets\/image-.*\.png> "A title"/);
   });
+  it("omits unchanged local portable assets without load_asset IPC while packing newly referenced images", async () => {
+    native.mockReset().mockImplementation(async (command: string, args?: { source?: string }) => {
+      if (command === "load_asset" && args?.source === "diagrams/new-arch.png") {
+        return "data:image/png;base64,aGVsbG8=";
+      }
+      throw new Error(`Unexpected IPC call: ${command} ${JSON.stringify(args)}`);
+    });
+    const deck = {
+      title: "Architecture",
+      steps: [
+        { label: "Unchanged slide", image: "assets/step-1.png", markdown: "![Nested unchanged](assets/fig-1.png)" },
+      ],
+    };
+    const md = [
+      "# Lecture",
+      "",
+      "![Unchanged](assets/fig-1.png)",
+      "![Ref unchanged][r]",
+      "",
+      "[r]: assets/fig-2.svg \"Diagram\"",
+      "",
+      '<img src="assets/inline-existing.png" width="240" alt="Existing">',
+      "",
+      "![[assets/fig-1.png|Wiki local]]",
+      "",
+      "![Newly added](diagrams/new-arch.png)",
+      "",
+      "![Inline data](data:image/gif;base64,R0lGODlhAQABAAAAACw=)",
+      "",
+      "```smd-steps",
+      JSON.stringify(deck, null, 2),
+      "```",
+      "",
+    ].join("\n");
+
+    const result = await prepareFmd(md, "content://vault/Lecture.smd", {
+      localAssets: ["assets/fig-1.png", "assets/fig-2.svg", "assets/step-1.png", "assets/inline-existing.png"],
+      omitLocalAssets: true,
+      trustedImageHosts: [],
+    });
+
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(native).toHaveBeenCalledWith("load_asset", {
+      documentPath: "content://vault/Lecture.smd",
+      source: "diagrams/new-arch.png",
+    });
+    expect(result.content).toContain("![Unchanged](assets/fig-1.png)");
+    expect(result.content).toContain('[r]: assets/fig-2.svg "Diagram"');
+    expect(result.content).toContain('<img src="assets/inline-existing.png" width="240" alt="Existing">');
+    expect(result.content).toContain("![Wiki local](<assets/fig-1.png>)");
+    expect(result.content).toContain('"image": "assets/step-1.png"');
+    expect(Object.keys(result.assets)).toHaveLength(2);
+    for (const key of ["assets/fig-1.png", "assets/fig-2.svg", "assets/step-1.png", "assets/inline-existing.png"]) {
+      expect(result.assets[key]).toBeUndefined();
+    }
+    expect(Object.values(result.assets)).toEqual(
+      expect.arrayContaining(["data:image/png;base64,aGVsbG8=", "data:image/gif;base64,R0lGODlhAQABAAAAACw="]),
+    );
+  });
+  it("enforces explicit reader consent for remote images across Markdown, wiki, steps, and HTML img tags", async () => {
+    const remoteSvg = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=";
+    native.mockReset().mockImplementation(async (command: string) => {
+      if (command === "fetch_resource") return { body: remoteSvg };
+      throw new Error(`Unexpected IPC: ${command}`);
+    });
+
+    const unconsentedInputs = [
+      "![Blocked](https://untrusted.example/a.svg)",
+      "![Blocked][id]\n\n[id]: https://untrusted.example/b.svg",
+      "![[https://untrusted.example/c.svg|Blocked wiki]]",
+      '<img src="https://untrusted.example/d.svg" alt="Blocked html">',
+      '<img src="//untrusted.example/e.svg" alt="Protocol relative">',
+      '```smd-steps\n{"title":"Steps","steps":[{"label":"S1","image":"https://untrusted.example/f.svg"}]}\n```',
+      '```smd-steps\n{"title":"Steps","steps":[{"label":"S1","markdown":"![Nested](https://untrusted.example/g.svg)"}]}\n```',
+    ];
+    for (const input of unconsentedInputs) {
+      await expect(
+        prepareFmd(input, "/notes/consent.smd", { trustedImageHosts: ["images.example"] }),
+      ).rejects.toThrow(/consent/i);
+    }
+    expect(native).not.toHaveBeenCalled();
+
+    // One-time reader consent resolves only the approved URL without invoking fetch_resource.
+    const approvedOnce = "https://one-time.example/chart.svg";
+    const oncePacked = await prepareFmd(`![Approved](${approvedOnce})`, "/notes/consent.smd", {
+      trustedImageHosts: [],
+      resolveConsentedRemoteImage: (url) => (url === approvedOnce ? remoteSvg : null),
+    });
+    expect(Object.values(oncePacked.assets)).toEqual([remoteSvg]);
+    expect(native).not.toHaveBeenCalled();
+
+    await expect(
+      prepareFmd("![Sibling](https://one-time.example/other.svg)", "/notes/consent.smd", {
+        trustedImageHosts: [],
+        resolveConsentedRemoteImage: (url) => (url === approvedOnce ? remoteSvg : null),
+      }),
+    ).rejects.toThrow(/consent/i);
+    expect(native).not.toHaveBeenCalled();
+
+    // Explicitly trusted domain fetches via fetch_resource.
+    const trustedPacked = await prepareFmd('<img src="https://images.example/diagram.svg" alt="Trusted">', "/notes/consent.smd", {
+      trustedImageHosts: ["images.example"],
+    });
+    expect(native).toHaveBeenCalledTimes(1);
+    expect(native).toHaveBeenCalledWith("fetch_resource", { url: "https://images.example/diagram.svg", image: true });
+    expect(Object.values(trustedPacked.assets)).toEqual([remoteSvg]);
+    expect(trustedPacked.content).toMatch(/<img src="assets\/image-.*\.svg" alt="Trusted">/);
+  });
   it("recognizes real YouTube hosts and uses oEmbed titles and optional thumbnails", async () => {
     expect(youtubeUrl("https://youtu.be/dQw4w9WgXcQ?t=10")).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
     expect(youtubeUrl("https://youtube.com.evil.test/watch?v=dQw4w9WgXcQ")).toBeNull();

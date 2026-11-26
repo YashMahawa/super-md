@@ -144,13 +144,14 @@ internal class ReaderBridge(
                     "agent_export_native" -> { onAgentExport(args); JSONObject().put("accepted", true).put("jobId", args.optString("requestId")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }
                     "request_fmd_export" -> { model.requestPortable?.invoke() ?: error("The file picker is not ready"); true }
-                    "export_fmd_native" -> { model.writePortable(args.getString("id"), args.getString("content"), args.getJSONObject("assets"), args.optBoolean("save"), args.getString("originalContent")); true }
+                    "export_fmd_native" -> { model.writePortable(args.getString("id"), args.getString("content"), args.getJSONObject("assets"), args.optBoolean("save"), args.getString("originalContent"), args.optBoolean("mergeLocalAssets")); true }
                     "run_python" -> runPython(args)
                     "export_pdf_native" -> exportPdf(args)
                     "cancel_export" -> cancelPdfExport(args)
                     "export_markdown_native" -> { model.shareMarkdown(args.getString("id"), args.getString("content"), args.optJSONObject("assets") ?: JSONObject(), args.optBoolean("archive")); true }
                     "export_failed" -> {
                         val message = args.getString("error")
+                        model.clearPendingPortableWriteState()
                         if (isPdfExportCancellationMessage(message)) model.pdfExportCancelled()
                         else if (message !in listOf(DOCUMENT_ACCESS_MESSAGE, "Error: $DOCUMENT_ACCESS_MESSAGE", LINKED_ASSET_ACCESS_MESSAGE, "Error: $LINKED_ASSET_ACCESS_MESSAGE")) model.fail(message)
                         true
@@ -160,6 +161,7 @@ internal class ReaderBridge(
                 val encoded = when(output) { null -> "null"; is JSONObject -> output.toString(); is String -> JSONObject.quote(output); else -> output.toString() }
                 web.post { if (!retired.get()) web.evaluateJavascript("window.supermdReply?.(${JSONObject.quote(id)},$encoded,null)", null) }
             } catch (error: Exception) {
+                if (command == "export_fmd_native") model.clearPendingPortableWriteState()
                 val portableSave = command == "export_fmd_native" && runCatching { JSONObject(raw).optBoolean("save") }.getOrDefault(false)
                 val permissionFailure = portableSave && isDocumentAccessFailure(error)
                 val linkedFailure = command in listOf("load_asset", "load_text_asset", "resolve_reader_asset") && isDocumentAccessFailure(error) && run {

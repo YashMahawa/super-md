@@ -338,6 +338,24 @@ class MediaStorage(private val context: Context) {
         return encoded
     }
 
+    /** List valid asset keys present in a portable note's local bundle directory without reading bytes. */
+    fun portableAssetKeys(directory: String?): List<String> {
+        if (directory == null) return emptyList()
+        require(Regex("[a-f0-9-]{36}").matches(directory)) { "Portable asset directory is invalid" }
+        val expectedBundlesRoot = context.filesDir.canonicalFile.toPath().resolve(bundles.name).normalize().toFile()
+        val root = File(bundles, directory).canonicalFile
+        require(bundles.canonicalFile == expectedBundlesRoot && root.parentFile == expectedBundlesRoot && root.isDirectory) {
+            "Portable assets are unavailable"
+        }
+        return root.listFiles()
+            ?.asSequence()
+            ?.filter { it.isFile && validKey("assets/${it.name}") }
+            ?.map { "assets/${it.name}" }
+            ?.sorted()
+            ?.toList()
+            .orEmpty()
+    }
+
     /** Return every extracted asset in a portable note, including currently unlinked originals. */
     fun portableAssets(directory: String?): JSONObject {
         val result = JSONObject()

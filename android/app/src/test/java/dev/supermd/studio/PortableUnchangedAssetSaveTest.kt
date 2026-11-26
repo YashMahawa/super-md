@@ -740,6 +740,194 @@ class PortableUnchangedAssetSaveTest {
             app.getSharedPreferences("studio", 0).edit().putString("recent", previousRecentJson).apply()
         }
     }
+
+    @Test
+    fun readerReadySaveManualAndSaveAsReuseNativeFastPathAndPreserveMixedAssetsConsentAndStaleChecks() =
+        withStudioModel(autosave = false) { app, tempDir, bundlesRoot, _, model ->
+            val assetBytes = linkedMapOf(
+                "assets/fig-1.png" to ("image/png" to syntheticPngBytes(40_000, 301L)),
+                "assets/fig-2.png" to ("image/png" to syntheticPngBytes(40_000, 302L)),
+                "assets/diagram-1.svg" to ("image/svg+xml" to svgBytes("reader-fast-a", 48)),
+                "assets/diagram-2.svg" to ("image/svg+xml" to svgBytes("reader-fast-b", 48)),
+            )
+            val initialAssets = JSONObject()
+            assetBytes.forEach { (key, spec) -> initialAssets.put(key, dataUrl(spec.first, spec.second)) }
+            val imageLinks = assetBytes.keys.joinToString("\n") { "![Image]($it)" }
+            val initialMd = "# Reader Ready Note\n\n$imageLinks\n"
+
+            val smdFile = File(tempDir, "ReaderReady.smd")
+            MediaStorage(app).let { seed -> smdFile.outputStream().use { seed.writeFmd(it, initialMd, initialAssets) } }
+
+            awaitJob(model.open(Uri.fromFile(smdFile)))
+            val noteId = model.state.value.active.id
+            val initialDir = model.state.value.active.assetDirectory!!
+
+            // Wire a live reader flush + requestPortableWrite hook matching MainActivity when readerReady == true.
+            var pendingReaderDraft: Pair<String, String>? = null
+            val portableRequests = mutableListOf<StudioViewModel.PortableWriteRequest>()
+            var handlePortableRequest: ((StudioViewModel.PortableWriteRequest) -> Unit)? = null
+            model.readerFlushRequester = { flushId ->
+                pendingReaderDraft?.takeIf { it.first == flushId }?.let { (id, draft) ->
+                    pendingReaderDraft = null
+                    model.readerEdit(id, draft, protocolPatch = true)
+                }
+                true
+            }
+            model.requestPortableWrite = { request ->
+                portableRequests += request
+                handlePortableRequest?.invoke(request)
+                true
+            }
+
+            // 1. Reader-ready saveManual flushes live reader edits and writes unchanged local assets natively
+            //    with 0 requestPortableWrite/prepareFmd calls and 0 Base64 decodes/encodes/extractions.
+            val manualFlushedMd = "# Reader Ready Note (manual save)\n\nFlushed from reader.\n\n$imageLinks\n"
+            pendingReaderDraft = noteId to manualFlushedMd
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy && model.state.value.active.saved == manualFlushedMd }
+            assertNull(model.state.value.error)
+            assertEquals("Expected 0 JS portable requests for unchanged local assets", emptyList<StudioViewModel.PortableWriteRequest>(), portableRequests)
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(0, model.media.portableAssetExtractions.get())
+            assertEquals(initialDir, model.state.value.active.assetDirectory)
+
+            // 2. Reader-ready completePortableSaveAs flushes live reader edits and writes unchanged local assets natively
+            //    with 0 requestPortableWrite/prepareFmd calls and 0 Base64 decodes/encodes.
+            val saveAsCopy = File(tempDir, "ReaderReady Copy.smd")
+            val saveAsFlushedMd = "# Reader Ready Note (Save As copy)\n\nFlushed before Save As.\n\n$imageLinks\n"
+            pendingReaderDraft = noteId to saveAsFlushedMd
+            model.media.resetPortableCounters()
+            model.completePortableSaveAs(Uri.fromFile(saveAsCopy), noteId)
+            awaitCondition {
+                model.state.value.active.uri == Uri.fromFile(saveAsCopy).toString() &&
+                    !model.state.value.active.dirty &&
+                    !model.state.value.busy
+            }
+            assertNull(model.state.value.error)
+            assertEquals("Expected 0 JS portable requests on Save As with unchanged local assets", emptyList<StudioViewModel.PortableWriteRequest>(), portableRequests)
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            val saveAsDir = model.state.value.active.assetDirectory!!
+
+            val verifyMedia = MediaStorage(app)
+            val reopenedCopy = saveAsCopy.inputStream().use(verifyMedia::openFmd)
+            try {
+                assertEquals(saveAsFlushedMd, reopenedCopy.markdown)
+                assetBytes.forEach { (key, spec) ->
+                    assertArrayEquals(spec.second, verifyMedia.local(key, reopenedCopy.directory)!!.readBytes())
+                }
+            } finally {
+                File(bundlesRoot, reopenedCopy.directory).deleteRecursively()
+            }
+
+            // 3. Newly imported local attachment (assets/import-*) alongside unchanged bundle assets also stays on native fast path.
+            val importedBytes = syntheticPngBytes(18_000, 777L)
+            val importedMeta = model.media.importJson(
+                org.json.JSONArray().put(JSONObject().put("name", "pasted.png").put("data", dataUrl("image/png", importedBytes))),
+            ).getJSONObject(0)
+            val importedSource = importedMeta.getString("source")
+            model.markAssetsDirty(noteId)
+            val withImportedMd = "$saveAsFlushedMd\n![Pasted](<$importedSource>)\n"
+            pendingReaderDraft = noteId to withImportedMd
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy && model.state.value.active.saved == withImportedMd }
+            assertEquals(emptyList<StudioViewModel.PortableWriteRequest>(), portableRequests)
+            assertEquals("Only the 1 new attachment is encoded once from disk; 0 unchanged bundle assets are re-encoded", 1, model.media.portableBase64Encodes.get())
+            assertEquals("Cache hit from importJson avoids re-decoding even the new attachment", 0, model.media.portableBase64Decodes.get())
+            val importedDir = model.state.value.active.assetDirectory!!
+
+            // 4. Newly referenced external relative image delegates to requestPortableWrite with localAssets,
+            //    surfaces explicit linked-asset consent when ungranted, and merges unchanged local assets without Base64 transfer once resolved.
+            val externalLinkedMd = "$withImportedMd\n![External diagram](diagrams/external.png)\n"
+            pendingReaderDraft = noteId to externalLinkedMd
+            val externalPng = syntheticPngBytes(22_000, 888L)
+
+            // 4a. First attempt: ungranted linked external image reports explicit linked-file consent and cleans pending state.
+            handlePortableRequest = { req ->
+                val err = assertThrows(SecurityException::class.java) {
+                    runCatching { awaitSuspend { model.asset(req.noteId, "diagrams/external.png") } }.getOrThrow()
+                }
+                assertTrue(model.reportLinkedAssetFailure(req.noteId, "diagrams/external.png", err))
+            }
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.busy && model.documentAccessRequests.value != null }
+            assertEquals(1, portableRequests.size)
+            assertTrue(portableRequests.single().localAssets.containsAll(assetBytes.keys + importedSource))
+            assertEquals("diagrams/external.png", model.documentAccessRequests.value?.assetSource)
+            assertEquals(LINKED_ASSET_ACCESS_MESSAGE, model.state.value.message)
+
+            // Dismissing the consent prompt and explicitly tapping Save again re-prompts linked-file consent.
+            model.dismissDocumentAccess()
+            assertNull(model.documentAccessRequests.value)
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.busy && model.documentAccessRequests.value != null }
+            assertEquals("diagrams/external.png", model.documentAccessRequests.value?.assetSource)
+            model.dismissDocumentAccess()
+
+            // 4b. Once resolved in the reader, sending ONLY the 1 new asset with mergeLocalAssets = true preserves all 5 local assets with 0 unchanged decodes/encodes.
+            portableRequests.clear()
+            val rewrittenExternalMd = "$withImportedMd\n![External diagram](<assets/image-external.png>)\n"
+            handlePortableRequest = { req ->
+                CoroutineScope(Dispatchers.Default).async {
+                    model.writePortable(
+                        id = req.noteId,
+                        content = rewrittenExternalMd,
+                        assets = JSONObject().put("assets/image-external.png", String(dataUrl("image/png", externalPng).toCharArray())),
+                        save = req.save,
+                        originalContent = externalLinkedMd,
+                        mergeLocalAssets = true,
+                    )
+                }
+            }
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy && model.state.value.active.content == rewrittenExternalMd }
+            assertEquals(1, portableRequests.size)
+            assertEquals(1, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(1, model.media.portableAssetExtractions.get())
+            val mergedDir = model.state.value.active.assetDirectory!!
+
+            val reopenedMerged = saveAsCopy.inputStream().use(verifyMedia::openFmd)
+            try {
+                assertEquals(rewrittenExternalMd, reopenedMerged.markdown)
+                assetBytes.forEach { (key, spec) ->
+                    assertArrayEquals(spec.second, verifyMedia.local(key, reopenedMerged.directory)!!.readBytes())
+                }
+                assertArrayEquals(importedBytes, verifyMedia.local(importedSource, reopenedMerged.directory)!!.readBytes())
+                assertArrayEquals(externalPng, verifyMedia.local("assets/image-external.png", reopenedMerged.directory)!!.readBytes())
+            } finally {
+                File(bundlesRoot, reopenedMerged.directory).deleteRecursively()
+            }
+
+            // 5. Stale-document check: writePortable rejects outdated originalContent without overwriting the saved file.
+            val beforeStaleBytes = saveAsCopy.readBytes()
+            val newerLiveMd = "$rewrittenExternalMd\nNewer typing after export started.\n"
+            model.edit(noteId, newerLiveMd)
+            assertThrows(IllegalStateException::class.java) {
+                awaitSuspend {
+                    model.writePortable(
+                        id = noteId,
+                        content = rewrittenExternalMd,
+                        assets = JSONObject(),
+                        save = true,
+                        originalContent = rewrittenExternalMd,
+                        mergeLocalAssets = true,
+                    )
+                }
+            }
+            assertArrayEquals("Stale writePortable must leave on-disk bytes untouched", beforeStaleBytes, saveAsCopy.readBytes())
+            assertEquals(newerLiveMd, model.state.value.active.content)
+
+            File(bundlesRoot, initialDir).deleteRecursively()
+            File(bundlesRoot, saveAsDir).deleteRecursively()
+            File(bundlesRoot, importedDir).deleteRecursively()
+            File(bundlesRoot, mergedDir).deleteRecursively()
+            File(app.filesDir, "attachments/${importedSource.substringAfter('/')}").delete()
+        }
 }
 
 private class PortableOpaqueSafProvider(
