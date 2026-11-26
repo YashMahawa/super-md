@@ -4,18 +4,39 @@ import { setReaderOverlay } from "../readerOverlays";
 import { ArrowUpIcon, ArrowDownIcon, XIcon, TextAaIcon, TextboxIcon, AsteriskIcon, ArrowsClockwiseIcon } from "@phosphor-icons/react";
 import { editorFindQuery, editorFindRange } from "./Editor";
 import { windowedMatches, revealWindowed, compileSearchPattern, nextSearchMatch, normalizeSearchOptions, type WindowedMatch, type SearchMatchConfig, type SearchMatchOptions } from "../windowedSearch";
+import { parseFrontmatter, type FrontmatterVisibleField, type FrontmatterVisibleSpan, type ParsedFrontmatter } from "../frontmatter";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import { refreshDocumentExtent } from "../documentZoom";
 export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
 
 const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
+const MANUAL_SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+const SEARCH_SETTLE_WINDOW_MS = 800;
 type HighlightRegistry = Map<string, unknown>;
 type SourceRange = { from: number; to: number };
 const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
 const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
-const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|document-properties|is-offstage)(?:\s|$)/;
+const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|is-offstage)(?:\s|$)/;
 const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
+
+let cachedFrontmatterContent: string | null = null;
+let cachedFrontmatterResult: ParsedFrontmatter | null = null;
+function getParsedFrontmatter(content: string): ParsedFrontmatter | null {
+  if (cachedFrontmatterContent === content) return cachedFrontmatterResult;
+  cachedFrontmatterContent = content;
+  cachedFrontmatterResult = parseFrontmatter(content, { includeSpans: true });
+  return cachedFrontmatterResult;
+}
+
+function isFrontmatterPropertiesContainer(el: Element): boolean {
+  return el.hasAttribute("data-frontmatter-properties") || el.classList.contains("document-properties");
+}
+
+function isAllowedFrontmatterField(el: Element): el is HTMLElement {
+  const field = el.getAttribute("data-frontmatter-field");
+  return field === "title" || field === "author" || field === "tag";
+}
 
 function isHiddenOrExcludedSearchElement(el: Element): boolean {
   if (EXCLUDED_SEARCH_TAGS.has(el.localName)) return true;
@@ -26,8 +47,7 @@ function isHiddenOrExcludedSearchElement(el: Element): boolean {
   if (
     el.getAttribute("data-windowed-mounted") === "false" ||
     el.hasAttribute("hidden") ||
-    el.hasAttribute("inert") ||
-    el.hasAttribute("data-frontmatter-properties")
+    el.hasAttribute("inert")
   ) {
     return true;
   }
@@ -174,8 +194,8 @@ function sourceBounds(el: Element, content?: string): { start: number; end: numb
       if (prev instanceof HTMLElement && prev.classList.contains("code-container")) ordinal++;
     }
     if (regionStart === 0) {
-      const fm = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
-      if (fm) regionStart = fm[0].length;
+      const fm = getParsedFrontmatter(content);
+      if (fm) regionStart = fm.end;
     }
     let regionEnd = content.length;
     for (let next = el.nextElementSibling; next; next = next.nextElementSibling) {
@@ -337,8 +357,77 @@ function sameDomRange(a: Range, b: Range): boolean {
   return a.startContainer === b.startContainer && a.startOffset === b.startOffset && a.endContainer === b.endContainer && a.endOffset === b.endOffset;
 }
 
+function findFrontmatterFieldElement(host: Element, field: FrontmatterVisibleField, fieldOrdinal: number): HTMLElement | null {
+  const header = isFrontmatterPropertiesContainer(host)
+    ? host
+    : host.querySelector("[data-frontmatter-properties],.document-properties");
+  if (!header) return null;
+  const list = header.querySelectorAll<HTMLElement>(`[data-frontmatter-field="${field}"]`);
+  return list[fieldOrdinal] ?? null;
+}
+
+function orderedFrontmatterSourceIndices(
+  spans: FrontmatterVisibleSpan[],
+  ranges: SourceRange[],
+  field: FrontmatterVisibleField,
+  fieldOrdinal: number,
+): number[] {
+  const indices: number[] = [];
+  for (const span of spans) {
+    if (span.field !== field || span.fieldOrdinal !== fieldOrdinal) continue;
+    for (let i = 0; i < ranges.length; i++) {
+      const candidate = ranges[i];
+      if (candidate.from >= span.start && candidate.to <= span.end && !indices.includes(i)) {
+        indices.push(i);
+      }
+    }
+  }
+  return indices;
+}
+
+function mapFrontmatterSourceRangeToDomRange(
+  host: Element,
+  content: string,
+  ranges: SourceRange[],
+  activeIndex: number,
+  query: string,
+  options: SearchMatchConfig = false,
+): Range | null {
+  const target = ranges[activeIndex];
+  if (!target) return null;
+  const spans = getParsedFrontmatter(content)?.visibleSpans;
+  if (!spans?.length) return null;
+  const matchSpan = spans.find(s => target.from >= s.start && target.to <= s.end);
+  if (!matchSpan) return null;
+  const fieldEl = findFrontmatterFieldElement(host, matchSpan.field, matchSpan.fieldOrdinal);
+  if (!fieldEl) return null;
+  const domRanges = readingMatches(fieldEl, query, options);
+  if (!domRanges.length) return null;
+  const orderedIndices = orderedFrontmatterSourceIndices(spans, ranges, matchSpan.field, matchSpan.fieldOrdinal);
+  const ordinal = orderedIndices.indexOf(activeIndex);
+  return ordinal >= 0 ? (domRanges[ordinal] ?? null) : null;
+}
+
 function mapDomRangeToSourceIndex(host: Element, content: string, ranges: SourceRange[], domRange: Range, query: string, options: SearchMatchConfig = false): number {
   const common = domRange.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? domRange.commonAncestorContainer as Element : domRange.commonAncestorContainer.parentElement;
+  const fmFieldEl = common?.closest<HTMLElement>("[data-frontmatter-field]");
+  if (fmFieldEl && isAllowedFrontmatterField(fmFieldEl)) {
+    const rawField = fmFieldEl.getAttribute("data-frontmatter-field") as FrontmatterVisibleField;
+    const header = fmFieldEl.closest("[data-frontmatter-properties],.document-properties") ?? host;
+    const siblings = Array.from(header.querySelectorAll<HTMLElement>(`[data-frontmatter-field="${rawField}"]`));
+    const fieldOrdinal = siblings.indexOf(fmFieldEl);
+    if (fieldOrdinal >= 0) {
+      const domRanges = readingMatches(fmFieldEl, query, options);
+      const ordinal = domRanges.findIndex(r => sameDomRange(r, domRange));
+      if (ordinal >= 0) {
+        const spans = getParsedFrontmatter(content)?.visibleSpans;
+        if (spans?.length) {
+          const orderedIndices = orderedFrontmatterSourceIndices(spans, ranges, rawField, fieldOrdinal);
+          if (orderedIndices[ordinal] !== undefined) return orderedIndices[ordinal];
+        }
+      }
+    }
+  }
   const owner = common?.closest<HTMLElement>("[data-source-start],.code-container");
   if (owner) {
     const domRanges = directOwnerDomRanges(owner, query, options);
@@ -380,8 +469,8 @@ export function resolveSourceHighlightRange(host: Element, content: string, rang
   const target = ranges[activeIndex];
   if (!target) return null;
   const block = findContainingBlock(host, target, content);
-  if (!block) return null;
-  return mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options);
+  if (block) return mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options);
+  return mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
 }
 
 function collectSearchText(
@@ -405,10 +494,32 @@ function collectSearchText(
       } else if (nt === Node.ELEMENT_NODE) {
         const childEl = child as Element;
         if (isHiddenOrExcludedSearchElement(childEl)) continue;
-        walk(childEl, SEARCH_BLOCK_TAGS.has(childEl.localName) ? childEl : currentBlock);
+        if (isFrontmatterPropertiesContainer(childEl)) {
+          walkFrontmatterFields(childEl);
+          continue;
+        }
+        const nextBlock = isAllowedFrontmatterField(childEl) || SEARCH_BLOCK_TAGS.has(childEl.localName)
+          ? childEl
+          : currentBlock;
+        walk(childEl, nextBlock);
       }
     }
   };
+  const walkFrontmatterFields = (container: Element) => {
+    const fields = container.querySelectorAll("[data-frontmatter-field]");
+    for (const fieldEl of fields) {
+      if (!isAllowedFrontmatterField(fieldEl)) continue;
+      let excluded = false;
+      for (let anc: Element | null = fieldEl; anc && anc !== container; anc = anc.parentElement) {
+        if (isHiddenOrExcludedSearchElement(anc)) { excluded = true; break; }
+      }
+      if (!excluded) walk(fieldEl, fieldEl);
+    }
+  };
+  if (isFrontmatterPropertiesContainer(root)) {
+    walkFrontmatterFields(root);
+    return;
+  }
   walk(root, initialBlock);
 }
 
@@ -443,11 +554,14 @@ function matchPartsToRanges(
 export function readingMatches(host: Element, query: string, options: SearchMatchConfig = false): Range[] {
   const { pattern } = compileSearchPattern(query, options, false);
   if (!pattern) return [];
+  const rawFieldAnc = host.closest("[data-frontmatter-field]");
+  const insideAllowedField = rawFieldAnc && isAllowedFrontmatterField(rawFieldAnc) ? rawFieldAnc : null;
   for (let anc: Element | null = host; anc; anc = anc.parentElement) {
     if (isHiddenOrExcludedSearchElement(anc)) return [];
+    if (anc !== host && isFrontmatterPropertiesContainer(anc) && !insideAllowedField) return [];
   }
   const state = { parts: [] as Array<{ node: Text; start: number; end: number }>, text: "", block: null as Element | null };
-  collectSearchText(host, host.closest("p,h1,h2,h3,h4,li,pre,td,summary"), state);
+  collectSearchText(host, insideAllowedField ?? host.closest("p,h1,h2,h3,h4,li,pre,td,summary"), state);
   return matchPartsToRanges(state.parts, state.text, pattern);
 }
 
@@ -516,11 +630,116 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const input = useRef<HTMLInputElement>(null);
   const closeRef = useRef(close); closeRef.current = close;
   const prevState = useRef({ query, content, caseSensitive, wholeWord, regexp });
-  const settleFrames = useRef<[number, number]>([0, 0]);
+  const settleCleanup = useRef<(() => void) | null>(null);
   const clearSettleFrames = () => {
-    cancelAnimationFrame(settleFrames.current[0]);
-    cancelAnimationFrame(settleFrames.current[1]);
-    settleFrames.current = [0, 0];
+    settleCleanup.current?.();
+    settleCleanup.current = null;
+  };
+  const scheduleSearchSettle = (anchorHost: Element | null, step: () => boolean) => {
+    clearSettleFrames();
+    const scroller = anchorHost?.matches(".android-reading,.reading-scroll")
+      ? (anchorHost as HTMLElement)
+      : anchorHost?.closest<HTMLElement>(".android-reading,.reading-scroll")
+        ?? document.querySelector<HTMLElement>(".android-reading,.reading-scroll");
+    const eventHost = scroller ?? anchorHost;
+    if (!eventHost) return;
+    let active = true;
+    let frame = 0;
+    let remainingFrames = 4;
+    let layoutMutating = false;
+    let recordedScrollTop = scroller?.scrollTop ?? 0;
+    let recordedScrollHeight = scroller?.scrollHeight ?? 0;
+    const recordScrollerState = () => {
+      if (!scroller) return;
+      recordedScrollTop = scroller.scrollTop;
+      recordedScrollHeight = scroller.scrollHeight;
+    };
+    const inSearchUi = (target: EventTarget | null) =>
+      target instanceof Element && Boolean(target.closest(".reading-search"));
+    const stop = () => {
+      if (!active) return;
+      active = false;
+      cancelAnimationFrame(frame);
+      frame = 0;
+      window.clearTimeout(timer);
+      observer?.disconnect();
+      eventHost.removeEventListener("supermd-window-change", onWindowChange);
+      scroller?.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", onUserGesture, { capture: true });
+      window.removeEventListener("touchstart", onUserGesture, { capture: true });
+      window.removeEventListener("touchmove", onUserGesture, { capture: true });
+      window.removeEventListener("pointerdown", onUserGesture, { capture: true });
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
+      window.removeEventListener("supermd-goto-offset", stop);
+      if (settleCleanup.current === stop) settleCleanup.current = null;
+    };
+    const runPass = () => {
+      frame = 0;
+      if (!active) return;
+      if (!step()) {
+        stop();
+        return;
+      }
+      recordScrollerState();
+      if (remainingFrames > 0) {
+        remainingFrames--;
+        frame = requestAnimationFrame(runPass);
+      }
+    };
+    const schedulePass = () => {
+      if (!active || frame) return;
+      frame = requestAnimationFrame(runPass);
+    };
+    const onUserGesture = (event: Event) => {
+      if (!inSearchUi(event.target)) stop();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!inSearchUi(event.target) && MANUAL_SCROLL_KEYS.has(event.key)) stop();
+    };
+    const onWindowChange = () => {
+      if (!active) return;
+      layoutMutating = true;
+      queueMicrotask(() => {
+        layoutMutating = false;
+        if (active) recordScrollerState();
+      });
+      schedulePass();
+    };
+    const onScroll = () => {
+      if (!active || !scroller || layoutMutating) return;
+      if (scroller.scrollHeight !== recordedScrollHeight) {
+        recordScrollerState();
+        schedulePass();
+        return;
+      }
+      if (Math.abs(scroller.scrollTop - recordedScrollTop) > 2) stop();
+    };
+    const page = scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body")
+      ?? (eventHost instanceof HTMLElement ? eventHost : null);
+    let lastPageHeight = page?.getBoundingClientRect().height ?? 0;
+    const observer = page && typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(entries => {
+          if (!active) return;
+          const nextHeight = entries[0]?.borderBoxSize?.[0]?.blockSize ?? entries[0]?.contentRect.height ?? page.getBoundingClientRect().height;
+          if (Math.abs(nextHeight - lastPageHeight) <= 0.5) return;
+          lastPageHeight = nextHeight;
+          if (scroller && scroller.scrollHeight !== recordedScrollHeight) recordScrollerState();
+          schedulePass();
+        })
+      : undefined;
+    if (page && observer) observer.observe(page);
+    eventHost.addEventListener("supermd-window-change", onWindowChange);
+    scroller?.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("touchstart", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("touchmove", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("pointerdown", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("keydown", onKeyDown, { capture: true, passive: true });
+    window.addEventListener("supermd-goto-offset", stop);
+    const timer = window.setTimeout(stop, SEARCH_SETTLE_WINDOW_MS);
+    settleCleanup.current = stop;
+    remainingFrames--;
+    frame = requestAnimationFrame(runPass);
   };
   const sourceCacheRef = useRef<{
     content: string;
@@ -554,12 +773,31 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const host = findReadingHost();
     if (!sr || !host) return -1;
     const block = findContainingBlock(host, sr, content);
-    if (!block) return -1;
     const liveWindowed = knownWindowed !== undefined
       ? knownWindowed
       : windowed && windowed.every(w => w.element.isConnected && host.contains(w.element))
         ? windowed
         : windowedMatches(host, query, filterOptions);
+    if (!block) {
+      const fmResolved = mapFrontmatterSourceRangeToDomRange(host, content, activeSourceRanges, sourceIdx, query, filterOptions);
+      if (!fmResolved) return -1;
+      if (liveWindowed) {
+        for (let i = 0; i < liveWindowed.length; i++) {
+          const w = liveWindowed[i];
+          if (w.element.contains(fmResolved.startContainer)) {
+            const wRange = readingMatches(w.element, query, filterOptions)[w.ordinal];
+            if (wRange && sameDomRange(wRange, fmResolved)) return i;
+          }
+        }
+        return -1;
+      }
+      const liveMatches = knownMatches !== undefined
+        ? knownMatches
+        : matches.length && matches[0].startContainer.nodeType === Node.TEXT_NODE && host.contains(matches[0].startContainer)
+          ? matches
+          : readingMatches(host, query, filterOptions);
+      return liveMatches.findIndex(m => sameDomRange(m, fmResolved));
+    }
     if (liveWindowed) {
       if (!liveWindowed.length) return -1;
       if (!block.closest('[data-windowed-mounted="false"]')) {
@@ -622,6 +860,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   }, [canReplace, replacing]);
 
   const revealAndHighlightSource = (targetIndex: number, ranges: SourceRange[], sourceText: string, scroll: boolean) => {
+    if (scroll) clearSettleFrames();
     const range = ranges[targetIndex];
     if (!range) return;
     if (scroll && sourceSession) {
@@ -632,9 +871,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!host) return;
     const initialBlock = findContainingBlock(host, range, sourceText);
     if (!initialBlock) {
-      registry?.delete("smd-search-current");
+      const fmDomRange = mapFrontmatterSourceRangeToDomRange(host, sourceText, ranges, targetIndex, query, filterOptions);
+      if (registry && HighlightClass) {
+        if (scroll) registry.set("smd-search", new HighlightClass(...readingMatches(host, query, filterOptions)));
+        registry.delete("smd-search-current");
+        if (fmDomRange) registry.set("smd-search-current", new HighlightClass(fmDomRange));
+      }
       if (scroll) {
-        const fallback = host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
+        const fmTarget = fmDomRange
+          ? (fmDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? fmDomRange.startContainer as Element : fmDomRange.startContainer.parentElement)
+          : null;
+        const fallback = fmTarget ?? host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
         scrollTargetIntoView(fallback, host);
       }
       return;
@@ -655,6 +902,31 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry.delete("smd-search-current");
       if (domRange) registry.set("smd-search-current", new HighlightClass(domRange));
     }
+    if (scroll) {
+      scheduleSearchSettle(host, () => {
+        if (!sourceSearchRef.current || indexRef.current !== targetIndex) return false;
+        const liveHost = findReadingHost();
+        if (!liveHost) return false;
+        const currentBlock = findContainingBlock(liveHost, range, sourceText);
+        if (!currentBlock) return false;
+        revealMountedBlock(currentBlock);
+        const settledBlock = findContainingBlock(liveHost, range, sourceText) ?? currentBlock;
+        const settledOwner = deepestSourceOwner(settledBlock, range, sourceText) ?? settledBlock;
+        openDisclosuresFor(settledOwner, settledBlock, null, range);
+        const settledDomRange = mapSourceRangeToDomRange(settledBlock, sourceText, ranges, targetIndex, query, filterOptions);
+        openDisclosuresFor(settledOwner, settledBlock, settledDomRange, range);
+        const settledScrollEl = settledDomRange
+          ? (settledDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? settledDomRange.startContainer as Element : settledDomRange.startContainer.parentElement)
+          : settledOwner;
+        scrollTargetIntoView(settledScrollEl ?? settledBlock, liveHost);
+        if (registry && HighlightClass) {
+          registry.set("smd-search", new HighlightClass(...readingMatches(liveHost, query, filterOptions)));
+          registry.delete("smd-search-current");
+          if (settledDomRange) registry.set("smd-search-current", new HighlightClass(settledDomRange));
+        }
+        return true;
+      });
+    }
   };
 
   const selectWindowedMatch = (next: number, activeWindowed: WindowedMatch[], host: HTMLElement | null) => {
@@ -673,27 +945,28 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry.delete("smd-search-current");
       if (range) registry.set("smd-search-current", new HighlightClass(range));
     }
-    settleFrames.current[0] = requestAnimationFrame(() => {
-      settleFrames.current[1] = requestAnimationFrame(() => {
-        settleFrames.current = [0, 0];
-        if (indexRef.current !== next || !match.element.isConnected) return;
-        const liveHost = findReadingHost();
-        const liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-        openDisclosuresFor(match.element, match.element, liveRange);
-        const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
-        scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
-        if (registry && HighlightClass) {
-          registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
-          registry.delete("smd-search-current");
-          if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
-        }
-      });
+    scheduleSearchSettle(host ?? match.element, () => {
+      if (sourceSearchRef.current || indexRef.current !== next || !match.element.isConnected) return false;
+      revealMountedBlock(match.element);
+      const liveHost = findReadingHost();
+      openDisclosuresFor(match.element, match.element);
+      let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
+      scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
+      if (registry && HighlightClass) {
+        registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
+        registry.delete("smd-search-current");
+        if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
+      }
+      return true;
     });
   };
 
   const selectDomMatch = (next: number, activeMatches: Range[], host: HTMLElement | null) => {
     const range = activeMatches[next];
     if (!range) return;
+    clearSettleFrames();
     const element = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
     openDisclosuresFor(element, element?.closest(".code-container,details") ?? element, range);
     scrollTargetIntoView(element, host);
@@ -769,6 +1042,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     // Search is a new deliberate navigation, just like pan/zoom. A briefly
     // observing heading jump must not pull the viewport back after this move.
     cancelSettlingHeading();
+    clearSettleFrames();
     pendingAutoSelect.current = false;
     if (regexError) return;
     const current = indexRef.current;

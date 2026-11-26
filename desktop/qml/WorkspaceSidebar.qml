@@ -5,6 +5,7 @@ import QtQuick.Layouts
 Pane {
     id: sidebar
     required property var viewState
+    required property var sidebarState
     property var shortcutLabels: ({})
     property string section: "folder"
     signal sectionEdited(string value)
@@ -35,21 +36,23 @@ Pane {
             Layout.fillWidth: true
             Layout.fillHeight: true
             viewState: sidebar.viewState
+            sidebarState: sidebar.sidebarState
             shortcutLabels: sidebar.shortcutLabels
         }
-        OutlineList { visible: sidebar.section === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebar.viewState.outline || []; noteId: sidebar.viewState.active }
+        OutlineList { objectName: "sidebarOutlineList"; visible: sidebar.section === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebar.sidebarState.outline || []; noteId: sidebar.sidebarState.active }
         Rectangle { Layout.fillWidth: true; height: 1; color: sidebar.viewState.colors.outline }
         Label { text: "Recent notes"; font.weight: Font.DemiBold; color: sidebar.viewState.colors.text }
         RecentNotes {
+            objectName: "sidebarRecentNotes"
             Layout.fillWidth: true
-            Layout.preferredHeight: Math.min(240, sidebar.viewState.recent.length * 40)
+            Layout.preferredHeight: Math.min(240, sidebar.sidebarState.recent.length * 40)
             clip: true
-            model: sidebar.viewState.recent
-            pinned: studio.pinnedRecent
+            model: sidebar.sidebarState.recent
+            pinned: sidebar.sidebarState.pinned
             onOpenRequested: path => studio.openNote(path)
             onPinRequested: path => studio.pinRecent(path)
         }
-        Label { visible: !sidebar.viewState.folder && !sidebar.viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: sidebar.viewState.colors.muted }
+        Label { visible: !sidebar.sidebarState.folder && !sidebar.sidebarState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: sidebar.viewState.colors.muted }
         Rectangle { Layout.fillWidth: true; height: 1; color: sidebar.viewState.colors.outline }
         ActionButton { objectName: "newWindowButton"; text: "New window"; tonal: true; Layout.fillWidth: true; ToolTip.text: sidebar.shortcutHint("New window", "new_window"); onClicked: studio.command("window") }
     }

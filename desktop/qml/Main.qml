@@ -9,12 +9,8 @@ import QtWebChannel
 ApplicationWindow {
     id: window
     signal readerViewChanged(var readerView)
-    onReaderViewChanged: function(view) {
-        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view)
-    }
-    Component.onCompleted: {
-        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader)
-    }
+    onReaderViewChanged: function(view) { if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view) }
+    Component.onCompleted: { if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader) }
     width: 1320
     height: 880
     minimumWidth: 760
@@ -23,6 +19,7 @@ ApplicationWindow {
     flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var reader: readerLoader.item
     property bool sidebar: true
     property bool settingsOpen: false
@@ -49,11 +46,7 @@ ApplicationWindow {
     // Deliberate desktop reveal target; ordinary pointer movement in a note
     // does not summon controls. Scrolling only hides; clicks may toggle them.
     HoverHandler { onPointChanged: { if(window.viewState.fullscreen && point.position.y < 56) window.chromeAwake = true; if(window.chromeAwake) chromeIdle.restart() } }
-    WindowModes {
-        id: windowModes
-        host: window
-        onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) }
-    }
+    WindowModes { id: windowModes; host: window; onFullscreenChanged: { window.chromeAwake = !fullscreen; chromeIdle.stop(); studio.setFullscreen(fullscreen) } }
     WindowResizeEdges { host: window }
     function runDocumentScript(script) {
         if (!reader) return
@@ -256,6 +249,15 @@ ApplicationWindow {
         readerRecoveryMessage = "Reopening the document reader…"
         scheduleReaderRemount(0)
     }
+    function chooseSaveDestination(dialogTitle, folderUrl, fileUrl) {
+        const dialog = saveDestinationComponent.createObject(window, {
+            title: dialogTitle,
+            portableNote: Boolean(viewState.portable),
+            currentFolder: folderUrl,
+            selectedFile: fileUrl
+        })
+        dialog.open()
+    }
     function showExport(share) { sharing = share; outputFormat = "pdf"; exportDialog.open() }
     function chooseExportDestination() {
         // A fresh native chooser for every operation: some portal helpers keep
@@ -291,15 +293,15 @@ ApplicationWindow {
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
-        function onSaveRequested(name) { saveDialog.title = "Save note"; saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
-        function onSaveAsRequested(name) { saveDialog.title = "Save as"; saveDialog.selectedFile = studio.defaultSaveAsLocation(name); saveDialog.open() }
+        function onSaveRequested(name) { window.chooseSaveDestination("Save note", studio.defaultSaveFolder(), studio.defaultSaveLocation(name)) }
+        function onSaveAsRequested(name) { window.chooseSaveDestination("Save as", studio.defaultSaveAsFolder(), studio.defaultSaveAsLocation(name)) }
         function onSaveConflictRequested(name) { flushDialog.close(); closeDialog.close(); saveConflictDialog.title = name + " changed on disk"; if (!saveConflictDialog.visible) saveConflictDialog.open() }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
         function onThemePickerRequested() { themeDialog.open() }
-        function onThemeExportRequested() { themeExportDialog.open() }
+        function onThemeExportRequested() { themeExportDialog.selectedFile = studio.defaultThemeExportLocation("My theme.supermd-theme.json"); themeExportDialog.open() }
         function onReaderLoad(payload) {
             const script = "(function(){if(!window.supermdLoad)return false;window.supermdLoad(" + payload + ");window.supermdChromeInset?.(" + (studio.readerFullscreen ? 56 : 0) + ");document.documentElement.style.setProperty('--native-visible-chrome-inset','" + window.readerVisibleChromeInset + "px');return true})()"
             window.runDocumentScript(script)
@@ -308,14 +310,8 @@ ApplicationWindow {
         function onReaderReloadRequested() { if (window.reader) window.reader.reload() }
         function onChromeRequested(action) { window.chromeAwake = action === "toggle" ? !window.chromeAwake : action === "show"; if(window.chromeAwake) chromeIdle.restart(); else { chromeIdle.stop(); window.focusReader() } }
         function onAgentRequest(payload) { window.routeAgentRequest(payload) }
-        function onWorkspaceSearchChanged() {
-            if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
-            else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
-        }
-        function onWorkspaceFolderDropped() {
-            window.sidebar = true
-            window.sidebarSection = "folder"
-        }
+        function onWorkspaceSearchChanged() { if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open(); else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close() }
+        function onWorkspaceFolderDropped() { window.sidebar = true; window.sidebarSection = "folder" }
     }
     onViewStateChanged: {
         if (!viewState.readerReady) readerStableTimer.stop()
@@ -359,19 +355,13 @@ ApplicationWindow {
     Repeater {
         model: JSON.parse(studio.shortcutActions)
         delegate: Item {
-            required property var modelData
-            width: 0; height: 0
-            Shortcut {
-                sequences: window.shortcutBindings[modelData.id]
-                enabled: !window.capturingShortcut && window.shortcutEnabled(modelData.id)
-                context: Qt.WindowShortcut
-                onActivated: window.activateShortcut(modelData.id)
-            }
+            required property var modelData; width: 0; height: 0
+            Shortcut { sequences: window.shortcutBindings[modelData.id]; enabled: !window.capturingShortcut && window.shortcutEnabled(modelData.id); context: Qt.WindowShortcut; onActivated: window.activateShortcut(modelData.id) }
         }
     }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     FileDialog { id:themeDialog;title:"Import a Super MD theme";fileMode:FileDialog.OpenFile;nameFilters:["Theme files (*.json)"];onAccepted:studio.importCustomTheme(selectedFile.toString()) }
-    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
+    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultThemeExportLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
 
     header: Column {
@@ -392,17 +382,9 @@ ApplicationWindow {
                 ActionButton { glyph: "Undo"; ToolTip.text: window.hintWithShortcut("Undo", "undo"); onClicked: studio.command("undo") }
                 ActionButton { glyph: "Redo"; ToolTip.text: window.hintWithShortcut("Redo", "redo"); onClicked: studio.command("redo") }
                 Item {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    DragHandler {
-                        enabled: studio.fedoraWindowFrame
-                        target: null
-                        onActiveChanged: if (active) window.startSystemMove()
-                    }
-                    TapHandler {
-                        enabled: studio.fedoraWindowFrame
-                        onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
-                    }
+                    Layout.fillWidth: true; Layout.fillHeight: true
+                    DragHandler { enabled: studio.fedoraWindowFrame; target: null; onActiveChanged: if (active) window.startSystemMove() }
+                    TapHandler { enabled: studio.fedoraWindowFrame; onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized() }
                 }
                 ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
                 ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Search across notes", "search_folder"); onClicked: studio.openFolderSearch() }
@@ -428,11 +410,7 @@ ApplicationWindow {
                 WindowControls { visible: studio.showToolbarWindowControls; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
-        TabStrip {
-            width: parent.width
-            viewState: window.viewState
-            shortcutLabels: window.shortcutLabels
-        }
+        TabStrip { width: parent.width; viewState: window.viewState; shortcutLabels: window.shortcutLabels }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
     }
     SplitView {
@@ -441,7 +419,8 @@ ApplicationWindow {
         handle: Rectangle { implicitWidth: 6; color: window.viewState.colors["surface-low"]; Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: SplitHandle.pressed || SplitHandle.hovered ? 3 : 1; height: parent.height; color: SplitHandle.pressed || SplitHandle.hovered ? window.Material.primary : window.viewState.colors.outline } }
         WorkspaceSidebar {
             id: folderSidebar; visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay
-            viewState: window.viewState; shortcutLabels: window.shortcutLabels; section: window.sidebarSection; onSectionEdited: value => window.sidebarSection = value
+            viewState: window.viewState; sidebarState: window.sidebarState; shortcutLabels: window.shortcutLabels
+            section: window.sidebarSection; onSectionEdited: value => window.sidebarSection = value
         }
         Item {
             SplitView.fillWidth: true
@@ -661,7 +640,7 @@ ApplicationWindow {
         }
     }
     ContentsPopup {
-        id: contentsPopup; windowWidth: window.width; windowHeight: window.height; viewState: window.viewState
+        id: contentsPopup; windowWidth: window.width; windowHeight: window.height; viewState: window.viewState; sidebarState: window.sidebarState
         onHeadingChosen: { window.chromeAwake = false; window.focusReader() }
     }
     AppDialog {
@@ -681,7 +660,18 @@ ApplicationWindow {
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
-    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    Component {
+        id: saveDestinationComponent
+        FileDialog {
+            property bool portableNote: false
+            objectName: "saveDestination"
+            title: "Save note"
+            fileMode: FileDialog.SaveFile
+            nameFilters: portableNote ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]
+            onAccepted: { studio.saveAs(selectedFile.toString()); destroy() }
+            onRejected: { studio.resolveClose("cancel"); destroy() }
+        }
+    }
     Component {
         id: exportDestinationComponent
         FileDialog {

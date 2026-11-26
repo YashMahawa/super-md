@@ -14,6 +14,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+from core.paths import DESKTOP_DIR, SOURCE_ROOT, resource_root
+
 try:
     from . import documents
     from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _scan_read_only, _symlink_component
@@ -164,10 +166,9 @@ def find_engine(explicit: str | os.PathLike[str] | None = None) -> Path:
             return candidate
         raise AgentDocumentError("Native export engine is not a file")
     executable = "smd-engine.exe" if os.name == "nt" else "smd-engine"
-    desktop_dir = Path(__file__).resolve().parent
-    packaged = (Path(sys._MEIPASS) / "resources" / "desktop" / executable,) if getattr(sys, "frozen", False) else ()
-    candidates = (*packaged, desktop_dir / executable, desktop_dir.parent / "smd-core" / "target" / "release" / executable,
-                  desktop_dir.parent / "smd-core" / "target" / "debug" / executable)
+    packaged = (resource_root() / "desktop" / executable,) if getattr(sys, "frozen", False) else ()
+    candidates = (*packaged, DESKTOP_DIR / executable, SOURCE_ROOT / "smd-core" / "target" / "release" / executable,
+                  SOURCE_ROOT / "smd-core" / "target" / "debug" / executable)
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()

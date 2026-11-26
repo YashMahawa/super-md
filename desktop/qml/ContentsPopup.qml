@@ -6,6 +6,7 @@ Popup {
     id: popup
     objectName: "contentsOverlay"
     required property var viewState
+    required property var sidebarState
     required property real windowWidth
     required property real windowHeight
     signal headingChosen()
@@ -24,10 +25,11 @@ Popup {
             ActionButton { glyph: "X"; compact: true; ToolTip.text: "Close contents"; onClicked: popup.close() }
         }
         OutlineList {
+            objectName: "popupOutlineList"
             Layout.fillWidth: true
             Layout.fillHeight: true
-            entries: popup.viewState.outline || []
-            noteId: popup.viewState.active
+            entries: popup.sidebarState.outline || []
+            noteId: popup.sidebarState.active
             onChosen: { popup.close(); popup.headingChosen() }
         }
     }
