@@ -13,6 +13,32 @@ const findReadingHost = () => document.querySelector<HTMLElement>(".android-read
 type HighlightRegistry = Map<string, unknown>;
 type SourceRange = { from: number; to: number };
 const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
+const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
+const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|document-properties|is-offstage)(?:\s|$)/;
+const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
+
+function isHiddenOrExcludedSearchElement(el: Element): boolean {
+  if (EXCLUDED_SEARCH_TAGS.has(el.localName)) return true;
+  if (!el.hasAttributes()) return false;
+  const cls = el.className;
+  const hasClassString = typeof cls === "string" && cls.length > 0;
+  if (hasClassString && EXCLUDED_SEARCH_CLASS_PATTERN.test(cls)) return true;
+  if (
+    el.getAttribute("data-windowed-mounted") === "false" ||
+    el.hasAttribute("hidden") ||
+    el.hasAttribute("inert") ||
+    el.hasAttribute("data-frontmatter-properties")
+  ) {
+    return true;
+  }
+  if (el.getAttribute("aria-hidden") === "true" && !el.classList.contains("katex-html")) return true;
+  const inlineStyle = el.getAttribute("style");
+  if (inlineStyle && (inlineStyle.includes("none") || inlineStyle.includes("hidden"))) {
+    const style = (el as HTMLElement).style;
+    if (style && (style.display === "none" || style.visibility === "hidden")) return true;
+  }
+  return false;
+}
 
 export function nextSearchIndex(index: number, direction: number, count: number): number {
   if (count <= 0) return -1;
@@ -297,9 +323,11 @@ function mapSourceRangeToDomRange(block: HTMLElement, content: string, ranges: S
   if (!owner || !isDirectVisibleMatch(owner, content, target)) return null;
   const domRanges = directOwnerDomRanges(owner, query, options);
   if (!domRanges.length) return null;
+  const ownerBounds = sourceBounds(owner, content);
   let ordinal = 0;
   for (let i = 0; i < activeIndex; i++) {
     const candidate = ranges[i];
+    if (ownerBounds && (candidate.from < ownerBounds.start || candidate.to > ownerBounds.end)) continue;
     if (deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate)) ordinal++;
   }
   return domRanges[ordinal] ?? null;
@@ -316,9 +344,11 @@ function mapDomRangeToSourceIndex(host: Element, content: string, ranges: Source
     const domRanges = directOwnerDomRanges(owner, query, options);
     const ordinal = domRanges.findIndex(r => sameDomRange(r, domRange));
     if (ordinal >= 0) {
+      const ownerBounds = sourceBounds(owner, content);
       let seen = 0;
       for (let i = 0; i < ranges.length; i++) {
         const candidate = ranges[i];
+        if (ownerBounds && (candidate.from < ownerBounds.start || candidate.to > ownerBounds.end)) continue;
         const block = findContainingBlock(host, candidate, content);
         if (block && deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate)) {
           if (seen === ordinal) return i;
@@ -354,21 +384,40 @@ export function resolveSourceHighlightRange(host: Element, content: string, rang
   return mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options);
 }
 
-export function readingMatches(host: Element, query: string, options: SearchMatchConfig = false): Range[] {
-  const { pattern } = compileSearchPattern(query, options, false);
-  if (!pattern) return [];
-  const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT);
-  const parts: Array<{ node: Text; start: number; end: number }> = [];
-  let text = "", node: Node | null, block: Element | null = null;
-  while ((node = walker.nextNode())) {
-    const parent = node.parentElement;
-    if (!parent || parent.closest("button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools,.image-loading,.image-error,.remote-image-card,[data-frontmatter-properties],.document-properties")) continue;
-    const nextBlock = parent.closest("p,h1,h2,h3,h4,li,pre,td,summary");
-    if (block !== nextBlock) { text += "\n"; block = nextBlock; }
-    const value = node.textContent || "";
-    parts.push({ node: node as Text, start: text.length, end: text.length + value.length });
-    text += value;
-  }
+function collectSearchText(
+  root: Element,
+  initialBlock: Element | null,
+  state: { parts: Array<{ node: Text; start: number; end: number }>; text: string; block: Element | null },
+): void {
+  const walk = (el: Element, currentBlock: Element | null) => {
+    for (let child = el.firstChild; child; child = child.nextSibling) {
+      const nt = child.nodeType;
+      if (nt === Node.TEXT_NODE) {
+        const value = (child as Text).data;
+        if (!value) continue;
+        if (state.block !== currentBlock) {
+          state.text += "\n";
+          state.block = currentBlock;
+        }
+        const start = state.text.length;
+        state.parts.push({ node: child as Text, start, end: start + value.length });
+        state.text += value;
+      } else if (nt === Node.ELEMENT_NODE) {
+        const childEl = child as Element;
+        if (isHiddenOrExcludedSearchElement(childEl)) continue;
+        walk(childEl, SEARCH_BLOCK_TAGS.has(childEl.localName) ? childEl : currentBlock);
+      }
+    }
+  };
+  walk(root, initialBlock);
+}
+
+function matchPartsToRanges(
+  parts: Array<{ node: Text; start: number; end: number }>,
+  text: string,
+  pattern: RegExp,
+): Range[] {
+  if (!parts.length) return [];
   // Case folding can expand Unicode characters and invalidate DOM offsets.
   // Regex matches retain the original UTF-16 positions instead.
   const ranges: Range[] = [];
@@ -380,12 +429,26 @@ export function readingMatches(host: Element, query: string, options: SearchMatc
     while (lastIndex < parts.length && parts[lastIndex].end < end) lastIndex++;
     const first = parts[firstIndex], last = parts[lastIndex];
     if (!first || !last) continue;
+    const startOffset = Math.max(0, Math.min(first.node.length, start - first.start));
+    const endOffset = Math.max(0, Math.min(last.node.length, end - last.start));
+    if (first.node === last.node && startOffset >= endOffset) continue;
     const range = document.createRange();
-    range.setStart(first.node, Math.max(0, start - first.start));
-    range.setEnd(last.node, end - last.start);
+    range.setStart(first.node, startOffset);
+    range.setEnd(last.node, endOffset);
     ranges.push(range);
   }
   return ranges;
+}
+
+export function readingMatches(host: Element, query: string, options: SearchMatchConfig = false): Range[] {
+  const { pattern } = compileSearchPattern(query, options, false);
+  if (!pattern) return [];
+  for (let anc: Element | null = host; anc; anc = anc.parentElement) {
+    if (isHiddenOrExcludedSearchElement(anc)) return [];
+  }
+  const state = { parts: [] as Array<{ node: Text; start: number; end: number }>, text: "", block: null as Element | null };
+  collectSearchText(host, host.closest("p,h1,h2,h3,h4,li,pre,td,summary"), state);
+  return matchPartsToRanges(state.parts, state.text, pattern);
 }
 
 export function replaceSourceMatches(content: string, query: string, replacement: string, options: SearchMatchConfig = false, index?: number): string {
@@ -459,21 +522,48 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     cancelAnimationFrame(settleFrames.current[1]);
     settleFrames.current = [0, 0];
   };
+  const sourceCacheRef = useRef<{
+    content: string;
+    query: string;
+    caseSensitive: boolean;
+    wholeWord: boolean;
+    regexp: boolean;
+    ranges: SourceRange[];
+  } | null>(null);
+  const getSourceRanges = (text = content, q = query, opts: SearchMatchOptions = filterOptions): SourceRange[] => {
+    const cs = Boolean(opts.caseSensitive), ww = Boolean(opts.wholeWord), rx = Boolean(opts.regexp);
+    const cached = sourceCacheRef.current;
+    if (cached && cached.content === text && cached.query === q && cached.caseSensitive === cs && cached.wholeWord === ww && cached.regexp === rx) {
+      return cached.ranges;
+    }
+    const computed = sourceMatches(text, q, { caseSensitive: cs, wholeWord: ww, regexp: rx });
+    sourceCacheRef.current = { content: text, query: q, caseSensitive: cs, wholeWord: ww, regexp: rx, ranges: computed };
+    return computed;
+  };
   const registry = typeof CSS === "undefined" ? undefined : (CSS as typeof CSS & { highlights?: HighlightRegistry }).highlights;
   const HighlightClass = (window as typeof window & { Highlight?: new (...ranges: Range[]) => unknown }).Highlight;
 
-  const mapSourceIndexToRendered = (sourceIdx: number): number => {
+  const mapSourceIndexToRendered = (
+    sourceIdx: number,
+    activeSourceRanges: SourceRange[] = sourceRanges,
+    knownWindowed?: WindowedMatch[] | null,
+    knownMatches?: Range[],
+  ): number => {
     if (sourceIdx < 0 || regexError) return -1;
-    const sr = sourceRanges[sourceIdx];
+    const sr = activeSourceRanges[sourceIdx];
     const host = findReadingHost();
     if (!sr || !host) return -1;
     const block = findContainingBlock(host, sr, content);
     if (!block) return -1;
-    const liveWindowed = windowed && windowed.every(w => w.element.isConnected && host.contains(w.element)) ? windowed : windowedMatches(host, query, filterOptions);
+    const liveWindowed = knownWindowed !== undefined
+      ? knownWindowed
+      : windowed && windowed.every(w => w.element.isConnected && host.contains(w.element))
+        ? windowed
+        : windowedMatches(host, query, filterOptions);
     if (liveWindowed) {
       if (!liveWindowed.length) return -1;
       if (!block.closest('[data-windowed-mounted="false"]')) {
-        const resolved = mapSourceRangeToDomRange(block, content, sourceRanges, sourceIdx, query, filterOptions);
+        const resolved = mapSourceRangeToDomRange(block, content, activeSourceRanges, sourceIdx, query, filterOptions);
         if (!resolved) return -1;
         for (let i = 0; i < liveWindowed.length; i++) {
           const w = liveWindowed[i];
@@ -485,20 +575,47 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       }
       const owner = deepestSourceOwner(block, sr, content);
       if (owner && !isDirectVisibleMatch(owner, content, sr)) return -1;
+      const wBlock = block.closest<HTMLElement>("[data-windowed-block]") ?? block;
+      const wBounds = sourceBounds(wBlock, content);
+      let targetOrdinal = 0;
+      if (wBounds) {
+        for (let i = 0; i < sourceIdx; i++) {
+          const prev = activeSourceRanges[i];
+          if (prev.from >= wBounds.start && prev.to <= wBounds.end && isDirectVisibleMatch(wBlock, content, prev)) {
+            targetOrdinal++;
+          }
+        }
+      }
+      const exactIdx = liveWindowed.findIndex(w => w.element === wBlock && w.ordinal === targetOrdinal);
+      if (exactIdx >= 0) return exactIdx;
       return liveWindowed.findIndex(w => {
         const b = sourceBounds(w.element, content);
         return b !== null && sr.from >= b.start && sr.to <= b.end;
       });
     }
-    const liveMatches = matches.length && matches[0].startContainer.nodeType === Node.TEXT_NODE && host.contains(matches[0].startContainer) ? matches : readingMatches(host, query, filterOptions);
+    const liveMatches = knownMatches !== undefined
+      ? knownMatches
+      : matches.length && matches[0].startContainer.nodeType === Node.TEXT_NODE && host.contains(matches[0].startContainer)
+        ? matches
+        : readingMatches(host, query, filterOptions);
     if (!liveMatches.length) return -1;
-    const resolved = mapSourceRangeToDomRange(block, content, sourceRanges, sourceIdx, query, filterOptions);
+    const resolved = mapSourceRangeToDomRange(block, content, activeSourceRanges, sourceIdx, query, filterOptions);
     return resolved ? liveMatches.findIndex(m => sameDomRange(m, resolved)) : -1;
   };
 
   useEffect(() => {
     if (!canReplace && replacing) {
-      const nextIndex = !sourceSession && indexRef.current >= 0 ? mapSourceIndexToRendered(indexRef.current) : indexRef.current;
+      const activeSourceRanges = regexError ? [] : (sourceRanges.length || !query ? sourceRanges : getSourceRanges());
+      const host = findReadingHost();
+      const liveWindowed = !sourceSession && host && !regexError ? windowedMatches(host, query, filterOptions) : null;
+      const liveMatches = !sourceSession && host && !liveWindowed && !regexError ? readingMatches(host, query, filterOptions) : [];
+      if (!sourceSession) {
+        setWindowed(liveWindowed);
+        setMatches(liveMatches);
+      }
+      const nextIndex = !sourceSession && indexRef.current >= 0
+        ? (regexError ? -1 : mapSourceIndexToRendered(indexRef.current, activeSourceRanges, liveWindowed, liveMatches))
+        : indexRef.current;
       setReplacing(false);
       if (nextIndex !== indexRef.current) updateIndex(nextIndex);
     }
@@ -590,24 +707,28 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const toggleReplacing = (nextReplacing = !activeReplacing) => {
     if (!canReplaceRef.current || nextReplacing === activeReplacing) return;
     let nextIndex = indexRef.current;
-    if (!sourceSession && nextIndex >= 0) {
-      const host = findReadingHost();
-      const liveWindowed = windowed && windowed.every(w => w.element.isConnected && Boolean(host?.contains(w.element))) ? windowed : (host && !regexError ? windowedMatches(host, query, filterOptions) : null);
-      if (nextReplacing) {
-        if (!sourceRanges.length || !host || regexError) nextIndex = -1;
+    if (nextReplacing) {
+      const activeSourceRanges = regexError ? [] : getSourceRanges();
+      setSourceRanges(activeSourceRanges);
+      if (!sourceSession && nextIndex >= 0) {
+        const host = findReadingHost();
+        const liveWindowed = windowed && windowed.every(w => w.element.isConnected && Boolean(host?.contains(w.element)))
+          ? windowed
+          : (host && !regexError ? windowedMatches(host, query, filterOptions) : null);
+        if (!activeSourceRanges.length || !host || regexError) nextIndex = -1;
         else if (liveWindowed) {
           const active = liveWindowed[nextIndex];
           if (!active) nextIndex = -1;
           else if (!active.element.closest('[data-windowed-mounted="false"]')) {
             const domRange = readingMatches(active.element, query, filterOptions)[active.ordinal];
-            const mapped = domRange ? mapDomRangeToSourceIndex(host, content, sourceRanges, domRange, query, filterOptions) : -1;
+            const mapped = domRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, domRange, query, filterOptions) : -1;
             nextIndex = mapped >= 0 ? mapped : -1;
           } else {
             const bounds = sourceBounds(active.element, content);
             let seen = 0, mapped = -1;
             if (bounds) {
-              for (let i = 0; i < sourceRanges.length; i++) {
-                const sr = sourceRanges[i];
+              for (let i = 0; i < activeSourceRanges.length; i++) {
+                const sr = activeSourceRanges[i];
                 if (sr.from >= bounds.start && sr.to <= bounds.end && isDirectVisibleMatch(active.element, content, sr)) {
                   if (seen === active.ordinal) { mapped = i; break; }
                   seen++;
@@ -618,17 +739,26 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
           }
         } else {
           const m = matches[nextIndex];
-          const liveDomRange = m && m.startContainer.nodeType === Node.TEXT_NODE && host.contains(m.startContainer) ? m : readingMatches(host, query, filterOptions)[nextIndex];
-          const mapped = liveDomRange ? mapDomRangeToSourceIndex(host, content, sourceRanges, liveDomRange, query, filterOptions) : -1;
+          const liveDomRange = m && m.startContainer.nodeType === Node.TEXT_NODE && host.contains(m.startContainer)
+            ? m
+            : readingMatches(host, query, filterOptions)[nextIndex];
+          const mapped = liveDomRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, liveDomRange, query, filterOptions) : -1;
           nextIndex = mapped >= 0 ? mapped : -1;
         }
-      } else {
-        const sr = sourceRanges[nextIndex];
+      }
+    } else if (!sourceSession) {
+      const activeSourceRanges = regexError ? [] : (sourceRanges.length || !query ? sourceRanges : getSourceRanges());
+      const host = findReadingHost();
+      if (nextIndex >= 0 && !regexError) {
+        const sr = activeSourceRanges[nextIndex];
         const block = sr && host ? findContainingBlock(host, sr, content) : null;
         if (block) revealMountedBlock(block);
-        if (host && !liveWindowed && !regexError) setMatches(readingMatches(host, query, filterOptions));
-        nextIndex = mapSourceIndexToRendered(nextIndex);
       }
+      const liveWindowed = host && !regexError ? windowedMatches(host, query, filterOptions) : null;
+      const liveMatches = host && !liveWindowed && !regexError ? readingMatches(host, query, filterOptions) : [];
+      setWindowed(liveWindowed);
+      setMatches(liveMatches);
+      if (nextIndex >= 0) nextIndex = regexError ? -1 : mapSourceIndexToRendered(nextIndex, activeSourceRanges, liveWindowed, liveMatches);
     }
     setReplacing(nextReplacing);
     if (nextIndex !== indexRef.current) updateIndex(nextIndex);
@@ -639,10 +769,11 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     // Search is a new deliberate navigation, just like pan/zoom. A briefly
     // observing heading jump must not pull the viewport back after this move.
     cancelSettlingHeading();
+    pendingAutoSelect.current = false;
     if (regexError) return;
     const current = indexRef.current;
     if (sourceSearch) {
-      const activeSourceRanges = sourceRanges.length || !query ? sourceRanges : sourceMatches(content, query, filterOptions);
+      const activeSourceRanges = sourceRanges.length || !query ? sourceRanges : getSourceRanges();
       const next = nextSearchIndex(current, direction, activeSourceRanges.length);
       if (next < 0) return;
       updateIndex(next);
@@ -670,7 +801,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!target) return;
     const nextContent = replaceSourceMatches(content, query, replacement, filterOptions, index);
     const replacedEnd = target.to + (nextContent.length - content.length);
-    const nextRanges = sourceMatches(nextContent, query, filterOptions);
+    const nextRanges = getSourceRanges(nextContent, query, filterOptions);
     const nextIndex = !nextRanges.length ? -1 : (() => { const found = nextRanges.findIndex(r => r.from >= replacedEnd); return found >= 0 ? found : 0; })();
     if (nextContent === content) {
       updateIndex(nextIndex);
@@ -738,16 +869,18 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const criteriaChanged = prev.query !== query || prev.caseSensitive !== caseSensitive || prev.wholeWord !== wholeWord || prev.regexp !== regexp;
     const contentChanged = prev.content !== content;
     prevState.current = { query, content, caseSensitive, wholeWord, regexp };
-    const nextSourceRanges = regexError ? [] : sourceMatches(content, query, filterOptions);
-    setSourceRanges(nextSourceRanges);
+    // Only evaluate the source-search pipeline when Source/Split editor search or
+    // Replace-in-source is active; rendered Read/Live Find skips scanning raw source.
+    const nextSourceRanges = regexError || !sourceSearch ? [] : getSourceRanges();
+    setSourceRanges(prevRanges => (prevRanges.length === 0 && nextSourceRanges.length === 0 ? prevRanges : nextSourceRanges));
     if (sourceSession) editorFindQuery(sourceSession, regexError ? "" : query, caseSensitive, { wholeWord, regexp });
     const autoSelect = pendingAutoSelect.current;
-    pendingAutoSelect.current = false;
     let targetIndex = indexRef.current;
     let shouldScrollReplaced = false;
     if (autoSelect && !regexError) {
       pendingReplaceIndex.current = null;
     } else if (criteriaChanged || regexError) {
+      pendingAutoSelect.current = false;
       pendingReplaceIndex.current = null;
       targetIndex = -1;
       if (indexRef.current !== -1) updateIndex(-1);
@@ -764,40 +897,77 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       updateIndex(targetIndex);
     }
     const frame = requestAnimationFrame(() => {
-      if (!autoSelect && shouldScrollReplaced && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
+      const runAutoSelect = pendingAutoSelect.current;
+      pendingAutoSelect.current = false;
+      if (!runAutoSelect && shouldScrollReplaced && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
         revealAndHighlightSource(targetIndex, nextSourceRanges, content, true);
       }
       const host = findReadingHost();
-      const nextWindowed = host && !regexError ? windowedMatches(host, query, filterOptions) : null;
-      const result = host && !regexError ? readingMatches(host, query, filterOptions) : [];
-      setWindowed(nextWindowed);
-      setMatches(result);
-      if (autoSelect && !regexError) {
-        if (sourceSearchRef.current && nextSourceRanges.length) {
-          updateIndex(0);
-          revealAndHighlightSource(0, nextSourceRanges, content, true);
-          return;
+      if (regexError) {
+        setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
+        setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
+        registry?.delete("smd-search");
+        registry?.delete("smd-search-current");
+        return;
+      }
+      if (sourceSearchRef.current) {
+        const activeRanges = nextSourceRanges.length || !query ? nextSourceRanges : getSourceRanges();
+        setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
+        setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
+        if (runAutoSelect) {
+          if (activeRanges.length) {
+            updateIndex(0);
+            revealAndHighlightSource(0, activeRanges, content, true);
+            return;
+          }
+          updateIndex(-1);
         }
-        if (nextWindowed && nextWindowed.length) { selectWindowedMatch(0, nextWindowed, host); return; }
+        if (host && registry && HighlightClass) {
+          const visible = activeRanges.length ? readingMatches(host, query, filterOptions) : [];
+          registry.set("smd-search", new HighlightClass(...visible));
+          if (shouldScrollReplaced && targetIndex >= 0) {
+            registry.delete("smd-search-current");
+            const domRange = resolveSourceHighlightRange(host, content, activeRanges, targetIndex, query, filterOptions);
+            if (domRange) registry.set("smd-search-current", new HighlightClass(domRange));
+          } else if (indexRef.current < 0) {
+            registry.delete("smd-search-current");
+          }
+        }
+        return;
+      }
+      const nextWindowed = host ? windowedMatches(host, query, filterOptions) : null;
+      if (nextWindowed !== null) {
+        setWindowed(nextWindowed);
+        setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
+        if (runAutoSelect) {
+          if (nextWindowed.length) { selectWindowedMatch(0, nextWindowed, host); return; }
+          updateIndex(-1);
+        } else if (!criteriaChanged && !contentChanged && indexRef.current >= nextWindowed.length) {
+          updateIndex(nextWindowed.length - 1);
+        }
+        if (host && registry && HighlightClass) {
+          const visible = nextWindowed.length ? readingMatches(host, query, filterOptions) : [];
+          registry.set("smd-search", new HighlightClass(...visible));
+          if (indexRef.current < 0) registry.delete("smd-search-current");
+        }
+        return;
+      }
+      const result = host ? readingMatches(host, query, filterOptions) : [];
+      setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
+      setMatches(result);
+      if (runAutoSelect) {
         if (result.length) {
           if (registry && HighlightClass) registry.set("smd-search", new HighlightClass(...result));
           selectDomMatch(0, result, host);
           return;
         }
         updateIndex(-1);
-      } else if (!sourceSearch && !criteriaChanged && !contentChanged && !regexError) {
-        const total = nextWindowed?.length ?? result.length;
-        if (indexRef.current >= total) updateIndex(total - 1);
+      } else if (!criteriaChanged && !contentChanged && indexRef.current >= result.length) {
+        updateIndex(result.length - 1);
       }
       if (registry && HighlightClass) {
         registry.set("smd-search", new HighlightClass(...result));
-        if (shouldScrollReplaced && targetIndex >= 0 && host) {
-          registry.delete("smd-search-current");
-          const domRange = resolveSourceHighlightRange(host, content, nextSourceRanges, targetIndex, query, filterOptions);
-          if (domRange) registry.set("smd-search-current", new HighlightClass(domRange));
-        } else if (indexRef.current < 0 || regexError) {
-          registry.delete("smd-search-current");
-        }
+        if (indexRef.current < 0) registry.delete("smd-search-current");
       }
     });
     return () => {
@@ -807,7 +977,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry?.delete("smd-search-current");
       if (sourceSession) editorFindQuery(sourceSession, "", false);
     };
-  }, [query, content, caseSensitive, wholeWord, regexp, sourceSession, canReplace, seed?.nonce]);
+  }, [query, content, caseSensitive, wholeWord, regexp, sourceSearch, sourceSession, canReplace, seed?.nonce]);
 
   useEffect(() => {
     if (!registry || !HighlightClass) return;
@@ -859,13 +1029,13 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   }, [windowed, sourceSearch, sourceRanges, content, query, caseSensitive, wholeWord, regexp, regexError]);
 
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
-    <input ref={input} aria-label="Find in note" aria-invalid={!!regexError || undefined} role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
+    <input ref={input} aria-label="Find in note" aria-invalid={!!regexError || undefined} role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => { pendingAutoSelect.current = false; setQuery(event.target.value); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
     <output aria-live="polite" className={regexError ? "search-error" : undefined} title={regexError ? regexError : count >= 5000 ? "Showing the first 5,000 matches. Narrow your search to find later results." : undefined}>{regexError ? regexError : count ? `${index < 0 ? 0 : index + 1} / ${count}${count >= 5000 ? "+" : ""}` : query ? "No matches" : ""}</output>
     <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={() => move(-1)} title="Previous match (Shift+Enter / Shift+F3)"><ArrowUpIcon size={20} weight="bold" /></button>
     <button className="search-icon" aria-label="Next match" disabled={!count} onClick={() => move(1)} title="Next match (Enter / F3)"><ArrowDownIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={caseSensitive} onClick={() => setCaseSensitive(!caseSensitive)} title="Match case" aria-label="Match case"><TextAaIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={wholeWord} onClick={() => setWholeWord(!wholeWord)} title="Match whole word" aria-label="Match whole word"><TextboxIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={regexp} onClick={() => setRegexp(!regexp)} title="Regular expression" aria-label="Regular expression"><AsteriskIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={caseSensitive} onClick={() => { pendingAutoSelect.current = false; setCaseSensitive(!caseSensitive); }} title="Match case" aria-label="Match case"><TextAaIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={wholeWord} onClick={() => { pendingAutoSelect.current = false; setWholeWord(!wholeWord); }} title="Match whole word" aria-label="Match whole word"><TextboxIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={regexp} onClick={() => { pendingAutoSelect.current = false; setRegexp(!regexp); }} title="Regular expression" aria-label="Regular expression"><AsteriskIcon size={20} weight="bold" /></button>
     {canReplace && <button className="search-icon" aria-pressed={activeReplacing} onClick={() => toggleReplacing()} title="Replace in source (Ctrl+H)" aria-label="Replace in source"><ArrowsClockwiseIcon size={20} weight="bold" /></button>}
     <button className="search-icon" onClick={close} title="Close search (Esc)" aria-label="Close search"><XIcon size={20} weight="bold" /></button>
     {activeReplacing && onChange && <div className="search-replace"><input aria-label="Replacement text" placeholder="Replace with" value={replacement} onChange={e => setReplacement(e.target.value)} /><button disabled={!query || !!regexError || !count || index < 0} onClick={handleSingleReplace}>Replace</button><button disabled={!query || !!regexError || !count} onClick={handleReplaceAll}>Replace all</button><small>{regexError ? `${regexError}.` : regexp ? "Replaces regex matches in Markdown source ($1, $&, $$ supported)." : "Replaces literal text in Markdown source."}</small></div>}

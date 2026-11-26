@@ -709,18 +709,96 @@ def atomic_write(path: Path, data: bytes) -> None:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def _write_json_str(raw, text: str) -> None:
+    if type(text) is str and _is_cached_validated_asset(text):
+        raw.write(b'"')
+        for offset in range(0, len(text), _B64_DECODE_CHUNK):
+            raw.write(text[offset:offset + _B64_DECODE_CHUNK].encode("ascii"))
+        raw.write(b'"')
+        return
+    if len(text) <= _B64_DECODE_CHUNK:
+        raw.write(json.dumps(text, ensure_ascii=False).encode("utf-8", errors="backslashreplace"))
+        return
+    plain = text if type(text) is str else str(text)
+    raw.write(b'"')
+    for offset in range(0, len(plain), _B64_DECODE_CHUNK):
+        chunk = json.dumps(plain[offset:offset + _B64_DECODE_CHUNK], ensure_ascii=False)[1:-1]
+        raw.write(chunk.encode("utf-8", errors="backslashreplace"))
+    raw.write(b'"')
+
+
+def _write_json_value(raw, value, seen: set[int]) -> None:
+    if isinstance(value, str):
+        _write_json_str(raw, value)
+    elif value is None:
+        raw.write(b"null")
+    elif value is True:
+        raw.write(b"true")
+    elif value is False:
+        raw.write(b"false")
+    elif isinstance(value, (int, float)):
+        raw.write(json.dumps(value).encode("ascii"))
+    elif isinstance(value, (list, tuple)):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("Circular reference detected")
+        seen.add(marker)
+        try:
+            raw.write(b"[")
+            for idx, item in enumerate(value):
+                if idx:
+                    raw.write(b", ")
+                _write_json_value(raw, item, seen)
+            raw.write(b"]")
+        finally:
+            seen.remove(marker)
+    elif isinstance(value, dict):
+        marker = id(value)
+        if marker in seen:
+            raise ValueError("Circular reference detected")
+        seen.add(marker)
+        try:
+            raw.write(b"{")
+            first = True
+            for key, item in value.items():
+                if not first:
+                    raw.write(b", ")
+                first = False
+                if isinstance(key, str):
+                    _write_json_str(raw, key)
+                elif key is None:
+                    raw.write(b'"null"')
+                elif key is True:
+                    raw.write(b'"true"')
+                elif key is False:
+                    raw.write(b'"false"')
+                elif isinstance(key, (int, float)):
+                    raw.write(b'"' + json.dumps(key).encode("ascii") + b'"')
+                else:
+                    raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
+                raw.write(b": ")
+                _write_json_value(raw, item, seen)
+            raw.write(b"}")
+        finally:
+            seen.remove(marker)
+    else:
+        raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def atomic_json(path: Path, value) -> None:
-    """Write ordered recovery without full-workspace JSON + UTF-8 copies."""
+    """Write ordered recovery without full-workspace JSON + UTF-8 copies or long GIL holds."""
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(handle, "w", encoding="utf-8", errors="backslashreplace") as file:
-            if path.exists() and hasattr(os,"fchmod"):
-                os.fchmod(file.fileno(),stat.S_IMODE(path.stat().st_mode))
-            json.dump(value,file,ensure_ascii=False)
-            file.flush();os.fsync(file.fileno())
-        _replace_with_windows_sharing_retry(temporary,path)
+        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as file:
+            if path.exists() and hasattr(os, "fchmod"):
+                os.fchmod(file.fileno(), stat.S_IMODE(path.stat().st_mode))
+            _write_json_value(file, value, set())
+            file.flush()
+            os.fsync(file.fileno())
+        _replace_with_windows_sharing_retry(temporary, path)
     finally:
-        if os.path.exists(temporary):os.unlink(temporary)
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 def materialize_assets(root: Path, assets: dict[str,str]) -> None:
     """Save a portable note as Markdown without dropping its pictures or overwriting others."""
