@@ -461,6 +461,28 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                     app.processEvents()
                 self.assertFalse(second_discovery.exists())
 
+    def test_studio_agent_setup_module_boundary_honors_studio_patches_and_reexports(self):
+        import studio
+        import studio_agent_setup
+
+        self.assertIs(studio.agent_mcp_setup_config, studio_agent_setup.agent_mcp_setup_config)
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            guide_dest = temp / "guide.md"
+            skill_dest = temp / "skill.zip"
+            setup = json.dumps({"command": "/apps/super-md", "args": ["agent", "mcp"]})
+            proxy = SimpleNamespace(agentAccessEnabled=True, agentSetupInstructions=setup,
+                                    cloudAgentConfigured=False, _agent_error="", message="",
+                                    _emit=lambda *args: None)
+            with patch("studio.atomic_write", side_effect=OSError("disk full")):
+                Studio.saveAgentSetupInstructions(proxy, str(guide_dest))
+                self.assertIn("OSError", proxy._agent_error)
+                self.assertFalse(guide_dest.exists())
+                proxy._agent_error = ""
+                self.assertFalse(Studio.exportAgentSkill(proxy, str(skill_dest)))
+                self.assertIn("OSError", proxy._agent_error)
+                self.assertFalse(skill_dest.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
