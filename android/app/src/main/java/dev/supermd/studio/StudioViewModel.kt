@@ -8,8 +8,6 @@ import android.util.Base64
 import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.chaquo.python.Python
-import com.chaquo.python.android.AndroidPlatform
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -44,7 +42,6 @@ private data class UriRemap(
     val oldUri: String,
     val newUri: String,
     val newName: String? = null,
-    val oldRelative: String? = null,
     val newRelative: String? = null,
 )
 
@@ -347,12 +344,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private var initialOpenIntentUri: String? = null
     fun requestOpen(uri: Uri, relative: String? = null) =
         openIntentDispatcher.request(OpenDocumentTarget(uri, externalIntentFlags = null), relative)
-    fun requestInitialOpen(uri: Uri) {
-        val key = uri.toString()
-        if (initialOpenIntentUri == key) return
-        initialOpenIntentUri = key
-        requestOpen(uri)
-    }
     internal fun requestExternalOpen(
         uri: Uri,
         intentFlags: Int,
@@ -806,7 +797,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             delay(200)
             val beforeIo=mutable.value
             val folderSnapshot=beforeIo.folder
-            val relativeSnapshot=normalizeFolderRelative(beforeIo.folderRelative.ifEmpty { listedRelative })
+            val relativeSnapshot=normalizeRelativePath(beforeIo.folderRelative.ifEmpty { listedRelative })
             val listSeqSnapshot=listFolderSeq
             val uris=(beforeIo.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
             val relativeHints=buildMap {
@@ -852,7 +843,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(recents!=recentMutable.value)storeRecent(recents)
             val currentFolder=mutable.value.folder
             if(currentFolder!=null) {
-                val currentRelative=normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { listedRelative })
+                val currentRelative=normalizeRelativePath(mutable.value.folderRelative.ifEmpty { listedRelative })
                 if(currentFolder==folderSnapshot&&currentRelative==relativeSnapshot&&listFolderSeq==listSeqSnapshot&&refreshSnapshot.folderListing!=null) {
                     refreshSnapshot.folderListing.fold(
                         onSuccess = {listing->
@@ -1171,7 +1162,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun restore(): StudioState {
         val restoredFolder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null)
-        val restoredRelative = if (restoredFolder != null) normalizeFolderRelative(windowPrefs.getString("folderRelative", "") ?: "") else ""
+        val restoredRelative = if (restoredFolder != null) normalizeRelativePath(windowPrefs.getString("folderRelative", "") ?: "") else ""
         listedRelative = restoredRelative
         var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = restoredFolder, folderRelative = restoredRelative, pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
         s = s.copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
@@ -1225,7 +1216,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     )
     private fun schedulePersist() { recoveryWriter.schedule(mutable.value) }
     fun flush(): Job? = recoveryWriter.flush(mutable.value)
-    internal suspend fun flushRecoveryAndAwait(): Boolean = recoveryWriter.flushAndAwait(mutable.value)
     // The exact String the reader last sent per note. Echoing it back on every
     // keystroke re-serializes the whole note on both sides and costs battery.
     val readerEcho = java.util.concurrent.ConcurrentHashMap<String, String>()
@@ -2005,7 +1995,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
             }
             val newRelative = renamedRelative(note.relative, name)
-            applyUriRemaps(listOf(UriRemap(existingUri, renamedUri, name, note.relative, newRelative)), statusMessage = "Renamed to $name")
+            applyUriRemaps(listOf(UriRemap(existingUri, renamedUri, name, newRelative)), statusMessage = "Renamed to $name")
             mutable.value.tabs.find { it.id == id }?.let(::remember)
             onResult(true, null)
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -2633,16 +2623,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     fun navigateFolderUp(): Boolean {
         val folderUri = mutable.value.folder ?: return false
-        val current = normalizeFolderRelative(listedRelative)
+        val current = normalizeRelativePath(listedRelative)
         if (current.isEmpty()) return false
-        val parent = parentFolderRelative(current)
+        val parent = parentRelativePath(current)
         listFolder(Uri.parse(folderUri), parent)
         return true
     }
     fun listFolder(uri: Uri, relative: String): Job {
         val seq = ++listFolderSeq
         val invalidPath = hasInvalidSafFolderRelative(relative)
-        val requestedRelative = if (invalidPath) listedRelative else normalizeFolderRelative(relative)
+        val requestedRelative = if (invalidPath) listedRelative else normalizeRelativePath(relative)
         if (!invalidPath) {
             listedRelative = requestedRelative
             mutable.value = mutable.value.copy(folderRelative = requestedRelative)
@@ -3118,7 +3108,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     Triple(
                         finalName,
                         finalRelative,
-                        listOf(UriRemap(entryUri.toString(), renamedUri.toString(), finalName, cleanRelative, finalRelative)),
+                        listOf(UriRemap(entryUri.toString(), renamedUri.toString(), finalName, finalRelative)),
                     )
                 } else {
                     beforeSubtreeNodes.filter { !it.isDirectory }.forEach { oldNode ->
@@ -3144,7 +3134,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             documentAccess.persist(afterNode.treeDocumentUri)
                             canonicalTreeDocumentKey(afterNode.treeDocumentUri)?.let(confirmedTreeDocumentKeys::add)
                         }
-                        UriRemap(oldUri, afterNode.treeDocumentUri.toString(), afterNode.displayName, oldRel, updatedRel)
+                        UriRemap(oldUri, afterNode.treeDocumentUri.toString(), afterNode.displayName, updatedRel)
                     }
                     Triple(finalName, finalRelative, childRemaps)
                 }
@@ -3834,7 +3824,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
 
-    private fun sameAssets(left: JSONObject, right: JSONObject): Boolean = portableAssetsMatch(left, right)
     suspend fun python(code: String): JSONObject = withContext(Dispatchers.IO) {
         pythonExecution.lock()
         val app = getApplication<Application>()

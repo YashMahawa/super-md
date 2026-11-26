@@ -45,10 +45,14 @@ internal fun isSupportedFolderNoteFile(name: String): Boolean =
     !name.startsWith('.') && '.' in name && name.substringAfterLast('.', "").lowercase() in FOLDER_NOTE_EXTENSIONS
 
 internal fun normalizeRelativePath(relative: String?): String =
-    normalizeFolderRelative(relative.orEmpty())
+    relative.orEmpty().split('/').map { it.trim() }
+        .filter { it.isNotEmpty() && it != "." && it != ".." }
+        .joinToString("/")
 
-internal fun parentRelativePath(relative: String): String =
-    parentFolderRelative(relative)
+internal fun parentRelativePath(relative: String): String {
+    val normalized = normalizeRelativePath(relative)
+    return if ('/' in normalized) normalized.substringBeforeLast('/') else ""
+}
 
 internal fun childRelativePath(parentRelative: String, name: String): String {
     val parent = normalizeRelativePath(parentRelative)

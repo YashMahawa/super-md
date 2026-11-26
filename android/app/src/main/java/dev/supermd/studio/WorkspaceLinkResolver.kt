@@ -1,7 +1,6 @@
 package dev.supermd.studio
 
 import android.net.Uri
-import android.provider.DocumentsContract
 
 internal val WORKSPACE_NOTE_EXTENSIONS = listOf("md", "smd", "fmd", "markdown", "txt")
 

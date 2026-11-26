@@ -2,7 +2,6 @@
 
 package dev.supermd.studio
 
-import android.app.Activity
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.provider.Settings
@@ -58,7 +57,6 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
-import org.robolectric.shadows.ShadowWindowManagerGlobal
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], qualifiers = "w360dp-h800dp-xxhdpi")
