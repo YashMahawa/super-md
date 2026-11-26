@@ -1,6 +1,7 @@
 """Control the per-user application service over its private local socket."""
 import argparse,hashlib,json,os,subprocess,sys,time
 from pathlib import Path
+from core.paths import DESKTOP_DIR
 
 def main(argv):
     parser=argparse.ArgumentParser(description='Super MD background service')
@@ -21,7 +22,7 @@ def main(argv):
     running=request(action)
     if args.action=='start' and not running:
         root.mkdir(parents=True,exist_ok=True)
-        command=[sys.executable,'--background','--agent-access'] if getattr(sys,'frozen',False) else [sys.executable,str(Path(__file__).with_name('main.py')),'--background','--agent-access']
+        command=[sys.executable,'--background','--agent-access'] if getattr(sys,'frozen',False) else [sys.executable,str(DESKTOP_DIR/'main.py'),'--background','--agent-access']
         with (root/'background-service.log').open('ab') as log:
             subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=os.name!='nt',creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name=='nt' else 0)
         deadline=time.monotonic()+20

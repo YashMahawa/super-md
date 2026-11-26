@@ -16,9 +16,9 @@ fn is_unescaped_percent_pair(bytes: &[u8], mask: &[bool], at: usize, floor: usiz
 
 /// Strip paired `%%...%%` Obsidian comments outside code spans/blocks and math.
 pub fn strip_percent_comments(input: &str) -> Cow<'_, str> {
-    if !input.contains("%%") {
+    let Some(first_percent) = input.find("%%") else {
         return Cow::Borrowed(input);
-    }
+    };
     let mut mask = vec![false; input.len()];
     let mut in_code_block = false;
     for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
@@ -34,18 +34,32 @@ pub fn strip_percent_comments(input: &str) -> Cow<'_, str> {
         }
     }
     let bytes = input.as_bytes();
-    let mut out = String::with_capacity(input.len());
+    let mut out = String::new();
     let mut cursor = 0usize;
-    let mut i = 0usize;
-    while i + 1 < bytes.len() {
-        if !is_unescaped_percent_pair(bytes, &mask, i, cursor) {
-            i += 1;
+    let mut i = first_percent;
+    while let Some(rel) = input[i..].find("%%") {
+        let open = i + rel;
+        if !is_unescaped_percent_pair(bytes, &mask, open, cursor) {
+            i = open + 1;
             continue;
         }
-        let Some(end) = (i + 2..bytes.len().saturating_sub(1)).find(|&j| is_unescaped_percent_pair(bytes, &mask, j, i + 2)) else {
+        let mut search = open + 2;
+        let mut close = None;
+        while let Some(end_rel) = input[search..].find("%%") {
+            let cand = search + end_rel;
+            if is_unescaped_percent_pair(bytes, &mask, cand, open + 2) {
+                close = Some(cand);
+                break;
+            }
+            search = cand + 1;
+        }
+        let Some(end) = close else {
             break;
         };
-        out.push_str(&input[cursor..i]);
+        if cursor == 0 {
+            out.reserve(input.len());
+        }
+        out.push_str(&input[cursor..open]);
         cursor = end + 2;
         i = cursor;
     }
@@ -196,9 +210,65 @@ fn tokenize_raw_html<'a>(raw: &str, out: &mut Vec<Node<'a>>) {
     flush(&mut literal, out);
 }
 
+fn slice_cow<'a>(cow: &CowStr<'a>, range: std::ops::Range<usize>) -> CowStr<'a> {
+    match cow {
+        CowStr::Borrowed(s) => CowStr::Borrowed(&s[range]),
+        _ => CowStr::from(cow.as_ref()[range].to_string()),
+    }
+}
+
+fn has_study_delim_bytes(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'~' | b'^' => return true,
+            b'=' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn has_enrich_trigger(bytes: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' | b'~' | b'^' => return true,
+            b'=' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn str_has_ws(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b < 128 {
+            if b == b' ' || (0x09..=0x0d).contains(&b) {
+                return true;
+            }
+            i += 1;
+        } else {
+            return s[i..].chars().any(char::is_whitespace);
+        }
+    }
+    false
+}
+
 fn has_break(node: &Node<'_>, reject_spaces: bool) -> bool {
     match node {
-        Node::Text(v, _) => if reject_spaces { v.chars().any(char::is_whitespace) } else { v.contains(['\n', '\r']) },
+        Node::Text(v, _) => {
+            if reject_spaces {
+                str_has_ws(v)
+            } else {
+                v.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r')
+            }
+        }
         Node::Leaf(Event::SoftBreak | Event::HardBreak) => true,
         Node::Group { children, .. } => children.iter().any(|c| has_break(c, reject_spaces)),
         _ => false,
@@ -206,7 +276,10 @@ fn has_break(node: &Node<'_>, reject_spaces: bool) -> bool {
 }
 
 fn fold_html_tags<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
-    let mut out: Vec<Node<'a>> = Vec::new();
+    if !nodes.iter().any(|n| matches!(n, Node::HtmlTag { .. })) {
+        return nodes;
+    }
+    let mut out: Vec<Node<'a>> = Vec::with_capacity(nodes.len());
     let mut stack: Vec<(&'static str, String, Vec<Node<'a>>)> = Vec::new();
     let emit = |item: Node<'a>, stack: &mut Vec<(&'static str, String, Vec<Node<'a>>)>, out: &mut Vec<Node<'a>>| {
         if let Some((_, _, top)) = stack.last_mut() { top.push(item); } else { out.push(item); }
@@ -238,16 +311,29 @@ fn fold_html_tags<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
 }
 
 fn merge_unescaped_text<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
+    if !nodes.windows(2).any(|w| matches!(w, [Node::Text(_, false), Node::Text(_, false)])) {
+        return nodes;
+    }
     let mut out: Vec<Node<'a>> = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        if let Node::Text(val, false) = node {
-            if let Some(Node::Text(prev, false)) = out.last_mut() {
-                let mut combined = prev.to_string();
-                combined.push_str(&val);
-                *prev = CowStr::from(combined);
-                continue;
+    let mut iter = nodes.into_iter().peekable();
+    while let Some(node) = iter.next() {
+        if let Node::Text(first, false) = node {
+            if matches!(iter.peek(), Some(Node::Text(_, false))) {
+                let mut parts: Vec<CowStr<'a>> = vec![first];
+                let mut total_len = parts[0].len();
+                while let Some(Node::Text(_, false)) = iter.peek() {
+                    let Some(Node::Text(next_val, false)) = iter.next() else { unreachable!() };
+                    total_len += next_val.len();
+                    parts.push(next_val);
+                }
+                let mut combined = String::with_capacity(total_len);
+                for part in parts {
+                    combined.push_str(&part);
+                }
+                out.push(Node::Text(CowStr::from(combined), false));
+            } else {
+                out.push(Node::Text(first, false));
             }
-            out.push(Node::Text(val, false));
         } else {
             out.push(node);
         }
@@ -258,14 +344,14 @@ fn merge_unescaped_text<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
 fn apply_study_delimiters<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
     enum Piece<'a> {
         Node(Node<'a>),
-        Text(String, bool),
+        Text(CowStr<'a>, bool),
         Delim { kind: DelimKind, can_open: bool, can_close: bool },
     }
-    fn to_nodes<'a>(pieces: Vec<Piece<'a>>) -> Vec<Node<'a>> {
+    fn to_nodes<'a, I: IntoIterator<Item = Piece<'a>>>(pieces: I) -> Vec<Node<'a>> {
         merge_unescaped_text(pieces.into_iter().filter_map(|p| match p {
             Piece::Node(n) => Some(n),
-            Piece::Text(s, esc) => (!s.is_empty()).then(|| Node::Text(CowStr::from(s), esc)),
-            Piece::Delim { kind, .. } => Some(Node::Text(CowStr::from(match kind {
+            Piece::Text(s, esc) => (!s.is_empty()).then_some(Node::Text(s, esc)),
+            Piece::Delim { kind, .. } => Some(Node::Text(CowStr::Borrowed(match kind {
                 DelimKind::Highlight => "==",
                 DelimKind::Sub => "~",
                 DelimKind::Sup => "^",
@@ -296,10 +382,10 @@ fn apply_study_delimiters<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
     }
 
     let nodes = merge_unescaped_text(nodes);
-    if !nodes.iter().any(|n| matches!(n, Node::Text(s, false) if s.contains(['=', '~', '^']))) {
+    if !nodes.iter().any(|n| matches!(n, Node::Text(s, false) if has_study_delim_bytes(s.as_bytes()))) {
         return nodes;
     }
-    let mut pieces: Vec<Piece<'a>> = Vec::new();
+    let mut pieces: Vec<Piece<'a>> = Vec::with_capacity(nodes.len() + 4);
     let mut saw_delim = false;
     let mut iter = nodes.into_iter().peekable();
     let mut prev_b: Option<char> = None;
@@ -311,16 +397,17 @@ fn apply_study_delimiters<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
             prev_b = cur_end_b;
             continue;
         };
-        let s = val.as_ref();
-        if !s.contains(['=', '~', '^']) {
-            pieces.push(Piece::Text(s.to_string(), false));
+        let bytes = val.as_bytes();
+        if !has_study_delim_bytes(bytes) {
+            pieces.push(Piece::Text(val, false));
             prev_b = cur_end_b;
             continue;
         }
-        let bytes = s.as_bytes();
-        let mut buf = String::new();
+        let s = val.as_ref();
+        let mut seg_start = 0usize;
+        let mut split = false;
         let mut i = 0usize;
-        while i < s.len() {
+        while i < bytes.len() {
             let b = bytes[i];
             if matches!(b, b'=' | b'~' | b'^') {
                 let run = 1 + bytes[i + 1..].iter().take_while(|&&c| c == b).count();
@@ -329,59 +416,108 @@ fn apply_study_delimiters<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
                     let after = if i + run < s.len() { s[i + run..].chars().next() } else { next_b };
                     let (can_open, can_close) = delim_flanking(b, before, after);
                     if can_open || can_close {
-                        if !buf.is_empty() {
-                            pieces.push(Piece::Text(std::mem::take(&mut buf), false));
+                        if i > seg_start {
+                            pieces.push(Piece::Text(slice_cow(&val, seg_start..i), false));
                         }
+                        split = true;
                         saw_delim = true;
                         let kind = match b { b'=' => DelimKind::Highlight, b'~' => DelimKind::Sub, _ => DelimKind::Sup };
                         pieces.push(Piece::Delim { kind, can_open, can_close });
                         i += run;
+                        seg_start = i;
                         continue;
                     }
                 }
-                buf.push_str(&s[i..i + run]);
                 i += run;
                 continue;
             }
-            let ch = s[i..].chars().next().unwrap();
-            buf.push(ch);
-            i += ch.len_utf8();
+            i += 1;
         }
-        if !buf.is_empty() {
-            pieces.push(Piece::Text(buf, false));
+        if !split {
+            pieces.push(Piece::Text(val, false));
+        } else if seg_start < s.len() {
+            pieces.push(Piece::Text(slice_cow(&val, seg_start..s.len()), false));
         }
         prev_b = cur_end_b;
     }
     if !saw_delim {
         return to_nodes(pieces);
     }
-    let valid = |kind: DelimKind, slice: &[Piece<'_>]| -> bool {
-        let reject_spaces = kind != DelimKind::Highlight;
-        !slice.is_empty() && !slice.iter().any(|p| match p {
-            Piece::Text(s, _) => if reject_spaces { s.chars().any(char::is_whitespace) } else { s.contains(['\n', '\r']) },
-            Piece::Node(n) => has_break(n, reject_spaces),
-            Piece::Delim { .. } => false,
-        })
-    };
-    let mut working: Vec<Piece<'a>> = Vec::new();
-    let mut openers: Vec<(usize, DelimKind)> = Vec::new();
+
+    let mut working: Vec<Piece<'a>> = Vec::with_capacity(pieces.len());
+    let mut hl_openers: Vec<usize> = Vec::new();
+    let mut sub_openers: Vec<usize> = Vec::new();
+    let mut sup_openers: Vec<usize> = Vec::new();
+    let mut changed = false;
+
     for piece in pieces {
         let Piece::Delim { kind, can_open, can_close } = piece else {
+            if !hl_openers.is_empty() || !sub_openers.is_empty() || !sup_openers.is_empty() {
+                match &piece {
+                    Piece::Text(s, _) => {
+                        if !hl_openers.is_empty() && s.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r') {
+                            hl_openers.clear();
+                            sub_openers.clear();
+                            sup_openers.clear();
+                        } else if (!sub_openers.is_empty() || !sup_openers.is_empty()) && str_has_ws(s) {
+                            sub_openers.clear();
+                            sup_openers.clear();
+                        }
+                    }
+                    Piece::Node(n) => {
+                        if !hl_openers.is_empty() && has_break(n, false) {
+                            hl_openers.clear();
+                            sub_openers.clear();
+                            sup_openers.clear();
+                        } else if (!sub_openers.is_empty() || !sup_openers.is_empty()) && has_break(n, true) {
+                            sub_openers.clear();
+                            sup_openers.clear();
+                        }
+                    }
+                    Piece::Delim { .. } => unreachable!(),
+                }
+            }
             working.push(piece);
             continue;
         };
-        if let Some(open_idx) = can_close.then(|| openers.iter().rposition(|(pos, k)| *k == kind && valid(kind, &working[*pos + 1..]))).flatten() {
-            let (pos, _) = openers[open_idx];
-            openers.truncate(open_idx);
-            let inner = to_nodes(working.drain(pos + 1..).collect());
+
+        let stack = match kind {
+            DelimKind::Highlight => &mut hl_openers,
+            DelimKind::Sub => &mut sub_openers,
+            DelimKind::Sup => &mut sup_openers,
+        };
+        let match_idx = if can_close && !stack.is_empty() {
+            let top = stack.len() - 1;
+            if stack[top] + 1 < working.len() {
+                Some(top)
+            } else if top > 0 {
+                Some(top - 1)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(idx) = match_idx {
+            let opener_pos = stack[idx];
+            stack.truncate(idx);
+            while hl_openers.last().is_some_and(|&p| p > opener_pos) { hl_openers.pop(); }
+            while sub_openers.last().is_some_and(|&p| p > opener_pos) { sub_openers.pop(); }
+            while sup_openers.last().is_some_and(|&p| p > opener_pos) { sup_openers.pop(); }
+            let inner = to_nodes(working.drain(opener_pos + 1..));
             let name = match kind { DelimKind::Highlight => "mark", DelimKind::Sub => "sub", DelimKind::Sup => "sup" };
-            working[pos] = Piece::Node(span_group(name, inner));
+            working[opener_pos] = Piece::Node(span_group(name, inner));
+            changed = true;
         } else {
             let pos = working.len();
             working.push(Piece::Delim { kind, can_open, can_close });
-            if can_open { openers.push((pos, kind)); }
+            if can_open {
+                stack.push(pos);
+            }
         }
     }
+    let _ = changed;
     to_nodes(working)
 }
 
@@ -507,8 +643,8 @@ where
                     if let Some(ch) = value.chars().next() {
                         let split = ch.len_utf8();
                         if split < value.len() {
-                            out.push(Node::Text(CowStr::from(value[..split].to_string()), true));
-                            out.push(Node::Text(CowStr::from(value[split..].to_string()), false));
+                            out.push(Node::Text(slice_cow(&value, 0..split), true));
+                            out.push(Node::Text(slice_cow(&value, split..value.len()), false));
                             continue;
                         }
                     }
@@ -537,13 +673,104 @@ fn flatten<'a>(nodes: Vec<Node<'a>>, out: &mut Vec<Event<'a>>) {
 }
 
 pub(crate) fn enrich_events<'a>(normalized: &'a str, options: Options) -> Vec<Event<'a>> {
-    if !normalized.as_bytes().iter().any(|b| matches!(b, b'=' | b'~' | b'^' | b'<')) {
+    if !has_enrich_trigger(normalized.as_bytes()) {
         return Parser::new_ext(normalized, options).collect();
     }
     let mut iter = Parser::new_ext(normalized, options).into_offset_iter();
     let tree = build_nodes(&mut iter, normalized, None);
+    let cap = tree.len().saturating_mul(4);
     let processed = process_nodes(tree, false);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(cap);
     flatten(processed, &mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{source, PdfOptions};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    #[test]
+    fn study_delimiter_parity_covers_nested_unicode_overlapping_and_single_equals() {
+        let md = concat!(
+            "Nested ==**bold** and *italic* with H~2~O and 10^-3^== plus x~*i*~ and y^**2**^.\n\n",
+            "Unicode 🧪==emoji highlight==, ==trailing🧪==, 🧪~2~, x^🧪^, “==smart quotes==”, «==guillemets==», and \u{00a0}==nbsp open==.\n\n",
+            "Overlapping ~a==b~c==, ==outer ==inner==, ==outer ==~inner==, and intraword a~b c~d~e.\n\n",
+            "Equations A = L * U, x = 1, a == b, a === b, ~~struck~~, \\==escaped==, &#61;=entity==, \\\\==after slash==, and =<!-- c -->=joined==.\n",
+        );
+        let typst = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#strong[#text(\"bold\")]#text(\" and \")#emph[#text(\"italic\")]#text(\" with H\")#sub[#text(\"2\")]#text(\"O and 10\")#super[#text(\"-3\")]]"), "{typst}");
+        assert!(typst.contains("x\")#sub[#emph[#text(\"i\")]]") && typst.contains("y\")#super[#strong[#text(\"2\")]]"), "{typst}");
+        assert!(typst.contains("🧪\")#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"emoji highlight\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"trailing🧪\")]"), "{typst}");
+        assert!(typst.contains("🧪\")#sub[#text(\"2\")]") && typst.contains("x\")#super[#text(\"🧪\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"smart quotes\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"guillemets\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"nbsp open\")]"), "{typst}");
+        assert!(typst.contains("#sub[#text(\"a==b\")]#text(\"c==, ==outer \")#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"inner\")]#text(\", ==outer \")#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"~inner\")]"), "{typst}");
+        assert!(typst.contains("a~b c\")#sub[#text(\"d\")]#text(\"e."), "{typst}");
+        assert!(typst.contains("#strike[#text(\"struck\")]"), "{typst}");
+        assert!(!typst.contains("[#text(\"escaped\")]") && !typst.contains("[#text(\"entity\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"after slash\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"joined\")]"), "{typst}");
+
+        let plain = "Plain equation A = L * U and y = mx + b without study markers.\n";
+        assert!(!has_enrich_trigger(plain.as_bytes()));
+    }
+
+    #[test]
+    fn enrich_events_scales_linearly_on_large_single_block_study_note() {
+        let mut doc = String::from("# Large Study Block\n\n");
+        for i in 1..=800 {
+            doc.push_str(&format!(
+                "Line {i}: ==Key takeaway {i}== notes that H~2~O and C~6~H~12~O~6~ scale by 2^10^ (~15 ms latency, if x == y or z = {i}, ~spaced tilde~ and ^spaced caret^) with 🧪==emoji== and \\~escaped\\~ markers.\n"
+            ));
+        }
+        let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES;
+        let t0 = Instant::now();
+        let events = enrich_events(&doc, opts);
+        let elapsed = t0.elapsed();
+        assert!(elapsed.as_millis() < 1500, "enrich_events took too long on ~185 KB single block: {elapsed:?}");
+
+        let mark_opens = events.iter().filter(|e| matches!(e, Event::InlineHtml(h) if h.as_ref() == "<mark>")).count();
+        let sub_opens = events.iter().filter(|e| matches!(e, Event::Start(Tag::Subscript))).count();
+        let sup_opens = events.iter().filter(|e| matches!(e, Event::Start(Tag::Superscript))).count();
+        assert_eq!(mark_opens, 1600);
+        assert_eq!(sub_opens, 3200);
+        assert_eq!(sup_opens, 800);
+    }
+
+    #[test]
+    fn strip_percent_comments_scales_with_interleaved_math_escapes_and_code_fences() {
+        let no_strip = "Inline `$a$` and `%%code_only%%` plus $x %% y$ and \\%%escaped\\%%:\n```python\n%%timeit x = 1\n```\n";
+        assert!(matches!(strip_percent_comments(no_strip), Cow::Borrowed(_)));
+
+        let mut doc = String::new();
+        for i in 0..400 {
+            doc.push_str(&format!(
+                "Item {i}: inline $a_{i} + b_{i} = 100\\%$ and $p_{i} %% kept_inline_{i}$ %%strip_inline_{i}%% costs $50 to $99 (\\$escaped, \\%%kept_lit_{i}\\%%) with $$m_{i} %% kept_compact_{i}$$.\n\
+                 $$\n%% kept_display_{i}\n\\sum_{{k=1}}^{{n}} x_k = {i}\n$$\n\
+                 ```python\n%%timeit total = {i}\n```\n\
+                 ~~~markdown\n%%kept_tilde_{i}%%\n~~~\n"
+            ));
+        }
+        for j in 0..1600 {
+            doc.push_str(&format!(
+                "Ledger {j}: budget $50 to $99 (\\$fee, \\%%lit_{j}\\%%) %%strip_ledger_{j}%%\n"
+            ));
+        }
+
+        let t0 = Instant::now();
+        let stripped = strip_percent_comments(&doc);
+        let elapsed = t0.elapsed();
+        assert!(elapsed.as_millis() < 1000, "strip_percent_comments took too long on ~260 KB interleaved note: {elapsed:?}");
+        assert!(stripped.contains("kept_inline_0") && stripped.contains("kept_inline_399"));
+        assert!(stripped.contains("kept_compact_399") && stripped.contains("kept_display_399"));
+        assert!(stripped.contains("%%timeit total = 399") && stripped.contains("%%kept_tilde_399%%"));
+        assert!(stripped.contains("\\%%kept_lit_200\\%%") && stripped.contains("\\%%lit_1599\\%%"));
+        assert!(!stripped.contains("strip_inline_0") && !stripped.contains("strip_inline_399"));
+        assert!(!stripped.contains("strip_ledger_0") && !stripped.contains("strip_ledger_1599"));
+    }
 }

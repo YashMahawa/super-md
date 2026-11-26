@@ -315,6 +315,9 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .katex-display::-webkit-scrollbar-track { background:transparent; }
 .katex-display::-webkit-scrollbar-thumb { border:2px solid transparent;border-radius:12px;background:transparent;background-clip:padding-box; }
 .katex-display:hover::-webkit-scrollbar-thumb,.katex-display.scroll-indicator-active::-webkit-scrollbar-thumb { background-color:color-mix(in srgb,var(--primary) 60%,transparent); }
+.math-equation-anchor { position: relative; scroll-margin-top: 24px; }
+.equation-ref { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.equation-ref.is-unresolved { color: var(--muted); }
 .android-reading.is-panning { cursor:grabbing;user-select:none; }
 .callout { --callout-accent: var(--primary); display: flow-root; position: relative; margin: 1.55em 0; padding: 12px 20px 13px 22px; border: 1px solid color-mix(in srgb, var(--callout-accent) 36%, var(--outline)); border-radius: 14px; background: color-mix(in srgb, var(--callout-accent) 8%, var(--surface)); }
 .callout::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 4px; border-radius: 0 4px 4px 0; background: var(--callout-accent); }
@@ -808,3 +811,6 @@ button.code-copy:active { border-radius:10px; }
  .step-viewer .is-visual-only .step-cards-notes { position:absolute; top:4px; left:4px; z-index:2; max-width:calc(100% - 8px); pointer-events:none; }
  .step-viewer .is-visual-only .step-cards-legacy-note { pointer-events:auto; }
 }
+.reader-link-notice { position:sticky; top:calc(var(--native-chrome-inset,0px) + 12px); z-index:20; display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 14px; padding:10px 14px; border:1px solid var(--outline,var(--code-border)); border-radius:14px; background:var(--surface-high,var(--surface,#fff)); color:var(--text,#20252d); box-shadow:0 4px 18px #0002; font-size:.9em; line-height:1.4; }
+.reader-link-notice button { flex:none; min-height:32px; padding:4px 12px; border:1px solid var(--outline,var(--code-border)); border-radius:999px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.reader-link-notice button:hover,.reader-link-notice button:focus-visible { background:color-mix(in srgb,var(--primary,#6750a4) 14%,transparent); outline:2px solid transparent; }
