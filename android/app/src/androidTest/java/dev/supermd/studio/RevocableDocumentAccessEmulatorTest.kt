@@ -11,6 +11,8 @@ import androidx.activity.result.ActivityResultRegistryOwner
 import androidx.activity.result.contract.ActivityResultContract
 import androidx.compose.ui.test.SemanticsNodeInteractionCollection
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.isEnabled
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithText
@@ -21,7 +23,11 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -33,6 +39,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 @RunWith(AndroidJUnit4::class)
@@ -144,7 +151,7 @@ class RevocableDocumentAccessEmulatorTest {
             cleanRevokedId = openAndAwait(initial, model!!, cleanRevokedUri)
 
             assertEquals(unsavedDraftText, model!!.state.value.tabs.single { it.id == draftRevokedId }.content)
-            assertTrue(runBlocking { model!!.flushRecoveryAndAwait() })
+            assertTrue(flushRecoveryPumpingCompose(model!!))
             assertTrue(File(app.filesDir, "workspaces/$workspace.json").isFile)
         }
 
@@ -320,10 +327,11 @@ class RevocableDocumentAccessEmulatorTest {
     }
 
     private fun awaitActiveReader(model: StudioViewModel) {
-        waitForCondition(30_000L) {
-            val activeId = model.state.value.active.id
-            activeId.isNotEmpty() && runBlocking { model.awaitReaderSnapshot(activeId, 2_500L) }
+        waitForCondition(30_000L, "reader bridge ready") {
+            model.state.value.active.id.isNotEmpty() &&
+                compose.onAllNodes(hasContentDescription("Export") and isEnabled()).hasAnyNode()
         }
+        awaitReaderSnapshotPumpingCompose(model, model.state.value.active.id)
     }
 
     private fun openAndAwait(
@@ -335,21 +343,18 @@ class RevocableDocumentAccessEmulatorTest {
         awaitActiveReader(model)
         scenario.onActivity { activity -> activity.requestOpen(uri, relative) }
         var openedId = ""
-        waitForCondition(30_000L) {
+        waitForCondition(30_000L, "open($uri)") {
             val match = model.state.value.tabs.firstOrNull {
                 it.uri != null && sameDocument(Uri.parse(it.uri), uri)
             }
-            if (
-                match != null &&
-                model.state.value.active.id == match.id &&
-                runBlocking { model.awaitReaderSnapshot(match.id, 2_500L) }
-            ) {
+            if (match != null && model.state.value.active.id == match.id) {
                 openedId = match.id
                 true
             } else {
                 false
             }
         }
+        awaitReaderSnapshotPumpingCompose(model, openedId)
         return openedId
     }
 
@@ -360,10 +365,10 @@ class RevocableDocumentAccessEmulatorTest {
     ) {
         awaitActiveReader(model)
         scenario.onActivity { model.select(targetId) }
-        waitForCondition(30_000L) {
-            model.state.value.active.id == targetId &&
-                runBlocking { model.awaitReaderSnapshot(targetId, 2_500L) }
+        waitForCondition(30_000L, "select($targetId)") {
+            model.state.value.active.id == targetId
         }
+        awaitReaderSnapshotPumpingCompose(model, targetId)
     }
 
     private fun editAndAwait(
@@ -373,15 +378,57 @@ class RevocableDocumentAccessEmulatorTest {
         content: String,
     ) {
         scenario.onActivity { model.edit(noteId, content) }
-        waitForCondition(30_000L) {
-            val current = model.state.value
-            current.tabs.single { it.id == noteId }.content == content &&
-                (current.active.id != noteId || runBlocking { model.awaitReaderSnapshot(noteId, 2_500L) })
+        waitForCondition(30_000L, "edit($noteId)") {
+            model.state.value.tabs.single { it.id == noteId }.content == content
+        }
+        if (model.state.value.active.id == noteId) {
+            awaitReaderSnapshotPumpingCompose(model, noteId)
         }
     }
 
+    private fun awaitReaderSnapshotPumpingCompose(
+        model: StudioViewModel,
+        noteId: String,
+        timeoutMs: Long = 30_000L,
+    ) {
+        compose.waitForIdle()
+        val done = AtomicBoolean(false)
+        val job = CoroutineScope(Dispatchers.Main).launch {
+            while (isActive && !done.get()) {
+                if (model.state.value.active.id == noteId && model.awaitReaderSnapshot(noteId, 2_500L)) {
+                    done.set(true)
+                    break
+                }
+                delay(40)
+            }
+        }
+        try {
+            waitForCondition(timeoutMs, "awaitReaderSnapshot($noteId)") { done.get() }
+        } finally {
+            job.cancel()
+        }
+    }
+
+    private fun flushRecoveryPumpingCompose(
+        model: StudioViewModel,
+        timeoutMs: Long = 15_000L,
+    ): Boolean {
+        val flushed = AtomicBoolean(false)
+        val finished = AtomicBoolean(false)
+        val job = CoroutineScope(Dispatchers.Main).launch {
+            flushed.set(model.flushRecoveryAndAwait())
+            finished.set(true)
+        }
+        try {
+            waitForCondition(timeoutMs, "flushRecoveryAndAwait") { finished.get() }
+        } finally {
+            job.cancel()
+        }
+        return flushed.get()
+    }
+
     private fun waitForNodeText(text: String, timeoutMs: Long = 30_000L) {
-        waitForCondition(timeoutMs) {
+        waitForCondition(timeoutMs, "nodeWithText($text)") {
             compose.onAllNodesWithText(text).hasAnyNode()
         }
         compose.onNodeWithText(text).assertIsDisplayed()
@@ -390,7 +437,11 @@ class RevocableDocumentAccessEmulatorTest {
     private fun SemanticsNodeInteractionCollection.hasAnyNode(): Boolean =
         runCatching { fetchSemanticsNodes().isNotEmpty() }.getOrDefault(false)
 
-    private fun waitForCondition(timeoutMs: Long = 30_000L, condition: () -> Boolean) {
+    private fun waitForCondition(
+        timeoutMs: Long = 30_000L,
+        description: String = "condition",
+        condition: () -> Boolean,
+    ) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             compose.waitForIdle()
@@ -398,6 +449,6 @@ class RevocableDocumentAccessEmulatorTest {
             Thread.sleep(25)
         }
         compose.waitForIdle()
-        assertTrue("Timed out after ${timeoutMs}ms waiting for condition", condition())
+        assertTrue("Timed out after ${timeoutMs}ms waiting for $description", condition())
     }
 }
