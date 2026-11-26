@@ -3,9 +3,11 @@ import time
 import unittest
 
 from latest_writes import (
+    EXACT_ABORTED,
     EXACT_COMMITTED,
     EXACT_FAILED,
     EXACT_SUPERSEDED,
+    ExactWriteAborted,
     LatestWriteExecutor,
 )
 
@@ -200,6 +202,24 @@ class LatestWriteExecutorTest(unittest.TestCase):
             status6, done_rev6, err6 = fut6.result(timeout=1)
             self.assertEqual((status6, done_rev6), (EXACT_FAILED, rev6))
             self.assertIsInstance(err6, OSError)
+            self.assertEqual(writer.committed_revision("recovery"), rev5)
+
+            # 5. Aborted exact write reports EXACT_ABORTED, skips on_done, and preserves committed_revision
+            enqueued_revs = []
+            done_calls = []
+
+            def abort_recovery():
+                raise ExactWriteAborted()
+
+            rev7, fut7 = writer.submit_latest_exact(
+                "recovery",
+                abort_recovery,
+                done_calls.append,
+                on_enqueued=enqueued_revs.append,
+            )
+            self.assertEqual(enqueued_revs, [rev7])
+            self.assertEqual(fut7.result(timeout=1), (EXACT_ABORTED, rev7, None))
+            self.assertEqual(done_calls, [])
             self.assertEqual(writer.committed_revision("recovery"), rev5)
         finally:
             writer.shutdown(wait=True)

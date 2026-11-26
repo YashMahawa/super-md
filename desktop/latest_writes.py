@@ -15,6 +15,11 @@ from collections.abc import Callable
 EXACT_COMMITTED = "committed"
 EXACT_SUPERSEDED = "superseded"
 EXACT_FAILED = "failed"
+EXACT_ABORTED = "aborted"
+
+
+class ExactWriteAborted(Exception):
+    """Raised inside an exact latest action when publication is declined before commit."""
 
 
 class LatestWriteExecutor:
@@ -57,6 +62,7 @@ class LatestWriteExecutor:
         action: Callable,
         on_done: Callable | None,
         exact_done: Callable | None,
+        on_enqueued: Callable[[int], None] | None = None,
     ) -> int:
         if key not in self.LATEST_KEYS or not callable(action):
             raise ValueError("Latest writes are limited to startup and recovery snapshots")
@@ -66,6 +72,8 @@ class LatestWriteExecutor:
                 raise RuntimeError("cannot schedule new futures after shutdown")
             rev = self._latest_revision.get(key, 0) + 1
             self._latest_revision[key] = rev
+            if on_enqueued is not None:
+                on_enqueued(rev)
             displaced = self._pending.get(key)
             self._pending[key] = (rev, action, on_done, exact_done)
             if not self._scheduled:
@@ -89,11 +97,13 @@ class LatestWriteExecutor:
         action: Callable,
         on_done: Callable | None = None,
         exact_done: Callable | None = None,
+        *,
+        on_enqueued: Callable[[int], None] | None = None,
     ) -> tuple[int, concurrent.futures.Future]:
         """Submit a keyed snapshot and track whether that exact revision committed.
 
         Resolves ``future`` (and optional ``exact_done``) with ``(status, rev, error)``
-        where ``status`` is ``"committed"``, ``"superseded"``, or ``"failed"``.
+        where ``status`` is ``"committed"``, ``"superseded"``, ``"aborted"``, or ``"failed"``.
         """
         outcome: concurrent.futures.Future = concurrent.futures.Future()
 
@@ -106,7 +116,7 @@ class LatestWriteExecutor:
                 except Exception:
                     pass
 
-        rev = self._enqueue_latest(key, action, on_done, finish_exact)
+        rev = self._enqueue_latest(key, action, on_done, finish_exact, on_enqueued=on_enqueued)
         return rev, outcome
 
     def flush(self, timeout=3.0) -> None:
@@ -179,19 +189,24 @@ class LatestWriteExecutor:
                             pass
                         continue
                 error = None
+                aborted = False
                 try:
                     action()
+                except ExactWriteAborted:
+                    aborted = True
                 except Exception as failure:
                     error = failure
                 with self._condition:
-                    if error is not None:
+                    if aborted:
+                        status = EXACT_ABORTED
+                    elif error is not None:
                         status = EXACT_FAILED
                     elif self._latest_revision.get(key, 0) == rev:
                         self._committed_revision[key] = rev
                         status = EXACT_COMMITTED
                     else:
                         status = EXACT_SUPERSEDED
-                if on_done is not None:
+                if on_done is not None and not aborted:
                     try:
                         on_done(error)
                     except Exception:

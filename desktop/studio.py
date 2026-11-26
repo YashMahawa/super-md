@@ -37,7 +37,7 @@ from network_tls import client_context
 from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
-    atomic_write, atomic_json, bundle, decode_base64_chunked,
+    atomic_write, atomic_json, stage_atomic_json, bundle, decode_base64_chunked,
     encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
@@ -49,7 +49,7 @@ from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
-from latest_writes import LatestWriteExecutor
+from latest_writes import ExactWriteAborted, LatestWriteExecutor
 import updates
 import app_integration
 import python_runtime
@@ -3200,7 +3200,7 @@ class Studio(QObject):
             self._pending_write_retirements.pop(token, None)
         done(value, error)
 
-    def _submit_exact_recovery_write(self, action, done, *, on_retired=None):
+    def _submit_exact_recovery_write(self, action, done, *, on_retired=None, on_enqueued=None):
         token = uuid.uuid4().hex
         invoked = False
 
@@ -3232,7 +3232,9 @@ class Studio(QObject):
                 notify_retired()
 
         try:
-            self.writes.submit_latest_exact("recovery", action, None, exact_completed)
+            self.writes.submit_latest_exact(
+                "recovery", action, None, exact_completed, on_enqueued=on_enqueued
+            )
         except RuntimeError:
             notify_retired()
             return False
@@ -5234,6 +5236,65 @@ class Studio(QObject):
             "isDirty": edited != current_tab["saved"],
         }
 
+    def _make_staged_recovery_write_action(
+        self,
+        tab_id: str,
+        previous: str,
+        snapshot: list,
+        decision_lock: threading.Lock,
+        attempt_state: dict,
+        rev_holder: list[int],
+        wrote_holder: list[bool],
+    ):
+        recovery_path = self.data / "recovery.json"
+
+        def should_abort_locked() -> bool:
+            if (
+                attempt_state["decided"]
+                or self.retired
+                or getattr(self.writes, "_shutdown", False)
+                or self.writes.latest_revision("recovery") != rev_holder[0]
+            ):
+                return True
+            live_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+            return live_tab is None or tab_id in self._closing_tabs or live_tab["content"] != previous
+
+        def should_abort() -> bool:
+            with decision_lock:
+                return should_abort_locked()
+
+        def write_action() -> None:
+            with decision_lock:
+                if should_abort_locked():
+                    if not attempt_state["decided"]:
+                        attempt_state["decided"] = True
+                        attempt_state["outcome"] = "aborted"
+                    raise ExactWriteAborted()
+            prior_bytes = recovery_path.read_bytes() if recovery_path.exists() else None
+            with stage_atomic_json(recovery_path, abort_check=should_abort) as staged:
+                atomic_json(recovery_path, snapshot)
+                with decision_lock:
+                    if should_abort_locked():
+                        if not attempt_state["decided"]:
+                            attempt_state["decided"] = True
+                            attempt_state["outcome"] = "aborted"
+                        if staged.intercepted:
+                            staged.discard()
+                        else:
+                            if prior_bytes is None:
+                                if recovery_path.exists():
+                                    recovery_path.unlink()
+                            else:
+                                atomic_write(recovery_path, prior_bytes)
+                        raise ExactWriteAborted()
+                    if staged.intercepted:
+                        staged.publish(recovery_path)
+                    attempt_state["decided"] = True
+                    attempt_state["outcome"] = "published"
+                    wrote_holder[0] = True
+
+        return write_action
+
     def _stage_inactive_patch_tab_sync(self, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool) -> dict:
         if self.retired or getattr(self.writes, "_shutdown", False):
             raise ValueError("The target desktop window was closed")
@@ -5265,17 +5326,37 @@ class Studio(QObject):
                 all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
                     tab_id, current_tab, previous, edited, changed
                 )
+                decision_lock = threading.Lock()
+                attempt_state = {"decided": False, "outcome": None}
+                rev_holder = [0]
                 wrote_holder = [False]
-
-                def write_action(snapshot=all_drafts, holder=wrote_holder):
-                    atomic_json(self.data / "recovery.json", snapshot)
-                    holder[0] = True
-
-                rev, outcome = self.writes.submit_latest_exact("recovery", write_action)
+                write_action = self._make_staged_recovery_write_action(
+                    tab_id, previous, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder
+                )
+                rev, outcome = self.writes.submit_latest_exact(
+                    "recovery",
+                    write_action,
+                    on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev),
+                )
                 try:
                     status, _done_rev, write_error = outcome.result(timeout=timeout)
                 except concurrent.futures.TimeoutError as exc:
-                    raise RuntimeError(self._RECOVERY_ERROR_FAILED) from exc
+                    with decision_lock:
+                        if not attempt_state["decided"]:
+                            attempt_state["decided"] = True
+                            attempt_state["outcome"] = "timed_out"
+                        published = attempt_state["outcome"] == "published"
+                    if not published:
+                        if any_wrote_candidate:
+                            self._recover()
+                        elif had_recovery_timer:
+                            self.recovery_timer.start(800)
+                        raise RuntimeError(self._RECOVERY_ERROR_FAILED) from exc
+                    try:
+                        status, _done_rev, write_error = outcome.result(timeout=2.0)
+                    except concurrent.futures.TimeoutError as post_exc:
+                        self._recover()
+                        raise RuntimeError(self._RECOVERY_ERROR_FAILED) from post_exc
                 if wrote_holder[0]:
                     any_wrote_candidate = True
                 if self.retired or getattr(self.writes, "_shutdown", False):
@@ -5314,7 +5395,14 @@ class Studio(QObject):
         finally:
             self._staging_tabs.discard(tab_id)
 
-    def _stage_inactive_patch_tab_async(self, args, on_complete) -> None:
+    def _stage_inactive_patch_tab_async(
+        self,
+        args,
+        on_complete,
+        *,
+        register_cancel=None,
+        is_cancelled=None,
+    ) -> None:
         tab, tab_id, previous, revision, edited, operation_results, changed = self._validate_and_compute_patch_tab(
             args, bridge_revision_json=True
         )
@@ -5343,6 +5431,9 @@ class Studio(QObject):
         active_in_queue = False
         had_recovery_timer = False
         any_wrote_candidate = False
+        stage_lock = threading.Lock()
+        stage_cancelled = False
+        current_attempt: tuple[threading.Lock, dict] | None = None
 
         self._staging_tabs.add(tab_id)
 
@@ -5358,14 +5449,54 @@ class Studio(QObject):
                 self.session._advance_agent_stage_queue()
             on_complete(result, error)
 
+        def finish_cancelled_on_ui(_result=None, _error=None):
+            if finished_flag:
+                return
+            if any_wrote_candidate and not self.retired and not getattr(self.writes, "_shutdown", False):
+                self._recover()
+            elif had_recovery_timer and not self.retired:
+                self.recovery_timer.start(800)
+            finish_stage(None, self._RECOVERY_ERROR_FAILED)
+
+        def cancel_stage() -> bool:
+            nonlocal stage_cancelled
+            with stage_lock:
+                active_attempt = current_attempt
+                if active_attempt is None:
+                    stage_cancelled = True
+                    published = False
+                else:
+                    d_lock, a_state = active_attempt
+                    with d_lock:
+                        if not a_state["decided"]:
+                            a_state["decided"] = True
+                            a_state["outcome"] = "timed_out"
+                        published = a_state["outcome"] == "published"
+                    if not published:
+                        stage_cancelled = True
+            if not published:
+                try:
+                    self.completed.emit((finish_cancelled_on_ui, None, None, False))
+                except RuntimeError:
+                    pass
+            return published
+
+        if callable(register_cancel):
+            register_cancel(cancel_stage)
+
         with self._write_callback_lock:
             self._pending_write_retirements[queue_token] = lambda: finish_stage(
                 None, "The target desktop window was closed"
             )
 
         def run_attempt(attempt: int) -> None:
-            nonlocal had_recovery_timer, any_wrote_candidate
+            nonlocal had_recovery_timer, any_wrote_candidate, current_attempt
             if finished_flag:
+                return
+            with stage_lock:
+                cancelled_now = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
+            if cancelled_now:
+                finish_cancelled_on_ui()
                 return
             if self.retired or getattr(self.writes, "_shutdown", False):
                 if any_wrote_candidate and not getattr(self.writes, "_shutdown", False):
@@ -5394,11 +5525,18 @@ class Studio(QObject):
             all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
                 tab_id, current_tab, previous, edited, changed
             )
+            decision_lock = threading.Lock()
+            attempt_state = {"decided": False, "outcome": None}
+            with stage_lock:
+                if stage_cancelled or (callable(is_cancelled) and bool(is_cancelled())):
+                    finish_cancelled_on_ui()
+                    return
+                current_attempt = (decision_lock, attempt_state)
+            rev_holder = [0]
             wrote_holder = [False]
-
-            def write_action(snapshot=all_drafts, holder=wrote_holder):
-                atomic_json(self.data / "recovery.json", snapshot)
-                holder[0] = True
+            write_action = self._make_staged_recovery_write_action(
+                tab_id, previous, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder
+            )
 
             def on_write_done(outcome_tuple, _err_str):
                 nonlocal any_wrote_candidate
@@ -5407,6 +5545,11 @@ class Studio(QObject):
                 status, rev, write_error = outcome_tuple
                 if wrote_holder[0]:
                     any_wrote_candidate = True
+                with stage_lock:
+                    cancelled_after = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
+                if cancelled_after:
+                    finish_cancelled_on_ui()
+                    return
                 if self.retired or getattr(self.writes, "_shutdown", False):
                     finish_stage(None, "The target desktop window was closed")
                     return
@@ -5456,11 +5599,17 @@ class Studio(QObject):
                 write_action,
                 on_write_done,
                 on_retired=lambda: finish_stage(None, "The target desktop window was closed"),
+                on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev),
             )
 
         def start_queued() -> bool:
             nonlocal active_in_queue
             if finished_flag:
+                return False
+            with stage_lock:
+                cancelled_before_start = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
+            if cancelled_before_start:
+                finish_cancelled_on_ui()
                 return False
             with self._write_callback_lock:
                 self._pending_write_retirements.pop(queue_token, None)
@@ -5670,10 +5819,22 @@ class Studio(QObject):
             saving.discard(tab_id)
         return finalize(value, None)
 
-    def _agent_document_action_async(self, args, on_complete):
+    def _agent_document_action_async(
+        self,
+        args,
+        on_complete,
+        *,
+        register_cancel=None,
+        is_cancelled=None,
+    ):
         action = args.get("action")
         if action == "patch_tab":
-            self._stage_inactive_patch_tab_async(args, on_complete)
+            self._stage_inactive_patch_tab_async(
+                args,
+                on_complete,
+                register_cancel=register_cancel,
+                is_cancelled=is_cancelled,
+            )
             return
         if action == "save_document":
             prepared = Studio._prepare_save_document(self, args)
