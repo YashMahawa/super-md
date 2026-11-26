@@ -366,9 +366,18 @@ class StudioUiTest {
             compose.waitUntil(30_000) { model.state.value.active.uri == firstUri.toString() }
             val firstId = model.state.value.active.id
             scenario.onActivity { it.requestOpen(secondUri) }
-            compose.waitUntil(30_000) {
-                val state = model.state.value
-                state.active.uri == secondUri.toString() && state.tabs.any { it.uri == firstUri.toString() }
+            try {
+                compose.waitUntil(30_000) {
+                    val state = model.state.value
+                    state.active.uri == secondUri.toString() && state.tabs.any { it.uri == firstUri.toString() }
+                }
+            } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+                val snapshot = model.state.value
+                throw AssertionError(
+                    "Second external open timed out; active=${snapshot.active.id}:${snapshot.active.name}(uri=${snapshot.active.uri}); " +
+                        "tabs=${snapshot.tabs.map { "${it.id}:${it.name}(uri=${it.uri})" }}; message=${snapshot.message}; error=${snapshot.error}",
+                    timeout,
+                )
             }
             val secondId = model.state.value.active.id
             scenarioJavascriptUntil(scenario, "document.querySelector('.android-document h1')?.textContent?.trim()==='Second External Open'", "true")
@@ -1294,15 +1303,52 @@ ax.set_title("Matplotlib 3D figure")
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { (it.trim('"').toFloatOrNull() ?: 0f)>fullBaseline*1.1f }
         compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }
+        val initialTabIds = model.state.value.tabs.map { it.id }.toSet()
         compose.onNodeWithContentDescription("New tab").performClick()
+        compose.waitUntil(10_000) {
+            val active = model.state.value.active
+            active.id !in initialTabIds && active.uri == null && active.name == "Untitled.md"
+        }
         val emptyId = model.state.value.active.id
         compose.onNodeWithContentDescription("Close Untitled.md").performClick()
+        compose.waitUntil(10_000) { model.state.value.tabs.none { it.id == emptyId } }
         compose.runOnIdle { assertFalse("Empty unnamed notes must be discarded", model.state.value.closedTabs.any { it.id == emptyId }) }
+        val tabsBeforeDraft = model.state.value.tabs.map { it.id }.toSet()
         compose.onNodeWithContentDescription("New tab").performClick()
-        compose.runOnIdle { model.edit(model.state.value.active.id, "# Recoverable draft") }
-        javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
-        compose.waitUntil(10_000) { model.state.value.active.name == "Recoverable draft.md" }
+        compose.waitUntil(10_000) {
+            val active = model.state.value.active
+            active.id !in tabsBeforeDraft && active.uri == null && active.name == "Untitled.md"
+        }
         val recoverableId = model.state.value.active.id
+        val initialDraftName = model.state.value.active.name
+        assertEquals("Untitled.md", initialDraftName)
+        compose.runOnIdle { model.edit(recoverableId, "# Recoverable draft") }
+        javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
+        try {
+            compose.waitUntil(10_000) {
+                val current = model.state.value
+                current.active.id == recoverableId &&
+                    current.active.name == "Recoverable draft.md" &&
+                    model.lastOutlineNoteId == recoverableId &&
+                    model.headings.value.firstOrNull()?.title == "Recoverable draft"
+            }
+        } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+            val snapshot = model.state.value
+            val draftTab = snapshot.tabs.firstOrNull { it.id == recoverableId }
+            val domState = runCatching {
+                javascriptSnapshot("JSON.stringify({heading:document.querySelector('.android-reading h1,.live-document h1')?.textContent??null,editError:document.querySelector('.reader-edit-error')?.textContent??null})")
+            }.getOrElse { "unavailable: ${it.message}" }
+            throw AssertionError(
+                "Recoverable draft title/outline handoff timed out; recoverableId=$recoverableId; initialDraftName=$initialDraftName; " +
+                    "draftTab=${draftTab?.let { "${it.id}:${it.name}(uri=${it.uri})" }}; " +
+                    "active=${snapshot.active.id}:${snapshot.active.name}(uri=${snapshot.active.uri}); " +
+                    "lastOutlineNoteId=${model.lastOutlineNoteId}; headings=${model.headings.value.map { it.title }}; " +
+                    "message=${snapshot.message}; error=${snapshot.error}; dom=$domState",
+                timeout,
+            )
+        }
+        assertEquals(recoverableId, model.state.value.active.id)
+        assertEquals("Recoverable draft.md", model.state.value.active.name)
         // Close commits the recoverable snapshot/index asynchronously after
         // the reader flush barrier. Do not race the reopen shortcut against it.
         val closeBounds = compose.onNodeWithContentDescription("Close Recoverable draft.md").fetchSemanticsNode().boundsInRoot
@@ -1325,6 +1371,7 @@ ax.set_title("Matplotlib 3D figure")
         compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         compose.onNodeWithText("Discard").performClick()
+        compose.waitUntil(15_000) { model.state.value.tabs.none { it.id == recoverableId } }
         if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
             compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
             compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE }
