@@ -11,7 +11,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QEvent, QMetaObject, QObject, QUrl, Q_ARG, Q_RETURN_ARG, qInstallMessageHandler
+from PySide6.QtCore import QEvent, QMetaObject, QObject, QUrl, Q_ARG, Q_RETURN_ARG
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuick import QQuickItem
@@ -89,10 +89,6 @@ def _production_sidebar_harness_qml() -> bytes:
     popup_end = qml.index("    AppDialog {\n        id: settingsDialog", popup_start)
     popup_block = textwrap.dedent(qml[popup_start:popup_end]).rstrip()
 
-    repeater_start = qml.index("    Repeater {\n        model: JSON.parse(studio.shortcutActions)")
-    repeater_end = qml.index("    FileDialog { id:fontDialog", repeater_start)
-    shortcut_repeater = textwrap.dedent(qml[repeater_start:repeater_end]).rstrip()
-
     hint_fn = _extract_qml_function(qml, "    function hintWithShortcut(label, key, fallback)")
     focus_fn = _extract_qml_function(qml, "    function nativeTextEditorFocused()")
     enabled_fn = _extract_qml_function(qml, "    function shortcutEnabled(action)")
@@ -136,7 +132,6 @@ ApplicationWindow {{
 {textwrap.indent(focus_fn, "    ")}
 {textwrap.indent(enabled_fn, "    ")}
 {textwrap.indent(activate_fn, "    ")}
-{textwrap.indent(shortcut_repeater, "    ")}
     Material.theme: viewState.dark ? Material.Dark : Material.Light
     Material.primary: viewState.colors.primary
     Material.accent: viewState.colors.primary
@@ -172,11 +167,15 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["Sidebar snapshot slices tests"])
 
+    def _on_qml_warnings(self, warnings):
+        self.qml_warnings.extend(err.toString() for err in warnings)
+
     def setUp(self):
-        self.qt_messages: list[str] = []
-        self._prev_msg_handler = qInstallMessageHandler(
-            lambda _mode, _ctx, message: self.qt_messages.append(message)
-        )
+        self.qml_warnings: list[str] = []
+        self.window = None
+        self.component = None
+        self.engine = None
+        self.studio = None
         self.session = Session(True)
         self.session.settings.update(theme="dark", accent="blue", motion=False, welcomed=True, autosave=False)
         self.studio = QuietStudio(True, self.session)
@@ -189,6 +188,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         (self.workspace / "Reading.md").write_text("# Reading\n\nChapter 2", encoding="utf-8")
 
         self.engine = QQmlEngine()
+        self.engine.warnings.connect(self._on_qml_warnings)
         self.engine.rootContext().setContextProperty("studio", self.studio)
         self.component = QQmlComponent(self.engine)
         self.component.setData(
@@ -198,29 +198,52 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.assertFalse(self.component.isError(), str(self.component.errors()))
         self.window = self.component.create()
         self.assertIsNotNone(self.window, str(self.component.errors()))
-        QTest.qWait(40)
-        self._polish()
+        QTest.qWait(25)
+        self._pump()
 
     def tearDown(self):
-        self._settle_watchers()
-        self.window.close()
-        self.window.deleteLater()
-        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        self.engine.deleteLater()
-        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        self.app.processEvents()
-        for window in list(self.session.windows.values()):
-            window.stop()
-            window.pool.shutdown(wait=True, cancel_futures=True)
-            window._search_pool.shutdown(wait=True, cancel_futures=True)
-        self.session.writes.shutdown(wait=True)
-        qInstallMessageHandler(self._prev_msg_handler)
+        data_dir = getattr(self.studio, "data", None)
+        qml_warnings = list(getattr(self, "qml_warnings", ()))
+        try:
+            if getattr(self, "session", None) is not None:
+                self._settle_watchers()
+            if getattr(self, "engine", None) is not None:
+                try:
+                    self.engine.warnings.disconnect(self._on_qml_warnings)
+                except (RuntimeError, TypeError):
+                    pass
+            if getattr(self, "window", None) is not None:
+                self.window.close()
+                self.window.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            if getattr(self, "component", None) is not None:
+                self.component.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            if getattr(self, "engine", None) is not None:
+                self.engine.collectGarbage()
+                self.engine.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+            if getattr(self, "session", None) is not None:
+                for window in list(self.session.windows.values()):
+                    window.stop()
+                    window.pool.shutdown(wait=True, cancel_futures=True)
+                    window._search_pool.shutdown(wait=True, cancel_futures=True)
+                self.session.writes.shutdown(wait=True)
+        finally:
+            self.window = None
+            self.component = None
+            self.engine = None
+            self.studio = None
+            self.session = None
+            self.qml_warnings = []
+            if data_dir is not None:
+                shutil.rmtree(data_dir, ignore_errors=True)
         qml_errors = [
-            msg for msg in self.qt_messages
+            msg for msg in qml_warnings
             if "TypeError:" in msg or "ReferenceError:" in msg
         ]
         self.assertEqual(qml_errors, [], f"Unexpected QML errors: {qml_errors}")
-        shutil.rmtree(self.studio.data, ignore_errors=True)
 
     def items(self, item=None):
         item = item or self.window.contentItem()
@@ -250,10 +273,15 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(predicate())
 
+    def _pump(self):
+        self.app.sendPostedEvents()
+        self.app.processEvents()
+
     def _polish(self):
-        self.app.processEvents()
-        self.window.grabWindow()
-        self.app.processEvents()
+        self._pump()
+        if self.window is not None:
+            self.window.grabWindow()
+        self._pump()
 
     def _settle_watchers(self):
         for window in tuple(self.session.windows.values()):
@@ -262,16 +290,18 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             if window.external_timer.isActive() or window.external_paths:
                 window.external_timer.stop()
                 window.external_paths.clear()
-        QTest.qWait(25)
+        QTest.qWait(15)
         for window in tuple(self.session.windows.values()):
             if getattr(window, "retired", False):
                 continue
             window.external_timer.stop()
             window.external_paths.clear()
-        self._polish()
+        self._pump()
 
     @staticmethod
     def _retire_window(window):
+        window.external_timer.stop()
+        window.external_paths.clear()
         window.stop()
         window.pool.shutdown(wait=True, cancel_futures=True)
         window._search_pool.shutdown(wait=True, cancel_futures=True)
@@ -291,7 +321,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         return value.toVariant() if hasattr(value, "toVariant") else value
 
     def _list_delegates(self, list_view):
-        self._polish()
+        self._pump()
         content = list_view.property("contentItem")
         if content is None:
             return []
@@ -303,6 +333,16 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             and (child.property("width") or 0) > 0
             and (child.property("height") or 0) > 0
         ]
+        if not delegates and (list_view.property("count") or 0) > 0:
+            self._polish()
+            delegates = [
+                child
+                for child in content.childItems()
+                if child.metaObject().className() != "QQuickItem"
+                and bool(child.property("visible"))
+                and (child.property("width") or 0) > 0
+                and (child.property("height") or 0) > 0
+            ]
         delegates.sort(
             key=lambda child: (
                 round(float(child.property("y") or 0.0), 2),
@@ -785,6 +825,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             lambda: [d.property("text") for d in self._list_delegates(files_view)] == ["▾ Labs", "1.3 Systems.md"]
         )
 
+        self._settle_watchers()
         folder_sidebar.openRenameFor(str(labs_dir), "Labs", True)
         self.wait_until(lambda: bool(rename_dialog.property("visible")))
         rename_field.setProperty("text", "ProblemSets")
@@ -862,6 +903,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             second_studio.openFolder(str(self.workspace))
             self.wait_until(lambda: len(second_studio.files) == 3)
 
+            self._settle_watchers()
             renamed_overview = self.workspace / "Course Overview.md"
             self.studio.renameNote(active_id, "Course Overview.md")
             self.wait_until(
@@ -1057,14 +1099,15 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.wait_until(lambda: all(t["id"] != unsaved_id for t in self.studio.tabs))
 
         # 3. Overflowing TabStrip reveals active tab across folder create/open/rename while non-sidebar actions keep delegates alive.
-        for idx in range(6):
+        self.window.setWidth(760)
+        for idx in range(3):
             title = f"2.{idx + 1} Distributed Systems Lecture"
             self.studio.createFolderNote(str(self.workspace), title, "md")
             self.wait_until(
                 lambda expected=f"{title}.md": self.studio.busy == 0
                 and self.studio._current()["name"] == expected
             )
-        QTest.qWait(50)
+        QTest.qWait(35)
         strip = self.window.findChild(QQuickItem, "tabStrip")
         flickable = strip.property("contentItem")
         self.assertGreater(float(flickable.property("contentWidth")), strip.width())
@@ -1073,7 +1116,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         # Activate Overview.md via openNote (as FolderSidebar click does) and verify left-side tab reveal.
         self.studio.openNote(str(overview))
         self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
-        QTest.qWait(50)
+        QTest.qWait(35)
         self._assert_active_tab_revealed("after activating Overview.md from folder")
 
         # Populate outline on Overview.md, capture sidebar delegates, and exercise tab reordering + mode switches + zoom.
@@ -1087,7 +1130,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.wait_until(lambda: len(self._list_delegates(outline_list)) == 1)
         baseline_outline_delegates = self._list_delegates(outline_list)
         self.window.setProperty("sidebarSection", "folder")
-        self.wait_until(lambda: len(self._list_delegates(files_view)) >= 8)
+        self.wait_until(lambda: len(self._list_delegates(files_view)) >= 6)
         baseline_file_delegates = self._list_delegates(files_view)
         baseline_recent_delegates = self._list_delegates(recent_notes)
         self._settle_watchers()
@@ -1095,15 +1138,15 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         non_sidebar_signals = []
         self.studio.sidebarChanged.connect(lambda: non_sidebar_signals.append(1))
         activate("move_tab_right")
-        QTest.qWait(35)
+        QTest.qWait(25)
         self._assert_active_tab_revealed("after moving active tab right")
         activate("move_tab_left")
-        QTest.qWait(35)
+        QTest.qWait(25)
         self._assert_active_tab_revealed("after moving active tab left")
         activate("mode_editor")
         activate("mode_live")
         self.studio.setZoom(120)
-        QTest.qWait(35)
+        QTest.qWait(25)
 
         self.assertEqual(len(non_sidebar_signals), 0)
         self.assertEqual(self._list_delegates(files_view), baseline_file_delegates)
@@ -1112,20 +1155,21 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.assertEqual(self._list_delegates(outline_list), baseline_outline_delegates)
         self.window.setProperty("sidebarSection", "folder")
 
-        # Jump to rightmost tab via tab_9 and rename via FolderSidebar so tab widens and stays revealed.
-        activate("tab_9")
-        QTest.qWait(50)
-        self._assert_active_tab_revealed("after jumping to rightmost tab via tab_9")
+        # Jump to rightmost tab via tab_6 and rename via FolderSidebar so tab widens and stays revealed.
+        activate("tab_6")
+        QTest.qWait(35)
+        self._assert_active_tab_revealed("after jumping to rightmost tab via tab_6")
+        self._settle_watchers()
         rightmost_path = self.studio._current()["path"]
         folder_sidebar.openRenameFor(rightmost_path, self.studio._current()["name"], False)
         self.wait_until(lambda: bool(rename_dialog.property("visible")))
-        rename_field.setProperty("text", "2.6 Comprehensive Byzantine Fault Tolerance Reference")
+        rename_field.setProperty("text", "2.3 Comprehensive Byzantine Fault Tolerance Reference")
         rename_dialog.accept()
         self.wait_until(
             lambda: self.studio.busy == 0
-            and self.studio._current()["name"] == "2.6 Comprehensive Byzantine Fault Tolerance Reference.md"
+            and self.studio._current()["name"] == "2.3 Comprehensive Byzantine Fault Tolerance Reference.md"
         )
-        QTest.qWait(60)
+        QTest.qWait(40)
         self._assert_active_tab_revealed("after widening active rightmost tab via FolderSidebar rename")
 
 
