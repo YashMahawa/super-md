@@ -283,6 +283,7 @@ class StudioUiTest {
         try {
             val launch = android.content.Intent(android.content.Intent.ACTION_VIEW, firstUri)
                 .setClass(context, MainActivity::class.java)
+                .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 .putExtra("workspace", workspace)
             scenario = androidx.test.core.app.ActivityScenario.launch(launch)
             val openedModel = AtomicReference<StudioViewModel>()
