@@ -11,7 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 from core.paths import SOURCE_ROOT
-from package_runtime import wayland_dependencies
+from scripts.package_runtime import wayland_dependencies
 
 ROOT = SOURCE_ROOT
 OUTPUT = ROOT / "desktop/dist"

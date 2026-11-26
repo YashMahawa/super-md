@@ -1,4 +1,4 @@
-import importlib
 import sys
+import scripts.package_runtime as _module
 
-sys.modules[__name__] = importlib.import_module("scripts.package_runtime")
+sys.modules[__name__] = _module

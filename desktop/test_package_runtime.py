@@ -107,26 +107,31 @@ class PackageRuntimeTest(unittest.TestCase):
 
     def test_pyinstaller_spec_and_hook_import_scripts_package_runtime(self):
         desktop_dir = Path(__file__).resolve().parent
-        spec_path = desktop_dir / "super-md.spec"
-        spec_source = spec_path.read_text(encoding="utf-8")
-        self.assertIn('pathex=[str(root / "desktop")]', spec_source)
-        spec_imports = [
-            node.module
-            for node in ast.walk(ast.parse(spec_source, filename=str(spec_path)))
-            if isinstance(node, ast.ImportFrom)
-        ]
-        self.assertIn("scripts.package_runtime", spec_imports)
-        self.assertNotIn("package_runtime", spec_imports)
+        for entry_script in (
+            "package.py",
+            "check_packaged.py",
+            "check_packaged_mcp.py",
+            "check_bundled_python.py",
+            "check_update_install.py",
+        ):
+            self.assertTrue((desktop_dir / entry_script).is_file(), f"Missing {entry_script}")
 
-        hook_path = desktop_dir / "pyinstaller_hooks" / "hook-PySide6.QtWebEngineCore.py"
-        hook_source = hook_path.read_text(encoding="utf-8")
-        hook_imports = [
-            node.module
-            for node in ast.walk(ast.parse(hook_source, filename=str(hook_path)))
-            if isinstance(node, ast.ImportFrom)
-        ]
-        self.assertIn("scripts.package_runtime", hook_imports)
-        self.assertNotIn("package_runtime", hook_imports)
+        for relative_path in (
+            Path("package.py"),
+            Path("super-md.spec"),
+            Path("pyinstaller_hooks") / "hook-PySide6.QtWebEngineCore.py",
+        ):
+            target_path = desktop_dir / relative_path
+            source = target_path.read_text(encoding="utf-8")
+            if relative_path == Path("super-md.spec"):
+                self.assertIn('pathex=[str(root / "desktop")]', source)
+            imports = [
+                node.module
+                for node in ast.walk(ast.parse(source, filename=str(target_path)))
+                if isinstance(node, ast.ImportFrom)
+            ]
+            self.assertIn("scripts.package_runtime", imports, f"Expected scripts.package_runtime in {relative_path}")
+            self.assertNotIn("package_runtime", imports, f"Unexpected bare package_runtime in {relative_path}")
 
 
 if __name__ == "__main__":
