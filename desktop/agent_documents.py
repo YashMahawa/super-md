@@ -441,6 +441,28 @@ class DocumentStore:
                 )
                 self._cache_put_locked(entry)
 
+    def _commit_write(self, path: Path, entry: _CachedEnvelope, *, expected_revision: str,
+                      text: str, assets: dict[str, str], portable: bool, data: bytes,
+                      conflict_message: str,
+                      decoded_asset: tuple[str, tuple[str, bytes, str]] | None = None) -> str:
+        # Recheck immediately before atomic replace to catch ordinary
+        # external writers that do not participate in our lock protocol.
+        if digest_bytes(self._read_raw(path)) != expected_revision:
+            with self._cache_lock:
+                self._invalidate_path_locked(path, entry.stat_key)
+            raise RevisionConflict(conflict_message)
+        _atomic_replace(path, data)
+        with self._cache_lock:
+            prior_decoded = dict(entry.decoded_assets)
+        if decoded_asset is not None:
+            prior_decoded[decoded_asset[0]] = decoded_asset[1]
+        new_revision = digest_bytes(data)
+        self._record_written_snapshot(
+            path, old_stat=entry.stat_key, text=text, assets=assets,
+            portable=portable, data=data, revision=new_revision, prior_decoded=prior_decoded,
+        )
+        return new_revision
+
     def _load(self, path: Path) -> tuple[str, dict[str, str], bool, bytes]:
         with _path_lock(path):
             before_stat = self._try_stat_key(path)
@@ -589,19 +611,9 @@ class DocumentStore:
             if len(edited.encode("utf-8")) > 20_000_000:
                 raise AgentDocumentError("Edited Markdown exceeds the 20 MB limit")
             data = _serialize(path, edited, entry.assets, portable=entry.portable)
-            # Recheck immediately before atomic replace to catch ordinary
-            # external writers that do not participate in our lock protocol.
-            if digest_bytes(self._read_raw(path)) != expected_revision:
-                with self._cache_lock:
-                    self._invalidate_path_locked(path, entry.stat_key)
-                raise RevisionConflict("Document changed during the edit; no changes were saved")
-            with self._cache_lock:
-                prior_decoded = dict(entry.decoded_assets)
-            _atomic_replace(path, data)
-            new_revision = digest_bytes(data)
-            self._record_written_snapshot(
-                path, old_stat=entry.stat_key, text=edited, assets=entry.assets,
-                portable=entry.portable, data=data, revision=new_revision, prior_decoded=prior_decoded,
+            new_revision = self._commit_write(
+                path, entry, expected_revision=expected_revision, text=edited, assets=entry.assets,
+                portable=entry.portable, data=data, conflict_message="Document changed during the edit; no changes were saved",
             )
         return {"path": self.display_path(path), "previous_revision": actual,
                 "revision": new_revision, "sha256": new_revision, "bytes": len(data),
@@ -677,18 +689,10 @@ class DocumentStore:
             updated = dict(entry.assets)
             updated[asset_key] = data_url
             data = _serialize(path, entry.text, updated, portable=True)
-            if digest_bytes(self._read_raw(path)) != expected_revision:
-                with self._cache_lock:
-                    self._invalidate_path_locked(path, entry.stat_key)
-                raise RevisionConflict("Document changed during the edit; no changes were saved")
-            with self._cache_lock:
-                prior_decoded = dict(entry.decoded_assets)
-            prior_decoded[asset_key] = (mime, raw_asset, asset_sha)
-            _atomic_replace(path, data)
-            new_revision = digest_bytes(data)
-            self._record_written_snapshot(
-                path, old_stat=entry.stat_key, text=entry.text, assets=updated,
-                portable=True, data=data, revision=new_revision, prior_decoded=prior_decoded,
+            new_revision = self._commit_write(
+                path, entry, expected_revision=expected_revision, text=entry.text, assets=updated, portable=True,
+                data=data, conflict_message="Document changed during the edit; no changes were saved",
+                decoded_asset=(asset_key, (mime, raw_asset, asset_sha)),
             )
         return {"path": self.display_path(path), "asset": _asset_record(asset_key, mime, len(raw_asset), asset_sha),
                 "previous_revision": expected_revision, "revision": new_revision, "saved": True}
@@ -733,19 +737,11 @@ class DocumentStore:
             documents._cache_validated_asset(new_url, mime, len(raw_asset))
             updated[asset_name] = new_url
             data = _serialize(path, entry.text, updated, portable=True)
-            if digest_bytes(self._read_raw(path)) != expected_revision:
-                with self._cache_lock:
-                    self._invalidate_path_locked(path, entry.stat_key)
-                raise RevisionConflict("Document changed during replacement; no changes were saved")
             new_sha = digest_bytes(raw_asset)
-            with self._cache_lock:
-                prior_decoded = dict(entry.decoded_assets)
-            prior_decoded[asset_name] = (mime, raw_asset, new_sha)
-            _atomic_replace(path, data)
-            new_revision = digest_bytes(data)
-            self._record_written_snapshot(
-                path, old_stat=entry.stat_key, text=entry.text, assets=updated,
-                portable=True, data=data, revision=new_revision, prior_decoded=prior_decoded,
+            new_revision = self._commit_write(
+                path, entry, expected_revision=expected_revision, text=entry.text, assets=updated, portable=True,
+                data=data, conflict_message="Document changed during replacement; no changes were saved",
+                decoded_asset=(asset_name, (mime, raw_asset, new_sha)),
             )
         return {"path": self.display_path(path), "asset": _asset_record(asset_name, mime, len(raw_asset), new_sha),
                 "previous_revision": revision, "revision": new_revision, "saved": True, "changed": True}

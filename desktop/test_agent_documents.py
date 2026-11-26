@@ -919,6 +919,287 @@ class AgentDocumentsTest(unittest.TestCase):
             [{"start": unclosed_braced_py.index("<svg/>"), "end": unclosed_braced_py.index("<svg/>") + len("<svg/>")}],
         )
 
+    def test_stale_writes_leave_original_note_and_cached_revision_intact(self):
+        import documents
+        from unittest.mock import patch
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='4'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='8' height='8'/></svg>"
+        png_a = b"\x89PNG\r\n\x1a\nfirst-png"
+        png_b = b"\x89PNG\r\n\x1a\nsecond-png"
+        (self.root / "chart.svg").write_bytes(svg_v1)
+        (self.root / "chart_v2.svg").write_bytes(svg_v2)
+        (self.root / "a.png").write_bytes(png_a)
+        (self.root / "b.png").write_bytes(png_b)
+
+        created = self.store.create("stale-check.smd", "# Heading\nBody v0\n")
+        rev_v0 = created["revision"]
+        rev_attach = self.store.attach_asset("stale-check.smd", "chart.svg", expected_revision=rev_v0)["revision"]
+        rev_attach2 = self.store.attach_asset("stale-check.smd", "a.png", expected_revision=rev_attach)["revision"]
+        patched = self.store.patch(
+            "stale-check.smd",
+            expected_revision=rev_attach2,
+            operations=[{"type": "replace", "old": "Body v0", "new": "Body v1"}],
+        )
+        rev_v1 = patched["revision"]
+        note_path = self.root / "stale-check.smd"
+        expected_bytes = note_path.read_bytes()
+
+        # Warm asset metadata and verify the current revision + decoded assets live in cache.
+        info = self.store.inspect("stale-check.smd")
+        chart_id = next(item["id"] for item in info["assets"] if item["name"] == "assets/chart.svg")
+        cached_before = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+        self.assertEqual(cached_before.revision, rev_v1)
+        self.assertEqual(set(cached_before.decoded_assets.keys()), {"assets/chart.svg", "assets/a.png"})
+
+        with (
+            patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+            patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+        ):
+            with self.assertRaisesRegex(
+                RevisionConflict, "Document changed since it was read; inspect it again before editing"
+            ):
+                self.store.patch(
+                    "stale-check.smd",
+                    expected_revision=rev_v0,
+                    operations=[{"type": "replace", "old": "Body v1", "new": "Stale overwrite"}],
+                )
+            with self.assertRaisesRegex(
+                RevisionConflict, "Document changed since it was read; inspect it again before editing"
+            ):
+                self.store.attach_asset("stale-check.smd", "b.png", expected_revision=rev_v0)
+            with self.assertRaisesRegex(
+                RevisionConflict, "Document changed since it was read; inspect again before replacing an asset"
+            ):
+                self.store.replace_asset("stale-check.smd", chart_id, "chart_v2.svg", expected_revision=rev_v0)
+
+            self.assertEqual(note_path.read_bytes(), expected_bytes)
+            cached_after = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+            self.assertIs(cached_after, cached_before)
+            self.assertEqual(cached_after.revision, rev_v1)
+            self.assertEqual(self.store.read("stale-check.smd", view="source")["revision"], rev_v1)
+            self.assertEqual(
+                self.store.read_asset("stale-check.smd", "assets/chart.svg", expected_revision=rev_v1)["data"],
+                svg_v1,
+            )
+            self.assertEqual(gzip_spy.call_count, 0)
+            self.assertEqual(b64_spy.call_count, 0)
+
+        # Also verify stale expected_revision after an external atomic update leaves the new note and its cached revision intact.
+        external_packed = compressed_bundle(
+            "# Heading\nExternal v2\n",
+            {"assets/chart.svg": "data:image/svg+xml;base64," + base64.b64encode(svg_v1).decode("ascii")},
+        )
+        atomic_write(note_path, external_packed)
+        rev_v2 = hashlib.sha256(external_packed).hexdigest()
+        for attempt in (
+            lambda: self.store.patch(
+                "stale-check.smd",
+                expected_revision=rev_v1,
+                operations=[{"type": "replace", "old": "External v2", "new": "Stale"}],
+            ),
+            lambda: self.store.attach_asset("stale-check.smd", "b.png", expected_revision=rev_v1),
+            lambda: self.store.replace_asset("stale-check.smd", chart_id, "chart_v2.svg", expected_revision=rev_v1),
+        ):
+            with self.assertRaises(RevisionConflict):
+                attempt()
+        self.assertEqual(note_path.read_bytes(), external_packed)
+        cached_v2 = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+        self.assertEqual(cached_v2.revision, rev_v2)
+        self.assertEqual(self.store.inspect("stale-check.smd")["revision"], rev_v2)
+
+    def test_failed_writes_leave_original_note_and_cached_revision_intact(self):
+        import agent_documents
+        import documents
+        from unittest.mock import patch
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0L4 4'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M1 1L9 9'/></svg>"
+        png_a = b"\x89PNG\r\n\x1a\nkept-png"
+        png_new = b"\x89PNG\r\n\x1a\ncandidate-png"
+        (self.root / "chart.svg").write_bytes(svg_v1)
+        (self.root / "chart_v2.svg").write_bytes(svg_v2)
+        (self.root / "a.png").write_bytes(png_a)
+        (self.root / "new.png").write_bytes(png_new)
+        (self.root / "plain.md").write_text("# Plain\nNo portable envelope\n", encoding="utf-8")
+        plain_rev = self.store.inspect("plain.md")["revision"]
+
+        rev0 = self.store.create("atomic-safe.smd", "# Safe\nOriginal text\n")["revision"]
+        rev1 = self.store.attach_asset("atomic-safe.smd", "chart.svg", expected_revision=rev0)["revision"]
+        rev = self.store.attach_asset("atomic-safe.smd", "a.png", expected_revision=rev1)["revision"]
+        note_path = self.root / "atomic-safe.smd"
+        original_bytes = note_path.read_bytes()
+        info = self.store.inspect("atomic-safe.smd")
+        chart_id = next(item["id"] for item in info["assets"] if item["name"] == "assets/chart.svg")
+        cached_entry = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+
+        outside = self.root.parent / (self.root.name + "-outside-asset.png")
+        outside.write_bytes(png_new)
+        try:
+            # Validation, access-control, and domain-rule failures across patch, attach_asset, and replace_asset.
+            failing_calls = [
+                lambda: self.store.patch("atomic-safe.smd", expected_revision="bad-rev", operations=[{"type": "insert", "line": 1, "text": "x\n"}]),
+                lambda: self.store.patch("atomic-safe.smd", expected_revision=rev, operations=[{"type": "replace", "old": "missing-token", "new": "x"}]),
+                lambda: self.store.attach_asset("atomic-safe.smd", str(outside), expected_revision=rev),
+                lambda: self.store.attach_asset("atomic-safe.smd", "chart.svg", expected_revision=rev),
+                lambda: self.store.attach_asset("atomic-safe.smd", "new.png", expected_revision=rev, name="../escape.png"),
+                lambda: self.store.attach_asset("plain.md", "new.png", expected_revision=plain_rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", chart_id, str(outside), expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", "", "chart_v2.svg", expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", "assets/missing.svg", "chart_v2.svg", expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", chart_id, "new.png", expected_revision=rev),
+                lambda: self.store.replace_asset("plain.md", "assets/chart.svg", "chart_v2.svg", expected_revision=plain_rev),
+            ]
+            for call in failing_calls:
+                with self.assertRaises(AgentDocumentError):
+                    call()
+
+            # Simulated serialization failure and mid-commit os.replace / symlink-guard failure across all three writes.
+            write_attempts = [
+                lambda: self.store.patch(
+                    "atomic-safe.smd",
+                    expected_revision=rev,
+                    operations=[{"type": "replace", "old": "Original text", "new": "Uncommitted patch"}],
+                ),
+                lambda: self.store.attach_asset("atomic-safe.smd", "new.png", expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", chart_id, "chart_v2.svg", expected_revision=rev),
+            ]
+            with patch("agent_documents._serialize", side_effect=AgentDocumentError("Bundle exceeds 75 MB")):
+                for attempt in write_attempts:
+                    with self.assertRaisesRegex(AgentDocumentError, "Bundle exceeds 75 MB"):
+                        attempt()
+
+            with patch("agent_documents.os.replace", side_effect=OSError("simulated I/O failure")):
+                for attempt in write_attempts:
+                    with self.assertRaisesRegex(OSError, "simulated I/O failure"):
+                        attempt()
+                    self.assertEqual(list(self.root.glob(".*agent-tmp")), [])
+
+            for attempt in write_attempts:
+                checks = 0
+
+                def symlink_after_resolve(candidate):
+                    nonlocal checks
+                    if candidate == note_path:
+                        checks += 1
+                        return note_path if checks >= 2 else None
+                    return None
+
+                with patch("agent_documents._symlink_component", side_effect=symlink_after_resolve):
+                    with self.assertRaisesRegex(AgentDocumentError, "Refusing to replace a symlink path"):
+                        attempt()
+                self.assertEqual(list(self.root.glob(".*agent-tmp")), [])
+
+            # Original note on disk, cached revision, and memoized decoded_assets remain completely untouched.
+            self.assertEqual(note_path.read_bytes(), original_bytes)
+            current_cached = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+            self.assertIs(current_cached, cached_entry)
+            self.assertEqual(current_cached.revision, rev)
+            self.assertEqual(set(current_cached.decoded_assets.keys()), {"assets/chart.svg", "assets/a.png"})
+            self.assertEqual(current_cached.decoded_assets["assets/chart.svg"][1], svg_v1)
+
+            with (
+                patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+                patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+            ):
+                self.assertEqual(self.store.read("atomic-safe.smd", view="source")["text"], "# Safe\nOriginal text\n")
+                self.assertEqual(
+                    self.store.read_asset("atomic-safe.smd", "assets/chart.svg", expected_revision=rev)["data"],
+                    svg_v1,
+                )
+                self.assertEqual(gzip_spy.call_count, 0)
+                self.assertEqual(b64_spy.call_count, 0)
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_mid_write_recheck_conflicts_and_replace_noop_keep_method_contracts(self):
+        import agent_documents
+        from unittest.mock import patch
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='2'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='9'/></svg>"
+        png_extra = b"\x89PNG\r\n\x1a\nextra-png"
+        (self.root / "same.svg").write_bytes(svg_v1)
+        (self.root / "next.svg").write_bytes(svg_v2)
+        (self.root / "extra.png").write_bytes(png_extra)
+
+        rev0 = self.store.create("race.smd", "# Race\nInitial line\n")["revision"]
+        rev = self.store.attach_asset("race.smd", "same.svg", expected_revision=rev0)["revision"]
+        note_path = self.root / "race.smd"
+        before_bytes = note_path.read_bytes()
+        info = self.store.inspect("race.smd")
+        asset_id = info["assets"][0]["id"]
+        cached_entry = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+
+        # Identical replacement bytes remain a clean no-op without touching disk or replacing the cached entry.
+        with patch("agent_documents._atomic_replace", wraps=agent_documents._atomic_replace) as replace_spy:
+            noop = self.store.replace_asset("race.smd", asset_id, "same.svg", expected_revision=rev)
+            self.assertEqual(replace_spy.call_count, 0)
+        self.assertFalse(noop["saved"])
+        self.assertFalse(noop["changed"])
+        self.assertEqual(noop["revision"], rev)
+        self.assertEqual(noop["previous_revision"], rev)
+        self.assertEqual(note_path.read_bytes(), before_bytes)
+        self.assertIs(
+            next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path)),
+            cached_entry,
+        )
+
+        # Mid-write external modifications caught by the pre-replace recheck preserve each method's error message
+        # and leave the external writer's note intact while refreshing the cache on subsequent reads.
+        real_serialize = agent_documents._serialize
+        cases = [
+            (
+                "patch",
+                "Document changed during the edit; no changes were saved",
+                lambda r: self.store.patch(
+                    "race.smd",
+                    expected_revision=r,
+                    operations=[{"type": "replace", "old": "Initial line", "new": "Agent edit"}],
+                ),
+            ),
+            (
+                "attach",
+                "Document changed during the edit; no changes were saved",
+                lambda r: self.store.attach_asset("race.smd", "extra.png", expected_revision=r),
+            ),
+            (
+                "replace",
+                "Document changed during replacement; no changes were saved",
+                lambda r: self.store.replace_asset("race.smd", asset_id, "next.svg", expected_revision=r),
+            ),
+        ]
+        for label, expected_msg, invoke in cases:
+            # Reset note to known state with asset_id intact.
+            base_bytes = compressed_bundle(
+                "# Race\nInitial line\n",
+                {"assets/same.svg": "data:image/svg+xml;base64," + base64.b64encode(svg_v1).decode("ascii")},
+            )
+            atomic_write(note_path, base_bytes)
+            current_rev = self.store.inspect("race.smd")["revision"]
+            external_bytes = compressed_bundle(
+                f"# Race\nExternal concurrent edit ({label})\n",
+                {"assets/same.svg": "data:image/svg+xml;base64," + base64.b64encode(svg_v1).decode("ascii")},
+            )
+            external_rev = hashlib.sha256(external_bytes).hexdigest()
+
+            def concurrent_external_write(target_path, text, assets, *, portable=None, _ext=external_bytes):
+                packed = real_serialize(target_path, text, assets, portable=portable)
+                atomic_write(note_path, _ext)
+                return packed
+
+            with (
+                patch("agent_documents._serialize", side_effect=concurrent_external_write),
+                patch("agent_documents._atomic_replace", wraps=agent_documents._atomic_replace) as replace_spy,
+            ):
+                with self.assertRaisesRegex(RevisionConflict, expected_msg):
+                    invoke(current_rev)
+                self.assertEqual(replace_spy.call_count, 0)
+
+            self.assertEqual(note_path.read_bytes(), external_bytes)
+            self.assertEqual(self.store.inspect("race.smd")["revision"], external_rev)
+            self.assertIn(f"External concurrent edit ({label})", self.store.read("race.smd", view="source")["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
