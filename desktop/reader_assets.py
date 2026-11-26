@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import secrets
+import stat
 import threading
 import urllib.parse
 from collections import OrderedDict
@@ -12,12 +13,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QByteArray, QBuffer, QFile, QIODevice, QUrlQuery
-from PySide6.QtWebEngineCore import QWebEngineUrlRequestJob, QWebEngineUrlSchemeHandler
+from PySide6.QtCore import QByteArray, QBuffer, QFile, QIODevice, QUrl, QUrlQuery
+from PySide6.QtWebEngineCore import QWebEngineUrlRequestJob, QWebEngineUrlScheme, QWebEngineUrlSchemeHandler
 
 from documents import MAX_IMAGE, MIMES, image_data
 
 SCHEME = "supermdasset"
+READER_SCHEME = "supermdreader"
+READER_HOST = "app"
+MAX_BUNDLE_FILE = 50_000_000
+BUNDLE_MIMES = {
+    "html": "text/html",
+    "js": "text/javascript",
+    "mjs": "text/javascript",
+    "css": "text/css",
+    "json": "application/json",
+    "svg": "image/svg+xml",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "avif": "image/avif",
+    "ico": "image/x-icon",
+    "woff2": "font/woff2",
+    "woff": "font/woff",
+    "ttf": "font/ttf",
+    "otf": "font/otf",
+    "wasm": "application/wasm",
+    "txt": "text/plain",
+    "md": "text/plain",
+    "zip": "application/zip",
+}
 TOKEN = re.compile(r"^[a-f0-9]{32}$")
 FINGERPRINT = re.compile(r"^[a-f0-9]{64}$")
 RASTER_MIMES = frozenset(("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif"))
@@ -340,6 +367,122 @@ class ReaderAssetSchemeHandler(QWebEngineUrlSchemeHandler):
         try:
             device = self._store.open_payload(grant)
             device.setParent(job)
+            job.setAdditionalResponseHeaders({
+                QByteArray(b"Access-Control-Allow-Origin"): QByteArray(f"{READER_SCHEME}://{READER_HOST}".encode("ascii")),
+                QByteArray(b"Cache-Control"): QByteArray(b"no-store"),
+                QByteArray(b"X-Content-Type-Options"): QByteArray(b"nosniff"),
+            })
             job.reply(grant.mime.encode("ascii"), device)
         except (OSError, ValueError):
             job.fail(QWebEngineUrlRequestJob.Error.RequestFailed)
+
+
+def reader_bundle_url(entry: str = "qt-reader.html") -> QUrl:
+    clean = entry.lstrip("/")
+    if not clean or "/" in clean and ".." in clean.split("/"):
+        raise ValueError("Invalid reader bundle entrypoint")
+    return QUrl(f"{READER_SCHEME}://{READER_HOST}/{clean}")
+
+
+def register_reader_schemes() -> None:
+    """Register isolated reader and raster schemes without local-file privileges."""
+    flags = (
+        QWebEngineUrlScheme.Flag.SecureScheme
+        | QWebEngineUrlScheme.Flag.CorsEnabled
+        | QWebEngineUrlScheme.Flag.FetchApiAllowed
+    )
+    for name in (SCHEME.encode("ascii"), READER_SCHEME.encode("ascii")):
+        if bytes(QWebEngineUrlScheme.schemeByName(name).name()) == name:
+            continue
+        scheme = QWebEngineUrlScheme(name)
+        scheme.setSyntax(QWebEngineUrlScheme.Syntax.Host)
+        scheme.setFlags(flags)
+        QWebEngineUrlScheme.registerScheme(scheme)
+
+
+def resolve_bundle_file(dist_root: Path, raw_path: str) -> tuple[Path, str]:
+    """Resolve a relative dist resource path while rejecting traversal and symlinks."""
+    if not isinstance(raw_path, str) or not raw_path.startswith("/"):
+        raise PermissionError("Invalid reader bundle path")
+    decoded = urllib.parse.unquote(raw_path)
+    if "\x00" in decoded or "\\" in decoded:
+        raise PermissionError("Invalid characters in reader bundle path")
+    parts = [part for part in decoded.split("/") if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        raise PermissionError("Path traversal is not allowed in reader bundle")
+    root = dist_root.resolve()
+    if not root.is_dir():
+        raise FileNotFoundError("Reader bundle root is missing")
+    cursor = root
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise PermissionError("Symbolic links are not served from the reader bundle")
+    resolved = cursor.resolve()
+    if not resolved.is_relative_to(root):
+        raise PermissionError("Resource escapes reader bundle root")
+    mime = BUNDLE_MIMES.get(cursor.suffix.lstrip(".").lower())
+    if not mime:
+        raise PermissionError("Unsupported reader bundle file type")
+    return resolved, mime
+
+
+class ReaderBundleSchemeHandler(QWebEngineUrlSchemeHandler):
+    """Serves only packaged dist files over the app-owned supermdreader://app origin."""
+
+    def __init__(self, dist_root: Path, parent=None):
+        super().__init__(parent)
+        self._dist_root = Path(dist_root)
+
+    def open_bundle_device(self, raw_path: str) -> tuple[QIODevice, str]:
+        target, mime = resolve_bundle_file(self._dist_root, raw_path)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(target, flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BUNDLE_FILE:
+                raise PermissionError("Bundle entry is not a bounded regular file")
+            device = QFile()
+            if not device.open(descriptor, QIODevice.OpenModeFlag.ReadOnly, QFile.FileHandleFlag.AutoCloseHandle):
+                raise OSError("Could not open reader bundle file")
+            descriptor = -1
+            return device, mime
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def requestStarted(self, job):  # noqa: N802 - Qt virtual method
+        url = job.requestUrl()
+        method = bytes(job.requestMethod()).upper()
+        if (
+            url.scheme() != READER_SCHEME
+            or url.host() != READER_HOST
+            or url.userInfo()
+            or url.port() != -1
+            or url.hasQuery()
+            or url.hasFragment()
+            or method not in (b"GET", b"HEAD")
+        ):
+            job.fail(QWebEngineUrlRequestJob.Error.RequestDenied)
+            return
+        try:
+            device, mime = self.open_bundle_device(url.path())
+            if method == b"HEAD":
+                device.close()
+                empty = QBuffer(job)
+                empty.setData(QByteArray())
+                empty.open(QIODevice.OpenModeFlag.ReadOnly)
+                device = empty
+            else:
+                device.setParent(job)
+            job.setAdditionalResponseHeaders({
+                QByteArray(b"Cache-Control"): QByteArray(b"no-store"),
+                QByteArray(b"X-Content-Type-Options"): QByteArray(b"nosniff"),
+            })
+            job.reply(mime.encode("ascii"), device)
+        except PermissionError:
+            job.fail(QWebEngineUrlRequestJob.Error.RequestDenied)
+        except (FileNotFoundError, NotADirectoryError):
+            job.fail(QWebEngineUrlRequestJob.Error.UrlNotFound)
+        except OSError:
+            job.fail(QWebEngineUrlRequestJob.Error.RequestDenied)
