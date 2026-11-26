@@ -57,6 +57,10 @@ from export_jobs import ExportJobRegistry
 import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
+try:
+    from . import studio_chrome
+except ImportError:
+    import studio_chrome
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
@@ -1221,126 +1225,76 @@ class Studio(QObject):
             self._last_reader_text=(tab["id"],tab["content"])
             self.readerLoad.emit(json.dumps(payload))
 
-    def _tokens(self):
-        # Scheme generation is costly and QML reads colors from many bindings.
-        theme = self.settings["fullTheme" if self.fullscreen else "theme"]
-        selected=self.session.custom_theme
-        key = (theme,self.system_dark,json.dumps(self.system_colors,sort_keys=True),self.system_mode,self.settings["accent"],self.session.theme_revision)
-        if getattr(self,"_token_key",None) != key:
-            self._token_key = key
-            dark,colors=tokens(theme,self.system_dark,self.system_colors,self.system_mode,selected["accent"] if selected else self.settings["accent"])
-            self._token_value = (dark,custom_theme.palette(colors,custom_theme.variant(selected,theme,dark).get("colors",{}))) if selected else (dark,colors)
-        return self._token_value
+    def _tokens(self): return studio_chrome.tokens_for(self)
 
-    def _dark(self):
-        return self._tokens()[0]
+    def _dark(self): return studio_chrome.dark_for(self)
 
-    def _colors(self):
-        return dict(self._tokens()[1])
+    def _colors(self): return studio_chrome.colors_for(self)
 
     @Property("QVariantMap", notify=changed)
-    def palette(self): return self._colors()
+    def palette(self): return studio_chrome.palette(self)
 
     @Property("QVariantMap",notify=changed)
-    def themeMetrics(self):return {"controlRadius":22,"contentRadius":16,**(self.session.custom_theme or {}).get("metrics",{})}
+    def themeMetrics(self): return studio_chrome.theme_metrics(self)
 
     @Property(str,notify=changed)
-    def customThemeName(self):return (self.session.custom_theme or {}).get("name","Built-in appearance")
+    def customThemeName(self): return studio_chrome.custom_theme_name(self)
 
     @Property(bool,notify=changed)
-    def customThemeActive(self):return self.session.custom_theme is not None
+    def customThemeActive(self): return studio_chrome.custom_theme_active(self)
 
     @Property("QVariantList",constant=True)
-    def bundledThemes(self):return custom_theme.bundled_themes(ROOT)
+    def bundledThemes(self): return studio_chrome.bundled_themes(self)
 
     @Property("QVariantList",notify=changed)
-    def savedThemes(self):return copy.deepcopy(self.session.saved_themes)
+    def savedThemes(self): return studio_chrome.saved_themes(self)
 
     @Property(str,notify=changed)
-    def activeThemeKind(self):return self.session.active_theme_kind
+    def activeThemeKind(self): return studio_chrome.active_theme_kind(self)
 
     @Property(str,notify=changed)
-    def activeThemeId(self):return self.session.active_theme_id
+    def activeThemeId(self): return studio_chrome.active_theme_id(self)
 
     @Property(bool,notify=changed)
-    def customThemeHasSource(self):
-        return self.session.custom_theme is not None and self.session.active_theme_kind != "preset" and bool(self.session.theme_source)
+    def customThemeHasSource(self): return studio_chrome.custom_theme_has_source(self)
 
     @Property("QVariantMap",notify=changed)
-    def themeArtwork(self):
-        selected=custom_theme.variant(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark())
-        return custom_theme.artwork(self.session.custom_theme,selected)
+    def themeArtwork(self): return studio_chrome.theme_artwork(self)
 
     @Property("QVariantMap",notify=changed)
-    def themeBackground(self):
-        style=custom_theme.reader(self.session.custom_theme,self.settings["theme"],self._dark(),self.settings)
-        return {"pattern":"none","opacity":.06,"size":24,"spacing":24,**(style["background"] or {})}
+    def themeBackground(self): return studio_chrome.theme_background(self)
 
     @Slot()
-    def resetThemeBackground(self):
-        self.settings.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
-        self._preferences();self._emit()
+    def resetThemeBackground(self): studio_chrome.reset_theme_background(self)
 
     @Property(bool, notify=changed)
-    def motionEnabled(self): return bool(self.settings["motion"])
+    def motionEnabled(self): return studio_chrome.motion_enabled(self)
 
     @Property(str, constant=True)
-    def shortcutActions(self): return json.dumps(SHORTCUT_DEFINITIONS)
+    def shortcutActions(self): return studio_chrome.shortcut_actions(self)
 
     @Property(str, notify=shortcutsChanged)
-    def shortcutBindings(self): return json.dumps(self.settings.get("shortcuts", {}))
+    def shortcutBindings(self): return studio_chrome.shortcut_bindings(self)
 
     @Property(str, notify=shortcutsChanged)
-    def shortcutLabels(self):
-        return json.dumps({action: self.shortcutLabel(action) for action in self.settings.get("shortcuts", {})})
+    def shortcutLabels(self): return studio_chrome.shortcut_labels(self)
 
     @Slot(str, result="QVariantList")
-    def shortcutSequences(self, action):
-        return list(self.settings.get("shortcuts", {}).get(action, []))
+    def shortcutSequences(self, action): return studio_chrome.shortcut_sequences(self, action)
 
     @Slot(str, result=str)
-    def shortcutLabel(self, action):
-        values = self.shortcutSequences(action)
-        return "  /  ".join(native_label(value) for value in values) if values else "Disabled"
+    def shortcutLabel(self, action): return studio_chrome.shortcut_label(self, action)
 
     @Slot(int, int, result=str)
-    def captureShortcut(self, key, modifiers):
-        sequence, error = capture_sequence(key, modifiers)
-        return json.dumps({"sequence": sequence, "error": error})
+    def captureShortcut(self, key, modifiers): return studio_chrome.capture_shortcut(self, key, modifiers)
 
     @Slot(str, str, result=str)
-    def setShortcut(self, action, value):
-        if action not in self.settings.get("shortcuts", {}):
-            return "Unknown shortcut action."
-        sequence = parse_sequence(value) if value else None
-        if value and sequence is None:
-            return "Invalid key combination."
-        candidate = copy.deepcopy(self.settings["shortcuts"])
-        candidate[action] = [sequence] if sequence else []
-        validated, error = normalize_shortcuts(candidate, edited_action=action)
-        if error: return error
-        if validated == self.settings["shortcuts"]: return ""
-        self.settings["shortcuts"] = validated
-        self._notify_shortcuts()
-        self._preferences()
-        self._emit(False)
-        return ""
+    def setShortcut(self, action, value): return studio_chrome.set_shortcut(self, action, value)
 
     @Slot(result=str)
-    def resetShortcuts(self):
-        defaults = default_shortcuts()
-        if defaults == self.settings["shortcuts"]: return ""
-        self.settings["shortcuts"] = defaults
-        self._notify_shortcuts()
-        self._preferences()
-        self._emit(False)
-        return ""
+    def resetShortcuts(self): return studio_chrome.reset_shortcuts(self)
 
-    def _notify_shortcuts(self):
-        # Do not rebuild every QML Shortcut/recorder on each note edit, zoom or
-        # scroll update. Only an actual binding change invalidates these maps.
-        for window in tuple(self.session.windows.values()):
-            if not window.retired: window.shortcutsChanged.emit()
+    def _notify_shortcuts(self): studio_chrome.notify_shortcuts(self)
 
     def _watch_notes(self,force=False):
         if self.retired:return
@@ -1458,41 +1412,15 @@ class Studio(QObject):
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
 
-    def _schedule_theme(self,*_):
-        self.theme_debounce.start(150)
+    def _schedule_theme(self,*args): studio_chrome.schedule_theme(self, *args)
 
-    def _watch_palette(self):
-        if self.retired:return
-        watched = set(self.palette_watcher.files()+self.palette_watcher.directories())
-        for path in system_palette_paths():
-            for target in (path,path.parent):
-                if target.exists() and str(target) not in watched:
-                    self.palette_watcher.addPath(str(target))
+    def _watch_palette(self): studio_chrome.watch_palette(self)
 
-    def _palette_changed(self,*_):
-        self._watch_palette()  # Atomic file replacement invalidates the old watch.
-        self._schedule_theme()
+    def _palette_changed(self,*args): studio_chrome.palette_changed(self, *args)
 
-    def _system_setting_changed(self):
-        self.system_preferences.readAllStandardOutput()
-        self._schedule_theme()
+    def _system_setting_changed(self): studio_chrome.system_setting_changed(self)
 
-    def _refresh_theme(self):
-        if self._theme_running:
-            self._theme_pending = True
-            return
-        self._theme_running = True
-        scheme = QGuiApplication.styleHints().colorScheme().name
-        def finished(result,error):
-            self._theme_running = False
-            if not error and result != self._theme_result:
-                self._theme_result = result
-                self.system_dark,(self.system_mode,self.system_colors) = result
-                self._emit()
-            if self._theme_pending:
-                self._theme_pending = False
-                self._schedule_theme()
-        self._submit(lambda:(detect_system_dark(scheme),read_system_palette()),finished,False)
+    def _refresh_theme(self): studio_chrome.refresh_theme(self)
 
     def stop(self):
         if self.retired: return
@@ -2297,23 +2225,13 @@ class Studio(QObject):
             return False
 
     @Property(bool,notify=changed)
-    def readerFullscreen(self):return self.fullscreen
+    def readerFullscreen(self): return studio_chrome.reader_fullscreen(self)
 
     @Property(str,notify=changed)
-    def selectionAssistantLabel(self):
-        provider=self.settings.get("selectionAssistant")
-        return ASSISTANTS.get(provider,"ChatGPT") if isinstance(provider,str) else "ChatGPT"
+    def selectionAssistantLabel(self): return studio_chrome.selection_assistant_label(self)
 
     @Slot(str,str)
-    def selectionAction(self, action, text):
-        try:
-            url, copy_text, message=selection_target(action,text,self.settings.get("selectionAssistant","chatgpt"))
-            if copy_text:QGuiApplication.clipboard().setText(text.replace("\u2029","\n"))
-            opened=QDesktopServices.openUrl(QUrl(url))
-            self.message=message if opened else "Could not open your browser." + (" The selected text is copied." if copy_text else "")
-        except (ValueError,UnicodeError) as error:
-            self.message=str(error)
-        self._emit(False)
+    def selectionAction(self, action, text): studio_chrome.selection_action(self, action, text)
 
     @Property(bool,notify=changed)
     def retired(self):return self._retired
@@ -2565,12 +2483,7 @@ class Studio(QObject):
         self._submit(lambda: python_runtime.setup_environment(managed, self.pythonProgress.emit), done, False)
 
     @Slot(int, int, bool)
-    def rememberWindow(self, width, height, maximized):
-        # Reopen at the size people left, not a fixed default every launch.
-        value = {"width": max(760, min(10000, int(width))), "height": max(520, min(10000, int(height))), "maximized": bool(maximized)}
-        if self.settings.get("window") != value:
-            self.settings["window"] = value
-            self._preferences()
+    def rememberWindow(self, width, height, maximized): studio_chrome.remember_window(self, width, height, maximized)
 
     @Slot()
     def installUpdate(self):
@@ -2686,307 +2599,76 @@ class Studio(QObject):
         self.detachTab(tab_id)
 
     @Property("QStringList", notify=changed)
-    def fonts(self):
-        preferred = ["Manrope", "Roboto", "Noto Sans", "Noto Serif", "JetBrains Mono", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]
-        return preferred + sorted(set(QFontDatabase.families()) - set(preferred))
+    def fonts(self): return studio_chrome.fonts(self)
 
     @Property(bool, constant=True)
-    def fedoraWindowFrame(self):
-        if not sys.platform.startswith("linux"):
-            return False
-        try:
-            return platform.freedesktop_os_release().get("ID") == "fedora"
-        except OSError:
-            return False
+    def fedoraWindowFrame(self): return studio_chrome.fedora_window_frame(self)
 
     @Property(bool, constant=True)
-    def showToolbarWindowControls(self):
-        desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
-        return self.fedoraWindowFrame or (sys.platform.startswith("linux") and
-            any(name in desktop for name in ("hyprland", "sway", "river", "niri")))
+    def showToolbarWindowControls(self): return studio_chrome.show_toolbar_window_controls(self)
 
     @Slot()
-    def chooseFont(self): self.fontPickerRequested.emit()
+    def chooseFont(self): studio_chrome.choose_font(self)
 
     @Slot()
-    def chooseCustomTheme(self):self.themePickerRequested.emit()
+    def chooseCustomTheme(self): studio_chrome.choose_custom_theme(self)
 
     @Slot()
-    def chooseThemeExport(self):self.themeExportRequested.emit()
+    def chooseThemeExport(self): studio_chrome.choose_theme_export(self)
 
     @Slot()
-    def openThemeGuide(self):self.readerCall.emit("window.supermdThemeGuide?.()")
+    def openThemeGuide(self): studio_chrome.open_theme_guide(self)
 
-    def _save_theme_library(self):
-        atomic_json(
-            self.data / "theme-library.json",
-            {
-                "active": {"kind": self.session.active_theme_kind, "id": self.session.active_theme_id},
-                "saved": self.session.saved_themes,
-            },
-        )
+    def _save_theme_library(self): studio_chrome.save_theme_library(self)
 
-    def _clear_theme_background_overrides(self):
-        changed = any(
-            self.settings.get(key) != default
-            for key, default in (("patternKind", ""), ("patternOpacity", -1), ("patternSize", 0), ("patternSpacing", 0))
-        )
-        self.settings.update(patternKind="", patternOpacity=-1, patternSize=0, patternSpacing=0)
-        if changed:
-            self._preferences(False)
+    def _clear_theme_background_overrides(self): studio_chrome.clear_theme_background_overrides(self)
 
-    def _watch_custom_theme(self):
-        if self.retired:return
-        watcher=self.custom_theme_watcher
-        paths=watcher.files()+watcher.directories()
-        if paths:watcher.removePaths(paths)
-        source=Path(self.session.theme_source) if self.session.active_theme_kind!="preset" and self.session.theme_source else None
-        self.custom_theme_stamp=custom_theme.stamp(source) if source else None
-        if source:
-            watcher.addPaths([str(path) for path in (source,source.parent) if path.exists()])
+    def _watch_custom_theme(self): studio_chrome.watch_custom_theme(self)
 
-    def _custom_theme_event(self):
-        if self.retired or self.session.active_theme_kind=="preset" or not self.session.theme_source:return
-        value=custom_theme.stamp(Path(self.session.theme_source))
-        if value==self.custom_theme_stamp:return
-        self.custom_theme_stamp=value
-        self.reloadCustomTheme()
+    def _custom_theme_event(self): studio_chrome.custom_theme_event(self)
 
-    def _restore_custom_theme(self):
-        if self.retired:
-            return
-        self._watch_custom_theme()
-        if self.session.theme_restored:
-            return
-        self.session.theme_restored = True
-        kind = self.session.active_theme_kind
-        cached = self.data / "theme.json"
-        if kind == "preset":
-            try:
-                target = cached if cached.is_file() else custom_theme.bundled_theme_path(self.session.active_theme_id, ROOT)
-            except ValueError:
-                return
-            self._load_custom_theme(target, mode="restore")
-            return
-        if kind == "saved":
-            saved_file = self.data / "themes" / f"{self.session.active_theme_id}.json"
-            primary = saved_file if saved_file.is_file() else cached
-            source = Path(self.session.theme_source) if self.session.theme_source else None
-            follow = source if source and source.is_file() and source != primary else None
-            if primary.is_file():
-                self._load_custom_theme(primary, mode="restore", follow_source=follow)
-            elif follow:
-                self._load_custom_theme(follow, mode="restore")
-            return
-        source = Path(self.session.theme_source) if self.session.theme_source else cached
-        if not source.is_file():
-            source = cached
-        if self.session.custom_theme is None and cached.is_file() and cached != source:
-            self._load_custom_theme(cached, mode="restore", follow_source=source)
-        elif source.is_file():
-            self._load_custom_theme(source, mode="restore")
+    def _restore_custom_theme(self): studio_chrome.restore_custom_theme(self)
 
     @Slot(str)
-    def importCustomTheme(self,value):self._load_custom_theme(local_path(value),mode="import")
+    def importCustomTheme(self,value): studio_chrome.import_custom_theme(self, value)
 
     @Slot(str)
-    def selectBundledTheme(self,preset_id):self._apply_bundled_theme(preset_id)
+    def selectBundledTheme(self,preset_id): studio_chrome.select_bundled_theme(self, preset_id)
 
-    def _apply_bundled_theme(self,preset_id,callback=None):
-        if not isinstance(preset_id,str) or not preset_id:
-            if callback:callback(None,"Unknown bundled theme")
-            return
-        if preset_id=="builtin":
-            self.resetCustomTheme()
-            if callback:callback({"id":"builtin","name":"Built-in appearance"},"")
-            return
-        try:
-            path=custom_theme.bundled_theme_path(preset_id,ROOT)
-        except ValueError as error:
-            self.message="Theme not applied: "+str(error);self._emit(False)
-            if callback:callback(None,str(error))
-            return
-        self._load_custom_theme(path,mode="preset",preset_id=preset_id,callback=callback)
+    def _apply_bundled_theme(self,preset_id,callback=None): studio_chrome.apply_bundled_theme(self, preset_id, callback=callback)
 
     @Slot(str)
-    def selectSavedTheme(self,entry_id):
-        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
-        if entry is None:return
-        path=self.data/"themes"/f"{entry_id}.json"
-        if not path.is_file():
-            self.message="Saved theme is unavailable.";self._emit(False);return
-        self._load_custom_theme(path,mode="saved",entry_id=entry_id)
+    def selectSavedTheme(self,entry_id): studio_chrome.select_saved_theme(self, entry_id)
 
     @Slot(str)
-    def deleteSavedTheme(self,entry_id):
-        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
-        if entry is None:return
-        self.session.saved_themes=[item for item in self.session.saved_themes if item["id"]!=entry_id]
-        (self.data/"themes"/f"{entry_id}.json").unlink(missing_ok=True)
-        was_active=self.session.active_theme_kind=="saved" and self.session.active_theme_id==entry_id
-        if was_active:
-            self.session.theme_epoch+=1
-            self.session.custom_theme=None
-            self.session.theme_source=""
-            self.session.active_theme_kind="builtin"
-            self.session.active_theme_id=""
-            self.session.theme_revision+=1
-            for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
-            self._clear_theme_background_overrides()
-            for window in self.session.windows.values():window._watch_custom_theme()
-        try:self._save_theme_library()
-        except OSError:pass
-        self.message="Removed "+entry["name"]
-        self.session.changed.emit()
+    def deleteSavedTheme(self,entry_id): studio_chrome.delete_saved_theme(self, entry_id)
 
     @Slot()
-    def reloadCustomTheme(self):
-        if self.retired or self.session.active_theme_kind=="preset":return
-        if self.session.active_theme_kind=="saved" and not self.session.theme_source:return
-        source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
-        if not source.is_file():source=self.data/"theme.json"
-        self._watch_custom_theme()
-        cached=self.data/"theme.json"
-        if self.session.custom_theme is None and cached.is_file() and cached!=source:self._load_custom_theme(cached,mode="restore",follow_source=source,clear_overrides_on_follow=True)
-        elif source.is_file():self._load_custom_theme(source,mode="reload")
+    def reloadCustomTheme(self): studio_chrome.reload_custom_theme(self)
 
     def _load_custom_theme(self,path,mode="import",follow_source=None,preset_id="",entry_id="",callback=None,clear_overrides_on_follow=False):
-        self.session.theme_epoch+=1
-        epoch=self.session.theme_epoch
-        try:engine=self._engine()
-        except ValueError as error:
-            self.message=str(error);self._emit(False)
-            if callback:callback(None,str(error))
-            return
-        def finished(value,error):
-            if epoch!=self.session.theme_epoch:
-                if callback:callback(None,"Superseded by newer theme selection")
-                return
-            if error:
-                self.message="Theme not applied: "+str(error);self._emit(False)
-                if callback:callback(None,str(error))
-                if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
-                return
-            try:
-                changed=value!=self.session.custom_theme
-                if mode=="import":
-                    source_str=str(path)
-                    existing=next((item for item in self.session.saved_themes if item.get("source")==source_str),None)
-                    if existing is not None:
-                        target_id=existing["id"]
-                        existing["name"]=value["name"]
-                    else:
-                        target_id=uuid.uuid4().hex
-                        self.session.saved_themes.append({"id":target_id,"name":value["name"],"source":source_str})
-                    (self.data/"themes").mkdir(parents=True,exist_ok=True)
-                    atomic_json(self.data/"themes"/f"{target_id}.json",value)
-                    self.session.active_theme_kind="saved"
-                    self.session.active_theme_id=target_id
-                    self.session.theme_source=source_str
-                    atomic_json(self.data/"theme-source.json",{"path":source_str})
-                    atomic_json(self.data/"theme.json",value)
-                    self._save_theme_library()
-                    self._clear_theme_background_overrides()
-                elif mode=="preset":
-                    self.session.active_theme_kind="preset"
-                    self.session.active_theme_id=preset_id
-                    self.session.theme_source=""
-                    (self.data/"theme-source.json").unlink(missing_ok=True)
-                    atomic_json(self.data/"theme.json",value)
-                    self._save_theme_library()
-                    self._clear_theme_background_overrides()
-                elif mode=="saved":
-                    entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
-                    source_str=entry.get("source","") if entry else ""
-                    if entry is not None:entry["name"]=value["name"]
-                    self.session.active_theme_kind="saved"
-                    self.session.active_theme_id=entry_id
-                    self.session.theme_source=source_str
-                    if source_str:atomic_json(self.data/"theme-source.json",{"path":source_str})
-                    else:(self.data/"theme-source.json").unlink(missing_ok=True)
-                    atomic_json(self.data/"theme.json",value)
-                    self._save_theme_library()
-                    self._clear_theme_background_overrides()
-                elif mode=="reload":
-                    if self.session.active_theme_kind=="saved" and self.session.active_theme_id:
-                        (self.data/"themes").mkdir(parents=True,exist_ok=True)
-                        atomic_json(self.data/"themes"/f"{self.session.active_theme_id}.json",value)
-                        entry=next((item for item in self.session.saved_themes if item["id"]==self.session.active_theme_id),None)
-                        if entry is not None:entry["name"]=value["name"]
-                        self._save_theme_library()
-                    if changed:atomic_json(self.data/"theme.json",value)
-                    self._clear_theme_background_overrides()
-                else:
-                    if changed:atomic_json(self.data/"theme.json",value)
-                self.session.custom_theme=value
-                if changed:self.session.theme_revision+=1
-                for window in self.session.windows.values():window._watch_custom_theme()
-                if mode in ("import","preset","saved","reload") or (mode!="restore" and changed):
-                    self.message="Applied "+value["name"]
-                self.session.changed.emit()
-                if callback:callback({"id":preset_id or entry_id or self.session.active_theme_id,"name":value["name"]},"")
-            except OSError as failure:
-                self.message="Could not save theme: "+str(failure);self._emit(False)
-                if callback:callback(None,str(failure))
-            if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
-        def read():
-            try:return custom_theme.read(engine,path),None
-            except Exception as failure:return None,str(failure)
-        self._submit(read,lambda result,error:finished(*(result or (None,error))),False)
+        studio_chrome.load_custom_theme(self, path, mode=mode, follow_source=follow_source, preset_id=preset_id, entry_id=entry_id, callback=callback, clear_overrides_on_follow=clear_overrides_on_follow)
 
     @Slot()
-    def resetCustomTheme(self):
-        self.session.theme_epoch+=1
-        self.session.custom_theme=None;self.session.theme_source=""
-        self.session.active_theme_kind="builtin";self.session.active_theme_id=""
-        self.session.theme_revision+=1
-        for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
-        try:self._save_theme_library()
-        except OSError:pass
-        self._clear_theme_background_overrides()
-        for window in self.session.windows.values():window._watch_custom_theme()
-        self.session.changed.emit()
+    def resetCustomTheme(self): studio_chrome.reset_custom_theme(self)
 
     @Slot()
-    def editCustomTheme(self):
-        if self.session.active_theme_kind=="preset" or not self.session.theme_source:return
-        source=Path(self.session.theme_source)
-        if source.is_file():QDesktopServices.openUrl(QUrl.fromLocalFile(str(source)))
+    def editCustomTheme(self): studio_chrome.edit_custom_theme(self)
 
     @Slot(str)
-    def exportCustomTheme(self,value):
-        try:
-            atomic_json(local_path(value),custom_theme.for_sharing(self.session.custom_theme))
-            self.message="Theme exported. Edit the JSON and import it to apply."
-        except OSError as error:self.message=str(error)
-        self._emit(False)
+    def exportCustomTheme(self,value): studio_chrome.export_custom_theme(self, value)
 
     @Slot()
-    def chooseNoteLocation(self): self.noteLocationPickerRequested.emit()
+    def chooseNoteLocation(self): studio_chrome.choose_note_location(self)
 
     @Slot(str)
-    def setNoteLocation(self, value):
-        directory = local_path(value)
-        if directory.is_dir():
-            self.settings["newNoteLocation"] = str(directory)
-            self._preferences(); self._emit(False)
+    def setNoteLocation(self, value): studio_chrome.set_note_location(self, value)
 
     @Slot(str)
-    def importFont(self,value):
-        try:
-            family=self.session.font_store.import_file(local_path(value))
-            self.settings["font"] = family
-            self.message = "Imported " + family + " for reading and PDF export"
-            self._preferences(); self._emit()
-        except (OSError,ValueError) as error:
-            self.message = str(error); self._emit(False)
+    def importFont(self,value): studio_chrome.import_font(self, value)
 
     @Property(str,notify=changed)
-    def brand(self):
-        svg = self._brand_svg
-        colors = self._colors()
-        svg = svg.replace("#16181d",colors["text"]).replace("#f4f4f1",colors["surface"])
-        return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
+    def brand(self): return studio_chrome.brand(self)
 
     def _submit(self, action, done, busy=True, executor=None):
         if self.retired:return
@@ -3835,78 +3517,21 @@ class Studio(QObject):
         self._emit(False)
 
     @Slot(str)
-    def setMode(self, mode):
-        if mode in ("live", "reader", "editor", "split"):
-            if mode!=self.mode:self._flush("mode",mode)
+    def setMode(self, mode): studio_chrome.set_mode(self, mode)
 
-    def _apply_mode(self,mode):
-        self.mode=mode
-        self.settings["readingMode"]=mode
-        self.preference_timer.start(500)
-        self._emit()
+    def _apply_mode(self,mode): studio_chrome.apply_mode(self, mode)
 
     @Slot(bool)
-    def setFullscreen(self, value):
-        if value == self.fullscreen:
-            return
-        if value:
-            self.settings["fullZoom"] = self.settings["normalZoom"]
-        self.fullscreen = value
-        self._emit()
+    def setFullscreen(self, value): studio_chrome.set_fullscreen(self, value)
 
     @Slot(float)
-    def setZoom(self, value):
-        zoom = max(40, min(300, round(value)))
-        self.settings["fullZoom" if self.fullscreen else "normalZoom"] = zoom
-        self.readerCall.emit(f"window.supermdSetZoom?.({zoom},{int(time.time()*1000)})")
-        self.preference_timer.start(500)
-        self._emit(False)
+    def setZoom(self, value): studio_chrome.set_zoom(self, value)
 
     @Slot(str, int)
-    def navigateHeading(self, heading, offset):
-        self.readerCall.emit(f"window.supermdHeading?.({json.dumps(heading)}, {offset})")
+    def navigateHeading(self, heading, offset): studio_chrome.navigate_heading(self, heading, offset)
 
     @Slot(str, str)
-    def setting(self, key, encoded):
-        if key not in DEFAULTS:
-            return
-        try:
-            value = json.loads(encoded)
-        except ValueError:
-            return
-        if key in ("theme","fullTheme") and value not in ("system","light","dark","black"): return
-        if key=="accent" and value not in ("system","blue","green","violet","rose","amber"):return
-        if key=="startup" and value not in ("restore","new"):return
-        if key=="selectionAssistant" and (not isinstance(value,str) or value not in ASSISTANTS):return
-        if key=="patternKind" and value not in ("","none","paws","dots","grid","diagonal","gradient"):return
-        if key in ("patternOpacity","patternSize","patternSpacing"):
-            if not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value):return
-            default,low,high={"patternOpacity":(-1,0,.25),"patternSize":(0,8,64),"patternSpacing":(0,12,192)}[key]
-            if value!=default and not low<=value<=high:return
-        if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
-        if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
-        if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
-        if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
-        if key == "python":
-            try: value = python_runtime.validate(value.strip())
-            except ValueError as error:
-                self.python_status = str(error); self._emit(False); return
-            self.python_status = ""
-        if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
-        if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return
-        if key == "shortcuts":
-            value, error = normalize_shortcuts(value)
-            if error: return
-        if key in ("window","widthMigrated"): return  # Internal state, not user settings.
-        if key == "size": value = max(6, min(32, float(value)))
-        if key == "width": value = max(0, min(5000, int(value)))
-        if key == "widthPercent": value = max(50,min(150,float(value)))
-        if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
-        self.settings[key] = value
-        if key == "shortcuts": self._notify_shortcuts()
-        self._preferences()
-        self._emit()
+    def setting(self, key, encoded): studio_chrome.setting(self, key, encoded)
 
     @Slot()
     def save(self):
@@ -4291,9 +3916,7 @@ class Studio(QObject):
             win._emit()
 
     @Slot(str)
-    def notifyMessage(self, text):
-        self.message = str(text or "")
-        self._emit(False)
+    def notifyMessage(self, text): studio_chrome.notify_message(self, text)
 
     @Slot(str, str, str)
     def createFolderNote(self, parent_path, name, fmt="md"):
@@ -4590,9 +4213,7 @@ class Studio(QObject):
         return QUrl.fromLocalFile(str(self._default_output_directory() / folder_ops._pure_path(filename).name))
 
     @Slot(str, result=QUrl)
-    def defaultThemeExportLocation(self, name):
-        leaf = folder_ops._pure_path(str(name or "")).name or "My theme.supermd-theme.json"
-        return QUrl.fromLocalFile(str(self._default_output_directory() / leaf))
+    def defaultThemeExportLocation(self, name): return studio_chrome.default_theme_export_location(self, name)
 
     @Slot(str)
     def closeTab(self, id):
