@@ -19,6 +19,7 @@ from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
+import file_events
 import folder_ops
 import studio
 from studio import Session
@@ -912,6 +913,343 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             and not self.studio._folder_searching
             and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["Coursework", "Week 1.md", "Week 3.md"]
         )
+
+    def test_rename_holds_suspension_until_ui_rebind_and_guards_parent_watcher_notifications(self):
+        overview = self.workspace / "Overview.md"
+        coursework = self.workspace / "Coursework"
+        week1 = coursework / "Week 1.md"
+
+        self.studio.openFolder(str(self.workspace))
+        self.studio.toggleDirectory(str(coursework))
+        self.wait_until(lambda: any(f["name"] == "Week 1.md" for f in self.studio.files))
+
+        self.studio.openNote(str(overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
+        overview_tab_id = self.studio.active
+        self.studio.post(
+            "dirty-overview",
+            "document_changed",
+            json.dumps({"id": overview_tab_id, "content": "# Overview\n\nUnsaved overview revision"}),
+        )
+        self.studio.pinRecent(str(overview))
+        self.studio._recover()
+        self.session.writes.flush(timeout=3.0)
+        self._settle_watchers()
+
+        held_completions: list[object] = []
+        completion_queued = threading.Event()
+        orig_on_rename_completed = self.session._on_rename_completed
+
+        def defer_rename_completion(payload):
+            held_completions.append(payload)
+            completion_queued.set()
+
+        # 1. File rename: deliver parent-directory notifications after filesystem rename & worker return, before UI metadata finalization.
+        renamed_overview = self.workspace / "Course Overview.md"
+        pre_rename_known = dict(self.studio.note_identities)
+        self.assertTrue(any(folder_ops.same_path(k, overview) for k in pre_rename_known))
+
+        self.session.renameCompleted.disconnect(orig_on_rename_completed)
+        self.session.renameCompleted.connect(defer_rename_completion)
+        try:
+            # Simulate an already-in-flight external reconciliation captured right before suspension started,
+            # plus a parent-directory notification delivered after Path.rename finishes on disk.
+            reconcile_gate = threading.Event()
+            reconcile_finished = threading.Event()
+            orig_reconcile = file_events.reconcile
+
+            def gated_reconcile(known, changed):
+                reconcile_gate.wait(timeout=3.0)
+                try:
+                    return orig_reconcile(known, changed)
+                finally:
+                    reconcile_finished.set()
+
+            with mock.patch.object(file_events, "reconcile", side_effect=gated_reconcile):
+                self.studio.external_paths = {str(self.workspace)}
+                self.studio._refresh_external_notes()
+
+                self.studio.renameNote(overview_tab_id, "Course Overview.md")
+                # Wait for the background writer to finish Path.rename AND return from work().
+                self.session.writes.flush(timeout=3.0)
+                self.wait_until(lambda: completion_queued.is_set())
+
+                self.assertFalse(overview.exists())
+                self.assertTrue(renamed_overview.is_file())
+                # Worker finished, yet UI completion has not run: suspension MUST remain active.
+                active_susp = self.studio._active_watch_suspensions()
+                self.assertEqual(len(active_susp), 1)
+                file_susp_event = active_susp[0][3]
+                self.assertFalse(file_susp_event.is_set())
+
+                # Intervening UI emit / _watch_notes before finalization must keep parent & note suspended.
+                self.studio._emit(False)
+                watched_now = self.studio.note_watcher.files() + self.studio.note_watcher.directories()
+                for w_path in watched_now:
+                    self.assertFalse(folder_ops.same_path(w_path, str(overview)))
+                    self.assertFalse(folder_ops.same_path(w_path, str(renamed_overview)))
+                    self.assertFalse(folder_ops.same_path(w_path, str(self.workspace)))
+
+                # Deliver a parent-directory notification between filesystem rename and metadata finalization,
+                # and release the pre-queued reconciliation so its UI callback runs before finalization.
+                self.studio.note_watcher.directoryChanged.emit(str(self.workspace))
+                self.studio._external_note_changed(str(self.workspace))
+                self.assertEqual(self.studio.external_paths, set())
+                self.studio.external_paths = {str(self.workspace)}
+                self.studio._refresh_external_notes()
+                reconcile_gate.set()
+                self.assertTrue(reconcile_finished.wait(timeout=3.0))
+                QTest.qWait(40)
+                self.app.processEvents()
+
+                # Before finalization, the tab/pins/drafts must not have been closed, unpinned, or marked deleted.
+                self.assertTrue(any(t["id"] == overview_tab_id for t in self.studio.tabs))
+                self.assertEqual(self.session.drafts.get("deleted-notes", []), [])
+                self.assertTrue(self._same_path_list(self.session.pinned, [overview]))
+
+            # Now run the queued UI metadata finalization.
+            self.assertEqual(len(held_completions), 1)
+            orig_on_rename_completed(held_completions.pop())
+            self.session.writes.flush(timeout=3.0)
+            self.wait_until(
+                lambda: self._same_path_list(self._qml_dict("sidebarState")["pinned"], [renamed_overview])
+                and any(f["name"] == "Course Overview.md" for f in self._qml_dict("sidebarState")["files"])
+            )
+
+            self.assertTrue(file_susp_event.is_set())
+            self.assertEqual(self.studio._active_watch_suspensions(), [])
+            renamed_tab = next((t for t in self.studio.tabs if t["id"] == overview_tab_id), None)
+            self.assertIsNotNone(renamed_tab)
+            assert renamed_tab is not None
+            self.assertTrue(folder_ops.same_path(renamed_tab["path"], renamed_overview))
+            self.assertEqual(renamed_tab["content"], "# Overview\n\nUnsaved overview revision")
+            self.assertFalse(renamed_tab.get("conflict"))
+            self.assertTrue(self._same_path_list(self.session.pinned, [renamed_overview]))
+            self.assertTrue(self._contains_path(self.studio.recent, renamed_overview))
+            self.assertFalse(self._contains_path(self.studio.recent, overview))
+            self.assertFalse(any(folder_ops.same_path(k, overview) for k in self.studio.note_identities))
+            self.assertTrue(any(folder_ops.same_path(k, renamed_overview) for k in self.studio.note_identities))
+            watched_after_file = self.studio.note_watcher.files() + self.studio.note_watcher.directories()
+            self.assertTrue(any(folder_ops.same_path(w_path, str(renamed_overview)) for w_path in watched_after_file))
+            self.assertTrue(any(folder_ops.same_path(w_path, str(self.workspace)) for w_path in watched_after_file))
+
+            startup_data = json.loads((self.studio.data / "startup.json").read_text(encoding="utf-8"))
+            recovery_data = json.loads((self.studio.data / "recovery.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(folder_ops.same_path(p, renamed_overview) for p in startup_data["paths"]))
+            self.assertFalse(any(folder_ops.same_path(p, overview) for p in startup_data["paths"]))
+            self.assertEqual(len(recovery_data), 1)
+            self.assertTrue(folder_ops.same_path(recovery_data[0]["path"], renamed_overview))
+            self.assertEqual(recovery_data[0]["content"], "# Overview\n\nUnsaved overview revision")
+            self.assertEqual(self.session.drafts.get("deleted-notes", []), [])
+
+            # 2. Folder rename: deliver parent-directory notifications (both workspace & old subfolder)
+            # between filesystem rename and metadata finalization; verify tabs, pins, and recovery stay intact.
+            completion_queued.clear()
+            self.studio.openNote(str(week1))
+            self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], week1))
+            week1_tab_id = self.studio.active
+            self.studio.post(
+                "dirty-week1",
+                "document_changed",
+                json.dumps({"id": week1_tab_id, "content": "# Week 1\n\nUnsaved seminar notes"}),
+            )
+            self.studio.pinRecent(str(week1))
+            self.studio._recover()
+            self.session.writes.flush(timeout=3.0)
+            self._settle_watchers()
+
+            seminars = self.workspace / "Seminars"
+            remapped_week1 = seminars / "Week 1.md"
+            dir_reconcile_gate = threading.Event()
+            dir_reconcile_done = threading.Event()
+
+            def gated_dir_reconcile(known, changed):
+                dir_reconcile_gate.wait(timeout=3.0)
+                try:
+                    return orig_reconcile(known, changed)
+                finally:
+                    dir_reconcile_done.set()
+
+            with mock.patch.object(file_events, "reconcile", side_effect=gated_dir_reconcile):
+                # Queue reconciliation for both the note's parent directory and the folder's parent directory
+                # right before folder rename suspends watches.
+                self.studio.external_paths = {str(coursework), str(self.workspace)}
+                self.studio._refresh_external_notes()
+
+                self.studio.renameEntry(str(coursework), "Seminars")
+                self.session.writes.flush(timeout=3.0)
+                self.wait_until(lambda: completion_queued.is_set())
+
+                self.assertFalse(coursework.exists())
+                self.assertTrue(remapped_week1.is_file())
+                dir_susp = self.studio._active_watch_suspensions()
+                self.assertEqual(len(dir_susp), 1)
+                dir_susp_event = dir_susp[0][3]
+                self.assertFalse(dir_susp_event.is_set())
+
+                # Deliver parent-directory notifications while filesystem rename is complete and UI rebind is still queued.
+                self.studio.note_watcher.directoryChanged.emit(str(self.workspace))
+                self.studio.note_watcher.directoryChanged.emit(str(coursework))
+                self.studio._external_note_changed(str(self.workspace))
+                self.studio._external_note_changed(str(coursework))
+                self.assertEqual(self.studio.external_paths, set())
+                self.studio.external_paths = {str(self.workspace), str(coursework)}
+                self.studio._refresh_external_notes()
+                dir_reconcile_gate.set()
+                self.assertTrue(dir_reconcile_done.wait(timeout=3.0))
+                QTest.qWait(40)
+                self.app.processEvents()
+
+                self.assertTrue(any(t["id"] == week1_tab_id for t in self.studio.tabs))
+                self.assertEqual(self.session.drafts.get("deleted-notes", []), [])
+
+            self.assertEqual(len(held_completions), 1)
+            orig_on_rename_completed(held_completions.pop())
+            self.session.writes.flush(timeout=3.0)
+            self.wait_until(
+                lambda: self._same_path_list(self._qml_dict("sidebarState")["pinned"], [renamed_overview, remapped_week1])
+                and any(f["name"] == "Seminars" for f in self._qml_dict("sidebarState")["files"])
+            )
+
+            self.assertTrue(dir_susp_event.is_set())
+            self.assertEqual(self.studio._active_watch_suspensions(), [])
+            week1_tab = next((t for t in self.studio.tabs if t["id"] == week1_tab_id), None)
+            self.assertIsNotNone(week1_tab)
+            assert week1_tab is not None
+            self.assertTrue(folder_ops.same_path(week1_tab["path"], remapped_week1))
+            self.assertEqual(week1_tab["content"], "# Week 1\n\nUnsaved seminar notes")
+            self.assertFalse(week1_tab.get("conflict"))
+            self.assertFalse(any(folder_ops.same_path(k, week1) for k in self.studio.note_identities))
+            self.assertTrue(any(folder_ops.same_path(k, remapped_week1) for k in self.studio.note_identities))
+
+            startup_after_dir = json.loads((self.studio.data / "startup.json").read_text(encoding="utf-8"))
+            recovery_after_dir = json.loads((self.studio.data / "recovery.json").read_text(encoding="utf-8"))
+            self.assertTrue(any(folder_ops.same_path(p, remapped_week1) for p in startup_after_dir["paths"]))
+            self.assertFalse(any(folder_ops.same_path(p, week1) for p in startup_after_dir["paths"]))
+            recovery_by_id = {entry["id"]: entry for entry in recovery_after_dir}
+            self.assertIn(week1_tab_id, recovery_by_id)
+            self.assertTrue(folder_ops.same_path(recovery_by_id[week1_tab_id]["path"], remapped_week1))
+            self.assertEqual(recovery_by_id[week1_tab_id]["content"], "# Week 1\n\nUnsaved seminar notes")
+            self.assertEqual(self.session.drafts.get("deleted-notes", []), [])
+        finally:
+            try:
+                self.session.renameCompleted.disconnect(defer_rename_completion)
+            except (RuntimeError, TypeError):
+                pass
+            self.session.renameCompleted.connect(orig_on_rename_completed)
+
+    def test_rename_cleanup_when_initiating_window_retires(self):
+        reading = self.workspace / "Reading.md"
+        renamed_reading = self.workspace / "Assigned Reading.md"
+
+        self.studio.openFolder(str(self.workspace))
+        self.wait_until(lambda: len(self.studio.files) == 3)
+        self.studio.openNote(str(reading))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], reading))
+        reading_tab_id = self.studio.active
+        self.studio.post(
+            "dirty-reading",
+            "document_changed",
+            json.dumps({"id": reading_tab_id, "content": "# Reading\n\nAnnotated chapter notes"}),
+        )
+        self.studio.pinRecent(str(reading))
+        self._settle_watchers()
+
+        # 1. Multi-window: initiating window retires mid-rename while a surviving window stays open.
+        initiator = QuietStudio(True, self.session)
+        initiator.openFolder(str(self.workspace))
+        self.wait_until(lambda: len(initiator.files) == 3)
+
+        orig_rename = Path.rename
+        worker_entered = threading.Event()
+        allow_worker_finish = threading.Event()
+
+        def gated_rename(self_path, target):
+            worker_entered.set()
+            allow_worker_finish.wait(timeout=3.0)
+            return orig_rename(self_path, target)
+
+        try:
+            with mock.patch.object(Path, "rename", gated_rename):
+                initiator.renameEntry(str(reading), "Assigned Reading")
+                self.assertTrue(worker_entered.wait(timeout=3.0))
+                active_susp = self.studio._active_watch_suspensions()
+                self.assertEqual(len(active_susp), 1)
+                multi_susp_event = active_susp[0][3]
+
+                # Retire the initiating window before the worker finishes.
+                self._retire_window(initiator)
+                # Suspension must remain active for the surviving window until UI rebind finishes.
+                self.assertFalse(multi_susp_event.is_set())
+
+                allow_worker_finish.set()
+                self.wait_until(
+                    lambda: renamed_reading.is_file()
+                    and multi_susp_event.is_set()
+                    and self._same_path_list(self._qml_dict("sidebarState")["pinned"], [renamed_reading])
+                    and any(f["name"] == "Assigned Reading.md" for f in self._qml_dict("sidebarState")["files"])
+                )
+                self.session.writes.flush(timeout=3.0)
+
+            self.assertEqual(self.studio._active_watch_suspensions(), [])
+            self.assertEqual(self.session._pending_rename_cleanups, {})
+            surviving_tab = next((t for t in self.studio.tabs if t["id"] == reading_tab_id), None)
+            self.assertIsNotNone(surviving_tab)
+            assert surviving_tab is not None
+            self.assertTrue(folder_ops.same_path(surviving_tab["path"], renamed_reading))
+            self.assertEqual(surviving_tab["content"], "# Reading\n\nAnnotated chapter notes")
+            self.assertTrue(any(folder_ops.same_path(k, renamed_reading) for k in self.studio.note_identities))
+            watched_survivor = self.studio.note_watcher.files() + self.studio.note_watcher.directories()
+            self.assertTrue(any(folder_ops.same_path(w, str(renamed_reading)) for w in watched_survivor))
+            self.assertTrue(any(folder_ops.same_path(w, str(self.workspace)) for w in watched_survivor))
+            recovery_data = json.loads((self.studio.data / "recovery.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(recovery_data), 1)
+            self.assertTrue(folder_ops.same_path(recovery_data[0]["path"], renamed_reading))
+        finally:
+            allow_worker_finish.set()
+            if not initiator.retired:
+                self._retire_window(initiator)
+
+        # 2. Last-window retirement: sole window retires while rename is in flight, releasing suspension without leaking.
+        solo_session = Session(True)
+        solo_studio = QuietStudio(True, solo_session)
+        solo_root = Path(folder_ops.canonical_path_str(solo_studio.data / "SoloNotes"))
+        solo_root.mkdir(parents=True, exist_ok=True)
+        solo_note = solo_root / "Draft.md"
+        solo_note.write_text("# Draft", encoding="utf-8")
+        solo_entered = threading.Event()
+        solo_release = threading.Event()
+
+        def gated_solo_rename(self_path, target):
+            solo_entered.set()
+            solo_release.wait(timeout=3.0)
+            return orig_rename(self_path, target)
+
+        try:
+            solo_studio.openFolder(str(solo_root))
+            self.wait_until(lambda: len(solo_studio.files) == 1)
+            with mock.patch.object(Path, "rename", gated_solo_rename):
+                solo_studio.renameEntry(str(solo_note), "Final")
+                self.assertTrue(solo_entered.wait(timeout=3.0))
+                self.assertEqual(len(solo_session._watch_suspensions), 1)
+                solo_susp_event = solo_session._watch_suspensions[0][3]
+                solo_studio.stop()
+                solo_release.set()
+                solo_session.writes.flush(timeout=3.0)
+            # Even without pumping UI events for solo_session, suspension is released once the worker finishes with no live windows.
+            self.assertTrue(solo_susp_event.is_set())
+            self.assertEqual(solo_session._watch_suspensions, [])
+            self.assertEqual(solo_session._pending_rename_cleanups, {})
+            self.app.processEvents()
+            solo_session.writes.flush(timeout=3.0)
+        finally:
+            solo_release.set()
+            if not solo_studio.retired:
+                solo_studio.stop()
+            solo_studio.pool.shutdown(wait=True, cancel_futures=True)
+            solo_studio._search_pool.shutdown(wait=True, cancel_futures=True)
+            solo_session.writes.shutdown(wait=True)
+            shutil.rmtree(solo_studio.data, ignore_errors=True)
 
 
 if __name__ == "__main__":
