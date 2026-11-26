@@ -48,6 +48,8 @@ internal fun sameDocument(left: Uri, right: Uri): Boolean {
     return first == runCatching { DocumentsContract.getDocumentId(right) }.getOrNull()
 }
 
+private val persistPermissionsLock = Any()
+
 internal const val EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY = "com.android.externalstorage.documents"
 
 internal data class ExternalStorageDocumentPath(val volume: String, val relativePath: String)
@@ -131,6 +133,9 @@ internal class DocumentAccess(
     private fun granted(candidate: Uri, modes: Int) =
         context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), modes) == PackageManager.PERMISSION_GRANTED
 
+    private fun persistedPermissionsSnapshot() =
+        synchronized(persistPermissionsLock) { context.contentResolver.persistedUriPermissions.toList() }
+
     fun hasWriteGrant(uri: Uri) = uri.scheme == "content" && granted(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
 
     fun hasReadGrant(
@@ -143,9 +148,10 @@ internal class DocumentAccess(
         is SafReadAccess.PendingTreeMembership -> access.directDocumentUri != null
         SafReadAccess.Denied -> false
     }
-
     fun persist(uri: Uri) {
-        if (uri.scheme == "content") persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
+        if (uri.scheme == "content") synchronized(persistPermissionsLock) {
+            persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
+        }
     }
 
     /** Reuse a user-granted containing tree; never manufacture access outside that tree. */
@@ -237,7 +243,7 @@ internal class DocumentAccess(
             }
         }
 
-        for (grant in context.contentResolver.persistedUriPermissions) {
+        for (grant in persistedPermissionsSnapshot()) {
             addIfAuthorized(grant.uri, grant.isReadPermission, grant.isWritePermission)
         }
         activeFolderUriProvider?.invoke()?.let { activeFolder ->
@@ -256,7 +262,7 @@ internal class DocumentAccess(
         activeFolderUri?.takeIf { it.authority == auth }?.let { active ->
             resolveReadableTreeRoot(active)?.let { root -> byCanonicalTree[root.first.toString()] = root }
         }
-        for (grant in context.contentResolver.persistedUriPermissions) {
+        for (grant in persistedPermissionsSnapshot()) {
             if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != auth || !grant.isReadPermission) continue
             val rootId = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull()
                 ?.takeIf { it.isNotEmpty() && '\u0000' !in it } ?: continue
@@ -357,7 +363,7 @@ internal class DocumentAccess(
             }
         }
 
-        for (grant in context.contentResolver.persistedUriPermissions) {
+        for (grant in persistedPermissionsSnapshot()) {
             if (!DocumentsContract.isTreeUri(grant.uri) || grant.uri.authority != authority || !grant.isReadPermission) continue
             val rootId = runCatching { DocumentsContract.getTreeDocumentId(grant.uri) }.getOrNull()?.takeIf { it.isNotEmpty() } ?: continue
             val canonicalTree = DocumentsContract.buildTreeDocumentUri(authority, rootId)
