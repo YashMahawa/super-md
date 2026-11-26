@@ -1,10 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import corpus from "../test-fixtures/frontmatter-corpus.json";
 import { compatibleMarkdown } from "./compatibleMarkdown";
 import { analyzeDocument } from "./documentAnalysis";
 import { imageRanges } from "./documentMedia";
 import { maskFrontmatter, parseFrontmatter, type DocumentMetadata, type YamlValue } from "./frontmatter";
+import { prepareMarkdownExport } from "./markdownExport";
 import { normalizeMarkdownSource } from "./markdownSource";
+
+const { mockInvoke } = vi.hoisted(() => ({
+  mockInvoke: vi.fn(),
+}));
+
+vi.mock("./nativeBridge", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./nativeBridge")>();
+  return {
+    ...actual,
+    invoke: mockInvoke,
+  };
+});
 
 const REQUIRED_CATEGORIES = [
   "quoted-scalars",
@@ -13,6 +26,13 @@ const REQUIRED_CATEGORIES = [
   "crlf",
   "unicode-separators",
 ] as const;
+
+const ONE_PIXEL_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+
+const frontmatterFixtureModules = import.meta.glob("../test-fixtures/frontmatter-*.json", {
+  eager: true,
+  import: "default",
+}) as Record<string, unknown>;
 
 interface SharedCorpusCase {
   id: string;
@@ -36,6 +56,8 @@ interface DivergenceCorpusCase {
   category: (typeof REQUIRED_CATEGORIES)[number];
   description: string;
   reason: string;
+  alignedInPr186: boolean;
+  conformanceCaseId?: string;
   source: string;
   typescript: {
     recognized: boolean;
@@ -49,6 +71,16 @@ interface DivergenceCorpusCase {
     body: string;
     endCodePoints: number;
   };
+}
+
+interface CompanionConformanceSuite {
+  version: number;
+  cases: Array<{
+    id: string;
+    valid: boolean;
+    markdown: string;
+    body: string;
+  }>;
 }
 
 function assertMaskInvariants(source: string, masked: string, endUtf16: number, expectedBody: string): void {
@@ -66,13 +98,24 @@ function assertMaskInvariants(source: string, masked: string, endUtf16: number, 
 describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
   const sharedCases = corpus.sharedCases as SharedCorpusCase[];
   const divergences = corpus.divergences as DivergenceCorpusCase[];
+  const conformanceSuite = frontmatterFixtureModules["../test-fixtures/frontmatter-conformance.json"] as
+    | CompanionConformanceSuite
+    | undefined;
 
-  it("covers quoted scalars, flow collections, folded scalars, CRLF, and Unicode separators with unique case IDs", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("covers quoted scalars, flow collections, folded scalars, CRLF, and Unicode separators and coordinates IDs with #186", () => {
     expect(corpus.version).toBe(1);
+    expect(corpus.companionConformanceFixture).toBe("test-fixtures/frontmatter-conformance.json");
     const ids = new Set<string>();
     for (const entry of [...sharedCases, ...divergences]) {
       expect(ids.has(entry.id), `duplicate corpus ID: ${entry.id}`).toBe(false);
       ids.add(entry.id);
+    }
+    for (const entry of divergences) {
+      expect(typeof entry.alignedInPr186).toBe("boolean");
     }
     for (const category of REQUIRED_CATEGORIES) {
       expect(
@@ -84,11 +127,31 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
         `missing negative shared case for ${category}`,
       ).toBe(true);
     }
+    if (conformanceSuite) {
+      expect(conformanceSuite.version).toBe(1);
+      const conformanceIds = new Set(conformanceSuite.cases.map((item) => item.id));
+      for (const id of ids) {
+        expect(conformanceIds.has(id), `overlapping fixture ID with #186: ${id}`).toBe(false);
+      }
+      for (const entry of divergences) {
+        if (entry.conformanceCaseId) {
+          expect(conformanceIds.has(entry.conformanceCaseId)).toBe(true);
+        }
+      }
+    }
   });
 
   it.each(sharedCases)(
-    "verifies recognition, masking, and source/body boundaries for shared case $id ($category)",
+    "verifies recognition, masking, companion export preparation, and boundaries for shared case $id ($category)",
     async (item) => {
+      const allowedImages = new Set(item.bodyImages ?? []);
+      mockInvoke.mockImplementation(async (command: string, args?: { source?: string }) => {
+        if (command === "load_asset" && args?.source && allowedImages.has(args.source)) {
+          return ONE_PIXEL_PNG;
+        }
+        throw new Error(`Unexpected native asset call: ${command} (${args?.source ?? ""})`);
+      });
+
       const parsed = parseFrontmatter(item.source);
       const masked = maskFrontmatter(item.source);
 
@@ -119,6 +182,22 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
 
         const exported = await compatibleMarkdown(item.source, null);
         expect(exported.startsWith(item.frontmatterRaw)).toBe(true);
+      }
+
+      const plainCompanion = await prepareMarkdownExport(item.source, "/workspace/note.md");
+      expect(plainCompanion.content).toBe(item.source);
+      expect(Object.keys(plainCompanion.assets)).toEqual(item.bodyImages ?? []);
+
+      const compatibleCompanion = await prepareMarkdownExport(item.source, "/workspace/note.md", {
+        compatible: true,
+      });
+      if (item.recognized) {
+        expect(compatibleCompanion.content.startsWith(item.frontmatterRaw)).toBe(true);
+      }
+      expect(Object.keys(compatibleCompanion.assets)).toEqual(item.bodyImages ?? []);
+      for (const forbidden of item.maskedExcludes ?? []) {
+        expect(plainCompanion.assets).not.toHaveProperty(forbidden);
+        expect(compatibleCompanion.assets).not.toHaveProperty(forbidden);
       }
 
       const endUtf16 = parsed?.end ?? 0;
@@ -157,8 +236,9 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
   );
 
   it.each(divergences)(
-    "records current TypeScript behavior for cross-parser divergence $id ($category)",
-    (entry) => {
+    "records TypeScript behavior and companion export invariants for cross-parser divergence $id ($category)",
+    async (entry) => {
+      mockInvoke.mockRejectedValue(new Error("Unexpected asset load in divergence case"));
       expect(entry.typescript.recognized).not.toBe(entry.desktop.recognized);
       const parsed = parseFrontmatter(entry.source);
       const masked = maskFrontmatter(entry.source);
@@ -173,6 +253,31 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
         expect(entry.source.slice(parsed!.end)).toBe(entry.typescript.body);
         assertMaskInvariants(entry.source, masked, parsed!.end, entry.typescript.body);
       }
+
+      const companion = await prepareMarkdownExport(entry.source, "/workspace/note.md");
+      expect(companion.content).toBe(entry.source);
+      expect(companion.assets).toEqual({});
     },
   );
+
+  it("verifies masking and companion export invariants across #186 conformance vectors when present", async () => {
+    const pr186SurrogateGuardActive = parseFrontmatter('---\ntitle: "\\uD800"\n---\nBody') === null;
+    if (!conformanceSuite || !pr186SurrogateGuardActive) return;
+
+    mockInvoke.mockRejectedValue(new Error("Unexpected asset load in conformance vector"));
+    for (const item of conformanceSuite.cases) {
+      const parsed = parseFrontmatter(item.markdown);
+      const masked = maskFrontmatter(item.markdown);
+      if (!item.valid) {
+        expect(parsed, item.id).toBeNull();
+        expect(masked, item.id).toBe(item.markdown);
+      } else {
+        expect(parsed, item.id).not.toBeNull();
+        assertMaskInvariants(item.markdown, masked, parsed!.end, item.body);
+      }
+      const companion = await prepareMarkdownExport(item.markdown, "/workspace/note.md");
+      expect(companion.content, item.id).toBe(item.markdown);
+      expect(companion.assets, item.id).toEqual({});
+    }
+  });
 });

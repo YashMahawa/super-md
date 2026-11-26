@@ -1,6 +1,7 @@
 {
   "version": 1,
-  "description": "Portable YAML frontmatter fixture corpus shared by TypeScript (src/frontmatter.ts) and Desktop Python (desktop/frontmatter.py) for quoted scalars, flow collections, folded scalars, CRLF, and Unicode separators, plus recorded cross-parser divergences on current main.",
+  "companionConformanceFixture": "test-fixtures/frontmatter-conformance.json",
+  "description": "Portable YAML frontmatter fixture corpus shared by TypeScript (src/frontmatter.ts, src/markdownExport.ts) and Desktop Python (desktop/frontmatter.py, desktop/markdown_export.py, desktop/agent_exports.py) for quoted scalars, flow collections, folded scalars, CRLF, and Unicode separators, coordinated with test-fixtures/frontmatter-conformance.json (#186).",
   "sharedCases": [
     {
       "id": "quoted-double-escapes-and-masked-tokens",
@@ -109,6 +110,22 @@
       "recognized": false,
       "frontmatterRaw": "",
       "body": "---\ntitle: \"Bad escape \\u123G\"\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "quoted-reject-truncated-hex-escape",
+      "category": "quoted-scalars",
+      "description": "Double-quoted scalars with truncated \\xXX hex escapes are rejected by both parsers.",
+      "source": "---\ntitle: \"Truncated \\x4\"\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntitle: \"Truncated \\x4\"\n---\n# Body\n",
       "endOffset": {
         "utf16": 0,
         "codePoints": 0
@@ -434,6 +451,28 @@
       }
     },
     {
+      "id": "crlf-comment-only-with-tab-indented-comment",
+      "category": "crlf",
+      "description": "Comment-only CRLF frontmatter blocks with leading-tab comment lines and dot closers are recognized and preserve companion body image paths.",
+      "source": "---\r\n# leading comment\r\n\t# tab-indented comment\r\n...\r\n# After Comment-Only Frontmatter\r\n\r\n![Body](comment-real.png)\r\n",
+      "recognized": true,
+      "frontmatterRaw": "---\r\n# leading comment\r\n\t# tab-indented comment\r\n...\r\n",
+      "body": "# After Comment-Only Frontmatter\r\n\r\n![Body](comment-real.png)\r\n",
+      "endOffset": {
+        "utf16": 54,
+        "codePoints": 54
+      },
+      "bodyProbes": [
+        "# After Comment-Only Frontmatter",
+        "![Body](comment-real.png)"
+      ],
+      "bodyImages": [
+        "comment-real.png"
+      ],
+      "unsupportedDiagrams": false,
+      "typescriptEntries": {}
+    },
+    {
       "id": "crlf-empty-and-mixed-line-endings",
       "category": "crlf",
       "description": "Mixed CRLF and LF line endings inside YAML frontmatter and body preserve exact line break positions.",
@@ -599,7 +638,9 @@
       "id": "divergence-flow-map-entry-missing-colon",
       "category": "flow-collections",
       "description": "Flow mapping containing a bare scalar without a key-value colon.",
-      "reason": "src/frontmatter.ts validates each {...} entry via splitKeyValue(..., true) in parseFlowValue, whereas desktop/frontmatter.py consume_flow only checks _flow_state brace balance.",
+      "reason": "src/frontmatter.ts validates each {...} entry via splitKeyValue(..., true) in parseFlowValue, whereas desktop/frontmatter.py consume_flow on pre-#186 main only checks _flow_state brace balance.",
+      "alignedInPr186": true,
+      "conformanceCaseId": "flow_map_bare_entry",
       "source": "---\nauthor: {invalid_without_colon}\n---\n# Body\n",
       "typescript": {
         "recognized": false,
@@ -618,7 +659,9 @@
       "id": "divergence-flow-mismatched-nested-delimiters",
       "category": "flow-collections",
       "description": "Nested flow collection with improperly interleaved closing brackets ([{a: 1]}).",
-      "reason": "src/frontmatter.ts recursively splits nested flow items in parseFlowValue and catches the unclosed '{', whereas desktop/frontmatter.py _flow_state tracks separate integer counters without a delimiter stack.",
+      "reason": "src/frontmatter.ts recursively splits nested flow items in parseFlowValue and catches the unclosed '{', whereas desktop/frontmatter.py _flow_state on pre-#186 main tracks separate integer counters without a delimiter stack.",
+      "alignedInPr186": true,
+      "conformanceCaseId": "flow_mismatched_nesting",
       "source": "---\ntags: [{a: 1]}\n---\n# Body\n",
       "typescript": {
         "recognized": false,
@@ -637,7 +680,9 @@
       "id": "divergence-flow-adjacent-quoted-scalars",
       "category": "flow-collections",
       "description": "Flow sequence item with two adjacent double-quoted scalars lacking a separating comma.",
-      "reason": "src/frontmatter.ts parseFlowValue requires onlyTrailingComment after each comma-split quoted item, whereas desktop/frontmatter.py _flow_state toggles quote flags without validating item boundaries.",
+      "reason": "src/frontmatter.ts parseFlowValue requires onlyTrailingComment after each comma-split quoted item, whereas desktop/frontmatter.py _flow_state on pre-#186 main toggles quote flags without validating item boundaries.",
+      "alignedInPr186": true,
+      "conformanceCaseId": "flow_quoted_item_trailing_garbage",
       "source": "---\ntags: [\"alpha\" \"beta\"]\n---\n# Body\n",
       "typescript": {
         "recognized": false,
@@ -656,7 +701,8 @@
       "id": "divergence-flow-invalid-unicode-escape-in-quoted-item",
       "category": "quoted-scalars",
       "description": "Double-quoted scalar inside a flow sequence containing a non-hex \\uZZZZ escape.",
-      "reason": "src/frontmatter.ts parseFlowValue calls parseDoubleQuoted on quoted flow items, whereas desktop/frontmatter.py consume_flow relies on _flow_state which skips '\\u' without hex validation.",
+      "reason": "src/frontmatter.ts parseFlowValue calls parseDoubleQuoted on quoted flow items, whereas desktop/frontmatter.py consume_flow on pre-#186 main relies on _flow_state which skips '\\u' without hex validation.",
+      "alignedInPr186": true,
       "source": "---\ntags: [\"\\uZZZZ\"]\n---\n# Body\n",
       "typescript": {
         "recognized": false,
@@ -676,6 +722,7 @@
       "category": "quoted-scalars",
       "description": "Quoted mapping key followed by U+00A0 non-breaking space before the colon.",
       "reason": "src/frontmatter.ts splitKeyValue uses String.prototype.trimStart() (which strips U+00A0), whereas desktop/frontmatter.py _split_key_value uses str.lstrip(' \\t').",
+      "alignedInPr186": false,
       "source": "---\n\"title\"\u00a0: NBSP Before Colon\n---\n# Body\n",
       "typescript": {
         "recognized": true,
@@ -695,6 +742,7 @@
       "category": "quoted-scalars",
       "description": "Double-quoted scalar value followed by U+00A0 non-breaking space before an inline # comment.",
       "reason": "src/frontmatter.ts onlyTrailingComment uses String.prototype.trimStart() (stripping U+00A0 before '#'), whereas desktop/frontmatter.py _only_trailing_comment uses str.lstrip(' \\t').",
+      "alignedInPr186": false,
       "source": "---\ntitle: \"Quoted\"\u00a0# comment after NBSP\n---\n# Body\n",
       "typescript": {
         "recognized": true,
@@ -713,7 +761,8 @@
       "id": "divergence-unicode-ls-in-quoted-scalar",
       "category": "unicode-separators",
       "description": "Double-quoted scalar containing U+2028 Unicode Line Separator followed by unindented text.",
-      "reason": "src/frontmatter.ts splits YAML lines only on /\\r?\\n/ so U+2028 stays inside the single-line quoted scalar, whereas desktop/frontmatter.py yaml_body.splitlines() splits on U+2028 into an unindented continuation line (indent 0 < min_indent).",
+      "reason": "src/frontmatter.ts splits YAML lines only on /\\r?\\n/ so U+2028 stays inside the single-line quoted scalar, whereas desktop/frontmatter.py yaml_body.splitlines() on pre-#186 main splits on U+2028 into an unindented continuation line (indent 0 < min_indent).",
+      "alignedInPr186": true,
       "source": "---\ntitle: \"First\u2028Second\"\n---\n# Body\n",
       "typescript": {
         "recognized": true,
@@ -732,7 +781,8 @@
       "id": "divergence-unicode-ps-and-nel-in-plain-scalar",
       "category": "unicode-separators",
       "description": "Plain scalar containing U+2029 Paragraph Separator and U+0085 Next Line (NEL).",
-      "reason": "src/frontmatter.ts keeps U+2029 and U+0085 inside the single plain scalar line, whereas desktop/frontmatter.py yaml_body.splitlines() splits them into root-level lines lacking ':'.",
+      "reason": "src/frontmatter.ts keeps U+2029 and U+0085 inside the single plain scalar line, whereas desktop/frontmatter.py yaml_body.splitlines() on pre-#186 main splits them into root-level lines lacking ':'.",
+      "alignedInPr186": true,
       "source": "---\ntitle: First\u2029Second\u0085Third\n---\n# Body\n",
       "typescript": {
         "recognized": true,
@@ -751,7 +801,8 @@
       "id": "divergence-unicode-ls-between-root-entries",
       "category": "unicode-separators",
       "description": "Two root mapping entries separated by U+2028 Line Separator instead of LF/CRLF.",
-      "reason": "src/frontmatter.ts keeps both entries on one line and rejects trailing 'author: \"Beta\"' after the first quoted scalar, whereas desktop/frontmatter.py yaml_body.splitlines() splits U+2028 into two valid root key: value lines.",
+      "reason": "src/frontmatter.ts keeps both entries on one line and rejects trailing 'author: \"Beta\"' after the first quoted scalar, whereas desktop/frontmatter.py yaml_body.splitlines() on pre-#186 main splits U+2028 into two valid root key: value lines.",
+      "alignedInPr186": true,
       "source": "---\ntitle: \"Alpha\"\u2028author: \"Beta\"\n---\n# Body\n",
       "typescript": {
         "recognized": false,
@@ -770,7 +821,8 @@
       "id": "divergence-folded-scalar-with-unicode-ls",
       "category": "folded-scalars",
       "description": "Folded block scalar containing U+2028 Line Separator before unindented text.",
-      "reason": "src/frontmatter.ts keeps the line together at indent 2 inside parseBlockScalar, whereas desktop/frontmatter.py yaml_body.splitlines() splits at U+2028, exiting consume_block_scalar at indent 0 and failing root mapping validation.",
+      "reason": "src/frontmatter.ts keeps the line together at indent 2 inside parseBlockScalar, whereas desktop/frontmatter.py yaml_body.splitlines() on pre-#186 main splits at U+2028, exiting consume_block_scalar at indent 0 and failing root mapping validation.",
+      "alignedInPr186": true,
       "source": "---\nsummary: >-\n  folded line\u2028unindented tail\n---\n# Body\n",
       "typescript": {
         "recognized": true,
@@ -789,7 +841,8 @@
       "id": "divergence-bare-cr-inside-yaml-scalar",
       "category": "crlf",
       "description": "YAML scalar containing a bare carriage return (\\r) not followed by \\n.",
-      "reason": "src/frontmatter.ts splits lines on /\\r?\\n/ (leaving bare \\r inside the scalar and preserving \\r in maskFrontmatter), whereas desktop/frontmatter.py yaml_body.splitlines() splits bare \\r into a root line lacking ':'.",
+      "reason": "src/frontmatter.ts splits lines on /\\r?\\n/ (leaving bare \\r inside the scalar and preserving \\r in maskFrontmatter), whereas desktop/frontmatter.py yaml_body.splitlines() on pre-#186 main splits bare \\r into a root line lacking ':'.",
+      "alignedInPr186": true,
       "source": "---\ntitle: First\rSecond\n---\n# Body\n",
       "typescript": {
         "recognized": true,
@@ -809,6 +862,7 @@
       "category": "unicode-separators",
       "description": "Line containing only U+FEFF ZERO WIDTH NO-BREAK SPACE between two YAML mapping entries.",
       "reason": "JavaScript String.prototype.trim() strips U+FEFF so src/frontmatter.ts treats the line as blank, whereas Python str.strip() preserves U+FEFF and desktop/frontmatter.py rejects it as a non-mapping root line.",
+      "alignedInPr186": false,
       "source": "---\ntitle: Alpha\n\ufeff\nauthor: Beta\n---\n# Body\n",
       "typescript": {
         "recognized": true,
@@ -827,7 +881,8 @@
       "id": "divergence-vtab-and-formfeed-in-quoted-scalar",
       "category": "unicode-separators",
       "description": "Double-quoted scalar containing ASCII vertical tab (U+000B) and form feed (U+000C).",
-      "reason": "src/frontmatter.ts keeps U+000B and U+000C inside the quoted line, whereas desktop/frontmatter.py yaml_body.splitlines() splits on \\x0b and \\x0c into indent-0 continuation lines.",
+      "reason": "src/frontmatter.ts keeps U+000B and U+000C inside the quoted line, whereas desktop/frontmatter.py yaml_body.splitlines() on pre-#186 main splits on \\x0b and \\x0c into indent-0 continuation lines.",
+      "alignedInPr186": true,
       "source": "---\ntitle: \"Vert\u000bTab\fForm\"\n---\n# Body\n",
       "typescript": {
         "recognized": true,
