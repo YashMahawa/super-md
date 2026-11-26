@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, useState } from "react";
+import { act, StrictMode, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, expect, it, vi } from "vitest";
 
@@ -26,10 +26,13 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
 import Editor from "./Editor";
 import LiveEditor from "./LiveEditor";
 import { cancelHeadingNavigation } from "../documentNavigation";
+import { applyHistoryEdit, replayHistory, tryLiveTextareaHistory, type LiveHistoryEditMeta, type NoteHistory } from "../noteHistory";
 import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+const execCommandCleanups: Array<() => void> = [];
 afterEach(() => {
+  while (execCommandCleanups.length > 0) execCommandCleanups.pop()?.();
   invokeMock.mockClear();
   toJsxRuntimeSpy.mockClear();
   vi.unstubAllGlobals();
@@ -1050,6 +1053,233 @@ it("continues and clears list, task, and quote markers on Enter and indents/outd
   delete document.documentElement.dataset.reduceMotion;
 });
 
+function HistoryBackedLiveEditor({
+  initial,
+  spellCheck = false,
+  grammarCheck = false,
+  historyRef,
+  onDocChange,
+  triggerRef,
+}: {
+  initial: string;
+  spellCheck?: boolean;
+  grammarCheck?: boolean;
+  historyRef: { current: NoteHistory };
+  onDocChange?: (value: string) => void;
+  triggerRef: { current: (direction: "undo" | "redo") => void };
+}) {
+  const [markdown, setMarkdown] = useState(initial);
+  const [replayToken, setReplayToken] = useState(0);
+  const latestMarkdownRef = { current: markdown };
+  latestMarkdownRef.current = markdown;
+
+  const commitChange = (next: string, meta?: LiveHistoryEditMeta) => {
+    const prev = latestMarkdownRef.current;
+    if (next === prev) return;
+    applyHistoryEdit(historyRef.current, prev, next, Date.now(), meta);
+    latestMarkdownRef.current = next;
+    setMarkdown(next);
+    onDocChange?.(next);
+  };
+
+  const runHistory = (direction: "undo" | "redo") => {
+    const activeEl = document.activeElement;
+    if (activeEl instanceof HTMLTextAreaElement && activeEl.closest(".live-active-block")) {
+      if (tryLiveTextareaHistory(direction)) return true;
+    }
+    const next = replayHistory(historyRef.current, latestMarkdownRef.current, direction);
+    if (next === undefined) return false;
+    latestMarkdownRef.current = next;
+    setReplayToken((n) => n + 1);
+    setMarkdown(next);
+    onDocChange?.(next);
+    return true;
+  };
+  triggerRef.current = (direction) => {
+    runHistory(direction);
+  };
+
+  return (
+    <div className="reading-scroll">
+      <LiveEditor
+        markdown={markdown}
+        documentPath={null}
+        dark={false}
+        python=""
+        spellCheck={spellCheck}
+        grammarCheck={grammarCheck}
+        onChange={commitChange}
+        onHistory={runHistory}
+        historyReplayToken={replayToken}
+      />
+    </div>
+  );
+}
+
+function installNativeTextareaExecCommandMock() {
+  const originalExecCommand = Object.getOwnPropertyDescriptor(document, "execCommand");
+  type StackItem = { before: string; after: string; beforeSel: [number, number]; afterSel: [number, number] };
+  const stacks = new WeakMap<HTMLTextAreaElement, { undo: StackItem[]; redo: StackItem[] }>();
+  const getStack = (area: HTMLTextAreaElement) => {
+    let stack = stacks.get(area);
+    if (!stack) {
+      stack = { undo: [], redo: [] };
+      stacks.set(area, stack);
+    }
+    return stack;
+  };
+  const setNativeValue = (area: HTMLTextAreaElement, next: string, selStart: number, selEnd: number, inputType: string) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(area, next);
+    area.setSelectionRange(selStart, selEnd);
+    area.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType }));
+    area.dispatchEvent(new InputEvent("input", { bubbles: true, inputType }));
+  };
+  const execCommandMock = vi.fn((command: string, _ui?: boolean, value = "") => {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLTextAreaElement)) return false;
+    const stack = getStack(active);
+    if (command === "insertText" || command === "delete") {
+      const from = active.selectionStart;
+      const to = active.selectionEnd;
+      const inserted = command === "insertText" ? value : "";
+      const before = active.value;
+      const after = before.slice(0, from) + inserted + before.slice(to);
+      if (after === before) return false;
+      const afterPos = from + inserted.length;
+      stack.undo.push({ before, after, beforeSel: [from, to], afterSel: [afterPos, afterPos] });
+      stack.redo = [];
+      setNativeValue(active, after, afterPos, afterPos, command === "insertText" ? "insertText" : "deleteContentBackward");
+      return true;
+    }
+    if (command === "undo") {
+      const step = stack.undo.pop();
+      if (!step) return false;
+      stack.redo.push(step);
+      setNativeValue(active, step.before, step.beforeSel[0], step.beforeSel[1], "historyUndo");
+      return true;
+    }
+    if (command === "redo") {
+      const step = stack.redo.pop();
+      if (!step) return false;
+      stack.undo.push(step);
+      setNativeValue(active, step.after, step.afterSel[0], step.afterSel[1], "historyRedo");
+      return true;
+    }
+    return false;
+  });
+  Object.defineProperty(document, "execCommand", { configurable: true, writable: true, value: execCommandMock });
+  execCommandCleanups.push(() => {
+    if (originalExecCommand) Object.defineProperty(document, "execCommand", originalExecCommand);
+    else delete (document as { execCommand?: unknown }).execCommand;
+  });
+  return { execCommandMock };
+}
+
+it("undoes inside one Live block via native textarea undo and redoes after leaving that block, and crosses block boundaries", async () => {
+  installNativeTextareaExecCommandMock();
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const historyRef: { current: NoteHistory } = { current: { undo: [], redo: [], last: 0 } };
+  const triggerRef: { current: (direction: "undo" | "redo") => void } = { current: () => {} };
+  let currentDoc = "First paragraph\n\nSecond paragraph";
+
+  await act(async () => {
+    root.render(
+      <HistoryBackedLiveEditor
+        initial={currentDoc}
+        historyRef={historyRef}
+        triggerRef={triggerRef}
+        onDocChange={(next) => {
+          currentDoc = next;
+        }}
+      />,
+    );
+  });
+
+  // 1. Open Block 1, type via native execCommand, undo INSIDE Block 1, then leave Block 1 and redo!
+  act(() => {
+    host.querySelectorAll<HTMLElement>(".live-block")[0].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const block1Area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  block1Area.focus();
+  block1Area.setSelectionRange(block1Area.value.length, block1Area.value.length);
+  act(() => {
+    document.execCommand("insertText", false, " refined");
+  });
+  expect(block1Area.value).toBe("First paragraph refined");
+  expect(currentDoc).toBe("First paragraph refined\n\nSecond paragraph");
+
+  // Undo inside Block 1 via Ctrl+Z while textarea remains open and focused.
+  act(() => {
+    block1Area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("First paragraph");
+  expect(currentDoc).toBe("First paragraph\n\nSecond paragraph");
+
+  // Leave Block 1 with Escape, then Redo from document history!
+  act(() => {
+    block1Area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+  act(() => {
+    triggerRef.current("redo");
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+  expect(currentDoc).toBe("First paragraph refined\n\nSecond paragraph");
+  expect(host.textContent).toContain("First paragraph refined");
+
+  // 2. Cross block boundaries: open Block 2, edit Block 2, then Undo twice (Block 2 -> Block 1) and Redo twice!
+  act(() => {
+    host.querySelectorAll<HTMLElement>(".live-block")[1].dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const block2Area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  block2Area.focus();
+  block2Area.setSelectionRange(block2Area.value.length, block2Area.value.length);
+  act(() => {
+    document.execCommand("insertText", false, " updated");
+  });
+  expect(block2Area.value).toBe("Second paragraph updated");
+  expect(currentDoc).toBe("First paragraph refined\n\nSecond paragraph updated");
+
+  // First Ctrl+Z inside Block 2 undoes Block 2's native textarea edit.
+  act(() => {
+    block2Area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("Second paragraph");
+  expect(currentDoc).toBe("First paragraph refined\n\nSecond paragraph");
+
+  // Second Ctrl+Z while still in Block 2's exhausted textarea crosses into Block 1!
+  act(() => {
+    host.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+  expect(currentDoc).toBe("First paragraph\n\nSecond paragraph");
+  const reanchoredBlock1 = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(reanchoredBlock1.value).toBe("First paragraph");
+  expect(document.activeElement).toBe(reanchoredBlock1);
+
+  // Redo twice crosses forward from Block 1 back into Block 2!
+  act(() => {
+    reanchoredBlock1.dispatchEvent(new KeyboardEvent("keydown", { key: "y", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(currentDoc).toBe("First paragraph refined\n\nSecond paragraph");
+  expect(host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("First paragraph refined");
+
+  act(() => {
+    host.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "z", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+  expect(currentDoc).toBe("First paragraph refined\n\nSecond paragraph updated");
+  expect(host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("Second paragraph updated");
+
+  act(() => root.unmount());
+  host.remove();
+});
+
 it("retains LiveEditor focus across WritingSuggestions replacement, dismissal, personal dictionary save, and single-step undo", async () => {
   vi.useFakeTimers();
   window.localStorage.removeItem("supermd.personal-dictionary.v1");
@@ -1261,3 +1491,228 @@ it("combines accessible Edit block controls with prose URL wrapping, raw paste i
   host.remove();
 });
 
+it("keeps WritingSuggestions replacements undoable and isolated both inside the active textarea and after leaving the block", async () => {
+  vi.useFakeTimers();
+  const originalWorker = globalThis.Worker;
+  class MockProofreadingWorker {
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: ErrorEvent) => void) | null = null;
+    postMessage(data: { id: number; text: string }) {
+      const idx = data.text.indexOf("teh");
+      const issues =
+        idx === -1
+          ? []
+          : [
+              {
+                from: idx,
+                to: idx + 3,
+                kind: "spelling",
+                message: "Possible spelling error: teh",
+                replacements: ["the"],
+              },
+            ];
+      queueMicrotask(() => {
+        this.onmessage?.({ data: { id: data.id, issues } } as MessageEvent);
+      });
+    }
+    terminate() {}
+  }
+  Object.defineProperty(globalThis, "Worker", {
+    configurable: true,
+    writable: true,
+    value: MockProofreadingWorker,
+  });
+  try {
+    installNativeTextareaExecCommandMock();
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const historyRef: { current: NoteHistory } = { current: { undo: [], redo: [], last: 0 } };
+    const triggerRef: { current: (direction: "undo" | "redo") => void } = { current: () => {} };
+    let currentDoc = "Fix teh typo";
+
+    await act(async () => {
+      root.render(
+        <HistoryBackedLiveEditor
+          initial={currentDoc}
+          spellCheck
+          grammarCheck
+          historyRef={historyRef}
+          triggerRef={triggerRef}
+          onDocChange={(next) => {
+            currentDoc = next;
+          }}
+        />,
+      );
+    });
+
+    act(() => {
+      host.querySelector<HTMLElement>(".live-block")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+    const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+    area.focus();
+    area.setSelectionRange(area.value.length, area.value.length);
+
+    // Type a single character so we also verify a same-length "teh" -> "the" suggestion does not coalesce into it.
+    act(() => {
+      document.execCommand("insertText", false, ".");
+    });
+    expect(area.value).toBe("Fix teh typo.");
+
+    // Advance timers so WritingSuggestions finishes checking "Fix teh typo." and offers "the".
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(700);
+    });
+    const theButton = [...host.querySelectorAll<HTMLButtonElement>(".writing-suggestions button")].find(
+      (btn) => btn.textContent === "the",
+    );
+    expect(theButton).toBeDefined();
+
+    // Accept the "the" suggestion while focused in the textarea.
+    act(() => {
+      theButton!.click();
+    });
+    expect(area.value).toBe("Fix the typo.");
+    expect(currentDoc).toBe("Fix the typo.");
+    expect(document.activeElement).toBe(area);
+
+    // Immediate Ctrl+Z inside the textarea reverts ONLY the accepted suggestion ("the" -> "teh"), keeping "." intact!
+    act(() => {
+      area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(area.value).toBe("Fix teh typo.");
+    expect(currentDoc).toBe("Fix teh typo.");
+
+    // Leave the block with Escape, then Redo restores "Fix the typo.", and two Undos step cleanly through suggestion then "."!
+    act(() => {
+      area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(host.querySelector("textarea")).toBeNull();
+
+    act(() => {
+      triggerRef.current("redo");
+    });
+    expect(currentDoc).toBe("Fix the typo.");
+
+    act(() => {
+      triggerRef.current("undo");
+    });
+    expect(currentDoc).toBe("Fix teh typo.");
+
+    act(() => {
+      triggerRef.current("undo");
+    });
+    expect(currentDoc).toBe("Fix teh typo");
+
+    act(() => root.unmount());
+    host.remove();
+    await vi.advanceTimersByTimeAsync(50_000);
+  } finally {
+    Object.defineProperty(globalThis, "Worker", {
+      configurable: true,
+      writable: true,
+      value: originalWorker,
+    });
+    vi.useRealTimers();
+  }
+});
+
+it("keeps the active textarea mounted, focused, and undo/redo reconciled inside React StrictMode across Edit block and double-click", async () => {
+  installNativeTextareaExecCommandMock();
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const historyRef: { current: NoteHistory } = { current: { undo: [], redo: [], last: 0 } };
+  const triggerRef: { current: (direction: "undo" | "redo") => void } = { current: () => {} };
+  let currentDoc = "# First heading\n\nSecond paragraph";
+  const removedTextareas: HTMLTextAreaElement[] = [];
+  const observer = new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of record.removedNodes) {
+        if (node instanceof HTMLTextAreaElement) removedTextareas.push(node);
+      }
+    }
+  });
+  observer.observe(host, { childList: true, subtree: true });
+
+  await act(async () => {
+    root.render(
+      <StrictMode>
+        <div className="reading-scroll">
+          <HistoryBackedLiveEditor
+            initial={currentDoc}
+            historyRef={historyRef}
+            triggerRef={triggerRef}
+            onDocChange={(next) => {
+              currentDoc = next;
+            }}
+          />
+        </div>
+      </StrictMode>,
+    );
+  });
+
+  // 1. Open first block via revealed "Edit block" button inside StrictMode.
+  const firstBlock = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
+  act(() => {
+    firstBlock.focus();
+  });
+  const editButton = firstBlock.querySelector<HTMLButtonElement>('button[aria-label="Edit block"]')!;
+  expect(editButton).not.toBeNull();
+  act(() => {
+    editButton.click();
+  });
+  const firstTextarea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]');
+  expect(firstTextarea).not.toBeNull();
+  expect(document.activeElement).toBe(firstTextarea);
+  expect(removedTextareas).toHaveLength(0);
+
+  act(() => {
+    firstTextarea!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  // 2. Open second block via double-click with Typewriter scroll enabled inside StrictMode, edit, undo, exit, and redo.
+  act(() => {
+    setTypewriterScroll(true);
+  });
+  try {
+    removedTextareas.length = 0;
+    const secondBlock = host.querySelectorAll<HTMLElement>(".live-block")[1]!;
+    act(() => {
+      secondBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    });
+    const secondTextarea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+    expect(secondTextarea).not.toBeNull();
+    expect(document.activeElement).toBe(secondTextarea);
+    expect(removedTextareas).toHaveLength(0);
+
+    act(() => {
+      secondTextarea.setSelectionRange(secondTextarea.value.length, secondTextarea.value.length);
+      document.execCommand("insertText", false, " updated");
+    });
+    expect(currentDoc).toBe("# First heading\n\nSecond paragraph updated");
+
+    act(() => {
+      secondTextarea.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(currentDoc).toBe("# First heading\n\nSecond paragraph");
+
+    act(() => {
+      secondTextarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(host.querySelector("textarea")).toBeNull();
+
+    act(() => {
+      triggerRef.current("redo");
+    });
+    expect(currentDoc).toBe("# First heading\n\nSecond paragraph updated");
+  } finally {
+    act(() => {
+      setTypewriterScroll(false);
+    });
+    observer.disconnect();
+    act(() => root.unmount());
+    host.remove();
+  }
+});

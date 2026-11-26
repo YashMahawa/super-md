@@ -1,5 +1,6 @@
-import {createContext,useContext,useEffect,useLayoutEffect,useRef,useState,type ClipboardEvent,type KeyboardEvent as ReactKeyboardEvent,type ReactNode,type RefObject} from 'react';
+import {createContext,useCallback,useContext,useEffect,useLayoutEffect,useRef,useState,type ReactNode,type RefObject} from 'react';
 import {PencilSimpleIcon} from '@phosphor-icons/react';
+import type {LiveHistoryEditMeta} from '../noteHistory';
 import WindowedBlock,{type WindowHeading} from './WindowedBlock';
 import WritingSuggestions from './WritingSuggestions';
 
@@ -14,12 +15,13 @@ export interface ActiveDraftContextValue {
   caret:number;
   spellCheck:boolean;
   grammarCheck:boolean;
-  onChange:(value:string,target:HTMLTextAreaElement)=>void;
+  onChange:(value:string,target:HTMLTextAreaElement,meta?:LiveHistoryEditMeta)=>void;
+  onBeforeInput:(inputType?:string)=>void;
   onSuggestionChange:(value:string)=>void;
   onSuggestionAction:(edit?:{from:number;to:number;insertLength:number})=>void;
   onSyncCaret:(area:HTMLTextAreaElement)=>void;
-  onPaste:(event:ClipboardEvent<HTMLTextAreaElement>)=>void;
-  onKeyDown:(event:ReactKeyboardEvent<HTMLTextAreaElement>)=>void;
+  onPaste:(area:HTMLTextAreaElement,event:ClipboardEvent)=>void;
+  onKeyDown:(area:HTMLTextAreaElement,event:KeyboardEvent)=>void;
   onCaretMove:()=>void;
   onRememberSelection:(area:HTMLTextAreaElement)=>void;
   onBlurSession:(session:number,area:HTMLTextAreaElement,shouldClose:boolean,relatedTarget:Element|null)=>void;
@@ -30,31 +32,106 @@ export const ActiveDraftContext=createContext<ActiveDraftContextValue|null>(null
 export function ActiveBlockEditor(){
   const draft=useContext(ActiveDraftContext);
   if(!draft)return null;
-  const {session,editorRef,sourceStart,text,caret,spellCheck,grammarCheck,onChange,onSuggestionChange,onSuggestionAction,onSyncCaret,onPaste,onKeyDown,onCaretMove,onRememberSelection,onBlurSession}=draft;
+  return <ActiveBlockEditorInner key={draft.session} draft={draft}/>;
+}
+
+function ActiveBlockEditorInner({draft}:{draft:ActiveDraftContextValue}){
+  const {session,editorRef,sourceStart,text,caret,spellCheck,grammarCheck,onSuggestionChange,onSuggestionAction}=draft;
+  const areaRef=useRef<HTMLTextAreaElement|null>(null);
+  const draftRef=useRef(draft);
+  draftRef.current=draft;
+  const getOrCreateTextarea=useCallback(()=>{
+    let area=areaRef.current;
+    if(!area){
+      const initial=draftRef.current;
+      area=document.createElement('textarea');
+      area.setAttribute('data-source-start',String(initial.sourceStart));
+      area.spellcheck=false;
+      area.setAttribute('spellcheck','false');
+      area.setAttribute('aria-label','Edit Markdown block');
+      area.defaultValue=initial.text;
+      area.value=initial.text;
+      area.style.height=`${Math.max(120,initial.text.split('\n').length*27+32)}px`;
+      areaRef.current=area;
+    }
+    return area;
+  },[]);
+  const setHostRef=useCallback((host:HTMLDivElement|null)=>{
+    const ref=draftRef.current.editorRef as {current:HTMLTextAreaElement|null};
+    if(!host){
+      if(ref.current===areaRef.current)ref.current=null;
+      return;
+    }
+    const area=getOrCreateTextarea();
+    if(area.parentElement!==host)host.insertBefore(area,host.firstChild);
+    ref.current=area;
+  },[getOrCreateTextarea]);
+  useLayoutEffect(()=>{
+    const area=areaRef.current;
+    if(!area)return;
+    (draftRef.current.editorRef as {current:HTMLTextAreaElement|null}).current=area;
+    let disposed=false;
+    const onPaste=(event:ClipboardEvent)=>draftRef.current.onPaste(area,event);
+    const onBeforeInput=(event:Event)=>draftRef.current.onBeforeInput((event as InputEvent).inputType);
+    const onFocus=()=>draftRef.current.onRememberSelection(area);
+    const onSelect=()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);};
+    const onPointerUp=()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);};
+    const onClick=()=>{draftRef.current.onSyncCaret(area);draftRef.current.onRememberSelection(area);};
+    const onInput=(event:Event)=>{
+      const inputType=(event as InputEvent).inputType;
+      const dir=inputType==='historyUndo'?'undo':inputType==='historyRedo'?'redo':undefined;
+      draftRef.current.onSyncCaret(area);
+      draftRef.current.onChange(area.value,area,dir?{historyDirection:dir}:undefined);
+    };
+    const onKeyUp=(event:KeyboardEvent)=>{
+      draftRef.current.onSyncCaret(area);
+      draftRef.current.onRememberSelection(area);
+      if(CARET_KEYS.has(event.key))draftRef.current.onCaretMove();
+    };
+    const onKeyDown=(event:KeyboardEvent)=>draftRef.current.onKeyDown(area,event);
+    const onBlur=(event:FocusEvent)=>{
+      if(disposed||!area.isConnected)return;
+      const related=event.relatedTarget;
+      const shouldClose=!(related instanceof Node&&area.parentElement?.contains(related));
+      draftRef.current.onBlurSession(session,area,shouldClose,related instanceof Element?related:null);
+    };
+    area.addEventListener('paste',onPaste);
+    area.addEventListener('beforeinput',onBeforeInput);
+    area.addEventListener('focus',onFocus);
+    area.addEventListener('select',onSelect);
+    area.addEventListener('pointerup',onPointerUp);
+    area.addEventListener('click',onClick);
+    area.addEventListener('input',onInput);
+    area.addEventListener('keyup',onKeyUp);
+    area.addEventListener('keydown',onKeyDown);
+    area.addEventListener('blur',onBlur);
+    return()=>{
+      disposed=true;
+      area.removeEventListener('paste',onPaste);
+      area.removeEventListener('beforeinput',onBeforeInput);
+      area.removeEventListener('focus',onFocus);
+      area.removeEventListener('select',onSelect);
+      area.removeEventListener('pointerup',onPointerUp);
+      area.removeEventListener('click',onClick);
+      area.removeEventListener('input',onInput);
+      area.removeEventListener('keyup',onKeyUp);
+      area.removeEventListener('keydown',onKeyDown);
+      area.removeEventListener('blur',onBlur);
+      const ref=draftRef.current.editorRef as {current:HTMLTextAreaElement|null};
+      if(ref.current===area)ref.current=null;
+    };
+  },[session]);
+  useLayoutEffect(()=>{
+    const area=editorRef.current??areaRef.current;
+    if(!area)return;
+    const nextStart=String(sourceStart);
+    if(area.getAttribute('data-source-start')!==nextStart)area.setAttribute('data-source-start',nextStart);
+    if(area.value!==text)area.value=text;
+    const nextHeight=`${Math.max(120,text.split('\n').length*27+32)}px`;
+    if(area.style.height!==nextHeight)area.style.height=nextHeight;
+  },[editorRef,sourceStart,text]);
   return (
-    <div className="live-active-block">
-      <textarea
-        ref={editorRef}
-        data-source-start={sourceStart}
-        spellCheck={false}
-        value={text}
-        style={{height:Math.max(120,text.split('\n').length*27+32)}}
-        onPaste={onPaste}
-        onFocus={event=>onRememberSelection(event.currentTarget)}
-        onSelect={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);}}
-        onPointerUp={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);}}
-        onClick={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);}}
-        onChange={event=>{onSyncCaret(event.target);onChange(event.target.value,event.currentTarget);}}
-        onKeyUp={event=>{onSyncCaret(event.currentTarget);onRememberSelection(event.currentTarget);if(CARET_KEYS.has(event.key))onCaretMove();}}
-        onKeyDown={onKeyDown}
-        onBlur={event=>{
-          if(!event.currentTarget.isConnected)return;
-          const related=event.relatedTarget;
-          const shouldClose=!(related instanceof Node&&event.currentTarget.parentElement?.contains(related));
-          onBlurSession(session,event.currentTarget,shouldClose,related instanceof Element?related:null);
-        }}
-        aria-label="Edit Markdown block"
-      />
+    <div ref={setHostRef} className="live-active-block">
       <WritingSuggestions text={text} caret={caret} spellCheck={spellCheck} grammarCheck={grammarCheck} onChange={onSuggestionChange} onAction={onSuggestionAction}/>
     </div>
   );
@@ -64,10 +141,11 @@ export interface LiveBlockShellProps {
   windowed:boolean;estimate:number;text:string;headings:WindowHeading[];
   start:number;end:number;blockIndex:number;active:boolean;protectedHint:boolean;
   onOpen:(element:HTMLElement,start:number,end:number,protectedHint:boolean)=>void;
+  editor?:ReactNode;
   children:ReactNode;
 }
 
-export function LiveBlockShell({windowed,estimate,text,headings,start,end,blockIndex,active,protectedHint,onOpen,children}:LiveBlockShellProps){
+export function LiveBlockShell({windowed,estimate,text,headings,start,end,blockIndex,active,protectedHint,onOpen,editor,children}:LiveBlockShellProps){
   const [hovered,setHovered]=useState(false);
   const [focused,setFocused]=useState(false);
   const [tapped,setTapped]=useState(false);
@@ -131,6 +209,6 @@ export function LiveBlockShell({windowed,estimate,text,headings,start,end,blockI
       const owner=event.currentTarget.closest<HTMLElement>('.live-block');
       if(owner)onOpen(owner,start,end,protectedHint);
     }}><PencilSimpleIcon size={13} weight="bold" aria-hidden="true"/><span>Edit</span></button>:null}
-    {active?<ActiveBlockEditor/>:children}
+    {active?(editor??<ActiveBlockEditor/>):children}
   </WindowedBlock>;
 }

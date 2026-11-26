@@ -1,5 +1,5 @@
-import {useCallback,useEffect,useRef,type ClipboardEvent,type KeyboardEvent as ReactKeyboardEvent,type RefObject} from 'react';
-import type {SourceBlock} from './documentAnalysis';
+import {useCallback,useEffect,useLayoutEffect,useRef,type RefObject} from 'react';
+import {analyzeDocument,type SourceBlock} from './documentAnalysis';
 import {repairPastedMath} from './mathRepair';
 import {
   applyMarkdownUrlPaste,
@@ -12,6 +12,7 @@ import {
 } from './markdownFormatting';
 import {editableBlockSpans,indentMarkdownSelection,isFirstLineCursor,isLastLineCursor} from './liveBlockFlow';
 import {handleLiveEditorKey} from './liveEditorKeys';
+import {registerLiveTextareaHistory,tryLiveTextareaHistory,type LiveHistoryEditMeta} from './noteHistory';
 
 export const MAX_BLOCK_HISTORY=60;
 export const BLOCK_TYPING_COALESCE_MS=600;
@@ -19,7 +20,14 @@ export type SelectionDirection='forward'|'backward'|'none';
 
 export interface BlockSelection {start:number;end:number;direction?:SelectionDirection}
 export interface BlockSnapshot {text:string;start:number;end:number;direction:SelectionDirection}
-export interface BlockHistoryState {undo:BlockSnapshot[];redo:BlockSnapshot[];last:number}
+export interface DiscreteSelectionStep {
+  beforeText:string;beforeStart:number;beforeEnd:number;beforeDirection:SelectionDirection;
+  afterText:string;afterStart:number;afterEnd:number;afterDirection:SelectionDirection;
+}
+export interface BlockHistoryState {
+  undo:BlockSnapshot[];redo:BlockSnapshot[];last:number;
+  discreteUndo:DiscreteSelectionStep[];discreteRedo:DiscreteSelectionStep[];
+}
 export interface EditingSession {
   session:number;prefix:string;suffix:string;baseMarkdown:string;baseSplitEnd:number;
   protectedBlock:boolean;insertAfter?:number|'end';
@@ -27,6 +35,12 @@ export interface EditingSession {
 export interface EditSpan {baseSource:string;start:number;oldEnd:number;newEnd:number}
 export interface BlockKeyState {source:string;keys:Map<number,string>;seq:number}
 export type PendingBlockFocus={offset:number}|'end'|null;
+
+interface PendingSuggestionEdit {
+  from:number;to:number;insertLength:number;
+  origStart:number;origEnd:number;origDirection:SelectionDirection;
+  selectionStart:number;selectionEnd:number;selectionDirection:SelectionDirection;
+}
 
 export function diffTextSpan(previous:string,next:string):{start:number;oldEnd:number;newEnd:number}{
   let start=0,oldEnd=previous.length,newEnd=next.length;
@@ -67,7 +81,30 @@ export function reconcileBlockKeys(state:BlockKeyState,renderedSource:string,blo
   return nextKeys;
 }
 
-export function createBlockHistoryState():BlockHistoryState{return {undo:[],redo:[],last:0};}
+export function resolveReanchoredHistoryTarget(
+  previousMarkdown:string,
+  nextMarkdown:string,
+):{start:number;end:number;caretOffset:number;protectedHint?:boolean}|null{
+  const {start:diffStart,newEnd}=diffTextSpan(previousMarkdown,nextMarkdown);
+  const analysis=analyzeDocument(nextMarkdown);
+  const bodyHasNodes=analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
+  const frontmatterEnd=analysis.frontmatter?.end??0;
+  if(frontmatterEnd>0&&newEnd<=frontmatterEnd&&diffStart<frontmatterEnd)return null;
+  if(!nextMarkdown.trim()||!bodyHasNodes){
+    const start=analysis.bodyBlocks[0]?.start??0;
+    const caretOffset=Math.max(0,nextMarkdown.length-start);
+    return {start,end:nextMarkdown.length,caretOffset,protectedHint:false};
+  }
+  const spans=editableBlockSpans(nextMarkdown,analysis);
+  if(!spans.length)return null;
+  const target=spans.find(span=>span.start<=diffStart&&newEnd<=span.end)??spans.filter(span=>span.start<=newEnd).at(-1)??spans[0];
+  const caretOffset=Math.max(0,Math.min(target.end-target.start,newEnd-target.start));
+  return {start:target.start,end:target.end,caretOffset};
+}
+
+export function createBlockHistoryState():BlockHistoryState{
+  return {undo:[],redo:[],last:0,discreteUndo:[],discreteRedo:[]};
+}
 
 function pushTrimmedUndo(history:BlockHistoryState,snapshot:BlockSnapshot):void{
   history.undo.push(snapshot);
@@ -80,12 +117,19 @@ export function pushBlockUndoSnapshot(history:BlockHistoryState,snapshot:BlockSn
   history.last=0;
 }
 
+export function pushDiscreteSelectionStep(history:BlockHistoryState,step:DiscreteSelectionStep):void{
+  history.discreteUndo.push(step);
+  while(history.discreteUndo.length>MAX_BLOCK_HISTORY)history.discreteUndo.shift();
+  history.discreteRedo=[];
+}
+
 export function recordCoalescedBlockTypingSnapshot(history:BlockHistoryState,previousSnapshot:BlockSnapshot,nextText:string,now:number=Date.now()):void{
   if(now-history.last>BLOCK_TYPING_COALESCE_MS||Math.abs(nextText.length-previousSnapshot.text.length)>1||history.undo.length===0){
     pushTrimmedUndo(history,previousSnapshot);
   }
   history.redo=[];
   history.last=now;
+  history.discreteRedo=[];
 }
 
 export function popBlockHistorySnapshot(history:BlockHistoryState,direction:'undo'|'redo',currentSnapshot:BlockSnapshot):BlockSnapshot|null{
@@ -98,17 +142,16 @@ export function popBlockHistorySnapshot(history:BlockHistoryState,direction:'und
 }
 
 let activeLiveFormatHandler:((action:FormatAction)=>boolean)|null=null;
-let activeLiveHistoryHandler:((direction:'undo'|'redo')=>boolean)|null=null;
 
 export function setActiveLiveBlockHandlers(
   formatHandler:((action:FormatAction)=>boolean)|null,
-  historyHandler:((direction:'undo'|'redo')=>boolean)|null,
+  historyHandler?:((direction:'undo'|'redo')=>boolean)|null,
 ):()=>void{
   activeLiveFormatHandler=formatHandler;
-  activeLiveHistoryHandler=historyHandler;
+  const clearHistory=historyHandler!==undefined?registerLiveTextareaHistory(historyHandler):null;
   return()=>{
     if(activeLiveFormatHandler===formatHandler)activeLiveFormatHandler=null;
-    if(activeLiveHistoryHandler===historyHandler)activeLiveHistoryHandler=null;
+    clearHistory?.();
   };
 }
 
@@ -118,53 +161,106 @@ export function formatActiveLiveBlock(rawAction:string):boolean{
 }
 
 export function replayActiveLiveBlockHistory(direction:'undo'|'redo'):boolean{
-  return !!activeLiveHistoryHandler&&activeLiveHistoryHandler(direction);
+  return tryLiveTextareaHistory(direction);
 }
 
 export interface UseLiveBlockEditingOptions {
   editing:EditingSession|null;
   editorRef:RefObject<HTMLTextAreaElement|null>;
-  latestRef:RefObject<{editing:EditingSession|null;draftText:string;latexAutofix:boolean}>;
+  latestRef:RefObject<{editing:EditingSession|null;draftText:string;latexAutofix:boolean;onHistory?:(direction:'undo'|'redo')=>boolean}>;
   syncedMarkdownRef:RefObject<string>;
   blockHistory:RefObject<BlockHistoryState>;
   lastSelection:RefObject<{start:number;end:number;direction:SelectionDirection}>;
   pendingSelection:RefObject<BlockSelection|null>;
+  pendingInputMetaRef:RefObject<LiveHistoryEditMeta|null>;
   pendingBlockFocus:RefObject<PendingBlockFocus>;
   setCaret:(caret:number)=>void;
   rememberSelection:(area:HTMLTextAreaElement|null,current?:EditingSession|null)=>void;
-  update:(text:string,selectionStart?:number,selectionEnd?:number)=>void;
+  update:(text:string,selectionStart?:number,selectionEnd?:number,meta?:LiveHistoryEditMeta)=>void;
   closeEditor:(target?:Element|null,clientY?:number|null)=>void;
   openInsertedBlock:(baseDoc:string,insertPos:number,insertAfter:number|'end')=>void;
   openDocBlock:(element:HTMLElement|null,start:number,end:number,baseDoc?:string,selection?:BlockSelection,protectedHint?:boolean)=>void;
 }
 
 export function useLiveBlockEditing({
-  editing,editorRef,latestRef,syncedMarkdownRef,blockHistory,lastSelection,pendingSelection,pendingBlockFocus,
+  editing,editorRef,latestRef,syncedMarkdownRef,blockHistory,lastSelection,pendingSelection,pendingInputMetaRef,pendingBlockFocus,
   setCaret,rememberSelection,update,closeEditor,openInsertedBlock,openDocBlock,
 }:UseLiveBlockEditingOptions){
   const suppressHistoryPush=useRef(false);
-  const pendingSuggestionSelection=useRef<{start:number;end:number;direction:SelectionDirection}|null>(null);
+  const pendingSuggestionEditRef=useRef<PendingSuggestionEdit|null>(null);
+  const lastSessionRef=useRef<number|null>(null);
+  const currentSession=editing?.session??null;
+  if(lastSessionRef.current!==currentSession){
+    lastSessionRef.current=currentSession;
+    pendingSuggestionEditRef.current=null;
+  }
 
-  const commitDiscreteBlockEdit=useCallback((nextText:string,nextStart:number,nextEnd:number,nextDirection:SelectionDirection='none')=>{
+  const handleBeforeInput=useCallback((inputType?:string)=>{
+    if(inputType==='historyUndo')pendingInputMetaRef.current={historyDirection:'undo'};
+    else if(inputType==='historyRedo')pendingInputMetaRef.current={historyDirection:'redo'};
+  },[pendingInputMetaRef]);
+
+  const applyInlineBlockEdit=useCallback((
+    area:HTMLTextAreaElement,currentDraft:string,replaceFrom:number,replaceTo:number,replacement:string,
+    nextValue:string,nextStart:number,nextEnd:number,direction:SelectionDirection='none',
+    origOverride?:{start:number;end:number;direction:SelectionDirection},
+  )=>{
+    const origStart=origOverride?.start??area.selectionStart;
+    const origEnd=origOverride?.end??area.selectionEnd;
+    const origDirection=origOverride?.direction??(area.selectionDirection||'none');
+    if(nextValue!==area.value){
+      pushBlockUndoSnapshot(blockHistory.current,{text:currentDraft,start:origStart,end:origEnd,direction:origDirection});
+      pushDiscreteSelectionStep(blockHistory.current,{
+        beforeText:currentDraft,beforeStart:origStart,beforeEnd:origEnd,beforeDirection:origDirection,
+        afterText:nextValue,afterStart:nextStart,afterEnd:nextEnd,afterDirection:direction,
+      });
+      pendingSelection.current={start:nextStart,end:nextEnd,direction};
+      notifyHistoryBoundary();
+      suppressHistoryPush.current=true;
+      pendingInputMetaRef.current={isolateHistory:true};
+      area.focus({preventScroll:true});
+      area.setSelectionRange(replaceFrom,replaceTo);
+      let applied=false;
+      try{
+        applied=typeof document.execCommand==='function'&&(replacement.length>0?document.execCommand('insertText',false,replacement):document.execCommand('delete',false));
+      }catch{applied=false;}
+      pendingInputMetaRef.current=null;
+      suppressHistoryPush.current=false;
+      if(!applied||area.value!==nextValue){
+        update(nextValue,nextStart,nextEnd,{isolateHistory:true});
+        area.value=nextValue;
+      }else if(latestRef.current.draftText!==nextValue){
+        update(nextValue,nextStart,nextEnd,{isolateHistory:true});
+      }
+      notifyHistoryBoundary();
+    }
+    area.focus({preventScroll:true});
+    area.setSelectionRange(nextStart,nextEnd,direction);
+    lastSelection.current={start:nextStart,end:nextEnd,direction};
+    setCaret(nextStart);
+    rememberSelection(area,latestRef.current.editing);
+  },[blockHistory,lastSelection,latestRef,pendingInputMetaRef,pendingSelection,rememberSelection,setCaret,update]);
+
+  const commitDiscreteBlockEdit=useCallback((
+    nextText:string,nextStart:number,nextEnd:number,nextDirection:SelectionDirection='none',
+    origOverride?:{start:number;end:number;direction:SelectionDirection},
+  )=>{
     const {editing:current,draftText:currentDraft}=latestRef.current,area=editorRef.current;
     if(!current||!area)return false;
     if(nextText===currentDraft&&nextStart===area.selectionStart&&nextEnd===area.selectionEnd)return true;
-    pushBlockUndoSnapshot(blockHistory.current,{text:currentDraft,start:area.selectionStart,end:area.selectionEnd,direction:area.selectionDirection||'none'});
-    pendingSelection.current={start:nextStart,end:nextEnd,direction:nextDirection};
-    setCaret(nextStart);
     if(nextText===currentDraft){
       area.focus({preventScroll:true});
       area.setSelectionRange(nextStart,nextEnd,nextDirection);
       lastSelection.current={start:nextStart,end:nextEnd,direction:nextDirection};
+      setCaret(nextStart);
       rememberSelection(area,current);
       pendingSelection.current=null;
       return true;
     }
-    notifyHistoryBoundary();
-    update(nextText,nextStart,nextEnd);
-    notifyHistoryBoundary();
+    const {start:diffStart,oldEnd:prevEnd,newEnd:nextDiffEnd}=diffTextSpan(currentDraft,nextText);
+    applyInlineBlockEdit(area,currentDraft,diffStart,prevEnd,nextText.slice(diffStart,nextDiffEnd),nextText,nextStart,nextEnd,nextDirection,origOverride);
     return true;
-  },[blockHistory,editorRef,lastSelection,latestRef,pendingSelection,rememberSelection,setCaret,update]);
+  },[applyInlineBlockEdit,editorRef,lastSelection,latestRef,pendingSelection,rememberSelection,setCaret]);
 
   const applyLiveFormat=useCallback((action:FormatAction):boolean=>{
     const {editing:current,draftText:currentDraft}=latestRef.current,area=editorRef.current;
@@ -181,22 +277,29 @@ export function useLiveBlockEditing({
   const replayBlockHistory=useCallback((direction:'undo'|'redo'):boolean=>{
     const {editing:current,draftText:currentDraft}=latestRef.current,area=editorRef.current;
     if(!current||!area)return false;
-    const snapshot=popBlockHistorySnapshot(blockHistory.current,direction,{text:currentDraft,start:area.selectionStart,end:area.selectionEnd,direction:area.selectionDirection||'none'});
+    const snapshot=popBlockHistorySnapshot(blockHistory.current,direction,{
+      text:currentDraft,start:area.selectionStart,end:area.selectionEnd,direction:area.selectionDirection||'none',
+    });
     if(!snapshot)return false;
-    pendingSelection.current={start:snapshot.start,end:snapshot.end,direction:snapshot.direction};
-    setCaret(snapshot.start);
-    update(snapshot.text,snapshot.start,snapshot.end);
+    const start=Math.max(0,Math.min(snapshot.text.length,snapshot.start));
+    const end=Math.max(start,Math.min(snapshot.text.length,snapshot.end));
+    pendingSelection.current={start,end,direction:snapshot.direction};
+    area.value=snapshot.text;
+    area.setSelectionRange(start,end,snapshot.direction);
+    lastSelection.current={start,end,direction:snapshot.direction};
+    setCaret(start);
+    update(snapshot.text,start,end,{historyDirection:direction});
+    rememberSelection(area,latestRef.current.editing);
     return true;
-  },[blockHistory,editorRef,latestRef,pendingSelection,setCaret,update]);
+  },[blockHistory,editorRef,lastSelection,latestRef,pendingSelection,rememberSelection,setCaret,update]);
 
   const hasEditing=Boolean(editing);
   useEffect(()=>{
     if(!hasEditing){
       if(activeLiveFormatHandler===applyLiveFormat)activeLiveFormatHandler=null;
-      if(activeLiveHistoryHandler===replayBlockHistory)activeLiveHistoryHandler=null;
       return;
     }
-    const clearHandlers=setActiveLiveBlockHandlers(applyLiveFormat,replayBlockHistory);
+    const clearHandlers=setActiveLiveBlockHandlers(applyLiveFormat);
     const onFormatEvent=(event:Event)=>{
       const detail=(event as CustomEvent<{action?:string;prefix?:string;suffix?:string;block?:boolean}>).detail;
       const action=normalizeFormatAction(detail?.action);
@@ -218,20 +321,56 @@ export function useLiveBlockEditing({
       window.removeEventListener('supermd-format',onFormatEvent);
       clearHandlers();
     };
-  },[hasEditing,applyLiveFormat,replayBlockHistory,commitDiscreteBlockEdit,editorRef,latestRef]);
+  },[hasEditing,applyLiveFormat,commitDiscreteBlockEdit,editorRef,latestRef]);
+
+  const syncTextareaCaret=useCallback((area:HTMLTextAreaElement)=>setCaret(area.selectionStart),[setCaret]);
+
+  useLayoutEffect(()=>{
+    if(!hasEditing)return;
+    return registerLiveTextareaHistory(direction=>{
+      const area=editorRef.current;
+      if(!area||document.activeElement!==area)return false;
+      if(typeof document.execCommand!=='function')return replayBlockHistory(direction);
+      const beforeValue=area.value,beforeSynced=syncedMarkdownRef.current;
+      pendingInputMetaRef.current={historyDirection:direction};
+      let executed=false;
+      try{executed=document.execCommand(direction);}catch{executed=false;}
+      if(!executed||(area.value===beforeValue&&syncedMarkdownRef.current===beforeSynced)){
+        pendingInputMetaRef.current=null;
+        return false;
+      }
+      if(area.value!==latestRef.current.draftText){
+        syncTextareaCaret(area);
+        update(area.value,area.selectionStart,area.selectionEnd,{historyDirection:direction});
+      }
+      if(pendingSelection.current){
+        const max=area.value.length;
+        const start=Math.max(0,Math.min(max,pendingSelection.current.start));
+        const end=Math.max(start,Math.min(max,pendingSelection.current.end));
+        const selDir=pendingSelection.current.direction||'none';
+        area.setSelectionRange(start,end,selDir);
+        lastSelection.current={start,end,direction:selDir};
+        setCaret(start);
+      }
+      pendingInputMetaRef.current=null;
+      rememberSelection(area,latestRef.current.editing);
+      return true;
+    });
+  },[editorRef,hasEditing,lastSelection,latestRef,pendingInputMetaRef,pendingSelection,rememberSelection,replayBlockHistory,setCaret,syncTextareaCaret,syncedMarkdownRef,update]);
 
   const handleSuggestionAction=useCallback((edit?:{from:number;to:number;insertLength:number})=>{
-    const area=editorRef.current;if(!area)return;
+    const area=editorRef.current;if(!area){pendingSuggestionEditRef.current=null;return;}
+    const origStart=area.selectionStart,origEnd=area.selectionEnd;
     const direction=area.selectionDirection||'none';
-    let start=area.selectionStart,end=area.selectionEnd;
+    let start=origStart,end=origEnd;
     if(edit){
       const delta=edit.insertLength-(edit.to-edit.from);
       const mapOffset=(pos:number)=>pos<=edit.from?pos:pos>=edit.to?pos+delta:edit.from+edit.insertLength;
       start=mapOffset(start);end=mapOffset(end);
-      pendingSuggestionSelection.current={start,end,direction};
       pendingSelection.current={start,end,direction};
+      pendingSuggestionEditRef.current={...edit,origStart,origEnd,origDirection:direction,selectionStart:start,selectionEnd:end,selectionDirection:direction};
       setCaret(start);
-    }
+    }else pendingSuggestionEditRef.current=null;
     area.focus({preventScroll:true});
     queueMicrotask(()=>{
       const current=editorRef.current,{editing:active,draftText:latestDraft}=latestRef.current;
@@ -252,10 +391,10 @@ export function useLiveBlockEditing({
     });
   },[editorRef,lastSelection,latestRef,pendingSelection,rememberSelection,setCaret]);
 
-  const paste=useCallback((event:ClipboardEvent<HTMLTextAreaElement>)=>{
+  const paste=useCallback((area:HTMLTextAreaElement,event:ClipboardEvent)=>{
     const {latexAutofix:autofix,editing:currentEditing}=latestRef.current;
-    if(!currentEditing||event.defaultPrevented||event.clipboardData.files.length)return;
-    const area=event.currentTarget,from=area.selectionStart,to=area.selectionEnd;
+    if(!currentEditing||event.defaultPrevented||!event.clipboardData||event.clipboardData.files.length)return;
+    const from=area.selectionStart,to=area.selectionEnd;
     const raw=event.clipboardData.getData('text/plain');
     if(!raw)return;
     if(parseStandaloneHttpUrl(raw)){
@@ -263,8 +402,8 @@ export function useLiveBlockEditing({
       const fullDoc=currentEditing.prefix+area.value+currentEditing.suffix;
       const wrapped=currentEditing.protectedBlock?null:applyMarkdownUrlPaste(fullDoc,[{anchor:currentEditing.prefix.length+from,head:currentEditing.prefix.length+to}],raw);
       const insert=wrapped&&wrapped.changes.length===1?wrapped.changes[0].insert:raw;
-      const caret=from+insert.length;
-      commitDiscreteBlockEdit(area.value.slice(0,from)+insert+area.value.slice(to),caret,caret);
+      const caretPos=from+insert.length;
+      commitDiscreteBlockEdit(area.value.slice(0,from)+insert+area.value.slice(to),caretPos,caretPos);
       return;
     }
     if(!autofix||!/[\\$^]/.test(raw))return;
@@ -273,48 +412,14 @@ export function useLiveBlockEditing({
     const after=(area.value.slice(to,to+16_384)+currentEditing.suffix.slice(0,16_384)).slice(0,16_384);
     const repaired=repairPastedMath(raw,before,after);if(repaired===raw)return;
     event.preventDefault();
-    const caret=from+repaired.length;
-    commitDiscreteBlockEdit(area.value.slice(0,from)+repaired+area.value.slice(to),caret,caret);
+    const caretPos=from+repaired.length;
+    commitDiscreteBlockEdit(area.value.slice(0,from)+repaired+area.value.slice(to),caretPos,caretPos);
   },[commitDiscreteBlockEdit,latestRef]);
 
-  const applyInlineBlockEdit=useCallback((
-    area:HTMLTextAreaElement,currentDraft:string,replaceFrom:number,replaceTo:number,replacement:string,
-    nextValue:string,nextStart:number,nextEnd:number,direction:SelectionDirection='none',
-  )=>{
-    const origStart=area.selectionStart,origEnd=area.selectionEnd,origDirection=area.selectionDirection||'none';
-    if(nextValue!==area.value){
-      pushBlockUndoSnapshot(blockHistory.current,{text:currentDraft,start:origStart,end:origEnd,direction:origDirection});
-      pendingSelection.current={start:nextStart,end:nextEnd,direction};
-      notifyHistoryBoundary();
-      suppressHistoryPush.current=true;
-      area.setSelectionRange(replaceFrom,replaceTo);
-      let applied=false;
-      try{
-        applied=replacement.length>0?document.execCommand('insertText',false,replacement):document.execCommand('delete',false);
-      }catch{applied=false;}
-      suppressHistoryPush.current=false;
-      if(!applied||area.value!==nextValue){
-        update(nextValue,nextStart,nextEnd);
-        area.value=nextValue;
-      }else if(latestRef.current.draftText!==nextValue){
-        update(nextValue,nextStart,nextEnd);
-      }
-      notifyHistoryBoundary();
-    }
-    area.setSelectionRange(nextStart,nextEnd,direction);
-    lastSelection.current={start:nextStart,end:nextEnd,direction};
-    setCaret(nextStart);
-    rememberSelection(area,latestRef.current.editing);
-    area.focus({preventScroll:true});
-  },[blockHistory,lastSelection,latestRef,pendingSelection,rememberSelection,setCaret,update]);
-
-  const syncTextareaCaret=useCallback((area:HTMLTextAreaElement)=>setCaret(area.selectionStart),[setCaret]);
-
-  const onEditorKeyDown=useCallback((event:ReactKeyboardEvent<HTMLTextAreaElement>)=>{
-    if(event.nativeEvent.isComposing||event.keyCode===229)return;
-    const {editing:active,draftText:currentDraft}=latestRef.current;
+  const onEditorKeyDown=useCallback((area:HTMLTextAreaElement,event:KeyboardEvent)=>{
+    if(event.isComposing||event.keyCode===229)return;
+    const {editing:active,draftText:currentDraft,onHistory:triggerHistory}=latestRef.current;
     if(!active)return;
-    const area=event.currentTarget;
     if(event.key==='Tab'&&!event.ctrlKey&&!event.metaKey&&!event.altKey){
       event.preventDefault();event.stopPropagation();
       const direction=area.selectionDirection||'none';
@@ -343,7 +448,7 @@ export function useLiveBlockEditing({
       const next=handleLiveEditorKey({
         text:area.value,selectionStart:area.selectionStart,selectionEnd:area.selectionEnd,
         key:event.key,shiftKey:event.shiftKey,ctrlKey:event.ctrlKey,metaKey:event.metaKey,altKey:event.altKey,
-        isComposing:event.nativeEvent.isComposing,protectedBlock:active.protectedBlock,
+        isComposing:event.isComposing,protectedBlock:active.protectedBlock,
       });
       if(next){
         event.preventDefault();event.stopPropagation();
@@ -379,12 +484,20 @@ export function useLiveBlockEditing({
     if(document.documentElement.dataset.host==='qt')return;
     if((event.ctrlKey||event.metaKey)&&!event.altKey){
       const lower=event.key.toLowerCase();
-      if(lower==='z'||lower==='y'){
-        const dir:'undo'|'redo'=lower==='y'||event.shiftKey?'redo':'undo';
-        if(blockHistory.current[dir].length>0){
+      const historyDir=lower==='z'?(event.shiftKey?'redo':'undo'):lower==='y'&&!event.shiftKey?'redo':null;
+      if(historyDir){
+        if(triggerHistory){
           event.preventDefault();event.stopPropagation();
-          if(typeof window!=='undefined'&&window.supermdHistory)window.supermdHistory(dir);
-          else replayBlockHistory(dir);
+          triggerHistory(historyDir);
+          return;
+        }
+        if(typeof window!=='undefined'&&window.supermdHistory){
+          event.preventDefault();event.stopPropagation();
+          window.supermdHistory(historyDir);
+          return;
+        }
+        if(tryLiveTextareaHistory(historyDir)){
+          event.preventDefault();event.stopPropagation();
           return;
         }
       }
@@ -394,12 +507,39 @@ export function useLiveBlockEditing({
       event.preventDefault();event.stopPropagation();
       applyLiveFormat(formatAction);
     }
-  },[applyInlineBlockEdit,applyLiveFormat,blockHistory,closeEditor,latestRef,openDocBlock,openInsertedBlock,pendingBlockFocus,rememberSelection,replayBlockHistory,syncedMarkdownRef]);
+  },[applyInlineBlockEdit,applyLiveFormat,closeEditor,latestRef,openDocBlock,openInsertedBlock,pendingBlockFocus,rememberSelection,syncedMarkdownRef]);
 
-  const handleTextareaChange=useCallback((nextText:string,target:HTMLTextAreaElement)=>{
+  const handleTextareaChange=useCallback((nextText:string,target:HTMLTextAreaElement,meta?:LiveHistoryEditMeta)=>{
     const {editing:active,draftText:currentDraft}=latestRef.current;
     if(!active)return;
-    if(!suppressHistoryPush.current){
+    const resolvedDir=meta?.historyDirection??pendingInputMetaRef.current?.historyDirection;
+    let selStart=target.selectionStart,selEnd=target.selectionEnd;
+    let selDir:SelectionDirection=target.selectionDirection||'none';
+    if(resolvedDir==='undo'){
+      const top=blockHistory.current.discreteUndo.at(-1);
+      if(top&&top.afterText===currentDraft&&top.beforeText===nextText){
+        blockHistory.current.discreteUndo.pop();
+        blockHistory.current.discreteRedo.push(top);
+        selStart=Math.max(0,Math.min(nextText.length,top.beforeStart));
+        selEnd=Math.max(selStart,Math.min(nextText.length,top.beforeEnd));
+        selDir=top.beforeDirection;
+        pendingSelection.current={start:selStart,end:selEnd,direction:selDir};
+        target.setSelectionRange(selStart,selEnd,selDir);
+        setCaret(selStart);
+      }
+    }else if(resolvedDir==='redo'){
+      const top=blockHistory.current.discreteRedo.at(-1);
+      if(top&&top.beforeText===currentDraft&&top.afterText===nextText){
+        blockHistory.current.discreteRedo.pop();
+        blockHistory.current.discreteUndo.push(top);
+        selStart=Math.max(0,Math.min(nextText.length,top.afterStart));
+        selEnd=Math.max(selStart,Math.min(nextText.length,top.afterEnd));
+        selDir=top.afterDirection;
+        pendingSelection.current={start:selStart,end:selEnd,direction:selDir};
+        target.setSelectionRange(selStart,selEnd,selDir);
+        setCaret(selStart);
+      }
+    }else if(!suppressHistoryPush.current){
       recordCoalescedBlockTypingSnapshot(blockHistory.current,{
         text:currentDraft,
         start:lastSelection.current.start,
@@ -407,16 +547,29 @@ export function useLiveBlockEditing({
         direction:lastSelection.current.direction,
       },nextText);
     }
-    lastSelection.current={start:target.selectionStart,end:target.selectionEnd,direction:target.selectionDirection||'none'};
-    update(nextText,target.selectionStart,target.selectionEnd);
-  },[blockHistory,lastSelection,latestRef,update]);
+    lastSelection.current={start:selStart,end:selEnd,direction:selDir};
+    update(nextText,selStart,selEnd,meta);
+  },[blockHistory,lastSelection,latestRef,pendingInputMetaRef,pendingSelection,setCaret,update]);
 
   const handleSuggestionChange=useCallback((next:string)=>{
-    const mapped=pendingSuggestionSelection.current;
-    pendingSuggestionSelection.current=null;
-    const nextStart=mapped?mapped.start:next.length,nextEnd=mapped?mapped.end:nextStart,nextDirection=mapped?mapped.direction:'none';
-    commitDiscreteBlockEdit(next,nextStart,nextEnd,nextDirection);
-  },[commitDiscreteBlockEdit]);
+    const suggestionEdit=pendingSuggestionEditRef.current;
+    pendingSuggestionEditRef.current=null;
+    const area=editorRef.current;
+    if(area&&suggestionEdit){
+      const replacement=next.slice(suggestionEdit.from,suggestionEdit.from+suggestionEdit.insertLength);
+      applyInlineBlockEdit(
+        area,latestRef.current.draftText,suggestionEdit.from,suggestionEdit.to,replacement,
+        next,suggestionEdit.selectionStart,suggestionEdit.selectionEnd,suggestionEdit.selectionDirection,
+        {start:suggestionEdit.origStart,end:suggestionEdit.origEnd,direction:suggestionEdit.origDirection},
+      );
+      return;
+    }
+    if(area){
+      commitDiscreteBlockEdit(next,next.length,next.length,'none');
+      return;
+    }
+    update(next,undefined,undefined,{isolateHistory:true});
+  },[applyInlineBlockEdit,commitDiscreteBlockEdit,editorRef,latestRef,update]);
 
-  return {handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown};
+  return {handleBeforeInput,handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown};
 }

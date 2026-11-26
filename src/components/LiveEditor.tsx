@@ -1,8 +1,9 @@
-import {Fragment,useCallback,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type DragEvent} from 'react';
+import {Fragment,useCallback,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent as ReactClipboardEvent,type DragEvent} from 'react';
 import MarkdownPreview from './MarkdownPreview';
 import type {RenderedMarkdownBlock} from './CachedMarkdown';
 import {analyzeDocument,type SourceBlock,type SourceDocumentAnalysis} from '../documentAnalysis';
 import {selectedMarkdown,setSelectedMarkdownDrag} from '../copySource';
+import type {LiveHistoryEditMeta} from '../noteHistory';
 import type {WritingOptions} from '../proofreading';
 import type {ReaderAccessibilityPreference} from '../types';
 import {useTypewriterScroll} from '../typewriterScroll';
@@ -13,6 +14,7 @@ import {
   formatActiveLiveBlock,
   reconcileBlockKeys,
   replayActiveLiveBlockHistory,
+  resolveReanchoredHistoryTarget,
   translateRenderedRange,
   useLiveBlockEditing,
   type BlockHistoryState,
@@ -34,13 +36,16 @@ export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyz
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
   latexAutofix?:boolean;
   typewriterScroll?:boolean;
-  markdown:string;onChange:(value:string)=>void;documentPath:string|null;savedDocumentPath?:string|null;python:string;dark:boolean;
+  markdown:string;onChange:(value:string,meta?:LiveHistoryEditMeta)=>void;documentPath:string|null;savedDocumentPath?:string|null;python:string;dark:boolean;
+  onHistory?:(direction:'undo'|'redo')=>boolean;
+  historyReplayToken?:number;
   trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;onNotice?:(message:string)=>void;
 }
 
 interface LiveEditorState {
   markdown:string;
-  onChange:(value:string)=>void;
+  onChange:(value:string,meta?:LiveHistoryEditMeta)=>void;
+  onHistory?:(direction:'undo'|'redo')=>boolean;
   latexAutofix:boolean;
   activeTypewriter:boolean;
   editing:EditingSession|null;
@@ -52,7 +57,7 @@ interface LiveEditorState {
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,savedDocumentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,onNotice,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({markdown,onChange,onHistory,historyReplayToken,documentPath,savedDocumentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,onNotice,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<EditingSession|null>(null);
   const [draftText,setDraftText]=useState('');
   const [caret,setCaret]=useState(0);
@@ -62,6 +67,8 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
   const blockHistory=useRef<BlockHistoryState>(createBlockHistoryState());
   const lastSelection=useRef<{start:number;end:number;direction:SelectionDirection}>({start:0,end:0,direction:'none'});
   const pendingSelection=useRef<BlockSelection|null>(null);
+  const pendingInputMetaRef=useRef<LiveHistoryEditMeta|null>(null);
+  const appliedHistoryReplayRef=useRef(historyReplayToken);
   const pendingBlockFocus=useRef<PendingBlockFocus>(null);
   const outsidePressRef=useRef<{active:boolean;deferredClose:boolean;target:HTMLElement|null;clientY:number|null;session:number;timer:number}>({active:false,deferredClose:false,target:null,clientY:null,session:0,timer:0});
   const editSpanRef=useRef<EditSpan|null>(null);
@@ -75,8 +82,8 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
   const blocks=sourceAnalysis.analysis.bodyBlocks;
   const frontmatter=sourceAnalysis.analysis.frontmatter;
   const hasBodyNodes=sourceAnalysis.analysis.tree.children.some(node=>node.position?.start.offset!==undefined);
-  const latestRef=useRef<LiveEditorState>({markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter});
-  latestRef.current={markdown,onChange,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter};
+  const latestRef=useRef<LiveEditorState>({markdown,onChange,onHistory,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter});
+  latestRef.current={markdown,onChange,onHistory,latexAutofix,activeTypewriter,editing,draftText,renderedSource,sourceAnalysis,frontmatter};
 
   const rememberSelection=useCallback((area:HTMLTextAreaElement|null,current:EditingSession|null=latestRef.current.editing)=>{
     if(!area||!current)return;
@@ -164,6 +171,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     resetOutsidePress(session);
     anchorTop.current=element?element.getBoundingClientRect().top:null;
     blockHistory.current=createBlockHistoryState();
+    pendingInputMetaRef.current=null;
     lastSelection.current={start:selection?.start??0,end:selection?.end??0,direction:selection?.direction??'none'};
     pendingSelection.current=selection??null;
     const text=resolvedDoc.slice(start,end);
@@ -189,6 +197,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     resetOutsidePress(session);
     anchorTop.current=null;
     blockHistory.current=createBlockHistoryState();
+    pendingInputMetaRef.current=null;
     lastSelection.current={start:0,end:0,direction:'none'};
     pendingSelection.current={start:0,end:0,direction:'none'};
     setCaret(0);
@@ -217,6 +226,24 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     const insertPos=baseDoc.replace(/[ \t]*\n+$/,'').length;
     openInsertedBlock(baseDoc,insertPos,'end');
   },[openDocBlock,openInsertedBlock]);
+
+  const reanchorHistorySession=useCallback((previousMarkdown:string,nextMarkdown:string)=>{
+    const target=resolveReanchoredHistoryTarget(previousMarkdown,nextMarkdown);
+    if(!target){closeEditor();return;}
+    openDocBlock(null,target.start,target.end,nextMarkdown,{start:target.caretOffset,end:target.caretOffset},target.protectedHint);
+  },[closeEditor,openDocBlock]);
+
+  useLayoutEffect(()=>{
+    const isHistoryReplay=historyReplayToken!==appliedHistoryReplayRef.current;
+    appliedHistoryReplayRef.current=historyReplayToken;
+    const active=latestRef.current.editing;
+    const previousMarkdown=syncedMarkdownRef.current;
+    if(active&&markdown!==previousMarkdown){
+      if(isHistoryReplay)reanchorHistorySession(previousMarkdown,markdown);
+      else closeEditor();
+    }
+    if(savedSelection.current&&savedSelection.current.markdown!==markdown)savedSelection.current=null;
+  },[markdown,historyReplayToken,closeEditor,reanchorHistorySession]);
 
   useLayoutEffect(()=>{
     const sel=pendingSelection.current,area=editor.current;
@@ -302,12 +329,6 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
   },[isEditing,closeEditor]);
 
   useEffect(()=>{
-    const active=latestRef.current.editing;
-    if(active&&markdown!==syncedMarkdownRef.current)closeEditor();
-    if(savedSelection.current&&savedSelection.current.markdown!==markdown)savedSelection.current=null;
-  },[markdown,closeEditor]);
-
-  useEffect(()=>{
     if(!isEditing)return;
     const syncCaret=()=>{const area=editor.current;if(area&&document.activeElement===area)setCaret(area.selectionStart);};
     document.addEventListener('selectionchange',syncCaret);
@@ -365,7 +386,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     if(latestRef.current.editing?.session===session)closeEditor(relatedTarget);
   },[rememberSelection,closeEditor]);
 
-  const copy=useCallback((event:ClipboardEvent)=>{
+  const copy=useCallback((event:ReactClipboardEvent)=>{
     if((event.target as Element).closest('textarea'))return;
     const source=selectedMarkdown(window.getSelection(),latestRef.current.renderedSource);
     if(source!==null){event.clipboardData.setData('text/plain',source);event.preventDefault();}
@@ -375,8 +396,16 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     setSelectedMarkdownDrag(event.nativeEvent,latestRef.current.renderedSource);
   },[]);
 
-  const update=useCallback((text:string,selectionStart?:number,selectionEnd?:number)=>{
-    const {editing:active,onChange:emitChange,frontmatter:currentFrontmatter}=latestRef.current;
+  const emitEditorChange=useCallback((value:string,meta?:LiveHistoryEditMeta)=>{
+    const emit=latestRef.current.onChange;
+    if(meta&&(meta.historyDirection||meta.isolateHistory))emit(value,meta);
+    else emit(value);
+  },[]);
+
+  const update=useCallback((text:string,selectionStart?:number,selectionEnd?:number,meta?:LiveHistoryEditMeta)=>{
+    const {editing:active,frontmatter:currentFrontmatter}=latestRef.current;
+    const resolvedMeta=meta??pendingInputMetaRef.current??undefined;
+    pendingInputMetaRef.current=null;
     if(!active)return;
     latestRef.current.draftText=text;
     setDraftText(text);
@@ -386,7 +415,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
       editSpanRef.current=null;
       const pos=Math.max(0,Math.min(active.baseSplitEnd,active.baseMarkdown.length));
       savedSelection.current={from:pos,to:pos,markdown:active.baseMarkdown};
-      if(changed)emitChange(active.baseMarkdown);
+      if(changed)emitEditorChange(active.baseMarkdown,resolvedMeta);
       syncActiveCaretCenter();
       return;
     }
@@ -416,11 +445,11 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
       setEditing(nextSession);
     }
     syncedMarkdownRef.current=nextMarkdown;
-    emitChange(nextMarkdown);
+    emitEditorChange(nextMarkdown,resolvedMeta);
     syncActiveCaretCenter();
-  },[syncActiveCaretCenter]);
+  },[emitEditorChange,syncActiveCaretCenter]);
 
-  const {handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown}=useLiveBlockEditing({
+  const {handleBeforeInput,handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown}=useLiveBlockEditing({
     editing,
     editorRef:editor,
     latestRef,
@@ -428,6 +457,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     blockHistory,
     lastSelection,
     pendingSelection,
+    pendingInputMetaRef,
     pendingBlockFocus,
     setCaret,
     rememberSelection,
@@ -447,6 +477,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
       spellCheck,
       grammarCheck,
       onChange:handleTextareaChange,
+      onBeforeInput:handleBeforeInput,
       onSuggestionChange:handleSuggestionChange,
       onSuggestionAction:handleSuggestionAction,
       onSyncCaret:syncTextareaCaret,
@@ -456,7 +487,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
       onRememberSelection:handleRememberSelection,
       onBlurSession:blurSession,
     }:null,
-    [editing,draftText,caret,spellCheck,grammarCheck,handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown,syncActiveCaretCenter,handleRememberSelection,blurSession],
+    [editing,draftText,caret,spellCheck,grammarCheck,handleTextareaChange,handleBeforeInput,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown,syncActiveCaretCenter,handleRememberSelection,blurSession],
   );
 
   const renderBlock=useCallback((entry:RenderedMarkdownBlock)=>{
@@ -473,7 +504,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     const protectedHint=['code','math','html','definition'].includes(entry.node.type);
     return (
       <Fragment key={blockKey}>
-        <LiveBlockShell windowed={entry.windowed} estimate={entry.estimate} text={entry.text} headings={entry.headings} start={start} end={end} blockIndex={low} active={active} protectedHint={protectedHint} onOpen={openRenderedBlock}>
+        <LiveBlockShell windowed={entry.windowed} estimate={entry.estimate} text={entry.text} headings={entry.headings} start={start} end={end} blockIndex={low} active={active} protectedHint={protectedHint} onOpen={openRenderedBlock} editor={<ActiveBlockEditor/>}>
           {entry.content}
         </LiveBlockShell>
         {insertedBelow&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
@@ -482,8 +513,8 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
   },[blocks,blockKeys,editing,openRenderedBlock]);
 
   const previewChange=useCallback((next:string)=>{
-    const {editing:currentEditing,onChange:emitChange,renderedSource:frozenSource}=latestRef.current;
-    if(!currentEditing){emitChange(next);return;}
+    const {editing:currentEditing,renderedSource:frozenSource}=latestRef.current;
+    if(!currentEditing){emitEditorChange(next,{isolateHistory:true});return;}
     // Translate a checkbox outside the frozen editor without losing its draft.
     const activeDoc=syncedMarkdownRef.current;
     const {start,oldEnd:end,newEnd:nextEnd}=diffTextSpan(frozenSource,next);
@@ -494,8 +525,8 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     outsidePressRef.current.deferredClose=false;
     latestRef.current.editing=null;
     setEditing(null);
-    emitChange(activeDoc.slice(0,from)+next.slice(start,nextEnd)+activeDoc.slice(to));
-  },[captureCloseAnchor]);
+    emitEditorChange(activeDoc.slice(0,from)+next.slice(start,nextEnd)+activeDoc.slice(to),{isolateHistory:true});
+  },[captureCloseAnchor,emitEditorChange]);
 
   return <ActiveDraftContext.Provider value={activeDraftValue}>
     <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={dragStart}>

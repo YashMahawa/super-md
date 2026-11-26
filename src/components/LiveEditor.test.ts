@@ -11,8 +11,10 @@ import {
   diffTextSpan,
   popBlockHistorySnapshot,
   pushBlockUndoSnapshot,
+  pushDiscreteSelectionStep,
   reconcileBlockKeys,
   recordCoalescedBlockTypingSnapshot,
+  resolveReanchoredHistoryTarget,
   setActiveLiveBlockHandlers,
   translateRenderedRange,
   type BlockKeyState,
@@ -198,5 +200,30 @@ describe("liveBlockHistory helpers", () => {
     expect(replayActiveLiveBlockHistory("undo")).toBe(true);
     clear();
     expect(formatActiveLiveBlock("bold")).toBe(false);
+  });
+
+  it("caps discrete selection steps and resolves reanchored history targets across blocks and frontmatter", () => {
+    const history = createBlockHistoryState();
+    for (let i = 0; i < MAX_BLOCK_HISTORY + 3; i++) {
+      pushDiscreteSelectionStep(history, {
+        beforeText: `b-${i}`, beforeStart: 0, beforeEnd: 0, beforeDirection: "none",
+        afterText: `a-${i}`, afterStart: 3, afterEnd: 3, afterDirection: "none",
+      });
+    }
+    expect(history.discreteUndo).toHaveLength(MAX_BLOCK_HISTORY);
+    expect(history.discreteUndo[0].beforeText).toBe("b-3");
+    history.discreteRedo.push(history.discreteUndo[0]);
+    recordCoalescedBlockTypingSnapshot(history, { text: "x", start: 1, end: 1, direction: "none" }, "xy", 5_000);
+    expect(history.discreteRedo).toHaveLength(0);
+
+    const prev = "---\ntitle: One\n---\n\nFirst block\n\nSecond block edited";
+    const next = "---\ntitle: One\n---\n\nFirst block\n\nSecond block";
+    expect(resolveReanchoredHistoryTarget(prev, next)).toEqual({
+      start: 33,
+      end: 45,
+      caretOffset: 12,
+    });
+    const nextFm = "---\ntitle: Two\n---\n\nFirst block\n\nSecond block";
+    expect(resolveReanchoredHistoryTarget(next, nextFm)).toBeNull();
   });
 });

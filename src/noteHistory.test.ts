@@ -1,5 +1,5 @@
 import {expect,test} from 'vitest';
-import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
+import {applyHistoryEdit,recordHistory,reconcileHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
 test('typing in a huge note stores tiny edits and preserves grouped undo/redo',()=>{
   const original='# Huge note\n'+'Content '.repeat(500_000),h:NoteHistory={undo:[],redo:[],last:0};let content=original;
   for(let i=0;i<100;i++){const next=content+'x';recordHistory(h,content,next,1000+i*10);content=next;}
@@ -61,5 +61,83 @@ test('interior insertions, deletions, and cost eviction match uncached historySi
   recordHistory(evicted,'z'.repeat(2_100_000),'final',4000);
   expect(evicted.undo).toHaveLength(1);
   expect(replayHistory(evicted,'final','undo')).toBe('z'.repeat(2_100_000));
+});
+test('reconcileHistory syncs native textarea undo/redo across exact, multi-group, and coalesced steps',()=>{
+  const h:NoteHistory={undo:[],redo:[],last:0};
+  // Seed an earlier block edit so we verify earlier undo entries remain intact.
+  const d0='# Heading\n\nAlpha\n\nBeta';
+  const d1='# Heading\n\nAlpha 1\n\nBeta';
+  recordHistory(h,d0,d1,1000);
+
+  // Coalesced typing run in Block 2: "Beta" -> "Beta world"
+  let current=d1;
+  for(const [idx,ch] of [...' world'].entries()){
+    const next=current+ch;
+    recordHistory(h,current,next,2000+idx*40);
+    current=next;
+  }
+  expect(current).toBe('# Heading\n\nAlpha 1\n\nBeta world');
+  expect(h.undo).toHaveLength(2);
+
+  // Partial native undo ("Beta world" -> "Beta ") splits the coalesced group cleanly.
+  const partial='# Heading\n\nAlpha 1\n\nBeta ';
+  reconcileHistory(h,current,partial,'undo');
+  expect(validHistory(h)).toBe(true);
+  expect(historySize(h)).toBe(historySize({undo:structuredClone(h.undo),redo:structuredClone(h.redo),last:0}));
+
+  // Leaving the block and redoing restores "Beta world"; undoing twice crosses back to d1 then d0.
+  expect(replayHistory(h,partial,'redo')).toBe(current);
+  reconcileHistory(h,current,partial,'undo');
+  expect(replayHistory(h,partial,'undo')).toBe(d1);
+  expect(replayHistory(h,d1,'undo')).toBe(d0);
+  expect(replayHistory(h,d0,'redo')).toBe(d1);
+  expect(replayHistory(h,d1,'redo')).toBe(partial);
+  expect(replayHistory(h,partial,'redo')).toBe(current);
+
+  // Multi-group native undo (two >600ms groups undone in one native textarea step) preserves prior history.
+  const afterPause=current+'!';
+  recordHistory(h,current,afterPause,5000);
+  const afterSecondPause=afterPause+'?';
+  recordHistory(h,afterPause,afterSecondPause,6000);
+  reconcileHistory(h,afterSecondPause,current,'undo');
+  expect(validHistory(h)).toBe(true);
+  expect(replayHistory(h,current,'redo')).toBe(afterSecondPause);
+  reconcileHistory(h,afterSecondPause,current,'undo');
+  reconcileHistory(h,current,afterSecondPause,'redo');
+  expect(replayHistory(h,afterSecondPause,'undo')).toBe(current);
+
+  // Coalesced backspace deletion split by partial native undo.
+  const delHistory:NoteHistory={undo:[],redo:[],last:0};
+  let text='abcd';
+  for(let i=0;i<4;i++){
+    const next=text.slice(0,-1);
+    recordHistory(delHistory,text,next,1000+i*30);
+    text=next;
+  }
+  expect(text).toBe('');
+  reconcileHistory(delHistory,'','ab','undo');
+  expect(validHistory(delHistory)).toBe(true);
+  expect(replayHistory(delHistory,'ab','undo')).toBe('abcd');
+  expect(replayHistory(delHistory,'abcd','redo')).toBe('ab');
+  expect(replayHistory(delHistory,'ab','redo')).toBe('');
+});
+test('isolated edits (such as writing suggestions) never coalesce into surrounding keystrokes',()=>{
+  const h:NoteHistory={undo:[],redo:[],last:0};
+  const s0='Fix teh word';
+  const s1='Fix teh word!';
+  const s2='Fix the word!';
+  const s3='Fix the word!?';
+  applyHistoryEdit(h,s0,s1,1000);
+  // Same-length replacement within 600ms with isolateHistory: true
+  applyHistoryEdit(h,s1,s2,1100,{isolateHistory:true});
+  // Immediate single-character keystroke within 600ms after isolated edit
+  applyHistoryEdit(h,s2,s3,1200);
+  expect(h.undo).toHaveLength(3);
+  expect(replayHistory(h,s3,'undo')).toBe(s2);
+  expect(replayHistory(h,s2,'undo')).toBe(s1);
+  expect(replayHistory(h,s1,'undo')).toBe(s0);
+  expect(replayHistory(h,s0,'redo')).toBe(s1);
+  expect(replayHistory(h,s1,'redo')).toBe(s2);
+  expect(replayHistory(h,s2,'redo')).toBe(s3);
 });
 
