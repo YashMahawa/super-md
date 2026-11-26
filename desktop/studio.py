@@ -55,6 +55,10 @@ import app_integration
 import python_runtime
 import pending_python
 from export_jobs import ExportJobRegistry
+if __package__:
+    from . import studio_agent_actions
+else:
+    import studio_agent_actions
 import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
@@ -4927,49 +4931,10 @@ class Studio(QObject):
 
     @Slot(str)
     def command(self, action):
-        calls = {
-            "find": "window.supermdFind?.()",
-            "replace": "window.supermdFind?.(true)",
-            "find_next": "window.supermdFindStep?.(1)",
-            "find_previous": "window.supermdFindStep?.(-1)",
-            "insert": "window.supermdMedia?.()",
-            "repair": "window.supermdRepairMath?.()",
-            "undo": "window.supermdHistory?.('undo')",
-            "redo": "window.supermdHistory?.('redo')",
-            "format_bold": "window.supermdFormat?.('bold')",
-            "format_italic": "window.supermdFormat?.('italic')",
-            "format_inline_code": "window.supermdFormat?.('inline_code')",
-            "format_link": "window.supermdFormat?.('link')",
-            "format_heading": "window.supermdFormat?.('heading')",
-            "format_list": "window.supermdFormat?.('list')",
-            "format_quote": "window.supermdFormat?.('quote')",
-            "format_inline_math": "window.supermdFormat?.('inline_math')",
-        }
-        if action in calls: self.readerCall.emit(calls[action])
-        elif action == "window": self.newWindowRequested.emit()
+        return studio_agent_actions.command(self, action)
 
     def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
-        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
-        selected = filename or Path(tab["name"]).stem or "Super MD export"
-        if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
-            raise ValueError("Export filename must be a basename")
-        stem = Path(selected).stem if Path(selected).suffix else selected
-        stem = "".join(char for char in stem if char.isalnum() or char in " ._()-").strip(" .")[:100]
-        if not stem or stem in (".", ".."):
-            stem = "Super MD export"
-        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
-        if not directory.is_dir():
-            raise ValueError("The configured export folder is unavailable")
-        for index in range(1, 10_001):
-            suffix = "" if index == 1 else f" ({index})"
-            candidate = directory / f"{stem}{suffix}{extension}"
-            try:
-                descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                continue
-            os.close(descriptor)
-            return candidate
-        raise ValueError("Could not choose a unique export filename")
+        return studio_agent_actions.agent_export_path(self, filename, format, tab)
 
     @staticmethod
     def _agent_export_metadata(path: Path, format: str) -> dict:
@@ -5620,146 +5585,10 @@ class Studio(QObject):
         self.session._enqueue_agent_stage(start_queued)
 
     def _agent_document_action(self, args):
-        action = args.get("action")
-        if action == "patch_tab":
-            tab, tab_id, previous, revision, edited, operation_results, changed = self._validate_and_compute_patch_tab(args)
-            if tab_id == self.active:
-                if changed:
-                    tab["content"] = edited
-                    self._append_agent_edit(tab, previous, edited)
-                    tab["agent_unreviewed"] = True
-                    self.recovery_timer.start(800)
-                    self.autosave_timer.start(900)
-                    self._emit(load=True)
-                return {"tabId": tab_id, "windowId": self.window_id,
-                        "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
-                        "sourceLength": len(edited), "changed": changed,
-                        "applied": len(operation_results), "operation_results": operation_results,
-                        "isDirty": edited != tab["saved"]}
-            if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
-                return {"tabId": tab_id, "windowId": self.window_id,
-                        "revision": revision,
-                        "sourceLength": len(edited), "changed": False,
-                        "applied": len(operation_results), "operation_results": operation_results,
-                        "isDirty": False}
-            return self._stage_inactive_patch_tab_sync(tab_id, previous, edited, operation_results, changed)
-        if action == "replace_tab_asset":
-            return self._replace_tab_asset_native(args)
-        if action == "asset_action" and args.get("assetAction") == "attach":
-            return self._attach_tab_asset_native(args)
-        if action == "create_document":
-            fmt = args.get("format")
-            content = args.get("content", "")
-            title = args.get("title") or args.get("filename", "")
-            background = args.get("background", False)
-            if not isinstance(background, bool):
-                raise ValueError("background must be a boolean")
-            if fmt is None:
-                fmt = "smd" if isinstance(title, str) and Path(title).suffix.lower() == ".smd" else "md"
-            if (fmt not in ("md", "smd") or not isinstance(content, str) or
-                    len(content.encode("utf-8")) > 20_000_000 or not isinstance(title, str)):
-                raise ValueError("New document content or format is invalid")
-            title = title.strip() or ("Untitled.smd" if fmt == "smd" else "Untitled.md")
-            suffix = Path(title).suffix.lower()
-            if suffix in (".md", ".smd") and suffix != "." + fmt:
-                title = str(Path(title).with_suffix("." + fmt))
-            elif not title.lower().endswith("." + fmt):
-                title += "." + fmt
-            note = self._note(title, content, "", "", {}, fmt == "smd")
-            self.tabs.append(note)
-            if not background:
-                self.active = note["id"]
-            self.recovery_timer.start(800)
-            self._emit(load=not background)
-            revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            return self._agent_tab_result(note, active=not background, title=title)
-        if action == "save_document":
-            return Studio._run_prepared_write_sync(self, Studio._prepare_save_document(self, args))
-        if action == "activate_document":
-            tab_id = args.get("tabId")
-            tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-            if tab is None:
-                raise ValueError("The requested live tab is no longer open")
-            self.selectTab(tab_id)
-            return self._agent_tab_result(tab, active=True)
-        if action == "close_document":
-            tab_id = args.get("tabId")
-            tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-            if tab is None:
-                raise ValueError("The requested live tab is no longer open")
-            staging = getattr(self, "_staging_tabs", None)
-            if staging is not None and tab_id in staging:
-                raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
-            expected = args.get("expectedRevision")
-            revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
-            if not isinstance(expected, str) or expected != revision:
-                raise ValueError("Live tab revision changed; inspect it again before closing")
-            discard = args.get("discardChanges", False)
-            if not isinstance(discard, bool):
-                raise ValueError("discardChanges must be a boolean")
-            if Studio._is_dirty(self, tab) and not discard:
-                raise ValueError("The document has unsaved changes; pass discardChanges:true to close and preserve it in closed-note recovery")
-            self._remove_tab(tab_id)
-            if any(item["id"] == tab_id for item in self.tabs):
-                return {"status": "closing", "tabId": tab_id, "windowId": self.window_id,
-                        "path": tab["path"], "revision": revision, "active": self.active == tab_id}
-            return {"status": "closed", "tabId": tab_id, "windowId": self.window_id,
-                    "path": tab["path"], "revision": revision, "active": self.active == tab_id}
-        if action == "open_document":
-            background = args.get("background", False)
-            if not isinstance(background, bool):
-                raise ValueError("background must be a boolean")
-            filename = args.get("filename", "")
-            if filename == "":
-                tab_id = args.get("tabId")
-                existing = next((item for item in self.tabs if item["id"] == tab_id), None)
-                if existing is None:
-                    raise ValueError("The requested live tab is no longer open")
-                if not background: self.selectTab(existing["id"])
-                return self._agent_tab_result(existing, active=not background)
-            candidate = Path(filename).expanduser()
-            if not candidate.is_absolute():
-                directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
-                candidate = directory / candidate.name
-            if not self._agent_path_allowed(candidate):
-                raise ValueError("The file is outside the approved agent note roots")
-            resolved = str(candidate.resolve())
-            existing = next((item for item in self.tabs if item["path"] and str(Path(item["path"]).resolve()) == resolved), None)
-            if existing:
-                if not background: self.selectTab(existing["id"])
-                return self._agent_tab_result(existing, active=not background)
-            while len(self._agent_job_records) >= 20:
-                removable = next((key for key, value in self._agent_job_records.items()
-                                  if value.get("status") in ("completed", "failed", "cancelled")), None)
-                if removable is None:
-                    raise ValueError("The desktop already has 20 active agent jobs")
-                self._agent_job_records.pop(removable, None)
-            job_id = uuid.uuid4().hex
-            fmt = "smd" if Path(resolved).suffix.lower() == ".smd" else "md"
-            self._agent_job_records[job_id] = {"jobId": job_id, "status": "running", "action": "open_document",
-                                               "path": resolved, "windowId": self.window_id,
-                                               "active": not background, "format": fmt}
-            self._agent_open_paths.add(resolved)
-            def opened(result, error):
-                record = self._agent_job_records.get(job_id)
-                if record is None: return
-                if error:
-                    record.update(status="failed", error=str(error)[:1000])
-                else:
-                    metadata = self._agent_tab_result(result)
-                    record.update(status="completed", **metadata)
-            self._open_note(resolved, explicit=not background, completion_callback=opened)
-            return {"status": "opening", "jobId": job_id, "path": resolved, "windowId": self.window_id,
-                    "active": not background, "format": fmt}
-        raise ValueError("Unsupported native document action")
+        return studio_agent_actions.agent_document_action(self, args)
 
     def _agent_tab_result(self, tab, *, active=None, title=None):
-        content = tab["content"]
-        path = tab["path"]
-        fmt = "smd" if tab.get("portable") or Path(path or tab["name"]).suffix.lower() == ".smd" else "md"
-        return {"tabId": tab["id"], "windowId": self.window_id, "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                "path": path, "title": title or tab["name"], "active": self.active == tab["id"] if active is None else active,
-                "sourceLength": len(content), "format": fmt, "isDirty": Studio._is_dirty(self, tab)}
+        return studio_agent_actions.agent_tab_result(self, tab, active=active, title=title)
 
     def _agent_path_allowed(self, path: Path) -> bool:
         """Check open targets against user-selected note roots and session paths."""
@@ -6351,171 +6180,29 @@ class Studio(QObject):
         return Studio._run_prepared_write_sync(self, Studio._prepare_replace_tab_asset(self, args))
 
     def _agent_viewport_pending(self, request_id, tab_id):
-        bridge = getattr(self.session, "agent_bridge", None)
-        return bool(bridge and bridge.has_pending(request_id, self.window_id, "render_tab", tab_id))
+        return studio_agent_actions.agent_viewport_pending(self, request_id, tab_id)
 
     def _agent_viewport_revision(self, tab_id):
-        if self.retired or self.active != tab_id:
-            raise ValueError("The target tab is no longer active; refresh the live tab list")
-        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-        if tab is None:
-            raise ValueError("The requested live tab is no longer open")
-        return hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
+        return studio_agent_actions.agent_viewport_revision(self, tab_id)
 
     def _begin_agent_viewport_capture(self, request_id, args):
-        if not isinstance(args, dict) or args.get("requestId") != request_id:
-            raise ValueError("Viewport capture request is invalid")
-        tab_id, revision, context = args.get("tabId"), args.get("revision"), args.get("context")
-        if not isinstance(tab_id, str) or not isinstance(revision, str) or len(revision) != 64:
-            raise ValueError("Viewport capture is missing its live tab revision")
-        if not isinstance(context, dict) or context.get("revision") != revision:
-            raise ValueError("Viewport context revision does not match the request")
-        if not self._agent_viewport_pending(request_id, tab_id):
-            return
-        if self._agent_viewport_revision(tab_id) != revision:
-            raise ValueError("The live tab changed before its viewport was captured")
-        if self.host_window is not None and not self.host_window.isVisible():
-            self._capture_background_preview(request_id,tab_id,revision,context,args)
-            return
-        bounds = context.get("viewport")
-        if not isinstance(bounds, dict):
-            raise ValueError("Reader viewport bounds are unavailable")
-        try:
-            rect = {key: float(bounds[key]) for key in ("x", "y", "width", "height", "viewportWidth", "viewportHeight")}
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError("Reader viewport bounds are invalid") from error
-        if any(not math.isfinite(value) for value in rect.values()) or rect["width"] <= 0 or rect["height"] <= 0 or rect["viewportWidth"] <= 0 or rect["viewportHeight"] <= 0:
-            raise ValueError("Reader viewport bounds are invalid")
-        if rect["x"] < 0 or rect["y"] < 0 or rect["x"] + rect["width"] > rect["viewportWidth"] + 1 or rect["y"] + rect["height"] > rect["viewportHeight"] + 1:
-            raise ValueError("Reader viewport bounds are outside the visible page")
-        width = args.get("width", 1600)
-        if not isinstance(width, int) or isinstance(width, bool) or not 64 <= width <= 1600:
-            raise ValueError("Viewport width must be between 64 and 1,600 pixels")
-        image_format = args.get("imageFormat", "png")
-        if image_format not in ("png", "jpeg"):
-            raise ValueError("Viewport imageFormat must be png or jpeg")
-        if self._agent_viewport_capture is not None:
-            raise ValueError("Another viewport capture is already in progress")
-        window = self.host_window
-        if window is None:
-            raise ValueError("The desktop reader window is unavailable")
-        pending = {"requestId": request_id, "tabId": tab_id, "revision": revision,
-                   "context": context, "bounds": rect, "width": width,
-                   "imageFormat": image_format, "window": window}
-        self._agent_viewport_capture = pending
-        try:
-            window.frameSwapped.connect(self._agent_viewport_frame_swapped, Qt.ConnectionType.QueuedConnection)
-        except (AttributeError, RuntimeError, TypeError):
-            pass
-        window.update()
-        # Some software Qt backends do not emit frameSwapped for an unchanged
-        # exposed window. Try a bounded capture after 200 ms in that case.
-        QTimer.singleShot(200, lambda rid=request_id: self._agent_viewport_fallback(rid))
+        return studio_agent_actions.begin_agent_viewport_capture(self, request_id, args)
 
     def _capture_background_preview(self, request_id, tab_id, revision, context, args):
-        from offline_view import render_live_snapshot
-        tab=next(t for t in self.tabs if t["id"]==tab_id)
-        content,assets,path=tab["content"],dict(tab.get("assets",{})),tab.get("path","")
-        width=max(320,min(1600,int(args.get("width",1200))))
-        heading=context.get("reading",{}).get("heading") or None
-        view={"dark":self._dark(),"colors":self._colors(),"font":self.settings["font"],"size":self.settings["size"],"svgAppearance":self.settings["svgAppearance"],"lineHeight":self.settings["lineHeight"]}
-        def done(body,error):
-            bridge=getattr(self.session,"agent_bridge",None)
-            if bridge is None:return
-            if error:bridge.complete(request_id,None,str(error),window_id=self.window_id);return
-            if self._agent_viewport_revision(tab_id)!=revision:
-                bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
-            image=QImage.fromData(body,"PNG")
-            mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
-            encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
-            bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
-        self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
+        return studio_agent_actions.capture_background_preview(self, request_id, tab_id, revision, context, args)
 
     def _clear_agent_viewport_capture(self, pending):
-        if self._agent_viewport_capture is not pending:
-            return
-        self._agent_viewport_capture = None
-        try:
-            pending["window"].frameSwapped.disconnect(self._agent_viewport_frame_swapped)
-        except (AttributeError, RuntimeError, TypeError):
-            pass
+        return studio_agent_actions.clear_agent_viewport_capture(self, pending)
 
     def _agent_viewport_fallback(self, request_id):
-        pending = self._agent_viewport_capture
-        if pending is not None and pending["requestId"] == request_id:
-            self._capture_agent_viewport(pending)
+        return studio_agent_actions.agent_viewport_fallback(self, request_id)
 
     @Slot()
     def _agent_viewport_frame_swapped(self):
-        pending = self._agent_viewport_capture
-        if pending is not None:
-            self._capture_agent_viewport(pending)
+        return studio_agent_actions.agent_viewport_frame_swapped(self)
 
     def _capture_agent_viewport(self, pending):
-        if self._agent_viewport_capture is not pending:
-            return
-        bridge = getattr(self.session, "agent_bridge", None)
-        request_id, tab_id, revision = pending["requestId"], pending["tabId"], pending["revision"]
-        if bridge is None or not self._agent_viewport_pending(request_id, tab_id):
-            self._clear_agent_viewport_capture(pending)
-            return
-        try:
-            if self._agent_viewport_revision(tab_id) != revision:
-                raise ValueError("The live tab changed before its viewport was captured")
-            window = pending["window"]
-            reader = window.property("reader")
-            if reader is None:
-                reader = window.findChild(QObject, "documentReader")
-            if reader is None or not callable(getattr(reader, "mapToScene", None)):
-                raise ValueError("The desktop WebEngine view is unavailable")
-            bounds = pending["bounds"]
-            view_width, view_height = float(reader.width()), float(reader.height())
-            if view_width <= 0 or view_height <= 0:
-                raise ValueError("The desktop WebEngine view has no visible area")
-            scale_x, scale_y = view_width / bounds["viewportWidth"], view_height / bounds["viewportHeight"]
-            top_left = reader.mapToScene(QPointF(bounds["x"] * scale_x, bounds["y"] * scale_y))
-            bottom_right = reader.mapToScene(QPointF((bounds["x"] + bounds["width"]) * scale_x,
-                                                      (bounds["y"] + bounds["height"]) * scale_y))
-            image = window.grabWindow()
-            if image is None or image.isNull():
-                raise ValueError("The desktop reader frame could not be captured")
-            pixel_scale_x = image.width() / max(1.0, float(window.width()))
-            pixel_scale_y = image.height() / max(1.0, float(window.height()))
-            left = max(0, math.floor(min(top_left.x(), bottom_right.x()) * pixel_scale_x))
-            top = max(0, math.floor(min(top_left.y(), bottom_right.y()) * pixel_scale_y))
-            right = min(image.width(), math.ceil(max(top_left.x(), bottom_right.x()) * pixel_scale_x))
-            bottom = min(image.height(), math.ceil(max(top_left.y(), bottom_right.y()) * pixel_scale_y))
-            if right <= left or bottom <= top:
-                raise ValueError("The reader viewport is outside the captured window")
-            crop = image.copy(QRect(left, top, right - left, bottom - top))
-            longest = max(crop.width(), crop.height())
-            if longest > pending["width"]:
-                ratio = pending["width"] / longest
-                crop = crop.scaled(max(1, round(crop.width() * ratio)), max(1, round(crop.height() * ratio)),
-                                   Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            if self._agent_viewport_revision(tab_id) != revision:
-                raise ValueError("The live tab changed while its viewport was being captured")
-            if not bridge.has_pending(request_id, self.window_id, "render_tab", tab_id):
-                self._clear_agent_viewport_capture(pending)
-                return
-            array = QByteArray()
-            buffer = QBuffer(array)
-            image_format = pending.get("imageFormat", "png")
-            image_encoder = "JPEG" if image_format == "jpeg" else "PNG"
-            saved = (crop.save(buffer, image_encoder, 90) if image_format == "jpeg"
-                     else crop.save(buffer, image_encoder)) if buffer.open(QIODevice.OpenModeFlag.WriteOnly) else False
-            if not saved:
-                raise ValueError(f"Could not encode the live viewport as {image_encoder}")
-            result = dict(pending["context"])
-            mime_type = "image/jpeg" if image_format == "jpeg" else "image/png"
-            result.update({"mime_type": mime_type, "data": base64.b64encode(bytes(array)).decode("ascii"),
-                           "width": crop.width(), "height": crop.height(), "revision": revision,
-                           "tabId": tab_id, "windowId": self.window_id})
-            self._clear_agent_viewport_capture(pending)
-            bridge.complete(request_id, result, window_id=self.window_id)
-        except Exception as error:
-            self._clear_agent_viewport_capture(pending)
-            bridge.complete(request_id, None, str(error)[:1000], window_id=self.window_id)
+        return studio_agent_actions.capture_agent_viewport(self, pending)
 
     @Slot(str, str, str)
     def post(self, id, command, raw):
