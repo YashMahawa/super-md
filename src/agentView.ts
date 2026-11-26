@@ -1,5 +1,6 @@
+import type {Root} from 'mdast';
 import {analyzeDocument} from './documentAnalysis';
-import {agentCharLength} from './agentOperations';
+import {agentCharLength,agentCodePointOffset,countCodePointsRange,hasUnicodeIndex} from './agentOperations';
 import type {ExportableMedia} from './mediaExport';
 import {mediaAt} from './mediaExport';
 import {invoke} from './nativeBridge';
@@ -7,38 +8,93 @@ import {parseStepDeck} from './components/StepCards';
 import {parseDiagramSource} from './components/InlineDiagram';
 import {parseBinaryTreeSource} from './components/BinaryTree';
 import {stepDiagramSvg} from './stepPdf';
-export interface AgentDiagram {id:string;kind:string;source:string;start:number;end:number;url?:string;label?:string;deckTitle?:string;stepLabel?:string;stepIndex?:number;stepCount?:number}
-/** Stable for this source revision; IDs avoid transmitting large artwork. */
-export function agentDiagrams(source:string):AgentDiagram[]{
-  const result:AgentDiagram[]=[],tree=analyzeDocument(source).tree;
+import {inspectCachedPythonOutput,safePythonFigure} from './renderedOutputs';
+export interface AgentDiagram {id:string;kind:string;source:string;start:number;end:number;sourceStart?:number;sourceEnd?:number;url?:string;label?:string;deckTitle?:string;stepLabel?:string;stepIndex?:number;stepCount?:number;activeStep?:boolean}
+export interface AgentDiagramOptions {documentPath?:string|null;python?:string;range?:{start:number;end:number}|null}
+const definitionCache=new WeakMap<Root,Map<string,string>>();
+function documentDefinitions(tree:Root):Map<string,string>{
+  const cached=definitionCache.get(tree);if(cached)return cached;
   const definitions=new Map<string,string>();
-  const definitionsIn=(node:any)=>{if(node.type==='definition')definitions.set(node.identifier,node.url);for(const child of node.children??[])definitionsIn(child);};definitionsIn(tree);
+  const definitionsIn=(node:any)=>{
+    if(node.type==='definition'){definitions.set(node.identifier,node.url);return;}
+    if(node.type==='paragraph'||node.type==='heading'||node.type==='code'||node.type==='table')return;
+    for(const child of node.children??[])definitionsIn(child);
+  };
+  definitionsIn(tree);definitionCache.set(tree,definitions);return definitions;
+}
+function isRangeOnly(value:AgentDiagramOptions|{start:number;end:number}|null|undefined):value is {start:number;end:number}{
+  return !!value&&typeof (value as {start?:unknown}).start==='number'&&typeof (value as {end?:unknown}).end==='number';
+}
+/** Stable for this source revision; IDs avoid transmitting large artwork. */
+export function agentDiagrams(source:string,options?:AgentDiagramOptions|{start:number;end:number}|null):AgentDiagram[]{
+  const resolved:AgentDiagramOptions|undefined=isRangeOnly(options)?{range:options}:options??undefined;
+  const range=resolved?.range??null;
+  if(range&&range.end<=range.start)return [];
+  const hasExecContext=!!resolved&&('documentPath' in resolved||'python' in resolved);
+  const result:AgentDiagram[]=[],analysis=analyzeDocument(source),tree=analysis.tree,definitions=documentDefinitions(tree);
+  const indexed=hasUnicodeIndex(source);
+  let cursorUtf16=range?-1:0,cursorCp=0,pythonOrdinal=0;
+  const cursorTo=(targetUtf16:number):number=>{
+    if(cursorUtf16<0||targetUtf16<cursorUtf16||(indexed&&targetUtf16-cursorUtf16>1024)){
+      cursorUtf16=targetUtf16;cursorCp=agentCodePointOffset(source,targetUtf16);return cursorCp;
+    }
+    if(targetUtf16===cursorUtf16)return cursorCp;
+    let delta=countCodePointsRange(source,cursorUtf16,targetUtf16);
+    if(cursorUtf16>0){
+      const high=source.charCodeAt(cursorUtf16-1),low=source.charCodeAt(cursorUtf16);
+      if(high>=0xd800&&high<=0xdbff&&low>=0xdc00&&low<=0xdfff)delta--;
+    }
+    cursorUtf16=targetUtf16;cursorCp+=delta;return cursorCp;
+  };
   const walk=(node:any)=>{
+    if(range&&node.position&&(node.position.end.offset<=range.start||node.position.start.offset>=range.end))return;
     if(node.type==='code'&&['svg','mermaid','smd-chart','smd-tree','smd-diagram'].includes(node.lang)&&node.position){
-      const start=agentCharLength(source.slice(0,node.position.start.offset));
-      result.push({id:`diagram:${start}`,kind:node.lang,source:node.value,start:node.position.start.offset,end:node.position.end.offset});
+      const startOffset=node.position.start.offset,endOffset=node.position.end.offset;
+      const sourceStart=cursorTo(startOffset),sourceEnd=cursorTo(endOffset);
+      result.push({id:`diagram:${sourceStart}`,kind:node.lang,source:node.value,start:startOffset,end:endOffset,sourceStart,sourceEnd});
+    }
+    if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase())&&node.position){
+      const startOffset=node.position.start.offset,endOffset=node.position.end.offset;
+      const pyIndex=analysis.pythonCells.findIndex(cell=>cell.offset===startOffset&&cell.source===String(node.value||''));
+      const cellIndex=pyIndex>=0?pyIndex:pythonOrdinal++;
+      const duplicateOrdinal=pyIndex>=0?analysis.pythonCells[pyIndex].ordinal:0;
+      const cached=inspectCachedPythonOutput(node.value,{...(hasExecContext?{document:resolved?.documentPath??null}:{}),cell:String(duplicateOrdinal),interpreter:resolved?.python});
+      const figures=cached?.images.filter(safePythonFigure).slice(0,16);
+      if(figures?.length){
+        const sourceStart=cursorTo(startOffset),sourceEnd=cursorTo(endOffset);
+        figures.forEach((figure,index)=>{
+          result.push({id:`diagram:python:${sourceStart}:${index}`,kind:'python-figure',url:figure,label:`Python cell ${cellIndex+1} — Figure ${index+1}`,source:node.value,start:startOffset,end:endOffset,sourceStart,sourceEnd});
+        });
+      }
     }
     if(node.type==='code'&&node.lang==='smd-steps'&&node.position){
-      const deck=parseStepDeck(node.value),offset=agentCharLength(source.slice(0,node.position.start.offset));
+      const startOffset=node.position.start.offset,endOffset=node.position.end.offset;
+      const deck=parseStepDeck(node.value),sourceStart=cursorTo(startOffset),sourceEnd=cursorTo(endOffset);
       deck?.steps.forEach((step,index)=>{
         if(!step.image&&!step.diagram&&!step.chart)return;
         const kind=step.image?'image':step.diagram?'smd-diagram':'smd-chart';
-        result.push({id:`diagram:step:${offset}:${index}`,kind,source:step.image?JSON.stringify({image:step.image,alt:step.alt||step.label}):step.diagram?JSON.stringify(step.diagram):step.chart!,start:node.position.start.offset,end:node.position.end.offset,...(step.image?{url:step.image}:{}),label:`${deck.title} — ${step.label}`,deckTitle:deck.title,stepLabel:step.label,stepIndex:index,stepCount:deck.steps.length});
+        result.push({id:`diagram:step:${sourceStart}:${index}`,kind,source:step.image?JSON.stringify({image:step.image,alt:step.alt||step.label}):step.diagram?JSON.stringify(step.diagram):step.chart!,start:startOffset,end:endOffset,sourceStart,sourceEnd,...(step.image?{url:step.image}:{}),label:`${deck.title} — ${step.label}`,deckTitle:deck.title,stepLabel:step.label,stepIndex:index,stepCount:deck.steps.length});
       });
     }
     if(['image','imageReference'].includes(node.type)&&node.position){
       const url=node.type==='image'?node.url:definitions.get(node.identifier);
-      if(url)result.push({id:`diagram:image:${agentCharLength(source.slice(0,node.position.start.offset))}`,kind:'image',url,label:node.alt||'Image',source:source.slice(node.position.start.offset,node.position.end.offset),start:node.position.start.offset,end:node.position.end.offset});
+      if(url){
+        const startOffset=node.position.start.offset,endOffset=node.position.end.offset;
+        const sourceStart=cursorTo(startOffset),sourceEnd=cursorTo(endOffset);
+        result.push({id:`diagram:image:${sourceStart}`,kind:'image',url,label:node.alt||'Image',source:source.slice(startOffset,endOffset),start:startOffset,end:endOffset,sourceStart,sourceEnd});
+      }
     }
     for(const child of node.children??[])walk(child);
   };
   walk(tree);return result;
 }
 export function diagramMetadata(source:string,diagram:AgentDiagram){
-  return {id:diagram.id,kind:diagram.kind,sourceStart:agentCharLength(source.slice(0,diagram.start)),sourceEnd:agentCharLength(source.slice(0,diagram.end)),sourceChars:agentCharLength(diagram.source),preview:diagram.label||(diagram.kind==='svg'?'SVG drawing':diagram.source.slice(0,160)),...(diagram.deckTitle?{deckTitle:diagram.deckTitle,stepLabel:diagram.stepLabel,stepIndex:diagram.stepIndex,stepCount:diagram.stepCount}:{}),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
+  const sourceStart=diagram.sourceStart??agentCodePointOffset(source,diagram.start);
+  const sourceEnd=diagram.sourceEnd??agentCodePointOffset(source,diagram.end);
+  return {id:diagram.id,kind:diagram.kind,sourceStart,sourceEnd,sourceChars:agentCharLength(diagram.source),preview:diagram.label||(diagram.kind==='svg'?'SVG drawing':diagram.source.slice(0,160)),...(diagram.deckTitle?{deckTitle:diagram.deckTitle,stepLabel:diagram.stepLabel,stepIndex:diagram.stepIndex,stepCount:diagram.stepCount}:{}),...(diagram.activeStep!==undefined?{activeStep:diagram.activeStep}:{}),...(diagram.url?{assetReference:diagram.url.startsWith('data:')?'(embedded image)':diagram.url.slice(0,512)}:{})};
 }
 export async function diagramMedia(diagram:AgentDiagram,documentPath:string|null=null):Promise<ExportableMedia>{
-  if(diagram.kind==='image'){
+  if(diagram.kind==='image'||diagram.kind==='python-figure'){
     for(const element of document.querySelectorAll<HTMLElement>('[data-note-image-source]')){
       if(element.dataset.noteImageSource===diagram.url){const loaded=mediaAt(element.querySelector('img'));if(loaded)return loaded;}
     }

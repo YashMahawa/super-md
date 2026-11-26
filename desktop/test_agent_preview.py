@@ -17,3 +17,17 @@ class PreviewTests(unittest.TestCase):
             blues=sum(image.pixelColor(x,y).blue()>150 and image.pixelColor(x,y).red()<80 for y in range(0,700,8) for x in range(0,800,8))
             self.assertGreater(blues,200,'The reader capture must include actual blue SVG pixels, not a blank page')
             self.assertTrue(json.loads(result.stdout)['result']['sourceUnchanged'])
+
+    def test_headless_preview_renders_sandboxed_mermaid_with_file_urls_disabled(self):
+        root=Path(__file__).resolve().parent.parent
+        if not (root/'dist/qt-reader.html').is_file():self.skipTest('Build the offline reader first')
+        preview_src=(root/'desktop/agent_preview.py').read_text(encoding='utf-8')
+        self.assertIn('LocalContentCanAccessFileUrls,False',preview_src.replace(' ',''))
+        with tempfile.TemporaryDirectory() as directory:
+            folder=Path(directory);note=folder/'mermaid-note.md';output=folder/'mermaid-preview.png'
+            note.write_text('# Isolated diagram\n\n```mermaid\ngantt\n  title Study schedule\n  Task A :a1, 2026-09-01, 3d\n```\n',encoding='utf-8')
+            result=subprocess.run([sys.executable,str(root/'desktop/agent_cli.py'),'--root',directory,'preview',str(note),str(output),'--width','800','--height','600'],capture_output=True,text=True,timeout=55,env={**os.environ,'QT_QPA_PLATFORM':'offscreen','QTWEBENGINE_DISABLE_SANDBOX':'1'})
+            self.assertEqual(result.returncode,0,result.stdout+'\n'+result.stderr[-1500:])
+            from PySide6.QtGui import QImage
+            image=QImage(str(output))
+            self.assertEqual((image.width(),image.height()),(800,600))

@@ -40,7 +40,17 @@ for(const {platform,zoom,cold} of scrollCases){
         const delta=step<14?-520:520,bounds=root.getBoundingClientRect(),point={x:bounds.left+bounds.width*.5,y:bounds.top+bounds.height*.5};
         // Track text expected to remain visible AFTER this input, not an old
         // source line that legitimately leaves the viewport during a burst.
-        const caretAtPoint=(document as Document&{caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint;
+        const caretAtPoint=(x:number,y:number):Range|null=>{
+          if(typeof (document as Partial<Document>).caretPositionFromPoint==='function'){
+            const pos=document.caretPositionFromPoint(x,y);
+            if(!pos||pos.offsetNode.nodeType!==Node.TEXT_NODE)return null;
+            const range=document.createRange();
+            range.setStart(pos.offsetNode,Math.max(0,Math.min(pos.offset,(pos.offsetNode as CharacterData).length)));
+            range.collapse(true);
+            return range;
+          }
+          return (document as unknown as {caretRangeFromPoint?:(x:number,y:number)=>Range|null}).caretRangeFromPoint?.(x,y)??null;
+        };
         const probeY=delta<0?bounds.top+100:bounds.bottom-100;
         // One point can land in math, whitespace, or a block gap. Sample a
         // small grid around the same carried source band so each wheel step
@@ -49,7 +59,7 @@ for(const {platform,zoom,cold} of scrollCases){
         const probes=[] as Array<{range:Range;sourceNode:Node;sourceOffset:number;before:DOMRect;block:string|null}>;
         const sampled=new Map<Node,Set<number>>();
         for(const yOffset of [-18,0,18])for(const xFraction of [.35,.5,.65]){
-          const caret=caretAtPoint?.call(document,bounds.left+bounds.width*xFraction,probeY+yOffset);
+          const caret=caretAtPoint(bounds.left+bounds.width*xFraction,probeY+yOffset);
           if(!caret||!root.contains(caret.startContainer)||caret.startContainer.nodeType!==Node.TEXT_NODE)continue;
           const range=caret.cloneRange(),sourceNode=range.startContainer,sourceOffset=range.startOffset;
           if(sourceOffset>=(sourceNode.textContent?.length??0))continue;
@@ -153,6 +163,7 @@ test('delayed image sizing does not move the visible source anchor during scroll
     },{platform,zoom,content:runContent});
     await page.evaluate(zoom=>window.supermdSetZoom?.(zoom),zoom);
     await expect(page.locator('.document-page')).toHaveAttribute('data-scale',String(zoom/100));
+    await page.evaluate(()=>document.fonts.ready);
     const anchor=page.locator('#visible-anchor');
     // The reader requires an explicit trust action for a new remote image host.
     await page.getByRole('button',{name:'Load image'}).click();
@@ -177,4 +188,42 @@ test('delayed image sizing does not move the visible source anchor during scroll
   for(const result of results){
     expect.soft(Math.abs(result.drift),`${result.platform} at ${result.zoom}% drifted ${result.drift}px`).toBeLessThan(3);
   }
+});
+
+test('settling Android magnified zoom to layout geometry preserves the visible source anchor',async({page})=>{
+  await page.setViewportSize({width:412,height:850});
+  await page.addInitScript(()=>{window.SuperMD={post:(id)=>queueMicrotask(()=>window.supermdReply?.(id,true,null))};});
+  const content=[
+    '# Scroll fixture',
+    `## Before the figure\n\n${'Readable lead-in text makes the following source anchor visible at high zoom. '.repeat(12)}`,
+    '## Visible anchor\n\nThis heading is the source location being tracked.',
+    ...Array.from({length:40},(_,i)=>`## Later ${i}\n\n${'Readable source after the delayed figure. '.repeat(14)}`),
+  ].join('\n\n');
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>!!window.supermdLoad);
+  await page.evaluate(content=>{
+    document.documentElement.dataset.host='android';
+    document.documentElement.dataset.platform='android';
+    window.supermdLoad?.({id:'scroll-android-settle-180',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:180,restorePosition:false});
+  },content);
+  await expect(page.locator('.document-page')).toHaveAttribute('data-scale','1.8');
+  await page.evaluate(()=>document.fonts.ready);
+  // Position the visible anchor immediately while zoom is still on its initial
+  // compositor transform, before the 240 ms Android layout-zoom settle fires.
+  const before=await page.evaluate(()=>{
+    const pageEl=document.querySelector<HTMLElement>('.document-page')!;
+    const root=document.querySelector<HTMLElement>('.android-reading')!;
+    const anchor=document.querySelector<HTMLElement>('#visible-anchor')!;
+    // Re-enter compositor zoom if fonts.ready exceeded 240 ms on a cold worker.
+    window.supermdSetZoom?.(175);
+    window.supermdSetZoom?.(180);
+    anchor.scrollIntoView({block:'center',behavior:'instant'});
+    root.scrollTop+=anchor.getBoundingClientRect().top-root.getBoundingClientRect().top-220;
+    return {top:anchor.getBoundingClientRect().top,model:pageEl.dataset.selectionModel??null};
+  });
+  expect(before.model).toBeNull();
+  await expect(page.locator('.document-page')).toHaveAttribute('data-selection-model','layout');
+  await expect(page.locator('.document-page')).toHaveAttribute('data-selection-scale','1.8');
+  const after=await page.locator('#visible-anchor').evaluate(el=>el.getBoundingClientRect().top);
+  expect(Math.abs(after-before.top)).toBeLessThan(3);
 });

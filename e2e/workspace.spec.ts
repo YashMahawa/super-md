@@ -164,6 +164,7 @@ test("shared repair applies on Android/Qt and button history can undo and redo i
 test("reading search highlights every match without switching mode and escapes cleanly",async({page})=>{
   await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});
   await page.goto("/android-reader.html");
+  await page.waitForFunction(()=>typeof window.supermdLoad==="function");
   await page.evaluate(()=>window.supermdLoad?.({id:"search",content:"# Find notes\n\nA **probability** result.\n\n> [!QUESTION]- Hidden probability\n> Another probability result.\n\n## Last probability",path:null,mode:"reader",dark:false,fullscreen:false,colors:{},font:"sans",size:18,zoom:100}));
   await expect(page.locator("h1")).toBeVisible();
   await page.evaluate(()=>window.supermdFind?.());
@@ -171,11 +172,69 @@ test("reading search highlights every match without switching mode and escapes c
   await expect(page.locator(".reading-search output")).toContainText("/ 4");
   expect(await page.evaluate(()=>CSS.highlights.get("smd-search")?.size)).toBe(4);
   await expect(page.locator(".cm-editor")).toHaveCount(0);
-  await page.getByRole("button",{name:"Next match",exact:true}).click();
+  await page.keyboard.press("F3");
+  await expect(page.locator(".reading-search output")).toContainText("1 / 4");
+  await page.keyboard.press("F3");
+  await expect(page.locator(".reading-search output")).toContainText("2 / 4");
+  await page.keyboard.press("Shift+F3");
+  await expect(page.locator(".reading-search output")).toContainText("1 / 4");
+  await page.keyboard.press("Control+h");
+  await expect(page.getByRole("button",{name:"Replace in source"})).toHaveCount(0);
+  await expect(page.getByRole("textbox",{name:"Replacement text"})).toHaveCount(0);
   await expect(page.locator(".reading-search output")).toContainText("1 / 4");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("search")).toHaveCount(0);
   expect(await page.evaluate(()=>CSS.highlights.has("smd-search"))).toBe(false);
+});
+test("Ctrl+H, F3, whole-word, regex capture groups, and offscreen windowed Live replacements stay synchronized",async({page})=>{
+  let content="";
+  await page.exposeFunction("syncDoc",(_id:string,command:string,raw:string)=>{if(command==="document_changed")content=JSON.parse(raw).content;});
+  await page.addInitScript(()=>{window.SuperMD={post:(id,command,raw)=>(window as any).syncDoc(id,command,raw)};});
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(()=>typeof window.supermdLoad==="function");
+  const filler="Readable windowed study paragraph with context.\n\n".repeat(40);
+  content=`# Windowed replace\n\nRead [Docs](https://example.org/token-00) and token-01 vs token-01extra.\n\n`+
+    Array.from({length:50},(_,i)=>`## Section ${i}\n\n${i===25?"Offscreen token-25 match.\n\n":i===45?"Distant token-45 match.\n\n":""}${filler}`).join("");
+  expect(content.length).toBeGreaterThan(85_000);
+  await page.evaluate(content=>window.supermdLoad?.({id:"windowed-replace",content,path:null,mode:"live",dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100}),content);
+  await expect(page.locator('[data-windowed-mounted="true"]')).not.toHaveCount(0);
+  await expect(page.locator('[data-windowed-mounted="false"]')).not.toHaveCount(0);
+
+  await page.keyboard.press("Control+h");
+  const searchbox=page.getByRole("searchbox",{name:"Find in note"});
+  await expect(searchbox).toBeFocused();
+  await page.getByRole("button",{name:"Match whole word",exact:true}).click();
+  await page.getByRole("button",{name:"Regular expression",exact:true}).click();
+  await searchbox.fill("(token)-(\\d+)");
+  // Whole-word regex matches token-00 (in URL), token-01, token-25, token-45, and skips token-01extra!
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 4");
+  await page.getByRole("textbox",{name:"Replacement text"}).fill("item-$2");
+  await expect(page.getByRole("button",{name:"Replace",exact:true})).toBeDisabled();
+  await expect(page.getByRole("button",{name:"Replace all",exact:true})).toBeEnabled();
+
+  // F3 selects match 0 (hidden URL) without painting a stale highlight or overwriting it.
+  await page.keyboard.press("F3");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 4");
+  await expect(page.getByRole("button",{name:"Replace",exact:true})).toBeEnabled();
+  expect(await page.evaluate(()=>CSS.highlights.has("smd-search-current"))).toBe(false);
+  expect(content).toContain("https://example.org/token-00");
+
+  // F3 steps to visible match 1 (token-01), F3 again mounts & scrolls offscreen Section 25 (token-25)!
+  await page.keyboard.press("F3");
+  await expect(page.locator(".reading-search output")).toHaveText("2 / 4");
+  await page.keyboard.press("F3");
+  await expect(page.locator(".reading-search output")).toHaveText("3 / 4");
+  const section25=page.locator('[data-windowed-mounted="true"]').filter({hasText:"Offscreen token-25 match."});
+  await expect(section25).toBeVisible();
+  await expect(section25).toBeInViewport();
+
+  // Single Replace expands capture group $2 -> item-25 and advances to offscreen Section 45 (token-45)!
+  await page.getByRole("button",{name:"Replace",exact:true}).click();
+  await expect.poll(()=>content).toContain("Offscreen item-25 match.");
+  await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+  const section45=page.locator('[data-windowed-mounted="true"]').filter({hasText:"Distant token-45 match."});
+  await expect(section45).toBeVisible();
+  await expect(section45).toBeInViewport();
 });
 test("native document sizing stays percentage based and Live edit exits on outside click",async({page})=>{
   await page.setViewportSize({width:1440,height:900});
@@ -433,8 +492,15 @@ test("click-to-edit, media drops, titled links and portable source work together
   await expect(page.locator(".live-edit-button")).toHaveCount(0); await expect(page.locator(".svg-diagram")).toBeVisible();
   await page.getByRole("heading", { name: "Study notes" }).click(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveCount(0);
   await page.getByRole("heading", { name: "Study notes" }).dblclick(); await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toContainText("# Study notes");
-  await page.evaluate(() => { const editor = document.querySelector('textarea')!; const clipboard = new DataTransfer(); clipboard.setData("text/plain", "https://youtu.be/dQw4w9WgXcQ"); editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true })); });
-  await expect(page.getByRole("dialog", { name: "Insert image or link" })).toBeVisible(); await expect(page.getByLabel("Link title")).toHaveValue("Understanding Fourier series");
+  await page.evaluate(() => { const editor = document.querySelector("textarea")!; editor.focus(); editor.setSelectionRange(2, 13); const clipboard = new DataTransfer(); clipboard.setData("text/plain", "https://youtu.be/dQw4w9WgXcQ"); editor.dispatchEvent(new ClipboardEvent("paste", { clipboardData: clipboard, bubbles: true, cancelable: true })); });
+  await expect(page.getByRole("dialog", { name: "Insert image or link" })).toHaveCount(0);
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("# [Study notes](https://youtu.be/dQw4w9WgXcQ)");
+  await page.evaluate(() => window.supermdHistory?.("undo"));
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("# Study notes");
+  await page.evaluate(() => { const editor = document.querySelector("textarea")!; editor.setSelectionRange(editor.value.length, editor.value.length); window.supermdMedia?.(); });
+  await expect(page.getByRole("dialog", { name: "Insert image or link" })).toBeVisible();
+  await page.getByLabel("Web address").fill("https://youtu.be/dQw4w9WgXcQ");
+  await expect(page.getByLabel("Link title")).toHaveValue("Understanding Fourier series");
   await page.getByLabel("Include the video thumbnail").check(); await page.getByRole("button", { name: "Insert link", exact: true }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect.poll(() => calls.filter((call) => call.command === "document_changed").at(-1)?.args.content).toContain("[Understanding Fourier series](<https://youtu.be/dQw4w9WgXcQ>)");

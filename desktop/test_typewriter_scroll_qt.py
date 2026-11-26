@@ -24,20 +24,26 @@ def _probe(screenshot_path: str | None = None) -> int:
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
     from PySide6.QtTest import QTest
+    from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
     from PySide6.QtWidgets import QApplication
 
+    sys.path.insert(0, str(ROOT))
+    from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
+    from studio import Session, Studio
+
     QQuickStyle.setStyle("Material")
+    register_reader_schemes()
     QtWebEngineQuick.initialize()
     app = QApplication(["Super MD typewriter scroll Qt test"])
-
-    sys.path.insert(0, str(ROOT))
-    from studio import Session, Studio
+    bundle_handler = ReaderBundleSchemeHandler(ROOT.parent / "dist", app)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
 
     with tempfile.TemporaryDirectory(prefix="supermd-typewriter-qt-") as temp_dir:
         lines = "\n".join(f"Line {i + 1}: Long-form study note paragraph {i + 1}." for i in range(90))
         session = Session(True)
         session.settings["welcomed"] = True
+        session.settings["python"] = sys.executable
         session.settings["newNoteLocation"] = temp_dir
         studio = Studio(True, session)
         tab = studio.tabs[0]
@@ -52,7 +58,7 @@ def _probe(screenshot_path: str | None = None) -> int:
             raise RuntimeError("Qt WebChannel runtime unavailable")
         engine = QQmlApplicationEngine()
         engine.rootContext().setContextProperty("studio", studio)
-        engine.rootContext().setContextProperty("readerUrl", QUrl.fromLocalFile(str(ROOT.parent / "dist" / "qt-reader.html")))
+        engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
         engine.rootContext().setContextProperty("channelScript", bytes(channel.readAll()).decode())
         engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(ROOT.parent / "public" / "brand-mark-fixed.svg")))
         engine.load(QUrl.fromLocalFile(str(ROOT / "qml" / "Main.qml")))

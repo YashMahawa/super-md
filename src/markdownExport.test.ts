@@ -2,14 +2,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 const { native } = vi.hoisted(() => ({ native: vi.fn() }));
 vi.mock("./nativeBridge", () => ({ invoke: native }));
-import { prepareMarkdownExport } from "./markdownExport";
+import { MAX_MARKDOWN_EXPORT_CONCURRENCY, prepareMarkdownExport } from "./markdownExport";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
 
 afterEach(() => native.mockReset());
 
 describe("plain Markdown export assets", () => {
-  it("inlines referenced SVG and preserves local raster paths and GIF bytes", async () => {
+  it("preserves referenced SVG and local raster paths and exact bytes", async () => {
     native.mockImplementation(async (_command: string, args: any) => {
       if (args.source === "diagrams/flow.svg") return "data:image/svg+xml;base64,PHN2Zz48dGV4dD5mbG93PC90ZXh0Pjwvc3ZnPg==";
       if (args.source === "images/loop.gif") return "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
@@ -19,12 +19,13 @@ describe("plain Markdown export assets", () => {
       "# Keep\n\n![Flow](diagrams/flow.svg)\n\n![Loop](images/loop.gif)\n\n```mermaid\ngraph TD; A-->B\n```\n",
       "/notes/source.smd",
     );
-    expect(result.content).toContain("```svg\n<svg><text>flow</text></svg>\n```");
+    expect(result.content).toContain("![Flow](diagrams/flow.svg)");
+    expect(result.content).not.toContain("```svg");
     expect(result.content).toContain("![Loop](images/loop.gif)");
     expect(result.content).toContain("```mermaid\ngraph TD; A-->B\n```");
-    expect(result.assets["images/loop.gif"]).toMatch(/^data:image\/gif;base64,/);
+    expect(result.assets["diagrams/flow.svg"]).toBe("data:image/svg+xml;base64,PHN2Zz48dGV4dD5mbG93PC90ZXh0Pjwvc3ZnPg==");
     expect(result.assets["images/loop.gif"]).toBe("data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7");
-    expect(Object.keys(result.assets)).toEqual(["images/loop.gif"]);
+    expect(Object.keys(result.assets)).toEqual(["diagrams/flow.svg", "images/loop.gif"]);
     expect(native).toHaveBeenCalledTimes(2);
   });
 
@@ -82,23 +83,47 @@ describe("plain Markdown export assets", () => {
     expect(result.assets["media/cover.jpeg"]).toMatch(/^data:image\/jpeg;base64,/);
   });
 
-  it("inlines reference-style SVG at the image use and keeps the remaining source valid", async () => {
-    native.mockResolvedValue("data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+");
-    const result = await prepareMarkdownExport("![Diagram][d]\n\n[d]: assets/image-a1b2c3.svg\n", "/notes/source.md");
-    expect(result.content).toContain("```svg\n<svg><path/></svg>\n```");
+  it("rewrites reference-style generated SVG to a companion SVG asset and removes the generated definition", async () => {
+    native.mockImplementation(async (_command: string, args: any) => {
+      if (args.source === "image1.svg") return "data:image/svg+xml;base64,PHN2Zz48Y2lyY2xlLz48L3N2Zz4=";
+      if (args.source === "assets/image-a1b2c3.svg") return "data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+";
+      throw Error(`unexpected asset ${args.source}`);
+    });
+    const result = await prepareMarkdownExport(
+      "![Existing](image1.svg)\n\n![Diagram][d]\n\n[d]: assets/image-a1b2c3.svg\n",
+      "/notes/source.md",
+    );
+    expect(result.content).toContain("![Existing](image1.svg)");
+    expect(result.content).toContain("![Diagram](<image2.svg>)");
     expect(result.content).not.toContain("image-a1b2c3");
-    expect(result.assets).toEqual({});
+    expect(result.content).not.toContain("```svg");
+    expect(result.assets).toEqual({
+      "image1.svg": "data:image/svg+xml;base64,PHN2Zz48Y2lyY2xlLz48L3N2Zz4=",
+      "image2.svg": "data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+",
+    });
   });
 
-  it("wraps inline prose SVG references in actual block fences", async () => {
+  it("keeps inline prose SVG references as linked SVG assets instead of code fences and rejects unsafe SVGs", async () => {
     native.mockResolvedValue("data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+");
-    const result = await prepareMarkdownExport("Before the figure ![Diagram](diagram.svg) after the figure.\n", "/notes/source.md");
+    const source = "Before the figure ![Diagram](diagram.svg) after the figure.\n";
+    const result = await prepareMarkdownExport(source, "/notes/source.md");
+    expect(result.content).toBe(source);
+    expect(result.assets).toEqual({ "diagram.svg": "data:image/svg+xml;base64,PHN2Zz48cGF0aC8+PC9zdmc+" });
     const tree = unified().use(remarkParse).parse(result.content);
-    const codes = (tree.children as any[]).filter(node => node.type === "code");
-    expect(codes).toHaveLength(1);
-    expect(codes[0].lang).toBe("svg");
-    expect((tree.children as any[]).some(node => node.type === "paragraph" && JSON.stringify(node).includes("Before the figure"))).toBe(true);
-    expect((tree.children as any[]).some(node => node.type === "paragraph" && JSON.stringify(node).includes("after the figure"))).toBe(true);
+    expect((tree.children as any[]).filter(node => node.type === "code")).toHaveLength(0);
+
+    for (const unsafeSvg of [
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"alert(1)\"><path/></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><foreignObject><div>html</div></foreignObject></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><image href=\"https://evil.example/a.png\"/></svg>",
+      "<svg xmlns=\"http://www.w3.org/2000/svg\"><style>@import url('https://evil.example/a.css');</style></svg>",
+    ]) {
+      const encoded = `data:image/svg+xml;base64,${btoa(unsafeSvg)}`;
+      native.mockResolvedValueOnce(encoded);
+      await expect(prepareMarkdownExport("![Bad](diagram.svg)", "/notes/source.md")).rejects.toThrow();
+      await expect(prepareMarkdownExport(`![Bad](${encoded})`, "/notes/source.md")).rejects.toThrow();
+    }
   });
 
   it("inlines local Mermaid source referenced by image, link, and reference syntax", async () => {
@@ -328,5 +353,285 @@ it('extracts clean alt text when renaming app-generated Obsidian image embeds',a
  const result=await prepareMarkdownExport(source,'/vault/Generated.smd',{compatible:true});
  expect(result.content).toBe('![Custom Diagram](<image1.png>)\n\n![image-def456.png](<image2.png>)\n');
  expect(Object.keys(result.assets)).toEqual(['image1.png','image2.png']);
+});
+it('preserves all recognized YAML frontmatter variations intact in compatible Markdown exports and ignores YAML image literals',async()=>{
+ native.mockReset();
+ const variations=[
+  '\uFEFF---\ntitle: "![Not an image](missing.png)"\nbanner: "![[unbundled-bom-banner.png]]"\ntags: [a, b]\n---\n\n:::callout tip\nBody\n:::',
+  '---   \ntitle: Dot Closer\nbanner: "![[unbundled-dot-banner.png]]"\n...  \n\n:::callout note\nBody\n:::',
+  '---\n---\n\n# After empty block',
+  '---\ntitle: EOF Only\n---',
+ ];
+ for(const source of variations){
+  const front=source.includes('Body')?source.split('\n\n:::callout')[0]:source.split('\n\n#')[0];
+  const result=await prepareMarkdownExport(source,'/notes/test.md',{compatible:true});
+  expect(result.content.startsWith(front)).toBe(true);
+  expect(result.assets).toEqual({});
+ }
+ expect(native).not.toHaveBeenCalled();
+});
+
+describe("bounded concurrent read-only Markdown asset preparation", () => {
+  const deferred = <T,>() => {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+    return { promise, resolve, reject };
+  };
+
+  it("caps concurrent read-only native loads at MAX_MARKDOWN_EXPORT_CONCURRENCY and deduplicates repeated sources", async () => {
+    expect(MAX_MARKDOWN_EXPORT_CONCURRENCY).toBe(4);
+    const pending = new Map<string, ReturnType<typeof deferred<string>>>();
+    let inFlight = 0;
+    let peakInFlight = 0;
+
+    native.mockImplementation((command: string, args: { source: string }) => {
+      expect(["load_asset", "load_text_asset"]).toContain(command);
+      inFlight++;
+      peakInFlight = Math.max(peakInFlight, inFlight);
+      const entry = deferred<string>();
+      pending.set(args.source, entry);
+      return entry.promise.finally(() => { inFlight--; });
+    });
+
+    const source = [
+      ...Array.from({ length: 8 }, (_, index) => `![Asset ${index + 1}](assets/import-${index + 1}.png)`),
+      "![Chart](diagrams/flow-1.mmd)",
+      "[Second Chart](diagrams/flow-2.mermaid)",
+      "![Duplicate Asset 1](assets/import-1.png)",
+      "[Duplicate Chart](diagrams/flow-1.mmd)",
+    ].join("\n\n");
+
+    const onProgress = vi.fn();
+    const preparation = prepareMarkdownExport(source, "/notes/concurrent.smd", { onProgress });
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(4));
+    expect(peakInFlight).toBe(4);
+    expect([...pending.keys()]).toEqual([
+      "assets/import-1.png",
+      "assets/import-2.png",
+      "assets/import-3.png",
+      "assets/import-4.png",
+    ]);
+
+    for (const key of ["assets/import-4.png", "assets/import-3.png", "assets/import-2.png", "assets/import-1.png"]) {
+      const idx = key.match(/\d+/)?.[0] ?? "0";
+      pending.get(key)!.resolve(`data:image/png;base64,${btoa(`png-${idx}`)}`);
+    }
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(8));
+    expect(peakInFlight).toBeLessThanOrEqual(4);
+
+    for (const key of ["assets/import-8.png", "assets/import-7.png", "assets/import-6.png", "assets/import-5.png"]) {
+      const idx = key.match(/\d+/)?.[0] ?? "0";
+      pending.get(key)!.resolve(`data:image/png;base64,${btoa(`png-${idx}`)}`);
+    }
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(10));
+    expect(peakInFlight).toBeLessThanOrEqual(4);
+
+    pending.get("diagrams/flow-2.mermaid")!.resolve("graph LR\n  B-->C\n");
+    pending.get("diagrams/flow-1.mmd")!.resolve("graph TD\n  A-->B\n");
+
+    const result = await preparation;
+    expect(native).toHaveBeenCalledTimes(10);
+    expect(Object.keys(result.assets)).toEqual(
+      Array.from({ length: 8 }, (_, index) => `image${index + 1}.png`),
+    );
+    for (let index = 1; index <= 8; index++) {
+      expect(result.assets[`image${index}.png`]).toBe(`data:image/png;base64,${btoa(`png-${index}`)}`);
+    }
+    expect(result.content).toContain("![Duplicate Asset 1](<image1.png>)");
+    expect(onProgress).toHaveBeenCalledWith({ phase: "assets", completed: 10, total: 10 });
+  });
+
+  it("preserves deterministic source order, filename assignment, and reference cleanup when later assets resolve first", async () => {
+    const slowFirst = deferred<string>();
+    const fastSecond = deferred<string>();
+    const fastNamedSvg = deferred<string>();
+    const slowMermaid = deferred<string>();
+    const fastRefSvg = deferred<string>();
+
+    native.mockImplementation((command: string, args: { source: string }) => {
+      if (command === "load_asset" && args.source === "image1.png") {
+        return Promise.resolve(`data:image/png;base64,${btoa("reserved-image1")}`);
+      }
+      if (command === "load_asset" && args.source === "assets/import-first.png") return slowFirst.promise;
+      if (command === "load_asset" && args.source === "assets/import-second.jpg") return fastSecond.promise;
+      if (command === "load_asset" && args.source === "diagrams/arch.svg") return fastNamedSvg.promise;
+      if (command === "load_text_asset" && args.source === "diagrams/steps.mmd") return slowMermaid.promise;
+      if (command === "load_asset" && args.source === "assets/image-third.svg") return fastRefSvg.promise;
+      throw new Error(`Unexpected native call: ${command} ${args.source}`);
+    });
+
+    const inlineGif = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+    const source = [
+      "![First Generated](assets/import-first.png)",
+      `![Inline Gif](${inlineGif})`,
+      "![Second Generated](assets/import-second.jpg)",
+      "[Architecture](diagrams/arch.svg)",
+      "![Flow][m]",
+      "![Third Generated][g]",
+      "![Reserved](image1.png)",
+      "",
+      "[m]: diagrams/steps.mmd",
+      "[g]: assets/image-third.svg",
+      "",
+    ].join("\n\n");
+
+    const compatiblePromise = prepareMarkdownExport(source, "/notes/order.smd", { compatible: true });
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(4));
+
+    fastNamedSvg.resolve(`data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>')}`);
+    fastSecond.resolve(`data:image/jpeg;base64,${btoa("second-jpeg")}`);
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(6));
+    fastRefSvg.resolve(`data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>')}`);
+    slowMermaid.resolve("flowchart TD\n  Start-->Stop\n");
+    slowFirst.resolve(`data:image/png;base64,${btoa("first-png")}`);
+
+    const compatibleResult = await compatiblePromise;
+
+    expect(Object.keys(compatibleResult.assets)).toEqual([
+      "image2.png",
+      "image3.gif",
+      "image4.jpg",
+      "diagrams/arch.svg",
+      "image5.svg",
+      "image1.png",
+    ]);
+    expect(compatibleResult.assets["image2.png"]).toBe(`data:image/png;base64,${btoa("first-png")}`);
+    expect(compatibleResult.assets["image3.gif"]).toBe(inlineGif);
+    expect(compatibleResult.assets["image4.jpg"]).toBe(`data:image/jpeg;base64,${btoa("second-jpeg")}`);
+    expect(compatibleResult.assets["image5.svg"]).toBe(
+      `data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>')}`,
+    );
+    expect(compatibleResult.assets["image1.png"]).toBe(`data:image/png;base64,${btoa("reserved-image1")}`);
+    expect(compatibleResult.content.indexOf("![First Generated](<image2.png>)")).toBeLessThan(
+      compatibleResult.content.indexOf("![Inline Gif](<image3.gif>)"),
+    );
+    expect(compatibleResult.content.indexOf("![Inline Gif](<image3.gif>)")).toBeLessThan(
+      compatibleResult.content.indexOf("![Second Generated](<image4.jpg>)"),
+    );
+    expect(compatibleResult.content.indexOf("![Architecture](<diagrams/arch.svg>)")).toBeLessThan(
+      compatibleResult.content.indexOf("```mermaid\nflowchart TD\n  Start-->Stop\n```"),
+    );
+    expect(compatibleResult.content.indexOf("```mermaid\nflowchart TD\n  Start-->Stop\n```")).toBeLessThan(
+      compatibleResult.content.indexOf("![Third Generated](<image5.svg>)"),
+    );
+    expect(compatibleResult.content).not.toContain("[m]:");
+    expect(compatibleResult.content).not.toContain("[g]:");
+  });
+
+  it("rejects pre-aborted signals, stops queued tasks on cancellation or error, suppresses stale progress, and cleans up abort listeners", async () => {
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await expect(
+      prepareMarkdownExport("![Photo](photo.png)", "/notes/a.md", { compatible: true, signal: preAborted.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(native).not.toHaveBeenCalled();
+
+    const pending = Array.from({ length: 4 }, () => deferred<string>());
+    native.mockImplementation(() => pending[native.mock.calls.length - 1].promise);
+    const markdown = Array.from({ length: 7 }, (_, index) => `![Photo ${index}](photo-${index}.png)`).join("\n\n");
+
+    const controller = new AbortController();
+    const addListenerSpy = vi.spyOn(controller.signal, "addEventListener");
+    const removeListenerSpy = vi.spyOn(controller.signal, "removeEventListener");
+    const onProgress = vi.fn();
+
+    const cancelledRun = prepareMarkdownExport(markdown, "/notes/a.md", {
+      signal: controller.signal,
+      onProgress,
+    });
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(4));
+    controller.abort();
+    await expect(cancelledRun).rejects.toMatchObject({ name: "AbortError" });
+    const progressCallsAtAbort = onProgress.mock.calls.length;
+
+    for (const item of pending) item.resolve("data:image/png;base64,aGVsbG8=");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(native).toHaveBeenCalledTimes(4);
+    expect(onProgress).toHaveBeenCalledTimes(progressCallsAtAbort);
+    expect(removeListenerSpy.mock.calls.length).toBeGreaterThanOrEqual(addListenerSpy.mock.calls.length);
+
+    // Same-tick resolution + cancellation still rejects with AbortError without publishing output.
+    native.mockReset();
+    const racePending = deferred<string>();
+    native.mockReturnValue(racePending.promise);
+    const raceController = new AbortController();
+    const racePreparation = prepareMarkdownExport("![Photo](photo.png)", "/notes/a.md", { signal: raceController.signal });
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(1));
+    racePending.resolve("data:image/png;base64,aGVsbG8=");
+    raceController.abort();
+    await expect(racePreparation).rejects.toMatchObject({ name: "AbortError" });
+
+    // Listener removal on normal completion.
+    native.mockReset();
+    const okController = new AbortController();
+    const okAddSpy = vi.spyOn(okController.signal, "addEventListener");
+    const okRemoveSpy = vi.spyOn(okController.signal, "removeEventListener");
+    native.mockResolvedValue("data:image/png;base64,aGVsbG8=");
+    await prepareMarkdownExport("![Single](single.png)", "/notes/a.md", { signal: okController.signal });
+    expect(okRemoveSpy.mock.calls.length).toBeGreaterThanOrEqual(okAddSpy.mock.calls.length);
+
+    // Queued tasks stop starting immediately when an in-flight worker fails.
+    native.mockReset();
+    const errorWave = Array.from({ length: 4 }, () => deferred<string>());
+    native.mockImplementation(() => errorWave[native.mock.calls.length - 1].promise);
+    const failedRun = prepareMarkdownExport(markdown, "/notes/a.md");
+    await vi.waitFor(() => expect(native).toHaveBeenCalledTimes(4));
+    errorWave[1].reject(new Error("Read permission denied"));
+    await expect(failedRun).rejects.toThrow("Read permission denied");
+    for (const [idx, item] of errorWave.entries()) {
+      if (idx !== 1) item.resolve("data:image/png;base64,aGVsbG8=");
+    }
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(native).toHaveBeenCalledTimes(4);
+  });
+
+  it("never fetches remote images or runs Python across Markdown, HTML, wikilink, or compatible step references", async () => {
+    native.mockImplementation(async (command: string, args: { source?: string }) => {
+      if (command === "load_asset" && args.source === "local/diagram.png") {
+        return "data:image/png;base64,aGVsbG8=";
+      }
+      if (command === "load_python_output") return null;
+      throw new Error(`Disallowed native command during Markdown export: ${command}`);
+    });
+
+    const source = [
+      "![Local](local/diagram.png)",
+      "![HTTPS](https://untrusted.example/track.png)",
+      "![HTTP](http://untrusted.example/plain.png)",
+      "![ProtocolRelative](//untrusted.example/proto.png)",
+      "![Credentialed](https://user:secret@untrusted.example/private.png)",
+      "![RefRemote][r]",
+      "[RemoteSvg](https://untrusted.example/diagram.svg)",
+      "![[https://untrusted.example/obsidian.png|Remote Wiki]]",
+      '<img src="https://untrusted.example/raw-html.png" alt="Raw HTML">',
+      [
+        "```smd-steps",
+        JSON.stringify({
+          title: "Remote Step Check",
+          steps: [
+            { label: "External", image: "https://untrusted.example/step.png", description: "Stays unfetched." },
+            { label: "Inline HTML", markdown: '<img src="https://untrusted.example/step-html.png">' },
+          ],
+        }),
+        "```",
+      ].join("\n"),
+      ["```python", "print('never execute')", "```"].join("\n"),
+      "[r]: https://untrusted.example/ref.png",
+    ].join("\n\n");
+
+    const plain = await prepareMarkdownExport(source, "/notes/consent.smd");
+    expect(plain.assets).toEqual({ "local/diagram.png": "data:image/png;base64,aGVsbG8=" });
+    expect(plain.content).toContain("https://untrusted.example/track.png");
+    expect(plain.content).toContain("[r]: https://untrusted.example/ref.png");
+    expect(plain.content).toContain('<img src="https://untrusted.example/raw-html.png" alt="Raw HTML">');
+
+    const compatible = await prepareMarkdownExport(source, "/notes/consent.smd", { compatible: true });
+    expect(compatible.assets).toEqual({ "local/diagram.png": "data:image/png;base64,aGVsbG8=" });
+    expect(compatible.content).toContain("![External](<https://untrusted.example/step.png>)");
+    expect(native.mock.calls.every(([command]) => command !== "fetch_resource" && command !== "run_python")).toBe(true);
+  });
 });
 

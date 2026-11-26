@@ -25,22 +25,28 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
     from PySide6.QtTest import QTest
+    from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
     from PySide6.QtWidgets import QApplication
 
-    QQuickStyle.setStyle("Material")
-    QtWebEngineQuick.initialize()
-    app = QApplication(["Super MD source mouse selection test"])
-
     sys.path.insert(0, str(ROOT))
+    from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
     from reader_gestures import ReaderGestures
     from studio import Session, Studio
+
+    QQuickStyle.setStyle("Material")
+    register_reader_schemes()
+    QtWebEngineQuick.initialize()
+    app = QApplication(["Super MD source mouse selection test"])
+    bundle_handler = ReaderBundleSchemeHandler(ROOT.parent / "dist", app)
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
 
     with tempfile.TemporaryDirectory(prefix="supermd-source-selection-") as temp_dir:
         target_text = NOTE_TEXT
         content = "# Mouse selection probe\n" + target_text + "\nSecond line after the selection.\n"
         session = Session(True)
         session.settings["welcomed"] = True
+        session.settings["python"] = sys.executable
         session.settings["newNoteLocation"] = temp_dir
         studio = Studio(True, session)
         studio.settings["normalZoom"] = zoom
@@ -59,7 +65,7 @@ def _probe(mode: str, zoom: float = 95.59963715447921, fullscreen: bool = False)
             raise RuntimeError("Qt WebChannel runtime unavailable")
         engine = QQmlApplicationEngine()
         engine.rootContext().setContextProperty("studio", studio)
-        engine.rootContext().setContextProperty("readerUrl", QUrl.fromLocalFile(str(ROOT.parent / "dist" / "qt-reader.html")))
+        engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
         engine.rootContext().setContextProperty("channelScript", bytes(channel.readAll()).decode())
         engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(ROOT.parent / "public" / "brand-mark-fixed.svg")))
         engine.load(QUrl.fromLocalFile(str(ROOT / "qml" / "Main.qml")))

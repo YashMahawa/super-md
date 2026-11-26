@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -11,6 +12,7 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 from PySide6.QtCore import QEvent, QPointF, QUrl, Qt
 from PySide6.QtGui import QGuiApplication, QKeySequence
 from PySide6.QtQml import QQmlComponent, QQmlEngine
+from PySide6.QtQuick import QQuickWindow  # noqa: F401
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
@@ -52,10 +54,14 @@ def _production_shortcut_enabled():
 class ShortcutSettingsSmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        QQuickStyle.setStyle("Material")
+        if QQuickStyle.name() != "Material":
+            QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["shortcut settings smoke"])
 
     def setUp(self):
+        self._discover_patch = patch("python_runtime.discover", return_value=[])
+        self.discover_mock = self._discover_patch.start()
+        self.addCleanup(self._discover_patch.stop)
         self.session = Session(True)
         self.studio = QuietStudio(True, self.session)
         self.engine = QQmlEngine()
@@ -132,6 +138,18 @@ ApplicationWindow {{
         }
         for action in actions:
             self.assertIsNotNone(self.named_item("shortcutRecorder_" + action["id"]))
+        for format_action in ("bold", "italic", "inline_code", "link", "heading", "list", "quote", "inline_math"):
+            self.assertIn(format_action, default_bindings)
+        self.assertIn("Italic", self.studio.setShortcut("bold", "Ctrl+I"))
+        self.assertEqual(self.studio.setShortcut("bold", "Ctrl+Alt+B"), "")
+        self.assertEqual(self.studio.shortcutSequences("bold"), ["Ctrl+Alt+B"])
+        self.assertEqual(self.studio.setShortcut("bold", ""), "")
+        self.assertEqual(self.studio.shortcutSequences("bold"), [])
+        emitted_calls = []
+        self.studio.readerCall.connect(emitted_calls.append)
+        self.studio.command("format_bold")
+        self.assertIn("window.supermdFormat?.('bold')", emitted_calls)
+        self.assertEqual(self.studio.resetShortcuts(), "")
         # Main.qml's Settings dialog is the single modal. Picking its shortcuts
         # category must not add another modal layer over the settings page.
         self.window.setProperty("modalDialogCount", 1)
@@ -155,7 +173,7 @@ ApplicationWindow {{
         QTest.qWait(20)
         self.assertTrue(recorder.property("recording"), "Clicking a shortcut row must start key capture")
         self.assertTrue(self.window.property("capturingShortcut"))
-        QTest.keyClick(self.window, Qt.Key_K, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_K, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier)
         QTest.qWait(40)
         self.assertFalse(self.window.property("capturingShortcut"))
         self.assertEqual(self.studio.shortcutSequences("find"), ["Ctrl+Alt+K"])
@@ -202,22 +220,85 @@ ApplicationWindow {{
         field = self.named_item("nativeTextField")
         self.assertIsNotNone(field)
         field.forceActiveFocus()
-        QTest.keyClick(self.window, Qt.Key_A, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
         QGuiApplication.clipboard().setText("clipboard sentinel")
-        QTest.keyClick(self.window, Qt.Key_C, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(40)
         self.assertFalse(self.window.property("copyShortcutTriggered"), "The app-level reader copy action must yield to native text inputs")
         self.assertEqual(QGuiApplication.clipboard().text(), "native clipboard", "Ctrl+C must copy the selected QML field text")
 
     def test_application_shortcuts_stay_inside_settings_modal(self):
         self.window.setProperty("modalDialogCount", 1)
-        QTest.keyClick(self.window, Qt.Key_N, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_N, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(40)
         self.assertFalse(self.window.property("newNoteShortcutTriggered"), "A modal settings dialog must disable background app actions")
         self.window.setProperty("modalDialogCount", 0)
-        QTest.keyClick(self.window, Qt.Key_N, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClick(self.window, Qt.Key.Key_N, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(40)
         self.assertTrue(self.window.property("newNoteShortcutTriggered"), "The app action should reactivate when the modal closes")
+
+    def test_python_discovery_defers_until_python_section_is_opened(self):
+        page = self.window.findChild(object, "settingsPage")
+        self.assertIsNotNone(page)
+        self.assertEqual(page.property("section"), "appearance")
+        self.discover_mock.assert_not_called()
+        page.setProperty("section", "python")
+        deadline = 40
+        while not self.discover_mock.called and deadline > 0:
+            QTest.qWait(25)
+            deadline -= 1
+        self.discover_mock.assert_called_once()
+        page.setProperty("section", "reading")
+        QTest.qWait(20)
+        page.setProperty("section", "python")
+        QTest.qWait(40)
+        self.discover_mock.assert_called_once()
+
+    def test_appearance_settings_expose_bundled_presets_saved_themes_and_scoped_file_actions(self):
+        import custom_theme
+        from unittest.mock import patch
+        page = self.window.findChild(object, "settingsPage")
+        self.assertIsNotNone(page)
+        page.setProperty("section", "appearance")
+        QTest.qWait(30)
+        preset_choice = self.named_item("bundledThemeChoice")
+        self.assertIsNotNone(preset_choice)
+        self.assertEqual(preset_choice.property("count"), 17, "Built-in appearance plus 16 bundled presets must be selectable")
+        edit_btn = self.named_item("editThemeFile")
+        reload_btn = self.named_item("reloadThemeFile")
+        self.assertIsNotNone(edit_btn)
+        self.assertIsNotNone(reload_btn)
+        self.assertFalse(edit_btn.isVisible())
+        self.assertFalse(reload_btn.isVisible())
+
+        source = self.studio.data / "imported-ui.supermd-theme.json"
+        source.write_text(json.dumps({**custom_theme.TEMPLATE, "name": "UI Imported"}))
+        pending = []
+        with patch.object(self.studio, "_engine", return_value=Path("unused-theme-engine")), patch.object(
+            self.studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))
+        ), patch("custom_theme.read", side_effect=lambda _, p: json.loads(Path(p).read_text())):
+            self.studio.importCustomTheme(str(source))
+            while pending:
+                action, done = pending.pop(0)
+                done(action(), None)
+        QTest.qWait(40)
+        self.assertTrue(edit_btn.isVisible())
+        self.assertTrue(reload_btn.isVisible())
+        saved_entry = self.studio.savedThemes[0]
+        self.assertIsNotNone(self.named_item("deleteSavedTheme_" + saved_entry["id"]))
+
+        pending = []
+        with patch.object(self.studio, "_engine", return_value=Path("unused-theme-engine")), patch.object(
+            self.studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))
+        ), patch("custom_theme.read", side_effect=lambda _, p: json.loads(Path(p).read_text())):
+            self.studio.selectBundledTheme("study-desk")
+            while pending:
+                action, done = pending.pop(0)
+                done(action(), None)
+        QTest.qWait(40)
+        self.assertFalse(edit_btn.isVisible(), "Bundled presets must hide external file edit/reload actions")
+        self.assertFalse(reload_btn.isVisible())
+        self.assertIsNotNone(self.named_item("deleteSavedTheme_" + saved_entry["id"]), "Saved imported themes remain available while a preset is active")
 
     def test_writing_typewriter_scroll_switch_and_shortcut_row_sync_with_studio(self):
         page = self.window.findChild(object, "settingsPage")
@@ -244,6 +325,177 @@ ApplicationWindow {{
         recorder = self.named_item("shortcutRecorder_typewriter_scroll")
         self.assertIsNotNone(recorder)
         self.assertEqual(self.studio.shortcutSequences("typewriter_scroll"), ["Ctrl+Alt+T"])
+
+    def test_python_discovery_waits_for_visible_python_section_and_rescans_on_demand(self):
+        from unittest.mock import patch
+
+        session = Session(True)
+        studio = QuietStudio(True, session)
+        engine = QQmlEngine()
+        engine.rootContext().setContextProperty("studio", studio)
+        source = '''import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+import "."
+ApplicationWindow {
+    id: host
+    width: 960; height: 700; visible: true
+    property var viewState: JSON.parse(studio.snapshot)
+    property bool settingsOpen: false
+    property int modalDialogCount: 0
+    onSettingsOpenChanged: settingsOpen ? settingsDialog.open() : settingsDialog.close()
+    Material.theme: viewState.dark ? Material.Dark : Material.Light
+    AppDialog {
+        id: settingsDialog
+        objectName: "settingsDialog"
+        width: Math.min(840, host.width - 48)
+        height: Math.min(760, host.height - 48)
+        padding: 0
+        onClosed: host.settingsOpen = false
+        SettingsPage { ownerPopup: settingsDialog; viewState: host.viewState; anchors.fill: parent; onBack: host.settingsOpen = false }
+    }
+}'''
+        component = QQmlComponent(engine)
+        component.setData(source.encode(), QUrl.fromLocalFile(str(QML_DIR / "deferred-python-settings-smoke.qml")))
+        self.assertFalse(component.isError(), "\n".join(error.toString() for error in component.errors()))
+        with patch.object(studio, "refreshPython", wraps=studio.refreshPython) as refresh_spy, patch(
+            "python_runtime.discover", return_value=[{"path": sys.executable, "label": "System Python 3.12", "detail": "ready", "matplotlib": True, "managed": False, "venv": False}]
+        ) as discover_mock:
+            dialog_window = component.create()
+            self.assertIsNotNone(dialog_window)
+            try:
+                QTest.qWait(40)
+                page = dialog_window.findChild(object, "settingsPage")
+                dialog = dialog_window.findChild(object, "settingsDialog")
+                self.assertIsNotNone(page)
+                self.assertIsNotNone(dialog)
+                self.assertFalse(dialog.property("visible"))
+                self.assertFalse(studio.pythonBusy)
+                self.assertEqual(refresh_spy.call_count, 0)
+                self.assertEqual(discover_mock.call_count, 0)
+
+                # Selecting "python" while settingsDialog remains closed must not scan.
+                page.setProperty("section", "python")
+                QTest.qWait(30)
+                self.assertEqual(refresh_spy.call_count, 0)
+                page.setProperty("section", "appearance")
+                QTest.qWait(20)
+
+                # Opening Settings on "appearance" and switching to "shortcuts" spawns 0 scans.
+                dialog_window.setProperty("settingsOpen", True)
+                QTest.qWait(40)
+                self.assertTrue(dialog.property("visible"))
+                self.assertEqual(refresh_spy.call_count, 0)
+                page.setProperty("section", "shortcuts")
+                QTest.qWait(30)
+                self.assertEqual(refresh_spy.call_count, 0)
+                self.assertEqual(discover_mock.call_count, 0)
+
+                # Switching section to "python" while visible calls studio.refreshPython() once.
+                page.setProperty("section", "python")
+                QTest.qWait(60)
+                self.assertEqual(refresh_spy.call_count, 1)
+                self.assertEqual(discover_mock.call_count, 1)
+
+                # Switching away and back does not trigger redundant automatic scans.
+                page.setProperty("section", "appearance")
+                QTest.qWait(20)
+                page.setProperty("section", "python")
+                QTest.qWait(40)
+                self.assertEqual(refresh_spy.call_count, 1)
+
+                # Clicking "Scan again" explicitly rescans.
+                scroll = dialog_window.findChild(object, "settingsScroll")
+                self.assertIsNotNone(scroll)
+                scroll_content = scroll.property("contentItem")
+                scroll_content.setProperty("contentY", max(0, scroll_content.property("contentHeight") - scroll.height()))
+                QTest.qWait(40)
+                rescan = dialog_window.findChild(object, "rescanPython")
+                self.assertIsNotNone(rescan)
+                self.assertTrue(rescan.property("enabled"))
+                point = rescan.mapToScene(QPointF(rescan.width() / 2, rescan.height() / 2)).toPoint()
+                QTest.mouseClick(dialog_window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+                QTest.qWait(60)
+                self.assertEqual(refresh_spy.call_count, 2)
+                self.assertEqual(discover_mock.call_count, 2)
+            finally:
+                dialog_window.close()
+                dialog_window.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                engine.deleteLater()
+                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                studio.stop()
+                studio.pool.shutdown(wait=True)
+                session.writes.shutdown(wait=True)
+
+    def test_main_qml_with_closed_settings_spawns_zero_python_probes(self):
+        import subprocess
+
+        probe_code = r'''
+import json, os, sys
+from pathlib import Path
+from unittest.mock import patch
+
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
+
+from PySide6.QtCore import QFile, QIODevice, QObject, QUrl
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtTest import QTest
+from PySide6.QtWebEngineQuick import QtWebEngineQuick
+from PySide6.QtWidgets import QApplication
+
+QQuickStyle.setStyle("Material")
+QtWebEngineQuick.initialize()
+app = QApplication(["main qml startup python probe test"])
+
+root = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(root))
+import python_runtime
+from studio import Session, Studio
+
+probes = []
+with patch("python_runtime.probe", side_effect=lambda *args, **kwargs: probes.append(args)):
+    for initial_python in ("", sys.executable):
+        session = Session(True)
+        session.settings["python"] = initial_python
+        studio = Studio(True, session)
+        channel = QFile(":/qtwebchannel/qwebchannel.js")
+        assert channel.open(QIODevice.OpenModeFlag.ReadOnly)
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("studio", studio)
+        engine.rootContext().setContextProperty("readerUrl", QUrl("about:blank"))
+        engine.rootContext().setContextProperty("channelScript", bytes(channel.readAll()).decode())
+        engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(root.parent / "public" / "brand-mark-fixed.svg")))
+        engine.load(QUrl.fromLocalFile(str(root / "qml" / "Main.qml")))
+        assert engine.rootObjects(), "Main.qml failed to load"
+        window = engine.rootObjects()[0]
+        assert window.property("settingsOpen") is False
+        assert window.findChild(QObject, "settingsPage") is not None
+        QTest.qWait(80)
+        assert studio.pythonBusy is False
+        assert bool(studio.settings["python"])
+        window.close()
+        del engine
+        studio.stop()
+        studio.pool.shutdown(wait=True, cancel_futures=True)
+        session.writes.shutdown(wait=True)
+
+print(json.dumps({"probes": len(probes)}), flush=True)
+os._exit(0)
+'''
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_code, str(Path(__file__).resolve().parent)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, f"{completed.stdout}\n{completed.stderr}")
+        payload = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(payload["probes"], 0)
 
 
 if __name__ == "__main__":
