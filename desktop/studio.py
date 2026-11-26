@@ -895,7 +895,8 @@ class Studio(QObject):
         else:self.session.pinned.append(path)
         self.recent=self.recent
         self._preferences()
-        self._notify_sidebar()
+        for window in tuple(self.session.windows.values()):
+            window._notify_sidebar()
 
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
         assets = dict(assets) if assets else {}
@@ -3095,6 +3096,10 @@ class Studio(QObject):
     def _start_subfolder_search(self):
         if self.retired:
             return
+        self.filter_timer.stop()
+        if self._search_cancel is not None:
+            self._search_cancel.set()
+            self._search_cancel = None
         folder = self.folder
         needle = self.folder_filter.strip().casefold()
         if not folder or not needle:
@@ -3657,10 +3662,19 @@ class Studio(QObject):
         def work():
             if after.exists(): raise ValueError("A file with that name already exists.")
             before.rename(after)
-        def finished(_,error):
+            try:
+                st = after.stat()
+                return (st.st_mtime_ns, st.st_size)
+            except OSError:
+                return None
+        def finished(stamp,error):
             if error: return
             tab.update(path=str(after),name=name)
             for window in tuple(self.session.windows.values()):
+                if not window.retired:
+                    window.note_file_stamps.pop(str(before), None)
+                    if stamp:
+                        window.note_file_stamps[str(after)] = stamp
                 if window is not self and not window.retired:
                     for other_tab in window.tabs:
                         if other_tab["path"] == str(before):

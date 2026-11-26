@@ -106,6 +106,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.window = self.component.create()
         self.assertIsNotNone(self.window, str(self.component.errors()))
         QTest.qWait(40)
+        self._polish()
 
     def tearDown(self):
         self.window.close()
@@ -147,12 +148,38 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(predicate())
 
+    def _polish(self):
+        self.app.processEvents()
+        self.window.grabWindow()
+        self.app.processEvents()
+
+    def _settle_watchers(self):
+        for window in tuple(self.session.windows.values()):
+            if getattr(window, "retired", False):
+                continue
+            if window.external_timer.isActive() or window.external_paths:
+                window.external_timer.stop()
+                window.external_paths.clear()
+        QTest.qWait(25)
+        for window in tuple(self.session.windows.values()):
+            if getattr(window, "retired", False):
+                continue
+            window.external_timer.stop()
+            window.external_paths.clear()
+        self._polish()
+
+    @staticmethod
+    def _retire_window(window):
+        window.stop()
+        window.pool.shutdown(wait=True)
+        window._search_pool.shutdown(wait=True, cancel_futures=True)
+
     def _qml_dict(self, prop_name: str) -> dict:
         value = self.window.property(prop_name)
         return value.toVariant() if hasattr(value, "toVariant") else value
 
-    @staticmethod
-    def _list_delegates(list_view):
+    def _list_delegates(self, list_view):
+        self._polish()
         content = list_view.property("contentItem")
         return [
             child
@@ -181,7 +208,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
                 ],
             }),
         )
-        QTest.qWait(40)
+        self.wait_until(lambda: len(self._qml_dict("sidebarState")["outline"]) == 2)
 
         files_view = self.named("folderFilesView")
         outline_list = self.named("sidebarOutlineList")
@@ -190,17 +217,24 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.assertIsNotNone(outline_list)
         self.assertIsNotNone(recent_notes)
 
+        self.wait_until(
+            lambda: len(self._list_delegates(files_view)) == 3
+            and len(self._list_delegates(recent_notes)) == 1
+        )
         initial_file_delegates = self._list_delegates(files_view)
         initial_recent_delegates = self._list_delegates(recent_notes)
         self.assertEqual(len(initial_file_delegates), 3)
         self.assertEqual(len(initial_recent_delegates), 1)
 
         self.window.setProperty("sidebarSection", "contents")
-        QTest.qWait(30)
+        self.wait_until(lambda: len(self._list_delegates(outline_list)) == 2)
         initial_outline_delegates = self._list_delegates(outline_list)
         self.assertEqual(len(initial_outline_delegates), 2)
         self.window.setProperty("sidebarSection", "folder")
-        QTest.qWait(30)
+        self.wait_until(lambda: len(self._list_delegates(files_view)) == 3)
+        initial_file_delegates = self._list_delegates(files_view)
+        initial_recent_delegates = self._list_delegates(recent_notes)
+        self._settle_watchers()
 
         # Prime caches and record exact cached string references.
         baseline_sidebar_json = self.studio.sidebarSnapshot
@@ -358,14 +392,18 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
 
         # Cross-window tab move updates both source and destination sidebar states.
         second_studio = QuietStudio(True, self.session)
-        moved_id = self.studio.active
-        self.assertTrue(self.studio._move_tab(second_studio, moved_id, 0))
-        self.assertEqual(json.loads(second_studio.sidebarSnapshot)["active"], moved_id)
-        self.assertNotEqual(json.loads(self.studio.sidebarSnapshot)["active"], moved_id)
+        try:
+            moved_id = self.studio.active
+            self.assertTrue(self.studio._move_tab(second_studio, moved_id, 0))
+            self.assertEqual(json.loads(second_studio.sidebarSnapshot)["active"], moved_id)
+            self.assertNotEqual(json.loads(self.studio.sidebarSnapshot)["active"], moved_id)
+        finally:
+            self._retire_window(second_studio)
 
         # Incremental document_patch clean -> dirty -> clean flips tab dirty state without emitting sidebarChanged.
         self.studio.selectTab(overview_id)
-        QTest.qWait(20)
+        self.wait_until(lambda: self._qml_dict("sidebarState")["active"] == overview_id)
+        self._settle_watchers()
         sync_sidebar_signals = []
         self.studio.sidebarChanged.connect(lambda: sync_sidebar_signals.append(1))
         original_text = self.studio._current()["saved"]
@@ -387,8 +425,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
                 "changes": [{"from": utf16_len, "to": utf16_len, "insert": added_suffix}],
             }),
         )
-        QTest.qWait(20)
-        self.assertTrue(any(t["id"] == overview_id and t["dirty"] for t in self._qml_dict("viewState")["tabs"]))
+        self.wait_until(lambda: any(t["id"] == overview_id and t["dirty"] for t in self._qml_dict("viewState")["tabs"]))
         self.assertEqual(len(sync_sidebar_signals), 0)
         self.studio.post(
             "patch-clean",
@@ -401,24 +438,23 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
                 "changes": [{"from": utf16_len, "to": utf16_len + len(added_suffix), "insert": ""}],
             }),
         )
-        QTest.qWait(20)
-        self.assertFalse(any(t["id"] == overview_id and t["dirty"] for t in self._qml_dict("viewState")["tabs"]))
+        self.wait_until(lambda: not any(t["id"] == overview_id and t["dirty"] for t in self._qml_dict("viewState")["tabs"]))
         self.assertEqual(len(sync_sidebar_signals), 0)
 
         # External rename and delete propagate to pinned & recent slices.
         self.studio.pinRecent(str(overview))
         ext_renamed = self.workspace / "Overview Renamed.md"
         overview.rename(ext_renamed)
-        self.studio._location_changed(str(overview), str(ext_renamed))
-        QTest.qWait(20)
+        self.session.locationChanged.emit(str(overview), str(ext_renamed))
+        self.wait_until(lambda: self._qml_dict("sidebarState")["pinned"] == [str(ext_renamed)])
         self.assertIn(str(ext_renamed), self._qml_dict("sidebarState")["recent"])
-        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [str(ext_renamed)])
         ext_renamed.unlink()
-        self.studio._location_changed(str(ext_renamed), "")
-        self.wait_until(lambda: all(t["path"] != str(ext_renamed) for t in self.studio.tabs))
-        QTest.qWait(20)
+        self.session.locationChanged.emit(str(ext_renamed), "")
+        self.wait_until(
+            lambda: all(t["path"] != str(ext_renamed) for t in self.studio.tabs)
+            and self._qml_dict("sidebarState")["pinned"] == []
+        )
         self.assertNotIn(str(ext_renamed), self._qml_dict("sidebarState")["recent"])
-        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [])
 
     def test_preserves_updates_after_folder_operations_pins_and_startup_restore(self):
         # Open folder and expand nested directory.
@@ -446,28 +482,24 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.wait_until(
             lambda: not self.studio._folder_searching
             and not self.studio.filter_timer.isActive()
-            and [f["name"] for f in self.studio.files] == ["Coursework", "Week 1.md"]
+            and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["Coursework", "Week 1.md"]
         )
-        QTest.qWait(30)
-        self.assertEqual(
-            [f["name"] for f in self._qml_dict("sidebarState")["files"]],
-            ["Coursework", "Week 1.md"],
-        )
+        self._polish()
         self.assertFalse(empty_state.property("visible"))
 
         filter_field.setProperty("text", "nonexistent-note-xyz")
         self.wait_until(
             lambda: not self.studio._folder_searching
             and not self.studio.filter_timer.isActive()
-            and len(self.studio.files) == 0
+            and len(self._qml_dict("sidebarState")["files"]) == 0
         )
-        QTest.qWait(30)
+        self._polish()
         self.assertTrue(empty_state.property("visible"))
 
         # Clearing filter restores expanded tree.
         filter_field.setProperty("text", "")
-        self.wait_until(lambda: len(self.studio.files) == 4)
-        QTest.qWait(30)
+        self.wait_until(lambda: len(self._qml_dict("sidebarState")["files"]) == 4)
+        self._polish()
         self.assertFalse(empty_state.property("visible"))
 
         # External file creation in watched folder refreshes sidebar files.
@@ -476,26 +508,25 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.studio._external_note_changed(str(coursework))
         self.studio.external_timer.stop()
         self.studio._refresh_external_notes()
-        self.wait_until(lambda: any(f["name"] == "Week 2.md" for f in self.studio.files))
-        QTest.qWait(30)
-        self.assertIn("Week 2.md", [f["name"] for f in self._qml_dict("sidebarState")["files"]])
+        self.wait_until(lambda: any(f["name"] == "Week 2.md" for f in self._qml_dict("sidebarState")["files"]))
 
         # Pinning & unpinning recent notes updates sidebarState.pinned and studio.pinnedRecent across windows.
         second_studio = QuietStudio(True, self.session)
-        second_sidebar_signals = []
-        second_studio.sidebarChanged.connect(lambda: second_sidebar_signals.append(1))
-        self.studio.openNote(str(added))
-        self.wait_until(lambda: str(added) in self.studio.recent)
-        self.studio.pinRecent(str(added))
-        QTest.qWait(30)
-        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [str(added)])
-        self.assertEqual(self.studio.pinnedRecent, [str(added)])
-        self.assertEqual(json.loads(second_studio.sidebarSnapshot)["pinned"], [str(added)])
-        self.assertGreaterEqual(len(second_sidebar_signals), 1)
+        try:
+            second_sidebar_signals = []
+            second_studio.sidebarChanged.connect(lambda: second_sidebar_signals.append(1))
+            self.studio.openNote(str(added))
+            self.wait_until(lambda: str(added) in self.studio.recent)
+            self.studio.pinRecent(str(added))
+            self.wait_until(lambda: self._qml_dict("sidebarState")["pinned"] == [str(added)])
+            self.assertEqual(self.studio.pinnedRecent, [str(added)])
+            self.assertEqual(json.loads(second_studio.sidebarSnapshot)["pinned"], [str(added)])
+            self.assertGreaterEqual(len(second_sidebar_signals), 1)
+        finally:
+            self._retire_window(second_studio)
 
         self.studio.pinRecent(str(added))
-        QTest.qWait(30)
-        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [])
+        self.wait_until(lambda: self._qml_dict("sidebarState")["pinned"] == [])
 
         # Closing folder clears folder & files while keeping recent notes intact.
         self.studio.closeFolder()
@@ -529,6 +560,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.studio.openNote(str(overview))
         self.wait_until(lambda: self.studio._current()["path"] == str(overview))
         self.assertNotIn("outline", self.studio._current())
+        self._settle_watchers()
 
         baseline_sidebar = self.studio.sidebarSnapshot
         _ = self.studio.snapshot
@@ -563,25 +595,26 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
 
         # 3. Renaming a pinned note via renameNote updates both sidebarState.pinned and sidebarState.recent cleanly.
         self.studio.pinRecent(str(overview))
-        QTest.qWait(20)
-        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [str(overview)])
+        self.wait_until(lambda: self._qml_dict("sidebarState")["pinned"] == [str(overview)])
 
         second_studio = QuietStudio(True, self.session)
-        second_studio.openFolder(str(self.workspace))
-        self.wait_until(lambda: len(second_studio.files) == 3)
+        try:
+            second_studio.openFolder(str(self.workspace))
+            self.wait_until(lambda: len(second_studio.files) == 3)
 
-        renamed_overview = self.workspace / "Course Overview.md"
-        self.studio.renameNote(active_id, "Course Overview.md")
-        self.wait_until(
-            lambda: renamed_overview.is_file()
-            and any(f["name"] == "Course Overview.md" for f in self.studio.files)
-            and any(f["name"] == "Course Overview.md" for f in second_studio.files)
-        )
-        QTest.qWait(25)
-        self.assertEqual(self._qml_dict("sidebarState")["pinned"], [str(renamed_overview)])
-        self.assertNotIn(str(overview), self._qml_dict("sidebarState")["recent"])
-        self.assertIn(str(renamed_overview), self._qml_dict("sidebarState")["recent"])
-        self.assertIn("Course Overview.md", [f["name"] for f in json.loads(second_studio.sidebarSnapshot)["files"]])
+            renamed_overview = self.workspace / "Course Overview.md"
+            self.studio.renameNote(active_id, "Course Overview.md")
+            self.wait_until(
+                lambda: renamed_overview.is_file()
+                and any(f["name"] == "Course Overview.md" for f in self._qml_dict("sidebarState")["files"])
+                and any(f["name"] == "Course Overview.md" for f in second_studio.files)
+                and self._qml_dict("sidebarState")["pinned"] == [str(renamed_overview)]
+            )
+            self.assertNotIn(str(overview), self._qml_dict("sidebarState")["recent"])
+            self.assertIn(str(renamed_overview), self._qml_dict("sidebarState")["recent"])
+            self.assertIn("Course Overview.md", [f["name"] for f in json.loads(second_studio.sidebarSnapshot)["files"]])
+        finally:
+            self._retire_window(second_studio)
 
         # 4. Saving a new note via saveAs inside an unexpanded subfolder refreshes active folderFilter results immediately.
         filter_field = self.named("folderFilterField")
@@ -589,7 +622,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.wait_until(
             lambda: not self.studio._folder_searching
             and not self.studio.filter_timer.isActive()
-            and [f["name"] for f in self.studio.files] == ["Coursework", "Week 1.md"]
+            and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["Coursework", "Week 1.md"]
         )
         self.studio.newNote()
         week3_id = self.studio.active
@@ -599,12 +632,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.wait_until(
             lambda: week3_path.is_file()
             and not self.studio._folder_searching
-            and [f["name"] for f in self.studio.files] == ["Coursework", "Week 1.md", "Week 3.md"]
-        )
-        QTest.qWait(25)
-        self.assertEqual(
-            [f["name"] for f in self._qml_dict("sidebarState")["files"]],
-            ["Coursework", "Week 1.md", "Week 3.md"],
+            and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["Coursework", "Week 1.md", "Week 3.md"]
         )
 
 
