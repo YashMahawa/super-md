@@ -1261,3 +1261,75 @@ it("combines accessible Edit block controls with prose URL wrapping, raw paste i
   host.remove();
 });
 
+it("toggles only the clicked nested task checkbox and keeps slider-containing tasks checked in LiveEditor", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+
+  const chartSpec = JSON.stringify({
+    series: [{ expression: "k * x" }],
+    sliders: [{ name: "k", label: "Slope", min: 1, max: 5, step: 1, value: 2 }],
+  });
+
+  let markdown = [
+    "# Study Session",
+    "",
+    "- [x] Review unit",
+    "  - [ ] Complete nested exercise",
+    "  - [x] Verify slider response",
+    "",
+    "    ```smd-chart",
+    `    ${chartSpec}`,
+    "    ```",
+  ].join("\n");
+
+  const renderLive = () =>
+    root.render(
+      <LiveEditor
+        markdown={markdown}
+        documentPath="/notes/live-tasks.md"
+        python=""
+        dark={false}
+        onChange={(next) => {
+          markdown = next;
+          renderLive();
+        }}
+      />,
+    );
+
+  await act(async () => { renderLive(); });
+
+  // Open the heading block and expand its draft so source offsets shift downstream,
+  // then change the study slider inside the checked nested task.
+  await act(async () => {
+    host.querySelector("h1")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  const updatedHeading = "# Study Session — Week 4";
+  await act(async () => { typeInTextarea(area, updatedHeading); });
+
+  const slider = host.querySelector<HTMLInputElement>('.chart-controls input[type="range"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(slider, "4");
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    slider.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  expect(host.querySelector(".chart-slider-head output")?.textContent).toBe("4");
+  expect(markdown).toContain(updatedHeading);
+  expect(markdown).toContain("  - [x] Verify slider response");
+
+  // Click the unchecked nested checkbox while the heading draft is still open:
+  // only "Complete nested exercise" flips to [x], keeping "Review unit" [x] and preserving the heading draft.
+  const checkboxes = host.querySelectorAll<HTMLInputElement>('input[type="checkbox"][data-task-checkbox]');
+  expect(checkboxes).toHaveLength(3);
+  await act(async () => {
+    checkboxes[1].click();
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+  expect(markdown).toContain(updatedHeading);
+  expect(markdown).toContain("- [x] Review unit\n  - [x] Complete nested exercise\n  - [x] Verify slider response");
+
+  await act(async () => root.unmount());
+  host.remove();
+});
+
