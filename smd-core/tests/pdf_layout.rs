@@ -577,3 +577,52 @@ fn html_images_with_angle_brackets_in_quoted_attributes_preserve_assets_and_widt
         }
     }
 }
+
+#[test]
+fn braced_python_and_mermaid_fences_match_standard_fence_highlighting_and_export_guards() {
+    let md = [
+        "```{python, echo=false}",
+        "def compute_wave(x):",
+        "    return \"BRACED_PYTHON_STRING\"",
+        "```",
+        "",
+        "~~~{.py #cell-two}",
+        "value = 42",
+        "~~~",
+        "",
+        "```{r, echo=FALSE}",
+        "x <- 1",
+        "```",
+        "",
+        "```{python",
+        "unclosed_brace = True",
+        "```",
+    ].join("\n");
+
+    let generated = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(generated.contains("lang: \"python\")"), "Expected normalized python lang: {generated}");
+    assert!(generated.contains("lang: \"py\")"), "Expected normalized py lang: {generated}");
+    assert!(generated.contains("lang: \"{r,\")"), "Non-Python/Mermaid braced fence must remain untouched: {generated}");
+    assert!(generated.contains("lang: \"{python\")"), "Unclosed brace fence must remain untouched: {generated}");
+
+    let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(pdf.starts_with(b"%PDF-"));
+    let streams = decompress_pdf_streams(&pdf).join("\n");
+    assert!(
+        streams.contains("0.09803922 0.53333336 0.0627451 scn"),
+        "Braced Python fence must retain Typst Python syntax highlighting in PDF streams: {streams}"
+    );
+
+    for mermaid_fence in [
+        "```{mermaid}\ngraph TD; A-->B\n```",
+        "```{.mermaid}\ngraph TD; A-->B\n```",
+        "```{mermaid, fig-width=6}\ngraph TD; A-->B\n```",
+        "~~~{mermaid echo=false}\ngraph TD; A-->B\n~~~",
+    ] {
+        let err = source(mermaid_fence, &PdfOptions::default(), &HashMap::new()).unwrap_err().to_string();
+        assert!(
+            err.contains("Export preparation did not render a mermaid block"),
+            "Headless export must guard braced Mermaid fence {mermaid_fence:?}, got: {err}"
+        );
+    }
+}

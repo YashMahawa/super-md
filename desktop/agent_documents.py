@@ -826,6 +826,19 @@ def _resolve_asset_id(assets: dict[str, str], asset_id: str) -> str:
 
 _SVG_FENCE_LANGUAGES = frozenset({"svg", "svg+xml", "image/svg+xml"})
 _DIAGRAM_FENCE_LANGUAGES = _SVG_FENCE_LANGUAGES | {"mermaid", "smd-chart"}
+_BRACED_FENCE_HEAD = re.compile(r"^\.?([A-Za-z][A-Za-z0-9_-]*)(?:$|[\s,#])")
+
+
+def normalize_fence_language(raw_info: str) -> str:
+    trimmed = raw_info.strip()
+    if len(trimmed) >= 4 and trimmed.startswith("{") and trimmed.endswith("}"):
+        match = _BRACED_FENCE_HEAD.match(trimmed[1:-1].strip())
+        if match:
+            lower = match.group(1).casefold()
+            if lower in ("python", "py", "mermaid"):
+                return lower
+    parts = trimmed.split(None, 1)
+    return parts[0].casefold() if parts else ""
 
 
 @dataclass(frozen=True)
@@ -838,6 +851,7 @@ class _FencedSpan:
     line_end: int
     is_svg: bool
     is_diagram: bool
+    language: str = ""
 
     def to_svg_dict(self) -> dict:
         return {
@@ -855,6 +869,7 @@ class _OpenFence:
     fence_start: int
     body_start: int
     line_start: int
+    language: str = ""
     svg_tagged: bool = False
     diagram_tagged: bool = False
     probe: list[str] = field(default_factory=list)
@@ -873,6 +888,7 @@ class _OpenFence:
             line_end=max(self.line_start, line_end),
             is_svg=is_svg,
             is_diagram=self.diagram_tagged or is_svg,
+            language=self.language,
         )
 
 
@@ -891,10 +907,7 @@ def _step_fence_boundary(
         return False, opened, None
     marker = match.group(1)
     if opened is None:
-        language = ""
-        if inspect_info:
-            info = body[match.end():].strip().split(None, 1)
-            language = info[0].casefold() if info else ""
+        language = normalize_fence_language(body[match.end():]) if inspect_info else ""
         svg_tagged = language in _SVG_FENCE_LANGUAGES
         return True, _OpenFence(
             char=marker[0],
@@ -902,6 +915,7 @@ def _step_fence_boundary(
             fence_start=offset,
             body_start=offset + line_len,
             line_start=line_number + 1,
+            language=language,
             svg_tagged=svg_tagged,
             diagram_tagged=svg_tagged or language in _DIAGRAM_FENCE_LANGUAGES,
         ), None
