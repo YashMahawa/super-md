@@ -1050,6 +1050,130 @@ it("continues and clears list, task, and quote markers on Enter and indents/outd
   delete document.documentElement.dataset.reduceMotion;
 });
 
+it("handles Tab and Shift+Tab through the active LiveEditor path across ordered lists, quotes, and multi-line selections", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let doc = [
+    "1. First step\n2. Second step\n\n   - [x] Nested task",
+    "> 1. Quoted parent\n> - Quoted child A\n>   - Quoted child B",
+    "> [!note]\n> Quoted prose",
+    "10. Ten\n11. Eleven",
+  ].join("\n\n");
+  const renderDoc = () =>
+    root.render(
+      <LiveEditor
+        markdown={doc}
+        documentPath={null}
+        dark={false}
+        python=""
+        onChange={(next) => {
+          doc = next;
+          renderDoc();
+        }}
+      />,
+    );
+  await act(async () => { renderDoc(); });
+
+  // 1. Ordered list single-line Tab, nested cap, Shift+Tab outdent, and loose multi-line selection
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[0]!.querySelector("li")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  let area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const secondCaret = area.value.indexOf("Second") + 3;
+  area.setSelectionRange(secondCaret, secondCaret);
+
+  const ordTab1 = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(ordTab1); });
+  expect(ordTab1.defaultPrevented).toBe(true);
+  expect(area.value).toBe("1. First step\n   2. Second step\n\n   - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([secondCaret + 3, secondCaret + 3]);
+  expect(document.activeElement).toBe(area);
+
+  const ordTabCap = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(ordTabCap); });
+  expect(ordTabCap.defaultPrevented).toBe(true);
+  expect(area.value).toBe("1. First step\n   2. Second step\n\n   - [x] Nested task");
+  expect(document.activeElement).toBe(area);
+
+  const ordShiftTab = new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(ordShiftTab); });
+  expect(ordShiftTab.defaultPrevented).toBe(true);
+  expect(area.value).toBe("1. First step\n2. Second step\n\n   - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([secondCaret, secondCaret]);
+
+  // Multi-line selection across ordered sibling + blank line + nested task item
+  const multiFrom = area.value.indexOf("2. Second step");
+  area.setSelectionRange(multiFrom, area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("1. First step\n   2. Second step\n\n      - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([multiFrom, area.value.length]);
+  expect(document.activeElement).toBe(area);
+
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("1. First step\n2. Second step\n\n   - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([multiFrom, area.value.length]);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // 2. Quoted list single-line & multi-line Tab/Shift+Tab (preserving `> ` prefix)
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[1]!.querySelector("li")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const quotedChildCaret = area.value.indexOf("Quoted child A");
+  area.setSelectionRange(quotedChildCaret, quotedChildCaret);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n>    - Quoted child A\n>   - Quoted child B");
+  expect(area.selectionStart).toBe(quotedChildCaret + 3);
+  expect(document.activeElement).toBe(area);
+
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n> - Quoted child A\n>   - Quoted child B");
+  expect(area.selectionStart).toBe(quotedChildCaret);
+
+  // Multi-line selection across quoted list items
+  const quotedMultiStart = area.value.indexOf("> - Quoted child A");
+  area.setSelectionRange(quotedMultiStart, area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n>    - Quoted child A\n>      - Quoted child B");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([quotedMultiStart, area.value.length]);
+
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n> - Quoted child A\n>   - Quoted child B");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([quotedMultiStart, area.value.length]);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // 3. Plain blockquote / callout prose Tab & Shift+Tab without stripping `> `
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[2]!.querySelector("p")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const proseCaret = area.value.indexOf("Quoted prose");
+  area.setSelectionRange(proseCaret, proseCaret);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> [!note]\n>   Quoted prose");
+  expect(area.selectionStart).toBe(proseCaret + 2);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> [!note]\n> Quoted prose");
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> [!note]\n> Quoted prose");
+  expect(document.activeElement).toBe(area);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // 4. Double-digit ordered list (`10. Ten\n11. Eleven`) aligns nested item at 4 spaces
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[3]!.querySelector("li")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const elevenCaret = area.value.indexOf("Eleven");
+  area.setSelectionRange(elevenCaret, elevenCaret);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("10. Ten\n    11. Eleven");
+  expect(area.selectionStart).toBe(elevenCaret + 4);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("10. Ten\n11. Eleven");
+  expect(area.selectionStart).toBe(elevenCaret);
+
+  act(() => root.unmount());
+  host.remove();
+});
+
 it("retains LiveEditor focus across WritingSuggestions replacement, dismissal, personal dictionary save, and single-step undo", async () => {
   vi.useFakeTimers();
   window.localStorage.removeItem("supermd.personal-dictionary.v1");

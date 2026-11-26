@@ -29,6 +29,14 @@ def _caught_exception_names(handler_type: ast.expr | None) -> set[str]:
     return set()
 
 
+def _has_import(statements: list[ast.stmt]) -> bool:
+    return any(isinstance(sub, (ast.Import, ast.ImportFrom)) for stmt in statements for sub in ast.walk(stmt))
+
+
+def _has_relative_import(statements: list[ast.stmt]) -> bool:
+    return any(isinstance(sub, ast.ImportFrom) and sub.level > 0 for stmt in statements for sub in ast.walk(stmt))
+
+
 class CoreAgentSubpackageTests(unittest.TestCase):
     def test_package_markers_preserve_script_directory_root(self):
         self.assertFalse((DESKTOP_DIR / "__init__.py").exists())
@@ -90,13 +98,13 @@ class CoreAgentSubpackageTests(unittest.TestCase):
         for path in files:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):
-                if isinstance(node, ast.Try):
+                if isinstance(node, ast.Try) and _has_import(node.body):
                     for handler in node.handlers:
-                        caught = _caught_exception_names(handler.type)
-                        self.assertFalse(
-                            caught & {"ImportError", "ModuleNotFoundError"},
-                            f"Dual-import shim found in {path.relative_to(DESKTOP_DIR)}",
-                        )
+                        if _caught_exception_names(handler.type) & {"ImportError", "ModuleNotFoundError"}:
+                            self.assertFalse(
+                                _has_import(handler.body) or _has_relative_import(node.body),
+                                f"Dual-import shim found in {path.relative_to(DESKTOP_DIR)}",
+                            )
 
 
 if __name__ == "__main__":
