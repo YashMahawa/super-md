@@ -13,12 +13,6 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
-    def __init__(self, isolated: bool = False, session: Session | None = None):
-        session = session or Session(isolated)
-        if not session.settings.get("python"):
-            session.settings["python"] = sys.executable
-        super().__init__(isolated, session)
-
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -217,6 +211,7 @@ class StudioTest(unittest.TestCase):
         self.session = Session(True)
         self.windows = []
         self.studio = self.window()
+        self.session.writes.flush(timeout=3)
 
     def window(self):
         window = QuietStudio(True,self.session)
@@ -321,6 +316,118 @@ class StudioTest(unittest.TestCase):
         studio._submit(lambda:1,lambda *_:self.fail("Retired callback ran"))
         studio._complete((lambda *_:self.fail("Retired callback ran"),None,None,False))
 
+    def test_startup_populates_default_python_before_reader_load_without_probing(self):
+        with (
+            patch("python_runtime.probe", side_effect=AssertionError("startup must not probe Python")),
+            patch("python_runtime.discover", side_effect=AssertionError("startup must not discover Python")),
+        ):
+            fresh_session = Session(True)
+            self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+            self.assertEqual(fresh_session.settings["python"], "")
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            self.assertFalse(fresh_studio.pythonBusy)
+            self.assertTrue(fresh_studio.settings["python"])
+            loads = []
+            fresh_studio.readerLoad.connect(loads.append)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.assertEqual(json.loads(loads[-1])["python"], fresh_studio.settings["python"])
+            self.app.processEvents()
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            saved_session = Session(True)
+            self.addCleanup(lambda: saved_session.writes.shutdown(wait=True))
+            saved_session.settings["python"] = sys.executable
+            saved_studio = QuietStudio(True, saved_session)
+            self.windows.append(saved_studio)
+            self.assertFalse(saved_studio.pythonBusy)
+            self.assertEqual(saved_studio.settings["python"], sys.executable)
+            self.app.processEvents()
+
+    def test_startup_default_python_persists_during_init_without_reader_ready_or_ui_completion(self):
+        fresh_session = Session(True)
+        self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+        submitted_writes = []
+        original_submit = fresh_session.writes.submit
+
+        def record_submit(fn, *args, **kwargs):
+            submitted_writes.append(fn)
+            return original_submit(fn, *args, **kwargs)
+
+        with patch.object(fresh_session.writes, "submit", side_effect=record_submit):
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            # Queued directly during __init__ before any QTimer.singleShot(0) or reader_ready runs.
+            self.assertEqual(len(submitted_writes), 1)
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            completed_events = []
+            fresh_studio.completed.connect(completed_events.append)
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertEqual(completed_events, [])
+
+            writes_before_ready = len(submitted_writes)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.app.processEvents()
+            self.assertEqual(len(submitted_writes), writes_before_ready)
+
+        with patch("studio.atomic_write", side_effect=OSError("disk full")):
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertIn("disk full", fresh_studio.message)
+
+    def test_concurrent_refresh_python_and_preferred_share_single_discover_run(self):
+        import concurrent.futures
+        import threading
+        import python_runtime
+
+        studio = self.studio
+        started = threading.Event()
+        release = threading.Event()
+        probe_calls = 0
+        lock = threading.Lock()
+
+        def controlled_probe(executable, timeout=6):
+            nonlocal probe_calls
+            with lock:
+                probe_calls += 1
+            started.set()
+            release.wait(5)
+            return {
+                "version": "3.12.0",
+                "prefix": sys.prefix,
+                "venv": True,
+                "matplotlib": True,
+                "numpy": True,
+                "venvModule": True,
+            }
+
+        with (
+            patch("python_runtime.bundled_available", return_value=False),
+            patch("python_runtime.candidates", return_value=[Path(sys.executable)]),
+            patch("python_runtime.probe", side_effect=controlled_probe),
+        ):
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            self.assertTrue(started.wait(2))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+                preferred_future = caller.submit(python_runtime.preferred, studio.data / "python-env")
+                time.sleep(0.05)
+                release.set()
+                chosen = preferred_future.result(timeout=5)
+            self._wait_for(lambda: not studio.pythonBusy)
+
+        self.assertEqual(probe_calls, 1)
+        self.assertEqual(chosen, sys.executable)
+        self.assertEqual([item["path"] for item in studio.python_choices], [sys.executable])
+
     def test_default_python_selection_and_refresh_publish_discovered_choices(self):
         studio = self.studio
         studio.settings["python"] = ""
@@ -328,12 +435,12 @@ class StudioTest(unittest.TestCase):
                     "matplotlib": True, "managed": False, "venv": True, "venvModule": True}]
         pending = []
         with patch.object(studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))), \
-             patch("python_runtime.preferred", return_value=sys.executable) as preferred, \
+             patch("python_runtime.default_python", return_value=sys.executable) as default_python, \
              patch("python_runtime.discover", return_value=choices) as discover:
             studio._choose_default_python()
             action, done = pending.pop()
             done(action(), None)
-            preferred.assert_called_once()
+            default_python.assert_called_once_with(studio.data / "python-env")
             self.assertEqual(studio.settings["python"], sys.executable)
 
             studio.refreshPython()
@@ -1147,7 +1254,9 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(replies[-1][2], "")
         self.assertTrue(json.loads(replies[-1][1])["opened"])
         self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
-        pending = loads[-1].get("pendingHeading")
+        self.assertEqual(len(loads), 1)
+        self.assertIn("content", loads[0])
+        pending = loads[0].get("pendingHeading")
         self.assertIsInstance(pending, dict)
         self.assertEqual(pending["heading"], "bayes")
         self.assertTrue(bool(pending.get("token")))
@@ -1264,10 +1373,114 @@ class StudioTest(unittest.TestCase):
             self.assertFalse(rejected["opened"])
             self.assertIn("symlink", rejected["message"])
 
+        def _linux_inotify_fds() -> int | None:
+            fd_dir = Path("/proc/self/fd")
+            if not fd_dir.is_dir():
+                return None
+            total = 0
+            for entry in os.listdir(fd_dir):
+                try:
+                    if "inotify" in os.readlink(fd_dir / entry):
+                        total += 1
+                except OSError:
+                    pass
+            return total
+
+        inotify_before = _linux_inotify_fds()
         self.assertTrue(studio.note_watcher.files() or studio.note_watcher.directories())
         studio.stop()
         self.assertEqual(studio.note_watcher.files(), [])
         self.assertEqual(studio.note_watcher.directories(), [])
+        inotify_after = _linux_inotify_fds()
+        if inotify_before is not None and inotify_after is not None:
+            self.assertLessEqual(inotify_after, inotify_before - 3)
+
+    def test_open_relative_note_pending_heading_preserves_manual_tab_switch_and_batch_drop(self):
+        from unittest.mock import patch
+
+        studio = self.studio
+        studio.ready = True
+        loads = []
+        studio.readerLoad.connect(lambda payload: loads.append(json.loads(payload)))
+
+        folder = studio.data / "heading-drop-coexist"
+        folder.mkdir(parents=True, exist_ok=True)
+        index_note = folder / "index.md"
+        keep_note = folder / "keep.md"
+        linked_note = folder / "linked.md"
+        drop_a = folder / "drop-a.md"
+        drop_b = folder / "drop-b.md"
+        index_note.write_text("# Index\n\n[[linked#Target]]\n", encoding="utf-8")
+        keep_note.write_text("# Keep\n", encoding="utf-8")
+        linked_note.write_text("# Linked\n\n## Target\n", encoding="utf-8")
+        drop_a.write_text("# Drop A\n", encoding="utf-8")
+        drop_b.write_text("# Drop B\n", encoding="utf-8")
+
+        studio.openFolder(str(folder))
+        studio.openNote(str(index_note))
+        self._wait_for(lambda: studio._current()["path"] == str(index_note.resolve()))
+        studio.openNote(str(keep_note))
+        self._wait_for(lambda: studio._current()["path"] == str(keep_note.resolve()))
+        keep_id = studio.active
+        index_id = next(t["id"] for t in studio.tabs if t["path"] == str(index_note.resolve()))
+        studio.selectTab(index_id)
+
+        replies = []
+        studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
+        pending_reads: list[tuple[object, object]] = []
+
+        def intercept_submit(action, done, *args, **kwargs):
+            # Let background settings writes discard cleanly; capture worker tasks.
+            if done.__name__ == "_noop_done":
+                return
+            pending_reads.append((action, done))
+
+        with patch.object(studio, "_submit", side_effect=intercept_submit):
+            studio.post("rel-coexist", "open_workspace_link", json.dumps({
+                "documentPath": str(index_note.resolve()),
+                "target": "linked.md",
+                "fragment": "target",
+                "wikilink": False,
+            }))
+            self.assertEqual(len(pending_reads), 1)
+            resolve_action, resolve_done = pending_reads.pop()
+            resolve_done(resolve_action(), None)
+            self.assertEqual(len(pending_reads), 1)
+
+            # User manually selects keep_id before the linked note finishes loading.
+            studio.selectTab(keep_id)
+            loads.clear()
+            action, done = pending_reads.pop()
+            done(action(), None)
+
+        self.assertEqual(replies[-1][0], "rel-coexist")
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
+        self.assertEqual(studio.active, keep_id)
+        self.assertEqual(loads, [])
+        linked_tab = next(t for t in studio.tabs if t["path"] == str(linked_note.resolve()))
+        self.assertNotIn("pendingHeading", linked_tab)
+
+        # Selecting linked_tab manually later must restore ordinarily without pendingHeading.
+        studio.selectTab(linked_tab["id"])
+        self.assertEqual(studio.active, linked_tab["id"])
+        self.assertNotIn("pendingHeading", loads[-1])
+
+        # Batch drop still preserves drop order and activates the last dropped note.
+        pending_reads.clear()
+        with patch.object(studio, "_submit", side_effect=intercept_submit):
+            studio.handleExternalDrop(
+                [QUrl.fromLocalFile(str(drop_a)), QUrl.fromLocalFile(str(drop_b))],
+                True,
+            )
+            self.assertEqual(len(pending_reads), 2)
+            # Complete out of order: drop_b (1) then drop_a (0).
+            for idx in (1, 0):
+                action, done = pending_reads[idx]
+                done(action(), None)
+
+        self.assertEqual(studio._current()["path"], str(drop_b.resolve()))
+        tail_paths = [t["path"] for t in studio.tabs[-2:]]
+        self.assertEqual(tail_paths, [str(drop_a.resolve()), str(drop_b.resolve())])
 
     def test_workspace_folder_and_expanded_subfolders_persist_across_restarts_tray_hides_and_multiwindow_shutdown(self):
         import tempfile

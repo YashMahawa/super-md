@@ -9,6 +9,12 @@ import QtWebChannel
 ApplicationWindow {
     id: window
     signal readerViewChanged(var readerView)
+    onReaderViewChanged: function(view) {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view)
+    }
+    Component.onCompleted: {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader)
+    }
     width: 1320
     height: 880
     minimumWidth: 760
@@ -297,6 +303,10 @@ ApplicationWindow {
         function onWorkspaceSearchChanged() {
             if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
             else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
+        }
+        function onWorkspaceFolderDropped() {
+            window.sidebar = true
+            window.sidebarSection = "folder"
         }
     }
     onViewStateChanged: {

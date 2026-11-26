@@ -566,6 +566,92 @@ private object NoMotionScheme : MotionScheme {
     override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
 }
 
+internal fun shouldAcceptExternalDrag(localState: Any?, description: android.content.ClipDescription?): Boolean {
+    if (localState != null || description == null) return false
+    val count = description.mimeTypeCount
+    if (count <= 0) return false
+    var hasExternalPayload = false
+    for (index in 0 until count) {
+        val mime = description.getMimeType(index)?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+        if (mime.startsWith("chromium/")) return false
+        if (mime.isNotEmpty() && mime != "text/plain" && mime != "text/html") {
+            hasExternalPayload = true
+        }
+    }
+    return hasExternalPayload
+}
+
+internal class ExternalDropDragController(
+    private val onExternalDrop: (android.view.DragEvent) -> Unit,
+) : android.view.View.OnDragListener {
+    private var acceptingExternalDrag = false
+
+    override fun onDrag(view: android.view.View?, event: android.view.DragEvent): Boolean =
+        onDragAction(
+            action = event.action,
+            localState = event.localState,
+            description = event.clipDescription,
+            event = event,
+        )
+
+    internal fun onDragAction(
+        action: Int,
+        localState: Any?,
+        description: android.content.ClipDescription?,
+        event: android.view.DragEvent? = null,
+    ): Boolean {
+        return when (action) {
+            android.view.DragEvent.ACTION_DRAG_STARTED -> {
+                acceptingExternalDrag = shouldAcceptExternalDrag(localState, description)
+                acceptingExternalDrag
+            }
+            android.view.DragEvent.ACTION_DROP -> {
+                if (!acceptingExternalDrag) return false
+                if (event != null) onExternalDrop(event)
+                true
+            }
+            android.view.DragEvent.ACTION_DRAG_ENDED -> {
+                val handled = acceptingExternalDrag
+                acceptingExternalDrag = false
+                handled
+            }
+            else -> acceptingExternalDrag
+        }
+    }
+}
+
+internal fun shouldBlockNativeDrop(
+    state: StudioState,
+    folderSearchVisible: Boolean = false,
+    accessRequestOpen: Boolean = false,
+    settingsOpen: Boolean = false,
+    exporting: Boolean = false,
+    renaming: Boolean = false,
+    contentsShown: Boolean = false,
+    drawerOpen: Boolean = false,
+): Boolean =
+    !state.welcomed ||
+        state.busy ||
+        state.readerOverlay ||
+        folderSearchVisible ||
+        accessRequestOpen ||
+        state.pendingCloseNoteId != null ||
+        state.pendingSaveConflictNoteId != null ||
+        settingsOpen ||
+        exporting ||
+        renaming ||
+        contentsShown ||
+        drawerOpen
+
+internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<android.net.Uri> {
+    if (clip == null) return emptyList()
+    return (0 until clip.itemCount).mapNotNull { index ->
+        clip.getItemAt(index)?.uri?.takeIf { uri ->
+            uri.scheme?.lowercase() in setOf("content", "file")
+        }
+    }
+}
+
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
@@ -1326,6 +1412,38 @@ private object NoMotionScheme : MotionScheme {
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
+                val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
+                    if (shouldBlockNativeDrop(
+                            model.state.value,
+                            folderSearchVisible = model.folderSearch.value.visible,
+                            accessRequestOpen = model.documentAccessRequests.value != null,
+                            settingsOpen = settings,
+                            exporting = exporting,
+                            renaming = renaming,
+                            contentsShown = contentsShown,
+                            drawerOpen = drawer.isOpen,
+                        )) {
+                        return@rememberUpdatedState
+                    }
+                    val permissions = activity.requestDragAndDropPermissions(event)
+                    val uris = extractDroppedFileUris(event.clipData)
+                    if (uris.isNotEmpty()) {
+                        val id = model.state.value.active.id
+                        val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
+                        val x = event.x / currentDensity
+                        val y = event.y / currentDensity
+                        reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
+                        model.importDropped(uris, id) { images ->
+                            permissions?.release()
+                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                        }
+                    } else {
+                        permissions?.release()
+                        if ((event.clipData?.itemCount ?: 0) > 0) {
+                            model.importDropped(emptyList(), model.state.value.active.id) {}
+                        }
+                    }
+                }
                 Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
                     key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -1407,26 +1525,9 @@ private object NoMotionScheme : MotionScheme {
                                     imagePicker.launch(arrayOf("image/*")); return true
                                 }
                             }
-                            setOnDragListener { _, event ->
-                                when(event.action) {
-                                    android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
-                                    android.view.DragEvent.ACTION_DROP -> {
-                                        if (model.state.value.readerOverlay || model.state.value.busy) return@setOnDragListener true
-                                        val permissions = activity.requestDragAndDropPermissions(event)
-                                        val clip = event.clipData
-                                        val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
-                                        if (uris.isNotEmpty()) {
-                                            val id = model.state.value.active.id
-                                            val x = event.x / density.density
-                                            val y = event.y / density.density
-                                            evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                                            model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
-                                        } else permissions?.release()
-                                        true
-                                    }
-                                    else -> true
-                                }
-                            }
+                            setOnDragListener(ExternalDropDragController { event ->
+                                handleExternalDrop.value(this, event)
+                            })
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
