@@ -885,6 +885,48 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                 _, saved_assets, _ = open_note(smd_path)
                 self.assertIn("assets/diagram.svg", saved_assets)
                 self.assertIn("rect width='8'", base64.b64decode(saved_assets["assets/diagram.svg"].split(",", 1)[1]).decode("utf-8"))
+
+                # Even when explicit workspace --root entries are configured (excluding note_dir per #124),
+                # single-note asset operations on the user-authorized open .smd tab still succeed via Studio
+                # while workspace assets resolve cleanly and outside/hidden/symlink paths remain rejected.
+                workspace_root = base / "approved-workspace"
+                workspace_root.mkdir()
+                workspace_svg = workspace_root / "workspace-fig.svg"
+                workspace_svg.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'><ellipse rx='3' ry='2'/></svg>")
+                note_local_v3 = note_dir / "figure-v3.svg"
+                note_local_v3.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'><polygon points='0,0 4,0 2,4'/></svg>")
+                studio.folder = str(workspace_root)
+                rooted_server, _ = build_mcp_server([str(workspace_root)], live_client=live_client)
+                async with Client(rooted_server) as rooted_client:
+                    hidden_rel = await call_with_qt(rooted_client.call_tool("document_attach_asset", {
+                        "path": target,
+                        "asset_path": ".hidden.svg",
+                        "expected_revision": revision,
+                    }))
+                    self.assertTrue(hidden_rel.is_error)
+
+                    outside_with_root = await call_with_qt(rooted_client.call_tool("document_attach_asset", {
+                        "path": target,
+                        "asset_path": str(outside_svg),
+                        "expected_revision": revision,
+                    }))
+                    self.assertTrue(outside_with_root.is_error)
+
+                    note_local_attach = await call_with_qt(rooted_client.call_tool("document_attach_asset", {
+                        "path": target,
+                        "asset_path": str(note_local_v3),
+                        "expected_revision": revision,
+                        "name": "note-local.svg",
+                    }))
+                    self.assertFalse(note_local_attach.is_error, note_local_attach.content[0].text if note_local_attach.content else "")
+
+                    ws_attach = await call_with_qt(rooted_client.call_tool("document_attach_asset", {
+                        "path": target,
+                        "asset_path": "workspace-fig.svg",
+                        "expected_revision": revision,
+                        "name": "ws-fig.svg",
+                    }))
+                    self.assertFalse(ws_attach.is_error, ws_attach.content[0].text if ws_attach.content else "")
             finally:
                 studio.stop()
                 studio.pool.shutdown(wait=True, cancel_futures=True)
@@ -1001,9 +1043,215 @@ class OfficialMCPClientTest(unittest.IsolatedAsyncioTestCase):
                         _system_aliases=(),
                     )
 
+    async def test_live_metadata_is_bounded_redacted_and_revision_bound(self):
+        import base64
+
+        from mcp import Client
+        from mcp_server import build_mcp_server
+
+        png_bytes = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO6pX+0AAAAASUVORK5CYII="
+        )
+        jpeg_bytes = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xd9"
+        revision = "a" * 64
+        expected_props = {
+            "title": "Path Integrals & Symmetries",
+            "author": "Richard Feynman, Emmy Noether",
+            "authors": ["Richard Feynman", "Emmy Noether"],
+            "tags": ["quantum", "physics"],
+        }
+
+        class FakeLiveClient:
+            def __init__(self):
+                self.capture_has_props = True
+                self.render_revision = revision
+                self.outline_revision = revision
+                self.asset_page_revision = revision
+                self.omit_inline_assets = False
+
+            def list_tabs(self):
+                return {"available": True, "tabs": [{
+                    "id": "win1:tab1", "windowId": "win1", "title": "Path Integrals",
+                    "active": True, "revision": revision,
+                }]}
+
+            def read_tab(self, tab_id, offset=0, limit=1, **kwargs):
+                if "asset_limit" in kwargs:
+                    return {"revision": self.asset_page_revision, "assets": [], "assetCount": 0}
+                payload = {
+                    "id": tab_id, "windowId": "win1", "title": "Path Integrals",
+                    "format": "markdown", "isDirty": True, "sourceLength": 64, "revision": revision,
+                    "properties": {
+                        **expected_props,
+                        "subtitle": "Redacted subtitle", "date": "2026-03-15", "customSecret": "ignored",
+                    },
+                }
+                if not self.omit_inline_assets:
+                    payload["assets"] = []
+                    payload["asset_count"] = 0
+                return payload
+
+            def outline_tab(self, tab_id, offset=0, limit=80):
+                return {
+                    "revision": self.outline_revision,
+                    "headings": [{"index": 0, "level": 1, "title": "Lecture 1", "offset": 44}],
+                    "total": 1, "truncated": False,
+                }
+
+            def document_action(self, tab_id, action, **kwargs):
+                if action != "get_context":
+                    raise AssertionError(f"Unexpected action: {action}")
+                return {
+                    "tabId": tab_id, "revision": revision, "sourceLength": 64, "mode": "reader",
+                    "properties": {
+                        **expected_props,
+                        "subtitle": "Redacted subtitle", "date": "2026-03-15",
+                        "description": "Redacted description", "aliases": ["RedactedAlias"],
+                    },
+                    "reading": {"offset": 0, "heading": "Path Integrals & Symmetries", "visibleText": "Path Integrals"},
+                    "visibleSource": {"text": "---\ntitle: Path Integrals & Symmetries\n---\n",
+                                      "start": 0, "end": 43, "total_chars": 64, "next_offset": 43, "truncated": True},
+                }
+
+            def render_tab(self, tab_id, width=1000, image_format="jpeg"):
+                ctx = {
+                    "tabId": tab_id, "revision": self.render_revision, "sourceLength": 64, "mode": "reader",
+                    "reading": {"offset": 0, "heading": "Path Integrals & Symmetries", "visibleText": "Path Integrals"},
+                    "visibleSource": {"text": "---\ntitle: Path Integrals & Symmetries\n---\n",
+                                      "start": 0, "end": 43, "total_chars": 64, "next_offset": 43, "truncated": True},
+                }
+                if self.capture_has_props:
+                    ctx["properties"] = {**expected_props, "customSecret": "ignored"}
+                is_png = image_format == "png"
+                return {
+                    "tabId": tab_id, "revision": self.render_revision,
+                    "mime_type": "image/png" if is_png else "image/jpeg",
+                    "data": png_bytes if is_png else jpeg_bytes,
+                    "width": 1, "height": 1, "context": ctx,
+                }
+
+        fake_live = FakeLiveClient()
+        server, _ = build_mcp_server([], live_client=fake_live)
+        async with Client(server) as client:
+            live_inspected = await client.call_tool("document_inspect", {"path": "tab:win1:tab1"})
+            self.assertFalse(live_inspected.is_error, live_inspected.content)
+            self.assertEqual(live_inspected.structured_content["properties"], expected_props)
+            self.assertEqual(live_inspected.structured_content["revision"], revision)
+
+            ctx_res = await client.call_tool("document_action", {"action": "get_context", "path": "tab:win1:tab1"})
+            self.assertFalse(ctx_res.is_error, ctx_res.content)
+            self.assertEqual(ctx_res.structured_content["properties"], expected_props)
+
+            no_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": False})
+            self.assertFalse(no_img.is_error, no_img.content)
+            self.assertEqual(json.loads(no_img.content[0].text)["readingContext"]["properties"], expected_props)
+
+            with_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True})
+            self.assertFalse(with_img.is_error, with_img.content)
+            with_img_payload = json.loads(with_img.content[1].text)
+            self.assertEqual(with_img_payload["readingContext"]["properties"], expected_props)
+            self.assertEqual(with_img_payload["captureContext"]["properties"], expected_props)
+
+            fake_live.capture_has_props = False
+            fallback_img = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True, "quality": "high"})
+            self.assertFalse(fallback_img.is_error, fallback_img.content)
+            self.assertEqual(json.loads(fallback_img.content[1].text)["readingContext"]["properties"], expected_props)
+
+            # Revision-bound rejection on outline, fallback asset page, and viewport capture drift.
+            fake_live.outline_revision = "b" * 64
+            stale_outline = await client.call_tool("document_inspect", {"path": "tab:win1:tab1"})
+            self.assertTrue(stale_outline.is_error)
+            fake_live.outline_revision = revision
+
+            fake_live.omit_inline_assets = True
+            fake_live.asset_page_revision = "c" * 64
+            stale_assets = await client.call_tool("document_inspect", {"path": "tab:win1:tab1"})
+            self.assertTrue(stale_assets.is_error)
+            fake_live.asset_page_revision = revision
+
+            fake_live.render_revision = "d" * 64
+            stale_capture = await client.call_tool("view_current", {"tabId": "win1:tab1", "includeImage": True})
+            self.assertTrue(stale_capture.is_error)
+
+    async def test_shared_validators_preserve_accepted_input_errors_and_limits(self):
+        from mcp import Client
+        from mcp_server import build_mcp_server
+
+        rev = "a" * 64
+
+        class LimitLive:
+            def __init__(self):
+                self.applied = []
+                self.oversized_context = False
+
+            def search_tab(self, tab_id, **kwargs):
+                return {"revision": rev, "matches": []}
+
+            def document_action(self, tab_id, action, **kwargs):
+                if action == "latex_apply":
+                    self.applied.append(kwargs["repair_indices"])
+                    return {"revision": "b" * 64, "applied": kwargs["repair_indices"]}
+                if action == "export_document":
+                    return {"jobId": "job-1", "status": "running", "format": kwargs["format"]}
+                if action == "get_context":
+                    text = "x" * 25_000 if self.oversized_context else "ok"
+                    return {"revision": rev, "sourceLength": len(text),
+                            "visibleSource": {"text": text, "start": 0, "end": len(text)}}
+                return {"status": "ok"}
+
+        live = LimitLive()
+        server, _ = build_mcp_server([], live_client=live)
+        tools_by_name = {tool.name: tool.fn for tool in server._tool_manager.list_tools()}
+        from agent_documents import AgentDocumentError
+
+        with self.assertRaisesRegex(AgentDocumentError, "1–40 selected repair indices"):
+            tools_by_name["document_action"](
+                action="latex_apply", path="tab:win:t1", expected_revision=rev, repair_indices=[],
+            )
+        with self.assertRaisesRegex(AgentDocumentError, "nonnegative integer indices"):
+            tools_by_name["document_action"](
+                action="latex_apply", path="tab:win:t1", expected_revision=rev, repair_indices=[-1],
+            )
+        with self.assertRaisesRegex(AgentDocumentError, "query, limit, context, offset, or search flags are invalid"):
+            tools_by_name["document_search"](path="tab:win:t1", query="x", limit=26)
+        with self.assertRaisesRegex(AgentDocumentError, "no larger than 8 KB"):
+            tools_by_name["document_action"](
+                action="export", path="tab:win:t1", format="pdf",
+                expected_revision=rev, options={"note": "x" * 8_100},
+            )
+
+        async with Client(server) as client:
+            dup_apply = await client.call_tool("document_action", {
+                "action": "latex_apply", "path": "tab:win:t1",
+                "expected_revision": rev, "repair_indices": [0, 0, 2],
+            })
+            self.assertFalse(dup_apply.is_error, dup_apply.content)
+            self.assertEqual(live.applied[-1], [0, 0, 2])
+
+            for bad_args in (
+                {"action": "latex_apply", "path": "tab:win:t1", "expected_revision": rev, "repair_indices": []},
+                {"action": "latex_apply", "path": "tab:win:t1", "expected_revision": rev, "repair_indices": [-1]},
+                {"action": "export", "path": "tab:win:t1", "format": "pdf", "expected_revision": rev, "options": {"note": "x" * 8_100}},
+            ):
+                err_res = await client.call_tool("document_action", bad_args)
+                self.assertTrue(err_res.is_error)
+
+            bad_search = await client.call_tool("document_search", {
+                "path": "tab:win:t1", "query": "x", "limit": 26,
+            })
+            self.assertTrue(bad_search.is_error)
+
+            live.oversized_context = True
+            over_24k = await client.call_tool("document_action", {"action": "get_context", "path": "tab:win:t1"})
+            self.assertTrue(over_24k.is_error)
+            with self.assertRaisesRegex(AgentDocumentError, "64 KB tool-output limit"):
+                tools_by_name["document_action"](action="get_context", path="tab:win:t1")
+
 
 class AgentMCPExtractionTest(unittest.TestCase):
     def test_mcp_server_facade_reexports_split_modules(self):
+        import subprocess
+
         import mcp_server
         from agent import mcp_http, mcp_tools
 
@@ -1011,6 +1259,22 @@ class AgentMCPExtractionTest(unittest.TestCase):
         self.assertIs(mcp_server.build_mcp_server, mcp_tools.build_mcp_server)
         self.assertIs(mcp_server._token, mcp_http._token)
         self.assertIs(mcp_server.main, mcp_http.main)
+
+        repo_root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [
+                sys.executable, "-c",
+                (
+                    "from desktop import mcp_server as pkg_mcp, agent_cli as pkg_cli; "
+                    "import mcp_server as flat_mcp, agent_cli as flat_cli; "
+                    "from desktop.agent import validators as pkg_val; "
+                    "from agent import validators as flat_val; "
+                    "assert pkg_mcp is flat_mcp and pkg_cli is flat_cli and pkg_val is flat_val"
+                ),
+            ],
+            cwd=repo_root, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_headless_imports_load_neither_pyside6_nor_mcp(self):
         import subprocess
@@ -1035,16 +1299,33 @@ class AgentMCPExtractionTest(unittest.TestCase):
         from agent.context_normalizer import (
             bounded_active_step,
             bounded_diagrams,
+            bounded_properties,
             bounded_python_cells,
             normalize_initial_reading_context,
             normalize_reading_context,
             viewport_contexts,
         )
 
+        props = bounded_properties({
+            "title": "  " + ("T" * 350) + "  ",
+            "authors": ["  Alice  ", ""] + [f"Author {i}" for i in range(25)],
+            "tags": ["  math  "] + [f"t{i}" for i in range(60)],
+            "subtitle": "secret",
+            "date": "2026-01-01",
+        })
+        self.assertEqual(len(props["title"]), 298)
+        self.assertEqual(len(props["authors"]), 20)
+        self.assertEqual(len(props["tags"]), 50)
+        self.assertNotIn("subtitle", props)
+        self.assertNotIn("date", props)
+        self.assertIsNone(bounded_properties({"subtitle": "hidden-only"}))
+
         normalized = normalize_reading_context({
             "sourceLength": 100,
+            "properties": {"subtitle": "hidden-only"},
             "visibleSource": {"text": "# Heading", "start": 0, "end": 9},
         })
+        self.assertNotIn("properties", normalized)
         self.assertEqual(normalized["visibleSource"]["total_chars"], 100)
         self.assertEqual(normalized["visibleSource"]["next_offset"], 9)
         self.assertTrue(normalized["visibleSource"]["truncated"])
@@ -1073,6 +1354,7 @@ class AgentMCPExtractionTest(unittest.TestCase):
         rev = "a" * 64
         initial = normalize_initial_reading_context(
             {"tabId": "raw-tab", "revision": rev, "sourceLength": 20,
+             "properties": {"title": "Doc", "aliases": ["secret"]},
              "visibleSource": {"text": "hello", "start": 0, "end": 5},
              "activeStep": {"bad": True}},
             resolved_tab="sess:win:raw-tab",
@@ -1080,25 +1362,31 @@ class AgentMCPExtractionTest(unittest.TestCase):
         )
         self.assertEqual(initial["nativeTabId"], "raw-tab")
         self.assertEqual(initial["tabId"], "sess:win:raw-tab")
+        self.assertEqual(initial["properties"], {"title": "Doc"})
         self.assertNotIn("activeStep", initial)
 
         cap_ctx, captured_reading = viewport_contexts(
             {"tabId": "raw-tab", "revision": rev, "sourceLength": 20,
+             "properties": {"title": "Doc", "subtitle": "hidden"},
              "visibleSource": {"text": "hello", "start": 0, "end": 5}},
             "sess:win:raw-tab",
             rev,
         )
         self.assertTrue(cap_ctx["contextRevisionMatches"])
+        self.assertEqual(cap_ctx["properties"], {"title": "Doc"})
         self.assertIsNotNone(captured_reading)
+        self.assertEqual(captured_reading["properties"], {"title": "Doc"})
         self.assertEqual(captured_reading["visibleSource"]["next_offset"], 5)
 
         mismatch_ctx, mismatch_reading = viewport_contexts(
             {"tabId": "raw-tab", "revision": "b" * 64, "sourceLength": 20,
+             "properties": {"title": "Stale Doc"},
              "visibleSource": {"text": "hello", "start": 0, "end": 5}},
             "sess:win:raw-tab",
             rev,
         )
         self.assertFalse(mismatch_ctx["contextRevisionMatches"])
+        self.assertNotIn("properties", mismatch_ctx)
         self.assertIsNone(mismatch_reading)
 
 

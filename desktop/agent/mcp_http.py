@@ -7,6 +7,10 @@ import os
 import sys
 from pathlib import Path
 
+_DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
+
 from .mcp_tools import build_mcp_server
 
 
@@ -102,3 +106,8 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, OSError, ImportError) as exc:
         print(f"Super MD MCP server: {exc}", file=sys.stderr)
         return 2
+
+
+if __name__ in ("agent.mcp_http", "desktop.agent.mcp_http"):
+    sys.modules.setdefault("agent.mcp_http", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent.mcp_http", sys.modules[__name__])

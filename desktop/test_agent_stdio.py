@@ -101,6 +101,34 @@ class AgentStdioTests(unittest.TestCase):
             response = json.loads(read.stdout.decode("utf-8"))
             self.assertEqual(response["result"]["text"], payload.decode("utf-8"))
 
+    def test_direct_script_and_module_entry_points_preserve_cli_and_mcp_dispatch(self):
+        desktop_dir = Path(__file__).resolve().parent
+        repo_root = desktop_dir.parent
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "entry.md").write_text("# Entry\nBody text\n", encoding="utf-8")
+
+            for cwd, cmd in (
+                (repo_root, [sys.executable, str(desktop_dir / "agent_cli.py"), "--root", str(root), "inspect", "entry.md"]),
+                (repo_root, [sys.executable, "-m", "desktop.agent_cli", "--root", str(root), "inspect", "entry.md"]),
+                (repo_root, [sys.executable, "-m", "desktop.agent_cli", "--root", str(root), "call", "document_inspect", "--arguments-json", '{"path":"entry.md"}']),
+            ):
+                completed = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                parsed = json.loads(completed.stdout)
+                self.assertTrue(parsed["ok"])
+
+            for help_cmd in (
+                [sys.executable, str(desktop_dir / "mcp_server.py"), "--help"],
+                [sys.executable, "-m", "desktop.mcp_server", "--help"],
+                [sys.executable, str(desktop_dir / "agent_cli.py"), "mcp", "--help"],
+                [sys.executable, str(desktop_dir / "agent_live_cli.py"), "--help"],
+                [sys.executable, "-m", "desktop.agent_live_cli", "--help"],
+                [sys.executable, str(desktop_dir / "agent_cli.py"), "live", "--help"],
+            ):
+                completed = subprocess.run(help_cmd, cwd=repo_root, capture_output=True, text=True, check=False)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

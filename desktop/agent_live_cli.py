@@ -11,6 +11,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+_DESKTOP_DIR = str(Path(__file__).resolve().parent)
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
+
 try:
     from .agent.cli_common import (
         MAX_CLI_OUTPUT,
@@ -27,6 +31,10 @@ except ImportError:  # python desktop/agent_live_cli.py
         make_json_argument_parser,
     )
     from agent_stdio import configure_stdio
+
+if __name__ in ("agent_live_cli", "desktop.agent_live_cli"):
+    sys.modules.setdefault("agent_live_cli", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent_live_cli", sys.modules[__name__])
 
 MAX_OUTPUT = MAX_CLI_OUTPUT
 MAX_INPUT = 64_000

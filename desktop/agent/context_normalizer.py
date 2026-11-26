@@ -1,6 +1,7 @@
 """Stdlib-only reading and viewport context normalizers for MCP view_current."""
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 
@@ -12,17 +13,55 @@ def _safe_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def bounded_properties(value: Any) -> dict[str, Any] | None:
+    """Allowlist and bound displayed frontmatter metadata (title, author, authors, tags)."""
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    raw_title = _bounded_text(value.get("title"), 300)
+    if raw_title and raw_title.strip():
+        out["title"] = raw_title.strip()
+    authors = [
+        item.strip()[:200]
+        for item in (value.get("authors") if isinstance(value.get("authors"), list) else [])
+        if isinstance(item, str) and item.strip()
+    ][:20]
+    raw_author = _bounded_text(value.get("author"), 500)
+    clean_author = raw_author.strip() if raw_author else ""
+    if authors:
+        out["authors"] = authors
+        out["author"] = clean_author or ", ".join(authors)[:500]
+    elif clean_author:
+        out["author"] = clean_author
+        out["authors"] = [clean_author[:200]]
+    tags = [
+        item.strip()[:100]
+        for item in (value.get("tags") if isinstance(value.get("tags"), list) else [])
+        if isinstance(item, str) and item.strip()
+    ][:50]
+    if tags:
+        out["tags"] = tags
+    return out or None
+
+
 def normalize_reading_context(context: dict[str, Any]) -> dict[str, Any]:
-    """Repair prefix-relative visibleSource pagination using authoritative sourceLength."""
-    source_length = _safe_int(context.get("sourceLength"))
-    visible_source = context.get("visibleSource")
+    """Repair prefix-relative visibleSource pagination and bound displayed properties."""
+    base = dict(context)
+    if "properties" in base:
+        bounded_props = bounded_properties(base.get("properties"))
+        if bounded_props is not None:
+            base["properties"] = bounded_props
+        else:
+            base.pop("properties", None)
+    source_length = _safe_int(base.get("sourceLength"))
+    visible_source = base.get("visibleSource")
     if source_length is None or source_length < 0 or not isinstance(visible_source, dict):
-        return dict(context)
+        return base
     start, end = _safe_int(visible_source.get("start")), _safe_int(visible_source.get("end"))
     if start is None or end is None or start < 0 or end < start or end > source_length:
-        return dict(context)
+        return base
     return {
-        **context,
+        **base,
         "visibleSource": {
             **visible_source,
             "total_chars": source_length,
@@ -162,6 +201,9 @@ def viewport_contexts(
     active_step = bounded_active_step(source.get("activeStep", metadata.get("activeStep") if metadata else None))
     if active_step is not None:
         capture_ctx["activeStep"] = active_step
+    props = bounded_properties(source.get("properties", metadata.get("properties") if metadata else None))
+    if props is not None and revision_matches:
+        capture_ctx["properties"] = props
     source_length = _safe_int(source.get("sourceLength"))
     normalized_src = source.get("visibleSource")
     if source_length is not None and source_length >= 0 and isinstance(normalized_src, dict):
@@ -235,8 +277,13 @@ def normalize_initial_reading_context(
     return reading_context
 
 
+_bounded_properties = bounded_properties
 _normalize_reading_context = normalize_reading_context
 _bounded_diagrams = bounded_diagrams
 _bounded_active_step = bounded_active_step
 _bounded_python_cells = bounded_python_cells
 _viewport_contexts = viewport_contexts
+
+if __name__ in ("agent.context_normalizer", "desktop.agent.context_normalizer"):
+    sys.modules.setdefault("agent.context_normalizer", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent.context_normalizer", sys.modules[__name__])

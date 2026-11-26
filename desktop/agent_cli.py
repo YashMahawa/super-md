@@ -4,6 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
+
+_DESKTOP_DIR = str(Path(__file__).resolve().parent)
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
 
 try:
     from .agent.cli_common import emit_json, heading_selector, make_json_argument_parser
@@ -13,6 +18,10 @@ except ImportError:  # python desktop/agent_cli.py
     from agent.cli_common import emit_json, heading_selector, make_json_argument_parser
     from agent_documents import AgentDocumentError, DocumentStore
     from agent_stdio import configure_stdio
+
+if __name__ in ("agent_cli", "desktop.agent_cli"):
+    sys.modules.setdefault("agent_cli", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent_cli", sys.modules[__name__])
 
 
 class _UsageError(Exception):
@@ -183,12 +192,18 @@ def main(argv: list[str] | None = None) -> int:
                 raise AgentDocumentError(f"Invalid patch JSON at character {exc.pos}") from exc
             result = store.patch(args.path, expected_revision=args.revision, operations=operations)
         elif args.command == "call":
-            from agent_call import call
+            try:
+                from .agent_call import call
+            except ImportError:
+                from agent_call import call
             result=call(args.root,args.tool,json.loads(args.arguments_json),sessions=args.live_sessions_dir,output=args.output)
             _emit({"ok":not result.get("is_error",False),"result":result})
             return 2 if result.get("is_error",False) else 0
         elif args.command == "preview":
-            from agent_preview import preview
+            try:
+                from .agent_preview import preview
+            except ImportError:
+                from agent_preview import preview
             result=preview(store,args.path,args.output_path,width=args.width,height=args.height,heading=args.heading,dark=args.dark,snapshot_value=args.snapshot)
         elif args.command == "assets":
             result = store.assets(args.path, offset=args.offset, limit=args.limit)

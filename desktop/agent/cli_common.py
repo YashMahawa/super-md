@@ -4,7 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
+
+_DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
 
 try:
     from ..agent_stdio import configure_stdio
@@ -60,3 +65,8 @@ def heading_selector(value: str | None) -> int | str | None:
     if value.isascii() and value.isdecimal():
         return int(value)
     return value
+
+
+if __name__ in ("agent.cli_common", "desktop.agent.cli_common"):
+    sys.modules.setdefault("agent.cli_common", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent.cli_common", sys.modules[__name__])

@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import base64
+import sys
 from pathlib import Path
 from typing import Any
+
+_DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
 
 try:
     from ..agent_documents import (
@@ -22,6 +27,10 @@ except ImportError:
 
 from . import mcp_live_helpers as _lh
 from . import validators as _v
+from .context_normalizer import bounded_properties
+
+sys.modules.setdefault("agent.validators", _v)
+sys.modules.setdefault("desktop.agent.validators", _v)
 
 _ASSET_KEYS = ("id", "name", "mime", "mime_type", "bytes", "sha256")
 
@@ -103,6 +112,9 @@ def build_mcp_server(roots: list[str], live_client=None):
         allowed = ("id", "windowId", "title", "path", "format", "isDirty", "sourceLength",
                    "revision", "outline", "outline_truncated", "assets", "asset_count")
         metadata = {key: result[key] for key in allowed if key in result}
+        live_props = bounded_properties(result.get("properties"))
+        if live_props is not None:
+            metadata["properties"] = live_props
         headings = outline["headings"]
         metadata.update({
             "outline": [_lh.normalize_live_heading(item) for item in headings[:80] if isinstance(item, dict)],
@@ -115,6 +127,8 @@ def build_mcp_server(roots: list[str], live_client=None):
         else:
             asset_page = live_call("read_tab", tab_id, offset=0, limit=1, asset_offset=0, asset_limit=40)
             if isinstance(asset_page, dict):
+                if result.get("revision") and asset_page.get("revision") and result["revision"] != asset_page["revision"]:
+                    raise RevisionConflict("The open note changed while its assets were being read; inspect again")
                 raw_assets = asset_page.get("assets", [])
                 if isinstance(raw_assets, list):
                     metadata["assets"] = [{k: item.get(k) for k in _ASSET_KEYS if k in item}
@@ -146,7 +160,10 @@ def build_mcp_server(roots: list[str], live_client=None):
         if tab_id is None:
             return store.search(path, query, limit=limit, context=context)
         flags = (("case_sensitive", case_sensitive), ("whole_word", whole_word), ("regex", regex), ("exclude_diagrams", exclude_diagrams))
-        _v.require_search_params(query, limit, context, offset, max_offset=20_000_000, flags=flags, error_cls=AgentDocumentError)
+        try:
+            _v.require_search_params(query, limit, context, offset, max_offset=20_000_000, flags=flags, error_cls=AgentDocumentError)
+        except AgentDocumentError as exc:
+            raise AgentDocumentError("query, limit, context, offset, or search flags are invalid") from exc
         result = live_call("search_tab", tab_id, query=query, limit=limit, context=context, offset=offset,
                            case_sensitive=case_sensitive, whole_word=whole_word, regex=regex, exclude_diagrams=exclude_diagrams)
         if not isinstance(result, dict) or not isinstance(result.get("matches"), list):
@@ -242,7 +259,12 @@ def build_mcp_server(roots: list[str], live_client=None):
             if tab_id is not None:
                 _v.require_sha256_revision(expected_revision, error_cls=AgentDocumentError,
                                            message="Live export requires expected_revision from document_inspect")
-                _v.require_export_params(format, options=options, error_cls=AgentDocumentError)
+                try:
+                    _v.require_export_params(format, options=options, error_cls=AgentDocumentError)
+                except AgentDocumentError as exc:
+                    if "smaller than 8 KB" in str(exc):
+                        raise AgentDocumentError("Export options must be an object no larger than 8 KB") from exc
+                    raise
                 if format != "pdf" and options:
                     raise AgentDocumentError("PDF options apply only to PDF export")
                 _require_safe_basename(filename, message="filename must be a safe basename")
@@ -305,10 +327,22 @@ def build_mcp_server(roots: list[str], live_client=None):
             if action == "latex_apply":
                 _v.require_sha256_revision(expected_revision, error_cls=AgentDocumentError,
                                            message="latex_apply requires expected_revision from latex_review")
-                _v.require_repair_indices(repair_indices, allow_empty=False, error_cls=AgentDocumentError)
+                if not isinstance(repair_indices, list) or not 1 <= len(repair_indices) <= 40:
+                    raise AgentDocumentError("latex_apply requires 1–40 selected repair indices")
+                for idx in repair_indices:
+                    _v.require_nonneg_int(idx, field="repair_indices", error_cls=AgentDocumentError,
+                                          message="repair_indices must be nonnegative integer indices")
                 params = {"expected_revision": expected_revision, "repair_indices": repair_indices}
-            return _lh.bounded_result(_call_dict("document_action", tab_id, action,
-                                                 _error="Live document action returned invalid status", **params), 24_000)
+            res = _call_dict("document_action", tab_id, action,
+                             _error="Live document action returned invalid status", **params)
+            if action == "get_context" and "properties" in res:
+                res = dict(res)
+                props = bounded_properties(res.get("properties"))
+                if props is not None:
+                    res["properties"] = props
+                else:
+                    res.pop("properties", None)
+            return _lh.bounded_result(res, 24_000)
         if action == "list_devices":
             if live_client is None:
                 return {"devices": [], "count": 0, "available": False, "reason": _lh.LIVE_UNAVAILABLE_REASON}
@@ -454,3 +488,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                                     width=width, quality=quality, includeImage=includeImage, include_image=include_image)
 
     return server, store
+
+
+if __name__ in ("agent.mcp_tools", "desktop.agent.mcp_tools"):
+    sys.modules.setdefault("agent.mcp_tools", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent.mcp_tools", sys.modules[__name__])

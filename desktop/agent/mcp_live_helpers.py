@@ -4,9 +4,14 @@ from __future__ import annotations
 import base64
 import inspect
 import json
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+_DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
 
 try:
     from .. import documents
@@ -186,7 +191,18 @@ def svg_source_blocks(data: bytes, metadata: dict[str, Any], offset: int = 0, li
 def resolve_live_asset_path(store: DocumentStore, raw_path: str) -> str:
     if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
         raise AgentDocumentError("asset_path must be a non-empty file path")
-    return str(store.resolve(raw_path)) if store.roots else str(Path(raw_path).expanduser())
+    expanded = Path(raw_path).expanduser()
+    if not expanded.is_absolute() and any(
+        part not in (".", "..") and part.startswith(".") for part in expanded.parts
+    ):
+        raise AgentDocumentError("Hidden files and directories are not allowed")
+    if store.roots:
+        try:
+            return str(store.resolve(raw_path))
+        except AgentDocumentError as error:
+            if "outside the configured workspace roots" not in str(error):
+                raise
+    return str(expanded)
 
 
 def run_view_current(
@@ -275,7 +291,12 @@ def run_view_current(
         }
         capture_context, captured_reading = viewport_contexts(image, resolved_tab, revision)
         if captured_reading is not None:
-            final_reading_context, reading_context_source, aligned = {**captured_reading, "target": target}, "viewport_capture", True
+            merged_reading = (
+                {**captured_reading, "properties": reading_context["properties"]}
+                if "properties" in reading_context and "properties" not in captured_reading
+                else captured_reading
+            )
+            final_reading_context, reading_context_source, aligned = {**merged_reading, "target": target}, "viewport_capture", True
         else:
             init_offset = reading_context.get("reading", {}).get("offset") if isinstance(reading_context.get("reading"), dict) else None
             cap_offset = capture_context.get("reading", {}).get("offset") if isinstance(capture_context.get("reading"), dict) else None
@@ -296,3 +317,8 @@ def run_view_current(
     if len(text.encode("utf-8")) > 48 * 1024:
         raise AgentDocumentError("The current reading context exceeds the bounded response size")
     return ([image_block] if image_block is not None else []) + [TextContent(type="text", text=text)]
+
+
+if __name__ in ("agent.mcp_live_helpers", "desktop.agent.mcp_live_helpers"):
+    sys.modules.setdefault("agent.mcp_live_helpers", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent.mcp_live_helpers", sys.modules[__name__])
