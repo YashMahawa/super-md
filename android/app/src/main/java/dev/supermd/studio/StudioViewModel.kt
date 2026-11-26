@@ -143,9 +143,6 @@ fun reorderedNotes(notes: List<Note>, id: String, index: Int): List<Note> {
     if (source < 0 || index !in notes.indices || source == index) return notes
     return notes.toMutableList().apply { add(index, removeAt(source)) }
 }
-// All windows share one killable Python worker. A per-window lock would allow
-// one cell's cleanup/timeout to kill another window's in-flight execution.
-private val pythonExecution = kotlinx.coroutines.sync.Mutex()
 
 class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
@@ -4010,47 +4007,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
 
     private fun sameAssets(left: JSONObject, right: JSONObject): Boolean = portableAssetsMatch(left, right)
     suspend fun python(code: String): JSONObject = withContext(Dispatchers.IO) {
-        pythonExecution.lock()
-        val app = getApplication<Application>()
-        val token = UUID.randomUUID().toString()
-        val input = File(app.cacheDir, "python-$token.py")
-        val output = File(app.cacheDir, "python-$token.json")
-        var remote: android.os.Messenger? = null
-        var connection: android.content.ServiceConnection? = null
-        try {
-            input.writeText(code)
-            kotlinx.coroutines.withTimeout(115_000) {
-                kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
-                    val reply = android.os.Messenger(android.os.Handler(android.os.Looper.getMainLooper()) { message ->
-                        if (continuation.isActive) {
-                            if (message.what == 1) {
-                                viewModelScope.launch(Dispatchers.IO) { try { val result = JSONObject(output.readText()); if (continuation.isActive) continuation.resumeWith(Result.success(result)) } catch (error: Exception) { if (continuation.isActive) continuation.resumeWith(Result.failure(error)) } }
-                            } else continuation.resumeWith(Result.failure(IllegalStateException(message.data.getString("error") ?: "Python failed")))
-                        }
-                        true
-                    })
-                    val service = object : android.content.ServiceConnection {
-                        override fun onServiceConnected(name: android.content.ComponentName, binder: android.os.IBinder) {
-                            remote = android.os.Messenger(binder)
-                            runCatching { remote!!.send(android.os.Message.obtain(null, 1).apply { replyTo = reply; data = android.os.Bundle().apply { putString("input", input.absolutePath); putString("output", output.absolutePath) } }) }.onFailure { if (continuation.isActive) continuation.resumeWith(Result.failure(it)) }
-                        }
-                        override fun onServiceDisconnected(name: android.content.ComponentName) { if (continuation.isActive) continuation.resumeWith(Result.failure(IllegalStateException("Python worker stopped"))) }
-                    }
-                    connection = service
-                    if (!app.bindService(Intent(app, PythonWorkerService::class.java), service, android.content.Context.BIND_AUTO_CREATE)) continuation.resumeWith(Result.failure(IllegalStateException("Cannot start Python worker")))
-                }
-            }
-        } finally {
-            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                // Release worker resources before another window can bind. Even
-                // cancellation must complete this barrier and unlock the queue.
-                runCatching { remote?.send(android.os.Message.obtain(null, 2)) }
-                remote?.binder?.let { binder -> kotlinx.coroutines.withTimeoutOrNull(2000) { while (binder.isBinderAlive) kotlinx.coroutines.delay(10) } }
-                connection?.let { runCatching { app.unbindService(it) } }
-                input.delete(); output.delete()
-                pythonExecution.unlock()
-            }
-        }
+        PythonCellRunner.run(getApplication(), viewModelScope, code)
     }
     private fun copyAttachments(note: Note, destination: Uri, destinationTree: Uri? = null) {
         val sources = JSONArray(markdownImageSourcesJson(note.content))
@@ -4239,29 +4196,4 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             throw error
         } finally { staging.deleteRecursively() }
     }
-}
-internal fun markdownImageSourcesJson(markdown: String): String = try {
-    PdfEngine.imageSources(markdown)
-} catch (_: UnsatisfiedLinkError) {
-    fallbackMarkdownImageSourcesJson(markdown)
-} catch (_: NoClassDefFoundError) {
-    fallbackMarkdownImageSourcesJson(markdown)
-}
-
-private fun fallbackMarkdownImageSourcesJson(markdown: String): String {
-    val result = JSONArray()
-    val pattern = Regex("""!\[(?:\\.|[^\]])*]\(\s*(?:<([^>\r\n]+)>|([^\s)\r\n]+))(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)""")
-    pattern.findAll(markdown).forEach { match ->
-        val source = (match.groupValues[1].ifEmpty { match.groupValues[2] }).trim()
-        if (source.isNotEmpty()) result.put(source)
-    }
-    return result.toString()
-}
-
-object PdfEngine {
-    init { System.loadLibrary("smd_core") }
-    @JvmStatic external fun export(markdown: String, options: String, assets: String, output: String): String
-    @JvmStatic external fun imageSources(markdown: String): String
-    @JvmStatic external fun fontFamilies(path: String): String
-    @JvmStatic external fun validateTheme(input:String):String
 }
