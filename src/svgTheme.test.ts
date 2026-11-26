@@ -91,3 +91,23 @@ it('monochrome keeps curved area categories and matching legends tonally distinc
   expect(paths[0].getAttribute('fill')).not.toBe(paths[1].getAttribute('fill'));
   expect(xml.querySelector('#legend')!.getAttribute('fill')).toBe(paths[0].getAttribute('fill'));
 });
+it('adapts valid SVG data URIs and rejects invalid, active, external or oversized SVG data URIs',()=>{
+  const validSvg='<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40" fill="black"/></svg>';
+  const adaptedUtf8=adaptSvgData('data:image/svg+xml;charset=utf-8,'+encodeURIComponent(validSvg),dark,true);
+  expect(decodeURIComponent(adaptedUtf8.split(',')[1])).toContain(`fill="${dark.primary}"`);
+  const adaptedB64=adaptSvgData('data:image/svg+xml;base64,'+btoa(validSvg),dark,true);
+  expect(decodeURIComponent(adaptedB64.split(',')[1])).toContain(`fill="${dark.primary}"`);
+
+  for(const malicious of [
+    'data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+    'data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>'),
+    'data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg"><image href="https://evil.example/a.png"/></svg>'),
+    'data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg"><style>@import "https://evil.example/a.css";</style></svg>'),
+    'data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<not-svg/>'),
+    'data:image/svg+xml;base64,%%%invalid%%%',
+    'data:image/SVG+XML,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg"><script>1</script></svg>'),
+    'data:image/svg+xml,'+'a'.repeat(1_400_001),
+  ]){
+    expect(()=>adaptSvgData(malicious,dark,true),malicious.slice(0,80)).toThrow();
+  }
+});

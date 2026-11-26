@@ -98,6 +98,7 @@ def check(executable: Path, version: str, graphics: str) -> None:
             raise RuntimeError(f"Document did not paint: {evidence}")
         if evidence.get("theme")!="Packaged theme check":raise RuntimeError("Packaged custom-theme validator or native/reader bridge failed")
         if '"themeArt":true' not in evidence.get("content",""):raise RuntimeError("Packaged embedded theme artwork did not reach the reader")
+        if '"mermaid":1' not in evidence.get("content",""):raise RuntimeError("Packaged fallback Mermaid sandbox did not render in the Qt reader")
         if graphics != "auto" and evidence.get("software") is not True:
             raise RuntimeError("Required graphics fallback was not selected")
         print(json.dumps({"executable":str(executable),"version":version,"graphics":graphics,

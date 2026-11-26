@@ -3637,6 +3637,9 @@ class Studio(QObject):
     def command(self, action):
         calls = {
             "find": "window.supermdFind?.()",
+            "replace": "window.supermdFind?.(true)",
+            "find_next": "window.supermdFindStep?.(1)",
+            "find_previous": "window.supermdFindStep?.(-1)",
             "insert": "window.supermdMedia?.()",
             "repair": "window.supermdRepairMath?.()",
             "undo": "window.supermdHistory?.('undo')",
