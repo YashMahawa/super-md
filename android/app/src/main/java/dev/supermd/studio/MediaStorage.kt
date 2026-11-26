@@ -61,6 +61,12 @@ class MediaStorage(private val context: Context) {
         }
     }
     data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int)
+    internal data class VerifiedDroppedImageCandidate(
+        val uri: Uri,
+        val intentFlags: Int,
+        val name: String?,
+        val resolvedMime: String,
+    )
     private val attachments = File(context.filesDir, "attachments").apply { mkdirs() }
     private val bundles = File(context.filesDir, "portable-assets").apply { mkdirs() }
 
@@ -419,7 +425,8 @@ class MediaStorage(private val context: Context) {
         return result
     }
     private fun resolveUriDisplayName(uri: Uri): String? =
-        androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name
+        runCatching { androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name }
+            .getOrNull()
             ?.takeIf { it.isNotBlank() }
             ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
 
@@ -483,6 +490,55 @@ class MediaStorage(private val context: Context) {
             result.put(store(name ?: "Image", resolvedMime, bytes))
         }
         return DroppedImageBatch(result, skipped)
+    }
+
+    internal fun discardImportedImages(images: JSONArray) {
+        for (i in 0 until images.length()) {
+            val source = images.optJSONObject(i)?.optString("source").orEmpty()
+            if (!source.startsWith("assets/import-") || !validKey(source)) continue
+            containedFile(attachments, File(attachments, source.substringAfter('/')))?.let { file ->
+                invalidateLocalAsset(file)
+                file.delete()
+            }
+        }
+    }
+
+    internal fun importVerifiedDroppedImages(candidates: List<VerifiedDroppedImageCandidate>): DroppedImageBatch {
+        if (candidates.isEmpty()) return DroppedImageBatch(JSONArray(), 0)
+        var total = 0L
+        var skipped = 0
+        val result = JSONArray()
+        val dropCaller = ExternalIntentCaller(allowGrantedShareFile = false)
+        try {
+            for (candidate in candidates) {
+                require(result.length() < 32) { "Insert at most 32 images at a time" }
+                val bytes = runCatching {
+                    ExternalDocumentEntryGuard.openVerifiedExternalInputStream(
+                        context = context,
+                        resolver = context.contentResolver,
+                        uri = candidate.uri,
+                        intentFlags = candidate.intentFlags,
+                        caller = dropCaller,
+                    ).use { readLimited(it, 25_000_000) }
+                }.getOrElse { error ->
+                    if (error.message?.contains("exceeds", ignoreCase = true) == true) throw error
+                    skipped++
+                    continue
+                }
+                val validSignature = runCatching { requireMediaSignature(candidate.resolvedMime, bytes) }.isSuccess
+                if (!validSignature) {
+                    skipped++
+                    continue
+                }
+                total += bytes.size
+                require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+                result.put(store(candidate.name ?: "Image", candidate.resolvedMime, bytes))
+            }
+            return DroppedImageBatch(result, skipped)
+        } catch (error: Throwable) {
+            discardImportedImages(result)
+            throw error
+        }
     }
 
     /** Save a requested browser image/diagram into Downloads or the user's configured note folder. */

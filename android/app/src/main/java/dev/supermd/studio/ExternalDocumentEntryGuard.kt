@@ -14,12 +14,21 @@ import android.system.OsConstants
 import java.io.File
 import java.io.InputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Paths
+import java.nio.file.attribute.BasicFileAttributes
 
 internal data class ExternalIntentCaller(
     val uid: Int? = null,
     val callerGrantedOwnShareUri: Boolean = false,
+    val allowGrantedShareFile: Boolean = true,
 )
+
+internal sealed interface DroppedUriValidation {
+    data class Allowed(val uri: Uri, val intentFlags: Int) : DroppedUriValidation
+    data class FolderRejected(val uri: Uri) : DroppedUriValidation
+    data class Rejected(val uri: Uri, val reason: String) : DroppedUriValidation
+}
 
 internal sealed interface ExternalDocumentDecision {
     data object NoDocument : ExternalDocumentDecision
@@ -139,12 +148,74 @@ internal object ExternalDocumentEntryGuard {
         return ExternalDocumentDecision.Allowed(uri, intentFlags)
     }
 
+    private fun isOwnShareAuthority(context: Context, authority: String?): Boolean {
+        val normalized = authority?.substringAfter('@')?.takeIf(String::isNotBlank) ?: return false
+        return normalized.equals("${context.packageName}.share", ignoreCase = true)
+    }
+
+    fun validateDroppedUri(
+        context: Context,
+        uri: Uri,
+        dragReadPermissionGranted: Boolean,
+    ): DroppedUriValidation {
+        return when (uri.scheme?.lowercase()) {
+            "content" -> {
+                val authority = uri.authority
+                if (authority.isNullOrBlank()) {
+                    return DroppedUriValidation.Rejected(uri, "Missing document provider authority")
+                }
+                if (isOwnShareAuthority(context, authority)) {
+                    return DroppedUriValidation.Rejected(uri, "App-private share URIs cannot be dropped")
+                }
+                if (DocumentsContract.isTreeUri(uri)) {
+                    return DroppedUriValidation.FolderRejected(uri)
+                }
+                if (!dragReadPermissionGranted) {
+                    return DroppedUriValidation.Rejected(uri, "Document read access was not granted by the caller")
+                }
+                val dropCaller = ExternalIntentCaller(allowGrantedShareFile = false)
+                if (!hasDirectReadUriPermission(context, uri, dropCaller)) {
+                    return DroppedUriValidation.Rejected(uri, "Document permission is unavailable; choose it again")
+                }
+                DroppedUriValidation.Allowed(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            "file" -> {
+                if (!uri.authority.isNullOrEmpty() && !uri.authority.equals("localhost", ignoreCase = true)) {
+                    return DroppedUriValidation.Rejected(uri, "Remote file URIs are not supported")
+                }
+                val rawPath = uri.path
+                if (rawPath.isNullOrBlank() || '\u0000' in rawPath) {
+                    return DroppedUriValidation.Rejected(uri, "Invalid file path")
+                }
+                val safeFile = runCatching { requireSafeExternalFile(context, File(rawPath)) }.getOrElse { error ->
+                    return DroppedUriValidation.Rejected(
+                        uri,
+                        error.message ?: "App-private paths cannot be opened externally",
+                    )
+                }
+                val attrs = runCatching {
+                    Files.readAttributes(safeFile.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+                }.getOrNull() ?: return DroppedUriValidation.Rejected(uri, "File does not exist")
+                if (attrs.isDirectory) {
+                    return DroppedUriValidation.FolderRejected(uri)
+                }
+                if (!attrs.isRegularFile) {
+                    return DroppedUriValidation.Rejected(uri, "Document is not a regular file")
+                }
+                DroppedUriValidation.Allowed(uri, 0)
+            }
+            else -> DroppedUriValidation.Rejected(uri, "Unsupported document URI scheme")
+        }
+    }
+
     fun hasDirectReadUriPermission(
         context: Context,
         uri: Uri,
         caller: ExternalIntentCaller = ExternalIntentCaller(),
     ): Boolean {
         if (!uri.scheme.equals("content", ignoreCase = true)) return false
+        val ownShare = isOwnShareAuthority(context, uri.authority)
+        if (!caller.allowGrantedShareFile && ownShare) return false
         if (
             context.checkUriPermission(
                 uri,
@@ -159,7 +230,7 @@ internal object ExternalDocumentEntryGuard {
         // record into mGrantedUriPermissions when targetUid already owns the provider
         // (${packageName}.share). Verify the kernel-authenticated caller instead so
         // legitimate own-share launches succeed while ungranted external callers fail.
-        if (uri.authority == "${context.packageName}.share") {
+        if (ownShare) {
             if (caller.callerGrantedOwnShareUri) return true
             val uid = caller.uid
             if (uid != null && uid > 0) {
@@ -230,6 +301,9 @@ internal object ExternalDocumentEntryGuard {
         return when (uri.scheme?.lowercase()) {
             "content" -> {
                 require(!DocumentsContract.isTreeUri(uri)) { "Folder URIs cannot be opened as a note" }
+                require(caller.allowGrantedShareFile || !isOwnShareAuthority(context, uri.authority)) {
+                    "App-private share URIs cannot be dropped"
+                }
                 require((intentFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
                     "Document read access was not granted by the caller"
                 }
@@ -240,7 +314,7 @@ internal object ExternalDocumentEntryGuard {
                 val pfd = resolver.openFileDescriptor(uri, "r")
                     ?: error("Document permission is unavailable; choose it again")
                 try {
-                    verifyOpenedDescriptor(context, uri, pfd)
+                    verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = caller.allowGrantedShareFile)
                     ParcelFileDescriptor.AutoCloseInputStream(pfd)
                 } catch (error: Throwable) {
                     runCatching { pfd.close() }
@@ -254,9 +328,13 @@ internal object ExternalDocumentEntryGuard {
                 val rawPath = uri.path?.takeIf { it.isNotBlank() && '\u0000' !in it }
                     ?: throw IllegalArgumentException("Invalid file path")
                 val safeFile = requireSafeExternalFile(context, File(rawPath))
+                val attrs = runCatching {
+                    Files.readAttributes(safeFile.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+                }.getOrNull() ?: throw IllegalArgumentException("File does not exist")
+                require(attrs.isRegularFile) { "Document is not a regular file" }
                 val pfd = ParcelFileDescriptor.open(safeFile, ParcelFileDescriptor.MODE_READ_ONLY)
                 try {
-                    verifyOpenedDescriptor(context, uri, pfd)
+                    verifyOpenedDescriptor(context, uri, pfd, allowGrantedShareFile = false)
                     ParcelFileDescriptor.AutoCloseInputStream(pfd)
                 } catch (error: Throwable) {
                     runCatching { pfd.close() }
@@ -267,17 +345,23 @@ internal object ExternalDocumentEntryGuard {
         }
     }
 
-    private fun verifyOpenedDescriptor(context: Context, uri: Uri, pfd: ParcelFileDescriptor) {
+    private fun verifyOpenedDescriptor(
+        context: Context,
+        uri: Uri,
+        pfd: ParcelFileDescriptor,
+        allowGrantedShareFile: Boolean = true,
+    ) {
         val stat = runCatching { Os.fstat(pfd.fileDescriptor) }.getOrNull()
         if (stat != null && stat.st_mode != 0) {
-            require(OsConstants.S_ISREG(stat.st_mode) || OsConstants.S_ISFIFO(stat.st_mode)) {
+            val isFileScheme = uri.scheme.equals("file", ignoreCase = true)
+            require(OsConstants.S_ISREG(stat.st_mode) || (!isFileScheme && OsConstants.S_ISFIFO(stat.st_mode))) {
                 "Document is not a regular file"
             }
         }
         val fdPath = resolveDescriptorPath(pfd) ?: return
         if (!fdPath.startsWith("/")) return
         val cleanFdPath = fdPath.removeSuffix(" (deleted)")
-        if (isAllowedGrantedShareFile(context, uri, cleanFdPath)) return
+        if (allowGrantedShareFile && isAllowedGrantedShareFile(context, uri, cleanFdPath)) return
         require(!isForbiddenExternalPath(context, cleanFdPath)) {
             "App-private paths cannot be opened externally"
         }
@@ -291,7 +375,7 @@ internal object ExternalDocumentEntryGuard {
 
     private fun isAllowedGrantedShareFile(context: Context, uri: Uri, resolvedPath: String): Boolean {
         if (!uri.scheme.equals("content", ignoreCase = true)) return false
-        if (uri.authority != "${context.packageName}.share") return false
+        if (!isOwnShareAuthority(context, uri.authority)) return false
         val shareRoot = runCatching { File(context.cacheDir, "share").canonicalPath }.getOrNull() ?: return false
         val canonicalCandidate = runCatching { File(resolvedPath).canonicalPath }.getOrDefault(resolvedPath)
         return canonicalCandidate.startsWith("$shareRoot${File.separator}")
@@ -316,7 +400,9 @@ internal object ExternalDocumentEntryGuard {
         val pkg = context.packageName
         if (pkg.isNotBlank()) {
             for (segment in listOf("/Android/data/$pkg", "/Android/obb/$pkg", "/Android/media/$pkg")) {
-                if (normalized.endsWith(segment) || normalized.contains("$segment/")) return true
+                if (normalized.endsWith(segment, ignoreCase = true) || normalized.contains("$segment/", ignoreCase = true)) {
+                    return true
+                }
             }
         }
         for (privateRoot in appPrivateRoots(context)) {

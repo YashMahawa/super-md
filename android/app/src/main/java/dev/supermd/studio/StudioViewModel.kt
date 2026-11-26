@@ -961,9 +961,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     private fun resolveDisplayName(target: Uri): String? =
-        DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank)
+        runCatching { DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank) }.getOrNull()
             ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
-            ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.lastPathSegment?.takeIf(String::isNotBlank)
+            ?: target.lastPathSegment?.substringAfterLast('/')?.takeIf(String::isNotBlank)
 
     private var autosaveJob: Job? = null
     private val autosavePending = mutableSetOf<String>()
@@ -2041,11 +2041,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         relative: String?,
         externalIntentFlags: Int?,
         externalCaller: ExternalIntentCaller,
+        strictDroppedNote: Boolean = false,
     ): Note {
         if (externalIntentFlags == null) return loadNoteForOpen(uri, relative)
-        // External Intents must prove their own live caller grant; never manufacture
+        // External Intents and drops must prove their own live caller grant; never manufacture
         // access from persisted SAF folder trees or untrusted app-private paths.
-        return loadResolvedNoteForOpen(uri, uri, relative, externalIntentFlags, externalCaller)
+        return loadResolvedNoteForOpen(uri, uri, relative, externalIntentFlags, externalCaller, strictDroppedNote)
     }
     private fun loadResolvedNoteForOpen(
         target: Uri,
@@ -2053,6 +2054,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         relative: String?,
         externalIntentFlags: Int?,
         externalCaller: ExternalIntentCaller,
+        strictDroppedNote: Boolean = false,
     ): Note {
         val app = getApplication<Application>()
         val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, originalUri.toString()) } == true }
@@ -2065,7 +2067,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
             }
             verifyStream.use { }
-            return existing.copy(uri = target.toString(), relative = relative ?: existing.relative)
+            val preserveExistingUri = externalIntentFlags != null &&
+                (externalIntentFlags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) == 0 &&
+                existing.uri != null
+            return existing.copy(
+                uri = if (preserveExistingUri) existing.uri else target.toString(),
+                relative = relative ?: existing.relative,
+            )
         }
         val inputStream = if (externalIntentFlags != null) {
             ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
@@ -2086,7 +2094,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
                     .also { recordPortableBaseline(it.id, opened.directory) }
             } else {
-                val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                if (strictDroppedNote) {
+                    val lowerExt = name.substringAfterLast('.', "").lowercase()
+                    require(lowerExt != "smd" && lowerExt != "fmd") { "Unsupported portable note file" }
+                }
+                val rawBytes = readLimited(buffered, 20_000_000)
+                if (strictDroppedNote) {
+                    require(rawBytes.none { it == 0.toByte() }) { "Binary files cannot be opened as Markdown notes" }
+                }
+                val content = rawBytes.toString(Charsets.UTF_8).removePrefix("\uFEFF")
                 Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
             }
         }
@@ -4034,6 +4050,233 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             result(null)
         }
     }
+
+    internal fun discardDroppedImages(images: JSONArray) {
+        viewModelScope.launch(Dispatchers.IO) { media.discardImportedImages(images) }
+    }
+
+    private data class ValidatedDroppedNoteCandidate(
+        val uri: Uri,
+        val intentFlags: Int,
+        val name: String?,
+        val providerMime: String?,
+    )
+
+    private suspend fun openDroppedNoteBatch(
+        candidates: List<ValidatedDroppedNoteCandidate>,
+        batchNotice: String?,
+    ) {
+        val request = openRequests.begin()
+        val dropCaller = ExternalIntentCaller(allowGrantedShareFile = false)
+        val loadedNotes = mutableListOf<Note>()
+        val createdPortableDirectories = LinkedHashSet<String>()
+        val openErrors = mutableListOf<String>()
+        try {
+            withContext(Dispatchers.IO) {
+                for (candidate in candidates) {
+                    val label = candidate.name ?: candidate.uri.lastPathSegment ?: "note"
+                    runCatching {
+                        loadNoteForOpen(
+                            uri = candidate.uri,
+                            relative = null,
+                            externalIntentFlags = candidate.intentFlags,
+                            externalCaller = dropCaller,
+                            strictDroppedNote = true,
+                        )
+                    }.onSuccess { note ->
+                        loadedNotes += note
+                        note.assetDirectory?.let { dir ->
+                            if (mutable.value.tabs.none { it.assetDirectory == dir }) {
+                                createdPortableDirectories += dir
+                            }
+                        }
+                    }.onFailure { error ->
+                        openErrors += "$label: ${error.message ?: "Could not read note"}"
+                    }
+                }
+            }
+            if (loadedNotes.isEmpty()) {
+                val parts = mutableListOf<String>()
+                if (openErrors.isNotEmpty()) parts += "Could not open ${openErrors.joinToString("; ")}"
+                if (!batchNotice.isNullOrBlank()) parts += batchNotice
+                fail(parts.joinToString(" ").ifBlank { "Could not open dropped note" })
+                return
+            }
+            if (!openRequests.isCurrent(request)) {
+                loadedNotes.forEach { retainOpenedNote(it, activate = false) }
+            } else {
+                val expectedActiveId = mutable.value.active.id
+                var retainedCount = 0
+                val accepted = performReaderBarrier(expectedActiveId) {
+                    val activateLast = openRequests.isCurrent(request)
+                    loadedNotes.forEachIndexed { index, note ->
+                        retainOpenedNote(
+                            note,
+                            activate = activateLast && index == loadedNotes.lastIndex,
+                        )
+                        retainedCount++
+                    }
+                }
+                if (!accepted || retainedCount == 0) {
+                    if (!openRequests.isCurrent(request)) {
+                        loadedNotes.forEach { retainOpenedNote(it, activate = false) }
+                    } else {
+                        cleanupPortableDirectories(createdPortableDirectories)
+                        readerBarrierFailed()
+                        return
+                    }
+                }
+            }
+            val notices = mutableListOf<String>()
+            if (openErrors.isNotEmpty()) notices += "Could not open ${openErrors.joinToString("; ")}"
+            if (!batchNotice.isNullOrBlank()) notices += batchNotice
+            if (notices.isNotEmpty()) {
+                mutable.value = mutable.value.copy(message = notices.joinToString(" "))
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            cleanupPortableDirectories(createdPortableDirectories)
+            throw cancelled
+        }
+    }
+
+    internal fun handleExternalDrop(
+        uris: List<Uri>,
+        activeNoteId: String,
+        dragReadPermissionGranted: Boolean,
+        onComplete: () -> Unit = {},
+        result: (JSONArray?) -> Unit = {},
+    ): Job = viewModelScope.launch {
+        try {
+            val seen = LinkedHashSet<String>()
+            val orderedUris = uris.filter { seen.add(it.toString()) }
+            if (orderedUris.isEmpty()) {
+                mutable.value = mutable.value.copy(message = DROP_UNSUPPORTED_ITEM_MESSAGE)
+                result(null)
+                return@launch
+            }
+            val app = getApplication<Application>()
+            val imageCandidates = mutableListOf<MediaStorage.VerifiedDroppedImageCandidate>()
+            val noteCandidates = mutableListOf<ValidatedDroppedNoteCandidate>()
+            var folderRejectedCount = 0
+            var unsupportedFileCount = 0
+            val securityRejectedReasons = mutableListOf<String>()
+
+            withContext(Dispatchers.IO) {
+                for (uri in orderedUris) {
+                    when (val validation = ExternalDocumentEntryGuard.validateDroppedUri(app, uri, dragReadPermissionGranted)) {
+                        is DroppedUriValidation.FolderRejected -> folderRejectedCount++
+                        is DroppedUriValidation.Rejected -> securityRejectedReasons += validation.reason
+                        is DroppedUriValidation.Allowed -> {
+                            val name = resolveDisplayName(uri)
+                            val providerMime = if (uri.scheme.equals("content", ignoreCase = true)) {
+                                runCatching { resolver.getType(uri) }.getOrNull()
+                            } else {
+                                null
+                            }
+                            if (providerMime?.substringBefore(';')?.trim()?.equals(DocumentsContract.Document.MIME_TYPE_DIR, ignoreCase = true) == true) {
+                                folderRejectedCount++
+                                continue
+                            }
+                            val imageMime = MediaStorage.resolveDroppedImageMime(name, providerMime)
+                            when {
+                                imageMime != null -> imageCandidates += MediaStorage.VerifiedDroppedImageCandidate(
+                                    uri = uri,
+                                    intentFlags = validation.intentFlags,
+                                    name = name,
+                                    resolvedMime = imageMime,
+                                )
+                                isSupportedDroppedNote(name, providerMime) -> noteCandidates += ValidatedDroppedNoteCandidate(
+                                    uri = uri,
+                                    intentFlags = validation.intentFlags,
+                                    name = name,
+                                    providerMime = providerMime,
+                                )
+                                else -> unsupportedFileCount++
+                            }
+                        }
+                    }
+                }
+            }
+
+            when {
+                noteCandidates.isNotEmpty() -> {
+                    val skippedParts = mutableListOf<String>()
+                    if (folderRejectedCount > 0) {
+                        skippedParts += if (folderRejectedCount == 1) {
+                            "Skipped 1 folder (use Open folder instead)."
+                        } else {
+                            "Skipped $folderRejectedCount folders (use Open folder instead)."
+                        }
+                    }
+                    if (imageCandidates.isNotEmpty()) {
+                        skippedParts += "Drop images inside an open note after opening it."
+                    }
+                    val skippedOther = unsupportedFileCount + securityRejectedReasons.size
+                    if (skippedOther > 0) {
+                        skippedParts += if (skippedOther == 1) {
+                            "Skipped 1 unsupported item."
+                        } else {
+                            "Skipped $skippedOther unsupported items."
+                        }
+                    }
+                    openDroppedNoteBatch(
+                        candidates = noteCandidates,
+                        batchNotice = skippedParts.joinToString(" ").takeIf { it.isNotBlank() },
+                    )
+                    result(null)
+                }
+                imageCandidates.isNotEmpty() -> {
+                    try {
+                        val batch = withContext(Dispatchers.IO) { media.importVerifiedDroppedImages(imageCandidates) }
+                        val images = batch.images
+                        if (images.length() == 0) {
+                            mutable.value = mutable.value.copy(message = MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE)
+                            result(null)
+                            return@launch
+                        }
+                        markAssetsDirty(activeNoteId)
+                        val totalSkipped = batch.skippedCount + folderRejectedCount + unsupportedFileCount + securityRejectedReasons.size
+                        if (totalSkipped > 0) {
+                            val skippedMessage = if (totalSkipped == 1) {
+                                "Skipped 1 unsupported file; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
+                            } else {
+                                "Skipped $totalSkipped unsupported files; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
+                            }
+                            mutable.value = mutable.value.copy(message = skippedMessage)
+                        }
+                        if (mutable.value.active.id == activeNoteId) {
+                            result(images)
+                        } else {
+                            val insertion = (0 until images.length()).joinToString("\n\n") { i ->
+                                val image = images.getJSONObject(i)
+                                "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)"
+                            }
+                            val note = mutable.value.tabs.find { it.id == activeNoteId }
+                            if (note != null) edit(activeNoteId, note.content + "\n\n" + insertion + "\n")
+                            else media.discardImportedImages(images)
+                            result(null)
+                        }
+                    } catch (error: Exception) {
+                        fail("Could not insert image: ${error.message}")
+                        result(null)
+                    }
+                }
+                else -> {
+                    when {
+                        folderRejectedCount > 0 && unsupportedFileCount == 0 && securityRejectedReasons.isEmpty() ->
+                            mutable.value = mutable.value.copy(message = DROP_FOLDER_UNSUPPORTED_MESSAGE)
+                        securityRejectedReasons.isNotEmpty() && unsupportedFileCount == 0 && folderRejectedCount == 0 ->
+                            fail("Could not open dropped file: ${securityRejectedReasons.first()}")
+                        else ->
+                            mutable.value = mutable.value.copy(message = DROP_UNSUPPORTED_ITEM_MESSAGE)
+                    }
+                    result(null)
+                }
+            }
+        } finally {
+            onComplete()
+        }
+    }
     internal suspend fun export(
         content: String,
         options: String,
@@ -4091,3 +4334,61 @@ object PdfEngine {
     @JvmStatic external fun fontFamilies(path: String): String
     @JvmStatic external fun validateTheme(input:String):String
 }
+
+internal const val DROP_UNSUPPORTED_ITEM_MESSAGE =
+    "Only supported Markdown notes (.md, .smd, .fmd, .markdown, .txt) or images can be dropped."
+internal const val DROP_FOLDER_UNSUPPORTED_MESSAGE =
+    "Folder drops are not supported; use Open folder instead."
+
+private val UNAMBIGUOUS_DROPPED_NOTE_MIMES = setOf(
+    "text/markdown",
+    "text/x-markdown",
+    "text/x-supermarkdown",
+    "application/vnd.supermd.smd",
+    "application/vnd.supermd.fmd",
+    "application/x-smd",
+    "application/x-fmd",
+)
+
+private val PORTABLE_COMPATIBLE_NOTE_MIMES = UNAMBIGUOUS_DROPPED_NOTE_MIMES + setOf(
+    "application/gzip",
+    "application/x-gzip",
+    "application/json",
+    "application/octet-stream",
+    "text/plain",
+)
+
+private val PLAIN_COMPATIBLE_NOTE_MIMES = UNAMBIGUOUS_DROPPED_NOTE_MIMES + setOf(
+    "text/plain",
+    "application/octet-stream",
+)
+
+internal fun isSupportedDroppedNote(name: String?, providerMime: String?): Boolean {
+    val normalizedMime = providerMime?.substringBefore(';')?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+    if (normalizedMime == DocumentsContract.Document.MIME_TYPE_DIR.lowercase()) return false
+    if (
+        normalizedMime != null && (
+            normalizedMime.startsWith("image/") ||
+                normalizedMime.startsWith("video/") ||
+                normalizedMime.startsWith("audio/") ||
+                normalizedMime == "application/pdf" ||
+                normalizedMime == "application/zip"
+        )
+    ) {
+        return false
+    }
+    val leaf = name?.substringAfterLast('/')?.substringAfterLast('\\')?.trim().orEmpty()
+    val dot = leaf.lastIndexOf('.')
+    val ext = if (dot > 0 && dot < leaf.lastIndex) leaf.substring(dot + 1).lowercase() else ""
+    if (ext.isNotEmpty()) {
+        if (ext !in FOLDER_NOTE_EXTENSIONS) return false
+        if (normalizedMime == null) return true
+        return if (ext == "smd" || ext == "fmd") {
+            normalizedMime in PORTABLE_COMPATIBLE_NOTE_MIMES
+        } else {
+            normalizedMime in PLAIN_COMPATIBLE_NOTE_MIMES
+        }
+    }
+    return normalizedMime != null && normalizedMime in UNAMBIGUOUS_DROPPED_NOTE_MIMES
+}
+

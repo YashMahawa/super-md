@@ -622,6 +622,7 @@ internal class ExternalDropDragController(
 
 internal fun shouldBlockNativeDrop(
     state: StudioState,
+    readerReady: Boolean = true,
     folderSearchVisible: Boolean = false,
     accessRequestOpen: Boolean = false,
     settingsOpen: Boolean = false,
@@ -630,7 +631,8 @@ internal fun shouldBlockNativeDrop(
     contentsShown: Boolean = false,
     drawerOpen: Boolean = false,
 ): Boolean =
-    !state.welcomed ||
+    !readerReady ||
+        !state.welcomed ||
         state.busy ||
         state.readerOverlay ||
         folderSearchVisible ||
@@ -1415,6 +1417,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
                     if (shouldBlockNativeDrop(
                             model.state.value,
+                            readerReady = readerReady,
                             folderSearchVisible = model.folderSearch.value.visible,
                             accessRequestOpen = model.documentAccessRequests.value != null,
                             settingsOpen = settings,
@@ -1425,7 +1428,8 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                         )) {
                         return@rememberUpdatedState
                     }
-                    val permissions = activity.requestDragAndDropPermissions(event)
+                    val permissions = runCatching { activity.requestDragAndDropPermissions(event) }.getOrNull()
+                    val dragReadGranted = permissions != null
                     val uris = extractDroppedFileUris(event.clipData)
                     if (uris.isNotEmpty()) {
                         val id = model.state.value.active.id
@@ -1433,14 +1437,28 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                         val x = event.x / currentDensity
                         val y = event.y / currentDensity
                         reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                        model.importDropped(uris, id) { images ->
-                            permissions?.release()
-                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                        model.handleExternalDrop(
+                            uris = uris,
+                            activeNoteId = id,
+                            dragReadPermissionGranted = dragReadGranted,
+                            onComplete = { runCatching { permissions?.release() } },
+                        ) { images ->
+                            if (images != null) {
+                                if (web === reader && readerReady) {
+                                    reader.evaluateJavascript("window.supermdInsertImages?.($images)", null)
+                                } else {
+                                    model.discardDroppedImages(images)
+                                }
+                            }
                         }
                     } else {
-                        permissions?.release()
+                        runCatching { permissions?.release() }
                         if ((event.clipData?.itemCount ?: 0) > 0) {
-                            model.importDropped(emptyList(), model.state.value.active.id) {}
+                            model.handleExternalDrop(
+                                uris = emptyList(),
+                                activeNoteId = model.state.value.active.id,
+                                dragReadPermissionGranted = false,
+                            ) {}
                         }
                     }
                 }
