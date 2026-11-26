@@ -17,7 +17,7 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
 
-from PySide6.QtCore import QEvent, QObject, Qt, QUrl
+from PySide6.QtCore import QEvent, QMetaObject, QObject, Q_ARG, Q_RETURN_ARG, Qt, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
@@ -670,6 +670,236 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
                     lambda: not bool(dialog.property("visible"))
                     and int(window.property("modalDialogCount") or 0) == 0
                     and bool(zoom_field.property("activeFocus"))
+                )
+            )
+        finally:
+            window.setProperty("closingAllowed", True)
+            window.setProperty("intentionalShutdown", True)
+            window.close()
+            window.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_preserves_pr104_remappable_shortcuts_active_tab_reveal_and_modal_keyboard_scope(self):
+        ws = self.root / "pr104-coexist"
+        ws.mkdir(parents=True)
+        note_paths: list[Path] = []
+        for idx in range(1, 8):
+            md_path = ws / f"Chapter-{idx:02d}-Foundations-And- Derivations.md".replace(" ", "")
+            md_path.write_text(f"# Chapter {idx}\n", encoding="utf-8")
+            note_paths.append(md_path)
+        overflow_smd = ws / "Chapter-08-Portable-Appendix.smd"
+        documents.write_portable(overflow_smd, "# Portable Appendix\n", {})
+
+        self.studio.settings["welcomed"] = True
+        self.studio.settings["motion"] = True
+        self.studio.openFolder(str(ws))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) > 0))
+        for p in note_paths:
+            self.studio.openNote(str(p))
+        self.assertTrue(_wait_until(lambda: len(self.studio.tabs) >= len(note_paths)))
+
+        qml_root = Path(__file__).resolve().parent / "qml"
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("studio", self.studio)
+        engine.rootContext().setContextProperty("readerUrl", QUrl("about:blank"))
+        engine.rootContext().setContextProperty("channelScript", "")
+        engine.rootContext().setContextProperty(
+            "brandUrl",
+            QUrl.fromLocalFile(str(qml_root.parent.parent / "public" / "brand-mark-fixed.svg")),
+        )
+        engine.load(QUrl.fromLocalFile(str(qml_root / "Main.qml")))
+        self.assertTrue(engine.rootObjects(), "Main.qml failed to load")
+
+        window = engine.rootObjects()[0]
+        self.studio.host_window = window
+        window.resize(760, 600)
+        window.show()
+        window.requestActivate()
+        QTest.qWaitForWindowActive(window, 1000)
+        QTest.qWait(80)
+
+        def js_variant(value):
+            return value.toVariant() if hasattr(value, "toVariant") else value
+
+        def shortcut_enabled(action_id: str) -> bool:
+            result = QMetaObject.invokeMethod(
+                window,
+                "shortcutEnabled",
+                Q_RETURN_ARG("QVariant"),
+                Q_ARG("QVariant", action_id),
+            )
+            return bool(js_variant(result))
+
+        try:
+            # 1. #104 remappable shortcuts: live update + disable hides menu hint without showing "Disabled"
+            compact_qs = window.findChild(QObject, "quickSwitcherAction")
+            compact_search = window.findChild(QObject, "compactSearchFolderAction")
+            self.assertIsNotNone(compact_qs)
+            self.assertIsNotNone(compact_search)
+            self.assertEqual(
+                compact_search.findChild(QObject, "menuShortcutHint").property("text"),
+                native_label("Ctrl+Shift+F"),
+            )
+            self.assertEqual(self.studio.setShortcut("quick_switcher", "Ctrl+Alt+P"), "")
+            self.assertTrue(
+                _wait_until(
+                    lambda: compact_qs.findChild(QObject, "menuShortcutHint").property("text")
+                    == native_label("Ctrl+Alt+P")
+                )
+            )
+            self.assertEqual(js_variant(window.property("shortcutBindings"))["quick_switcher"], ["Ctrl+Alt+P"])
+
+            self.assertEqual(self.studio.setShortcut("quick_switcher", ""), "")
+            self.assertTrue(_wait_until(lambda: not bool(compact_qs.property("hasShortcutHint"))))
+            self.assertEqual(js_variant(window.property("shortcutLabels"))["quick_switcher"], "Disabled")
+
+            self.assertEqual(self.studio.resetShortcuts(), "")
+            self.assertTrue(
+                _wait_until(
+                    lambda: bool(compact_qs.property("hasShortcutHint"))
+                    and compact_qs.findChild(QObject, "menuShortcutHint").property("text")
+                    == native_label("Ctrl+P")
+                )
+            )
+
+            # 2. #104 modal keyboard scope & focus behavior (with motion=True animated transitions)
+            self.assertTrue(shortcut_enabled("quick_switcher"))
+            self.assertTrue(shortcut_enabled("mode_live"))
+            self.assertTrue(shortcut_enabled("new_folder_note"))
+
+            # Another modal (#104/#87) suppresses quick_switcher shortcut
+            window.setProperty("settingsOpen", True)
+            self.assertTrue(_wait_until(lambda: int(window.property("modalDialogCount") or 0) == 1))
+            self.assertFalse(shortcut_enabled("quick_switcher"))
+            window.setProperty("settingsOpen", False)
+            self.assertTrue(_wait_until(lambda: int(window.property("modalDialogCount") or 0) == 0))
+            self.assertTrue(shortcut_enabled("quick_switcher"))
+
+            zoom_field = window.findChild(QObject, "zoomPercentage")
+            filter_field = window.findChild(QObject, "folderFilterField")
+            dialog = window.findChild(QObject, "quickSwitcherDialog")
+            self.assertIsNotNone(zoom_field)
+            self.assertIsNotNone(filter_field)
+            self.assertIsNotNone(dialog)
+            zoom_field.forceActiveFocus()
+            self.assertTrue(_wait_until(lambda: bool(zoom_field.property("activeFocus"))))
+
+            self.studio.openQuickSwitcher()
+            self.assertTrue(
+                _wait_until(lambda: bool(dialog.property("opened")) and not self.studio.quickSwitcherState["loading"])
+            )
+            qs_input = _find_visual_item(dialog.property("contentItem"), "quickSwitcherInput")
+            self.assertIsNotNone(qs_input)
+            self.assertTrue(_wait_until(lambda: bool(qs_input.property("activeFocus"))))
+            self.assertEqual(int(window.property("modalDialogCount") or 0), 1)
+            self.assertTrue(
+                bool(js_variant(QMetaObject.invokeMethod(window, "nativeTextEditorFocused", Q_RETURN_ARG("QVariant"))))
+            )
+            for suppressed in (
+                "mode_live",
+                "mode_editor",
+                "mode_reader",
+                "mode_split",
+                "new_note",
+                "new_folder_note",
+                "rename_entry",
+                "close_tab",
+                "select_all",
+                "copy",
+                "paste",
+                "bold",
+                "dismiss",
+            ):
+                self.assertFalse(shortcut_enabled(suppressed), f"Expected {suppressed} disabled while modal open")
+
+            # Tab / Shift+Tab cycle Quick Switcher selection without escaping Overlay.overlay into background chrome
+            self.assertGreaterEqual(len(self.studio.quickSwitcherState["items"]), 2)
+            QTest.keyClick(window, Qt.Key.Key_Tab)
+            self.assertTrue(_wait_until(lambda: int(dialog.property("selectedIndex")) == 1))
+            self.assertTrue(bool(qs_input.property("activeFocus")))
+            QTest.keyClick(window, Qt.Key.Key_Tab, Qt.KeyboardModifier.ShiftModifier)
+            self.assertTrue(_wait_until(lambda: int(dialog.property("selectedIndex")) == 0))
+            self.assertTrue(bool(qs_input.property("activeFocus")))
+
+            # Animated Escape dismissal (motion=True) restores focus to zoom_field and re-enables shortcuts
+            QTest.keyClick(window, Qt.Key.Key_Escape)
+            self.assertTrue(
+                _wait_until(
+                    lambda: not bool(dialog.property("visible"))
+                    and int(window.property("modalDialogCount") or 0) == 0
+                    and bool(zoom_field.property("activeFocus"))
+                )
+            )
+            QTest.qWait(40)
+            self.assertTrue(bool(zoom_field.property("activeFocus")))
+            self.assertTrue(shortcut_enabled("mode_live"))
+
+            # Animated Enter activation (motion=True) from a focused QML field focuses documentReader
+            # rather than letting QQuickPopup's exit transition revert focus back to zoom_field
+            reader = window.findChild(QObject, "documentReader")
+            self.assertIsNotNone(reader)
+            self.studio.openQuickSwitcher()
+            self.assertTrue(
+                _wait_until(lambda: bool(dialog.property("opened")) and not self.studio.quickSwitcherState["loading"])
+            )
+            QTest.keyClick(window, Qt.Key.Key_Return)
+            self.assertTrue(
+                _wait_until(
+                    lambda: not bool(dialog.property("visible"))
+                    and int(window.property("modalDialogCount") or 0) == 0
+                    and bool(reader.property("activeFocus"))
+                )
+            )
+            QTest.qWait(40)
+            self.assertTrue(bool(reader.property("activeFocus")))
+            self.assertFalse(bool(zoom_field.property("activeFocus")))
+
+            # 3. #104 TabStrip active-tab reveal on Quick Switcher selection
+            tab_strip = window.findChild(QObject, "tabStrip")
+            self.assertIsNotNone(tab_strip)
+            flickable = tab_strip.property("contentItem")
+            self.assertIsNotNone(flickable)
+
+            def active_tab_revealed() -> bool:
+                QTest.qWait(10)
+                viewport_w = float(tab_strip.property("availableWidth") or tab_strip.property("width") or 0)
+                scroll_x = float(flickable.property("contentX") or 0)
+                stack = [tab_strip]
+                while stack:
+                    candidate = stack.pop()
+                    if candidate.objectName() == "noteTab" and bool(candidate.property("isActive")):
+                        left = float(candidate.property("x") or 0)
+                        width = float(candidate.property("width") or 0)
+                        return width > 0 and (left + 0.5) >= scroll_x and (left + width - 0.5) <= (scroll_x + viewport_w)
+                    child_items = getattr(candidate, "childItems", None)
+                    if callable(child_items):
+                        stack.extend(child_items())
+                return False
+
+            first_tab = next(t for t in self.studio.tabs if t["path"] == str(note_paths[0].resolve()))
+            self.studio.activateQuickSwitcherItem(first_tab["id"], first_tab["path"])
+            self.assertTrue(_wait_until(active_tab_revealed))
+            left_scroll_x = float(flickable.property("contentX") or 0)
+
+            # Open overflowing Chapter-08-Portable-Appendix.smd via Quick Switcher -> TabStrip scrolls right to reveal it
+            self.studio.activateQuickSwitcherItem("", str(overflow_smd))
+            self.assertTrue(
+                _wait_until(
+                    lambda: self.studio._current()["name"] == "Chapter-08-Portable-Appendix.smd"
+                    and active_tab_revealed()
+                    and float(flickable.property("contentX") or 0) > left_scroll_x + 40.0
+                )
+            )
+
+            # Switch back to Chapter-01 via Quick Switcher -> TabStrip scrolls back left to reveal it
+            self.studio.activateQuickSwitcherItem(first_tab["id"], first_tab["path"])
+            self.assertTrue(
+                _wait_until(
+                    lambda: self.studio.active == first_tab["id"]
+                    and active_tab_revealed()
+                    and float(flickable.property("contentX") or 0) <= left_scroll_x + 20.0
                 )
             )
         finally:

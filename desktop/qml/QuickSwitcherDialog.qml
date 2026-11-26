@@ -75,6 +75,20 @@ AppDialog {
         }
     }
 
+    function restoreFocusIfNeeded(wasActivated, savedTarget) {
+        if (!hostWindow) return
+        const otherModals = (hostWindow.modalDialogCount || 0) - (dialog.blockingHints ? 1 : 0)
+        if (otherModals > 0) return
+        const currentFocus = hostWindow.activeFocusItem
+        const lostFocusToRootOrPopup = !currentFocus
+            || currentFocus === hostWindow.contentItem
+            || currentFocus === dialog.parent
+            || dialog.isInsideDialog(currentFocus)
+        if (lostFocusToRootOrPopup || (wasActivated && currentFocus === savedTarget)) {
+            restoreTargetFocus(wasActivated, savedTarget)
+        }
+    }
+
     function clampSelection() {
         const items = stateData && stateData.items ? stateData.items : []
         if (!items.length) {
@@ -131,6 +145,14 @@ AppDialog {
                 dialog.moveSelection(1, true)
             }
             Keys.onUpPressed: event => {
+                event.accepted = true
+                dialog.moveSelection(-1, true)
+            }
+            Keys.onTabPressed: event => {
+                event.accepted = true
+                dialog.moveSelection((event.modifiers & Qt.ShiftModifier) ? -1 : 1, true)
+            }
+            Keys.onBacktabPressed: event => {
                 event.accepted = true
                 dialog.moveSelection(-1, true)
             }
@@ -191,6 +213,8 @@ AppDialog {
             objectName: "quickSwitcherList"
             Layout.fillWidth: true
             Layout.fillHeight: true
+            activeFocusOnTab: false
+            focus: false
             clip: true
             spacing: 4
             model: dialog.stateData.items || []
@@ -202,6 +226,8 @@ AppDialog {
                 width: ListView.view ? ListView.view.width - 8 : 520
                 implicitHeight: (modelData.parentPath || "").length > 0 ? 56 : 46
                 padding: 10
+                focusPolicy: Qt.NoFocus
+                activeFocusOnTab: false
                 highlighted: index === dialog.selectedIndex
                 onClicked: dialog.activateIndex(index)
                 background: Rectangle {
@@ -317,17 +343,10 @@ AppDialog {
         previousFocusItem = null
         activatedItem = false
         studio.closeQuickSwitcher()
-        restoreTargetFocus(wasActivated, savedTarget)
+        restoreFocusIfNeeded(wasActivated, savedTarget)
         Qt.callLater(function() {
-            if (dialog.visible || !hostWindow) return
-            const currentFocus = hostWindow.activeFocusItem
-            const lostFocusToRootOrPopup = !currentFocus
-                || currentFocus === hostWindow.contentItem
-                || currentFocus === dialog.parent
-                || dialog.isInsideDialog(currentFocus)
-            if (lostFocusToRootOrPopup) {
-                dialog.restoreTargetFocus(wasActivated, savedTarget)
-            }
+            if (dialog.visible) return
+            dialog.restoreFocusIfNeeded(wasActivated, savedTarget)
         })
     }
 }
