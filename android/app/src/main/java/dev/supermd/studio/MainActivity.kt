@@ -809,6 +809,7 @@ internal fun shouldBlockNativeDrop(
         state.readerOverlay ||
         folderSearchVisible ||
         accessRequestOpen ||
+        state.folderAccessPrompt != null ||
         state.pendingCloseNoteId != null ||
         state.pendingSaveConflictNoteId != null ||
         settingsOpen ||
@@ -1258,6 +1259,12 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
     val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> model.setFolder(uri) } }
+    var workspaceFolderPickerShowing by rememberSaveable { mutableStateOf(false) }
+    val workspaceFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        workspaceFolderPickerShowing = false
+        if (uri != null) model.grantWorkspaceFolderForLink(uri)
+        else model.dismissWorkspaceFolderPrompt()
+    }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
@@ -1810,6 +1817,27 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             } },
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
+    }
+    if (!workspaceFolderPickerShowing) state.folderAccessPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = model::dismissWorkspaceFolderPrompt,
+            title = { Text("Allow folder access for note links") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(prompt.noteName, style = MaterialTheme.typography.titleSmall)
+                    Text("Super MD needs permission for the folder containing this note to open linked notes like \"${prompt.target}\". Your current note and edits remain untouched.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspaceFolderPickerShowing = true
+                    workspaceFolderPicker.launch(prompt.initialUri)
+                }) { Text("Choose folder") }
+            },
+            dismissButton = {
+                TextButton(onClick = model::dismissWorkspaceFolderPrompt) { Text("Not now") }
+            },
+        )
     }
     if (folderSearch.visible) {
         BackHandler { model.cancelWorkspaceSearch() }
