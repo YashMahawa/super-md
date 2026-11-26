@@ -6,19 +6,37 @@ ColumnLayout {
     id: root
     objectName: "folderSidebar"
     required property var viewState
+    property var sidebarState: typeof studio !== "undefined" && studio && studio.sidebarSnapshot !== undefined ? JSON.parse(studio.sidebarSnapshot) : viewState
     property var shortcutLabels: ({})
+    readonly property string currentFolder: sidebarState.folder || ""
     property string selectedPath: ""
     property string selectedName: ""
     property bool selectedDirectory: false
     readonly property string activeTabPath: {
         const tabs = root.viewState && root.viewState.tabs ? root.viewState.tabs : []
-        const activeId = root.viewState ? root.viewState.active : ""
+        const activeId = root.sidebarState && root.sidebarState.active !== undefined
+            ? root.sidebarState.active
+            : (root.viewState ? root.viewState.active : "")
         for (let i = 0; i < tabs.length; i += 1) {
             if (tabs[i].id === activeId) return tabs[i].path || ""
         }
         return ""
     }
     spacing: 8
+
+    function resetSelection() {
+        selectedPath = ""
+        selectedName = ""
+        selectedDirectory = false
+    }
+
+    onCurrentFolderChanged: resetSelection()
+
+    onSidebarStateChanged: {
+        if (selectedPath && !sidebarState.folderSearching && !(sidebarState.files || []).some(item => root.samePathKey(item.path, selectedPath))) {
+            resetSelection()
+        }
+    }
 
     function noteStem(name) {
         const raw = name || ""
@@ -50,10 +68,11 @@ ColumnLayout {
     }
 
     function targetCreationFolder() {
-        if (!viewState.folder) return ""
-        if (selectedPath && (viewState.files || []).some(item => item.path === selectedPath))
-            return selectedDirectory ? selectedPath : parentPathOf(selectedPath)
-        return viewState.folder
+        if (!sidebarState.folder) return ""
+        const selectedEntry = selectedPath ? (sidebarState.files || []).find(item => item.path === selectedPath) : null
+        if (selectedEntry)
+            return selectedEntry.directory ? selectedEntry.path : parentPathOf(selectedEntry.path)
+        return sidebarState.folder
     }
 
     function folderDisplayName(pathValue) {
@@ -70,15 +89,15 @@ ColumnLayout {
     }
 
     function openCreateDialog(kind, parentDir) {
-        if (!viewState.folder) { studio.notifyMessage("Open a folder first."); return }
+        if (!sidebarState.folder) { studio.notifyMessage("Open a folder first."); return }
         createFolderItemDialog.itemKind = kind
-        createFolderItemDialog.parentDir = parentDir || viewState.folder
+        createFolderItemDialog.parentDir = parentDir || sidebarState.folder
         createFolderItemField.text = ""
         createFolderItemDialog.open()
     }
 
     function openRenameFor(pathValue, nameValue, isDir) {
-        if (!viewState.folder || !pathValue) return
+        if (!sidebarState.folder || !pathValue) return
         renameEntryDialog.entryPath = pathValue
         renameEntryDialog.entryIsDirectory = isDir
         renameEntryField.text = nameValue
@@ -102,8 +121,8 @@ ColumnLayout {
     function triggerNewSubfolder() { openCreateDialog("folder", targetCreationFolder()) }
 
     function isInsideOpenFolder(candidatePath) {
-        if (!candidatePath || !viewState.folder) return false
-        const normFolder = viewState.folder.replace(/\\/g, "/").replace(/\/+$/, "")
+        if (!candidatePath || !sidebarState.folder) return false
+        const normFolder = sidebarState.folder.replace(/\\/g, "/").replace(/\/+$/, "")
         const normCand = candidatePath.replace(/\\/g, "/")
         if (Qt.platform.os === "windows")
             return normCand.toLowerCase().startsWith((normFolder + "/").toLowerCase())
@@ -111,11 +130,13 @@ ColumnLayout {
     }
 
     function triggerRenameSelectedOrActive() {
-        if (viewState.folder && selectedPath && (viewState.files || []).some(item => item.path === selectedPath)) {
-            openRenameFor(selectedPath, selectedName, selectedDirectory)
+        const selectedEntry = sidebarState.folder && selectedPath ? (sidebarState.files || []).find(item => item.path === selectedPath) : null
+        if (selectedEntry) {
+            openRenameFor(selectedEntry.path, selectedEntry.name, Boolean(selectedEntry.directory))
             return
         }
-        const activeTab = (viewState.tabs || []).find(t => t.id === viewState.active)
+        const activeId = sidebarState.active || viewState.active
+        const activeTab = (viewState.tabs || []).find(t => t.id === activeId)
         if (activeTab && activeTab.path && root.isInsideOpenFolder(activeTab.path)) {
             openRenameFor(activeTab.path, activeTab.name, false)
             return
@@ -129,7 +150,7 @@ ColumnLayout {
 
     ActionButton {
         objectName: "openFolderSidebarButton"
-        visible: !viewState.folder
+        visible: !sidebarState.folder
         text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true
         onClicked: studio.chooseFolder()
     }
@@ -148,7 +169,7 @@ ColumnLayout {
     Rectangle {
         id: folderHeaderBar
         objectName: "folderHeaderBar"
-        visible: !!viewState.folder
+        visible: !!sidebarState.folder
         Layout.fillWidth: true
         implicitHeight: 42
         radius: 12
@@ -178,13 +199,13 @@ ColumnLayout {
 
             Label {
                 objectName: "folderHeaderTitle"
-                text: root.folderDisplayName(viewState.folder)
+                text: root.folderDisplayName(sidebarState.folder)
                 font.pixelSize: 14
                 font.weight: Font.DemiBold
                 Layout.fillWidth: true
                 elide: Text.ElideRight
                 color: viewState.colors.text
-                Hint { requested: parent.truncated; text: viewState.folder }
+                Hint { requested: parent.truncated; text: sidebarState.folder }
             }
 
             ActionButton {
@@ -201,9 +222,9 @@ ColumnLayout {
                     id: headerCreateMenu
                     objectName: "headerCreateMenu"
                     implicitWidth: 310
-                    NoteMenuItem { objectName: "headerNewMarkdownItem"; text: "New Markdown note (.md)"; shortcutText: root.shortcutLabels.new_folder_note || ""; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("md", viewState.folder) }
-                    NoteMenuItem { objectName: "headerNewPortableItem"; text: "New portable note (.smd)"; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("smd", viewState.folder) }
-                    NoteMenuItem { objectName: "headerNewSubfolderItem"; text: "New subfolder"; shortcutText: root.shortcutLabels.new_subfolder || ""; icon.source: "../icons/FolderOpen.svg"; onTriggered: root.openCreateDialog("folder", viewState.folder) }
+                    NoteMenuItem { objectName: "headerNewMarkdownItem"; text: "New Markdown note (.md)"; shortcutText: root.shortcutLabels.new_folder_note || ""; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("md", sidebarState.folder) }
+                    NoteMenuItem { objectName: "headerNewPortableItem"; text: "New portable note (.smd)"; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("smd", sidebarState.folder) }
+                    NoteMenuItem { objectName: "headerNewSubfolderItem"; text: "New subfolder"; shortcutText: root.shortcutLabels.new_subfolder || ""; icon.source: "../icons/FolderOpen.svg"; onTriggered: root.openCreateDialog("folder", sidebarState.folder) }
                     MenuSeparator {}
                     NoteMenuItem { objectName: "headerSwitchFolderItem"; text: "Switch folder…"; icon.source: "../icons/FolderOpen.svg"; onTriggered: studio.chooseFolder() }
                 }
@@ -218,7 +239,7 @@ ColumnLayout {
                 icon.width: 18; icon.height: 18
                 Accessible.name: "Close folder"
                 ToolTip.text: "Close folder (notes stay open)"
-                onClicked: { root.selectedPath = ""; studio.closeFolder() }
+                onClicked: { root.resetSelection(); studio.closeFolder() }
             }
         }
     }
@@ -247,10 +268,10 @@ ColumnLayout {
             id: folderFilesView
             objectName: "folderFilesView"
             anchors.fill: parent
-            visible: viewState.files.length > 0
+            visible: (sidebarState.files || []).length > 0
             clip: true
             spacing: 2
-            model: viewState.files
+            model: sidebarState.files || []
             delegate: ItemDelegate {
                 id: fileEntry
                 objectName: "fileEntry"
@@ -330,7 +351,8 @@ ColumnLayout {
                     root.selectedName = modelData.name
                     root.selectedDirectory = modelData.directory
                     if (modelData.directory) {
-                        studio.toggleDirectory(modelData.path)
+                        if (!((sidebarState.folderFilter || "").trim()))
+                            studio.toggleDirectory(modelData.path)
                     } else {
                         studio.openNote(modelData.path)
                     }
@@ -363,15 +385,24 @@ ColumnLayout {
             anchors.centerIn: parent
             width: parent.width - 16
             spacing: 4
-            visible: !!viewState.folder && viewState.files.length === 0 && !viewState.folderSearching
+            visible: !!sidebarState.folder && (sidebarState.files || []).length === 0 && !sidebarState.folderSearching
             Label {
                 objectName: "folderEmptyLabel"
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode: Text.WordWrap
                 font.weight: Font.Medium
+                color: viewState.colors.text
+                text: (sidebarState.folderFilter || "").trim().length > 0 ? "No matching notes found" : "No notes in this folder"
+            }
+            Label {
+                visible: (sidebarState.folderFilter || "").trim().length > 0
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                font.pixelSize: 12
                 color: viewState.colors.muted
-                text: "No notes in this folder"
+                text: "Try another filename or clear the filter."
             }
         }
     }

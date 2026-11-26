@@ -333,6 +333,8 @@ ApplicationWindow {
         self._wait_for(lambda: "04_LaterNested/Unit 1/Notes.txt" in self._rels())
 
     def test_folder_sidebar_qml_removes_clutter_and_highlights_active_note(self):
+        empty_dir = self.workspace / "EmptySelectionDir"
+        empty_dir.mkdir()
         (self.workspace / "Overview.md").write_text("# Overview\n", encoding="utf-8")
         (self.workspace / "Chapter 1.md").write_text("# Chapter 1\n", encoding="utf-8")
 
@@ -350,18 +352,16 @@ ApplicationWindow {
     height: 560
     visible: true
     property var viewState: JSON.parse(studio.snapshot)
-    property var shortcutLabels: JSON.parse(studio.shortcutLabelsJson || "{}")
+    property var sidebarState: JSON.parse(studio.sidebarSnapshot)
+    property var shortcutLabels: JSON.parse(studio.shortcutLabels || "{}")
     property int contextMenuCount: 0
     property int modalDialogCount: 0
-    Connections {
-        target: studio
-        function onChanged() { window.viewState = JSON.parse(studio.snapshot) }
-    }
     FolderSidebar {
         id: sidebar
         anchors.fill: parent
         anchors.margins: 12
         viewState: window.viewState
+        sidebarState: window.sidebarState
         shortcutLabels: window.shortcutLabels
     }
 }
@@ -385,11 +385,44 @@ ApplicationWindow {
             QTest.qWait(40)
             self.assertFalse(open_btn.property("visible"))
             self.assertTrue(header_bar.property("visible"))
+            self.assertEqual(
+                [item["name"] for item in json.loads(self.studio.sidebarSnapshot)["files"]],
+                ["Chapter 1.md", "Overview.md"],
+            )
 
             self.studio.openNote(str(self.workspace / "Overview.md"))
             self._wait_for(lambda: Path(self.studio._current()["path"]).name == "Overview.md")
             QTest.qWait(40)
             self.assertTrue(sidebar.property("activeTabPath").endswith("Overview.md"))
+
+            # Toggling hideNonNoteFolders off exposes EmptySelectionDir in sidebarSnapshot; re-enabling resets stale selection.
+            self.studio.setting("hideNonNoteFolders", "false")
+            self._wait_for(
+                lambda: "EmptySelectionDir" in [item["name"] for item in json.loads(self.studio.sidebarSnapshot)["files"]]
+            )
+            QTest.qWait(30)
+            sidebar.setProperty("selectedPath", canonical_path_str(empty_dir))
+            sidebar.setProperty("selectedName", "EmptySelectionDir")
+            sidebar.setProperty("selectedDirectory", True)
+
+            self.studio.setting("hideNonNoteFolders", "true")
+            self._wait_for(
+                lambda: "EmptySelectionDir" not in [item["name"] for item in json.loads(self.studio.sidebarSnapshot)["files"]]
+            )
+            QTest.qWait(30)
+            self.assertEqual(sidebar.property("selectedPath"), "")
+            self.assertEqual(sidebar.property("selectedName"), "")
+            self.assertFalse(bool(sidebar.property("selectedDirectory")))
+
+            # Selecting a visible note and switching/closing folder also resets FolderSidebar selection.
+            sidebar.setProperty("selectedPath", canonical_path_str(self.workspace / "Overview.md"))
+            sidebar.setProperty("selectedName", "Overview.md")
+            sidebar.setProperty("selectedDirectory", False)
+            self.studio.closeFolder()
+            QTest.qWait(30)
+            self.assertEqual(sidebar.property("selectedPath"), "")
+            self.assertEqual(sidebar.property("selectedName"), "")
+            self.assertFalse(bool(sidebar.property("selectedDirectory")))
         finally:
             win.close()
             win.deleteLater()
