@@ -661,6 +661,8 @@ class DocumentStore:
         named_ext = Path(filename).suffix.lower().lstrip(".")
         if not named_ext:
             filename += "." + ext
+            if not documents.is_valid_asset_filename(filename):
+                raise AgentDocumentError("Asset name must be a simple filename (letters, digits, dot, underscore, hyphen)")
         elif documents.MIMES.get(named_ext) != mime:
             raise AgentDocumentError("Asset name extension must match the image type")
         asset_key = "assets/" + filename

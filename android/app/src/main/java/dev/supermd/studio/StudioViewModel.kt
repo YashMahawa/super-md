@@ -3737,6 +3737,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             require(mime in setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")) { "Unsupported image type" }
             val extension = filename.substringAfterLast('.', "").lowercase()
             val normalizedName = if (extension.isEmpty()) "$filename.${when(mime) { "image/png" -> "png"; "image/jpeg" -> "jpg"; "image/gif" -> "gif"; "image/webp" -> "webp"; "image/avif" -> "avif"; else -> "svg" }}" else filename
+            require(isValidPortableAssetFilename(normalizedName)) { "Asset name must be a simple filename" }
             require(media.assetMime(normalizedName) == mime) { "Asset extension must match its image type" }
             val encoded = request.getString("body")
             require(encoded.length <= 1_400_000 && encoded.length % 4 == 0) { "Asset body must be at most 1 MiB" }

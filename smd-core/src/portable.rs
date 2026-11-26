@@ -8,6 +8,8 @@ use std::{collections::BTreeMap, io::{self, Cursor, Read, Write}};
 
 pub const MAX_FILE: usize = 120_000_000;
 pub const MAX_IMAGE: usize = 25_000_000;
+pub const MAX_ASSET_FILENAME_LEN: usize = 150;
+pub const MAX_COMPAT_ASSET_FILENAME_LEN: usize = 159;
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortableDocument {
@@ -19,8 +21,14 @@ pub struct PortableDocument {
 pub fn asset_mime(name: &str) -> Option<&'static str> {
     match name.rsplit('.').next()?.to_ascii_lowercase().as_str() { "png" => Some("image/png"), "jpg" | "jpeg" => Some("image/jpeg"), "svg" => Some("image/svg+xml"), "gif" => Some("image/gif"), "webp" => Some("image/webp"), "avif" => Some("image/avif"), _ => None }
 }
+fn valid_asset_basename(name: &str, max_len: usize) -> bool {
+    !name.is_empty() && name.len() <= max_len && name != "." && name != ".." && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+pub fn new_asset_name(name: &str) -> bool {
+    name.strip_prefix("assets/").is_some_and(|name| valid_asset_basename(name, MAX_ASSET_FILENAME_LEN))
+}
 pub fn asset_name(name: &str) -> bool {
-    name.strip_prefix("assets/").is_some_and(|name| !name.is_empty() && name.len() <= 150 && name != "." && name != ".." && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+    name.strip_prefix("assets/").is_some_and(|name| valid_asset_basename(name, MAX_COMPAT_ASSET_FILENAME_LEN))
 }
 pub fn image_bytes(data: &str) -> Result<(&str, Vec<u8>)> {
     let (header, encoded) = data.split_once(",").ok_or_else(|| anyhow::anyhow!("Invalid image data"))?;
@@ -115,7 +123,9 @@ pub fn pack(markdown: &str, mut load: impl FnMut(&str) -> Result<String>) -> Res
             let name = if let Some(name) = shared.get(&source) { name.clone() } else {
                 let data = if source.starts_with("data:") { source.clone() } else { load(&source)? };
                 let (mime, _) = image_bytes(&data)?; let extension = match mime { "image/svg+xml" => "svg", "image/jpeg" => "jpg", _ => mime.trim_start_matches("image/") };
-                let name = format!("assets/image-{}.{}", assets.len() + 1, extension); assets.insert(name.clone(), data); shared.insert(source, name.clone()); name
+                let name = format!("assets/image-{}.{}", assets.len() + 1, extension);
+                if !new_asset_name(&name) { bail!("Unsafe FMD asset name: {name}"); }
+                assets.insert(name.clone(), data); shared.insert(source, name.clone()); name
             };
             let label = alt.replace('\\', "\\\\").replace('[', "\\[").replace(']', "\\]");
             let title = if title.is_empty() { String::new() } else { format!(" \"{}\"", title.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', " ")) };
@@ -134,13 +144,36 @@ pub fn pack(markdown: &str, mut load: impl FnMut(&str) -> Result<String>) -> Res
         assert_eq!(reopened.markdown, doc.markdown); assert_eq!(reopened.assets, doc.assets); assert!(!reopened.markdown.contains("base64"));
     }
     #[test] fn rejects_traversal_active_payloads_and_unknown_versions() {
-        for name in ["../x", "assets/../x", "assets/x/y", "/x", "assets/.", "assets/.."] { assert!(!asset_name(name)); }
-        let svg_data = format!("data:image/svg+xml;base64,{}", STANDARD.encode(b"<svg xmlns='http://www.w3.org/2000/svg'/>"));
-        let max_key = format!("assets/{}.svg", "a".repeat(146));
-        assert!(asset_name(&max_key));
-        PortableDocument::new("notes".into(), BTreeMap::from([(max_key, svg_data.clone())])).validate().unwrap();
-        let over_key = format!("assets/{}.svg", "a".repeat(147));
-        for invalid in [over_key.as_str(), "assets/.", "assets/.."] {
+        for name in ["../x", "assets/../x", "assets/x/y", "/x", "assets/.", "assets/.."] {
+            assert!(!asset_name(name));
+            assert!(!new_asset_name(name));
+        }
+        let svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24'><rect width='24' height='24' fill='#386a57'/></svg>";
+        let svg_data = format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg_bytes));
+        let max_new_key = format!("assets/{}.svg", "a".repeat(146));
+        let compat_mid_key = format!("assets/{}.svg", "a".repeat(147));
+        let compat_max_key = format!("assets/{}.svg", "a".repeat(155));
+        let over_compat_key = format!("assets/{}.svg", "a".repeat(156));
+        assert!(new_asset_name(&max_new_key));
+        assert!(asset_name(&max_new_key));
+        for compat_key in [&compat_mid_key, &compat_max_key] {
+            assert!(!new_asset_name(compat_key));
+            assert!(asset_name(compat_key));
+            let initial_md = format!("# Legacy bundle\n\n![Diagram](<{compat_key}>)\n");
+            let legacy = PortableDocument::new(initial_md.clone(), BTreeMap::from([(compat_key.clone(), svg_data.clone())]));
+            let mut reopened = PortableDocument::decode_bytes(&legacy.encode_compressed().unwrap()).unwrap();
+            assert_eq!(reopened.markdown, initial_md);
+            assert_eq!(image_bytes(&reopened.assets[compat_key]).unwrap().1, svg_bytes);
+            let pdf_assets = std::collections::HashMap::from([(compat_key.clone(), image_bytes(&reopened.assets[compat_key]).unwrap().1)]);
+            let pdf = crate::export(&reopened.markdown, &crate::PdfOptions::default(), &pdf_assets).unwrap();
+            assert!(pdf.starts_with(b"%PDF-"));
+            reopened.markdown.push_str("\nUpdated note paragraph.\n");
+            let resaved = PortableDocument::decode_bytes(&reopened.encode_compressed().unwrap()).unwrap();
+            assert!(resaved.markdown.contains(compat_key));
+            assert_eq!(image_bytes(&resaved.assets[compat_key]).unwrap().1, svg_bytes);
+        }
+        for invalid in [over_compat_key.as_str(), "assets/.", "assets/.."] {
+            assert!(!new_asset_name(invalid));
             assert!(!asset_name(invalid));
             assert!(PortableDocument::new("notes".into(), BTreeMap::from([(invalid.to_string(), svg_data.clone())])).validate().is_err());
         }

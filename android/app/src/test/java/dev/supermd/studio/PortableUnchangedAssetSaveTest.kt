@@ -386,20 +386,32 @@ class PortableUnchangedAssetSaveTest {
             media.portableEnvelopeMatches(ByteArrayInputStream(validCompressed + byteArrayOf(0x42)), "# Hi", JSONObject())
         }
 
-        // 5. Canonical 1..150 character portable asset filename cap across media and AgentRelayClient.
-        val maxFilename = "a".repeat(146) + ".png"
-        val overFilename = "a".repeat(147) + ".png"
-        val maxKey = "assets/$maxFilename"
-        val overKey = "assets/$overFilename"
-        assertTrue(media.validKey(maxKey))
-        val maxArchive = ByteArrayOutputStream().also {
-            media.writeFmd(it, "# Max filename", JSONObject().put(maxKey, validPngUrl))
-        }.toByteArray()
-        val reopenedMax = media.openFmd(ByteArrayInputStream(maxArchive))
-        try {
-            assertTrue(media.portableAssets(reopenedMax.directory).has(maxKey))
-        } finally {
-            File(app.filesDir, "portable-assets/${reopenedMax.directory}").deleteRecursively()
+        // 5. 1..150 new-asset filename cap alongside 1..159 compatibility read/export/re-save path.
+        val maxNewFilename = "a".repeat(146) + ".png"
+        val compatMidFilename = "a".repeat(147) + ".png"
+        val compatMaxFilename = "a".repeat(155) + ".png"
+        val overCompatFilename = "a".repeat(156) + ".png"
+        val maxNewKey = "assets/$maxNewFilename"
+        val compatMidKey = "assets/$compatMidFilename"
+        val compatMaxKey = "assets/$compatMaxFilename"
+        val overCompatKey = "assets/$overCompatFilename"
+        assertTrue(isValidPortableAssetFilename(maxNewFilename))
+        assertTrue(isValidPortableAssetKey(maxNewKey))
+        for ((compatName, compatKey) in listOf(compatMidFilename to compatMidKey, compatMaxFilename to compatMaxKey)) {
+            assertFalse(isValidPortableAssetFilename(compatName))
+            assertFalse(isValidPortableAssetKey(compatKey))
+            assertTrue(isValidCompatPortableAssetFilename(compatName))
+            assertTrue(media.validKey(compatKey))
+            val compatArchive = ByteArrayOutputStream().also {
+                media.writeFmd(it, "# Legacy\n\n![Img](<$compatKey>)\n", JSONObject().put(compatKey, validPngUrl))
+            }.toByteArray()
+            val reopenedCompat = media.openFmd(ByteArrayInputStream(compatArchive))
+            try {
+                assertEquals("# Legacy\n\n![Img](<$compatKey>)\n", reopenedCompat.markdown)
+                assertTrue(media.portableAssets(reopenedCompat.directory).has(compatKey))
+            } finally {
+                File(app.filesDir, "portable-assets/${reopenedCompat.directory}").deleteRecursively()
+            }
         }
         val relayClient = AgentRelayClient()
         val relayPngBody = Base64.encodeToString(syntheticPngBytes(64, 9L), Base64.NO_WRAP)
@@ -412,9 +424,14 @@ class PortableUnchangedAssetSaveTest {
             .put("assetName", assetName)
             .put("mimeType", "image/png")
             .put("body", relayPngBody)
-        relayClient.validateRequest(attachRequest(maxKey))
-        relayClient.validateRequest(attachRequest(maxFilename))
-        for (badKey in listOf(overKey, "assets/.", "assets/..")) {
+        relayClient.validateRequest(attachRequest(maxNewKey))
+        relayClient.validateRequest(attachRequest(maxNewFilename))
+        for (compatRejectedNew in listOf(compatMidKey, compatMidFilename, compatMaxKey, compatMaxFilename)) {
+            assertThrows(IllegalArgumentException::class.java) {
+                relayClient.validateRequest(attachRequest(compatRejectedNew))
+            }
+        }
+        for (badKey in listOf(overCompatKey, "assets/.", "assets/..")) {
             assertFalse("Expected validKey to reject $badKey", media.validKey(badKey))
             assertThrows(IllegalArgumentException::class.java) {
                 media.writeFmd(ByteArrayOutputStream(), "# Bad key", JSONObject().put(badKey, validPngUrl))
@@ -433,10 +450,105 @@ class PortableUnchangedAssetSaveTest {
                 relayClient.validateRequest(attachRequest(badKey))
             }
         }
-        for (badName in listOf(overFilename, ".", "..")) {
+        for (badName in listOf(overCompatFilename, ".", "..")) {
             assertThrows(IllegalArgumentException::class.java) {
                 relayClient.validateRequest(attachRequest(badName))
             }
+        }
+    }
+
+    @Test
+    fun existingCompatAssetBundleOpensExportsAndResavesWithoutLosingAssetOrReference() = withStudioModel(autosave = false) { app, tempDir, bundlesRoot, _, model ->
+        val compatKey = "assets/" + "a".repeat(155) + ".svg"
+        assertEquals(159, compatKey.removePrefix("assets/").length)
+        val svg = svgBytes("compat-159", 12)
+        val svgDataUrl = dataUrl("image/svg+xml", svg)
+        val initialMd = "# Existing Compat Note\n\n![Legacy](<$compatKey>)\n"
+        val smdFile = File(tempDir, "LegacyCompat.smd")
+        val seedMedia = MediaStorage(app)
+        smdFile.outputStream().use { seedMedia.writeFmd(it, initialMd, JSONObject().put(compatKey, svgDataUrl)) }
+
+        // 1. Open existing bundle with 159-char basename.
+        awaitJob(model.open(Uri.fromFile(smdFile)))
+        val noteId = model.state.value.active.id
+        assertEquals(initialMd, model.state.value.active.content)
+        val openedAssets = model.media.portableAssets(model.state.value.active.assetDirectory)
+        assertTrue(openedAssets.has(compatKey))
+        assertArrayEquals(svg, model.media.local(compatKey, model.state.value.active.assetDirectory)!!.readBytes())
+
+        // 2. Export existing bundle to portable .smd and Markdown ZIP without losing its asset or reference.
+        val exportDir = File(tempDir, "exports").apply { mkdirs() }
+        val authority = "dev.supermd.test.portable.compat.${UUID.randomUUID()}"
+        val provider = PortableOpaqueSafProvider(app, exportDir).also { it.attach(app, authority) }
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(authority, provider)
+        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, PortableOpaqueSafProvider.ROOT_ID)
+        app.grantUriPermission(
+            app.packageName,
+            treeUri,
+            android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+        val studioPrefs = app.getSharedPreferences("studio", 0)
+        val previousNoteLocation = studioPrefs.getString("newNoteLocation", null)
+        studioPrefs.edit().putString("newNoteLocation", treeUri.toString()).apply()
+        try {
+            val (exportedSmdUri, _) = awaitSuspend {
+                model.writeAgentExport(initialMd, openedAssets, "smd", "ExportedCompat.smd", "{}")
+            }
+            val reopenedExport = app.contentResolver.openInputStream(exportedSmdUri)!!.use(seedMedia::openFmd)
+            try {
+                assertEquals(initialMd, reopenedExport.markdown)
+                assertArrayEquals(svg, seedMedia.local(compatKey, reopenedExport.directory)!!.readBytes())
+            } finally {
+                File(bundlesRoot, reopenedExport.directory).deleteRecursively()
+            }
+
+            val (exportedZipUri, _) = awaitSuspend {
+                model.writeAgentExport(initialMd, openedAssets, "mdzip", "ExportedCompat.zip", "{}")
+            }
+            val zipEntries = linkedMapOf<String, ByteArray>()
+            java.util.zip.ZipInputStream(app.contentResolver.openInputStream(exportedZipUri)!!).use { zis ->
+                while (true) {
+                    val entry = zis.nextEntry ?: break
+                    zipEntries[entry.name] = zis.readBytes()
+                    zis.closeEntry()
+                }
+            }
+            assertEquals(initialMd, zipEntries["ExportedCompat.md"]!!.toString(Charsets.UTF_8))
+            assertArrayEquals(svg, zipEntries[compatKey])
+        } finally {
+            studioPrefs.edit().apply {
+                if (previousNoteLocation == null) remove("newNoteLocation") else putString("newNoteLocation", previousNoteLocation)
+            }.apply()
+        }
+
+        // 3. Reject attaching a new asset exceeding the 150-char cap (including extensionless stem -> 151 chars), then edit and re-save intact.
+        val tooLongAttach = JSONObject()
+            .put("tabId", noteId)
+            .put("assetAction", "attach")
+            .put("expectedRevision", agentContentRevision(initialMd))
+            .put("assetName", "b".repeat(147))
+            .put("mimeType", "image/svg+xml")
+            .put("body", Base64.encodeToString(svg, Base64.NO_WRAP))
+        assertThrows(IllegalArgumentException::class.java) {
+            awaitSuspend { model.agentAssetAction(tooLongAttach) }
+        }
+
+        val editedMd = "$initialMd\nPreserved after re-save.\n"
+        model.edit(noteId, editedMd)
+        model.saveManual(noteId = noteId)
+        awaitCondition { !model.state.value.active.dirty && !model.state.value.busy }
+        assertNull(model.state.value.error)
+
+        val reopenedResaved = smdFile.inputStream().use(seedMedia::openFmd)
+        try {
+            assertEquals(editedMd, reopenedResaved.markdown)
+            assertTrue(reopenedResaved.markdown.contains(compatKey))
+            assertArrayEquals(svg, seedMedia.local(compatKey, reopenedResaved.directory)!!.readBytes())
+        } finally {
+            File(bundlesRoot, reopenedResaved.directory).deleteRecursively()
         }
     }
 

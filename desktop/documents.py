@@ -21,15 +21,24 @@ MAX_ASSETS = 512
 GZIP_MAGIC = b"\x1f\x8b"
 PORTABLE_COMPRESSLEVEL = 3
 _SAFE_ASSET_FILENAME = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]{1,150}")
-_SAFE_ASSET_NAME = re.compile(r"assets/(?!\.\.?\Z)[A-Za-z0-9._-]{1,150}")
+_SAFE_COMPAT_ASSET_FILENAME = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]{1,159}")
+_SAFE_ASSET_NAME = re.compile(r"assets/(?!\.\.?\Z)[A-Za-z0-9._-]{1,159}")
 
 
 def is_valid_asset_filename(filename: str) -> bool:
     return isinstance(filename, str) and _SAFE_ASSET_FILENAME.fullmatch(filename) is not None
 
 
-def is_valid_asset_key(name: str) -> bool:
+def is_valid_compat_asset_filename(filename: str) -> bool:
+    return isinstance(filename, str) and _SAFE_COMPAT_ASSET_FILENAME.fullmatch(filename) is not None
+
+
+def is_valid_new_asset_key(name: str) -> bool:
     return isinstance(name, str) and name.startswith("assets/") and is_valid_asset_filename(name[7:])
+
+
+def is_valid_asset_key(name: str) -> bool:
+    return isinstance(name, str) and name.startswith("assets/") and is_valid_compat_asset_filename(name[7:])
 _MAX_CACHED_ASSETS = 512
 _MAX_CACHED_CHARS = 110_000_000
 _VALIDATED_LOCK = threading.Lock()

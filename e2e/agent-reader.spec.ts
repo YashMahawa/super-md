@@ -199,8 +199,6 @@ test('heading navigation realigns after delayed layout growth beyond a windowed 
 });
 
 test('slow mouse drags keep selecting source, reader and live text after a prior selection',async({page})=>{
-  // Performs 9 full /android-reader.html navigations and 18 multi-step mouse drags across modes and zoom levels.
-  test.setTimeout(180_000);
   const first='The first realistic mouse drag should select this complete sentence.',
     second='A later drag must keep extending selection instead of stopping after a character.',
     paragraphs=Array.from({length:78},(_,index)=>index===2?first:index===6?second:`Paragraph ${index}: mixed Markdown with **bold**, a [link](https://example.org), inline $x^2$, and enough useful words to fill a realistic note.`),
@@ -245,8 +243,6 @@ test('slow mouse drags keep selecting source, reader and live text after a prior
 });
 
 test('long-held outside release keeps later mouse selections active at fractional zoom',async({page})=>{
-  // Performs 4 full /android-reader.html navigations plus ~19.4s of intentional hold/step delays across 4 modes.
-  test.setTimeout(180_000);
   const first='The first drag waits before moving and must still select this whole sentence.',
     second='The next drag releases outside the window before another selection starts.',
     third='The final drag checks that native release cleanup did not strand the pointer.',

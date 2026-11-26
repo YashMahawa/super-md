@@ -9,7 +9,14 @@ import { remarkObsidianMath } from "./obsidianMath";
 
 export interface ImportedImage { source: string; alt: string }
 export interface LinkDetails { url: string; title: string; thumbnail?: string }
-export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source);
+export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source) && source.length <= 7 + 150;
+const compatPortableAssetSource = (source: string, ext: string) => {
+  if (!source.startsWith("assets/")) return false;
+  const name = source.slice(7);
+  if (!name || name.length > 159 || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name)) return false;
+  const actualExt = name.split(".").pop()?.toLowerCase();
+  return ext === "jpg" ? actualExt === "jpg" || actualExt === "jpeg" : actualExt === ext;
+};
 export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&").replace(/[\r\n]+/g, " ");
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
@@ -85,6 +92,7 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
 export async function prepareFmd(markdown: string, documentPath: string | null) {
+  const portableDoc = /\.(?:smd|fmd)$/i.test(documentPath || "");
   const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
   const tree = processor.parse(maskFrontmatter(markdown));
   const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
@@ -97,7 +105,8 @@ export async function prepareFmd(markdown: string, documentPath: string | null) 
       const data = /^data:image\//.test(source) ? source : /^https?:/.test(source) ? (await invoke<{ body: string }>("fetch_resource", { url: source, image: true })).body : await invoke<string>("load_asset", { documentPath: documentPath || "", source });
       const type = data.match(/^data:image\/([^;]+);base64,/)?.[1];
       if (!type) throw new Error(`Unsupported image ${source}`);
-      const name = attachmentSource(source) ? source : `assets/image-${crypto.randomUUID()}.${type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type}`;
+      const ext = type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type;
+      const name = attachmentSource(source) || (portableDoc && compatPortableAssetSource(source, ext)) ? source : `assets/image-${crypto.randomUUID()}.${ext}`;
       assets[name] = data;
       return name;
     })());

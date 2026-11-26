@@ -192,9 +192,11 @@ The file is a UTF-8 JSON envelope, not a renamed Markdown file:
 }
 ```
 
-Asset names must match `assets/[A-Za-z0-9._-]{1,150}`, where the filename
+New asset names must match `assets/[A-Za-z0-9._-]{1,150}`, where the filename
 segment after `assets/` is 1 to 150 ASCII characters (`A-Z`, `a-z`, `0-9`,
-`.`, `_`, `-`) and is neither `.` nor `..`. Supported image types are PNG,
+`.`, `_`, `-`) and is neither `.` nor `..`; existing safe
+`assets/[A-Za-z0-9._-]{1,159}` entries remain valid on read, export, and
+re-save for compatibility. Supported image types are PNG,
 JPEG, SVG, GIF, WebP and AVIF. Limits: 20 MB of Markdown, 25 MB per image,
 75 MB total decoded assets, 512 images, and 120 MB total file size.
 Remote images are fetched only during an explicit insertion or export; link

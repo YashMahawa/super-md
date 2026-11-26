@@ -15,19 +15,26 @@ test("device RPC schema rejects unknown fields, oversized ranges and stale-write
   assert.equal(validateRpcRequest({ requestId: "r6", action: "document_action", documentAction: "job_status", jobId: "job-1" }).jobId, "job-1");
   assert.throws(() => validateRpcRequest({ requestId: "r7", action: "replace_tab_asset", tabId: "tab:1", assetName: "image.png", assetPath: "a".repeat(4097), expectedRevision: "a".repeat(64) }), /asset path/);
   const assetRequest = {requestId:"asset",action:"replace_tab_asset",tabId:"tab:1",assetPath:"/Downloads/new.png",expectedRevision:"a".repeat(64)};
-  const maxAssetKey = `assets/${"a".repeat(146)}.png`;
-  const overAssetKey = `assets/${"a".repeat(147)}.png`;
+  const maxNewAssetKey = `assets/${"a".repeat(146)}.png`;
+  const compatMidAssetKey = `assets/${"a".repeat(147)}.png`;
+  const compatMaxAssetKey = `assets/${"a".repeat(155)}.png`;
+  const overCompatAssetKey = `assets/${"a".repeat(156)}.png`;
   assert.equal(validateRpcRequest({...assetRequest,assetName:"assets/current.png"}).assetName,"assets/current.png");
-  assert.equal(validateRpcRequest({...assetRequest,assetName:maxAssetKey}).assetName,maxAssetKey);
+  assert.equal(validateRpcRequest({...assetRequest,assetName:maxNewAssetKey}).assetName,maxNewAssetKey);
+  assert.equal(validateRpcRequest({...assetRequest,assetName:compatMidAssetKey}).assetName,compatMidAssetKey);
+  assert.equal(validateRpcRequest({...assetRequest,assetName:compatMaxAssetKey}).assetName,compatMaxAssetKey);
   assert.equal(validateRpcRequest({...assetRequest,assetName:"b".repeat(64)}).assetName,"b".repeat(64));
-  for(const assetName of ["../secret.png","assets/../secret.png","assets/a/b.png","assets/.","assets/..","/secret.png",overAssetKey])
+  for(const assetName of ["../secret.png","assets/../secret.png","assets/a/b.png","assets/.","assets/..","/secret.png",overCompatAssetKey])
     assert.throws(()=>validateRpcRequest({...assetRequest,assetName}),/asset name/);
   const inline = {requestId:"media",action:"asset_action",tabId:"tab:1",assetAction:"attach",assetName:"assets/model.png",mimeType:"image/png",body:"iVBORw0KGgo=",expectedRevision:"b".repeat(64)};
   assert.equal(validateRpcRequest(inline).assetAction,"attach");
-  assert.equal(validateRpcRequest({...inline,assetName:maxAssetKey}).assetName,maxAssetKey);
+  assert.equal(validateRpcRequest({...inline,assetName:maxNewAssetKey}).assetName,maxNewAssetKey);
+  assert.equal(validateRpcRequest({requestId:"source_compat",action:"asset_action",tabId:"tab:1",assetAction:"source",assetName:compatMaxAssetKey,expectedRevision:"b".repeat(64)}).assetName,compatMaxAssetKey);
   assert.throws(()=>validateRpcRequest({...inline,body:"A".repeat(1_400_001)}),/Media body is too large/);
   assert.throws(()=>validateRpcRequest({...inline,mimeType:"text/html"}),/Unsupported image type/);
-  for(const assetName of ["assets/../model.png","assets/.","assets/..",".","..",overAssetKey])
+  for(const assetName of [compatMidAssetKey,compatMaxAssetKey])
+    assert.throws(()=>validateRpcRequest({...inline,assetName}),/Invalid new asset name/);
+  for(const assetName of ["assets/../model.png","assets/.","assets/..",".","..",overCompatAssetKey])
     assert.throws(()=>validateRpcRequest({...inline,assetName}),/Invalid asset name/);
   assert.throws(()=>validateRpcRequest({...inline,assetAction:"source",assetName:undefined,body:undefined}),/source requires assetName/);
   assert.equal(validateRpcRequest({ requestId: "jpeg", action: "render_tab", tabId: "tab:1", imageFormat: "jpeg" }).imageFormat, "jpeg");
