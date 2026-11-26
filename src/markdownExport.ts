@@ -5,22 +5,61 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
+import { maskFrontmatter, parseFrontmatter } from "./frontmatter";
 import { remarkObsidianMath } from "./obsidianMath";
+import { svgImage } from "./svgImage";
 
 type ImageRef = { source: string; start: number; end: number; image: boolean; definition?: { start: number; end: number } };
+type ResolvedMarkdownAsset =
+  | { kind: "mermaid"; mermaid: string }
+  | { kind: "image"; mime: string; dataUrl: string; text?: string };
+
+export const MAX_MARKDOWN_EXPORT_CONCURRENCY = 4;
+export type MarkdownExportPhase = "prepare" | "assets";
+export type MarkdownExportProgress = { phase: MarkdownExportPhase; completed: number; total: number };
+export type PrepareMarkdownExportOptions = {
+  compatible?: boolean;
+  python?: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: MarkdownExportProgress) => void;
+};
+
 const APP_GENERATED = /^assets\/(?:import|image)-[a-z0-9-]+\.(?:png|jpe?g|svg|gif|webp|avif)$/i;
 const MIME_EXT: Record<string, string> = {
   "image/png": "png", "image/jpeg": "jpg", "image/svg+xml": "svg", "image/gif": "gif",
   "image/webp": "webp", "image/avif": "avif",
 };
 
+function cancelledError(): Error {
+  if (typeof DOMException !== "undefined") return new DOMException("Markdown export preparation was cancelled", "AbortError");
+  const error = new Error("Markdown export preparation was cancelled");
+  error.name = "AbortError";
+  return error;
+}
+
+function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(cancelledError());
+  return new Promise((resolve, reject) => {
+    const abort = () => { signal.removeEventListener("abort", abort); reject(cancelledError()); };
+    signal.addEventListener("abort", abort, { once: true });
+    promise.then(
+      value => { signal.removeEventListener("abort", abort); resolve(value); },
+      error => { signal.removeEventListener("abort", abort); reject(error); },
+    );
+  });
+}
+
 function refs(markdown: string): ImageRef[] {
-  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+  const frontmatterEnd = parseFrontmatter(markdown)?.end ?? 0;
+  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
-  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
+  visit(tree, "definition", (node: any) => {
+    if (node.position && node.position.start.offset >= frontmatterEnd) definitions.set(node.identifier, node);
+  });
   visit(tree, (node: any) => {
-    if (!node.position) return;
+    if (!node.position || node.position.start.offset < frontmatterEnd) return;
     if (node.type === "image") result.push({ source: node.url, start: node.position.start.offset, end: node.position.end.offset, image: true });
     if (node.type === "imageReference") {
       const definition = definitions.get(node.identifier);
@@ -75,12 +114,12 @@ function cleanRelativePath(source: string): string | null {
   return parts.join("/");
 }
 
-function sourceFence(source: string, language: "svg" | "mermaid"): string {
+function sourceFence(source: string, language: "mermaid"): string {
   const runs = [...source.matchAll(/`+/g)].map(match => match[0].length);
   const fence = "`".repeat(Math.max(3, ...runs.map(length => length + 1)));
   return `${fence}${language}\n${source.replace(/\s+$/, "")}\n${fence}`;
 }
-function sourceFenceBlock(source: string, language: "svg" | "mermaid"): string {
+function sourceFenceBlock(source: string, language: "mermaid"): string {
   return `\n\n${sourceFence(source, language)}\n\n`;
 }
 
@@ -89,88 +128,177 @@ function sourceFenceBlock(source: string, language: "svg" | "mermaid"): string {
  * written beside the exported Markdown by the native host; remote URLs remain
  * untouched and are never fetched as a side effect of export.
  */
-export async function prepareMarkdownExport(markdown: string, documentPath: string | null, options: {compatible?:boolean} = {}) {
-  if(options.compatible){
-    const {compatibleMarkdown}=await import('./compatibleMarkdown');
-    markdown=await compatibleMarkdown(markdown,documentPath);
-  }
-  const assets: Record<string, string> = {};
-  const edits: Array<{ start: number; end: number; value: string }> = [];
-  const shared = new Map<string, Promise<{ mime: string; dataUrl: string; text?: string } | { mermaid: string }>>();
-  const references = refs(markdown);
-  const definitionsToRemove = new Map<number, { start: number; end: number }>();
-  const reservedPaths = new Set(references.flatMap(({ source }) => {
-    const path = cleanRelativePath(source);
-    return path && !APP_GENERATED.test(path) && (!/\.(?:svg|mmd|mermaid)$/i.test(path)||options.compatible&&/\.svg$/i.test(path)) ? [path] : [];
-  }));
-  const generatedPaths = new Map<string, string>();
-  const usedPaths = new Set(reservedPaths);
-  let generatedIndex = 0;
-  const allocateGeneratedPath = (source: string, extension: string) => {
-    const existing = generatedPaths.get(source);
-    if (existing) return existing;
-    let candidate: string;
-    do { candidate = `image${++generatedIndex}.${extension}`; }
-    while (usedPaths.has(candidate));
-    usedPaths.add(candidate);
-    generatedPaths.set(source, candidate);
-    return candidate;
+export async function prepareMarkdownExport(markdown: string, documentPath: string | null, options: PrepareMarkdownExportOptions = {}) {
+  const { signal } = options;
+  let active = true;
+  let failed = false;
+  const resolvedBySource = new Map<string, ResolvedMarkdownAsset>();
+  const checkCurrent = () => {
+    if (!active || signal?.aborted) throw cancelledError();
   };
-  for (const ref of references) {
-    if (/^https?:|^\/\//i.test(ref.source)) continue;
-    if (!shared.has(ref.source)) shared.set(ref.source, (async () => {
+  const report = (progress: MarkdownExportProgress) => {
+    checkCurrent();
+    try { options.onProgress?.(progress); } catch { /* Progress reporting must not break an export. */ }
+  };
+  const onAbort = () => {
+    active = false;
+    resolvedBySource.clear();
+  };
+  checkCurrent();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    report({ phase: "prepare", completed: 0, total: 1 });
+    if (options.compatible) {
+      const { compatibleMarkdown } = await import("./compatibleMarkdown");
+      checkCurrent();
+      const compatible = compatibleMarkdown(markdown, documentPath, options.python);
+      compatible.catch(() => {});
+      markdown = await raceSignal(compatible, signal);
+      checkCurrent();
+    }
+    const references = refs(markdown);
+    report({ phase: "prepare", completed: 1, total: 1 });
+    const seenSources = new Set<string>();
+    const tasks: Array<() => Promise<void>> = [];
+    for (const ref of references) {
+      checkCurrent();
+      if (/^https?:|^\/\//i.test(ref.source) || seenSources.has(ref.source)) continue;
+      seenSources.add(ref.source);
       if (/\.(?:mmd|mermaid)(?:[?#]|$)/i.test(ref.source)) {
         if (ref.source.startsWith("data:")) throw Error("Mermaid source must be a local .mmd or .mermaid file");
         const relative = cleanRelativePath(ref.source);
         if (!relative) throw Error(`Cannot safely resolve Mermaid source ${ref.source}`);
-        const loaded = await invoke<string | { text: string }>("load_text_asset", { documentPath: documentPath || "", source: ref.source });
-        const text = typeof loaded === "string" ? loaded : loaded?.text;
-        if (typeof text !== "string" || text.length > 2_000_000) throw Error(`Mermaid source is unavailable or too large: ${ref.source}`);
-        return { mermaid: text };
+        const source = ref.source;
+        tasks.push(async () => {
+          const loaded = await invoke<string | { text: string }>("load_text_asset", { documentPath: documentPath || "", source });
+          checkCurrent();
+          const text = typeof loaded === "string" ? loaded : loaded?.text;
+          if (typeof text !== "string" || text.length > 2_000_000) throw Error(`Mermaid source is unavailable or too large: ${source}`);
+          resolvedBySource.set(source, { kind: "mermaid", mermaid: text });
+        });
+        continue;
       }
       if (ref.source.startsWith("data:")) {
         const decoded = decodeDataUrl(ref.source);
         if (!decoded) throw Error("Markdown export contains an unsupported or invalid embedded image");
-        return decoded;
+        if (decoded.mime === "image/svg+xml") svgImage(decoded.text!);
+        if (!MIME_EXT[decoded.mime]) throw Error(`Image format is not supported for Markdown export: ${ref.source}`);
+        resolvedBySource.set(ref.source, { kind: "image", ...decoded });
+        continue;
       }
       const path = cleanRelativePath(ref.source);
       if (!path) throw Error(`Cannot safely resolve image ${ref.source}`);
-      const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source: ref.source });
-      const decoded = decodeDataUrl(value);
-      if (!decoded) throw Error(`Image is unavailable or unsupported: ${ref.source}`);
-      return decoded;
-    })());
-    const resolved = await shared.get(ref.source)!;
-    if ("mermaid" in resolved) {
-      edits.push({ start: ref.start, end: ref.end, value: sourceFenceBlock(resolved.mermaid, "mermaid") });
-      if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
-      continue;
+      const source = ref.source;
+      tasks.push(async () => {
+        const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source });
+        checkCurrent();
+        const decoded = decodeDataUrl(value);
+        if (!decoded) throw Error(`Image is unavailable or unsupported: ${source}`);
+        if (decoded.mime === "image/svg+xml") svgImage(decoded.text!);
+        if (!MIME_EXT[decoded.mime]) throw Error(`Image format is not supported for Markdown export: ${source}`);
+        resolvedBySource.set(source, { kind: "image", ...decoded });
+      });
     }
-    if (!MIME_EXT[resolved.mime]) throw Error(`Image format is not supported for Markdown export: ${ref.source}`);
-    if (!options.compatible && resolved.mime === "image/svg+xml" && resolved.text !== undefined) {
-      edits.push({ start: ref.start, end: ref.end, value: sourceFenceBlock(resolved.text, "svg") });
-      if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
-      continue;
+    report({ phase: "assets", completed: 0, total: tasks.length });
+    if (tasks.length > 0) {
+      let next = 0;
+      let completed = 0;
+      const workers = Array.from(
+        { length: Math.min(MAX_MARKDOWN_EXPORT_CONCURRENCY, tasks.length) },
+        async () => {
+          while (!failed && next < tasks.length) {
+            checkCurrent();
+            const task = tasks[next++];
+            try {
+              await task();
+            } catch (error) {
+              if (!active || signal?.aborted) throw cancelledError();
+              failed = true;
+              throw error;
+            }
+            if (failed) return;
+            checkCurrent();
+            report({ phase: "assets", completed: ++completed, total: tasks.length });
+          }
+        },
+      );
+      const allWorkers = Promise.all(workers);
+      allWorkers.catch(() => {});
+      await raceSignal(allWorkers, signal);
+      checkCurrent();
     }
-    const relative = cleanRelativePath(ref.source);
-    const generatedKey = relative ?? ref.source;
-    const path = ref.source.startsWith("data:") || !relative || APP_GENERATED.test(relative)
-      ? allocateGeneratedPath(generatedKey, MIME_EXT[resolved.mime]) : relative;
-    if (assets[path] && assets[path] !== resolved.dataUrl) throw Error(`Markdown asset path collision: ${path}`);
-    if (!assets[path]) assets[path] = resolved.dataUrl;
-    if ((ref.image && path !== ref.source) || options.compatible && !ref.image && resolved.mime === "image/svg+xml") {
-      const label = ref.source.startsWith("data:") ? "Image" : ref.source.split("/").pop() || "Image";
-      const altMatch = markdown.slice(ref.start, ref.end).match(/^!\[([^\]]*)\]/);
-      const alt = (altMatch?.[1] || label).replace(/[\[\]\\]/g, "\\$&").replace(/[\r\n]+/g, " ");
-      edits.push({ start: ref.start, end: ref.end, value: `![${alt}](<${path}>)` });
+    const assets: Record<string, string> = {};
+    const edits: Array<{ start: number; end: number; value: string }> = [];
+    const definitionsToRemove = new Map<number, { start: number; end: number }>();
+    const keptDefinitions = new Set<number>();
+    const reservedPaths = new Set(references.flatMap(({ source }) => {
+      const path = cleanRelativePath(source);
+      return path && !APP_GENERATED.test(path) && !/\.(?:mmd|mermaid)$/i.test(path) ? [path] : [];
+    }));
+    const generatedPaths = new Map<string, string>();
+    const usedPaths = new Set(reservedPaths);
+    let generatedIndex = 0;
+    const allocateGeneratedPath = (source: string, extension: string) => {
+      const existing = generatedPaths.get(source);
+      if (existing) return existing;
+      let candidate: string;
+      do { candidate = `image${++generatedIndex}.${extension}`; }
+      while (usedPaths.has(candidate));
+      usedPaths.add(candidate);
+      generatedPaths.set(source, candidate);
+      return candidate;
+    };
+    for (const ref of references) {
+      if (/^https?:|^\/\//i.test(ref.source)) {
+        if (ref.definition) keptDefinitions.add(ref.definition.start);
+        continue;
+      }
+      const resolved = resolvedBySource.get(ref.source);
+      if (!resolved) throw Error(`Image is unavailable or unsupported: ${ref.source}`);
+      if (resolved.kind === "mermaid") {
+        edits.push({ start: ref.start, end: ref.end, value: sourceFenceBlock(resolved.mermaid, "mermaid") });
+        if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
+        continue;
+      }
+      const relative = cleanRelativePath(ref.source);
+      const generatedKey = relative ?? ref.source;
+      const renamed = ref.source.startsWith("data:") || !relative || APP_GENERATED.test(relative);
+      const path = renamed
+        ? allocateGeneratedPath(generatedKey, MIME_EXT[resolved.mime]) : relative;
+      if (assets[path] && assets[path] !== resolved.dataUrl) throw Error(`Markdown asset path collision: ${path}`);
+      if (!assets[path]) assets[path] = resolved.dataUrl;
+      if ((ref.image && renamed) || options.compatible && !ref.image && resolved.mime === "image/svg+xml") {
+        const slice = markdown.slice(ref.start, ref.end);
+        const wikilinkAlt = /^!\[\[[^\]|]+(?:\|([^\]]+))?\]\]$/.exec(slice);
+        const altMatch = wikilinkAlt ? [slice, wikilinkAlt[1] ?? ""] : slice.match(/^!?\[([^\]]*)\]/);
+        const label = ref.source.startsWith("data:") ? "Image" : (relative ?? ref.source).split("/").pop() || "Image";
+        const alt = (altMatch?.[1] || label).replace(/[\[\]\\]/g, "\\$&").replace(/[\r\n]+/g, " ");
+        edits.push({ start: ref.start, end: ref.end, value: `![${alt}](<${path}>)` });
+        if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
+      } else if (!ref.image && renamed) {
+        const slice = markdown.slice(ref.start, ref.end);
+        const linkMatch = slice.match(/^\[([^\]]*)\]/);
+        const label = (relative ?? ref.source).split("/").pop() || path;
+        const text = (linkMatch?.[1] || label).replace(/[\[\]\\]/g, "\\$&").replace(/[\r\n]+/g, " ");
+        edits.push({ start: ref.start, end: ref.end, value: `[${text}](<${path}>)` });
+        if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
+      } else if (ref.definition) {
+        keptDefinitions.add(ref.definition.start);
+      }
     }
+    for (const [start, definition] of definitionsToRemove) {
+      if (keptDefinitions.has(start)) continue;
+      const lineStart = markdown.lastIndexOf("\n", definition.start - 1) + 1;
+      const lineEnd = markdown.indexOf("\n", definition.end);
+      edits.push({ start: lineStart, end: lineEnd < 0 ? markdown.length : lineEnd + 1, value: "" });
+    }
+    let content = markdown;
+    for (const edit of edits.sort((a, b) => b.start - a.start)) content = content.slice(0, edit.start) + edit.value + content.slice(edit.end);
+    checkCurrent();
+    return { content, assets };
+  } finally {
+    active = false;
+    resolvedBySource.clear();
+    signal?.removeEventListener("abort", onAbort);
   }
-  for (const definition of definitionsToRemove.values()) {
-    const lineStart = markdown.lastIndexOf("\n", definition.start - 1) + 1;
-    const lineEnd = markdown.indexOf("\n", definition.end);
-    edits.push({ start: lineStart, end: lineEnd < 0 ? markdown.length : lineEnd + 1, value: "" });
-  }
-  let content = markdown;
-  for (const edit of edits.sort((a, b) => b.start - a.start)) content = content.slice(0, edit.start) + edit.value + content.slice(edit.end);
-  return { content, assets };
 }

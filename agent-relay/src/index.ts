@@ -1,5 +1,8 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { createServer, type IncomingMessage } from "node:http";
+import { resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { createMcpHandler, McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
@@ -20,6 +23,7 @@ type Group = { groupId: string; connectorHash: string; pairingHash: string; devi
 const GROUP_ID_RE = /^[a-f0-9]{32}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_RE = /^[A-Za-z0-9_-]{40,128}$/;
+const REVISION_RE = /^[a-f0-9]{64}$/i;
 const MAX_GROUPS = boundedEnv("MAX_GROUPS", 1000, 1, 10_000);
 const MAX_DEVICES_PER_GROUP = boundedEnv("MAX_DEVICES_PER_GROUP", 32, 1, 128);
 const port = boundedEnv("PORT", 8787, 1, 65535);
@@ -181,6 +185,54 @@ function assetSourceResult(response: { result?: unknown; error?: string }, offse
 }
 const exportsAvailable = new ExportDownloads();
 const downloadOrigin = (/^(localhost|127\.0\.0\.1)(:|$)/.test(expectedHost) ? "http://" : "https://") + expectedHost;
+const completedExportTemplate = new ResourceTemplate(downloadOrigin + "/download/{token}", { list: undefined });
+const deviceIdSchema = z.string().regex(UUID_RE).optional();
+const tabIdSchema = z.string().min(1).max(512);
+const optionalTabIdSchema = tabIdSchema.optional();
+const expectedRevisionSchema = z.string().regex(REVISION_RE);
+const optionalExpectedRevisionSchema = expectedRevisionSchema.optional();
+const headingSelectorSchema = z.union([z.number().int().min(0), z.string().min(1).max(512)]).optional();
+const textOffsetSchema = z.number().int().min(0).max(20_000_000).optional();
+const assetOffsetSchema = z.number().int().min(0).max(1_048_576).optional();
+const textLimitSchema = z.number().int().min(1).max(12_000).optional();
+const searchLimitSchema = z.number().int().min(1).max(25).optional();
+const searchContextSchema = z.number().int().min(0).max(500).optional();
+const viewportWidthSchema = z.number().int().min(64).max(1600).optional();
+const imageQualitySchema = z.enum(["standard", "high"]).optional();
+const assetNameSchema = z.string().min(1).max(256);
+const optionalAssetNameSchema = assetNameSchema.optional();
+const pageSizeSchema = z.enum(["a3", "a4", "a5", "a6", "iso-b4", "iso-b5", "iso-b6", "letter", "legal", "tabloid", "executive"]);
+const exportOptionsSchema = z.object({
+  pageSize: pageSizeSchema.optional(), margin: z.number().min(4).max(60).optional(), fontSize: z.number().min(5).max(24).optional(),
+  lineHeight: z.number().min(0.9).max(2.2).optional(), paragraphSpacing: z.number().min(0).max(3).optional(),
+  fontFamily: z.string().max(128).optional(), pageNumbers: z.boolean().optional(), themed: z.boolean().optional(),
+});
+const patchOperationSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("replace"), old: z.string().min(1), new: z.string(), count: z.union([z.literal(1), z.literal("all")]).optional(), expectedCount: z.number().int().positive().optional() }).strict(),
+  z.object({ type: z.literal("lines"), start_line: z.number().int().positive().describe("First line, 1-based inclusive"), end_line: z.number().int().positive().describe("Last line, 1-based inclusive"), text: z.string() }).strict(),
+  z.object({ type: z.literal("insert"), line: z.number().int().positive().describe("Insert before this 1-based line; line count + 1 appends"), text: z.string() }).strict(),
+]);
+const documentOptionsSchema = exportOptionsSchema.extend({
+  section: headingSelectorSchema, offset: textOffsetSchema, background: z.boolean().optional(),
+  saveAs: z.boolean().optional(), discardChanges: z.boolean().optional(), archive: z.boolean().optional(), title: z.string().max(160).optional(),
+  format: z.enum(["pdf", "smd", "md", "mdzip"]).optional(), repairIndices: z.array(z.number().int().min(0)).max(40).optional(),
+  filename: z.string().max(256).optional(), jobId: z.string().max(128).optional(), limit: textLimitSchema,
+  width: viewportWidthSchema, quality: imageQualitySchema,
+}).optional();
+
+export const TOOL_INPUT_SCHEMAS = Object.freeze({
+  list_devices: z.object({}),
+  list_tabs: z.object({ deviceId: deviceIdSchema }),
+  read_tab: z.object({ deviceId: deviceIdSchema, tabId: optionalTabIdSchema, heading: headingSelectorSchema, view: z.enum(["source", "prose"]).optional(), offset: textOffsetSchema, limit: textLimitSchema }),
+  search_tab: z.object({ deviceId: deviceIdSchema, tabId: tabIdSchema, query: z.string().min(1).max(500), offset: textOffsetSchema, limit: searchLimitSchema, context: searchContextSchema, caseSensitive: z.boolean().optional(), wholeWord: z.boolean().optional(), regex: z.boolean().optional(), excludeDiagrams: z.boolean().optional() }),
+  patch_tab: z.object({ deviceId: deviceIdSchema, tabId: tabIdSchema, expectedRevision: expectedRevisionSchema, operations: z.array(patchOperationSchema).min(1).max(100) }),
+  render_tab: z.object({ deviceId: deviceIdSchema, tabId: tabIdSchema, width: viewportWidthSchema, quality: imageQualitySchema }),
+  view_current: z.object({ deviceId: deviceIdSchema, tabId: optionalTabIdSchema, width: viewportWidthSchema, quality: imageQualitySchema, includeImage: z.boolean().optional() }),
+  diagram_action: z.object({ deviceId: deviceIdSchema, tabId: tabIdSchema, diagramAction: z.enum(["list", "source", "image"]), diagramId: z.string().min(1).max(128).optional(), expectedRevision: optionalExpectedRevisionSchema, offset: textOffsetSchema, limit: textLimitSchema, width: viewportWidthSchema, quality: imageQualitySchema }),
+  replace_tab_asset: z.object({ deviceId: deviceIdSchema, tabId: tabIdSchema, assetName: assetNameSchema, assetPath: z.string().min(1).max(4096), expectedRevision: expectedRevisionSchema }),
+  asset_action: z.object({ deviceId: deviceIdSchema, tabId: tabIdSchema, assetAction: z.enum(["list", "source", "attach"]), assetName: optionalAssetNameSchema, mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).describe("Base64-encoded original bytes, including UTF-8 SVG; not raw SVG text or a data URL").optional(), offset: assetOffsetSchema, limit: textLimitSchema, expectedRevision: expectedRevisionSchema }),
+  document_action: z.object({ deviceId: deviceIdSchema, documentAction: z.enum(["get_context", "outline", "create", "export", "latexfix", "latex_review", "latex_apply", "open", "activate", "close", "save", "snapshot", "job_status"]), tabId: optionalTabIdSchema, expectedRevision: optionalExpectedRevisionSchema, operations: z.array(patchOperationSchema).max(100).optional(), content: z.string().max(60_000).optional(), options: documentOptionsSchema }),
+});
 async function readTarget(group: Group, selected?: string, tab?: string): Promise<{deviceId?:string;tabId?:string;error?:string}> {
   const chosen=chooseDevice(group,selected);
   if(!chosen.device)return {error:chosen.error};
@@ -204,7 +256,7 @@ function exportJobResult(group:Group, selected:string|undefined, jobId:string|un
   return {content:[{type:"resource_link" as const,uri,name:lease.filename,mimeType:lease.mimeType,size:lease.bytes,description:"Private exported file; expires in ten minutes. The Super MD device must remain connected."},...textResult(metadata).content]};
 }
 function registerTools(server: McpServer, group: Group): void {
-  server.registerResource("completed-export",new ResourceTemplate(downloadOrigin+"/download/{token}",{list:undefined}),{
+  server.registerResource("completed-export", completedExportTemplate, {
     title:"Completed Super MD export",description:"Private MD, SMD or PDF export. Small files support MCP resource reads; large files stream over the same HTTPS URL.",
   },async(uri,variables)=>{
     const token=variables.token;
@@ -218,20 +270,7 @@ function registerTools(server: McpServer, group: Group): void {
     if(lease.format==="md"&&!Buffer.from(bytes.toString("utf8"),"utf8").equals(bytes))throw Error("This Markdown export is not valid UTF-8; download the original bytes over HTTPS.");
     return {contents:[lease.format==="md"?{uri:uri.href,mimeType:lease.mimeType,text:bytes.toString("utf8")}:{uri:uri.href,mimeType:lease.mimeType,blob:bytes.toString("base64")}]};
   });
-  const deviceId = z.string().regex(UUID_RE).optional();
-  const tabId = z.string().min(1).max(512);
-  const pageSize = z.enum(["a3","a4","a5","a6","iso-b4","iso-b5","iso-b6","letter","legal","tabloid","executive"]);
-  const exportOptions = z.object({
-    pageSize: pageSize.optional(), margin: z.number().min(4).max(60).optional(), fontSize: z.number().min(5).max(24).optional(),
-    lineHeight: z.number().min(0.9).max(2.2).optional(), paragraphSpacing: z.number().min(0).max(3).optional(),
-    fontFamily: z.string().max(128).optional(), pageNumbers: z.boolean().optional(), themed: z.boolean().optional(),
-  });
-  const patchOperation = z.discriminatedUnion("type", [
-    z.object({ type: z.literal("replace"), old: z.string().min(1), new: z.string(), count: z.union([z.literal(1), z.literal("all")]).optional(), expectedCount: z.number().int().positive().optional() }).strict(),
-    z.object({ type: z.literal("lines"), start_line: z.number().int().positive().describe("First line, 1-based inclusive"), end_line: z.number().int().positive().describe("Last line, 1-based inclusive"), text: z.string() }).strict(),
-    z.object({ type: z.literal("insert"), line: z.number().int().positive().describe("Insert before this 1-based line; line count + 1 appends"), text: z.string() }).strict(),
-  ]);
-  server.registerTool("list_devices", { description: "List devices paired with this Super MD workspace and their live/last-seen state. Includes current open tabs for connected devices.", inputSchema: {} }, async () => {
+  server.registerTool("list_devices", { description: "List devices paired with this Super MD workspace and their live/last-seen state. Includes current open tabs for connected devices.", inputSchema: TOOL_INPUT_SCHEMAS.list_devices }, async () => {
     const devices = await Promise.all([...group.devices.values()].map(async (device) => {
       const online = device.socket?.readyState === WebSocket.OPEN;
       let tabs: unknown[] = [];
@@ -246,14 +285,14 @@ function registerTools(server: McpServer, group: Group): void {
     }));
     return textResult({ devices });
   });
-  server.registerTool("list_tabs", { description: "List open tabs on a connected device. Supply deviceId when the workspace has multiple connected devices.", inputSchema: { deviceId } }, async ({ deviceId: selected }) => toolResponse(await rpc(group, { action: "list_tabs", deviceId: selected })));
-  server.registerTool("read_tab", { description: "Read only the needed Markdown/prose page. Omit tabId for the current document. heading accepts an outline index, exact title, slug, or numbered prefix such as 7.4; returns that section and nested subsections, bounded by limit. Follow the cursor within sectionEnd. Use view:source for exact editable source; prose skips SVG bodies. Whole-file PDF/MD/SMD is available through export followed by job_status and its private resource link.", inputSchema: { deviceId, tabId:tabId.optional(), heading:z.union([z.number().int().min(0),z.string().min(1).max(512)]).optional(), view: z.enum(["source","prose"]).optional(), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional() } }, async ({ deviceId: selected, tabId: tab, heading, view, offset, limit }) => {
+  server.registerTool("list_tabs", { description: "List open tabs on a connected device. Supply deviceId when the workspace has multiple connected devices.", inputSchema: TOOL_INPUT_SCHEMAS.list_tabs }, async ({ deviceId: selected }) => toolResponse(await rpc(group, { action: "list_tabs", deviceId: selected })));
+  server.registerTool("read_tab", { description: "Read only the needed Markdown/prose page. Omit tabId for the current document. heading accepts an outline index, exact title, slug, or numbered prefix such as 7.4; returns that section and nested subsections, bounded by limit. Follow the cursor within sectionEnd. Use view:source for exact editable source; prose skips SVG bodies. Whole-file PDF/MD/SMD is available through export followed by job_status and its private resource link.", inputSchema: TOOL_INPUT_SCHEMAS.read_tab }, async ({ deviceId: selected, tabId: tab, heading, view, offset, limit }) => {
     const target=await readTarget(group,selected,tab);if(target.error)return textResult({error:target.error},true);
     return toolResponse(await rpc(group,{action:"read_tab",deviceId:target.deviceId,tabId:target.tabId,heading,view,offset,limit}));
   });
-  server.registerTool("search_tab", { description: "Search source with paged code-point offsets. Follow nextOffset for more matches. Regex accepts only safe fixed-width literals, dot, character classes and anchors; no groups, alternation or quantifiers.", inputSchema: { deviceId, tabId, query: z.string().min(1).max(500), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(25).optional(), context: z.number().int().min(0).max(500).optional(), caseSensitive: z.boolean().optional(), wholeWord: z.boolean().optional(), regex: z.boolean().optional(), excludeDiagrams: z.boolean().optional() } }, async ({ deviceId: selected, tabId: tab, query, offset, limit, context, caseSensitive, wholeWord, regex, excludeDiagrams }) => toolResponse(await rpc(group, { action: "search_tab", deviceId: selected, tabId: tab, query, offset, limit, context, caseSensitive, wholeWord, regex, excludeDiagrams })));
-  server.registerTool("patch_tab", { description: "Atomically edit an open tab, including inactive tabs without changing focus. Operations run sequentially; applied counts completed operations. Exact replace defaults to one unique match; count:'all' replaces all. expectedCount asserts the match count (if greater than one, omitted count means all). Writes require the latest SHA-256 expectedRevision; never guess it.", inputSchema: { deviceId, tabId, expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i), operations: z.array(patchOperation).min(1).max(100) } }, async ({ deviceId: selected, tabId: tab, expectedRevision, operations }) => toolResponse(await rpc(group, { action: "patch_tab", deviceId: selected, tabId: tab, expectedRevision, operations })));
-  server.registerTool("render_tab", { description: "Render the current reading/editor viewport as an MCP image. Standard quality returns a compact JPEG preview; high quality returns the lossless PNG. Supply deviceId when ambiguous.", inputSchema: { deviceId, tabId, width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional() } }, async ({ deviceId: selected, tabId: tab, width, quality }) => {
+  server.registerTool("search_tab", { description: "Search source with paged code-point offsets. Follow nextOffset for more matches. Regex accepts only safe fixed-width literals, dot, character classes and anchors; no groups, alternation or quantifiers.", inputSchema: TOOL_INPUT_SCHEMAS.search_tab }, async ({ deviceId: selected, tabId: tab, query, offset, limit, context, caseSensitive, wholeWord, regex, excludeDiagrams }) => toolResponse(await rpc(group, { action: "search_tab", deviceId: selected, tabId: tab, query, offset, limit, context, caseSensitive, wholeWord, regex, excludeDiagrams })));
+  server.registerTool("patch_tab", { description: "Atomically edit an open tab, including inactive tabs without changing focus. Operations run sequentially; applied counts completed operations. Exact replace defaults to one unique match; count:'all' replaces all. expectedCount asserts the match count (if greater than one, omitted count means all). Writes require the latest SHA-256 expectedRevision; never guess it.", inputSchema: TOOL_INPUT_SCHEMAS.patch_tab }, async ({ deviceId: selected, tabId: tab, expectedRevision, operations }) => toolResponse(await rpc(group, { action: "patch_tab", deviceId: selected, tabId: tab, expectedRevision, operations })));
+  server.registerTool("render_tab", { description: "Render the current reading/editor viewport as an MCP image. Standard quality returns a compact JPEG preview; high quality returns the lossless PNG. Supply deviceId when ambiguous.", inputSchema: TOOL_INPUT_SCHEMAS.render_tab }, async ({ deviceId: selected, tabId: tab, width, quality }) => {
     const selectedQuality = quality ?? "standard";
     const edge = width ?? (selectedQuality === "high" ? 1600 : 1000);
     const request = { action: "render_tab" as const, deviceId: selected, tabId: tab, width: edge };
@@ -261,7 +300,7 @@ function registerTools(server: McpServer, group: Group): void {
   });
   server.registerTool("view_current", {
     description: "Use FIRST for the current Super MD page or selected/highlighted text. Returns the exact selection, surrounding Markdown, reading position and visible diagram references in one call, with an optional matching image. Set includeImage:false for selection/text-only questions.",
-    inputSchema: { deviceId, tabId: tabId.optional(), width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional(), includeImage: z.boolean().optional() },
+    inputSchema: TOOL_INPUT_SCHEMAS.view_current,
   }, async ({ deviceId: selected, tabId: requestedTab, width, quality, includeImage }) => {
     const chosen = chooseDevice(group, selected);
     if (!chosen.device) return textResult({ error: chosen.error }, true);
@@ -284,7 +323,7 @@ function registerTools(server: McpServer, group: Group): void {
     const contextResponse = await rpc(group, { action: "document_action", documentAction: "get_context", deviceId: chosenDeviceId, tabId: tab, options: { limit: 4000 } });
     if (contextResponse.error) return toolResponse(contextResponse);
     const context = contextResponse.result as Record<string, unknown> | undefined;
-    if (!context || typeof context.tabId !== "string" || !context.tabId || typeof context.revision !== "string" || !/^[a-f0-9]{64}$/i.test(context.revision)) return textResult({ error: "The app returned invalid reading context for the selected tab." }, true);
+    if (!context || typeof context.tabId !== "string" || !context.tabId || typeof context.revision !== "string" || !REVISION_RE.test(context.revision)) return textResult({ error: "The app returned invalid reading context for the selected tab." }, true);
     const normalizedContext = normalizeReadingContext(context) ?? context;
     const readingContext = normalizedContext.tabId === tab ? normalizedContext : { ...normalizedContext, tabId: tab, nativeTabId: normalizedContext.tabId };
 
@@ -338,7 +377,7 @@ function registerTools(server: McpServer, group: Group): void {
     if (Buffer.byteLength(text) > 48 * 1024) return textResult({ error: "The current reading context exceeds the bounded response size." }, true);
     return { content: [...(previewContent ? [previewContent] : []), { type: "text" as const, text }] };
   });
-  server.registerTool("diagram_action", { description: "List diagrams, read their source, or capture a diagram image. Standard image quality returns a compact JPEG; high quality returns lossless PNG.", inputSchema: { deviceId, tabId, diagramAction: z.enum(["list","source","image"]), diagramId: z.string().min(1).max(128).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), offset: z.number().int().min(0).max(20_000_000).optional(), limit: z.number().int().min(1).max(12_000).optional(), width: z.number().int().min(64).max(1600).optional(), quality: z.enum(["standard", "high"]).optional() } }, async ({ deviceId: selected, tabId: tab, diagramAction, diagramId, expectedRevision, offset, limit, width, quality }) => {
+  server.registerTool("diagram_action", { description: "List diagrams, read their source, or capture a diagram image. Standard image quality returns a compact JPEG; high quality returns lossless PNG.", inputSchema: TOOL_INPUT_SCHEMAS.diagram_action }, async ({ deviceId: selected, tabId: tab, diagramAction, diagramId, expectedRevision, offset, limit, width, quality }) => {
     if (diagramAction !== "list" && !expectedRevision) return textResult({error: "Diagram source/image needs expectedRevision from the inventory or reading context."}, true);
     if (diagramAction === "list" && limit !== undefined && limit > 80) return textResult({error: "Diagram list limit must be between 1 and 80."}, true);
     const action = diagramAction === "list" ? "list_diagrams" : diagramAction === "source" ? "get_diagram" : "get_diagram_image";
@@ -352,14 +391,14 @@ function registerTools(server: McpServer, group: Group): void {
     const response = await rpc(group, { action, deviceId: selected, tabId: tab, diagramId, expectedRevision, offset, limit, width });
     return toolResponse(response);
   });
-  server.registerTool("replace_tab_asset", { description: "Replace a linked asset using a path available to the selected Super MD device. The device restricts reads to its configured asset roots; the relay never reads or stores the file.", inputSchema: { deviceId, tabId, assetName: z.string().min(1).max(256), assetPath: z.string().min(1).max(4096), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision }) => toolResponse(await rpc(group, { action: "replace_tab_asset", deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision })));
-  server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: { deviceId, tabId, assetAction: z.enum(["list", "source", "attach"]), assetName: z.string().min(1).max(256).optional(), mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"]).optional(), body: z.string().max(1_400_000).describe("Base64-encoded original bytes, including UTF-8 SVG; not raw SVG text or a data URL").optional(), offset: z.number().int().min(0).max(1_048_576).optional(), limit: z.number().int().min(1).max(12_000).optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i) } }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
+  server.registerTool("replace_tab_asset", { description: "Replace a linked asset using a path available to the selected Super MD device. The device restricts reads to its configured asset roots; the relay never reads or stores the file.", inputSchema: TOOL_INPUT_SCHEMAS.replace_tab_asset }, async ({ deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision }) => toolResponse(await rpc(group, { action: "replace_tab_asset", deviceId: selected, tabId: tab, assetName, assetPath, expectedRevision })));
+  server.registerTool("asset_action", { description: "List embedded assets, retrieve an original image/SVG (SVG source is returned in bounded chunks), or attach model-supplied bytes to a saved portable .smd note. Attachments are limited to 1 MiB and require the note's current source revision; the relay does not read files or fetch URLs.", inputSchema: TOOL_INPUT_SCHEMAS.asset_action }, async ({ deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision }) => {
     const response = await rpc(group, { action: "asset_action", deviceId: selected, tabId: tab, assetAction, assetName, mimeType, body, offset, limit, expectedRevision });
     if (response.error) return toolResponse(response);
     if (assetAction === "source") return assetSourceResult(response, offset, limit);
     return toolResponse(response);
   });
-  server.registerTool("document_action", { description: "Read exact reading context, create, export, repair LaTeX, open, save, check an export job, or snapshot through Super MD's native UI. Snapshot defaults to JPEG at 1000 pixels; set options.quality to high for lossless PNG at 1600 pixels. options.width overrides the edge from 64 to 1600 pixels. Create/open support options.background. Save preserves the existing path and format; options.saveAs is explicit. Close requires expectedRevision and refuses dirty drafts unless options.discardChanges is true. latex_review proposes indexed repairs; latex_apply applies chosen repairIndices against that revision. Poll job_status after asynchronous open/export. No shell or code execution. For a whole document export use format md, smd or pdf; options.section exports only a chosen heading and its descendants. Completed export job_status returns a private expiring download resource link, so file bytes do not consume model tokens. Use outline with options.offset/limit for bounded heading discovery. Android agent exports use the configured folder or Downloads. PDF options match app controls; choose deviceId when ambiguous.", inputSchema: { deviceId, documentAction: z.enum(["get_context","outline","create","export","latexfix","latex_review","latex_apply","open","activate","close","save","snapshot","job_status"]), tabId: tabId.optional(), expectedRevision: z.string().regex(/^[a-f0-9]{64}$/i).optional(), operations: z.array(patchOperation).max(100).optional(), content: z.string().max(60_000).optional(), options: exportOptions.extend({section:z.union([z.number().int().min(0),z.string().min(1).max(512)]).optional(),offset:z.number().int().min(0).max(20_000_000).optional(),background:z.boolean().optional(),saveAs:z.boolean().optional(),discardChanges:z.boolean().optional(),title:z.string().max(160).optional(),format:z.enum(["pdf","smd","md"]).optional(),repairIndices:z.array(z.number().int().min(0)).max(40).optional(),filename:z.string().max(256).optional(),jobId:z.string().max(128).optional(),limit:z.number().int().min(1).max(12_000).optional(),width:z.number().int().min(64).max(1600).optional(),quality:z.enum(["standard","high"]).optional()}).optional() } }, async ({ deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, options }) => {
+  server.registerTool("document_action", { description: "Read exact reading context, create, export, repair LaTeX, open, save, check an export job, or snapshot through Super MD's native UI. Snapshot defaults to JPEG at 1000 pixels; set options.quality to high for lossless PNG at 1600 pixels. options.width overrides the edge from 64 to 1600 pixels. Create/open support options.background. Save preserves the existing path and format; options.saveAs is explicit. Close requires expectedRevision and refuses dirty drafts unless options.discardChanges is true. latex_review proposes indexed repairs; latex_apply applies chosen repairIndices against that revision. Poll job_status after asynchronous open/export. No shell or code execution. For a whole document export use format md, mdzip, smd or pdf; options.section exports only a chosen heading and its descendants. Completed export job_status returns a private expiring download resource link, so file bytes do not consume model tokens. Use outline with options.offset/limit for bounded heading discovery. Android agent exports use the configured folder or Downloads. PDF options match app controls; choose deviceId when ambiguous.", inputSchema: TOOL_INPUT_SCHEMAS.document_action }, async ({ deviceId: selected, documentAction, tabId: tab, expectedRevision, operations, content, options }) => {
     const jobId = options?.jobId;
     if (documentAction === "snapshot") {
       if (!tab) return textResult({ error: "tabId is required for snapshot." }, true);
@@ -381,12 +420,12 @@ function registerTools(server: McpServer, group: Group): void {
     return toolResponse(response);
   });
 }
-function buildServer(group: Group): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.3.0" }); registerTools(mcp, group); return mcp; }
+export function buildServer(group: Group = { groupId: "", connectorHash: "", pairingHash: "", devices: new Map() }): McpServer { const mcp = new McpServer({ name: "super-md-live", version: "0.3.0" }); registerTools(mcp, group); return mcp; }
 
 const modernHandler = createMcpHandler((ctx) => {
   const path = new URL(ctx.requestInfo!.url).pathname.split("/");
   const group = path[2] && path[3] ? authenticatedGroup(path[2], path[3]) : null;
-  return buildServer(group ?? { groupId: "", connectorHash: "", pairingHash: "", devices: new Map() });
+  return buildServer(group ?? undefined);
 });
 const modernNodeHandler = toNodeHandler(modernHandler, { maxRequestBodySize: 2 * 1024 * 1024 });
 
@@ -553,16 +592,25 @@ wss.on("connection", (ws: WebSocket, req: IncomingMessage, groupId: string, devi
   ws.on("error", () => { /* close handler clears pending requests */ });
   sendJson(ws, { type: "registered", groupId, deviceId });
 });
-setInterval(() => {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [groupId, group] of groups) {
-    for (const [deviceId, device] of group.devices) if (!device.socket && device.lastSeen < cutoff) group.devices.delete(deviceId);
-    if (group.devices.size === 0) {
-      groups.delete(groupId);
-      for (const [id, route] of sseTransports) if (route.group === group) { void route.transport.close(); sseTransports.delete(id); }
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const self = fileURLToPath(import.meta.url);
+  try { return realpathSync(entry) === realpathSync(self); }
+  catch { return resolvePath(entry) === self; }
+}
+if (isMainModule()) {
+  setInterval(() => {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const [groupId, group] of groups) {
+      for (const [deviceId, device] of group.devices) if (!device.socket && device.lastSeen < cutoff) group.devices.delete(deviceId);
+      if (group.devices.size === 0) {
+        groups.delete(groupId);
+        for (const [id, route] of sseTransports) if (route.group === group) { void route.transport.close(); sseTransports.delete(id); }
+      }
     }
-  }
-}, 60 * 60 * 1000).unref();
-server.listen(port, process.env.HOST ?? (publicHost ? "0.0.0.0" : "127.0.0.1"), () => {
-  console.info(`Super MD relay listening on ${process.env.HOST ?? (publicHost ? "0.0.0.0" : "127.0.0.1")}:${port}`);
-});
+  }, 60 * 60 * 1000).unref();
+  server.listen(port, process.env.HOST ?? (publicHost ? "0.0.0.0" : "127.0.0.1"), () => {
+    console.info(`Super MD relay listening on ${process.env.HOST ?? (publicHost ? "0.0.0.0" : "127.0.0.1")}:${port}`);
+  });
+}

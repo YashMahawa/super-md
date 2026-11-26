@@ -108,10 +108,62 @@ class AgentExportsTest(unittest.TestCase):
         with self.assertRaises(RevisionConflict):
             export_pdf(self.store, "asset.md", "art.pdf", engine=self.engine)
         chart = self.root / "chart.md"
-        chart.write_text("```mermaid\ngraph TD; A-->B\n```\n", encoding="utf-8")
-        with self.assertRaisesRegex(AgentDocumentError, "does not render Mermaid"):
-            export_pdf(self.store, "chart.md", "chart.pdf", engine=self.engine)
-        self.assertFalse((self.root / "chart.pdf").exists())
+        for body in (
+            "```mermaid\ngraph TD; A-->B\n```\n",
+            "```{mermaid}\ngraph TD; A-->B\n```\n",
+            "```{.mermaid}\ngraph TD; A-->B\n```\n",
+            "```{mermaid, fig-width=6}\ngraph TD; A-->B\n```\n",
+            "~~~{.mermaid echo=false}\ngraph TD; A-->B",
+        ):
+            chart.write_text(body, encoding="utf-8")
+            with self.assertRaisesRegex(AgentDocumentError, "does not render Mermaid"):
+                export_pdf(self.store, "chart.md", "chart.pdf", engine=self.engine)
+            self.assertFalse((self.root / "chart.pdf").exists())
+        chart.write_text("```{mermaid\nplain code with unclosed brace\n```\n", encoding="utf-8")
+        export_pdf(self.store, "chart.md", "unclosed-brace.pdf", engine=self.engine)
+        self.assertTrue((self.root / "unclosed-brace.pdf").read_bytes().startswith(b"%PDF-"))
+
+    def test_pdf_export_discovers_html_and_obsidian_images_and_renders_standalone_diagrams_and_breaks(self):
+        from agent_exports import _image_destinations
+        svg_a = b"<svg xmlns='http://www.w3.org/2000/svg' width='120' height='40'><rect width='120' height='40' fill='#386a57'/></svg>"
+        svg_b = b"<svg xmlns='http://www.w3.org/2000/svg' width='100' height='50'><circle cx='50' cy='25' r='20' fill='#2463b3'/></svg>"
+        svg_c = b"<svg xmlns='http://www.w3.org/2000/svg' width='160' height='40'><rect width='160' height='40' fill='#9a461a'/></svg>"
+        (self.root / "obsidian.svg").write_bytes(svg_a)
+        (self.root / "html.svg").write_bytes(svg_b)
+        (self.root / "assets").mkdir()
+        (self.root / "assets" / "plot.svg").write_bytes(svg_c)
+        markdown = "\n".join([
+            "# Agent Export",
+            "",
+            "Prose ![[obsidian.svg|240]] and `<img src=\"ignored.svg\" />` plus `![[ignored2.svg]]`.",
+            "",
+            "<img src=\"html.svg\" width=\"160px\" style=\"zoom:50%\" />",
+            "",
+            "<img alt=\"A > B\" title='Ratio > 1 & \"quoted\"' src=\"assets/plot.svg\" width=\"300\">",
+            "",
+            "```smd-tree",
+            '{"values":["10","5","15"]}',
+            "```",
+            "",
+            "```smd-diagram",
+            '{"width":240,"height":100,"nodes":[{"id":"a","label":"A","x":60,"y":50},{"id":"b","label":"B","x":180,"y":50}],"edges":[{"from":"a","to":"b"}]}',
+            "```",
+            "",
+            "```svg",
+            "<svg viewBox='0 0 60 30'><rect width='60' height='30' fill='#ffb367'/></svg>",
+            "```",
+            "",
+            "{{< pagebreak >}}",
+            "",
+            "Second page content.",
+        ])
+        self.assertEqual(_image_destinations(markdown), ["obsidian.svg", "html.svg", "assets/plot.svg"])
+        (self.root / "complete.md").write_text(markdown, encoding="utf-8")
+        result = export_pdf(self.store, "complete.md", "complete.pdf", engine=self.engine)
+        pdf_bytes = (self.root / "complete.pdf").read_bytes()
+        self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
+        self.assertNotIn(b"/Subtype /Image", pdf_bytes)
+        self.assertGreater(result["bytes"], 1000)
 
     def test_compressed_portable_pdf_uses_referenced_raw_assets_and_preserves_source(self):
         svg = b"<svg xmlns='http://www.w3.org/2000/svg' width='40' height='20'><text x='1' y='14'>Portable \xce\xbb</text></svg>"
@@ -167,6 +219,129 @@ class AgentExportsTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual((self.root / "extracted.svg").read_bytes(), svg)
         self.assertEqual(source.read_bytes(), original_source)
+
+    def test_pdf_export_embeds_custom_fonts_with_uppercase_ttf_and_otf_extensions(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        raw_ttf = (repo_root / "smd-core" / "fonts" / "NotoSans-Regular.ttf").read_bytes()
+
+        def rename_sfnt(raw: bytes, family: str, postscript: str) -> bytes:
+            num_tables = struct.unpack(">H", raw[4:6])[0]
+            entries = [
+                (1, family), (2, "Regular"), (3, postscript),
+                (4, f"{family} Regular"), (6, postscript),
+                (16, family), (17, "Regular"),
+            ]
+            header_len = 6 + len(entries) * 12
+            records = bytearray()
+            strings = bytearray()
+            for name_id, value in entries:
+                encoded = value.encode("utf-16-be")
+                records += struct.pack(">6H", 3, 1, 0x0409, name_id, len(encoded), len(strings))
+                strings += encoded
+            name_table = struct.pack(">3H", 0, len(entries), header_len) + bytes(records) + bytes(strings)
+            padded_table = name_table + b"\x00" * ((4 - len(name_table) % 4) % 4)
+            checksum = sum(struct.unpack(f">{len(padded_table) // 4}I", padded_table)) & 0xFFFFFFFF
+            out = bytearray(raw)
+            out += b"\x00" * ((4 - len(out) % 4) % 4)
+            offset = len(out)
+            out += padded_table
+            for idx in range(num_tables):
+                rec = 12 + idx * 16
+                if out[rec:rec + 4] == b"name":
+                    out[rec + 4:rec + 16] = struct.pack(">3I", checksum, offset, len(name_table))
+                    break
+            return bytes(out)
+
+        font_dir = self.root / "custom-fonts"
+        font_dir.mkdir()
+        (font_dir / "HeadlineFace.TTF").write_bytes(rename_sfnt(raw_ttf, "AgentUpperTtf", "AgentUpperTtf-Regular"))
+        (font_dir / "SecondaryFace.OTF").write_bytes(rename_sfnt(raw_ttf, "AgentUpperOtf", "AgentUpperOtf-Regular"))
+
+        (self.root / "fonts-note.md").write_text("# Custom Font Export\n\nBody text.\n", encoding="utf-8")
+        ttf_opts = {**DEFAULT_PDF_OPTIONS, "fontFamily": "AgentUpperTtf"}
+        export_pdf(self.store, "fonts-note.md", "ttf.pdf", options=ttf_opts, font_dir=font_dir, engine=self.engine)
+        self.assertIn(b"AgentUpperTtf-Regular", (self.root / "ttf.pdf").read_bytes())
+
+        otf_opts = {**DEFAULT_PDF_OPTIONS, "fontFamily": "AgentUpperOtf"}
+        export_pdf(self.store, "fonts-note.md", "otf.pdf", options=otf_opts, font_dir=font_dir, engine=self.engine)
+        self.assertIn(b"AgentUpperOtf-Regular", (self.root / "otf.pdf").read_bytes())
+
+    def test_pdf_and_markdown_exports_handle_yaml_frontmatter_variations_and_populate_pdf_properties(self):
+        from frontmatter import frontmatter_end, mask_frontmatter, strip_frontmatter
+        from markdown_prepare import prepare_markdown_export
+
+        for raw, expected_body in (
+            ("\ufeff---\ntitle: BOM\n---\nBody", "Body"),
+            ("---  \ntitle: Dots\n...  \nBody", "Body"),
+            ("---\n---\nBody", "Body"),
+            ("---\ntitle: EOF\n---", ""),
+        ):
+            self.assertGreater(frontmatter_end(raw), 0)
+            self.assertEqual(strip_frontmatter(raw), expected_body)
+            self.assertEqual(len(mask_frontmatter(raw)), len(raw))
+
+        for non_fm in (
+            "---\ntitle: Unclosed\n\n# Body",
+            "+++\ntitle = 'TOML'\n+++\n# Body",
+            "---\nPlain sentence between thematic breaks.\n---\n",
+        ):
+            self.assertEqual(frontmatter_end(non_fm), 0)
+
+        note = (
+            "\ufeff---  \n"
+            'title: "Hamiltonian Systems"\n'
+            'author: "William Rowan Hamilton"\n'
+            'description: "Phase space and ![not-an-image](missing.png) plus ```mermaid"\n'
+            "tags: [mechanics, symplectic]\n"
+            "date: 2026-03-15\n"
+            "...  \n\n"
+            "# Phase Space\n\n"
+            "Canonical coordinates $(q, p)$.\n"
+        )
+        (self.root / "hamilton.md").write_text(note, encoding="utf-8")
+        prepared_md, prepared_assets = prepare_markdown_export(self.store, "hamilton.md", note, {})
+        self.assertEqual(prepared_assets, {})
+        self.assertEqual(prepared_md, note)
+
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = agent_cli_main([
+                "--root", str(self.root), "export", "hamilton.md", "pdf", "hamilton.pdf",
+                "--engine", str(self.engine),
+            ])
+        self.assertEqual(status, 0)
+        pdf_bytes = (self.root / "hamilton.pdf").read_bytes()
+        self.assertTrue(pdf_bytes.startswith(b"%PDF-"))
+
+        corpus = pdf_bytes.decode("latin1")
+        idx = 0
+        while (pos := pdf_bytes.find(b"stream", idx)) != -1:
+            start = pos + 6
+            if pdf_bytes[start:start + 2] == b"\r\n":
+                start += 2
+            elif pdf_bytes[start:start + 1] == b"\n":
+                start += 1
+            else:
+                idx = start
+                continue
+            end = pdf_bytes.find(b"endstream", start)
+            if end == -1:
+                break
+            chunk = pdf_bytes[start:end].rstrip(b"\r\n")
+            try:
+                corpus += "\n" + zlib.decompress(chunk).decode("utf-8", errors="replace")
+            except zlib.error:
+                pass
+            idx = end + 9
+
+        for expected in (
+            "Hamiltonian Systems",
+            "William Rowan Hamilton",
+            "Phase space and ![not-an-image](missing.png)",
+            "symplectic",
+        ):
+            self.assertIn(expected, corpus)
+        self.assertTrue("2026-03-15" in corpus or "D:20260315" in corpus)
 
 
 if __name__ == "__main__":

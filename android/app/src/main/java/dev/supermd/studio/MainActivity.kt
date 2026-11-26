@@ -42,6 +42,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.MenuBook
+import androidx.compose.material.icons.automirrored.rounded.Redo
+import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -59,11 +61,25 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -84,6 +100,9 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 
 internal fun shouldShowNativeBusyOverlay(busy: Boolean, readerReady: Boolean, readerOwnsProgress: Boolean): Boolean =
     !readerOwnsProgress && (busy || !readerReady)
+
+internal fun isSystemMotionEnabled(context: android.content.Context): Boolean =
+    android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f
 
 private suspend fun View.awaitWindowFocus() {
     if (hasWindowFocus()) return
@@ -119,7 +138,10 @@ class MainActivity : ComponentActivity() {
     )
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
-    var openReaderFind: (() -> Unit)? = null
+    var openReaderFind: ((Boolean) -> Unit)? = null
+    var stepReaderFind: ((Int) -> Unit)? = null
+    var formatDocument: ((String) -> Unit)? = null
+    var canFormatEditor: (() -> Boolean)? = null
     val agentAccessState: AgentAccessState by lazy { AgentAccessState(this) }
     var agentRelayState by mutableStateOf(AgentRelayClient.State.DISCONNECTED)
         private set
@@ -147,23 +169,54 @@ class MainActivity : ComponentActivity() {
         // Create this task's workspace before RESUMED/lifecycle consumers can
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
-        intent?.data?.let(windowModel::retainDocumentAccess)
         setContent { Studio(windowModel, this) }
         val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
         if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
-            intent?.data?.let { uri ->
-                if (savedInstanceState == null || windowModel.state.value.let { state ->
-                        state.tabs.none { it.uri == uri.toString() } && state.closedTabs.none { it.uri == uri.toString() }
-                    }) {
-                    windowModel.requestInitialOpen(uri)
-                }
-            }
+            handleExternalDocumentIntent(intent, savedInstanceState, initial = true, targetModel = windowModel)
         }
     }
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        intent.data?.let { requestOpen(it) }
+        handleExternalDocumentIntent(intent, savedInstanceState = null, initial = false, targetModel = model)
+    }
+    private fun handleExternalDocumentIntent(
+        incoming: Intent?,
+        savedInstanceState: Bundle?,
+        initial: Boolean,
+        targetModel: StudioViewModel,
+    ) {
+        val caller = resolveExternalIntentCaller(incoming, initial)
+        ExternalDocumentEntryGuard.dispatchIncomingIntent(this, incoming, savedInstanceState, initial, targetModel, caller)
+    }
+    private fun resolveExternalIntentCaller(incoming: Intent?, initial: Boolean): ExternalIntentCaller {
+        val uri = incoming?.data
+        val isOwnShareUri = uri != null &&
+            uri.scheme.equals("content", ignoreCase = true) &&
+            uri.authority == "${packageName}.share"
+        if (Build.VERSION.SDK_INT >= 35) {
+            val caller = runCatching { currentCaller }.getOrNull()?.takeIf { it.uid > 0 }
+                ?: if (initial) runCatching { initialCaller }.getOrNull()?.takeIf { it.uid > 0 } else null
+            if (caller != null) {
+                val grantedShare = isOwnShareUri && runCatching {
+                    caller.checkContentUriPermission(uri!!, Intent.FLAG_GRANT_READ_URI_PERMISSION) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                }.getOrDefault(false)
+                return ExternalIntentCaller(uid = caller.uid, callerGrantedOwnShareUri = grantedShare)
+            }
+        }
+        if (initial && Build.VERSION.SDK_INT >= 34) {
+            val launchedUid = runCatching { launchedFromUid }.getOrDefault(-1)
+            if (launchedUid > 0) {
+                val grantedShare = isOwnShareUri && (
+                    launchedUid == android.os.Process.myUid() ||
+                        checkUriPermission(uri!!, -1, launchedUid, Intent.FLAG_GRANT_READ_URI_PERMISSION) ==
+                            android.content.pm.PackageManager.PERMISSION_GRANTED
+                    )
+                return ExternalIntentCaller(uid = launchedUid, callerGrantedOwnShareUri = grantedShare)
+            }
+        }
+        return ExternalIntentCaller()
     }
     fun requestOpen(uri: android.net.Uri, relative: String? = null) {
         model.retainDocumentAccess(uri)
@@ -206,7 +259,7 @@ class MainActivity : ComponentActivity() {
     internal fun agentExportJob(jobId: String): JSONObject? = agentExportJobs[jobId]?.let { JSONObject(it.toString()) }
     internal suspend fun completeAgentExport(jobId: String, uri: android.net.Uri, fallbackName: String, format: String) = withContext(Dispatchers.IO) {
         require(agentExportJobs[jobId]?.optString("phase") in setOf("preparing", "saving")) { "This export job is not active in this app" }
-        require(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
+        require(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
         val (bytes, digest) = fingerprintAgentExport(uri)
         require(bytes > 0 || format == "md") { "The completed PDF or portable export is empty" }
         require(bytes <= MAX_AGENT_EXPORT_BYTES) { "Agent downloads are limited to 128 MiB per export" }
@@ -219,7 +272,7 @@ class MainActivity : ComponentActivity() {
         val filename = rawName.substringAfterLast('/').substringAfterLast('\\')
             .replace(Regex("[\\u0000-\\u001f\\u007f]"), "").take(256)
         require(filename.isNotBlank()) { "Android did not provide a valid export filename" }
-        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; else -> "text/markdown" }
+        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; "mdzip" -> "application/zip"; else -> "text/markdown" }
         val artifact = AgentExportArtifact(uri, filename, format, mimeType, bytes, digest, System.currentTimeMillis())
         agentExportArtifacts[jobId] = artifact
         agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("status", "completed").put("phase", "completed")
@@ -331,7 +384,6 @@ class MainActivity : ComponentActivity() {
     internal fun agentSourceLength(value: String): Int = value.codePointCount(0, value.length)
     internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject {
         require(imageFormat in setOf("png", "jpeg")) { "Unsupported viewport image format" }
-        check(Build.VERSION.SDK_INT >= 26) { "Viewport snapshots require Android 8 or newer" }
         check(reader.width > 0 && reader.height > 0 && reader.isAttachedToWindow) { "The live reading viewport is unavailable" }
         val context = kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
             val requestId = "snapshot_context_${java.util.UUID.randomUUID()}"
@@ -405,18 +457,60 @@ class MainActivity : ComponentActivity() {
         }
     }
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
+        if (event.action == android.view.KeyEvent.ACTION_DOWN) {
+            if (canFormatEditor?.invoke() == true) {
+                val formatAction = markdownFormatActionForKey(
+                    keyCode = event.keyCode,
+                    isCtrlPressed = event.isCtrlPressed,
+                    isShiftPressed = event.isShiftPressed,
+                    isAltPressed = event.isAltPressed,
+                    isMetaPressed = event.isMetaPressed,
+                )
+                if (formatAction != null) {
+                    if (event.repeatCount == 0) formatDocument?.invoke(formatAction)
+                    return true
+                }
+            }
+        }
         if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
             if (event.keyCode == android.view.KeyEvent.KEYCODE_F11) { model.fullscreen(!model.state.value.fullscreen); return true }
-            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE && (model.state.value.fullscreen || model.state.value.readerOverlay)) { dismissDocument?.invoke() ?: model.fullscreen(false); return true }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_F3 && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) {
+                if (!model.folderSearch.value.visible) stepReaderFind?.invoke(if (event.isShiftPressed) -1 else 1)
+                return true
+            }
+            if (event.keyCode == android.view.KeyEvent.KEYCODE_ESCAPE) {
+                if (model.folderSearch.value.visible) {
+                    model.cancelWorkspaceSearch()
+                    return true
+                }
+                if (model.state.value.fullscreen || model.state.value.readerOverlay) {
+                    dismissDocument?.invoke() ?: model.fullscreen(false)
+                    return true
+                }
+            }
+            val primaryMod = event.isCtrlPressed || event.isMetaPressed
+            if (primaryMod && !event.isAltPressed) {
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_F) {
+                    if (event.isShiftPressed) model.openFolderSearch() else openReaderFind?.invoke(false)
+                    return true
+                }
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_H && !event.isShiftPressed) {
+                    openReaderFind?.invoke(true)
+                    return true
+                }
+                if (event.keyCode == android.view.KeyEvent.KEYCODE_S) {
+                    if (event.isShiftPressed) model.beginSaveAs() else model.saveManual()
+                    return true
+                }
+            }
             if (event.isCtrlPressed && event.keyCode == android.view.KeyEvent.KEYCODE_N) { newWindow(); return true }
             if (event.isCtrlPressed) {
                 when(event.keyCode) {
                     android.view.KeyEvent.KEYCODE_T -> { if(event.isShiftPressed)model.reopen() else model.newNote();return true }
-                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else model.close(model.state.value.active.id);return true }
+                    android.view.KeyEvent.KEYCODE_W -> { if(event.isShiftPressed)finish() else if(model.state.value.tabs.isNotEmpty())model.requestClose(model.state.value.active.id);return true }
                     android.view.KeyEvent.KEYCODE_TAB -> { model.cycle(if(event.isShiftPressed)-1 else 1);return true }
                     android.view.KeyEvent.KEYCODE_PAGE_DOWN -> {model.cycle(1);return true}
                     android.view.KeyEvent.KEYCODE_PAGE_UP -> {model.cycle(-1);return true}
-                    android.view.KeyEvent.KEYCODE_F -> {openReaderFind?.invoke();return true}
                 }
                 if(event.keyCode in android.view.KeyEvent.KEYCODE_1..android.view.KeyEvent.KEYCODE_9){model.tabNumber(event.keyCode-android.view.KeyEvent.KEYCODE_1+1);return true}
             }
@@ -454,7 +548,7 @@ class MainActivity : ComponentActivity() {
         if (theme == "black") base = manualAccent("neutral",true).copy(primary=Color(0xffdedede),onPrimary=Color(0xff1a1a1a),primaryContainer=Color(0xff343434),onPrimaryContainer=Color(0xfff0f0f0),background=Color.Black,surface=Color.Black,surfaceContainer=Color(0xff171717),surfaceContainerLow=Color(0xff101010),surfaceContainerHigh=Color(0xff242424))
         customThemeColors(base,custom,theme,dark)
     }
-    val systemMotion = remember { android.provider.Settings.Global.getFloat(context.contentResolver, android.provider.Settings.Global.ANIMATOR_DURATION_SCALE, 1f) != 0f }
+    val systemMotion = isSystemMotionEnabled(context)
     val shapes=remember(custom){val radius=custom?.optJSONObject("metrics")?.optDouble("controlRadius",Double.NaN);if(radius!=null&&radius.isFinite())Shapes().copy(small=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp),medium=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp),large=RoundedCornerShape(radius.toFloat().coerceIn(0f,28f).dp))else Shapes()}
     MaterialExpressiveTheme(colorScheme = colors, shapes=shapes, motionScheme = if (state.motion && systemMotion) MotionScheme.expressive() else NoMotionScheme) {
         Surface(Modifier.fillMaxSize(), color = colors.surface, contentColor = colors.onSurface) {
@@ -470,6 +564,92 @@ private object NoMotionScheme : MotionScheme {
     override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = snap()
     override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = snap()
     override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
+}
+
+internal fun shouldAcceptExternalDrag(localState: Any?, description: android.content.ClipDescription?): Boolean {
+    if (localState != null || description == null) return false
+    val count = description.mimeTypeCount
+    if (count <= 0) return false
+    var hasExternalPayload = false
+    for (index in 0 until count) {
+        val mime = description.getMimeType(index)?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+        if (mime.startsWith("chromium/")) return false
+        if (mime.isNotEmpty() && mime != "text/plain" && mime != "text/html") {
+            hasExternalPayload = true
+        }
+    }
+    return hasExternalPayload
+}
+
+internal class ExternalDropDragController(
+    private val onExternalDrop: (android.view.DragEvent) -> Unit,
+) : android.view.View.OnDragListener {
+    private var acceptingExternalDrag = false
+
+    override fun onDrag(view: android.view.View?, event: android.view.DragEvent): Boolean =
+        onDragAction(
+            action = event.action,
+            localState = event.localState,
+            description = event.clipDescription,
+            event = event,
+        )
+
+    internal fun onDragAction(
+        action: Int,
+        localState: Any?,
+        description: android.content.ClipDescription?,
+        event: android.view.DragEvent? = null,
+    ): Boolean {
+        return when (action) {
+            android.view.DragEvent.ACTION_DRAG_STARTED -> {
+                acceptingExternalDrag = shouldAcceptExternalDrag(localState, description)
+                acceptingExternalDrag
+            }
+            android.view.DragEvent.ACTION_DROP -> {
+                if (!acceptingExternalDrag) return false
+                if (event != null) onExternalDrop(event)
+                true
+            }
+            android.view.DragEvent.ACTION_DRAG_ENDED -> {
+                val handled = acceptingExternalDrag
+                acceptingExternalDrag = false
+                handled
+            }
+            else -> acceptingExternalDrag
+        }
+    }
+}
+
+internal fun shouldBlockNativeDrop(
+    state: StudioState,
+    folderSearchVisible: Boolean = false,
+    accessRequestOpen: Boolean = false,
+    settingsOpen: Boolean = false,
+    exporting: Boolean = false,
+    renaming: Boolean = false,
+    contentsShown: Boolean = false,
+    drawerOpen: Boolean = false,
+): Boolean =
+    !state.welcomed ||
+        state.busy ||
+        state.readerOverlay ||
+        folderSearchVisible ||
+        accessRequestOpen ||
+        state.pendingCloseNoteId != null ||
+        state.pendingSaveConflictNoteId != null ||
+        settingsOpen ||
+        exporting ||
+        renaming ||
+        contentsShown ||
+        drawerOpen
+
+internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<android.net.Uri> {
+    if (clip == null) return emptyList()
+    return (0 until clip.itemCount).mapNotNull { index ->
+        clip.getItemAt(index)?.uri?.takeIf { uri ->
+            uri.scheme?.lowercase() in setOf("content", "file")
+        }
+    }
 }
 
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
@@ -495,9 +675,9 @@ private object NoMotionScheme : MotionScheme {
     var readerPdfOwnsProgress by remember { mutableStateOf(false) }
     var menu by remember { mutableStateOf(false) }
     var findRequest by remember { mutableIntStateOf(0) }
-    var renaming by remember {mutableStateOf(false)}
+    var findReplace by remember { mutableStateOf(false) }
+    var renaming by rememberSaveable {mutableStateOf(false)}
     var contentsShown by remember {mutableStateOf(false)}
-    var sidebarSection by rememberSaveable {mutableStateOf("folder")}
     var readingChromeVisible by remember {mutableStateOf(true)}
     LaunchedEffect(state.busy) { if (!state.busy) readerPdfOwnsProgress = false }
     LaunchedEffect(state.active.id, state.mode, settings) { if (!state.fullscreen) readingChromeVisible = true }
@@ -560,15 +740,24 @@ private object NoMotionScheme : MotionScheme {
         }
         activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
-        activity.openReaderFind = {
+        activity.openReaderFind = { replace ->
             menu = false
+            findReplace = replace
             findRequest++
         }
-        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;model.assetAccessRestored=null }
+        activity.stepReaderFind = { direction ->
+            menu = false
+            web?.let { reader ->
+                reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFindStep?.(${if (direction < 0) -1 else 1}); true", null)
+            }
+        }
+        onDispose { activity.dismissDocument = null;activity.saveReaderPosition=null;activity.openReaderFind=null;activity.stepReaderFind=null;model.assetAccessRestored=null }
     }
     LaunchedEffect(findRequest, menu, web) {
         if (findRequest == 0 || menu) return@LaunchedEffect
         val requested = findRequest
+        val replace = findReplace
         // Wait for the popup window to release native focus before asking the
         // WebView for focus. This follows the actual dismissal instead of
         // estimating its transition duration.
@@ -576,8 +765,9 @@ private object NoMotionScheme : MotionScheme {
         reader.awaitWindowFocus()
         if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
         findRequest = 0
+        findReplace = false
         reader.requestFocus(View.FOCUS_DOWN)
-        reader.evaluateJavascript("window.supermdFind?.(); true") {
+        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
             reader.post {
                 reader.requestFocus(View.FOCUS_DOWN)
                 val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
@@ -605,7 +795,16 @@ private object NoMotionScheme : MotionScheme {
         onDispose { model.readerFlushRequester = null }
     }
     DisposableEffect(activity, model, readerReady) {
-        val handler = if (readerReady) OpenIntentDispatcher.Handler<android.net.Uri> { uri, relative -> model.open(uri, relative) } else null
+        val handler = if (readerReady) {
+            OpenIntentDispatcher.Handler<OpenDocumentTarget> { target, relative ->
+                model.openDocument(
+                    target.uri,
+                    relative,
+                    externalIntentFlags = target.externalIntentFlags,
+                    externalCaller = target.externalCaller,
+                )
+            }
+        } else null
         model.attachReaderOpenHandler(handler)
         onDispose { if (handler != null) model.detachReaderOpenHandler(handler) }
     }
@@ -905,9 +1104,12 @@ private object NoMotionScheme : MotionScheme {
         activity.setAgentRequestHandlers(bridge, null)
         onDispose { activity.setAgentRequestHandlers(null, null) }
     }
-    var folderRelative by remember { mutableStateOf("") }
+    var createFolderRequest by remember { mutableStateOf<CreateFolderRequest?>(null) }
+    var renameFolderTarget by remember { mutableStateOf<FileEntry?>(null) }
     var hinge by remember { mutableStateOf<FoldingFeature?>(null) }
     val recent by model.recent.collectAsStateWithLifecycle()
+    val folderSearch by model.folderSearch.collectAsStateWithLifecycle()
+    val seededFind by model.seededFind.collectAsStateWithLifecycle()
     val accessRequest by model.documentAccessRequests.collectAsStateWithLifecycle()
     var accessPickerShowing by rememberSaveable { mutableStateOf(false) }
     val accessPicker = rememberLauncherForActivityResult(RestoreDocumentAccess()) { uri ->
@@ -932,8 +1134,9 @@ private object NoMotionScheme : MotionScheme {
     val themeExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) {it?.let {uri->model.exportCustomTheme(uri)}}
     var noteLocation by remember {mutableStateOf(model.noteLocation())}
     val noteFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {it?.let {uri->runCatching{model.noteLocation(uri);noteLocation=uri.toString()}.onFailure{model.fail("Could not remember this folder: ${it.message}")}}}
-    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { it?.let { uri -> model.save(uri) } }
-    val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> folderRelative = ""; model.setFolder(uri) } }
+    val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
+    val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
+    val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> model.setFolder(uri) } }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
@@ -948,22 +1151,24 @@ private object NoMotionScheme : MotionScheme {
             pendingAgentExport = safeArgs
             val jobId = args.optString("requestId")
             val format = args.optString("format", "pdf")
-            check(format in setOf("pdf", "smd", "md")) { "Unsupported export format" }
+            check(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
             val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
-                ?: args.optString("id").takeIf { it.isNotBlank() } ?: state.active.name.substringBeforeLast('.')
+                ?: args.optString("id").takeIf { it.isNotBlank() } ?: noteStem(state.active.name).ifBlank { "Untitled" }
             activity.updateAgentExportJob(jobId, "preparing")
             model.busy(true)
             scope.launch {
                 try {
                     val pdfOptions = JSONObject(state.pdf)
                     val provided = safeArgs.optJSONObject("options") ?: JSONObject()
+                    val archive = format == "mdzip" || (format == "md" && (safeArgs.optBoolean("archive", false) || provided.optBoolean("archive", false)))
+                    val effectiveFormat = if (archive) "mdzip" else format
                     listOf("pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed")
                         .forEach { key -> if (provided.has(key)) pdfOptions.put(key, provided.get(key)) }
                     val (uri, filename) = model.writeAgentExport(
                         safeArgs.getString("content"), safeArgs.optJSONObject("assets") ?: JSONObject(),
-                        format, requestedName, pdfOptions.toString(),
+                        effectiveFormat, requestedName, pdfOptions.toString(), archive = archive,
                     )
-                    activity.completeAgentExport(jobId, uri, filename, format)
+                    activity.completeAgentExport(jobId, uri, filename, effectiveFormat)
                     model.busy(false)
                 } catch (error: Exception) {
                     activity.updateAgentExportJob(jobId, "failed", error.message ?: "Export failed")
@@ -987,14 +1192,42 @@ private object NoMotionScheme : MotionScheme {
         }
         onDispose { activity.setAgentUiHandler(null) }
     }
-    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(state.active.name.substringBeforeLast('.') + ".smd") }; onDispose { model.requestPortable = null } }
-    val saveAction: () -> Unit = { if (model.requestWriteAccessIfBlocked(state.active.id, explicit = true)) Unit else if (state.active.uri == null) save.launch(state.active.name.substringBeforeLast('.') + ".md") else if (state.active.portable) { model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(true)", null) ?: model.fail("The reader is not ready") } else model.save(); Unit }
+    DisposableEffect(portable, state.active.name) { model.requestPortable = { portable.launch(noteStem(state.active.name).ifBlank { "Untitled" } + ".smd") }; onDispose { model.requestPortable = null } }
+    DisposableEffect(save, portableSaveAs, model) {
+        model.requestSaveAs = { note ->
+            val stem = noteStem(note.name).ifBlank { "Untitled" }
+            if (note.portable) portableSaveAs.launch("$stem.smd")
+            else save.launch("$stem.md")
+        }
+        onDispose { model.requestSaveAs = null }
+    }
+    DisposableEffect(web, readerReady, model) {
+        model.requestPortableWrite = if (readerReady && web != null) { saveInPlace ->
+            model.busy(true)
+            web?.evaluateJavascript("window.supermdPortable?.($saveInPlace)", null)
+            true
+        } else null
+        onDispose { model.requestPortableWrite = null }
+    }
+    val saveAction: () -> Unit = { model.saveManual() }
     LaunchedEffect(state.message) { state.message?.let { snackbar.showSnackbar(it); model.dismissMessage() } }
     val immersive = (state.fullscreen || !readingChromeVisible || state.readerOverlay) && !settings
     LaunchedEffect(immersive, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
     }
-    BackHandler(state.fullscreen || drawer.isOpen || state.readerOverlay) { if (drawer.isOpen) scope.launch { drawer.close() } else web?.evaluateJavascript("window.supermdDismiss?.() || false") {dismissed->if(dismissed!="true")model.fullscreen(false)} }
+    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) {
+        if (contentsShown) {
+            contentsShown = false
+        } else if (drawer.isOpen) {
+            if (state.folder != null && state.folderRelative.isNotEmpty() && model.navigateFolderUp()) {
+                Unit
+            } else {
+                scope.launch { drawer.close() }
+            }
+        } else {
+            web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) }
+        }
+    }
     val palette = MaterialTheme.colorScheme
     val density = LocalDensity.current
     val tokens = remember(palette) { JSONObject().put("primary", hex(palette.primary)).put("on-primary", hex(palette.onPrimary)).put("primary-container",hex(palette.primaryContainer)).put("on-primary-container",hex(palette.onPrimaryContainer)).put("surface", hex(palette.surface)).put("surface-low", hex(palette.surfaceContainerLow)).put("surface-high", hex(palette.surfaceContainerHigh)).put("text", hex(palette.onSurface)).put("muted", hex(palette.onSurfaceVariant)).put("outline", hex(palette.outlineVariant)) }
@@ -1004,15 +1237,48 @@ private object NoMotionScheme : MotionScheme {
         val displayIsLarge = if (Build.VERSION.SDK_INT >= 30) activity.windowManager.maximumWindowMetrics.bounds.let { minOf(it.width(), it.height()) / density.density >= 600f } else activity.resources.configuration.smallestScreenWidthDp >= 600
         val wide = displayIsLarge && maxWidth >= 720.dp && maxHeight >= 400.dp
         val actualMode = if (!wide && state.mode == "split") "live" else state.mode
+        val imeVisible = WindowInsets.ime.getBottom(density) > 0
+        val modalOpen = settings || exporting || renaming || contentsShown || folderSearch.visible || drawer.isOpen || (!accessPickerShowing && accessRequest != null) || state.pendingCloseNote != null || state.pendingSaveConflictNote != null || state.error != null || !state.welcomed
+        val showFormattingBar = shouldShowKeyboardFormattingBar(actualMode, imeVisible, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        val triggerFormat = rememberUpdatedState<(String) -> Unit> { action ->
+            val reader = web
+            if (reader != null && readerReady) {
+                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+                reader.evaluateJavascript("window.supermdFormat?.(${JSONObject.quote(action)}); true", null)
+            }
+        }
+        val canFormatNow = rememberUpdatedState {
+            canTriggerHardwareFormatShortcut(actualMode, state.editorFocused, readerReady, state.readerOverlay, modalOpen)
+        }
+        DisposableEffect(activity) {
+            activity.formatDocument = { action -> triggerFormat.value(action) }
+            activity.canFormatEditor = { canFormatNow.value() }
+            onDispose {
+                activity.formatDocument = null
+                activity.canFormatEditor = null
+            }
+        }
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion) {
+        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
-            if (readerReady) {
+            if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
+                val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                if (pendingHeading != null) {
+                    payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
+                }
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
+                if (matchingSeed != null) {
+                    payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
+                }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
+                if (matchingSeed != null) {
+                    model.consumeSeededFind(matchingSeed.nonce)
+                }
                 readerNote[0] = note.id
                 readerContent[0] = note.content
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
@@ -1024,7 +1290,7 @@ private object NoMotionScheme : MotionScheme {
         }
         val headings by model.headings.collectAsStateWithLifecycle()
         val imageOverlay by model.imageOverlay.collectAsStateWithLifecycle()
-        val chromeShown = !state.readerOverlay && !imageOverlay && readingChromeVisible
+        val chromeShown = !state.readerOverlay && !imageOverlay && (readingChromeVisible || state.activeConflicted)
         val chromeReveal by animateFloatAsState(if(chromeShown) 1f else 0f,
             animationSpec=tween(if(motion) 120 else 0),label="Reading chrome")
         LaunchedEffect(readerReady,chromeHeight) {
@@ -1042,38 +1308,42 @@ private object NoMotionScheme : MotionScheme {
         LaunchedEffect(readerReady,safeTop) {
             if(readerReady) web?.evaluateJavascript("document.documentElement.style.setProperty('--native-safe-top','${safeTop}px')",null)
         }
-        if(contentsShown) AlertDialog(onDismissRequest={contentsShown=false},title={Text("Contents")},text={OutlinePanel(headings,state.active.id){heading->readingChromeVisible=false;web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);contentsShown=false}},confirmButton={TextButton(onClick={contentsShown=false}){Text("Close")}})
+        if (contentsShown) {
+            ContentsBottomSheet(headings = headings, noteId = state.active.id, motion = motion, onDismiss = { contentsShown = false }) { heading ->
+                if (actualMode in listOf("live", "reader") || state.fullscreen) readingChromeVisible = false
+                web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})", null)
+                contentsShown = false
+            }
+        }
         // Closed-drawer drag recognition steals diagonal scrolls and pinch
         // gestures from WebView. Opening is deliberate (menu button); dragging
         // still dismisses an already-open drawer.
         ModalNavigationDrawer(drawerState = drawer, gesturesEnabled = drawer.isOpen && !state.fullscreen, drawerContent = {
             ModalDrawerSheet(modifier = Modifier.widthIn(max = 340.dp)) {
-                Column(Modifier.fillMaxHeight().themeArtwork(state,"sidebar").safeDrawingPadding().padding(horizontal = 16.dp)) {
-                    Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 20.dp))
-                    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth().padding(bottom=12.dp)) {listOf("folder" to "Folder","contents" to "Contents").forEachIndexed {index,entry->SegmentedButton(selected=sidebarSection==entry.first,onClick={sidebarSection=entry.first},shape=SegmentedButtonDefaults.itemShape(index,2),colors=SegmentedButtonDefaults.colors(activeContainerColor=palette.primary,activeContentColor=palette.onPrimary)){Text(entry.second)}}}
-                    Button(onClick = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note") }
-                    FilledTonalButton(onClick = { folder.launch(state.folder?.let(android.net.Uri::parse)) }, modifier = Modifier.fillMaxWidth()) { Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder") }
-                    if (state.folder != null) TextButton(onClick = { folderRelative = ""; model.closeFolder() }) { Icon(Icons.Rounded.Close, null); Text("Close folder", Modifier.padding(start = 8.dp)) }
-                    Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 12.dp))
-                    if (folderRelative.isNotEmpty()) TextButton(onClick = { folderRelative = ""; state.folder?.let { model.listFolder(android.net.Uri.parse(it), "") } }) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, null); Text("Folder root") }
-                    if(sidebarSection=="contents") OutlinePanel(headings,state.active.id,Modifier.weight(1f)){heading->readingChromeVisible=false;web?.evaluateJavascript("window.supermdHeading?.(${JSONObject.quote(heading.id)},${heading.offset})",null);scope.launch{drawer.close()}}
-                    else LazyColumn(Modifier.weight(1f)) {
-                        items(state.files, key={"file:${it.uri}:${it.relative}"}) { entry ->
-                            val activate = { if (entry.directory) { folderRelative = entry.relative; model.listFolder(android.net.Uri.parse(entry.uri), entry.relative) } else { activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative); scope.launch { drawer.close() } }; Unit }
-                            ListItem(headlineContent = { Text(entry.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }, leadingContent = { Icon(if (entry.directory) Icons.Rounded.Folder else Icons.Rounded.Description, null) }, modifier = Modifier.fillMaxWidth().clickable(onClick = activate), trailingContent = { Icon(if (entry.directory) Icons.Rounded.ChevronRight else Icons.AutoMirrored.Rounded.MenuBook, null) })
+                FilesDrawerContent(
+                    state = state,
+                    recent = recent,
+                    folderRelative = state.folderRelative,
+                    onOpenNote = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } },
+                    onOpenFolder = { folder.launch(state.folder?.let(android.net.Uri::parse)) },
+                    onCloseFolder = model::closeFolder,
+                    onFolderRoot = { model.navigateFolderUp() },
+                    onNavigateFolderRelative = { rel -> state.folder?.let { model.listFolder(android.net.Uri.parse(it), rel) } },
+                    onCreateInFolder = { req -> createFolderRequest = req },
+                    onRenameEntry = { entry -> renameFolderTarget = entry },
+                    onFolderSearch = { scope.launch { drawer.close() }; model.openFolderSearch() },
+                    onActivateEntry = { entry ->
+                        if (entry.directory) {
+                            model.listFolder(android.net.Uri.parse(state.folder ?: entry.uri), entry.relative)
+                        } else {
+                            activity.requestOpen(android.net.Uri.parse(entry.uri), entry.relative)
+                            scope.launch { drawer.close() }
                         }
-                    }
-                    HorizontalDivider(Modifier.padding(vertical=8.dp))
-                    if(recent.isNotEmpty()) {
-                        Row(verticalAlignment=Alignment.CenterVertically){Text("Recent notes",Modifier.weight(1f),style=MaterialTheme.typography.titleSmall);TextButton(onClick=model::clearRecent){Text("Clear unpinned")}}
-                        LazyColumn(Modifier.heightIn(max=200.dp),verticalArrangement=Arrangement.spacedBy(6.dp),contentPadding=PaddingValues(bottom=12.dp)) {
-                            items(recent,key={it.uri}) { note ->
-                                val selected=state.active.uri==note.uri
-                                RecentNoteCard(note,selected,onOpen={activity.requestOpen(android.net.Uri.parse(note.uri),note.relative);scope.launch{drawer.close()}},onPin={model.pinRecent(note.uri)})
-                            }
-                        }
-                    }
-                }
+                    },
+                    onClearRecent = model::clearRecent,
+                    onOpenRecent = { note -> activity.requestOpen(android.net.Uri.parse(note.uri), note.relative); scope.launch { drawer.close() } },
+                    onPinRecent = { note -> model.pinRecent(note.uri) },
+                )
             }
         }) {
             // Measure chrome even when hidden, but place it in a separate layer.
@@ -1083,33 +1353,98 @@ private object NoMotionScheme : MotionScheme {
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
-                        TopAppBar(windowInsets=WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top+WindowInsetsSides.Horizontal), colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent), title = { Column { Text(state.active.name, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium); Text(if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft", style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant) } }, navigationIcon = { IconButton(onClick = { if (state.fullscreen) contentsShown=true else { scope.launch { drawer.open() }; state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), "") } } }) { Icon(painterResource(if(state.fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if(state.fullscreen) "Show contents" else "Open files") } }, actions = {
-                            IconButton(onClick = saveAction) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
-                            IconButton(onClick = { sharing = false; exporting = true }, enabled = readerReady && !state.busy) { Icon(painterResource(R.drawable.symbol_export), "Export") }
-                            StudyIcon(if(state.fullscreen) "Exit fullscreen" else "Fullscreen study", if(state.fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen) { model.fullscreen(!state.fullscreen) }
-                            StudyIcon(if(state.centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre",if(state.centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open) { model.centerLock(!state.centerLock) }
-                            Box { IconButton(onClick = { menu = true }) { Icon(Icons.Rounded.MoreVert, "More actions") }; DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                                DropdownMenuItem(text = { Text("New window") }, onClick = { menu = false; activity.newWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
-                                DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !state.busy, onClick = { menu = false; sharing = true; exporting = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
-                                DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdMedia?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
-                                DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { menu = false; web?.evaluateJavascript("window.supermdRepairMath?.()", null) }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
-                                DropdownMenuItem(text = { Text("Find in note") }, onClick = { menu = false; activity.openReaderFind?.invoke() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
-                                DropdownMenuItem(text = {Text("Rename note")},onClick = {menu=false;renaming=true},leadingIcon={Icon(painterResource(R.drawable.symbol_rename),null)})
-                                DropdownMenuItem(text = { Text("Settings") }, onClick = { menu = false; settingsSection = null; settings = true }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
-                            } }
-                        })
-                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::close, model::reorder, model::newNote)
-                        val modes = if (wide) listOf("live", "editor", "reader", "split") else listOf("live", "editor", "reader")
-                        if(!state.fullscreen) Row(Modifier.fillMaxWidth().padding(horizontal = if (wide) 24.dp else 8.dp, vertical = 8.dp),verticalAlignment=Alignment.CenterVertically) {
-                            SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) { modes.forEachIndexed { index, mode -> SegmentedButton(selected = actualMode == mode, onClick = { model.mode(mode) }, colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary), shape = SegmentedButtonDefaults.itemShape(index, modes.size)) { Text(when(mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" }) } } }
-                            IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('undo')",null)},enabled=readerReady){Icon(Icons.Rounded.Undo,"Undo (Ctrl+Z)")}
-                            IconButton(onClick={web?.evaluateJavascript("window.supermdHistory?.('redo')",null)},enabled=readerReady){Icon(Icons.Rounded.Redo,"Redo (Ctrl+Y)")}
+                        StudioTopBar(
+                            noteName = state.active.name,
+                            statusLabel = if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
+                            fullscreen = state.fullscreen,
+                            wide = wide,
+                            actualMode = actualMode,
+                            centerLock = state.centerLock,
+                            readerReady = readerReady,
+                            busy = state.busy,
+                            menuExpanded = menu,
+                            onMenuExpandedChange = { menu = it },
+                            onNavigateIcon = {
+                                if (state.fullscreen) contentsShown = true
+                                else {
+                                    scope.launch { drawer.open() }
+                                    state.folder?.let { if (state.files.isEmpty()) model.listFolder(android.net.Uri.parse(it), state.folderRelative) }
+                                }
+                            },
+                            onFolderSearch = { model.openFolderSearch() },
+                            onFind = { activity.openReaderFind?.invoke(false) },
+                            onSave = saveAction,
+                            onExport = { sharing = false; exporting = true },
+                            onToggleFullscreen = { model.fullscreen(!state.fullscreen) },
+                            onToggleCenterLock = { model.centerLock(!state.centerLock) },
+                            canReopenClosedTab = state.closedTabs.isNotEmpty(),
+                            onReopenClosedTab = model::reopen,
+                            onSaveAs = model::beginSaveAs,
+                            onNewWindow = activity::newWindow,
+                            onShare = { sharing = true; exporting = true },
+                            onInsertMedia = { web?.evaluateJavascript("window.supermdMedia?.()", null) },
+                            onFixLatex = { web?.evaluateJavascript("window.supermdRepairMath?.()", null) },
+                            onRename = { renaming = true },
+                            onSettings = { settingsSection = null; settings = true },
+                        )
+                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::requestClose, model::reorder, model::newNote)
+                        if(!state.fullscreen) StudioModeBar(
+                            wide = wide,
+                            actualMode = actualMode,
+                            centerLock = state.centerLock,
+                            readerReady = readerReady,
+                            onShowContents = { contentsShown = true },
+                            onSelectMode = model::mode,
+                            onUndo = { web?.evaluateJavascript("window.supermdHistory?.('undo')", null) },
+                            onRedo = { web?.evaluateJavascript("window.supermdHistory?.('redo')", null) },
+                            onEnterFullscreen = { model.fullscreen(true) },
+                            onToggleCenterLock = { model.centerLock(!state.centerLock) },
+                        )
+                        if (state.activeConflicted) {
+                            ConflictBanner(
+                                busy = state.busy,
+                                onSaveAs = { model.beginSaveAs() },
+                                onReload = { model.reloadFromDisk() },
+                                onOverwrite = { model.saveManual(forceOverwrite = true) },
+                            )
                         }
                         HorizontalDivider(color = palette.outlineVariant.copy(alpha = .55f))
                     }
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
-                Box(Modifier.fillMaxSize()) {
+                val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
+                    if (shouldBlockNativeDrop(
+                            model.state.value,
+                            folderSearchVisible = model.folderSearch.value.visible,
+                            accessRequestOpen = model.documentAccessRequests.value != null,
+                            settingsOpen = settings,
+                            exporting = exporting,
+                            renaming = renaming,
+                            contentsShown = contentsShown,
+                            drawerOpen = drawer.isOpen,
+                        )) {
+                        return@rememberUpdatedState
+                    }
+                    val permissions = activity.requestDragAndDropPermissions(event)
+                    val uris = extractDroppedFileUris(event.clipData)
+                    if (uris.isNotEmpty()) {
+                        val id = model.state.value.active.id
+                        val currentDensity = reader.resources.displayMetrics.density.takeIf { it > 0f } ?: density.density
+                        val x = event.x / currentDensity
+                        val y = event.y / currentDensity
+                        reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
+                        model.importDropped(uris, id) { images ->
+                            permissions?.release()
+                            images?.let { reader.evaluateJavascript("window.supermdInsertImages?.($it)", null) }
+                        }
+                    } else {
+                        permissions?.release()
+                        if ((event.clipData?.itemCount ?: 0) > 0) {
+                            model.importDropped(emptyList(), model.state.value.active.id) {}
+                        }
+                    }
+                }
+                Column(Modifier.fillMaxSize()) { Box(Modifier.fillMaxWidth().weight(1f)) {
                     key(readerGeneration) { AndroidView(factory = { context -> FrameLayout(context).apply {
                         layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
                         clipChildren = true
@@ -1128,6 +1463,7 @@ private object NoMotionScheme : MotionScheme {
                                 if (wasCurrent) {
                                     readerReady = false
                                     readerPdfOwnsProgress = false
+                                    model.editorFocus(false)
                                     readerNote[0] = null
                                     readerGeneration++
                                     web = null
@@ -1189,28 +1525,14 @@ private object NoMotionScheme : MotionScheme {
                                     imagePicker.launch(arrayOf("image/*")); return true
                                 }
                             }
-                            setOnDragListener { _, event ->
-                                when(event.action) {
-                                    android.view.DragEvent.ACTION_DRAG_STARTED -> event.clipDescription?.let { it.hasMimeType("image/*") || it.hasMimeType("application/octet-stream") || it.hasMimeType("text/uri-list") } == true
-                                    android.view.DragEvent.ACTION_DROP -> {
-                                        val permissions = activity.requestDragAndDropPermissions(event)
-                                        val clip = event.clipData
-                                        val uris = (0 until (clip?.itemCount ?: 0)).mapNotNull { clip!!.getItemAt(it).uri }
-                                        if (uris.isNotEmpty()) {
-                                            val id = model.state.value.active.id
-                                            evaluateJavascript("window.supermdCaptureInsertion?.()", null)
-                                            model.importDropped(uris, id) { images -> permissions?.release(); images?.let { evaluateJavascript("window.supermdInsertImages?.($it)", null) } }
-                                        } else permissions?.release()
-                                        true
-                                    }
-                                    else -> true
-                                }
-                            }
+                            setOnDragListener(ExternalDropDragController { event ->
+                                handleExternalDrop.value(this, event)
+                            })
                         })
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
                         if (released != null) {
-                            if (web === released) { web = null; readerReady = false }
+                            if (web === released) { web = null; readerReady = false; model.editorFocus(false) }
                             retireAndDestroyReader(released)
                         }
                         frame.removeAllViews()
@@ -1218,6 +1540,7 @@ private object NoMotionScheme : MotionScheme {
                     SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
                     if (shouldShowNativeBusyOverlay(state.busy, readerReady, readerPdfOwnsProgress)) Surface(color = palette.surface.copy(alpha = .96f), modifier = Modifier.fillMaxSize()) { Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) { if(motion) LoadingIndicator() else Icon(Icons.Rounded.Description,null,Modifier.size(48.dp),tint=palette.primary); Spacer(Modifier.height(16.dp)); Text(if(state.busy) "Preparing your document…" else "Opening your workspace…") } }
                 }
+                if (showFormattingBar) KeyboardFormattingBar(onFormat = { triggerFormat.value(it) }) }
             }
         }
     }
@@ -1228,12 +1551,54 @@ private object NoMotionScheme : MotionScheme {
             Settings(state, model, activity, noteLocation, settingsSection, { settingsSection = it }, {noteFolder.launch(noteLocation.takeIf{it.isNotBlank()}?.let(android.net.Uri::parse))}, {model.recoverDeletedDraft();settings=false;settingsSection=null}, {themePicker.launch(arrayOf("application/json","text/plain","application/octet-stream"))}, {themeExport.launch("My theme.supermd-theme.json")}, {settings=false;settingsSection=null;web?.evaluateJavascript("window.supermdThemeGuide?.()",null)}, readerReady) {fontPicker.launch(arrayOf("font/ttf","font/otf","application/x-font-ttf","application/vnd.ms-opentype","application/octet-stream"))}
         } }
     }
+    FolderActionDialogs(
+        state = state,
+        model = model,
+        createRequest = createFolderRequest,
+        onDismissCreate = { createFolderRequest = null },
+        onNoteCreated = { scope.launch { drawer.close() } },
+        renameTarget = renameFolderTarget,
+        onDismissRename = { renameFolderTarget = null },
+    )
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
-        var name by remember(state.active.id) {mutableStateOf(state.active.name)}
-        AlertDialog(onDismissRequest={renaming=false},title={Text("Rename note")},text={OutlinedTextField(value=name,onValueChange={name=it},singleLine=true,label={Text("Note name")})},confirmButton={TextButton(onClick={model.rename(state.active.id,name);renaming=false},enabled=name.isNotBlank()){Text("Rename")}},dismissButton={TextButton(onClick={renaming=false}){Text("Cancel")}})
+        val initialStem = remember(state.active.id, state.active.name) {
+            if (noteExtension(state.active.name).isNotEmpty()) noteStem(state.active.name) else state.active.name
+        }
+        var name by rememberSaveable(state.active.id, state.active.name) { mutableStateOf(initialStem) }
+        var renameError by remember(state.active.id, state.active.name) { mutableStateOf<String?>(null) }
+        var renameBusy by remember(state.active.id, state.active.name) { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = { if (!renameBusy) renaming = false },
+            title = { Text("Rename note") },
+            text = {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it; renameError = null },
+                    enabled = !renameBusy,
+                    singleLine = true,
+                    isError = renameError != null,
+                    label = { Text("Note name") },
+                    supportingText = renameError?.let { err -> { Text(err, color = MaterialTheme.colorScheme.error) } },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        renameBusy = true
+                        renameError = null
+                        model.rename(state.active.id, name, showGlobalError = false) { ok, err ->
+                            renameBusy = false
+                            if (ok) renaming = false else renameError = err
+                        }
+                    },
+                    enabled = !renameBusy && name.isNotBlank(),
+                ) { Text("Rename") }
+            },
+            dismissButton = { TextButton(enabled = !renameBusy, onClick = { renaming = false }) { Text("Cancel") } },
+        )
     }
-    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts) { format ->
+    if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
         exporting = false
         if (format in listOf("md", "mdzip")) {
             val archive = format == "mdzip"
@@ -1241,9 +1606,12 @@ private object NoMotionScheme : MotionScheme {
         } else if (sharing) {
             if (model.prepareShare(format)) {
                 if (format == "pdf") readerPdfOwnsProgress = true
-                when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready"); "md" -> web?.evaluateJavascript("window.supermdExportMarkdown?.()", null) ?: model.fail("The reader is not ready") }
+                when (format) { "pdf" -> web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready"); "smd" -> web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
             }
-        } else if (format == "smd") portable.launch(state.active.name.substringBeforeLast('.') + ".smd") else pdf.launch(state.active.name.substringBeforeLast('.') + ".pdf")
+        } else {
+            val stem = noteStem(state.active.name).ifBlank { "Untitled" }
+            if (format == "smd") portable.launch("$stem.smd") else pdf.launch("$stem.pdf")
+        }
     } }
     if (!accessPickerShowing) accessRequest?.let { request ->
         AlertDialog(onDismissRequest = model::dismissDocumentAccess,
@@ -1253,15 +1621,236 @@ private object NoMotionScheme : MotionScheme {
                 Text(request.detail ?: if(request.assetSource == null) DOCUMENT_ACCESS_MESSAGE else LINKED_ASSET_ACCESS_MESSAGE)
                 if (request.assetSource == null && request.noteId == state.active.id) TextButton(onClick = {
                     model.dismissDocumentAccess()
-                    if (state.active.portable) portable.launch(state.active.name.substringBeforeLast('.') + ".smd")
-                    else save.launch(state.active.name.substringBeforeLast('.') + ".md")
+                    model.beginSaveAs()
                 }) { Text("Save a copy instead") }
             } },
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
     }
+    if (folderSearch.visible) {
+        BackHandler { model.cancelWorkspaceSearch() }
+        FolderSearchModal(
+            state = folderSearch,
+            hasFolder = state.folder != null,
+            onUpdate = model::updateFolderSearch,
+            onSelect = model::openSearchMatch,
+            onDismiss = model::cancelWorkspaceSearch,
+        )
+    }
+    state.pendingCloseNote?.let { note ->
+        AlertDialog(
+            onDismissRequest = model::dismissCloseConfirmation,
+            title = { Text("Save changes to ${note.name}?") },
+            text = { Text("Save your changes before closing, or discard them.") },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { model.resolveCloseConfirmation("discard") }) { Text("Discard") }
+                    Button(onClick = { model.resolveCloseConfirmation("save") }) { Text("Save") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { model.resolveCloseConfirmation("cancel") }) { Text("Cancel") }
+            },
+        )
+    }
+    state.pendingSaveConflictNote?.let { note ->
+        AlertDialog(
+            onDismissRequest = model::dismissSaveConflict,
+            icon = { Icon(painterResource(R.drawable.symbol_warning), null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("${note.name} changed on disk") },
+            text = { Text("This note was modified outside Super MD since you opened or last saved it. Save a copy to keep both versions, or overwrite the file on disk.") },
+            confirmButton = {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { model.resolveSaveConflict("overwrite") }) { Text("Overwrite") }
+                    Button(onClick = { model.resolveSaveConflict("save_as") }) { Text("Save as") }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { model.resolveSaveConflict("cancel") }) { Text("Cancel") }
+            },
+        )
+    }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
     if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
+}
+
+internal fun buildHighlightedSnippet(
+    snippet: String,
+    matchStart: Int,
+    matchEnd: Int,
+    highlightColor: Color,
+): AnnotatedString {
+    val safeStart = clampUtf16Boundary(snippet, matchStart)
+    val safeEnd = clampUtf16Boundary(snippet, matchEnd).coerceAtLeast(safeStart)
+    if (safeEnd <= safeStart) return AnnotatedString(snippet)
+    return buildAnnotatedString {
+        append(snippet.substring(0, safeStart))
+        withStyle(
+            SpanStyle(
+                color = highlightColor,
+                background = highlightColor.copy(alpha = 0.18f),
+                fontWeight = FontWeight.SemiBold,
+            ),
+        ) {
+            append(snippet.substring(safeStart, safeEnd))
+        }
+        append(snippet.substring(safeEnd))
+    }
+}
+
+@Composable internal fun FolderSearchModal(
+    state: FolderSearchState,
+    hasFolder: Boolean,
+    onUpdate: (String, Boolean, Boolean) -> Unit,
+    onSelect: (FolderSearchMatch) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    var selectedIndex by remember(state.matches) { mutableIntStateOf(0) }
+    val highlightColor = MaterialTheme.colorScheme.primary
+    LaunchedEffect(Unit) { runCatching { focusRequester.requestFocus() } }
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+            modifier = Modifier
+                .widthIn(max = 680.dp)
+                .fillMaxWidth(0.95f)
+                .heightIn(max = 580.dp)
+                .onPreviewKeyEvent { event ->
+                    if (event.type != KeyEventType.KeyDown) return@onPreviewKeyEvent false
+                    when (event.key) {
+                        Key.Escape -> { onDismiss(); true }
+                        Key.DirectionDown -> {
+                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex + 1).coerceAtMost(state.matches.lastIndex)
+                            true
+                        }
+                        Key.DirectionUp -> {
+                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
+                            true
+                        }
+                        Key.Enter, Key.NumPadEnter -> {
+                            state.matches.getOrNull(selectedIndex)?.let(onSelect)
+                            true
+                        }
+                        else -> false
+                    }
+                },
+        ) {
+            Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Search across notes", style = MaterialTheme.typography.titleLarge)
+                        Text(
+                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
+                            else "No folder open · searching open tabs and accessible recent notes",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    TextButton(onClick = onDismiss) { Text("Close") }
+                }
+                OutlinedTextField(
+                    value = state.query,
+                    onValueChange = { onUpdate(it, state.caseSensitive, state.includeDiagrams) },
+                    singleLine = true,
+                    placeholder = { Text("Search text across notes…") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, null) },
+                    trailingIcon = {
+                        if (state.query.isNotEmpty()) {
+                            IconButton(onClick = { onUpdate("", state.caseSensitive, state.includeDiagrams) }) {
+                                Icon(Icons.Rounded.Close, "Clear query")
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                )
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilterChip(
+                        selected = state.caseSensitive,
+                        onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams) },
+                        label = { Text("Match case") },
+                    )
+                    FilterChip(
+                        selected = state.includeDiagrams,
+                        onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams) },
+                        label = { Text("Diagrams") },
+                    )
+                    Spacer(Modifier.weight(1f))
+                    if (state.query.isNotEmpty()) {
+                        Text(
+                            if (state.scanning) "Scanning · ${state.matches.size} (${state.scannedFiles} files)…"
+                            else "${state.matches.size}${if (state.truncated) "+" else ""} in ${state.scannedFiles} files",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                if (state.scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
+                if (state.query.isEmpty()) {
+                    Text(
+                        "Type to search Markdown prose across notes. Inline SVG, Mermaid, and chart blocks are skipped unless Diagrams is enabled.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 12.dp),
+                    )
+                } else if (!state.scanning && state.matches.isEmpty()) {
+                    Text(
+                        "No matches found.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 16.dp),
+                    )
+                } else {
+                    LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(state.matches.size, key = { state.matches[it].key }) { index ->
+                            val match = state.matches[index]
+                            val selected = index == selectedIndex
+                            val annotatedSnippet = remember(match.snippet, match.matchStart, match.matchEnd, highlightColor) {
+                                buildHighlightedSnippet(match.snippet, match.matchStart, match.matchEnd, highlightColor)
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(16.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+                                modifier = Modifier.fillMaxWidth().clickable { onSelect(match) },
+                            ) {
+                                Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Text(match.relative, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                                        if (match.dirty) {
+                                            Text("Edited", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                                        }
+                                        Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                                            Text(
+                                                "L${match.line}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                            )
+                                        }
+                                    }
+                                    Text(
+                                        text = annotatedSnippet,
+                                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable private fun WelcomeSetup(state: StudioState, model: StudioViewModel, open: () -> Unit) {
@@ -1281,9 +1870,268 @@ private object NoMotionScheme : MotionScheme {
         dismissButton = { if (step > 0) TextButton(onClick = { if (step == 2) open() else step-- }) { Text(if (step == 2) "Open a note" else "Back") } })
 }
 
-@Composable private fun StudyIcon(label:String, resource:Int, action:()->Unit) {
-    TooltipBox(positionProvider=TooltipDefaults.rememberTooltipPositionProvider(),tooltip={PlainTooltip{Text(label)}},state=rememberTooltipState()) {
-        IconButton(onClick=action) {Icon(painterResource(resource),label,Modifier.size(24.dp))}
+@Composable private fun ConflictBanner(
+    busy: Boolean,
+    onSaveAs: () -> Unit,
+    onReload: () -> Unit,
+    onOverwrite: () -> Unit,
+) {
+    val palette = MaterialTheme.colorScheme
+    Surface(
+        color = palette.errorContainer,
+        contentColor = palette.onErrorContainer,
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(painterResource(R.drawable.symbol_warning), null, Modifier.size(20.dp), tint = palette.onErrorContainer)
+                Column(Modifier.weight(1f)) {
+                    Text("Changed on disk", style = MaterialTheme.typography.titleSmall)
+                    Text("This file was modified outside Super MD. Autosave is paused for this tab.", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                FilledTonalButton(onClick = onSaveAs, enabled = !busy) { Text("Save as") }
+                OutlinedButton(onClick = onReload, enabled = !busy) { Text("Reload from disk") }
+                TextButton(onClick = onOverwrite, enabled = !busy) { Text("Overwrite") }
+            }
+        }
+    }
+}
+
+@Composable internal fun StudioTopBar(
+    noteName: String,
+    statusLabel: String,
+    fullscreen: Boolean,
+    wide: Boolean,
+    actualMode: String,
+    centerLock: Boolean,
+    readerReady: Boolean,
+    busy: Boolean,
+    menuExpanded: Boolean,
+    onMenuExpandedChange: (Boolean) -> Unit,
+    onNavigateIcon: () -> Unit,
+    onFind: () -> Unit,
+    onSave: () -> Unit,
+    onExport: () -> Unit,
+    onToggleFullscreen: () -> Unit,
+    onToggleCenterLock: () -> Unit,
+    canReopenClosedTab: Boolean = false,
+    onReopenClosedTab: () -> Unit = {},
+    onSaveAs: () -> Unit = {},
+    onNewWindow: () -> Unit,
+    onShare: () -> Unit,
+    onInsertMedia: () -> Unit,
+    onFixLatex: () -> Unit,
+    onRename: () -> Unit,
+    onSettings: () -> Unit,
+    onFolderSearch: () -> Unit = {},
+) {
+    val palette = MaterialTheme.colorScheme
+    TopAppBar(
+        windowInsets = WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+        title = {
+            Column(Modifier.fillMaxWidth()) {
+                Text(noteName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                Text(statusLabel, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant)
+            }
+        },
+        navigationIcon = {
+            IconButton(onClick = onNavigateIcon, modifier = Modifier.size(48.dp)) {
+                Icon(painterResource(if (fullscreen) R.drawable.symbol_contents else R.drawable.symbol_sidebar), if (fullscreen) "Show contents" else "Open files")
+            }
+        },
+        actions = {
+            if (wide && !fullscreen) {
+                IconButton(onClick = onFolderSearch, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_search), "Search across notes (Ctrl+Shift+F)") }
+            }
+            StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
+            IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
+            IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
+            if (fullscreen || (wide && actualMode != "reader")) {
+                StudyIcon(if (fullscreen) "Exit fullscreen" else "Fullscreen study", if (fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen, action = onToggleFullscreen)
+                StudyIcon(if (centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre", if (centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open, action = onToggleCenterLock)
+            }
+            Box {
+                IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
+                DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
+                    DropdownMenuItem(text = { Text("Search across notes") }, onClick = { onMenuExpandedChange(false); onFolderSearch() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
+                    DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = canReopenClosedTab, onClick = { onMenuExpandedChange(false); onReopenClosedTab() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
+                    DropdownMenuItem(text = { Text("Save as") }, enabled = !busy, onClick = { onMenuExpandedChange(false); onSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
+                    HorizontalDivider()
+                    DropdownMenuItem(text = { Text("New window") }, onClick = { onMenuExpandedChange(false); onNewWindow() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_open_window), null) })
+                    DropdownMenuItem(text = { Text("Share note") }, enabled = readerReady && !busy, onClick = { onMenuExpandedChange(false); onShare() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_share), null) })
+                    DropdownMenuItem(text = { Text("Insert image or link") }, onClick = { onMenuExpandedChange(false); onInsertMedia() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_image), null) })
+                    DropdownMenuItem(text = { Text("Fix LaTeX") }, onClick = { onMenuExpandedChange(false); onFixLatex() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_bug), null) })
+                    DropdownMenuItem(text = { Text("Rename note") }, onClick = { onMenuExpandedChange(false); onRename() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_rename), null) })
+                    DropdownMenuItem(text = { Text("Settings") }, onClick = { onMenuExpandedChange(false); onSettings() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_settings), null) })
+                }
+            }
+        }
+    )
+}
+
+@Composable internal fun StudioModeBar(
+    wide: Boolean,
+    actualMode: String,
+    centerLock: Boolean,
+    readerReady: Boolean,
+    onShowContents: () -> Unit,
+    onSelectMode: (String) -> Unit,
+    onUndo: () -> Unit,
+    onRedo: () -> Unit,
+    onEnterFullscreen: () -> Unit,
+    onToggleCenterLock: () -> Unit,
+) {
+    val palette = MaterialTheme.colorScheme
+    val modes = if (wide) listOf("live", "editor", "reader", "split") else listOf("live", "editor", "reader")
+    Row(Modifier.fillMaxWidth().padding(horizontal = if (wide) 24.dp else 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        StudyIcon("Show contents", R.drawable.symbol_contents, action = onShowContents)
+        Spacer(Modifier.width(4.dp))
+        SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
+            modes.forEachIndexed { index, mode ->
+                SegmentedButton(
+                    selected = actualMode == mode,
+                    onClick = { onSelectMode(mode) },
+                    icon = {},
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
+                    colors = SegmentedButtonDefaults.colors(activeContainerColor = palette.primary, activeContentColor = palette.onPrimary),
+                    shape = SegmentedButtonDefaults.itemShape(index, modes.size),
+                    modifier = Modifier.heightIn(min = 48.dp),
+                ) {
+                    Text(
+                        when (mode) { "editor" -> "Source"; "reader" -> "Read"; "split" -> "Split"; else -> "Live" },
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.width(4.dp))
+        if (actualMode == "reader") {
+            StudyIcon("Fullscreen study", R.drawable.symbol_fullscreen, action = onEnterFullscreen)
+            StudyIcon(if (centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre", if (centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open, action = onToggleCenterLock)
+        } else {
+            IconButton(onClick = onUndo, enabled = readerReady, modifier = Modifier.size(48.dp)) { Icon(Icons.AutoMirrored.Rounded.Undo, "Undo (Ctrl+Z)") }
+            IconButton(onClick = onRedo, enabled = readerReady, modifier = Modifier.size(48.dp)) { Icon(Icons.AutoMirrored.Rounded.Redo, "Redo (Ctrl+Y)") }
+        }
+    }
+}
+
+@Composable internal fun ContentsBottomSheet(
+    headings: List<OutlineHeading>,
+    noteId: String,
+    motion: Boolean = isSystemMotionEnabled(LocalContext.current),
+    onDismiss: () -> Unit,
+    onNavigate: (OutlineHeading) -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) {
+        ContentsSheetContent(headings = headings, noteId = noteId, motion = motion, onNavigate = onNavigate)
+    }
+}
+
+@Composable internal fun ContentsSheetContent(
+    headings: List<OutlineHeading>,
+    noteId: String,
+    motion: Boolean = isSystemMotionEnabled(LocalContext.current),
+    onNavigate: (OutlineHeading) -> Unit,
+) {
+    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
+        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth().navigationBarsPadding().padding(horizontal = 16.dp).padding(bottom = 16.dp)) {
+            Text("Contents", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp))
+            OutlinePanel(headings, noteId, Modifier.weight(1f, fill = false), motion = motion, navigate = onNavigate)
+        }
+    }
+}
+
+@Composable internal fun FilesDrawerContent(
+    state: StudioState,
+    recent: List<RecentNote>,
+    folderRelative: String = state.folderRelative,
+    onOpenNote: () -> Unit,
+    onOpenFolder: () -> Unit,
+    onCloseFolder: () -> Unit,
+    onFolderRoot: () -> Unit,
+    onActivateEntry: (FileEntry) -> Unit,
+    onClearRecent: () -> Unit,
+    onOpenRecent: (RecentNote) -> Unit,
+    onPinRecent: (RecentNote) -> Unit,
+    onNavigateFolderRelative: (String) -> Unit = { onFolderRoot() },
+    onCreateInFolder: (CreateFolderRequest) -> Unit = {},
+    onRenameEntry: (FileEntry) -> Unit = {},
+    modifier: Modifier = Modifier,
+    onFolderSearch: () -> Unit = {},
+) {
+    val palette = MaterialTheme.colorScheme
+    LazyColumn(
+        modifier = modifier.fillMaxSize().themeArtwork(state, "sidebar").safeDrawingPadding(),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        item(key = "header") {
+            Text("Your files", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 8.dp))
+        }
+        item(key = "file-actions") {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onOpenNote, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.Description, null); Spacer(Modifier.width(8.dp)); Text("Open note")
+                }
+                FilledTonalButton(onClick = onOpenFolder, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.FolderOpen, null); Spacer(Modifier.width(8.dp)); Text("Open folder")
+                }
+                OutlinedButton(onClick = onFolderSearch, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) {
+                    Icon(Icons.Rounded.Search, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Search across notes", maxLines = 1)
+                }
+                if (state.folder != null) {
+                    FolderDrawerHeader(
+                        folderUriRaw = state.folder,
+                        folderRelative = folderRelative,
+                        onNavigateRelative = onNavigateFolderRelative,
+                        onRequestCreate = onCreateInFolder,
+                        onCloseFolder = onCloseFolder,
+                    )
+                }
+                Text("No vault. No hidden metadata.", style = MaterialTheme.typography.bodySmall, color = palette.onSurfaceVariant, modifier = Modifier.padding(vertical = 4.dp))
+            }
+        }
+        folderFileItems(
+            files = state.files,
+            activeUri = state.active.uri,
+            onActivate = onActivateEntry,
+            onCreateInFolder = onCreateInFolder,
+            onRename = onRenameEntry,
+        )
+        if (recent.isNotEmpty()) {
+            item(key = "recent-header") {
+                Column {
+                    HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Recent notes", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                        TextButton(onClick = onClearRecent, modifier = Modifier.heightIn(min = 48.dp)) { Text("Clear unpinned") }
+                    }
+                }
+            }
+            items(recent, key = { "recent:${it.uri}" }) { note ->
+                Box(Modifier.padding(vertical = 3.dp)) {
+                    RecentNoteCard(
+                        note = note,
+                        selected = state.active.uri == note.uri,
+                        onOpen = { onOpenRecent(note) },
+                        onPin = { onPinRecent(note) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable private fun StudyIcon(label:String, resource:Int, enabled:Boolean=true, action:()->Unit) {
+    TooltipBox(positionProvider=TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),tooltip={PlainTooltip{Text(label)}},state=rememberTooltipState()) {
+        IconButton(onClick=action, enabled=enabled, modifier=Modifier.size(48.dp)) {Icon(painterResource(resource),label,Modifier.size(24.dp))}
     }
 }
 private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
@@ -1324,18 +2172,79 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Choice("Workspace theme", state.theme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(theme = it) }
                 Choice("Fullscreen theme", state.fullscreenTheme, listOf("system" to "System", "light" to "Light", "dark" to "Dark", "black" to "Pure black")) { model.appearance(fullTheme = it) }
                 if(state.customTheme.isBlank())Choice("Theme color",state.accent,listOf("system" to "System","blue" to "Blue","violet" to "Violet","rose" to "Rose","amber" to "Amber")){model.appearance(accent=it)}
-                else Text("Colors follow your imported theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
+                else Text("Colors follow your active custom theme. Reset it to use the built-in accent picker.",style=MaterialTheme.typography.bodySmall)
                 Row(verticalAlignment = Alignment.CenterVertically) { Column(Modifier.weight(1f)) { Text("Expressive motion", style = MaterialTheme.typography.titleMedium); Text("Spring transitions and responsive controls", style = MaterialTheme.typography.bodySmall) }; Switch(checked = state.motion, onCheckedChange = { model.appearance(motion = it) }) }
             }
             if (section == "Appearance") SettingsGroup("Custom theme") {
-                Text(themeDocument(state.customTheme)?.optString("name")?:"Built-in appearance",style=MaterialTheme.typography.titleMedium)
-                Text("Theme files customize controls, colors, reading typography and background patterns. Reading font and text size remain yours. Invalid edits keep the last valid appearance.",style=MaterialTheme.typography.bodySmall)
+                val activeThemeName = themeDocument(state.customTheme)?.optString("name") ?: "Built-in appearance"
+                val bundledPresets = remember { bundledThemes(activity.assets) }
+                val presetChoices = remember(bundledPresets) { listOf("builtin" to "Built-in appearance") + bundledPresets.map { it.id to it.name } }
+                Text(activeThemeName,style=MaterialTheme.typography.titleMedium)
+                Text("Choose a bundled preset or import your own JSON theme to customize controls, colors, reading typography and background patterns. Reading font and text size remain yours.",style=MaterialTheme.typography.bodySmall)
+                ThemePresetChoice(
+                    label = "Theme preset",
+                    activeKind = state.activeThemeKind,
+                    activeId = state.activeThemeId,
+                    activeName = activeThemeName,
+                    choices = presetChoices,
+                    change = model::selectBundledTheme,
+                )
+                if (state.savedThemes.isNotEmpty()) {
+                    Text("Saved imported themes", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        state.savedThemes.forEach { entry ->
+                            val selected = state.activeThemeKind == "saved" && state.activeThemeId == entry.id
+                            Surface(
+                                shape = RoundedCornerShape(18.dp),
+                                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                                modifier = Modifier.fillMaxWidth().clickable { model.selectSavedTheme(entry.id) },
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(start = 14.dp, end = 6.dp, top = 6.dp, bottom = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                ) {
+                                    Icon(
+                                        imageVector = if (selected) Icons.Rounded.Check else Icons.Rounded.FolderOpen,
+                                        contentDescription = null,
+                                        tint = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(20.dp),
+                                    )
+                                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                                        Text(
+                                            entry.name,
+                                            style = MaterialTheme.typography.bodyLarge,
+                                            fontWeight = FontWeight.Medium,
+                                            color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                        if (entry.sourceUri.isNotBlank()) {
+                                            Text(
+                                                "Linked external file",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                        }
+                                    }
+                                    IconButton(onClick = { model.deleteSavedTheme(entry.id) }) {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Close,
+                                            contentDescription = "Remove ${entry.name}",
+                                            tint = if (selected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){FilledTonalButton(onClick=importTheme){Text("Import theme…")};OutlinedButton(onClick=exportTheme){Text(if(state.customTheme.isBlank())"Export template…" else "Export theme…")};if(state.customTheme.isNotBlank())OutlinedButton(onClick={model.shareCustomTheme {send->runCatching {activity.startActivity(Intent.createChooser(send,"Share theme"))}.onFailure {model.fail("No app could share the theme: ${it.message}")}}}){Text("Share theme…")}}
-                if(state.customTheme.isNotBlank())FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){TextButton(onClick=model::reloadCustomTheme){Text("Reload file")};TextButton(onClick=model::resetCustomTheme){Text("Reset to built-in")}}
+                if(state.customTheme.isNotBlank())FlowRow(horizontalArrangement=Arrangement.spacedBy(8.dp)){if(state.customThemeSource.isNotBlank())TextButton(onClick=model::reloadCustomTheme){Text("Reload file")};TextButton(onClick=model::resetCustomTheme){Text("Reset to built-in")}}
                 if(state.customTheme.isNotBlank()) {
                     val themeAppearance=themeStyle(themeDocument(state.customTheme),state.theme,when(state.theme){"dark","black"->true;"light"->false;else->androidx.compose.foundation.isSystemInDarkTheme()},state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing)
                     val background=themeAppearance.optJSONObject("background")?:JSONObject()
-                    if(state.patternOpacity<0f)themeAppearance.optJSONObject("artwork")?.optJSONObject("reader")?.let {background.put("opacity",it.optDouble("opacity",.06))}
                     Text("Reading background",style=MaterialTheme.typography.titleMedium)
                     Choice("Pattern",background.optString("pattern","none"),listOf("none" to "None","paws" to "Cat paws","dots" to "Dots","grid" to "Grid","diagonal" to "Diagonal","gradient" to "Gradient")){model.readingPreference("patternKind",it)}
                     Text("Visibility · ${(background.optDouble("opacity",.06)*100).toInt()}%")
@@ -1385,6 +2294,8 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 FilledTonalButton(onClick=chooseNoteLocation,modifier=Modifier.fillMaxWidth()){Icon(Icons.Rounded.FolderOpen,null);Text(if(noteLocation.isBlank())"Downloads" else android.net.Uri.decode(noteLocation.substringAfterLast('/')),Modifier.padding(start=8.dp),maxLines=1,overflow=TextOverflow.Ellipsis)}
             }
             if (section == "Writing & shortcuts") SettingsGroup("Writing") {
+                Row(verticalAlignment=Alignment.CenterVertically){Text("Typewriter scrolling",Modifier.weight(1f));Switch(checked=state.typewriterScroll,onCheckedChange=model::typewriterScroll)}
+                Text("Off by default. Vertically centers the active line in Source, Split and Live while typing.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Spell check",Modifier.weight(1f));Switch(checked=state.spellCheck,onCheckedChange={model.writing(spellCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("Grammar check",Modifier.weight(1f));Switch(checked=state.grammarCheck,onCheckedChange={model.writing(grammarCheck=it)})}
                 Row(verticalAlignment=Alignment.CenterVertically){Text("LaTeX autofix on paste",Modifier.weight(1f));Switch(checked=state.latexAutofix,onCheckedChange=model::latexAutofix)}
@@ -1396,6 +2307,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 Text("Select text and use Search Google or Ask in the selection toolbar. Ask copies the text and opens the assistant for you to paste and review; it never submits a prompt automatically.",style=MaterialTheme.typography.bodySmall,color=MaterialTheme.colorScheme.onSurfaceVariant)
             }
             if (section == "Writing & shortcuts") SettingsGroup("Python & windows") {
+                Text("Hardware keyboard shortcuts: Ctrl+Shift+F searches across notes, Ctrl+F finds in the current note, and Esc dismisses overlays.", style = MaterialTheme.typography.bodyMedium)
                 Text("NumPy and Matplotlib run locally in a separate worker. Code runs only when you press Run; never automatically on open or export.", style = MaterialTheme.typography.bodyMedium)
                 Text("New window opens an independent workspace. Your device controls split-screen and desktop window placement. Hold and drag a tab to reorder it.", style = MaterialTheme.typography.bodyMedium)
                 Text("The monochrome icon follows your launcher's themed-icon setting.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1451,6 +2363,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     var message by remember { mutableStateOf("") }
     var pendingPairingFile by remember { mutableStateOf<String?>(null) }
     var pendingGuide by remember { mutableStateOf<String?>(null) }
+    var pendingSkillArchive by remember { mutableStateOf<ByteArray?>(null) }
     var enabled by remember { mutableStateOf(activity.agentAccessState.enabled) }
     fun revokeThen(action: () -> Unit) {
         message = "Disconnecting and revoking previous device registrations…"
@@ -1501,7 +2414,17 @@ internal class NoteDestination(private val mime: String, private val preferred: 
         if (uri != null && guide != null) runCatching {
             activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(guide.toByteArray(Charsets.UTF_8)); it.flush() }
                 ?: error("Android could not write the setup guide")
-        }.onFailure { message = "Could not save setup guide: ${it.message}" }
+        }.onSuccess { message = "Setup instructions saved." }
+            .onFailure { message = "Could not save setup guide: ${it.message}" }
+    }
+    val skillExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        val archive = pendingSkillArchive
+        pendingSkillArchive = null
+        if (uri != null && archive != null) runCatching {
+            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(archive); it.flush() }
+                ?: error("Android could not write the skill package")
+        }.onSuccess { message = "Skill package saved." }
+            .onFailure { message = "Could not save skill package: ${it.message}" }
     }
     val config = activity.agentConfigForThisWindow() ?: activity.agentAccessState.currentConfig()
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1529,6 +2452,11 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                 if (file == null) message = "Create or join a workspace first"
                 else { pendingPairingFile = file; pairingExport.launch("SuperMD-pairing.json") }
             }) { Text("Export trusted pairing file…") }
+            OutlinedButton(onClick = {
+                runCatching { activity.assets.open("web/super-md-skill.zip").use { it.readBytes() } }
+                    .onSuccess { bytes -> pendingSkillArchive = bytes; skillExport.launch("super-md-skill.zip") }
+                    .onFailure { message = "Could not load skill package: ${it.message}" }
+            }) { Text("Export skill package (.zip)…") }
         }
         if (config != null) {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1568,28 +2496,56 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
 }
 
-@Composable private fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+@Composable private fun SearchableChoice(
+    label: String,
+    selectedKey: String,
+    summary: String,
+    choices: List<Pair<String, String>>,
+    searchLabel: String,
+    emptyLabel: String,
+    topPadding: androidx.compose.ui.unit.Dp = 12.dp,
+    change: (String) -> Unit,
+) {
     var opened by remember { mutableStateOf(false) }
-    Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
+    Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = topPadding, bottom = 6.dp))
     FilledTonalButton(onClick = { opened = true }, modifier = Modifier.fillMaxWidth()) {
-        Text(choices.find {it.first == value}?.second ?: value, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(summary, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
         Icon(Icons.Rounded.ExpandMore, null)
     }
     if (opened) {
         var query by remember { mutableStateOf("") }
-        val matches = remember(query, choices) {choices.distinctBy {it.first}.filter {it.second.contains(query.trim(), ignoreCase = true)}}
-        AlertDialog(onDismissRequest = {opened = false}, title = {Text(label)}, text = {
+        val matches = remember(query, choices) { choices.distinctBy { it.first }.filter { it.second.contains(query.trim(), ignoreCase = true) } }
+        AlertDialog(onDismissRequest = { opened = false }, title = { Text(label) }, text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(value = query, onValueChange = {query = it}, singleLine = true, label = {Text("Search fonts")}, leadingIcon = {Icon(Icons.Rounded.Search, null)}, modifier = Modifier.fillMaxWidth())
-                if (matches.isEmpty()) Text("No matching fonts", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                OutlinedTextField(value = query, onValueChange = { query = it }, singleLine = true, label = { Text(searchLabel) }, leadingIcon = { Icon(Icons.Rounded.Search, null) }, modifier = Modifier.fillMaxWidth())
+                if (matches.isEmpty()) Text(emptyLabel, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 LazyColumn(Modifier.heightIn(max = 340.dp)) {
-                    items(matches, key = {it.first}) { (key, name) ->
-                        ListItem(headlineContent = {Text(name)}, trailingContent = {if (key == value) Icon(Icons.Rounded.Check, "Selected")}, colors = ListItemDefaults.colors(containerColor = if (key == value) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable {change(key); opened = false})
+                    items(matches, key = { it.first }) { (key, name) ->
+                        val selected = key == selectedKey
+                        ListItem(trailingContent = { if (selected) Icon(Icons.Rounded.Check, "Selected") }, colors = ListItemDefaults.colors(containerColor = if (selected) MaterialTheme.colorScheme.primaryContainer else Color.Transparent), modifier = Modifier.clickable { change(key); opened = false }) { Text(name) }
                     }
                 }
             }
-        }, confirmButton = {TextButton(onClick = {opened = false}) {Text("Cancel")}})
+        }, confirmButton = { TextButton(onClick = { opened = false }) { Text("Cancel") } })
     }
+}
+
+@Composable private fun ThemePresetChoice(label: String, activeKind: String, activeId: String, activeName: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+    val selectedKey = when (activeKind) {
+        "preset" -> activeId
+        "saved" -> ""
+        else -> "builtin"
+    }
+    val summary = when (activeKind) {
+        "saved" -> "Imported · $activeName"
+        "preset" -> choices.find { it.first == activeId }?.second ?: activeName
+        else -> "Built-in appearance"
+    }
+    SearchableChoice(label, selectedKey, summary, choices, "Search themes", "No matching themes", topPadding = 8.dp, change = change)
+}
+
+@Composable private fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+    SearchableChoice(label, value, choices.find { it.first == value }?.second ?: value, choices, "Search fonts", "No matching fonts", change = change)
 }
 
 @Composable private fun SettingsHome(onOpen: (String?)->Unit) {
@@ -1660,11 +2616,18 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     Text("Off uses plain paper. On uses your accent with light surfaces, even in dark mode.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
-@Composable private fun ExportSettings(raw: String, onChange: (String) -> Unit, sharing: Boolean = false, fonts:List<String> = emptyList(), export: (String) -> Unit) {
+internal fun exportPrimaryActionLabel(format: String, sharing: Boolean): String = when {
+    sharing -> "Prepare & share"
+    format == "md" -> "Export Markdown"
+    format == "mdzip" -> "Export ZIP"
+    else -> "Choose destination & export"
+}
+
+@Composable internal fun ExportSettings(raw: String, onChange: (String) -> Unit, sharing: Boolean = false, fonts:List<String> = emptyList(), noteLocation: String = "", export: (String) -> Unit) {
     var format by rememberSaveable { mutableStateOf("pdf") }
-    var markdownZip by rememberSaveable { mutableStateOf(false) }
     var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
     fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
+    val directSaveCopy = if (noteLocation.isBlank()) "Saves directly to Downloads/Super MD." else "Saves directly to your configured note folder."
     Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
         Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
             Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
@@ -1674,7 +2637,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     formats.chunked(2).forEach { row ->
                         Row(Modifier.fillMaxWidth()) {
                             row.forEach { (key, label) ->
-                                FilterChip(selected = format == key, onClick = { format = key }, label = { Text(label) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp))
+                                FilterChip(selected = format == key, onClick = { format = key }, label = { Text(label) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp, vertical = 2.dp).heightIn(min = 48.dp))
                             }
                         }
                     }
@@ -1684,20 +2647,18 @@ internal class NoteDestination(private val mime: String, private val preferred: 
                     PdfOptions(options, fonts, ::update)
                 } else if (format == "mdzip") {
                     Text("Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images.", style = MaterialTheme.typography.bodyMedium)
+                    if (!sharing) Text(directSaveCopy, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
                 } else if (format == "md") {
                     Text("SVGs and diagram sources are embedded in the Markdown. Images and GIFs keep readable relative filenames.", style = MaterialTheme.typography.bodyMedium)
-                    Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) { Text("Bundle as ZIP", style = MaterialTheme.typography.titleSmall); Text("Keep Markdown and all companion files together.", style = MaterialTheme.typography.bodySmall) }
-                        Switch(checked = markdownZip, onCheckedChange = { markdownZip = it })
-                    }
+                    if (!sharing) Text(directSaveCopy, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
                 } else {
                     Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
                     Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
                 }
             }
-            Button(onClick = { export(if (format == "md" && markdownZip) "mdzip" else format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp)) {
+            Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp).heightIn(min = 48.dp)) {
                 Icon(painterResource(if (sharing) R.drawable.symbol_share else R.drawable.symbol_export), null)
-                Text(if (sharing) "Prepare & share" else if (format == "md") "Export Markdown" else "Choose destination & export", Modifier.padding(start = 8.dp))
+                Text(exportPrimaryActionLabel(format, sharing), Modifier.padding(start = 8.dp))
             }
         }
     }

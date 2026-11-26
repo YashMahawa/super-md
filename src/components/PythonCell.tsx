@@ -15,7 +15,7 @@ function PythonFigure({image,index}:{image:string;index:number}) {
 // Figures come from local processes or caches: accept only bounded SVG/PNG/JPEG data.
 const safeFigure = (image: unknown): image is string => typeof image === "string" && image.length <= 12_000_000 && /^data:image\/(?:svg\+xml|png|jpeg);base64,[A-Za-z0-9+/]+=*$/.test(image.slice(0, 64) + (image.length > 64 ? image.slice(-8) : ""));
 
-export default function PythonCell({ source, python, highlighted, context }: { source: string; python: string; highlighted?: ReactNode; context?:PythonContext }) {
+export default function PythonCell({ source, python, highlighted, context, sourceStart, sourceEnd }: { source: string; python: string; highlighted?: ReactNode; context?:PythonContext; sourceStart?: number; sourceEnd?: number }) {
   const identity=context?pythonContextKey(source,context):JSON.stringify([source]);
   const scope= context?JSON.stringify([context.document,context.cell,context.interpreter]):"legacy";
   const initial=cachedPythonOutput(source,context)||null;
@@ -68,6 +68,7 @@ export default function PythonCell({ source, python, highlighted, context }: { s
       rememberPythonOutput(currentSource,scopedOutput,context);
       if (currentRun === runId.current) { executedSource.current = currentSource;executedContext.current=context;executedIdentity.current=identity;pendingStore.current={source:currentSource,context,freshExecution:!!context&&!nativeVerified};setStored(false); setResult(scopedOutput); }
     } catch (error) {
+      if (error instanceof Error && error.message === "Python cell cancelled") return;
       const failure:PythonResult = { stdout: "", stderr: String(error), images: [], ok: false,provenance:{verified:false,reason:'Execution failed before output was recorded'} };
       rememberPythonOutput(currentSource, failure,context);
       if (currentRun === runId.current) { executedSource.current = currentSource;executedContext.current=context;executedIdentity.current=identity;pendingStore.current=null;setStored(false); setResult(failure); }
@@ -75,7 +76,7 @@ export default function PythonCell({ source, python, highlighted, context }: { s
   };
   const stale = Boolean(result && (executedSource.current !== source || executedIdentity.current !== identity));
   return (
-    <div ref={cell} className="python-cell" data-output-pinned={!!result&&!stored||running}>
+    <div ref={cell} className="python-cell" data-output-pinned={!!result&&!stored||running} data-source-start={sourceStart} data-source-end={sourceEnd}>
       <div className="cell-toolbar"><span>Python {stale && <small className="stale-badge">Output from earlier code</small>} {result?.provenance?.unsaved&&<small className="stale-badge">Output not saved</small>} {result?.provenance&&!result.provenance.verified&&!result.provenance.unsaved&&result.provenance.reason?.includes('Legacy')&&<small className="stale-badge">Unverified saved output</small>}</span><CopyCode source={source}/><button className="python-run" onClick={run} disabled={running}>{running ? "Running…" : stale ? "Run updated code" : "Run"}</button></div>
       <pre className="python-source" aria-label="Python source"><code className="language-python">{highlighted ?? source}</code></pre>
       {result && <div className={`cell-output ${result.ok ? "" : "failed"} ${stale ? "stale" : ""}`}>

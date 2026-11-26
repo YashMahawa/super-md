@@ -39,6 +39,7 @@ internal class ReaderBridge(
     fun retire() {
         synchronized(capabilityLock) {
             if (retired.compareAndSet(false, true)) {
+                model.detachReaderCapabilities(assetCapabilities)
                 assetCapabilities.clear()
                 flushBarrier.failAll()
                 synchronized(pdfJobLock) { pdfJobs.clear() }
@@ -87,7 +88,13 @@ internal class ReaderBridge(
                     "document_flushed" -> documentFlushed(args)
                     "reading_position" -> {model.readingPosition(args.getString("id"),args.getJSONObject("location"));true}
                     "zoom_changed" -> { model.readerZoom(args.getDouble("zoom").toFloat(), args.optBoolean("fullscreen", model.state.value.fullscreen)); true }
+                    "typewriter_scroll" -> {
+                        val enabled = args.opt("enabled") as? Boolean ?: error("Invalid typewriter scroll value")
+                        model.typewriterScroll(enabled)
+                        true
+                    }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
+                    "editor_focus_changed" -> { model.editorFocus(args.optBoolean("focused")); true }
                     "copy_image_native" -> {
                         val uri = withContext(Dispatchers.IO) {
                             val body = args.opt("body") as? String ?: error("Clipboard image is invalid")
@@ -110,26 +117,55 @@ internal class ReaderBridge(
                         web.context.getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText("Super MD",text))
                         true
                     }
+                    "apply_bundled_theme" -> model.applyBundledTheme(args.getString("id"))
                     "document_outline" -> { model.outline(args.getString("id"), args.getJSONArray("headings")); true }
                     "load_font" -> withContext(Dispatchers.IO) {model.fonts.reader(args.getString("family"))}
                     "cache_python_output" -> cachePythonOutput(args)
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
+                    "open_workspace_link", "open_relative_note" -> {
+                        val fragment = if (args.has("fragment") && !args.isNull("fragment")) {
+                            args.opt("fragment") as? String ?: error("Invalid heading target")
+                        } else if (args.has("heading") && !args.isNull("heading")) {
+                            args.opt("heading") as? String ?: error("Invalid heading target")
+                        } else {
+                            ""
+                        }
+                        val wikilink = if (command == "open_workspace_link") args.optBoolean("wikilink", false) else false
+                        model.openWorkspaceLink(
+                            args.optString("documentPath", ""),
+                            args.getString("target"),
+                            fragment,
+                            wikilink,
+                        )
+                    }
+                    "open_external_url" -> {
+                        val rawUrl = args.getString("url")
+                        require(rawUrl.length in 1..4096) { "Invalid external URL" }
+                        val uri = Uri.parse(rawUrl)
+                        require(classifyReaderNavigationUrl(uri, isForMainFrame = true) == ReaderUrlDecision.OPEN_EXTERNAL) {
+                            "Unsupported external URL"
+                        }
+                        launchExternalReaderUri(web.context, uri)
+                        true
+                    }
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
                         val source = args.getString("source")
                         val (noteId, asset) = model.resolveReaderAsset(args.getString("documentPath"), source)
                         require(asset.mime != "image/svg+xml") { "SVG images use the safe data loader" }
+                        require(asset.mime in RASTER_ASSET_MIMES) { "Unsupported raster image type" }
                         val capability = synchronized(capabilityLock) {
                             check(!retired.get()) { "Reader is no longer available" }
-                            assetCapabilities.register(noteId, source, asset.mime, asset.fingerprint)
+                            check(model.matchesReaderAssetNote(noteId, asset.target)) { "The asset's document changed while resolving" }
+                            assetCapabilities.register(noteId, source, asset.mime, asset.fingerprint, asset.target)
                                 ?: error("Reader asset capacity reached; using the safe data loader")
                         }
                         JSONObject()
                             .put("url", "${ReaderAssetPathHandler.URL_PREFIX}${capability.token}?v=${capability.fingerprint}")
                             .put("mime", capability.mime)
                     }
-                    "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }
+                    "import_images" -> withContext(Dispatchers.IO) { model.media.importJson(args.getJSONArray("images")) }.also { model.markAssetsDirty(model.state.value.active.id) }
                     "save_media_native" -> model.saveAgentMedia(args)
                     "agent_export_native" -> { onAgentExport(args); JSONObject().put("accepted", true).put("jobId", args.optString("requestId")) }
                     "fetch_resource" -> withContext(Dispatchers.IO) { JSONObject().put("body", model.media.fetch(args.getString("url"), args.optBoolean("image"))) }
@@ -431,6 +467,61 @@ internal fun retireAndDestroyReader(web: WebView) {
     }
 }
 
+private val MERMAID_SANDBOX_ASSET_PATH = Regex("^/assets/web/assets/mermaid-sandbox-[A-Za-z0-9_-]+\\.html$")
+
+internal fun isBundledReaderOrigin(url: Uri): Boolean =
+    url.scheme.equals("https", ignoreCase = true) &&
+        url.host.equals("appassets.androidplatform.net", ignoreCase = true) &&
+        url.port == -1 &&
+        url.userInfo == null
+
+internal fun shouldOverrideReaderNavigation(url: Uri, isForMainFrame: Boolean): Boolean {
+    if (isForMainFrame) {
+        return !(isBundledReaderOrigin(url) && url.path == "/assets/web/android-reader.html" && url.query == null)
+    }
+    if (url.toString() == "about:blank") return false
+    val path = url.path ?: return true
+    return !(isBundledReaderOrigin(url) && url.query == null && MERMAID_SANDBOX_ASSET_PATH.matches(path))
+}
+
+internal fun interceptReaderRequest(
+    loader: WebViewAssetLoader,
+    url: Uri,
+    method: String = "GET",
+): WebResourceResponse {
+    val allowedMethod = method.equals("GET", ignoreCase = true) || method.equals("HEAD", ignoreCase = true)
+    val isAppAssetsHost = isBundledReaderOrigin(url)
+    val path = url.path ?: ""
+    val isReaderPath = path.startsWith("/assets/") || path.startsWith("/reader-assets/")
+    if (allowedMethod && isAppAssetsHost && isReaderPath) {
+        val loaded = loader.shouldInterceptRequest(url)
+        if (loaded != null && loaded.data != null) {
+            if (loaded.mimeType?.startsWith("text/", ignoreCase = true) == true && loaded.encoding.isNullOrBlank()) {
+                loaded.encoding = "UTF-8"
+            }
+            return loaded
+        }
+        if (path.startsWith("/assets/")) {
+            return WebResourceResponse(
+                "text/plain",
+                "UTF-8",
+                404,
+                "Not Found",
+                ReaderAssetPathHandler.NO_STORE_HEADERS,
+                java.io.ByteArrayInputStream(ByteArray(0)),
+            )
+        }
+    }
+    return WebResourceResponse(
+        "text/plain",
+        "UTF-8",
+        403,
+        "Forbidden",
+        ReaderAssetPathHandler.NO_STORE_HEADERS,
+        java.io.ByteArrayInputStream(ByteArray(0)),
+    )
+}
+
 fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope, ready: () -> Unit, rendererGone: (WebView) -> Unit, onAgentReply: (String, Any?, String?) -> Unit = { _, _, _ -> }, onAgentExport: (JSONObject) -> Unit = {}) {
     web.settings.javaScriptEnabled = true
     web.settings.domStorageEnabled = true
@@ -442,9 +533,10 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
     web.settings.textZoom = 100
     web.settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
     val capabilities = ReaderAssetCapabilities()
+    model.attachReaderCapabilities(capabilities)
     val assetPathHandler = ReaderAssetPathHandler(
         capabilities,
-        open = model::openReaderAsset,
+        openCapability = model::openReaderAsset,
         noteIsOpen = { noteId -> model.state.value.tabs.any { it.id == noteId } },
     )
     val loader = WebViewAssetLoader.Builder()
@@ -462,7 +554,8 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
             return true
         }
 
-        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? = loader.shouldInterceptRequest(request.url)
+        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse =
+            interceptReaderRequest(loader, request.url, request.method)
         override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
             if (request.url.host == "appassets.androidplatform.net" && request.url.path?.startsWith("/assets/") == true) {
                 model.fail("A bundled document resource is missing. Please reinstall a complete release.")
@@ -472,14 +565,27 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
             if (request.isForMainFrame) model.fail("The document reader could not load. Please reopen the note.")
         }
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-            // The bridge is available only in the bundled offline reader. Never
-            // navigate this WebView to a page from a note or external website.
-            if (request.url.host == "appassets.androidplatform.net" && request.url.path == "/assets/web/android-reader.html") return false
-            if (request.isForMainFrame && request.url.scheme in listOf("https", "http", "mailto")) runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
-            return true
+            // The bridge is available only in the bundled offline reader. Allow only
+            // the main reader entrypoint and its opaque-origin Mermaid sandbox subframe,
+            // and never send internal appassets.androidplatform.net paths to an external browser.
+            return when (classifyReaderNavigationUrl(request.url, request.isForMainFrame)) {
+                ReaderUrlDecision.ALLOW_READER -> false
+                ReaderUrlDecision.OPEN_EXTERNAL -> {
+                    launchExternalReaderUri(view.context, request.url)
+                    true
+                }
+                ReaderUrlDecision.BLOCK_INTERNAL -> true
+            }
         }
     }
     web.setTag(R.id.reader_bridge_tag, bridge)
     web.addJavascriptInterface(bridge, "SuperMD")
     web.loadUrl("https://appassets.androidplatform.net/assets/web/android-reader.html")
+}
+
+private fun launchExternalReaderUri(context: android.content.Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+        if (context !is android.app.Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(intent) }
 }

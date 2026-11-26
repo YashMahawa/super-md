@@ -42,6 +42,7 @@ class StudioUiTest {
                 model.mode(before.mode)
                 model.zoom(before.normalZoom)
                 model.centerLock(before.centerLock)
+                model.typewriterScroll(before.typewriterScroll)
                 model.flush()
                 assertEquals(before.active.content, model.state.value.active.content)
             }
@@ -57,14 +58,22 @@ class StudioUiTest {
                 }.getOrDefault(false)
             }
         } finally {
+            val hadImeOverride = temporaryImeSetting != null
             temporaryImeSetting?.let { previous ->
                 runCatching { shellOutput("settings put secure show_ime_with_hard_keyboard $previous") }
                 temporaryImeSetting = null
             }
             runCatching {
-                val reader = web(compose.activity.window.decorView)
-                if (reader != null) (compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
-                    .hideSoftInputFromWindow(reader.windowToken, 0)
+                val decor = compose.activity.window.decorView
+                val reader = web(decor)
+                compose.activity.runOnUiThread {
+                    reader?.evaluateJavascript("window.supermdDismiss?.()", null)
+                    val imm = compose.activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                    imm.hideSoftInputFromWindow((reader ?: decor).windowToken, 0)
+                }
+                if (hadImeOverride || imeVisible()) {
+                    compose.waitUntil(5_000) { !imeVisible() }
+                }
             }
             temporaryRestorePosition?.let { previous ->
                 val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
@@ -80,6 +89,68 @@ class StudioUiTest {
         val platformInsets = decor.rootWindowInsets ?: return false
         return androidx.core.view.WindowInsetsCompat.toWindowInsetsCompat(platformInsets)
             .isVisible(androidx.core.view.WindowInsetsCompat.Type.ime())
+    }
+    private val visualStateRequestSeq = java.util.concurrent.atomic.AtomicLong(1L)
+    private fun awaitActivityPresenterReady(requireNoIme: Boolean = false) {
+        compose.waitForIdle()
+        val instrument = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        compose.waitUntil(10_000) {
+            val ready = java.util.concurrent.atomic.AtomicBoolean(false)
+            instrument.runOnMainSync {
+                val activity = compose.activity
+                val decor = activity.window.decorView
+                val resumed = androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry.getInstance()
+                    .getActivitiesInStage(androidx.test.runner.lifecycle.Stage.RESUMED).any { it === activity }
+                ready.set(
+                    resumed &&
+                        activity.hasWindowFocus() &&
+                        decor.isAttachedToWindow &&
+                        decor.isShown &&
+                        decor.width > 0 &&
+                        decor.height > 0 &&
+                        (!requireNoIme || !imeVisible()),
+                )
+            }
+            ready.get()
+        }
+        val committed = java.util.concurrent.CountDownLatch(1)
+        instrument.runOnMainSync {
+            val decor = compose.activity.window.decorView
+            decor.viewTreeObserver.registerFrameCommitCallback { committed.countDown() }
+            decor.postInvalidateOnAnimation()
+        }
+        committed.await(3, java.util.concurrent.TimeUnit.SECONDS)
+    }
+    private fun awaitReaderVisualStateReady(requireNoIme: Boolean = false) {
+        awaitActivityPresenterReady(requireNoIme = requireNoIme)
+        val instrument = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        val visualCommitted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val requestId = visualStateRequestSeq.getAndIncrement()
+        instrument.runOnMainSync {
+            val reader = web(compose.activity.window.decorView)
+            if (reader == null) {
+                visualCommitted.set(true)
+            } else {
+                reader.postVisualStateCallback(
+                    requestId,
+                    object : WebView.VisualStateCallback() {
+                        override fun onComplete(completedId: Long) {
+                            if (completedId == requestId) visualCommitted.set(true)
+                        }
+                    },
+                )
+                reader.postInvalidateOnAnimation()
+            }
+        }
+        compose.waitUntil(10_000) { visualCommitted.get() }
+        val frameCommitted = java.util.concurrent.CountDownLatch(1)
+        instrument.runOnMainSync {
+            val decor = compose.activity.window.decorView
+            decor.viewTreeObserver.registerFrameCommitCallback { frameCommitted.countDown() }
+            web(decor)?.postInvalidateOnAnimation()
+            decor.postInvalidateOnAnimation()
+        }
+        frameCommitted.await(3, java.util.concurrent.TimeUnit.SECONDS)
     }
     /** Resolve touch input to this resumed activity, never an instrumentation helper root. */
     private fun activityRoot(): SemanticsNodeInteraction {
@@ -235,6 +306,37 @@ class StudioUiTest {
             compose.runOnIdle {model.latexAutofix(oldAutofix);model.edit(model.state.value.active.id,original)}
         }
     }
+    @Test fun typewriterScrollIsOptInAndSyncsBetweenSettingsAndReaderStatus() {
+        welcome()
+        val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState = model.state.value
+        val oldTypewriter = model.state.value.typewriterScroll
+        val prefs = compose.activity.getSharedPreferences("studio", 0)
+        try {
+            assertFalse(StudioState().typewriterScroll)
+            compose.runOnIdle { model.typewriterScroll(false); model.mode("editor") }
+            compose.waitUntil(15_000) { model.state.value.mode == "editor" }
+            javascriptUntil("document.querySelector('.source-editor-status button')?.getAttribute('aria-pressed') === 'false'", { it == "true" })
+
+            compose.onNodeWithContentDescription("More actions").performClick()
+            compose.onNodeWithText("Settings").performClick()
+            compose.onNodeWithText("Writing & shortcuts").performClick()
+            compose.onNodeWithText("Typewriter scrolling").assertExists()
+            compose.onAllNodes(isToggleable()).onFirst().performClick()
+            compose.runOnIdle {
+                assertTrue(model.state.value.typewriterScroll)
+                assertTrue(prefs.getBoolean("typewriterScroll", false))
+            }
+            compose.onNodeWithContentDescription("Back").performClick()
+            compose.onNodeWithContentDescription("Back").performClick()
+
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.source-editor-status button')].find(b=>b.textContent==='Typewriter');return b?.getAttribute('aria-pressed')==='true'})()", { it == "true" })
+            javascriptUntil("(()=>{const b=[...document.querySelectorAll('.source-editor-status button')].find(b=>b.textContent==='Typewriter');if(!b)return false;b.click();return true})()", { it == "true" })
+            compose.waitUntil(5_000) { !model.state.value.typewriterScroll && !prefs.getBoolean("typewriterScroll", true) }
+        } finally {
+            compose.runOnIdle { model.typewriterScroll(oldTypewriter) }
+        }
+    }
     @Test fun externalOpenActivatesNewAndAlreadyOpenFileTabs() {
         val context = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext
         val workspace = java.util.UUID.randomUUID().toString()
@@ -251,6 +353,7 @@ class StudioUiTest {
         try {
             val launch = android.content.Intent(android.content.Intent.ACTION_VIEW, firstUri)
                 .setClass(context, MainActivity::class.java)
+                .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 .putExtra("workspace", workspace)
             scenario = androidx.test.core.app.ActivityScenario.launch(launch)
             val openedModel = AtomicReference<StudioViewModel>()
@@ -397,15 +500,28 @@ class StudioUiTest {
             javascriptUntil("document.querySelector('.android-reading')?.dataset.centerLocked") {it=="\"false\""}
             compose.onNodeWithContentDescription("Lock document to centre").performClick()
             compose.waitUntil(5000){model.state.value.centerLock}
+            javascriptUntil("document.querySelector('.android-reading')?.dataset.centerLocked") {it=="\"true\""}
             fun painted(expected:Int) {
-                val raw=javascriptUntil("(()=>{const i=document.querySelector('.svg-diagram');if(!i?.complete)return null;const r=i.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,width:innerWidth};})()") {it.contains("\"width\"")}
+                javascriptUntil("(()=>{const i=document.querySelector('.svg-diagram');if(!i?.complete||!i.naturalWidth)return false;const r=i.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;if(window.__svgPaintSrc!==i.currentSrc){window.__svgPaintSrc=i.currentSrc;window.__svgPaintFrames=0;requestAnimationFrame(()=>requestAnimationFrame(()=>{window.__svgPaintFrames=2;}));return false;}return window.__svgPaintFrames===2;})()") {it=="true"}
+                awaitReaderVisualStateReady()
+                val raw=javascriptUntil("(()=>{const i=document.querySelector('.svg-diagram');if(!i?.complete||!i.naturalWidth)return null;const r=i.getBoundingClientRect();return {x:r.left+r.width/2,y:r.top+r.height/2,width:innerWidth};})()") {it.contains("\"width\"")}
                 val point=org.json.JSONObject(raw);val xy=AtomicReference(IntArray(2));val scale=AtomicReference(1f)
                 compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;val location=IntArray(2);reader.getLocationOnScreen(location);xy.set(location);scale.set(reader.width.toFloat()/point.getDouble("width").toFloat())}
                 var observed=0
+                var attempts=0
                 compose.waitUntil(15_000) {
+                    if (attempts++ > 0) {
+                        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                            web(compose.activity.window.decorView)?.postInvalidateOnAnimation()
+                            compose.activity.window.decorView.postInvalidateOnAnimation()
+                        }
+                        android.os.SystemClock.sleep(100)
+                    }
                     val bitmap=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
                     try {if(bitmap==null)false else {
-                        observed=bitmap.getPixel(xy.get()[0]+(point.getDouble("x")*scale.get()).toInt(),xy.get()[1]+(point.getDouble("y")*scale.get()).toInt())
+                        val px=(xy.get()[0]+(point.getDouble("x")*scale.get()).toInt()).coerceIn(0,bitmap.width-1)
+                        val py=(xy.get()[1]+(point.getDouble("y")*scale.get()).toInt()).coerceIn(0,bitmap.height-1)
+                        observed=bitmap.getPixel(px,py)
                         listOf(16,8,0).all {shift->kotlin.math.abs((observed shr shift and 255)-(expected shr shift and 255))<=2}
                     }} finally {bitmap?.recycle()}
                 }
@@ -431,14 +547,15 @@ class StudioUiTest {
         welcome()
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         val before=model.state.value;temporaryNoteState=before
-        val content="# Diagram appearance\n\n```mermaid\nflowchart LR\n A[Read] --> B[Understand]\n```"
+        val content="# Diagram appearance\n\n```mermaid\nflowchart LR\n A[Read] --> B[Understand]\n```\n\n```mermaid\ngantt\n title Study plan\n dateFormat YYYY-MM-DD\n Read :a1, 2026-10-01, 2d\n Review :after a1, 2d\n```"
         try {
             compose.runOnIdle {model.fullscreen(false);model.appearance(accent="rose",theme="dark",motion=false);model.readingPreference("imageAppearance","original");model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
-            javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return !!i?.complete&&i.naturalWidth>0&&i.dataset.mediaKind==='svg'&&i.dataset.mediaAdapted==='true'&&getComputedStyle(i).filter==='none'&&document.documentElement.dataset.imageAppearance==='original';})()") {it=="true"}
-            javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');if(!i)return false;const svg=decodeURIComponent(i.src.split(',').slice(1).join(','));return svg.includes('data-diagram-engine=\"pele\"')&&!svg.includes('var(');})()") {it=="true"}
+            javascriptUntil("(()=>{const errs=Array.from(document.querySelectorAll('.image-error,.render-error')).map(e=>e.textContent);if(errs.length)return {errors:errs};const imgs=Array.from(document.querySelectorAll('.mermaid img'));const ready=imgs.length===2&&imgs.every(i=>i.complete&&i.naturalWidth>0&&i.dataset.mediaKind==='svg'&&i.dataset.mediaAdapted==='true'&&getComputedStyle(i).filter==='none')&&document.documentElement.dataset.imageAppearance==='original';return ready?'ok':{imgs:imgs.length,widths:imgs.map(i=>i.naturalWidth),imageAppearance:document.documentElement.dataset.imageAppearance};})()") {it=="\"ok\""}
+            javascriptUntil("(()=>{const imgs=Array.from(document.querySelectorAll('.mermaid img'));if(imgs.length!==2)return false;const svgs=imgs.map(i=>decodeURIComponent(i.src.split(',').slice(1).join(',')));const frame=document.documentElement.querySelector('iframe[data-mermaid-sandbox]');return svgs.some(s=>s.includes('data-diagram-engine=\"pele\"'))&&svgs.some(s=>s.includes('data-diagram-engine=\"mermaid\"'))&&svgs.every(s=>!s.includes('var('))&&frame?.getAttribute('sandbox')==='allow-scripts'&&!document.body.contains(frame);})()") {it=="true"}
             for(mode in listOf("monochrome","contrast","invert-dark","original")) {
+                val expectedDark = if (mode == "original") "true" else "false"
                 compose.runOnIdle {model.readingPreference("svgAppearance",mode)}
-                javascriptUntil("(()=>{const i=document.querySelector('.mermaid img');return document.documentElement.dataset.svgAppearance==='$mode'&&!!i?.complete&&i.naturalWidth>0;})()") {it=="true"}
+                javascriptUntil("(()=>{const mermaid=Array.from(document.querySelectorAll('.mermaid'));const imgs=Array.from(document.querySelectorAll('.mermaid img'));return document.documentElement.dataset.svgAppearance==='$mode'&&mermaid.length===2&&mermaid.every(m=>m.dataset.renderDark==='$expectedDark')&&imgs.length===2&&imgs.every(i=>i.complete&&i.naturalWidth>0);})()") {it=="true"}
                 javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
                 compose.runOnIdle {assertEquals(content,model.state.value.active.content);assertEquals("original",model.state.value.imageAppearance)}
             }
@@ -572,7 +689,9 @@ class StudioUiTest {
         compose.onNodeWithContentDescription("Save note").assertExists()
         compose.onNodeWithContentDescription("More actions").performClick()
         compose.onNodeWithText("Open note").assertIsNotDisplayed() // closed drawer, not an overflow item
-        for(removed in listOf("New tab","New note","Reopen closed tab","Save as Markdown"))compose.onAllNodesWithText(removed).assertCountEquals(0)
+        for(removed in listOf("New tab","New note","Save as Markdown","Find in note"))compose.onAllNodesWithText(removed).assertCountEquals(0)
+        compose.onNodeWithText("Reopen closed tab").assertExists()
+        compose.onNodeWithText("Save as").assertExists()
         compose.onNodeWithText("New window").assertExists()
         androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(android.view.KeyEvent.KEYCODE_BACK)
         compose.waitForIdle()
@@ -630,8 +749,7 @@ class StudioUiTest {
         val content="# Immediate Find Focus\n\nHardware typing should land here without tapping the search field. FocusNeedle appears in this paragraph.\n"
         compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader")}
         javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('FocusNeedle')") {it=="true"}
-        compose.onNodeWithContentDescription("More actions").performClick()
-        compose.onNodeWithText("Find in note").performClick()
+        compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
         compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
         val nativeInputState = AtomicReference<org.json.JSONObject>()
@@ -691,8 +809,7 @@ class StudioUiTest {
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
         compose.runOnIdle { model.mode("reader") }
-        compose.onNodeWithContentDescription("More actions").performClick()
-        compose.onNodeWithText("Find in note").performClick()
+        compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
         compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
         compose.waitUntil(5_000) { imeVisible() }
@@ -712,41 +829,47 @@ class StudioUiTest {
         compose.waitUntil(5_000) {model.state.value.active.content==content}
         compose.runOnIdle {model.mode("reader");model.zoom(175f)}
         javascriptUntil("document.querySelector('.document-page')?.dataset.selectionScale"){it=="\"1.75\""}
+        javascriptUntil("(()=>{window.supermdDismiss?.();return !document.querySelector('.reading-search');})()") {it=="true"}
+        awaitActivityPresenterReady(requireNoIme = true)
         // Reset navigation only to mount the target; then align its measured
         // range below native controls inside the usable viewport.
         javascriptUntil("(()=>{window.supermdNativeWheel?.(0,0,{x:-1,y:-1},false);const host=document.querySelector('.android-reading');if(!host)return false;host.scrollTop=0;window.__selectionTargetAlign=0;return true;})()") {it=="true"}
         javascriptUntil("[...document.querySelectorAll('.markdown-body p')].some(p=>p.textContent.includes('Alpha Bravo Charlie Delta'))") {it=="true"}
         javascriptUntil("(()=>{const host=document.querySelector('.android-reading'),el=[...document.querySelectorAll('.markdown-body p')].find(p=>p.textContent.includes('Alpha Bravo Charlie Delta'));if(!host||!el)return false;const inset=parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))||0,targetY=(inset+innerHeight)/2;if(window.__selectionTargetAlign===0){const range=document.createRange();range.setStart(el.firstChild,6);range.setEnd(el.firstChild,11);const b=range.getBoundingClientRect();host.scrollTop+=b.top+b.height/2-targetY;window.__selectionTargetAlign=1;requestAnimationFrame(()=>requestAnimationFrame(()=>window.__selectionTargetAlign=2));return false;}if(window.__selectionTargetAlign!==2)return false;const r=document.createRange();r.setStart(el.firstChild,6);r.setEnd(el.firstChild,11);const b=r.getBoundingClientRect();return Math.abs(b.top+b.height/2-targetY)<2;})()") {it=="true"}
+        awaitReaderVisualStateReady(requireNoIme = true)
         val raw=javascriptUntil("(()=>{const el=[...document.querySelectorAll('.markdown-body p')].find(p=>p.textContent.includes('Alpha Bravo Charlie Delta'));if(!el)return null;try{const r=document.createRange();r.setStart(el.firstChild,6);r.setEnd(el.firstChild,11);const b=r.getBoundingClientRect();const caret=document.caretRangeFromPoint(b.left+b.width/2,b.top+b.height/2);return {target:el.textContent,x:b.left+b.width/2,y:b.top+b.height/2,width:innerWidth,word:caret?.startContainer.textContent,offset:caret?.startOffset,chromeInset:parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-chrome-inset'))||0};}catch(e){return {target:el.textContent,error:String(e),child:el.firstChild?.textContent,childType:el.firstChild?.nodeType};}})()"){it.contains("Alpha Bravo Charlie Delta")}
         val point=org.json.JSONObject(raw)
         assertFalse("Could not measure selection target: $point",point.has("error"))
         assertTrue("Caret geometry must resolve inside the intended text: $point",point.optString("word").contains("Alpha Bravo Charlie Delta"))
         assertTrue(point.getInt("offset") in 6..11)
         assertTrue("Selection target must be below the native toolbar overlay: point=$point",point.getDouble("y")>point.getDouble("chromeInset")+8)
-        val nativeControlsBottom=listOf("Save note","Export","More actions","Undo (Ctrl+Z)","Redo (Ctrl+Y)")
+        val nativeControlsBottom=listOf("Find in note","Save note","Export","More actions","Show contents","Fullscreen study")
             .maxOf { compose.onNodeWithContentDescription(it).fetchSemanticsNode().boundsInRoot.bottom }
         val nativePoint=AtomicReference(androidx.compose.ui.geometry.Offset.Zero)
         val nativeGeometry=AtomicReference("")
         val nativeScale=AtomicReference(1f)
         val nativeWebTop=AtomicReference(0f)
-        compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;val xy=IntArray(2);reader.getLocationOnScreen(xy);val scale=reader.width.toFloat()/point.getDouble("width").toFloat();nativeScale.set(scale);nativeWebTop.set(xy[1].toFloat());nativePoint.set(androidx.compose.ui.geometry.Offset(xy[0]+point.getDouble("x").toFloat()*scale,xy[1]+point.getDouble("y").toFloat()*scale));nativeGeometry.set("web=${reader.width}x${reader.height} at=${xy.contentToString()} scale=$scale decor=${compose.activity.window.decorView.width}x${compose.activity.window.decorView.height} density=${compose.activity.resources.displayMetrics.density}")}
+        compose.runOnIdle {val reader=web(compose.activity.window.decorView)!!;if(!reader.isFocused)reader.requestFocus();val xy=IntArray(2);reader.getLocationOnScreen(xy);val scale=reader.width.toFloat()/point.getDouble("width").toFloat();nativeScale.set(scale);nativeWebTop.set(xy[1].toFloat());nativePoint.set(androidx.compose.ui.geometry.Offset(xy[0]+point.getDouble("x").toFloat()*scale,xy[1]+point.getDouble("y").toFloat()*scale));nativeGeometry.set("web=${reader.width}x${reader.height} at=${xy.contentToString()} scale=$scale decor=${compose.activity.window.decorView.width}x${compose.activity.window.decorView.height} density=${compose.activity.resources.displayMetrics.density}")}
+        awaitReaderVisualStateReady(requireNoIme = true)
         assertTrue("Selection point must be below the bottom edge of visible native controls: point=${nativePoint.get()}, controlsBottom=$nativeControlsBottom, $nativeGeometry",nativePoint.get().y>nativeControlsBottom+8)
         println("SELECTION GEOMETRY: point=$point native=${nativePoint.get()} controlsBottom=$nativeControlsBottom ${nativeGeometry.get()}")
         val instrument=androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
         javascriptUntil("(()=>{window.__selectionInput=[];for(const type of ['pointerdown','pointerup','touchstart','touchend','contextmenu','selectionchange'])document.addEventListener(type,e=>window.__selectionInput.push({type,target:e.target?.textContent?.slice?.(0,40),client:[e.clientX,e.clientY],buttons:e.buttons,selection:window.getSelection()?.toString()}),true);return true;})()") {it=="true"}
-        val time=android.os.SystemClock.uptimeMillis();val position=nativePoint.get()
-        fun pointer(action:Int,eventTime:Long):android.view.MotionEvent {
+        val position=nativePoint.get()
+        val holdMs=maxOf(750L,android.view.ViewConfiguration.getLongPressTimeout().toLong()+250L)
+        fun pointer(downTime:Long,action:Int,eventTime:Long):android.view.MotionEvent {
             val properties=android.view.MotionEvent.PointerProperties().apply {id=0;toolType=android.view.MotionEvent.TOOL_TYPE_FINGER}
             val coordinates=android.view.MotionEvent.PointerCoords().apply {x=position.x;y=position.y;pressure=1f;size=1f}
-            return android.view.MotionEvent.obtain(time,eventTime,action,1,arrayOf(properties),arrayOf(coordinates),0,0,1f,1f,0,0,android.view.InputDevice.SOURCE_TOUCHSCREEN,0)
+            return android.view.MotionEvent.obtain(downTime,eventTime,action,1,arrayOf(properties),arrayOf(coordinates),0,0,1f,1f,0,0,android.view.InputDevice.SOURCE_TOUCHSCREEN,0)
         }
-        val down=pointer(android.view.MotionEvent.ACTION_DOWN,time)
-        println("SELECTION INPUT DOWN: (${down.x},${down.y}) source=${down.source} tool=${down.getToolType(0)} longPressTimeout=${android.view.ViewConfiguration.getLongPressTimeout()}")
+        val downTime=android.os.SystemClock.uptimeMillis()
+        val down=pointer(downTime,android.view.MotionEvent.ACTION_DOWN,downTime)
+        println("SELECTION INPUT DOWN: (${down.x},${down.y}) source=${down.source} tool=${down.getToolType(0)} longPressTimeout=${android.view.ViewConfiguration.getLongPressTimeout()} holdMs=$holdMs")
         var up:android.view.MotionEvent?=null
         try {
             instrument.sendPointerSync(down)
-            android.os.SystemClock.sleep(750)
-            up=pointer(android.view.MotionEvent.ACTION_UP,android.os.SystemClock.uptimeMillis())
+            android.os.SystemClock.sleep(holdMs)
+            up=pointer(downTime,android.view.MotionEvent.ACTION_UP,android.os.SystemClock.uptimeMillis())
             instrument.sendPointerSync(up)
         } finally {
             down.recycle()
@@ -775,7 +898,7 @@ class StudioUiTest {
             fun record(nodes:List<android.view.accessibility.AccessibilityNodeInfo>){seen.addAll(nodes.filter {it.isVisibleToUser}.mapNotNull {it.text?.toString()?.takeIf(String::isNotBlank)})}
             fun complete()=seen.contains("Search Google")&&seen.contains(ask)
             var nodes=toolbarNodes();record(nodes)
-            val deadline=android.os.SystemClock.uptimeMillis()+6_000
+            val deadline=android.os.SystemClock.uptimeMillis()+15_000
             while(!complete()&&nodes.none {it.contentDescription?.toString()=="More options"}&&android.os.SystemClock.uptimeMillis()<deadline){android.os.SystemClock.sleep(50);nodes=toolbarNodes();record(nodes)}
             // Expanding overflow can hide main-row actions, so retain the
             // visible labels from both presentations instead of requiring all
@@ -897,7 +1020,7 @@ ax.set_title("Matplotlib 3D figure")
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState = model.state.value
         val original="Given \\frac{a}{b} = c, continue."
-        compose.runOnIdle {model.edit(model.state.value.active.id,original);model.mode("reader")}
+        compose.runOnIdle {model.edit(model.state.value.active.id,original);model.mode("live")}
         javascriptUntil("document.querySelector('.markdown-body')?.textContent") {it.contains("Given")}
         compose.onNodeWithContentDescription("More actions").performClick();compose.onNodeWithText("Fix LaTeX").performClick()
         javascriptUntil("(()=>{const b=document.querySelector('.math-repair-panel footer button');if(b&&!b.disabled)b.click();return document.querySelectorAll('.katex').length;})()") {it=="1"}
@@ -971,6 +1094,7 @@ ax.set_title("Matplotlib 3D figure")
                     }
                 }.getOrDefault(false)
             }
+            awaitActivityPresenterReady()
         }
     }
     @Test fun rendererExitRecreatesReaderFromNativeState() {
@@ -1144,7 +1268,7 @@ ax.set_title("Matplotlib 3D figure")
         val paletteIcon = android.graphics.Color.parseColor(org.json.JSONArray("[${javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--muted')") { it.startsWith("\"#") }}]").getString(0))
         assertTrue("Reader must not overpaint the native toolbar", kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15)
         val normalScale = javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it.isNotBlank() && it != "null" && it != "\"\"" }
-        compose.onNodeWithContentDescription("Show contents").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Show contents").assertIsDisplayed()
         compose.onNodeWithContentDescription("Fullscreen study").performClick()
         javascriptUntil("document.documentElement.dataset.fullscreen") { it == "\"true\"" }
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }
@@ -1184,6 +1308,7 @@ ax.set_title("Matplotlib 3D figure")
         val closeBounds = compose.onNodeWithContentDescription("Close Recoverable draft.md").fetchSemanticsNode().boundsInRoot
         assertTrue("The selected tab's close control must be visible before closing it: $closeBounds", closeBounds.width > 0f && closeBounds.height > 0f)
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
+        compose.onNodeWithText("Discard").performClick()
         compose.waitUntil(15_000) {
             model.state.value.tabs.none { it.id == recoverableId } &&
                 model.state.value.closedTabs.any { it.id == recoverableId }
@@ -1199,6 +1324,7 @@ ax.set_title("Matplotlib 3D figure")
         compose.onNodeWithContentDescription("Close Recoverable draft.md").assertExists()
         compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
+        compose.onNodeWithText("Discard").performClick()
         if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
             compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
             compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE }

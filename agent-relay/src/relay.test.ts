@@ -117,10 +117,78 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   await http.connect(httpTransport);
   t.after(async () => { await http.close().catch(() => undefined); await httpTransport.close().catch(() => undefined); });
   const list = await http.listTools();
-  assert.deepEqual(list.tools.map((x) => x.name).sort(), ["asset_action", "diagram_action", "document_action", "list_devices", "list_tabs", "patch_tab", "read_tab", "render_tab", "replace_tab_asset", "search_tab", "view_current"].sort());
+  const expectedToolSchemas: Record<string, { properties: string[]; required?: string[] }> = {
+    list_devices: { properties: [] },
+    list_tabs: { properties: ["deviceId"] },
+    read_tab: { properties: ["deviceId", "tabId", "heading", "view", "offset", "limit"] },
+    search_tab: { properties: ["deviceId", "tabId", "query", "offset", "limit", "context", "caseSensitive", "wholeWord", "regex", "excludeDiagrams"], required: ["tabId", "query"] },
+    patch_tab: { properties: ["deviceId", "tabId", "expectedRevision", "operations"], required: ["tabId", "expectedRevision", "operations"] },
+    render_tab: { properties: ["deviceId", "tabId", "width", "quality"], required: ["tabId"] },
+    view_current: { properties: ["deviceId", "tabId", "width", "quality", "includeImage"] },
+    diagram_action: { properties: ["deviceId", "tabId", "diagramAction", "diagramId", "expectedRevision", "offset", "limit", "width", "quality"], required: ["tabId", "diagramAction"] },
+    replace_tab_asset: { properties: ["deviceId", "tabId", "assetName", "assetPath", "expectedRevision"], required: ["tabId", "assetName", "assetPath", "expectedRevision"] },
+    asset_action: { properties: ["deviceId", "tabId", "assetAction", "assetName", "mimeType", "body", "offset", "limit", "expectedRevision"], required: ["tabId", "assetAction", "expectedRevision"] },
+    document_action: { properties: ["deviceId", "documentAction", "tabId", "expectedRevision", "operations", "content", "options"], required: ["documentAction"] },
+  };
+  assert.deepEqual(list.tools.map((x) => x.name).sort(), Object.keys(expectedToolSchemas).sort());
+  const toolsByName = new Map(list.tools.map((tool) => [tool.name, tool]));
+  for (const [name, expected] of Object.entries(expectedToolSchemas)) {
+    const tool = toolsByName.get(name);
+    assert.ok(tool, `missing MCP tool ${name}`);
+    assert.ok(typeof tool.description === "string" && tool.description.length > 0, `${name} must advertise a description`);
+    const schema = tool.inputSchema as Record<string, unknown>;
+    assert.equal(schema.type, "object", `${name} inputSchema must be object-rooted`);
+    assert.notEqual(schema.additionalProperties, false, `${name} top-level inputSchema must not reject unknown keys`);
+    const props = schema.properties as Record<string, Record<string, unknown>> | undefined;
+    assert.ok(props && typeof props === "object" && !Array.isArray(props), `${name} inputSchema must define properties`);
+    assert.deepEqual(Object.keys(props), expected.properties, `${name} advertised unexpected property keys`);
+    assert.deepEqual(schema.required, expected.required, `${name} advertised unexpected required fields`);
+    if (expected.properties.includes("deviceId")) {
+      assert.equal(props.deviceId?.type, "string");
+      assert.match(String(props.deviceId?.pattern ?? ""), /^\^\[0-9a-f\]\{8\}-/);
+    }
+    if (expected.properties.includes("tabId")) {
+      assert.deepEqual({ type: props.tabId?.type, minLength: props.tabId?.minLength, maxLength: props.tabId?.maxLength }, { type: "string", minLength: 1, maxLength: 512 });
+    }
+    if (expected.properties.includes("expectedRevision")) {
+      assert.deepEqual({ type: props.expectedRevision?.type, pattern: props.expectedRevision?.pattern }, { type: "string", pattern: "^[a-f0-9]{64}$" });
+    }
+    if (expected.properties.includes("width")) {
+      assert.deepEqual({ type: props.width?.type, minimum: props.width?.minimum, maximum: props.width?.maximum }, { type: "integer", minimum: 64, maximum: 1600 });
+    }
+    if (expected.properties.includes("quality")) {
+      assert.deepEqual({ type: props.quality?.type, enum: props.quality?.enum }, { type: "string", enum: ["standard", "high"] });
+    }
+  }
+  const readProps = (toolsByName.get("read_tab")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+  assert.deepEqual({ minimum: readProps.offset?.minimum, maximum: readProps.offset?.maximum }, { minimum: 0, maximum: 20_000_000 });
+  assert.deepEqual({ minimum: readProps.limit?.minimum, maximum: readProps.limit?.maximum }, { minimum: 1, maximum: 12_000 });
+  const searchProps = (toolsByName.get("search_tab")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+  assert.deepEqual({ minimum: searchProps.limit?.minimum, maximum: searchProps.limit?.maximum }, { minimum: 1, maximum: 25 });
+  assert.deepEqual({ minimum: searchProps.context?.minimum, maximum: searchProps.context?.maximum }, { minimum: 0, maximum: 500 });
+  const assetProps = (toolsByName.get("asset_action")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+  assert.deepEqual({ minimum: assetProps.offset?.minimum, maximum: assetProps.offset?.maximum }, { minimum: 0, maximum: 1_048_576 });
+  assert.deepEqual({ minimum: assetProps.limit?.minimum, maximum: assetProps.limit?.maximum }, { minimum: 1, maximum: 12_000 });
+  const docProps = (toolsByName.get("document_action")!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties;
+  const docOptionsProps = (docProps.options as { properties?: Record<string, Record<string, unknown>> } | undefined)?.properties ?? {};
+  assert.deepEqual(Object.keys(docOptionsProps), [
+    "pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed",
+    "section", "offset", "background", "saveAs", "discardChanges", "archive", "title", "format", "repairIndices", "filename", "jobId", "limit", "width", "quality",
+  ]);
+  for (const opToolName of ["patch_tab", "document_action"] as const) {
+    const opsItems = ((toolsByName.get(opToolName)!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties.operations?.items ?? {}) as { oneOf?: Array<Record<string, unknown>> };
+    assert.equal(opsItems.oneOf?.length, 3, `${opToolName} operations must expose all three patch variants`);
+    for (const branch of opsItems.oneOf ?? []) assert.equal(branch.additionalProperties, false, `${opToolName} patch variants must stay strict`);
+  }
+
   const devices = await http.callTool({ name: "list_devices", arguments: {} });
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Test Android/);
   assert.match(String(devices.content?.[0]?.type === "text" ? devices.content[0].text : ""), /Untitled\.md/);
+  const devicesWithUnknownMeta = await http.callTool({ name: "list_devices", arguments: { extraTopLevelMeta: "ignored" } });
+  assert.equal(devicesWithUnknownMeta.isError, undefined, "zero-argument tools strip unknown top-level arguments");
+  const tabsWithUnknownMeta = await http.callTool({ name: "list_tabs", arguments: { deviceId, extraTopLevelMeta: "ignored" } });
+  assert.equal(tabsWithUnknownMeta.isError, undefined, "parameterized tools strip unknown top-level arguments");
+  assert.equal("extraTopLevelMeta" in (fastRequests.at(-1) ?? {}), false, "unknown top-level arguments never reach device RPC");
   // The discoverable schema must teach an unfamiliar agent the operation
   // shapes before it edits a note, and typos must never reach a device.
   const patchTool = list.tools.find(item => item.name === "patch_tab")!;
@@ -130,6 +198,9 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   const badPatch = await http.callTool({name:"patch_tab",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",expectedRevision:revision,operations:[{type:"lines",start_line:1,end_line:1,text:"test",startLine:1}]}});
   assert.equal(badPatch.isError,true);
   assert.equal(fastRequests.length,beforeInvalidPatch,"unknown operation fields never reach a device");
+  const badDocPatch = await http.callTool({name:"document_action",arguments:{deviceId,documentAction:"create",operations:[{type:"insert",line:1,text:"test",extraNestedField:true}]}});
+  assert.equal(badDocPatch.isError,true);
+  assert.equal(fastRequests.length,beforeInvalidPatch,"unknown nested operation fields in document_action never reach a device");
   await http.callTool({name:"search_tab",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",query:"Ward",offset:100,wholeWord:true,excludeDiagrams:true,caseSensitive:true,limit:4}});
   assert.deepEqual(Object.fromEntries(Object.entries(fastRequests.at(-1)!).filter(([key])=>["offset","wholeWord","excludeDiagrams","caseSensitive","limit"].includes(key))),{offset:100,limit:4,caseSensitive:true,wholeWord:true,excludeDiagrams:true});
   await http.callTool({name:"diagram_action",arguments:{deviceId,tabId:"tab:"+deviceId+":main:1",diagramAction:"list",offset:10,limit:5}});
@@ -308,6 +379,40 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   fastContext = undefined;
   fastCaptureContext = undefined;
 
+  fastContext = {
+    tabId: "note-17",
+    revision,
+    mode: "reader",
+    reading: { offset: 10, heading: "Walkthrough", visibleText: "Gradient Descent — Step 3: Optimum\nZero slope reached." },
+    activeStep: { deckTitle: "Gradient Descent", stepLabel: "Step 3: Optimum", stepIndex: 2, stepCount: 3, activeStep: true, expanded: true },
+    visibleSource: { text: "# Walkthrough", start: 0, end: 13, total_chars: 13, next_offset: null },
+  };
+  fastCaptureContext = {
+    tabId: "note-17",
+    revision,
+    sourceLength: 13,
+    mode: "reader",
+    reading: { offset: 0, heading: "Walkthrough", visibleText: "Gradient Descent — Step 3: Optimum\nZero slope reached." },
+    activeStep: { deckTitle: "Gradient Descent", stepLabel: "Step 3: Optimum", stepIndex: 2, stepCount: 3, activeStep: true, expanded: true },
+    visibleSource: { text: "# Walkthrough", start: 0, end: 13, total_chars: 13, next_offset: null },
+    diagrams: [{ id: "diagram:step:2:2", kind: "smd-diagram", sourceStart: 2, sourceEnd: 13, sourceChars: 11, preview: "Gradient Descent — Step 3: Optimum", deckTitle: "Gradient Descent", stepLabel: "Step 3: Optimum", stepIndex: 2, stepCount: 3, activeStep: true }],
+    pythonCells: [{ ordinal: 0, sourceStart: 0, sourceEnd: 13, ok: true, stdout: "converged\n", stderr: "", figureIds: ["diagram:python:0:0"] }],
+  };
+  const stepPortalView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: true } });
+  assert.equal(stepPortalView.isError, undefined);
+  const stepPortalPayload = JSON.parse(String(stepPortalView.content?.[1]?.type === "text" ? stepPortalView.content[1].text : "{}"));
+  assert.equal(stepPortalPayload.readingContext.activeStep.stepIndex, 2);
+  assert.equal(stepPortalPayload.readingContext.activeStep.deckTitle, "Gradient Descent");
+  assert.equal(stepPortalPayload.readingContext.activeStep.stepLabel, "Step 3: Optimum");
+  assert.equal(stepPortalPayload.readingContext.activeStep.stepCount, 3);
+  assert.equal(stepPortalPayload.readingContext.activeStep.activeStep, true);
+  assert.equal(stepPortalPayload.readingContext.diagrams[0].stepIndex, 2);
+  assert.equal(stepPortalPayload.readingContext.diagrams[0].activeStep, true);
+  assert.equal(stepPortalPayload.readingContext.reading.visibleText.includes("Zero slope reached."), true);
+  assert.deepEqual(stepPortalPayload.readingContext.pythonCells[0].figureIds, ["diagram:python:0:0"]);
+  fastContext = undefined;
+  fastCaptureContext = undefined;
+
   fastContext = { tabId: mediaTab, revision, reading: { offset: 123 }, visibleSource: { text: "Before scroll source", start: 123, end: 200 } };
   fastImageMetadata = { tabId: mediaTab, reading: { offset: 456, heading: "Scrolled during capture" }, selection: { text: "" } };
   const androidMovedView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
@@ -445,7 +550,9 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   const sseTransport = new SSEClientTransport(url);
   await sse.connect(sseTransport);
   t.after(async () => { await sse.close().catch(() => undefined); await sseTransport.close().catch(() => undefined); });
-  assert((await sse.listTools()).tools.some((x) => x.name === "list_devices"));
+  const sseTools = await sse.listTools();
+  assert(sseTools.tools.some((x) => x.name === "list_devices"));
+  assert.deepEqual(sseTools.tools, list.tools, "legacy SSE advertises identical object-rooted schemas for all 11 tools");
   assert.equal((await sse.callTool({ name: "list_tabs", arguments: { deviceId } })).isError, undefined);
   dropNext = true;
   assert.equal((await sse.callTool({ name: "read_tab", arguments: { deviceId, tabId: "tab:" + deviceId + ":main:1" } })).isError, true);
