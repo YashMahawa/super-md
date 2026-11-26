@@ -3,6 +3,7 @@ package dev.supermd.studio
 import android.app.Application
 import android.net.Uri
 import java.io.File
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -11,14 +12,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-data class PendingSeededFind(
-    val query: String,
-    val caseSensitive: Boolean,
-    val nonce: Long = System.nanoTime(),
-    val targetTabId: String? = null,
-    val targetUri: String? = null,
-)
 
 internal class FolderSearchController(
     private val app: Application,
@@ -59,7 +52,14 @@ internal class FolderSearchController(
         folderSearchJob = scope.launch {
             if (readState().tabs.isNotEmpty()) {
                 val activeId = readState().active.id
-                if (activeId.isNotEmpty()) runCatching { flushActiveReader(activeId) }
+                if (activeId.isNotEmpty()) {
+                    try {
+                        flushActiveReader(activeId)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                    }
+                }
             }
             if (nextQuery.isNotEmpty()) {
                 runFolderSearchScan(nextQuery, previous.caseSensitive, previous.includeDiagrams)
