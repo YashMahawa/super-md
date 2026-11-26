@@ -8,7 +8,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _headings, diagram_spans, outline_source, resolve_heading, search_source, section_source
+from agent_documents import (
+    AgentDocumentError,
+    DocumentStore,
+    RevisionConflict,
+    _headings,
+    diagram_spans,
+    outline_source,
+    resolve_heading,
+    search_source,
+    section_source,
+)
 from documents import atomic_write, compressed_bundle
 
 
@@ -108,7 +118,7 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertEqual(page["svg_omissions"][0]["source_start"], source.index("<svg>"))
 
     def test_heading_read_search_and_line_patch_keep_exact_embedded_asset(self):
-        svg = "<svg><text>Exact α</text></svg>".encode("utf-8")
+        svg = "<svg><text>Exact α</text></svg>".encode()
         encoded = "data:image/svg+xml;base64," + base64.b64encode(svg).decode()
         source = "# Title\nfirst line\nsecond phrase\n\n## Child\nchild text\n"
         path = self.root / "edit.smd"
@@ -221,7 +231,7 @@ class AgentDocumentsTest(unittest.TestCase):
 
     def test_patch_validation_insert_summaries_and_expected_counts(self):
         path = self.root / "patch-contract.md"
-        path.write_bytes("😀 one\none one\n".encode("utf-8"))
+        path.write_bytes("😀 one\none one\n".encode())
         revision = self.store.inspect("patch-contract.md")["revision"]
         result = self.store.patch("patch-contract.md", expected_revision=revision, operations=[
             {"type": "replace", "old": "one", "new": "two", "expectedCount": 3},
@@ -311,7 +321,6 @@ class AgentDocumentsTest(unittest.TestCase):
         asset_file.write_bytes(png)
         unicode_asset = self.root / "图形 with space.svg"
         unicode_asset.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'></svg>")
-        portable = self.root / "portable.smd"
         self.store.create("portable.smd", "# Image\n")
         revision = self.store.inspect("portable.smd")["revision"]
         attached = self.store.attach_asset("portable.smd", "图形 with space.svg", expected_revision=revision)
@@ -328,7 +337,7 @@ class AgentDocumentsTest(unittest.TestCase):
                                      expected_revision=attached["revision"])
 
     def test_explicit_asset_read_returns_exact_bytes_only_for_current_revision(self):
-        payload = "<svg xmlns='http://www.w3.org/2000/svg'><text>Σ</text></svg>".encode("utf-8")
+        payload = "<svg xmlns='http://www.w3.org/2000/svg'><text>Σ</text></svg>".encode()
         import base64
         data_url = "data:image/svg+xml;base64," + base64.b64encode(payload).decode("ascii")
         path = self.root / "asset.smd"
@@ -436,8 +445,9 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertEqual(headless.returncode, 0, headless.stderr)
 
     def test_text_operations_skip_asset_decoding_and_reuse_stat_verified_envelope_cache(self):
-        import documents
         from unittest.mock import patch
+
+        import documents
 
         png = b"\x89PNG\r\n\x1a\n" + (b"raster-bytes-" * 200)
         assets = {
@@ -503,9 +513,10 @@ class AgentDocumentsTest(unittest.TestCase):
             self.assertEqual(b64_spy.call_count, 0)
 
     def test_inspect_assets_read_asset_and_extract_decode_on_demand_and_memoize(self):
+        from unittest.mock import patch
+
         import agent_documents
         import documents
-        from unittest.mock import patch
 
         assets = {
             f"assets/img_{i:03d}.png": "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + f"img-{i}".encode()).decode("ascii")
@@ -603,8 +614,9 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertEqual(bad_note.read_bytes(), bad_bytes)
 
     def test_envelope_cache_invalidation_mutations_and_lru_byte_budget(self):
-        import documents
         from unittest.mock import patch
+
+        import documents
 
         created = self.store.create("lifecycle.smd", "# V1\n")
         rev = created["revision"]
@@ -653,8 +665,9 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertLess(len(small_store._cache), 6)
 
     def test_single_pass_fence_boundary_scan_across_headings_svg_and_diagrams(self):
-        import agent_documents
         from unittest.mock import patch
+
+        import agent_documents
 
         source = (
             "😀 Intro line\n"
@@ -838,8 +851,9 @@ class AgentDocumentsTest(unittest.TestCase):
         )
 
     def test_shared_fence_scanner_recognizes_braced_python_and_mermaid_with_exact_offsets_and_unclosed_fences(self):
-        import agent_documents
         from unittest.mock import patch
+
+        import agent_documents
 
         source = (
             "😀 Lead needle\r\n"
@@ -921,8 +935,9 @@ class AgentDocumentsTest(unittest.TestCase):
 
     def test_read_source_contract_and_agent_package_facade_identity(self):
         import importlib
+
         import agent_documents
-        from agent import source_ops
+        from agent import fs_ops, patches, source_ops, store
 
         repo_root = str(Path(__file__).resolve().parent.parent)
         added_root = repo_root not in sys.path
@@ -931,16 +946,23 @@ class AgentDocumentsTest(unittest.TestCase):
         try:
             pkg_agent_documents = importlib.import_module("desktop.agent_documents")
             pkg_source_ops = importlib.import_module("desktop.agent.source_ops")
+            pkg_patches = importlib.import_module("desktop.agent.patches")
+            pkg_fs_ops = importlib.import_module("desktop.agent.fs_ops")
+            pkg_store = importlib.import_module("desktop.agent.store")
         finally:
             if added_root and repo_root in sys.path:
                 sys.path.remove(repo_root)
 
         self.assertIs(pkg_agent_documents, agent_documents)
         self.assertIs(pkg_source_ops, source_ops)
+        self.assertIs(pkg_patches, patches)
+        self.assertIs(pkg_fs_ops, fs_ops)
+        self.assertIs(pkg_store, store)
         self.assertIs(source_ops.AgentDocumentError, AgentDocumentError)
         self.assertIs(source_ops.RevisionConflict, RevisionConflict)
         self.assertIs(source_ops.read_source, agent_documents.read_source)
         self.assertIs(pkg_agent_documents.DocumentStore, DocumentStore)
+        self.assertIs(store.DocumentStore, DocumentStore)
 
         source = "# Intro\nLead.\n## 1.2 Charts\n```svg\n<svg><circle/></svg>\n```\nBody.\n## 2. End\nTail.\n"
         prose = source_ops.read_source(source, heading="1.2", view="prose")
@@ -971,6 +993,129 @@ class AgentDocumentsTest(unittest.TestCase):
             self.store.patch("validation-order.md", expected_revision=stale_revision, operations=[])
         self.assertNotIsInstance(ctx.exception, RevisionConflict)
 
+    def test_patch_validates_pre_lock_and_runs_validation_once_per_store_patch(self):
+        from unittest.mock import patch
+
+        from agent import fs_ops, patches
+
+        created = self.store.create("single-pass-patch.md", "# Title\nalpha\nbeta\n")
+        revision = created["revision"]
+        stale_revision = "f" * 64
+        with (
+            patch.object(fs_ops, "_path_lock", wraps=fs_ops._path_lock) as lock_spy,
+            patch.object(patches, "validate_patch_operations", wraps=patches.validate_patch_operations) as validate_spy,
+        ):
+            with self.assertRaises(AgentDocumentError) as ctx:
+                self.store.patch(
+                    "single-pass-patch.md",
+                    expected_revision=stale_revision,
+                    operations=[{"type": "replace", "old": "", "new": "x"}],
+                )
+            self.assertNotIsInstance(ctx.exception, RevisionConflict)
+            self.assertEqual(validate_spy.call_count, 1)
+            self.assertEqual(lock_spy.call_count, 0)
+
+            validate_spy.reset_mock()
+            lock_spy.reset_mock()
+            updated = self.store.patch(
+                "single-pass-patch.md",
+                expected_revision=revision,
+                operations=[
+                    {"type": "replace", "old": "alpha", "new": "omega"},
+                    {"type": "insert", "line": 3, "text": "gamma\n"},
+                ],
+            )
+            self.assertTrue(updated["saved"])
+            self.assertEqual(validate_spy.call_count, 1)
+            self.assertEqual(lock_spy.call_count, 1)
+            self.assertEqual(
+                self.store.read("single-pass-patch.md", view="source")["text"],
+                "# Title\nomega\ngamma\nbeta\n",
+            )
+
+            validate_spy.reset_mock()
+            self.assertEqual(
+                patches.apply_patch_operations("one\n", [{"type": "replace", "old": "one", "new": "two"}]),
+                "two\n",
+            )
+            self.assertEqual(validate_spy.call_count, 1)
+            with self.assertRaises(AgentDocumentError):
+                patches.apply_patch_operations_detailed("one\n", [])
+            self.assertEqual(validate_spy.call_count, 2)
+
+    def test_dual_topology_clean_subprocesses_preserve_singletons_and_avoid_gui_or_mcp_imports(self):
+        desktop_dir = Path(__file__).resolve().parent
+        repo_root = desktop_dir.parent
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        probe_from_repo = (
+            "import importlib, sys\n"
+            "from unittest.mock import patch\n"
+            "from desktop import agent_documents as pkg_ad\n"
+            "from desktop.agent import fs_ops as pkg_fs, patches as pkg_p, source_ops as pkg_so, store as pkg_st\n"
+            "assert 'PySide6' not in sys.modules and 'mcp' not in sys.modules\n"
+            f"sys.path.insert(0, {str(desktop_dir)!r})\n"
+            "import agent_documents as flat_ad\n"
+            "from agent import fs_ops as flat_fs, patches as flat_p, source_ops as flat_so, store as flat_st\n"
+            "assert pkg_ad is flat_ad and pkg_fs is flat_fs and pkg_p is flat_p and pkg_so is flat_so and pkg_st is flat_st\n"
+            "assert pkg_ad.DocumentStore is flat_st.DocumentStore\n"
+            "with patch.object(pkg_ad, '_step_fence_boundary', wraps=pkg_ad._step_fence_boundary) as spy:\n"
+            "    pkg_ad.diagram_spans('```svg\\n<svg/>\\n```\\n')\n"
+            "    assert spy.call_count == 3\n"
+        )
+        probe_from_desktop = (
+            "import importlib, sys\n"
+            "from unittest.mock import patch\n"
+            "import agent_documents as flat_ad\n"
+            "from agent import fs_ops as flat_fs, patches as flat_p, source_ops as flat_so, store as flat_st\n"
+            "assert 'PySide6' not in sys.modules and 'mcp' not in sys.modules\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "pkg_ad = importlib.import_module('desktop.agent_documents')\n"
+            "pkg_fs = importlib.import_module('desktop.agent.fs_ops')\n"
+            "pkg_p = importlib.import_module('desktop.agent.patches')\n"
+            "pkg_so = importlib.import_module('desktop.agent.source_ops')\n"
+            "pkg_st = importlib.import_module('desktop.agent.store')\n"
+            "assert pkg_ad is flat_ad and pkg_fs is flat_fs and pkg_p is flat_p and pkg_so is flat_so and pkg_st is flat_st\n"
+            f"ws = flat_ad.DocumentStore([{str(self.root)!r}])\n"
+            "ws.create('probe.md', '# Probe\\n')\n"
+            "with patch.object(pkg_ad, 'digest_bytes', wraps=pkg_ad.digest_bytes) as dspy:\n"
+            "    ws.create('probe2.md', '# Probe 2\\n')\n"
+            "    assert dspy.call_count >= 1\n"
+            "assert 'PySide6' not in sys.modules and 'mcp' not in sys.modules\n"
+        )
+        for cwd, code in ((repo_root, probe_from_repo), (desktop_dir, probe_from_desktop)):
+            proc = subprocess.run(
+                [sys.executable, "-c", code],
+                cwd=str(cwd), env=env, capture_output=True, text=True, encoding="utf-8", check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_hidden_paths_rejected_and_inspect_supports_frontmatter_properties_hook(self):
+        from unittest.mock import patch
+
+        import frontmatter
+
+        (self.root / ".hidden.md").write_text("# Secret\n", encoding="utf-8")
+        hidden_dir = self.root / ".git"
+        hidden_dir.mkdir()
+        (hidden_dir / "config").write_text("x\n", encoding="utf-8")
+        sub = self.root / "sub"
+        sub.mkdir()
+        for rel in (".hidden.md", ".git/config", "sub/../.hidden.md"):
+            with self.assertRaisesRegex(AgentDocumentError, "Hidden files and directories"):
+                self.store.resolve(rel)
+        with self.assertRaisesRegex(AgentDocumentError, "Hidden files and directories"):
+            self.store.resolve(".new.md", must_exist=False)
+
+        fm_note = "---\ntitle: Spec\n# Hidden Heading\n---\n# Real Heading\nBody\n"
+        (self.root / "fm.md").write_text(fm_note, encoding="utf-8")
+        info_default = self.store.inspect("fm.md")
+        if not hasattr(frontmatter, "parse_frontmatter"):
+            self.assertNotIn("properties", info_default)
+        fm_end = frontmatter.frontmatter_end(fm_note)
+        with patch.object(frontmatter, "parse_frontmatter", create=True, return_value=(fm_end, {"title": "Spec"})):
+            info_props = self.store.inspect("fm.md")
+        self.assertEqual(info_props["properties"], {"title": "Spec"})
+        self.assertEqual([h["title"] for h in info_props["headings"]], ["Real Heading"])
 
 
 if __name__ == "__main__":
