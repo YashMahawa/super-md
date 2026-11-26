@@ -33,7 +33,7 @@ function validatePage(page, label) {
   return list;
 }
 
-export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
+function inspectProducerReadiness({ repository, runId, run, jobsPage }) {
   const expectedRunId = Number(runId);
   if (run?.id !== expectedRunId) throw new Error(`GitHub returned workflow run ${run?.id}, expected ${runId}`);
   if (run?.repository?.full_name?.toLowerCase() !== repository.toLowerCase()) {
@@ -45,14 +45,22 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   if (producerJobs.length > 1) throw new Error('Ambiguous native frontend producer jobs in this workflow run');
   if (producerJobs.length === 0) {
     if (run.status === 'completed') throw new Error('Native frontend producer is missing from the completed workflow run');
-    return { ready: false, reason: 'producer job has not been registered yet' };
+    return { ready: false, producerRegistered: false, reason: 'producer job has not been registered yet' };
   }
 
   const [producer] = producerJobs;
   if (producer.status === 'completed' && producer.conclusion !== 'success') {
     throw new Error(`Native frontend producer failed (${producer.conclusion || 'unknown'}); refusing fallback`);
   }
-  if (producer.status !== 'completed') return { ready: false, reason: `producer job is ${producer.status}` };
+  if (producer.status !== 'completed') {
+    return { ready: false, producerRegistered: true, reason: `producer job is ${producer.status}` };
+  }
+  return { ready: true, producerRegistered: true };
+}
+
+export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
+  const producerState = inspectProducerReadiness({ repository, runId, run, jobsPage });
+  if (!producerState.ready) return { ready: false, reason: producerState.reason };
 
   const artifacts = validatePage(artifactsPage, 'workflow artifacts');
   const expected = frontendArtifactNames(sourceSha);
@@ -66,7 +74,42 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   return { ready: true, names: expected };
 }
 
-async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
+function parseRetryAfterMs(headers, nowMs) {
+  const getHeader = name => headers?.get?.(name) ?? null;
+  const retryAfter = getHeader('retry-after');
+  if (retryAfter !== null) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.ceil(seconds * 1_000);
+    const retryDate = Date.parse(retryAfter);
+    if (Number.isFinite(retryDate)) return Math.max(0, retryDate - nowMs);
+  }
+  const reset = getHeader('x-ratelimit-reset');
+  if (reset !== null && getHeader('x-ratelimit-remaining') === '0') {
+    const resetEpochSeconds = Number(reset);
+    if (Number.isFinite(resetEpochSeconds) && resetEpochSeconds > 0) {
+      return Math.max(0, Math.ceil(resetEpochSeconds * 1_000 - nowMs) + 1_000);
+    }
+  }
+  return null;
+}
+
+async function isRateLimitedForbidden(response) {
+  const getHeader = name => response.headers?.get?.(name) ?? null;
+  if (getHeader('retry-after') !== null || getHeader('x-ratelimit-remaining') === '0') {
+    return true;
+  }
+  if (typeof response.text === 'function') {
+    try {
+      const bodyText = await response.text();
+      if (/rate[- ]limit/i.test(bodyText)) return true;
+    } catch {
+      // Ignore body read failures and fall through to fail closed.
+    }
+  }
+  return false;
+}
+
+async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -79,12 +122,18 @@ async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
     });
   } catch (error) {
     if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || error instanceof TypeError) {
-      return { retry: true, status: error.name || 'network-error' };
+      return { retry: true, status: error.name || 'network-error', retryAfterMs: null };
     }
     throw error;
   }
   if (!response.ok) {
-    if (response.status >= 500 || response.status === 429) return { retry: true, status: response.status };
+    const retryAfterMs = parseRetryAfterMs(response.headers, nowMs);
+    if (response.status >= 500 || response.status === 429) {
+      return { retry: true, status: response.status, retryAfterMs };
+    }
+    if (response.status === 403 && await isRateLimitedForbidden(response)) {
+      return { retry: true, status: response.status, retryAfterMs };
+    }
     throw new Error(`GitHub Actions API request failed with HTTP ${response.status}`);
   }
   return { value: await response.json() };
@@ -98,41 +147,75 @@ export async function waitForNativeFrontendArtifacts({
   apiUrl,
   fetchImpl = fetch,
   sleep = delay,
-  timeoutMs = 600_000,
-  pollIntervalMs = 5_000,
+  timeoutMs = 1_200_000,
+  pollIntervalMs = 10_000,
   now = Date.now,
 }) {
   const endpoint = assertInputs({ repository, runId, sourceSha, token, apiUrl });
-  const names = frontendArtifactNames(sourceSha);
+  frontendArtifactNames(sourceSha);
+  const baseUrl = `${endpoint.href.replace(/\/?$/, '/')}`;
   const runPath = `repos/${repository}/actions/runs/${runId}`;
   const started = now();
   const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
-  const pause = async () => {
+  const pause = async (retryAfterMs = null) => {
     const left = timeoutMs - (now() - started);
-    if (left > 0) await sleep(Math.min(pollIntervalMs, left));
+    if (left <= 0) return;
+    const desiredMs = retryAfterMs !== null ? Math.max(pollIntervalMs, retryAfterMs) : pollIntervalMs;
+    await sleep(Math.min(desiredMs, left));
   };
-  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
+  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()), now());
+  let cachedRun = null;
   while (now() - started < timeoutMs) {
-    const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
-    if (runResult.retry) {
-      await pause();
-      continue;
+    let fetchedRunThisPoll = false;
+    if (!cachedRun) {
+      const runResult = await request(new URL(runPath, baseUrl));
+      if (runResult.retry) {
+        await pause(runResult.retryAfterMs);
+        continue;
+      }
+      cachedRun = runResult.value;
+      fetchedRunThisPoll = true;
     }
-    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
+    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, baseUrl));
     if (jobsResult.retry) {
+      await pause(jobsResult.retryAfterMs);
+      continue;
+    }
+    let producerState = inspectProducerReadiness({
+      repository,
+      runId,
+      run: cachedRun,
+      jobsPage: jobsResult.value,
+    });
+    if ((!producerState.producerRegistered || producerState.ready) && !fetchedRunThisPoll) {
+      const freshRunResult = await request(new URL(runPath, baseUrl));
+      if (freshRunResult.retry) {
+        await pause(freshRunResult.retryAfterMs);
+        continue;
+      }
+      cachedRun = freshRunResult.value;
+      fetchedRunThisPoll = true;
+      producerState = inspectProducerReadiness({
+        repository,
+        runId,
+        run: cachedRun,
+        jobsPage: jobsResult.value,
+      });
+    }
+    if (!producerState.ready) {
       await pause();
       continue;
     }
-    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
+    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, baseUrl));
     if (artifactsResult.retry) {
-      await pause();
+      await pause(artifactsResult.retryAfterMs);
       continue;
     }
     const state = inspectFrontendArtifactReadiness({
       repository,
       runId,
       sourceSha,
-      run: runResult.value,
+      run: cachedRun,
       jobsPage: jobsResult.value,
       artifactsPage: artifactsResult.value,
     });
