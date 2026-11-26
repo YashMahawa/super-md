@@ -7,6 +7,7 @@ import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
 import { maskFrontmatter, parseFrontmatter } from "./frontmatter";
 import { remarkObsidianMath } from "./obsidianMath";
+import { svgImage } from "./svgImage";
 
 type ImageRef = { source: string; start: number; end: number; image: boolean; definition?: { start: number; end: number } };
 const APP_GENERATED = /^assets\/(?:import|image)-[a-z0-9-]+\.(?:png|jpe?g|svg|gif|webp|avif)$/i;
@@ -79,12 +80,12 @@ function cleanRelativePath(source: string): string | null {
   return parts.join("/");
 }
 
-function sourceFence(source: string, language: "svg" | "mermaid"): string {
+function sourceFence(source: string, language: "mermaid"): string {
   const runs = [...source.matchAll(/`+/g)].map(match => match[0].length);
   const fence = "`".repeat(Math.max(3, ...runs.map(length => length + 1)));
   return `${fence}${language}\n${source.replace(/\s+$/, "")}\n${fence}`;
 }
-function sourceFenceBlock(source: string, language: "svg" | "mermaid"): string {
+function sourceFenceBlock(source: string, language: "mermaid"): string {
   return `\n\n${sourceFence(source, language)}\n\n`;
 }
 
@@ -103,9 +104,10 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
   const shared = new Map<string, Promise<{ mime: string; dataUrl: string; text?: string } | { mermaid: string }>>();
   const references = refs(markdown);
   const definitionsToRemove = new Map<number, { start: number; end: number }>();
+  const keptDefinitions = new Set<number>();
   const reservedPaths = new Set(references.flatMap(({ source }) => {
     const path = cleanRelativePath(source);
-    return path && !APP_GENERATED.test(path) && (!/\.(?:svg|mmd|mermaid)$/i.test(path)||options.compatible&&/\.svg$/i.test(path)) ? [path] : [];
+    return path && !APP_GENERATED.test(path) && !/\.(?:mmd|mermaid)$/i.test(path) ? [path] : [];
   }));
   const generatedPaths = new Map<string, string>();
   const usedPaths = new Set(reservedPaths);
@@ -121,7 +123,10 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
     return candidate;
   };
   for (const ref of references) {
-    if (/^https?:|^\/\//i.test(ref.source)) continue;
+    if (/^https?:|^\/\//i.test(ref.source)) {
+      if (ref.definition) keptDefinitions.add(ref.definition.start);
+      continue;
+    }
     if (!shared.has(ref.source)) shared.set(ref.source, (async () => {
       if (/\.(?:mmd|mermaid)(?:[?#]|$)/i.test(ref.source)) {
         if (ref.source.startsWith("data:")) throw Error("Mermaid source must be a local .mmd or .mermaid file");
@@ -135,6 +140,7 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
       if (ref.source.startsWith("data:")) {
         const decoded = decodeDataUrl(ref.source);
         if (!decoded) throw Error("Markdown export contains an unsupported or invalid embedded image");
+        if (decoded.mime === "image/svg+xml") svgImage(decoded.text!);
         return decoded;
       }
       const path = cleanRelativePath(ref.source);
@@ -142,6 +148,7 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
       const value = await invoke<string>("load_asset", { documentPath: documentPath || "", source: ref.source });
       const decoded = decodeDataUrl(value);
       if (!decoded) throw Error(`Image is unavailable or unsupported: ${ref.source}`);
+      if (decoded.mime === "image/svg+xml") svgImage(decoded.text!);
       return decoded;
     })());
     const resolved = await shared.get(ref.source)!;
@@ -151,11 +158,6 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
       continue;
     }
     if (!MIME_EXT[resolved.mime]) throw Error(`Image format is not supported for Markdown export: ${ref.source}`);
-    if (!options.compatible && resolved.mime === "image/svg+xml" && resolved.text !== undefined) {
-      edits.push({ start: ref.start, end: ref.end, value: sourceFenceBlock(resolved.text, "svg") });
-      if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
-      continue;
-    }
     const relative = cleanRelativePath(ref.source);
     const generatedKey = relative ?? ref.source;
     const renamed = ref.source.startsWith("data:") || !relative || APP_GENERATED.test(relative);
@@ -166,13 +168,24 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
     if ((ref.image && renamed) || options.compatible && !ref.image && resolved.mime === "image/svg+xml") {
       const slice = markdown.slice(ref.start, ref.end);
       const wikilinkAlt = /^!\[\[[^\]|]+(?:\|([^\]]+))?\]\]$/.exec(slice);
-      const altMatch = wikilinkAlt ? [slice, wikilinkAlt[1] ?? ""] : slice.match(/^!\[([^\]]*)\]/);
+      const altMatch = wikilinkAlt ? [slice, wikilinkAlt[1] ?? ""] : slice.match(/^!?\[([^\]]*)\]/);
       const label = ref.source.startsWith("data:") ? "Image" : (relative ?? ref.source).split("/").pop() || "Image";
       const alt = (altMatch?.[1] || label).replace(/[\[\]\\]/g, "\\$&").replace(/[\r\n]+/g, " ");
       edits.push({ start: ref.start, end: ref.end, value: `![${alt}](<${path}>)` });
+      if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
+    } else if (!ref.image && renamed) {
+      const slice = markdown.slice(ref.start, ref.end);
+      const linkMatch = slice.match(/^\[([^\]]*)\]/);
+      const label = (relative ?? ref.source).split("/").pop() || path;
+      const text = (linkMatch?.[1] || label).replace(/[\[\]\\]/g, "\\$&").replace(/[\r\n]+/g, " ");
+      edits.push({ start: ref.start, end: ref.end, value: `[${text}](<${path}>)` });
+      if (ref.definition) definitionsToRemove.set(ref.definition.start, ref.definition);
+    } else if (ref.definition) {
+      keptDefinitions.add(ref.definition.start);
     }
   }
-  for (const definition of definitionsToRemove.values()) {
+  for (const [start, definition] of definitionsToRemove) {
+    if (keptDefinitions.has(start)) continue;
     const lineStart = markdown.lastIndexOf("\n", definition.start - 1) + 1;
     const lineEnd = markdown.indexOf("\n", definition.end);
     edits.push({ start: lineStart, end: lineEnd < 0 ? markdown.length : lineEnd + 1, value: "" });

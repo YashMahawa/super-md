@@ -169,9 +169,8 @@ def main(argv):
         proc=None
         if not running:
             flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
-            popen_extra={'process_group':0} if sys.platform=='darwin' else {'start_new_session':os.name!='nt'}
             with (root/'background-service.log').open('ab') as log:
-                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,creationflags=flags,**popen_extra)
+                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=os.name!='nt',creationflags=flags)
             deadline=time.monotonic()+30
             while time.monotonic()<deadline:
                 status=request('status',startup_poll=True)

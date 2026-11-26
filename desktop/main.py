@@ -151,13 +151,9 @@ def main():
     session.agent_bridge = create_qt_bridge(session, session.data)
     app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
-    reader_profile_ready = {"initialized": False}
-    def ensure_reader_profile():
-        if reader_profile_ready["initialized"]:
-            return
-        reader_profile_ready["initialized"] = True
-        QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
-    session.ensure_reader_profile = ensure_reader_profile
+    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
+    reader_profile_ready = {"initialized": True}
+    session.ensure_reader_profile = lambda: None
     def detach_window(source_id, tab_id):
         source = session.windows.get(source_id)
         if not source or not source._can_move(): return
@@ -176,8 +172,6 @@ def main():
             destination.tabs, destination.active = welcome, active
             QTimer.singleShot(0, destination.allowClose.emit)
     def create_window(note=None, *, show_window=True):
-        if show_window:
-            ensure_reader_profile()
         engine = QQmlApplicationEngine()
         studio = Studio(args.test_state,session)
         if args.smoke:
@@ -201,6 +195,7 @@ def main():
         if not engine.rootObjects():
             studio.stop()
             studio.pool.shutdown(wait=False, cancel_futures=True)
+            studio._search_pool.shutdown(wait=False, cancel_futures=True)
             engine.deleteLater()
             raise RuntimeError("Native QML window could not be loaded")
         # The user's laptop screen is preferred without changing active desktop focus.
@@ -512,7 +507,6 @@ def main():
     def open_from_service(note=None):
         hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
         if hidden is not None:
-            ensure_reader_profile()
             remembered = session.settings.get("window") or {}
             if isinstance(remembered, dict) and remembered.get("maximized"):
                 hidden.host_window.showMaximized()
@@ -526,6 +520,9 @@ def main():
     try:
         session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
         create_window(args.note,show_window=not args.background)
+        if not args.note and not args.smoke and session.settings.get("startup") == "restore":
+            while session.has_pending_startup_windows():
+                create_window(None, show_window=not args.background)
         if session.settings.get("agentAccessEnabled"):
             try:
                 session.agent_bridge.start()
@@ -567,6 +564,7 @@ def main():
 
 
 _TEARDOWN_COMPLETED = False
+_DARWIN_EXIT_ANCHOR = []
 
 
 def _exit_process(status: int) -> None:
@@ -579,10 +577,12 @@ def _exit_process(status: int) -> None:
 
 
 def _run_teardown(app, session, studios, engines, asset_handler, broker, *, reader_profile_initialized=False):
+    global _TEARDOWN_COMPLETED
     session.agent_bridge.stop()
     for studio in list(studios):
         studio.stop()
         studio.pool.shutdown(wait=False, cancel_futures=True)
+        studio._search_pool.shutdown(wait=False, cancel_futures=True)
     # Don't cancel a user's pending save or final recovery write.
     session.writes.shutdown(wait=True)
     if getattr(session, "background", None) is not None:
@@ -590,6 +590,19 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
         session.background.open_window = None
         if session.background.tray is not None:
             session.background.tray.hide()
+    if sys.platform == "darwin":
+        # On macOS, destroying QQuickWebEngineView / WebEngineContext during
+        # rapid headless start->stop transitions can block indefinitely waiting
+        # on a mid-spawn QtWebEngineProcess Mach port. Flush all Python/disk
+        # state and release the broker lock first, keep Qt/WebEngine wrappers
+        # anchored against GC, and let _exit_process terminate via os._exit
+        # (which atomically releases native-instance.lifecycle in the kernel).
+        if broker:
+            broker.close()
+            broker.set_service_handler(None)
+        _DARWIN_EXIT_ANCHOR[:] = [app, session, list(studios), list(engines), asset_handler, broker]
+        _TEARDOWN_COMPLETED = True
+        return
     for engine in list(engines):
         for root_obj in engine.rootObjects():
             try:
@@ -625,7 +638,6 @@ def _run_teardown(app, session, studios, engines, asset_handler, broker, *, read
             except (RuntimeError, TypeError):
                 pass
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    global _TEARDOWN_COMPLETED
     _TEARDOWN_COMPLETED = True
 
 

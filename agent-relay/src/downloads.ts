@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto';
 
-export type Download = { token:string; groupId:string; deviceId:string; jobId:string; filename:string; format:'md'|'smd'|'pdf'; mimeType:string; bytes:number; sha256:string; expiresAt:number };
+export type Download = { token:string; groupId:string; deviceId:string; jobId:string; filename:string; format:'md'|'mdzip'|'smd'|'pdf'; mimeType:string; bytes:number; sha256:string; expiresAt:number };
 type Reply={result?:unknown;error?:string};
-const MIMES={md:'text/markdown',smd:'application/vnd.supermd.smd',pdf:'application/pdf'} as const;
+const MIMES={md:'text/markdown',mdzip:'application/zip',smd:'application/vnd.supermd.smd',pdf:'application/pdf'} as const;
 export const EXPORT_CHUNK_BYTES=512*1024;
 export const MAX_DOWNLOAD_BYTES=128*1024*1024;
 export function attachmentHeader(filename:string):string {
@@ -24,7 +24,7 @@ export class ExportDownloads {
   issue(groupId:string,deviceId:string,jobId:string,value:unknown):Download|null {
     if(!value||typeof value!=='object'||Array.isArray(value))return null;
     const meta=value as Record<string,unknown>;
-    if(meta.downloadable!==true||(meta.status!=='completed'&&meta.phase!=='completed')||typeof meta.filename!=='string'||!meta.filename||meta.filename.length>256||/[\\/\x00-\x1f\x7f]/.test(meta.filename)||!['md','smd','pdf'].includes(String(meta.format))||!Number.isSafeInteger(meta.bytes)||Number(meta.bytes)<0||Number(meta.bytes)>MAX_DOWNLOAD_BYTES||typeof meta.sha256!=='string'||!/^[a-f0-9]{64}$/.test(meta.sha256))return null;
+    if(meta.downloadable!==true||(meta.status!=='completed'&&meta.phase!=='completed')||typeof meta.filename!=='string'||!meta.filename||meta.filename.length>256||/[\\/\x00-\x1f\x7f]/.test(meta.filename)||!['md','mdzip','smd','pdf'].includes(String(meta.format))||!Number.isSafeInteger(meta.bytes)||Number(meta.bytes)<0||Number(meta.bytes)>MAX_DOWNLOAD_BYTES||typeof meta.sha256!=='string'||!/^[a-f0-9]{64}$/.test(meta.sha256))return null;
     for(const [token,lease] of this.leases)if(lease.expiresAt<=this.now()&&!this.active.has(token))this.leases.delete(token);
     for(const lease of this.leases.values())if(lease.groupId===groupId&&lease.deviceId===deviceId&&lease.jobId===jobId&&lease.sha256===meta.sha256)return lease;
     if(this.leases.size>=this.capacity)return null;

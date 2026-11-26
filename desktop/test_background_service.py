@@ -618,14 +618,6 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 appdata = os.environ["SUPERMD_TEST_APPDATA"]
 downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
 desktop_dir = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
-diag_path = Path(appdata) / "daemon-diag.log"
-def _diag(stage):
-    try:
-        with diag_path.open("a", encoding="utf-8") as _df:
-            _df.write(f"{time.monotonic():.3f} pid={os.getpid()} {stage}\\n")
-    except OSError:
-        pass
-_diag("boot")
 cache_dir = str(Path(appdata) / "cache")
 xdg_data_dir = str(Path(appdata) / "xdg-data")
 Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -637,7 +629,6 @@ if desktop_dir not in sys.path:
 
 import graphics_runtime
 graphics_runtime.configure(safe=True)
-_diag("graphics_configured")
 
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtWidgets import QSystemTrayIcon
@@ -661,7 +652,6 @@ from studio import Studio
 Studio._restore_update = lambda self: None
 
 import main as desktop_main
-_diag("entering_main")
 sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]
 desktop_main._exit_process(desktop_main.main())
 """
@@ -1856,13 +1846,15 @@ desktop_main._exit_process(rc)""",
                 "    m_profile2.return_value.removeUrlSchemeHandler.assert_called_once_with(fake_handler)",
                 "events.clear()",
                 "with patch.object(desktop_main, 'sys', SimpleNamespace(platform='darwin', stdout=sys.stdout, stderr=sys.stderr, exit=MagicMock())) as m_darwin_sys, patch.object(desktop_main.QWebEngineProfile, 'defaultProfile') as m_profile_darwin, patch.object(desktop_main.os, '_exit') as m_os_exit:",
-                "    desktop_main._run_teardown(fake_app, fake_session, [fake_studio], [fake_engine], fake_handler, fake_broker, reader_profile_initialized=False)",
-                "    assert not m_profile_darwin.called, 'Darwin headless teardown must not initialize QWebEngineProfile.defaultProfile()'",
-                "    assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'engine_delete', 'deferred_delete', 'broker_close', 'deferred_delete'], events",
+                "    desktop_main._run_teardown(fake_app, fake_session, [fake_studio], [fake_engine], fake_handler, fake_broker, reader_profile_initialized=True)",
+                "    assert not m_profile_darwin.called, 'Darwin teardown must skip WebEngineContext/QQuickWebEngineView destruction before os._exit'",
+                "    assert events == ['bridge_stop', 'studio_stop', ('writes_shutdown', True), 'broker_close'], events",
+                "    assert desktop_main._DARWIN_EXIT_ANCHOR, 'Darwin teardown must anchor Qt/WebEngine wrappers against GC'",
                 "    assert desktop_main._TEARDOWN_COMPLETED is True",
                 "    desktop_main._exit_process(0)",
                 "    assert m_os_exit.call_args_list == [((0,), {})], m_os_exit.call_args_list",
                 "    assert not m_darwin_sys.exit.called",
+                "    desktop_main._DARWIN_EXIT_ANCHOR.clear()",
                 "    desktop_main._TEARDOWN_COMPLETED = False",
                 "    desktop_main._exit_process(0)",
                 "    assert m_darwin_sys.exit.call_args_list == [((0,), {})], m_darwin_sys.exit.call_args_list",
