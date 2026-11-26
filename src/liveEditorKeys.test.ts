@@ -123,97 +123,20 @@ describe("handleLiveEditorKey", () => {
     });
   });
 
-  describe("Tab and Shift+Tab list indentation", () => {
-    it("indents and outdents unordered, task, and ordered list items while preserving caret position", () => {
-      const indented = press("- First\n- Sec|ond", "Tab");
-      expect(formatResult(indented)).toBe("- First\n  - Sec|ond");
-      const outdented = handleLiveEditorKey({
-        text: indented!.text,
-        selectionStart: indented!.selectionStart,
-        selectionEnd: indented!.selectionEnd,
-        key: "Tab",
-        shiftKey: true,
-      });
-      expect(formatResult(outdented)).toBe("- First\n- Sec|ond");
-
-      const orderedIndented = press("1. First\n2. Sec|ond", "Tab");
-      expect(formatResult(orderedIndented)).toBe("1. First\n   1. Sec|ond");
-      const orderedOutdented = handleLiveEditorKey({
-        text: orderedIndented!.text,
-        selectionStart: orderedIndented!.selectionStart,
-        selectionEnd: orderedIndented!.selectionEnd,
-        key: "Tab",
-        shiftKey: true,
-      });
-      expect(formatResult(orderedOutdented)).toBe("1. First\n2. Sec|ond");
-    });
-
-    it("caps nested indentation at one level deeper than the parent item and keeps root markers on Shift+Tab", () => {
-      const once = press("- Parent\n- Child|", "Tab")!;
-      expect(formatResult(once)).toBe("- Parent\n  - Child|");
-      const capped = handleLiveEditorKey({
-        text: once.text,
-        selectionStart: once.selectionStart,
-        selectionEnd: once.selectionEnd,
-        key: "Tab",
-      });
-      expect(capped).toEqual({
-        text: "- Parent\n  - Child",
-        selectionStart: once.selectionStart,
-        selectionEnd: once.selectionEnd,
-      });
-
-      const rootOutdent = press("- Root item|", "Tab", { shiftKey: true });
-      expect(rootOutdent).toEqual({
-        text: "- Root item",
-        selectionStart: 11,
-        selectionEnd: 11,
-      });
-    });
-
-    it("indents and outdents multi-line selections including loose lists and quoted lists", () => {
-      const multi = press("- Parent\n|- [ ] First child\n\n- [x] Second child|", "Tab")!;
-      expect(formatResult(multi)).toBe("- Parent\n|  - [ ] First child\n\n  - [x] Second child|");
-
-      const cappedMulti = handleLiveEditorKey({
-        text: multi.text,
-        selectionStart: multi.selectionStart,
-        selectionEnd: multi.selectionEnd,
-        key: "Tab",
-      });
-      expect(formatResult(cappedMulti)).toBe("- Parent\n|  - [ ] First child\n\n  - [x] Second child|");
-
-      const outdentedMulti = handleLiveEditorKey({
-        text: multi.text,
-        selectionStart: multi.selectionStart,
-        selectionEnd: multi.selectionEnd,
-        key: "Tab",
-        shiftKey: true,
-      });
-      expect(formatResult(outdentedMulti)).toBe("- Parent\n|- [ ] First child\n\n- [x] Second child|");
-
-      expect(formatResult(press("> - Parent\n> - |Child", "Tab"))).toBe("> - Parent\n>   - |Child");
-    });
-  });
-
   describe("bypass conditions", () => {
-    it("skips IME composition, protected blocks, fenced code blocks, modifiers, and non-list Tab", () => {
+    it("skips IME composition, protected blocks, fenced code blocks, modifiers, selections, and non-Enter keys", () => {
       expect(press("- Item|", "Enter", { isComposing: true })).toBeNull();
-      expect(press("- Item|", "Tab", { isComposing: true })).toBeNull();
       expect(press("- Item|", "Enter", { protectedBlock: true })).toBeNull();
-      expect(press("- Item|", "Tab", { protectedBlock: true })).toBeNull();
       expect(press("- Item|", "Enter", { shiftKey: true })).toBeNull();
       expect(press("- Item|", "Enter", { ctrlKey: true })).toBeNull();
+      expect(press("- |Item|", "Enter")).toBeNull();
       expect(press("|- Item", "Enter")).toBeNull();
       expect(press("---|\n", "Enter")).toBeNull();
-
-      expect(press("Plain paragraph|", "Tab")).toBeNull();
-      expect(press("# Heading|", "Tab", { shiftKey: true })).toBeNull();
-      expect(press("> Quoted paragraph|", "Tab")).toBeNull();
+      expect(press("- Item|", "Tab")).toBeNull();
+      expect(press("- Item|", "Tab", { shiftKey: true })).toBeNull();
 
       expect(press("```python\n- not a list|\n```", "Enter")).toBeNull();
       expect(press("> ```python\n> x = 1|\n> ```", "Enter")).toBeNull();
-      expect(press("- Item\n  ```js\n  - code|\n  ```", "Tab")).toBeNull();
     });
   });
 });
