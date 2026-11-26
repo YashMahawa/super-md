@@ -210,6 +210,58 @@ class StudioUiTest {
         return (org.json.JSONTokener(result.get()).nextValue() as? String)
             ?: error("Expected JavaScript string result, got ${result.get()}")
     }
+    private fun evaluateJavascriptOnce(script: String, timeoutMs: Long = 10_000): String {
+        val result = AtomicReference<String?>(null)
+        compose.activity.runOnUiThread {
+            val reader = requireNotNull(web(compose.activity.window.decorView)) {
+                "Expected attached reader WebView before single JavaScript action"
+            }
+            reader.evaluateJavascript(script) { value -> result.set(value ?: "null") }
+        }
+        try {
+            compose.waitUntil(timeoutMs) { result.get() != null }
+        } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+            val boundedScript = script.replace('\n', ' ').take(240)
+            throw AssertionError("Single JavaScript evaluation timed out; script=$boundedScript", timeout)
+        }
+        return result.get()!!
+    }
+    private fun loadReaderFixture(model: StudioViewModel, content: String, zoom: Float = 100f) {
+        compose.runOnIdle {
+            model.edit(model.state.value.active.id, content)
+            model.zoom(zoom)
+        }
+        compose.waitUntil(15_000) { model.state.value.active.content == content }
+        compose.waitForIdle()
+        // Drain WebView's FIFO evaluation queue behind LaunchedEffect's supermdLoad
+        // so mode("reader")'s flush barrier confirms the updated fixture content.
+        evaluateJavascriptOnce("true")
+        compose.runOnIdle { model.mode("reader") }
+        compose.waitUntil(15_000) { model.state.value.mode == "reader" }
+        javascriptUntil("!!document.querySelector('.android-document.mode-reader')") { it == "true" }
+    }
+    private fun openImageViewer(selector: String) {
+        val quotedSelector = org.json.JSONObject.quote(selector)
+        javascriptUntil(
+            "(()=>{const img=document.querySelector($quotedSelector);if(!img||!img.isConnected||!img.closest('.markdown-body')||!img.complete||!(img.naturalWidth>0))return false;const src=img.currentSrc||img.getAttribute('src')||'';if(!src)return false;const style=getComputedStyle(img);if(style.visibility==='hidden'||style.display==='none')return false;const r=img.getBoundingClientRect();if(r.width<=0||r.height<=0)return false;if(r.bottom<=0||r.top>=innerHeight){img.scrollIntoView({block:'center',behavior:'instant'});return false;}return !document.querySelector('.image-viewer')&&!document.querySelector('.media-save-menu');})()",
+        ) { it == "true" }
+        awaitReaderVisualStateReady()
+        val clickReply = evaluateJavascriptOnce(
+            "(()=>{const img=document.querySelector($quotedSelector);if(!img||!img.isConnected||!img.complete||!(img.naturalWidth>0))return 'target-not-ready';const src=img.currentSrc||img.getAttribute('src')||'';if(!src)return 'missing-src';img.click();return 'clicked';})()",
+        )
+        assertEquals("Expected single click interaction on ready $selector", "\"clicked\"", clickReply)
+        javascriptUntil(
+            "(()=>{const viewer=document.querySelector('.image-viewer');const img=viewer?.querySelector('.image-viewer-canvas img');const close=viewer?.querySelector('button[aria-label=\"Close image viewer\"]');return viewer&&img&&Boolean(img.getAttribute('src'))&&close&&!close.disabled?'ready':{viewer:!!viewer,hasImg:!!img,hasClose:!!close,mode:document.querySelector('.android-document')?.className??null};})()",
+        ) { it == "\"ready\"" }
+    }
+    private fun closeImageViewer() {
+        awaitReaderVisualStateReady()
+        val closeReply = evaluateJavascriptOnce(
+            "(()=>{const close=document.querySelector('button[aria-label=\"Close image viewer\"]');if(!close||close.disabled)return 'close-not-ready';close.click();return 'clicked';})()",
+        )
+        assertEquals("Expected single click interaction on Close image viewer", "\"clicked\"", closeReply)
+        javascriptUntil("!document.querySelector('.image-viewer')") { it == "true" }
+    }
     private fun shellOutput(command: String): String {
         val descriptor = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command)
         return android.os.ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { String(it.readBytes()) }
@@ -366,9 +418,18 @@ class StudioUiTest {
             compose.waitUntil(30_000) { model.state.value.active.uri == firstUri.toString() }
             val firstId = model.state.value.active.id
             scenario.onActivity { it.requestOpen(secondUri) }
-            compose.waitUntil(30_000) {
-                val state = model.state.value
-                state.active.uri == secondUri.toString() && state.tabs.any { it.uri == firstUri.toString() }
+            try {
+                compose.waitUntil(30_000) {
+                    val state = model.state.value
+                    state.active.uri == secondUri.toString() && state.tabs.any { it.uri == firstUri.toString() }
+                }
+            } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+                val snapshot = model.state.value
+                throw AssertionError(
+                    "Second external open timed out; active=${snapshot.active.id}:${snapshot.active.name}(uri=${snapshot.active.uri}); " +
+                        "tabs=${snapshot.tabs.map { "${it.id}:${it.name}(uri=${it.uri})" }}; message=${snapshot.message}; error=${snapshot.error}",
+                    timeout,
+                )
             }
             val secondId = model.state.value.active.id
             scenarioJavascriptUntil(scenario, "document.querySelector('.android-document h1')?.textContent?.trim()==='Second External Open'", "true")
@@ -446,9 +507,9 @@ class StudioUiTest {
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
         val content="# Image safety\n\n```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"100\"><rect width=\"200\" height=\"100\" fill=\"#6486b2\"/></svg>\n```\n\nLast paragraph."
-        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
-        javascriptUntil("(()=>{const img=document.querySelector('.svg-diagram');if(!img)return false;img.click();return !!document.querySelector('.image-viewer');})()") {it=="true"}
-        javascriptUntil("(()=>{document.querySelector('button[aria-label=\"Close image viewer\"]')?.click();return !document.querySelector('.image-viewer');})()") {it=="true"}
+        loadReaderFixture(model, content, zoom = 100f)
+        openImageViewer(".svg-diagram")
+        closeImageViewer()
         javascriptUntil("(()=>{const img=document.querySelector('.svg-diagram');return !!img && !img.draggable && !img.dispatchEvent(new DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:new DataTransfer()}));})()") {it=="true"}
         compose.runOnIdle {assertEquals("Viewing must not import a second asset or append a broken block",content,model.state.value.active.content)}
         javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
@@ -549,7 +610,8 @@ class StudioUiTest {
         val before=model.state.value;temporaryNoteState=before
         val content="# Diagram appearance\n\n```mermaid\nflowchart LR\n A[Read] --> B[Understand]\n```\n\n```mermaid\ngantt\n title Study plan\n dateFormat YYYY-MM-DD\n Read :a1, 2026-10-01, 2d\n Review :after a1, 2d\n```"
         try {
-            compose.runOnIdle {model.fullscreen(false);model.appearance(accent="rose",theme="dark",motion=false);model.readingPreference("imageAppearance","original");model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+            compose.runOnIdle {model.fullscreen(false);model.appearance(accent="rose",theme="dark",motion=false);model.readingPreference("imageAppearance","original");model.readingPreference("svgAppearance","auto")}
+            loadReaderFixture(model, content, zoom = 100f)
             javascriptUntil("(()=>{const errs=Array.from(document.querySelectorAll('.image-error,.render-error')).map(e=>e.textContent);if(errs.length)return {errors:errs};const imgs=Array.from(document.querySelectorAll('.mermaid img'));const ready=imgs.length===2&&imgs.every(i=>i.complete&&i.naturalWidth>0&&i.dataset.mediaKind==='svg'&&i.dataset.mediaAdapted==='true'&&getComputedStyle(i).filter==='none')&&document.documentElement.dataset.imageAppearance==='original';return ready?'ok':{imgs:imgs.length,widths:imgs.map(i=>i.naturalWidth),imageAppearance:document.documentElement.dataset.imageAppearance};})()") {it=="\"ok\""}
             javascriptUntil("(()=>{const imgs=Array.from(document.querySelectorAll('.mermaid img'));if(imgs.length!==2)return false;const svgs=imgs.map(i=>decodeURIComponent(i.src.split(',').slice(1).join(',')));const frame=document.documentElement.querySelector('iframe[data-mermaid-sandbox]');return svgs.some(s=>s.includes('data-diagram-engine=\"pele\"'))&&svgs.some(s=>s.includes('data-diagram-engine=\"mermaid\"'))&&svgs.every(s=>!s.includes('var('))&&frame?.getAttribute('sandbox')==='allow-scripts'&&!document.body.contains(frame);})()") {it=="true"}
             for(mode in listOf("monochrome","contrast","invert-dark","original")) {
@@ -559,8 +621,9 @@ class StudioUiTest {
                 javascriptUntil("document.querySelectorAll('.image-error,.render-error').length") {it=="0"}
                 compose.runOnIdle {assertEquals(content,model.state.value.active.content);assertEquals("original",model.state.value.imageAppearance)}
             }
-            javascriptUntil("(()=>{document.querySelector('.mermaid img').click();return !!document.querySelector('.image-viewer');})()") {it=="true"}
-            javascriptUntil("(()=>{document.querySelector('button[aria-label=\"Close image viewer\"]')?.click();return !document.querySelector('.image-viewer');})()") {it=="true"}
+            openImageViewer(".mermaid img")
+            closeImageViewer()
+            compose.runOnIdle {assertEquals(content,model.state.value.active.content);assertEquals("original",model.state.value.imageAppearance)}
         } finally {
             compose.runOnIdle {model.appearance(accent=before.accent,theme=before.theme,motion=before.motion);model.readingPreference("imageAppearance",before.imageAppearance);model.readingPreference("svgAppearance",before.svgAppearance);model.fullscreen(before.fullscreen)}
         }
@@ -1294,15 +1357,52 @@ ax.set_title("Matplotlib 3D figure")
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { (it.trim('"').toFloatOrNull() ?: 0f)>fullBaseline*1.1f }
         compose.onNodeWithContentDescription("Exit fullscreen").performClick()
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == normalScale }
+        val initialTabIds = model.state.value.tabs.map { it.id }.toSet()
         compose.onNodeWithContentDescription("New tab").performClick()
+        compose.waitUntil(10_000) {
+            val active = model.state.value.active
+            active.id !in initialTabIds && active.uri == null && active.name == "Untitled.md"
+        }
         val emptyId = model.state.value.active.id
         compose.onNodeWithContentDescription("Close Untitled.md").performClick()
+        compose.waitUntil(10_000) { model.state.value.tabs.none { it.id == emptyId } }
         compose.runOnIdle { assertFalse("Empty unnamed notes must be discarded", model.state.value.closedTabs.any { it.id == emptyId }) }
+        val tabsBeforeDraft = model.state.value.tabs.map { it.id }.toSet()
         compose.onNodeWithContentDescription("New tab").performClick()
-        compose.runOnIdle { model.edit(model.state.value.active.id, "# Recoverable draft") }
-        javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
-        compose.waitUntil(10_000) { model.state.value.active.name == "Recoverable draft.md" }
+        compose.waitUntil(10_000) {
+            val active = model.state.value.active
+            active.id !in tabsBeforeDraft && active.uri == null && active.name == "Untitled.md"
+        }
         val recoverableId = model.state.value.active.id
+        val initialDraftName = model.state.value.active.name
+        assertEquals("Untitled.md", initialDraftName)
+        compose.runOnIdle { model.edit(recoverableId, "# Recoverable draft") }
+        javascriptUntil("document.querySelector('.android-reading')?.textContent || document.querySelector('.live-document')?.textContent") { it.contains("Recoverable draft") }
+        try {
+            compose.waitUntil(10_000) {
+                val current = model.state.value
+                current.active.id == recoverableId &&
+                    current.active.name == "Recoverable draft.md" &&
+                    model.lastOutlineNoteId == recoverableId &&
+                    model.headings.value.firstOrNull()?.title == "Recoverable draft"
+            }
+        } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) {
+            val snapshot = model.state.value
+            val draftTab = snapshot.tabs.firstOrNull { it.id == recoverableId }
+            val domState = runCatching {
+                javascriptSnapshot("JSON.stringify({heading:document.querySelector('.android-reading h1,.live-document h1')?.textContent??null,editError:document.querySelector('.reader-edit-error')?.textContent??null})")
+            }.getOrElse { "unavailable: ${it.message}" }
+            throw AssertionError(
+                "Recoverable draft title/outline handoff timed out; recoverableId=$recoverableId; initialDraftName=$initialDraftName; " +
+                    "draftTab=${draftTab?.let { "${it.id}:${it.name}(uri=${it.uri})" }}; " +
+                    "active=${snapshot.active.id}:${snapshot.active.name}(uri=${snapshot.active.uri}); " +
+                    "lastOutlineNoteId=${model.lastOutlineNoteId}; headings=${model.headings.value.map { it.title }}; " +
+                    "message=${snapshot.message}; error=${snapshot.error}; dom=$domState",
+                timeout,
+            )
+        }
+        assertEquals(recoverableId, model.state.value.active.id)
+        assertEquals("Recoverable draft.md", model.state.value.active.name)
         // Close commits the recoverable snapshot/index asynchronously after
         // the reader flush barrier. Do not race the reopen shortcut against it.
         val closeBounds = compose.onNodeWithContentDescription("Close Recoverable draft.md").fetchSemanticsNode().boundsInRoot
@@ -1325,6 +1425,7 @@ ax.set_title("Matplotlib 3D figure")
         compose.runOnIdle { assertEquals("# Recoverable draft", model.state.value.active.content) }
         compose.onNodeWithContentDescription("Close Recoverable draft.md").performClick()
         compose.onNodeWithText("Discard").performClick()
+        compose.waitUntil(15_000) { model.state.value.tabs.none { it.id == recoverableId } }
         if (compose.activity.resources.configuration.smallestScreenWidthDp < 600) {
             compose.runOnIdle { compose.activity.requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
             compose.waitUntil(10_000) { compose.activity.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE }
