@@ -33,6 +33,9 @@ pub fn strip_percent_comments(input: &str) -> Cow<'_, str> {
             _ => {}
         }
     }
+    for block in crate::equations::standalone_equation_blocks(input) {
+        mask[block.start..block.end].fill(true);
+    }
     let bytes = input.as_bytes();
     let mut out = String::new();
     let mut cursor = 0usize;

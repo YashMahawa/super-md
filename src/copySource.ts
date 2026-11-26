@@ -67,7 +67,10 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     if(node.matches("button,.image-edit-tools,.katex-mathml,.math-equation-extra-anchor,[data-frontmatter-properties],.document-properties"))return "";
     if(node.hasAttribute("data-source-tex"))return node.getAttribute("data-source-tex")||"";
     if(node.hasAttribute("data-math-inline-source"))return `$${node.getAttribute("data-math-inline-source")||""}$`;
-    if(node.hasAttribute("data-math-source"))return `\n$$\n${node.getAttribute("data-math-source")||""}\n$$\n`;
+    if(node.hasAttribute("data-math-source")){
+      const mathSource=node.getAttribute("data-math-source")||"";
+      return node.hasAttribute("data-math-bare")?`${mathSource}\n\n`:`\n$$\n${mathSource}\n$$\n`;
+    }
     if(node.matches(".katex-display,.katex")){const tex=node.querySelector('annotation[encoding="application/x-tex"]')?.textContent;if(tex)return node.matches(".katex-display")?`\n$$\n${tex}\n$$\n`:`$${tex}$`;}
     if(node.tagName==="TABLE"){
       const rows=Array.from(node.querySelectorAll("tr")).filter(row=>row.closest("table")===node).map(row=>Array.from(row.children).filter(cell=>/^(TH|TD)$/.test(cell.tagName)).map(cell=>Array.from(cell.childNodes).map(child=>serialize(child,true)).join("").trim().replace(/\n+/g,"<br>"))).filter(row=>row.length>0);

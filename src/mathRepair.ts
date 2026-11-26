@@ -89,7 +89,7 @@ export function suggestMathRepairs(markdown: string): MathRepair[] {
   for(const match of markdown.matchAll(/\\\$([^\n$]{1,2000})\\\$/g)){
     if(!mathOnly(match[1]))continue;const body=repair(match[1]);if(body!==null)add(match.index,match.index+match[0].length,wrap(body,false),"Restore copied math dollar delimiters");
   }
-  for(const match of markdown.matchAll(/^[ \t]*(\\begin\{(aligned|align\*?|equation\*?|gather\*?|cases|matrix|pmatrix|bmatrix)\}[\s\S]{1,12000}?\\end\{\2\})[ \t]*$/gm)){
+  for(const match of markdown.matchAll(/^[ \t]*(\\begin\{(aligned|align\*?|gather\*?|cases|matrix|pmatrix|bmatrix)\}[\s\S]{1,12000}?\\end\{\2\})[ \t]*$/gm)){
     const body=repair(match[1]);if(body!==null)add(match.index,match.index+match[0].length,wrap(body,true),"Enclose a standalone LaTeX environment");
   }
   for(const match of markdown.matchAll(/^[ \t]*([^\n]+)[ \t]*$/gm)){
@@ -136,7 +136,7 @@ export function repairPastedMath(text:string,before='',after=''):string {
   while(left.includes(marker)||right.includes(marker))marker+='x';
   const context=left+marker+right,from=left.length,to=from+marker.length;
   let protectedContext=false;
-  const inspect=(math:boolean)=>visit(math?unified().use(remarkParse).use(remarkMath).parse(context):unified().use(remarkParse).parse(context),(node:any)=>{
+  const inspect=(math:boolean)=>visit(math?unified().use(remarkParse).use(remarkMath).use(remarkObsidianMath).parse(context):unified().use(remarkParse).parse(context),(node:any)=>{
     if(['code','inlineCode','link','image','definition','html','math','inlineMath'].includes(node.type)&&node.position?.start.offset<=from&&node.position?.end.offset>=to)protectedContext=true;
   });
   inspect(false);inspect(true);

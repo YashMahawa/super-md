@@ -715,3 +715,129 @@ fn explicit_equation_tags_and_resolved_references_render_in_headless_pdf() {
         );
     }
 }
+
+#[test]
+fn numbered_latex_equation_blocks_without_dollars_resolve_forward_refs_in_headless_pdf() {
+    let md = [
+        "# Variational Mechanics",
+        "",
+        "Forward reference to Euler-Lagrange \\eqref{eq:euler-lagrange}, Equation \\ref{eq:euler-lagrange}, and inline $H + \\eqref{eq:hamilton} = 0$.",
+        "",
+        "\\begin{equation}",
+        "\\frac{d}{dt}\\left(\\frac{\\partial L}{\\partial \\dot{q}}\\right) - \\frac{\\partial L}{\\partial q} = 0 \\label{eq:euler-lagrange}",
+        "\\end{equation}",
+        "",
+        "\\begin{equation*}",
+        "\\delta S = 0 \\label{eq:unnumbered-star}",
+        "\\end{equation*}",
+        "",
+        "\\begin{equation}",
+        "p = \\frac{\\partial L}{\\partial \\dot{q}} \\notag \\label{eq:suppressed}",
+        "\\end{equation}",
+        "",
+        "\\begin{equation}",
+        "\\dot{q} = \\frac{\\partial H}{\\partial p} \\tag{H.1}\\label{eq:override}",
+        "\\end{equation}",
+        "",
+        "> \\begin{equation}",
+        "> H(q, p) = p\\dot{q} - L(q, \\dot{q}) \\label{eq:hamilton}",
+        "> \\end{equation}",
+        "",
+        "```latex",
+        "\\begin{equation}",
+        "x = 999 \\label{eq:fenced}",
+        "\\end{equation}",
+        "```",
+        "",
+        "$$",
+        "\\begin{align}",
+        "a &= b \\label{eq:align-unnumbered}",
+        "\\end{align}",
+        "$$",
+        "",
+        "Summary checks: backward \\eqref{eq:hamilton}, override \\eqref{eq:override}, [Hamiltonian link](#eq:hamilton), unnumbered \\eqref{eq:unnumbered-star} / \\eqref{eq:suppressed} / \\eqref{eq:align-unnumbered}, and fenced \\eqref{eq:fenced}.",
+    ]
+    .join("\n");
+
+    let typst_src = source(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(typst_src.contains("#smd-tagged-equation("), "{typst_src}");
+    assert!(typst_src.contains("<smd-eq-eq_3a_euler-lagrange>"), "{typst_src}");
+    assert!(typst_src.contains("<smd-eq-eq_3a_hamilton>"), "{typst_src}");
+    assert!(
+        typst_src.contains("#link(label(\"smd-eq-eq_3a_euler-lagrange\"))[#text(\"(1)\")]"),
+        "{typst_src}"
+    );
+    assert!(
+        typst_src.contains("#link(label(\"smd-eq-eq_3a_euler-lagrange\"))[#text(\"1\")]"),
+        "{typst_src}"
+    );
+    assert!(
+        typst_src.contains("#link(label(\"smd-eq-eq_3a_hamilton\"))[#text(\"(2)\")]"),
+        "{typst_src}"
+    );
+    assert!(
+        typst_src.contains("#link(label(\"smd-eq-eq_3a_override\"))[#text(\"(H.1)\")]"),
+        "{typst_src}"
+    );
+
+    let pdf = export(&md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 1);
+    let raw_pdf = String::from_utf8_lossy(&pdf);
+    assert!(
+        raw_pdf.contains("/Subtype /Link") || raw_pdf.contains("/Subtype/Link"),
+        "expected internal PDF link annotations for forward equation references"
+    );
+
+    if require_poppler() {
+        let dir = std::env::temp_dir().join(format!("smd-bare-eq-pdf-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("bare-equations.pdf");
+        std::fs::write(&pdf_path, &pdf).unwrap();
+        let out = std::process::Command::new("pdftotext")
+            .arg("-layout")
+            .arg(&pdf_path)
+            .arg("-")
+            .output()
+            .unwrap();
+        let bbox_out = std::process::Command::new("pdftotext")
+            .arg("-bbox")
+            .arg(&pdf_path)
+            .arg("-")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success());
+        assert!(bbox_out.status.success());
+
+        let extracted = String::from_utf8_lossy(&out.stdout);
+        let normalized_ws = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized_ws.contains("Forward reference to Euler-Lagrange (1), Equation 1, and inline"),
+            "extracted:\n{extracted}"
+        );
+        assert!(extracted.contains("(1)"), "extracted:\n{extracted}");
+        assert!(extracted.contains("(H.1)"), "extracted:\n{extracted}");
+        assert!(extracted.contains("(2)"), "extracted:\n{extracted}");
+        assert!(
+            normalized_ws.contains("Summary checks: backward (2), override (H.1), Hamiltonian link, unnumbered (??) / (??) / (??), and fenced (??)."),
+            "extracted:\n{extracted}"
+        );
+
+        let bbox_xml = String::from_utf8_lossy(&bbox_out.stdout);
+        let tag1_xmax = bbox_xml
+            .lines()
+            .filter(|line| line.contains("<word ") && line.contains(">(1)<"))
+            .filter_map(|line| {
+                line.split("xMax=\"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                    .and_then(|s| s.parse::<f64>().ok())
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            tag1_xmax > 520.0 && tag1_xmax <= 558.0,
+            "expected right-aligned (1) tag near printable right margin (~555.6pt), got xMax={tag1_xmax}pt\n{bbox_xml}"
+        );
+    }
+}

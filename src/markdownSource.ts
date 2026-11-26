@@ -324,8 +324,199 @@ function isInlineWs(source:string,idx:number):boolean {
   return c<128?(c===32||(c>=9&&c<=13)):/\s/.test(source[idx]);
 }
 
+export interface StandaloneEquationBlock {
+  start: number;
+  end: number;
+  openPrefix: string;
+  closePrefix: string;
+  starred: boolean;
+}
+
+export function findStandaloneEquationBlocks(
+  source: string,
+  preclassifiedLines?: ClassifiedLine[],
+  precomputedCodeMask?: Uint8Array,
+): StandaloneEquationBlock[] {
+  if (!source.includes('\\begin{equation')) return [];
+  const fmEnd = parseFrontmatter(source)?.end ?? 0;
+  const lines = preclassifiedLines ?? classifyMarkdownLines(source);
+  const codeMask = precomputedCodeMask ?? computeCodeMask(source, lines);
+  const blocks: StandaloneEquationBlock[] = [];
+  let cursor = fmEnd;
+
+  const advanceBlockedUpTo = (limit: number) => {
+    while (cursor < limit) {
+      if (codeMask[cursor]) {
+        cursor++;
+        continue;
+      }
+      if (source.startsWith('<!--', cursor)) {
+        const end = source.indexOf('-->', cursor + 4);
+        cursor = end >= 0 ? end + 3 : source.length;
+        continue;
+      }
+      if (
+        source[cursor] === '%' &&
+        cursor + 1 < source.length &&
+        source[cursor + 1] === '%' &&
+        !codeMask[cursor + 1] &&
+        !isUnmaskedEscaped(source, codeMask, cursor)
+      ) {
+        let close = -1;
+        for (let j = source.indexOf('%%', cursor + 2); j >= 0; j = source.indexOf('%%', j + 1)) {
+          if (!codeMask[j] && !codeMask[j + 1] && !isUnmaskedEscaped(source, codeMask, j)) {
+            close = j;
+            break;
+          }
+        }
+        cursor = close >= 0 ? close + 2 : cursor + 2;
+        continue;
+      }
+      if (
+        source[cursor] === '$' &&
+        cursor + 1 < source.length &&
+        source[cursor + 1] === '$' &&
+        !codeMask[cursor + 1] &&
+        !isUnmaskedEscaped(source, codeMask, cursor)
+      ) {
+        if (cursor + 2 < source.length && source[cursor + 2] === '$' && !codeMask[cursor + 2]) {
+          cursor += 3;
+          while (cursor < source.length && source[cursor] === '$' && !codeMask[cursor]) cursor++;
+          continue;
+        }
+        let close = -1;
+        let scan = cursor + 2;
+        while (scan + 1 < source.length) {
+          const d = source.indexOf('$$', scan);
+          if (d < 0) break;
+          if (codeMask[d] || codeMask[d + 1] || isUnmaskedEscaped(source, codeMask, d)) {
+            scan = d + 1;
+            continue;
+          }
+          if (d + 2 < source.length && source[d + 2] === '$' && !codeMask[d + 2]) {
+            scan = d + 3;
+            while (scan < source.length && source[scan] === '$' && !codeMask[scan]) scan++;
+            continue;
+          }
+          close = d;
+          break;
+        }
+        cursor = close >= 0 ? close + 2 : cursor + 2;
+        continue;
+      }
+      cursor++;
+    }
+  };
+
+  for (let idx = 0; idx < lines.length; idx++) {
+    const line = lines[idx];
+    if (
+      line.start < fmEnd ||
+      line.kind === 'fence' ||
+      line.kind === 'indented' ||
+      line.kind === 'blank' ||
+      line.kind === 'tableRow'
+    ) {
+      continue;
+    }
+    const rawLine = source.slice(line.start, line.end);
+    const p = scanLinePrefix(rawLine);
+    if (p.indent >= 4) continue;
+    const openOffset = line.start + p.contentPos;
+    advanceBlockedUpTo(openOffset);
+    if (cursor > openOffset || codeMask[openOffset]) continue;
+
+    const isStarred = source.startsWith('\\begin{equation*}', openOffset);
+    const isNumbered = !isStarred && source.startsWith('\\begin{equation}', openOffset);
+    if (!isStarred && !isNumbered) continue;
+
+    const envName = isStarred ? 'equation*' : 'equation';
+    const openToken = `\\begin{${envName}}`;
+    const closeToken = `\\end{${envName}}`;
+    let depth = 1;
+    let matchedEnd = -1;
+    let matchedLineIdx = -1;
+    let matchedClosePrefix = '';
+
+    for (let j = idx; j < lines.length; j++) {
+      const candLine = lines[j];
+      let scanStart = openOffset + openToken.length;
+      let candPrefixEnd = p.pos;
+      if (j > idx) {
+        if (candLine.kind === 'fence') break;
+        const pj = scanLinePrefix(source.slice(candLine.start, candLine.end));
+        if (pj.quoteDepth !== p.quoteDepth) break;
+        candPrefixEnd = pj.pos;
+        scanStart = candLine.start + pj.pos;
+      }
+      const lineFloor = j === idx ? openOffset : candLine.start + candPrefixEnd;
+      let k = scanStart;
+      while (k < candLine.end) {
+        if (source[k] === '%') {
+          let slashes = 0;
+          for (let b = k - 1; b >= lineFloor && source[b] === '\\'; b--) slashes++;
+          if ((slashes & 1) === 0) break;
+        }
+        if (source[k] !== '\\') {
+          k++;
+          continue;
+        }
+        let slashEnd = k;
+        while (slashEnd < candLine.end && source[slashEnd] === '\\') slashEnd++;
+        if (((slashEnd - k) & 1) === 0) {
+          k = slashEnd;
+          continue;
+        }
+        const cmdAt = slashEnd - 1;
+        if (source.startsWith(openToken, cmdAt)) {
+          depth++;
+          k = cmdAt + openToken.length;
+          continue;
+        }
+        if (source.startsWith(closeToken, cmdAt)) {
+          depth--;
+          const afterClose = cmdAt + closeToken.length;
+          if (depth === 0) {
+            const trailing = source.slice(afterClose, candLine.end);
+            if (/^[ \t]*(?:%.*)?$/.test(trailing)) {
+              matchedEnd = trailing.includes('%') ? candLine.end : afterClose;
+              matchedLineIdx = j;
+              matchedClosePrefix =
+                j === idx
+                  ? source.slice(line.start, openOffset)
+                  : source.slice(candLine.start, candLine.start + candPrefixEnd);
+            }
+            break;
+          }
+          k = afterClose;
+          continue;
+        }
+        k = slashEnd;
+      }
+      if (depth === 0) break;
+    }
+
+    if (matchedEnd > openOffset && matchedLineIdx >= idx) {
+      const openPrefix = source.slice(line.start, openOffset);
+      blocks.push({
+        start: openOffset,
+        end: matchedEnd,
+        openPrefix,
+        closePrefix: matchedClosePrefix,
+        starred: isStarred,
+      });
+      cursor = lines[matchedLineIdx].end;
+      idx = matchedLineIdx;
+    }
+  }
+  return blocks;
+}
+
 function computeCodeAndMathMask(source:string):Uint8Array {
   const lines=classifyMarkdownLines(source),mask=computeCodeMask(source,lines);
+  for(const block of findStandaloneEquationBlocks(source,lines,mask)){
+    for(let k=block.start;k<block.end;k++)mask[k]|=2;
+  }
   let i=source.indexOf('$');
   if(i<0)return mask;
   let lineIdx=0,inlineBlockEnd=0,inlineScan=0,displayScan=0;

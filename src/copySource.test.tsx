@@ -222,3 +222,66 @@ it("serializes highlight, subscript, superscript, kbd, underline, and strikethro
   expect(selectedMarkdown(selection)).toBe("==key==");
   selection.removeAllRanges();host.remove();
 });
+it("preserves bare \\begin{equation} blocks without fabricating $$ and keeps canonical source offsets across links and offscreen blocks",()=>{
+  const markdown=[
+    "Before [Guide](guide.md) and \\eqref{eq:euler}:",
+    "",
+    "\\begin{equation}",
+    "e^{i\\pi} + 1 = 0 \\label{eq:euler}",
+    "\\end{equation}",
+    "",
+    "After [[Target Note#Section]] and [Appendix](appendix.md).",
+  ].join("\n");
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath="/notes/euler.md" python="" dark={false}/>);
+  document.body.append(host);
+  const article=host.querySelector(".markdown-body")!;
+
+  // Every link and equation anchor carries exact canonical UTF-16 source offsets.
+  for(const el of Array.from(article.querySelectorAll<HTMLElement>("a[data-source-start], .math-equation-anchor[data-source-start]"))){
+    const from=Number(el.getAttribute("data-source-start"));
+    const to=Number(el.getAttribute("data-source-end"));
+    expect(to).toBeGreaterThan(from);
+    const slice=markdown.slice(from,to);
+    if(el.classList.contains("math-equation-anchor")){
+      expect(slice).toBe("\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}");
+    }else if(el.classList.contains("equation-ref")){
+      expect(slice).toBe("\\eqref{eq:euler}");
+    }else if(el.textContent==="Guide"){
+      expect(slice).toBe("[Guide](guide.md)");
+    }else if(el.textContent==="Target Note#Section"){
+      expect(slice).toBe("[[Target Note#Section]]");
+    }else if(el.textContent==="Appendix"){
+      expect(slice).toBe("[Appendix](appendix.md)");
+    }
+  }
+
+  // Copying across the full rendered article preserves exact raw Markdown without surrounding $$.
+  const selection=window.getSelection()!,range=document.createRange();
+  range.selectNodeContents(article);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)?.replace(/\n{3,}/g,"\n\n")).toBe([
+    "Before [Guide](guide.md) and \\eqref{eq:euler}:",
+    "",
+    "\\begin{equation}",
+    "e^{i\\pi} + 1 = 0 \\label{eq:euler}",
+    "\\end{equation}",
+    "",
+    "After [Target Note#Section](Target%20Note.md#section) and [Appendix](appendix.md).",
+  ].join("\n"));
+
+  // Selecting inside KaTeX glyphs of the bare equation block expands cleanly without $$.
+  const katexGlyph=article.querySelector(".katex-display .katex-html")!;
+  range.setStart(katexGlyph,0);range.setEnd(katexGlyph,1);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe("\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}");
+
+  // Offscreen windowed placeholder slices exact canonical equation offsets.
+  const eqAnchor=article.querySelector<HTMLElement>(".math-equation-anchor")!;
+  const eqStart=eqAnchor.getAttribute("data-source-start")!,eqEnd=eqAnchor.getAttribute("data-source-end")!;
+  const offscreenHost=document.createElement("article");offscreenHost.className="markdown-body";
+  offscreenHost.innerHTML=`<p>Before</p><section data-windowed-mounted="false" data-source-start="${eqStart}" data-source-end="${eqEnd}"></section><p>After</p>`;
+  document.body.append(offscreenHost);
+  range.selectNodeContents(offscreenHost);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe("Before\n\n\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}\n\nAfter");
+
+  selection.removeAllRanges();offscreenHost.remove();host.remove();
+});
