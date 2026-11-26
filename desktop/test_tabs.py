@@ -9,6 +9,7 @@ from PySide6.QtGui import QGuiApplication, QDragEnterEvent, QDragMoveEvent, QDro
 from PySide6.QtQml import QQmlEngine, QQmlComponent
 from PySide6.QtQuick import QQuickItem
 from PySide6.QtTest import QTest
+import folder_ops
 from studio import Session
 from test_studio import QuietStudio
 
@@ -271,4 +272,361 @@ ApplicationWindow {
         )
         QTest.qWait(60)
         self._assert_active_tab_revealed("after opening multi-note workspace drop")
+
+    def _ordered_note_tabs(self):
+        strip = self.window.findChild(QQuickItem, "tabStrip")
+        self.assertIsNotNone(strip)
+        items = [strip]
+        found = []
+        while items:
+            item = items.pop()
+            if item.objectName() == "noteTab":
+                found.append(item)
+            items.extend(item.childItems())
+        found.sort(key=lambda it: int(it.property("index")))
+        return strip, found
+
+    @staticmethod
+    def _find_descendant(root, object_name):
+        pending = [root]
+        while pending:
+            item = pending.pop(0)
+            if item.objectName() == object_name:
+                return item
+            pending.extend(item.childItems())
+        return None
+
+    def test_duplicate_filenames_show_shortest_parent_context_accessible_names_and_hover_details(self):
+        import shutil
+        import tempfile
+        import time
+        from PySide6.QtCore import QMetaObject, QObject, Q_ARG
+
+        root = Path(tempfile.mkdtemp(prefix="supermd-dup-tabs-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+
+        def wait_until(predicate, timeout=5.0):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                self.app.processEvents()
+                if predicate():
+                    return
+                QTest.qWait(10)
+            self.assertTrue(predicate())
+
+        phys_note = root / "Courses" / "Physics" / "Overview.md"
+        unique_note = root / "Courses" / "Roadmap.md"
+        chem_note = root / "Courses" / "Chemistry" / "Overview.md"
+        arch_phys_note = root / "Archive" / "Physics" / "Overview.md"
+        for target, body in (
+            (phys_note, "# Physics Overview\n"),
+            (unique_note, "# Roadmap\n"),
+            (chem_note, "# Chemistry Overview\n"),
+            (arch_phys_note, "# Archived Physics Overview\n"),
+        ):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+
+        # Replace initial scratch tabs cleanly so tab order is deterministic.
+        self.studio._open_dropped_notes([phys_note, unique_note, chem_note, arch_phys_note])
+        wait_until(lambda: self.studio.busy == 0 and any(t["name"] == "Roadmap.md" for t in self.studio.tabs))
+        for scratch_id in [t["id"] for t in list(self.studio.tabs) if not t["path"]]:
+            self.studio.closeTabSafely(scratch_id)
+        QTest.qWait(60)
+
+        # Exact open order is preserved; Chemistry uses depth 1 ("Chemistry") while colliding Physics folders expand to depth 2.
+        expected_paths = [
+            folder_ops.canonical_path_str(phys_note),
+            folder_ops.canonical_path_str(unique_note),
+            folder_ops.canonical_path_str(chem_note),
+            folder_ops.canonical_path_str(arch_phys_note),
+        ]
+        self.assertEqual([t["path"] for t in self.studio.tabs], expected_paths)
+
+        _, note_tabs = self._ordered_note_tabs()
+        self.assertEqual(len(note_tabs), 4)
+        self.assertLess(note_tabs[0].x(), note_tabs[1].x())
+        self.assertLess(note_tabs[1].x(), note_tabs[2].x())
+        self.assertLess(note_tabs[2].x(), note_tabs[3].x())
+
+        expected_contexts = ["Courses/Physics", "", "Chemistry", "Archive/Physics"]
+        expected_labels = [
+            "Overview.md · Courses/Physics",
+            "Roadmap.md",
+            "Overview.md · Chemistry",
+            "Overview.md · Archive/Physics",
+        ]
+        for tab_item, exp_ctx, exp_label, exp_path in zip(note_tabs, expected_contexts, expected_labels, expected_paths):
+            btn = self._find_descendant(tab_item, "noteTabButton")
+            ctx_text = self._find_descendant(tab_item, "noteTabParentContext")
+            hint = btn.findChild(QObject, "actionHint")
+            self.assertIsNotNone(hint)
+            self.assertEqual(tab_item.property("parentContext"), exp_ctx)
+            self.assertEqual(btn.property("text"), exp_label)
+            self.assertEqual(hint.property("text"), exp_path)
+            self.assertEqual(bool(ctx_text.property("visible")), bool(exp_ctx))
+            self.assertEqual(ctx_text.property("text"), exp_ctx)
+
+        # Inspect QQuickAccessibleAttached names via QML helper expression on the host window.
+        acc_probe = QQmlComponent(self.engine)
+        acc_probe.setData(
+            b"""
+import QtQuick
+import QtQuick.Controls
+QtObject {
+    function nameOf(item) { return item ? item.Accessible.name : "" }
+    function tipOf(item) { return item ? item.ToolTip.text : "" }
+}
+""",
+            QUrl("qrc:/acc_probe.qml"),
+        )
+        probe = acc_probe.create()
+
+        def acc_name(item):
+            from PySide6.QtCore import Q_RETURN_ARG
+            ok_val = [None]
+            val = QMetaObject.invokeMethod(
+                probe, "nameOf", Q_RETURN_ARG("QVariant"), Q_ARG("QVariant", item)
+            )
+            _ = ok_val
+            return val
+
+        def tip_text(item):
+            from PySide6.QtCore import Q_RETURN_ARG
+            return QMetaObject.invokeMethod(
+                probe, "tipOf", Q_RETURN_ARG("QVariant"), Q_ARG("QVariant", item)
+            )
+
+        for tab_item, exp_label, exp_path in zip(note_tabs, expected_labels, expected_paths):
+            btn = self._find_descendant(tab_item, "noteTabButton")
+            close_btn = self._find_descendant(tab_item, "noteTabCloseButton")
+            self.assertEqual(acc_name(btn), exp_label)
+            self.assertEqual(tip_text(btn), exp_path)
+            self.assertEqual(acc_name(close_btn), f"Close {exp_label}")
+            self.assertIn(f"Close {exp_label}", tip_text(close_btn))
+
+        # Dirty state updates both the visual bullet and accessible name while keeping parent context.
+        phys_id = self.studio.tabs[0]["id"]
+        self.studio.post("edit-phys", "document_changed", json.dumps({"id": phys_id, "content": "# Physics Updated\n"}))
+        QTest.qWait(40)
+        _, note_tabs = self._ordered_note_tabs()
+        dirty_btn = self._find_descendant(note_tabs[0], "noteTabButton")
+        self.assertEqual(dirty_btn.property("text"), "• Overview.md · Courses/Physics")
+        self.assertEqual(acc_name(dirty_btn), "Overview.md · Courses/Physics, unsaved changes")
+        # Revert edit so closeTabSafely below closes cleanly without unsaved prompt.
+        self.studio.post("revert-phys", "document_changed", json.dumps({"id": phys_id, "content": "# Physics Overview\n"}))
+        QTest.qWait(40)
+
+        # Rename dialog on a disambiguated tab still edits the raw filename (without parent context) and selects stem.
+        strip, _ = self._ordered_note_tabs()
+        self.assertTrue(
+            QMetaObject.invokeMethod(
+                strip,
+                "openRename",
+                Q_ARG("QVariant", phys_id),
+                Q_ARG("QVariant", self.studio.tabs[0]["name"]),
+            )
+        )
+        rename_field = self.window.findChild(QObject, "renameField")
+        wait_until(lambda: bool(rename_field.property("selectedText")))
+        self.assertEqual(rename_field.property("text"), "Overview.md")
+        self.assertEqual(rename_field.property("selectedText"), "Overview")
+        self.window.findChild(QObject, "renameDialog").close()
+        QTest.qWait(20)
+
+        # Closing Archive/Physics reduces Physics to depth 1 ("Physics"); closing Chemistry clears context on remaining Overview.md.
+        self.studio.closeTabSafely(self.studio.tabs[3]["id"])
+        wait_until(lambda: len(self.studio.tabs) == 3)
+        QTest.qWait(40)
+        _, note_tabs = self._ordered_note_tabs()
+        self.assertEqual(acc_name(self._find_descendant(note_tabs[0], "noteTabButton")), "Overview.md · Physics")
+        self.assertEqual(acc_name(self._find_descendant(note_tabs[2], "noteTabButton")), "Overview.md · Chemistry")
+
+        self.studio.closeTabSafely(self.studio.tabs[2]["id"])
+        wait_until(lambda: len(self.studio.tabs) == 2)
+        QTest.qWait(40)
+        _, note_tabs = self._ordered_note_tabs()
+        self.assertEqual(acc_name(self._find_descendant(note_tabs[0], "noteTabButton")), "Overview.md")
+        self.assertFalse(bool(self._find_descendant(note_tabs[0], "noteTabParentContext").property("visible")))
+
+        # Reopening restores parent disambiguation automatically.
+        self.studio.reopenTab()
+        wait_until(lambda: len(self.studio.tabs) == 3)
+        QTest.qWait(40)
+        _, note_tabs = self._ordered_note_tabs()
+        labels_after_reopen = [acc_name(self._find_descendant(t, "noteTabButton")) for t in note_tabs]
+        self.assertIn("Overview.md · Physics", labels_after_reopen)
+        self.assertIn("Overview.md · Chemistry", labels_after_reopen)
+        probe.deleteLater()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_long_duplicate_tabs_preserve_parent_context_narrow_layout_and_keyboard_reveal(self):
+        import shutil
+        import tempfile
+        import time
+
+        root = Path(tempfile.mkdtemp(prefix="supermd-dup-narrow-"))
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+
+        def wait_until(predicate, timeout=5.0):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                self.app.processEvents()
+                if predicate():
+                    return
+                QTest.qWait(10)
+            self.assertTrue(predicate())
+
+        long_name = "Comprehensive Distributed Systems Architecture Specification.md"
+        files = []
+        for folder in ("client", "server", "gateway", "worker"):
+            target = root / "packages" / folder / long_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(f"# {folder}\n", encoding="utf-8")
+            files.append(target)
+
+        self.studio._open_dropped_notes(files)
+        wait_until(lambda: self.studio.busy == 0 and sum(1 for t in self.studio.tabs if t["path"]) == 4)
+        for scratch_id in [t["id"] for t in list(self.studio.tabs) if not t["path"]]:
+            self.studio.closeTabSafely(scratch_id)
+        QTest.qWait(60)
+
+        strip, note_tabs = self._ordered_note_tabs()
+        self.assertEqual(len(note_tabs), 4)
+        for tab_item, expected_folder in zip(note_tabs, ("client", "server", "gateway", "worker")):
+            self.assertLessEqual(tab_item.width(), 260.5)
+            btn = self._find_descendant(tab_item, "noteTabButton")
+            close_btn = self._find_descendant(tab_item, "noteTabCloseButton")
+            title_text = self._find_descendant(tab_item, "noteTabTitle")
+            ctx_text = self._find_descendant(tab_item, "noteTabParentContext")
+            self.assertTrue(bool(ctx_text.property("visible")))
+            self.assertEqual(ctx_text.property("text"), expected_folder)
+            self.assertGreater(ctx_text.width(), 20.0)
+            self.assertFalse(bool(ctx_text.property("truncated")), "Short parent context must remain unclipped on 260px tabs")
+            self.assertTrue(bool(title_text.property("truncated")), "Long filename should elide before clipping parent context")
+            # Ensure label content never collides with close button.
+            self.assertLessEqual(btn.x() + btn.width(), close_btn.x() + 0.5)
+
+        # Keyboard tab selection, cycling, and reordering reveal disambiguated tabs cleanly.
+        self.studio.tabNumber(1)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after keyboard jump to first duplicate tab")
+        self.studio.cycleTab(-1)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after keyboard wrap to rightmost duplicate tab")
+        self.studio.moveActiveTab(-1)
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after moving disambiguated active tab left")
+
+        # Keyboard Tab focus on an offscreen non-active tab scrolls it into view without changing activeTabId.
+        active_before = self.studio.active
+        _, note_tabs = self._ordered_note_tabs()
+        first_btn = self._find_descendant(note_tabs[0], "noteTabButton")
+        first_btn.forceActiveFocus(Qt.FocusReason.TabFocusReason)
+        QTest.qWait(60)
+        flickable = strip.property("contentItem")
+        viewport_w = float(strip.property("availableWidth") or strip.width())
+        content_x = float(flickable.property("contentX"))
+        self.assertGreaterEqual(note_tabs[0].x() + 0.5, content_x)
+        self.assertLessEqual(note_tabs[0].x() + note_tabs[0].width() - 0.5, content_x + viewport_w)
+        self.assertEqual(self.studio.active, active_before)
+
+        # Narrow-window layout keeps tabs vertically centered, bounded, and active tab revealed.
+        for narrow_w in (460, 240):
+            self.window.resize(narrow_w, 180)
+            QTest.qWait(60)
+            self.studio.selectTab(self.studio.tabs[-1]["id"])
+            QTest.qWait(60)
+            self._assert_active_tab_revealed(f"at narrow width {narrow_w}px")
+            _, narrow_tabs = self._ordered_note_tabs()
+            for tab_item in narrow_tabs:
+                self.assertAlmostEqual(tab_item.y() + tab_item.height() / 2, 24, delta=0.5)
+
+
+class TabParentDisambiguationUnitTest(unittest.TestCase):
+    def test_unique_and_unsaved_tabs_stay_uncluttered(self):
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("Untitled.md", ""),
+                ("Untitled.md", ""),
+                ("Overview.md", "/work/Physics/Overview.md"),
+                ("Overview.smd", "/work/Physics/Overview.smd"),
+            ]),
+            ["", "", "", ""],
+        )
+
+    def test_unsaved_and_saved_same_filename_disambiguates_saved_parent(self):
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("Overview.md", ""),
+                ("Overview.md", "/Users/alice/Physics/Overview.md"),
+            ]),
+            ["", "Physics"],
+        )
+
+    def test_per_tab_shortest_depth_and_order_preservation(self):
+        tabs = [
+            ("index.md", "/repo/packages/core/src/index.md"),
+            ("Unique.md", "/repo/docs/Unique.md"),
+            ("index.md", "/repo/docs/index.md"),
+            ("index.md", "/repo/packages/cli/src/index.md"),
+        ]
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents(tabs),
+            ["core/src", "", "docs", "cli/src"],
+        )
+
+    def test_deep_shared_hierarchy_compacts_middle_segments_symmetrically(self):
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("README.md", "/repo/service-a/src/main/resources/docs/README.md"),
+                ("README.md", "/repo/service-b/src/main/resources/docs/README.md"),
+            ]),
+            ["service-a/…/docs", "service-b/…/docs"],
+        )
+        # When all four reach depth 5 and two share service-a, compaction preserves segment 2 symmetrically.
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("README.md", "/repo/service-a/alpha/v1/resources/docs/README.md"),
+                ("README.md", "/repo/service-a/beta/v1/resources/docs/README.md"),
+                ("README.md", "/repo/service-b/alpha/v1/resources/docs/README.md"),
+                ("README.md", "/repo/service-c/beta/v1/resources/docs/README.md"),
+            ]),
+            ["service-a/alpha/…/docs", "service-a/beta/…/docs", "service-b/…/docs", "service-c/…/docs"],
+        )
+
+    def test_posix_and_windows_root_and_drive_anchors(self):
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("README.md", "/README.md"),
+                ("README.md", "/docs/README.md"),
+            ]),
+            ["/", "docs"],
+        )
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("README.md", "/docs/README.md"),
+                ("README.md", "/work/docs/README.md"),
+            ]),
+            ["/docs", "work/docs"],
+        )
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("Notes.md", r"\\?\C:\Users\alice\work\docs\Notes.md"),
+                ("Notes.md", r"D:\Users\alice\work\docs\Notes.md"),
+            ]),
+            ["C:/…/docs", "D:/…/docs"],
+        )
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("Notes.md", r"C:\Notes.md"),
+                ("Notes.md", r"D:\Notes.md"),
+            ]),
+            ["C:", "D:"],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
 
