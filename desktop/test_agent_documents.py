@@ -919,6 +919,59 @@ class AgentDocumentsTest(unittest.TestCase):
             [{"start": unclosed_braced_py.index("<svg/>"), "end": unclosed_braced_py.index("<svg/>") + len("<svg/>")}],
         )
 
+    def test_read_source_contract_and_agent_package_facade_identity(self):
+        import importlib
+        import agent_documents
+        from agent import source_ops
+
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        added_root = repo_root not in sys.path
+        if added_root:
+            sys.path.insert(0, repo_root)
+        try:
+            pkg_agent_documents = importlib.import_module("desktop.agent_documents")
+            pkg_source_ops = importlib.import_module("desktop.agent.source_ops")
+        finally:
+            if added_root and repo_root in sys.path:
+                sys.path.remove(repo_root)
+
+        self.assertIs(pkg_agent_documents, agent_documents)
+        self.assertIs(pkg_source_ops, source_ops)
+        self.assertIs(source_ops.AgentDocumentError, AgentDocumentError)
+        self.assertIs(source_ops.RevisionConflict, RevisionConflict)
+        self.assertIs(source_ops.read_source, agent_documents.read_source)
+        self.assertIs(pkg_agent_documents.DocumentStore, DocumentStore)
+
+        source = "# Intro\nLead.\n## 1.2 Charts\n```svg\n<svg><circle/></svg>\n```\nBody.\n## 2. End\nTail.\n"
+        prose = source_ops.read_source(source, heading="1.2", view="prose")
+        self.assertEqual(prose["heading"], {"index": 1, "level": 2, "title": "1.2 Charts", "line": 3})
+        self.assertIn("[SVG omitted:", prose["text"])
+        self.assertNotIn("Tail.", prose["text"])
+        self.assertEqual(len(prose["svg_omissions"]), 1)
+        plain = source_ops.read_source(source, view="source", limit=12)
+        self.assertNotIn("heading", plain)
+        self.assertEqual(plain["text"], source[:12])
+        for kwargs in (
+            {"source": None},
+            {"source": source, "offset": True},
+            {"source": source, "offset": -1},
+            {"source": source, "offset": len(source) + 1},
+            {"source": source, "limit": False},
+            {"source": source, "limit": 0},
+            {"source": source, "view": "html"},
+        ):
+            with self.assertRaises(AgentDocumentError):
+                source_ops.read_source(**kwargs)
+
+        # Pre-lock patch write validation stays untouched and rejects invalid operations before revision checks.
+        created = self.store.create("validation-order.md", "# Title\nBody.\n")
+        stale_revision = "0" * 64
+        self.assertNotEqual(created["revision"], stale_revision)
+        with self.assertRaises(AgentDocumentError) as ctx:
+            self.store.patch("validation-order.md", expected_revision=stale_revision, operations=[])
+        self.assertNotIsInstance(ctx.exception, RevisionConflict)
+
+
 
 if __name__ == "__main__":
     unittest.main()
