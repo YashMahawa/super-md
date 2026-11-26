@@ -327,3 +327,132 @@ test("URL paste wraps selected prose inline without dialog, pastes raw URL in ba
   });
   await expect(page.getByRole("dialog", { name: "Insert image or link" })).toHaveCount(0);
 });
+
+test("Android landscape keyboard mode preserves visible editor geometry in Source and Live modes and keeps drafts on restore", async ({ page }) => {
+  const calls: Array<{ command: string; args: any }> = [];
+  await page.exposeFunction("bridgePost", (id: string, command: string, raw: string) => {
+    const args = JSON.parse(raw);
+    calls.push({ command, args });
+    void page.evaluate(({ id }) => window.supermdReply?.(id, true, null), { id });
+  });
+  await page.addInitScript(() => {
+    window.SuperMD = { post: (id, command, args) => (window as any).bridgePost(id, command, args) };
+  });
+
+  // Simulate post-IME + compact formatting-bar WebView height on a 731x411dp Android phone in landscape (~170px)
+  await page.setViewportSize({ width: 731, height: 170 });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const initialDoc = [
+    "# Landscape Editing",
+    "",
+    "Euler identity e^(i*pi) + 1 = 0 stays visible above the formatting bar.",
+    "",
+    "Second paragraph for scroll stability.",
+  ].join("\n");
+  const latestContent = () => calls.filter((c) => c.command === "document_changed").at(-1)?.args.content ?? initialDoc;
+
+  await page.evaluate((content) => {
+    document.documentElement.dataset.platform = "android";
+    document.documentElement.dataset.landscapeKeyboard = "true";
+    window.supermdChromeInset?.(24);
+    document.documentElement.style.setProperty("--native-visible-chrome-inset", "24px");
+    window.supermdLoad?.({
+      id: "landscape-note",
+      content,
+      path: "landscape-note",
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "sans",
+      size: 16,
+      zoom: 100,
+    });
+  }, initialDoc);
+
+  await expect(page.locator(".cm-content")).toBeVisible();
+  const sourceGeometry = await page.evaluate(() => {
+    const host = document.querySelector<HTMLElement>(".editor-host")!;
+    const status = document.querySelector<HTMLElement>(".source-editor-status")!;
+    const hostRect = host.getBoundingClientRect();
+    const statusRect = status.getBoundingClientRect();
+    const clippedTop = Math.max(24, hostRect.top);
+    const clippedBottom = Math.min(window.innerHeight, hostRect.bottom);
+    return {
+      visibleEditorHeight: clippedBottom - clippedTop,
+      statusHeight: statusRect.height,
+      typewriterVisible: statusRect.bottom <= window.innerHeight && statusRect.width > 0,
+    };
+  });
+  expect(sourceGeometry.visibleEditorHeight).toBeGreaterThanOrEqual(110);
+  expect(sourceGeometry.statusHeight).toBeLessThanOrEqual(32);
+  expect(sourceGeometry.typewriterVisible).toBe(true);
+
+  // Format with Inline math in Source mode while in compact landscape keyboard layout
+  await page.locator(".cm-content").click();
+  await page.evaluate(() => {
+    const line = Array.from(document.querySelectorAll(".cm-line")).find((el) => el.textContent?.includes("e^(i*pi) + 1 = 0"));
+    const textNode = line?.firstChild;
+    if (textNode) {
+      const text = textNode.textContent ?? "";
+      const start = text.indexOf("e^(i*pi) + 1 = 0");
+      const range = document.createRange();
+      range.setStart(textNode, start);
+      range.setEnd(textNode, start + "e^(i*pi) + 1 = 0".length);
+      const sel = window.getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    }
+  });
+  await page.evaluate(() => window.supermdFormat?.("inline_math"));
+  await expect.poll(latestContent).toContain("$e^(i*pi) + 1 = 0$");
+  await page.screenshot({ path: "/tmp/supermd-screenshots/reader-landscape-keyboard-source.png" });
+
+  // Switch to Live mode in the same constrained landscape keyboard viewport and open the paragraph block
+  const formattedDoc = latestContent();
+  await page.evaluate((content) => {
+    window.supermdLoad?.({
+      id: "landscape-note",
+      content,
+      path: "landscape-note",
+      mode: "live",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "sans",
+      size: 16,
+      zoom: 100,
+    });
+  }, formattedDoc);
+
+  await expect(page.locator(".live-document")).toBeVisible();
+  await page.locator(".live-block").nth(1).dblclick();
+  const liveBox = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(liveBox).toBeVisible();
+
+  const liveGeometry = await page.evaluate(() => {
+    const area = document.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
+    area.scrollIntoView({ block: "nearest" });
+    const rect = area.getBoundingClientRect();
+    const clippedTop = Math.max(24, rect.top);
+    const clippedBottom = Math.min(window.innerHeight, rect.bottom);
+    return {
+      visibleHeight: clippedBottom - clippedTop,
+      width: rect.width,
+    };
+  });
+  expect(liveGeometry.visibleHeight).toBeGreaterThanOrEqual(80);
+  expect(liveGeometry.width).toBeGreaterThan(400);
+  await page.screenshot({ path: "/tmp/supermd-screenshots/reader-landscape-keyboard-live.png" });
+
+  // Closing the soft keyboard restores full viewport height & top chrome inset while keeping the draft intact
+  await page.setViewportSize({ width: 731, height: 411 });
+  await page.evaluate(() => {
+    document.documentElement.dataset.landscapeKeyboard = "false";
+    window.supermdChromeInset?.(188);
+    document.documentElement.style.setProperty("--native-visible-chrome-inset", "188px");
+  });
+  await expect(liveBox).toHaveValue("Euler identity $e^(i*pi) + 1 = 0$ stays visible above the formatting bar.");
+});

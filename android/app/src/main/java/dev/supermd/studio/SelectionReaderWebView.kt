@@ -10,6 +10,8 @@ import android.view.ActionMode
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
 import android.webkit.WebView
 import android.widget.Toast
 import org.json.JSONTokener
@@ -19,6 +21,12 @@ internal const val SELECTION_TEXT_SCRIPT =
 
 /** Adds to the OS selection toolbar while preserving WebView's native handles. */
 internal class SelectionReaderWebView(context: Context, private val model: StudioViewModel) : WebView(context) {
+    override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+        val connection = super.onCreateInputConnection(outAttrs)
+        outAttrs.imeOptions = outAttrs.imeOptions or EditorInfo.IME_FLAG_NO_EXTRACT_UI or EditorInfo.IME_FLAG_NO_FULLSCREEN
+        return connection
+    }
+
     private fun wrap(callback: ActionMode.Callback): ActionMode.Callback =
         if (callback is SelectionActionCallback) callback else SelectionActionCallback(callback,
             { SelectionActions.label(model.state.value.selectionAssistant) }, ::selectedAction)

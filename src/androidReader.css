@@ -50,6 +50,11 @@
 :root[data-platform="android"] .android-document .reading-search { position:fixed; top:calc(max(var(--native-safe-top,0px), env(safe-area-inset-top,0px)) + 10px); left:12px; right:12px; padding:8px; gap:6px; border-radius:28px; }
 :root[data-platform="android"] .reading-search input { min-height:44px; flex-basis:140px; }
 .android-reading .live-document { width:100%; max-width:none; padding:24px 0 40vh; }
+:root[data-landscape-keyboard="true"] .android-reading .live-document { padding-top:8px; }
+:root[data-landscape-keyboard="true"] .live-active-block { margin-bottom:8px; padding:6px; }
+:root[data-landscape-keyboard="true"] .live-active-block textarea { min-height:min(88px, calc(100dvh - 36px)); max-height:max(72px, calc(100dvh - 28px)); padding:8px 10px; }
+:root[data-landscape-keyboard="true"] .source-editor-status { min-height:28px; padding:2px 12px; }
+:root[data-landscape-keyboard="true"] .source-editor-status button { min-height:24px; padding:2px 10px; }
 .android-reading .live-document[data-typewriter="true"] { padding-top:var(--live-typewriter-pad,45vh); padding-bottom:var(--live-typewriter-pad,45vh); }
 .android-reading .document-page .live-document > .markdown-body { padding:0; }
 .android-reading .live-block .markdown-body, .android-reading .live-active-block textarea { font-size:var(--reader-size); }
