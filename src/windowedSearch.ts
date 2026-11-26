@@ -4,7 +4,7 @@ import {flushSync} from 'react-dom';
 import {caretRangeAtPoint} from './caretPoint';
 import {refreshDocumentExtent} from './documentZoom';
 import {scrollInputVersion} from './scrollAnchor';
-const blocks=new Map<HTMLElement,string>();
+const blocks=new WeakMap<HTMLElement,string>();
 const pendingAnchors=new WeakSet<HTMLElement>();
 type ScrollSource={range:Range;node:Node;offset:number;input:number};
 const scrollSources=new WeakMap<HTMLElement,ScrollSource>();
@@ -137,36 +137,37 @@ export function nextSearchMatch(pattern:RegExp,text:string):RegExpExecArray|null
   }
   return null;
 }
-function frontmatterHeaderText(header:Element):string {
-  const walker=header.ownerDocument.createTreeWalker(header,NodeFilter.SHOW_TEXT);
-  let text='',node:Node|null,block:Element|null=null;
-  while((node=walker.nextNode())){
-    const parent=node.parentElement;
-    if(!parent||!parent.closest('[data-frontmatter-field]')||parent.closest('button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools,.image-loading,.image-error,.remote-image-card'))continue;
-    const nextBlock=parent.closest('p,h1,h2,h3,h4,li,pre,td,summary,[data-frontmatter-field]');
-    if(block!==nextBlock){text+='\n';block=nextBlock;}
-    text+=node.textContent||'';
-  }
-  return text;
-}
 export function windowedMatches(host:Element,query:string,options:SearchMatchConfig=false):WindowedMatch[]|null {
-  if(!host.querySelector('[data-windowed-block]'))return null;
+  const windowedBlocks=host.hasAttribute('data-windowed-block')?[host as HTMLElement]:host.querySelectorAll<HTMLElement>('[data-windowed-block]');
+  if(!windowedBlocks.length)return null;
   const result:WindowedMatch[]=[];
   const {pattern}=compileSearchPattern(query,options,false);
   if(!pattern)return result;
-  for(const header of host.querySelectorAll<HTMLElement>('[data-frontmatter-properties],.document-properties')){
-    const headerText=frontmatterHeaderText(header);
-    if(!headerText)continue;
-    pattern.lastIndex=0;let ordinal=0;
-    while(nextSearchMatch(pattern,headerText)){result.push({element:header,ordinal:ordinal++});if(result.length>=5000)return result;}
+  if(!host.hasAttribute('data-windowed-block')){
+    const fmHeader=host.querySelector<HTMLElement>('[data-frontmatter-properties]')??host.querySelector<HTMLElement>('.document-properties');
+    if(fmHeader&&!fmHeader.hasAttribute('hidden')&&!fmHeader.hasAttribute('inert')&&fmHeader.getAttribute('aria-hidden')!=='true'){
+      const fields=fmHeader.querySelectorAll<HTMLElement>('[data-frontmatter-field]');
+      const parts:string[]=[];
+      for(const f of fields){
+        const kind=f.getAttribute('data-frontmatter-field');
+        if((kind==='title'||kind==='author'||kind==='tag')&&f.textContent)parts.push(f.textContent);
+      }
+      if(parts.length){
+        const fmText=parts.join('\n');
+        pattern.lastIndex=0;let fmOrdinal=0;
+        while(nextSearchMatch(pattern,fmText)){result.push({element:fmHeader,ordinal:fmOrdinal++});if(result.length>=5000)return result;}
+      }
+    }
   }
-  for(const [element,text] of blocks){
-    if(!host.contains(element))continue;
+  // Query mounted block wrappers directly in DOM tree order so Live edits never
+  // require O(M log M) compareDocumentPosition sorting or misorder 5,000+ caps.
+  for(const element of windowedBlocks){
+    const text=blocks.get(element);
+    if(!text)continue;
     pattern.lastIndex=0;let ordinal=0;
     while(nextSearchMatch(pattern,text)){result.push({element,ordinal:ordinal++});if(result.length>=5000)return result;}
   }
-  // Registration order may change after a Live edit. Restore document order.
-  return result.sort((a,b)=>a.element===b.element?a.ordinal-b.ordinal:a.element.compareDocumentPosition(b.element)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1);
+  return result;
 }
 export function revealWindowed(element:HTMLElement):void {
   element.closest('[data-windowed-block]')?.dispatchEvent(new Event('supermd-reveal-window'));

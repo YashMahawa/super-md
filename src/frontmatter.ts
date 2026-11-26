@@ -18,6 +18,24 @@ export interface DocumentMetadata {
   aliases: string[];
 }
 
+export type FrontmatterVisibleField = "title" | "author" | "tag";
+
+export interface FrontmatterVisibleSpan {
+  /** Inclusive canonical UTF-16 start offset in the Markdown document. */
+  start: number;
+  /** Exclusive canonical UTF-16 end offset in the Markdown document. */
+  end: number;
+  /** Rendered metadata field category in DocumentProperties. */
+  field: FrontmatterVisibleField;
+  /** 0-based index among `[data-frontmatter-field="<field>"]` elements. */
+  fieldOrdinal: number;
+}
+
+export interface ParseFrontmatterOptions {
+  /** When true, populate canonical source spans for displayed title/author/tag values in the same parse pass. */
+  includeSpans?: boolean;
+}
+
 export interface ParsedFrontmatter {
   /** Exact raw substring from index 0 (including optional BOM and closing newline if present). */
   raw: string;
@@ -27,14 +45,26 @@ export interface ParsedFrontmatter {
   entries: Record<string, YamlValue>;
   /** Normalized reader/PDF properties, or null when no recognized fields are populated. */
   properties: DocumentMetadata | null;
+  /** Canonical UTF-16 spans for displayed title, author, and tag values (present when `includeSpans` is true). */
+  visibleSpans?: FrontmatterVisibleSpan[];
 }
 
 interface RawLine {
   raw: string;
   indent: number;
   trimmed: string;
+  offset: number;
+  trimmedOffset: number;
 }
 
+interface YamlNode {
+  value: YamlValue;
+  spans: Array<{ start: number; end: number }>;
+  items?: YamlNode[];
+  entries?: Record<string, YamlNode>;
+}
+
+const EMPTY_SPANS: Array<{ start: number; end: number }> = [];
 const BLOCK_SCALAR_HEADER = /^([|>])(?:([+-])([1-9])?|([1-9])([+-])?)?[ \t]*(?:#.*)?$/;
 
 function stripInlineComment(value: string): string {
@@ -149,8 +179,26 @@ function parsePlainScalar(raw: string): YamlValue {
   return cleaned;
 }
 
-function splitTopLevelCommas(inner: string): string[] | null {
-  const parts: string[] = [];
+function mapSliceToSpan(map: number[], relStart: number, relEnd: number): { start: number; end: number } | null {
+  if (relEnd < relStart || map.length === 0) return null;
+  if (relEnd === relStart) {
+    const pos = map[Math.min(relStart, map.length - 1)] ?? 0;
+    return { start: pos, end: pos };
+  }
+  const start = map[relStart];
+  const last = map[relEnd - 1];
+  if (start === undefined || last === undefined) return null;
+  return { start, end: last + 1 };
+}
+
+function makeDirectMap(startOffset: number, length: number): number[] {
+  const map = new Array<number>(length);
+  for (let i = 0; i < length; i++) map[i] = startOffset + i;
+  return map;
+}
+
+function splitTopLevelCommas(inner: string): Array<{ part: string; start: number }> | null {
+  const parts: Array<{ part: string; start: number }> = [];
   let start = 0;
   let depthBracket = 0;
   let depthBrace = 0;
@@ -173,87 +221,31 @@ function splitTopLevelCommas(inner: string): string[] | null {
     else if (ch === "{") depthBrace++;
     else if (ch === "}") { if (--depthBrace < 0) return null; }
     else if (ch === "," && depthBracket === 0 && depthBrace === 0) {
-      parts.push(inner.slice(start, i));
+      parts.push({ part: inner.slice(start, i), start });
       start = i + 1;
     }
   }
   if (depthBracket !== 0 || depthBrace !== 0) return null;
-  parts.push(inner.slice(start));
+  parts.push({ part: inner.slice(start), start });
   return parts;
 }
 
-function parseFlowValue(raw: string): { ok: true; value: YamlValue } | { ok: false } {
-  const trimmed = raw.trim();
-  if (!trimmed) return { ok: true, value: null };
-  if (trimmed.startsWith('"')) {
-    const parsed = parseDoubleQuoted(trimmed);
-    if (!parsed || !onlyTrailingComment(parsed.rest)) return { ok: false };
-    return { ok: true, value: parsed.value };
-  }
-  if (trimmed.startsWith("'")) {
-    const parsed = parseSingleQuoted(trimmed);
-    if (!parsed || !onlyTrailingComment(parsed.rest)) return { ok: false };
-    return { ok: true, value: parsed.value };
-  }
-  if (trimmed.startsWith("[")) {
-    if (!trimmed.endsWith("]")) return { ok: false };
-    const inner = trimmed.slice(1, -1).trim();
-    if (!inner) return { ok: true, value: [] };
-    const items = splitTopLevelCommas(inner);
-    if (!items) return { ok: false };
-    const out: YamlValue[] = [];
-    for (const item of items) {
-      if (!item.trim()) continue;
-      const parsed = parseFlowValue(item);
-      if (!parsed.ok) return { ok: false };
-      out.push(parsed.value);
-    }
-    return { ok: true, value: out };
-  }
-  if (trimmed.startsWith("{")) {
-    if (!trimmed.endsWith("}")) return { ok: false };
-    const inner = trimmed.slice(1, -1).trim();
-    if (!inner) return { ok: true, value: {} };
-    const pairs = splitTopLevelCommas(inner);
-    if (!pairs) return { ok: false };
-    const out: Record<string, YamlValue> = {};
-    for (const pair of pairs) {
-      if (!pair.trim()) continue;
-      const kv = splitKeyValue(pair.trim(), true);
-      if (!kv) return { ok: false };
-      const parsed = parseFlowValue(kv.rest);
-      if (!parsed.ok) return { ok: false };
-      out[kv.key] = parsed.value;
-    }
-    return { ok: true, value: out };
-  }
-  if (trimmed.includes("[") || trimmed.includes("]") || trimmed.includes("{") || trimmed.includes("}")) {
-    // Reject unbalanced flow indicators in flow values such as `[a, [b]`.
-    if (!splitTopLevelCommas(trimmed)) return { ok: false };
-  }
-  return { ok: true, value: parsePlainScalar(trimmed) };
-}
-
-function splitKeyValue(trimmedLine: string, allowCompactFlowColon = false): { key: string; rest: string } | null {
+function splitKeyValue(
+  trimmedLine: string,
+  allowCompactFlowColon = false,
+): { key: string; rest: string; restIndex: number } | null {
   if (!trimmedLine || trimmedLine.startsWith("#")) return null;
   if (trimmedLine.startsWith("- ") || trimmedLine === "-" || trimmedLine.startsWith("-\t")) return null;
-  if (trimmedLine.startsWith('"')) {
-    const parsed = parseDoubleQuoted(trimmedLine);
+  if (trimmedLine.startsWith('"') || trimmedLine.startsWith("'")) {
+    const parsed = trimmedLine.startsWith('"') ? parseDoubleQuoted(trimmedLine) : parseSingleQuoted(trimmedLine);
     if (!parsed) return null;
-    const after = parsed.rest.trimStart();
-    if (!after.startsWith(":")) return null;
-    const postColon = after.slice(1);
-    if (!allowCompactFlowColon && postColon.length > 0 && postColon[0] !== " " && postColon[0] !== "\t") return null;
-    return { key: parsed.value, rest: postColon.trimStart() };
-  }
-  if (trimmedLine.startsWith("'")) {
-    const parsed = parseSingleQuoted(trimmedLine);
-    if (!parsed) return null;
-    const after = parsed.rest.trimStart();
-    if (!after.startsWith(":")) return null;
-    const postColon = after.slice(1);
-    if (!allowCompactFlowColon && postColon.length > 0 && postColon[0] !== " " && postColon[0] !== "\t") return null;
-    return { key: parsed.value, rest: postColon.trimStart() };
+    let idx = trimmedLine.length - parsed.rest.length;
+    while (idx < trimmedLine.length && (trimmedLine[idx] === " " || trimmedLine[idx] === "\t")) idx++;
+    if (trimmedLine[idx] !== ":") return null;
+    idx++;
+    if (!allowCompactFlowColon && idx < trimmedLine.length && trimmedLine[idx] !== " " && trimmedLine[idx] !== "\t") return null;
+    while (idx < trimmedLine.length && (trimmedLine[idx] === " " || trimmedLine[idx] === "\t")) idx++;
+    return { key: parsed.value, rest: trimmedLine.slice(idx), restIndex: idx };
   }
   if (/^[\[\]{}|>*&!%@]/.test(trimmedLine)) return null;
   for (let i = 0; i < trimmedLine.length; i++) {
@@ -262,37 +254,103 @@ function splitKeyValue(trimmedLine: string, allowCompactFlowColon = false): { ke
     if (allowCompactFlowColon || next === undefined || next === " " || next === "\t") {
       const key = trimmedLine.slice(0, i).trim();
       if (!key || /[\[\]{}"']/.test(key)) return null;
-      return { key, rest: trimmedLine.slice(i + 1).trimStart() };
+      let restIndex = i + 1;
+      while (restIndex < trimmedLine.length && (trimmedLine[restIndex] === " " || trimmedLine[restIndex] === "\t")) restIndex++;
+      return { key, rest: trimmedLine.slice(restIndex), restIndex };
     }
   }
   return null;
+}
+
+function parseFlowValue(raw: string, map: number[] | null): YamlNode | null {
+  let lead = 0;
+  while (lead < raw.length && (raw[lead] === " " || raw[lead] === "\t" || raw[lead] === "\r" || raw[lead] === "\n")) lead++;
+  let endIdx = raw.length;
+  while (endIdx > lead && (raw[endIdx - 1] === " " || raw[endIdx - 1] === "\t" || raw[endIdx - 1] === "\r" || raw[endIdx - 1] === "\n")) endIdx--;
+  const trimmed = raw.slice(lead, endIdx);
+  const subMap = map ? map.slice(lead, endIdx) : null;
+  if (!trimmed) return { value: null, spans: EMPTY_SPANS };
+
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    const parsed = trimmed.startsWith('"') ? parseDoubleQuoted(trimmed) : parseSingleQuoted(trimmed);
+    if (!parsed || !onlyTrailingComment(parsed.rest)) return null;
+    if (!subMap) return { value: parsed.value, spans: EMPTY_SPANS };
+    const closeIdx = trimmed.length - parsed.rest.length - 1;
+    const span = mapSliceToSpan(subMap, 1, closeIdx);
+    return { value: parsed.value, spans: span ? [span] : EMPTY_SPANS };
+  }
+
+  if (trimmed.startsWith("[")) {
+    if (!trimmed.endsWith("]")) return null;
+    const inner = trimmed.slice(1, -1);
+    if (!inner.trim()) return { value: [], spans: EMPTY_SPANS, items: subMap ? [] : undefined };
+    const parts = splitTopLevelCommas(inner);
+    if (!parts) return null;
+    const innerMap = subMap ? subMap.slice(1, -1) : null;
+    const values: YamlValue[] = [];
+    const items: YamlNode[] | undefined = innerMap ? [] : undefined;
+    for (const { part, start } of parts) {
+      if (!part.trim()) continue;
+      const itemNode = parseFlowValue(part, innerMap ? innerMap.slice(start, start + part.length) : null);
+      if (!itemNode) return null;
+      values.push(itemNode.value);
+      items?.push(itemNode);
+    }
+    return { value: values, spans: EMPTY_SPANS, items };
+  }
+
+  if (trimmed.startsWith("{")) {
+    if (!trimmed.endsWith("}")) return null;
+    const inner = trimmed.slice(1, -1);
+    if (!inner.trim()) return { value: {}, spans: EMPTY_SPANS, entries: subMap ? {} : undefined };
+    const pairs = splitTopLevelCommas(inner);
+    if (!pairs) return null;
+    const innerMap = subMap ? subMap.slice(1, -1) : null;
+    const out: Record<string, YamlValue> = {};
+    const entries: Record<string, YamlNode> | undefined = innerMap ? {} : undefined;
+    for (const { part, start } of pairs) {
+      if (!part.trim()) continue;
+      let pairLead = 0;
+      while (pairLead < part.length && (part[pairLead] === " " || part[pairLead] === "\t")) pairLead++;
+      const pairTrimmed = part.slice(pairLead).trimEnd();
+      const kv = splitKeyValue(pairTrimmed, true);
+      if (!kv) return null;
+      const valStartInInner = start + pairLead + kv.restIndex;
+      const valNode = parseFlowValue(kv.rest, innerMap ? innerMap.slice(valStartInInner, valStartInInner + kv.rest.length) : null);
+      if (!valNode) return null;
+      out[kv.key] = valNode.value;
+      if (entries) entries[kv.key] = valNode;
+    }
+    return { value: out, spans: EMPTY_SPANS, entries };
+  }
+
+  if (trimmed.includes("[") || trimmed.includes("]") || trimmed.includes("{") || trimmed.includes("}")) {
+    // Reject unbalanced flow indicators in flow values such as `[a, [b]`.
+    if (!splitTopLevelCommas(trimmed)) return null;
+  }
+
+  const scalar = parsePlainScalar(trimmed);
+  if (!subMap || scalar === null) return { value: scalar, spans: EMPTY_SPANS };
+  const withoutComment = stripInlineComment(trimmed);
+  let cleanLead = 0;
+  while (cleanLead < withoutComment.length && (withoutComment[cleanLead] === " " || withoutComment[cleanLead] === "\t")) cleanLead++;
+  const cleaned = withoutComment.slice(cleanLead).trimEnd();
+  const span = cleaned.length > 0 ? mapSliceToSpan(subMap, cleanLead, cleanLead + cleaned.length) : null;
+  return { value: scalar, spans: span ? [span] : EMPTY_SPANS };
 }
 
 function isBlankOrComment(line: RawLine): boolean {
   return line.trimmed === "" || line.trimmed.startsWith("#");
 }
 
-function isSequenceItem(trimmed: string): { itemRest: string } | null {
-  if (trimmed === "-") return { itemRest: "" };
-  if (trimmed.startsWith("- ") || trimmed.startsWith("-\t")) {
-    return { itemRest: trimmed.slice(1).trimStart() };
+function sequenceItemWithOffset(line: RawLine): { itemRest: string; itemOffset: number } | null {
+  if (line.trimmed === "-") return { itemRest: "", itemOffset: line.trimmedOffset + 1 };
+  if (line.trimmed.startsWith("- ") || line.trimmed.startsWith("-\t")) {
+    let idx = 1;
+    while (idx < line.trimmed.length && (line.trimmed[idx] === " " || line.trimmed[idx] === "\t")) idx++;
+    return { itemRest: line.trimmed.slice(idx), itemOffset: line.trimmedOffset + idx };
   }
   return null;
-}
-
-function collectFlowLines(lines: RawLine[], startIndex: number, initialRest: string, minContIndent: number): { combined: string; nextIndex: number } | null {
-  let combined = stripFlowLineComment(initialRest);
-  let idx = startIndex;
-  while (true) {
-    const state = flowBalanceState(combined);
-    if (state === "error") return null;
-    if (state === "balanced") return { combined, nextIndex: idx + 1 };
-    idx++;
-    if (idx >= lines.length) return null;
-    if (isBlankOrComment(lines[idx])) continue;
-    if (lines[idx].indent < minContIndent) return null;
-    combined += " " + stripFlowLineComment(lines[idx].trimmed);
-  }
 }
 
 function stripFlowLineComment(line: string): string {
@@ -362,48 +420,103 @@ function flowBalanceState(text: string): "balanced" | "incomplete" | "error" {
   return closedTop ? "balanced" : "incomplete";
 }
 
-function collectQuotedScalar(lines: RawLine[], startIndex: number, initialRest: string, minContIndent: number): { value: string; nextIndex: number } | null {
+function collectFlowLines(
+  lines: RawLine[],
+  startIndex: number,
+  initialRest: string,
+  initialOffset: number,
+  minContIndent: number,
+  includeSpans: boolean,
+): { combined: string; map: number[] | null; nextIndex: number } | null {
+  const firstStripped = stripFlowLineComment(initialRest);
+  let combined = firstStripped;
+  const map = includeSpans ? makeDirectMap(initialOffset, firstStripped.length) : null;
+  let idx = startIndex;
+  while (true) {
+    const state = flowBalanceState(combined);
+    if (state === "error") return null;
+    if (state === "balanced") return { combined, map, nextIndex: idx + 1 };
+    idx++;
+    if (idx >= lines.length) return null;
+    if (isBlankOrComment(lines[idx])) continue;
+    if (lines[idx].indent < minContIndent) return null;
+    const nextStripped = stripFlowLineComment(lines[idx].trimmed);
+    combined += " " + nextStripped;
+    if (map) {
+      map.push(lines[idx].trimmedOffset > 0 ? lines[idx].trimmedOffset - 1 : lines[idx].trimmedOffset);
+      for (let i = 0; i < nextStripped.length; i++) map.push(lines[idx].trimmedOffset + i);
+    }
+  }
+}
+
+function collectQuotedScalar(
+  lines: RawLine[],
+  startIndex: number,
+  initialRest: string,
+  initialOffset: number,
+  minContIndent: number,
+  includeSpans: boolean,
+): { node: YamlNode; nextIndex: number } | null {
   const quote = initialRest[0];
   let combined = initialRest;
+  const map = includeSpans ? makeDirectMap(initialOffset, initialRest.length) : null;
   let idx = startIndex;
   while (true) {
     const parsed = quote === '"' ? parseDoubleQuoted(combined) : parseSingleQuoted(combined);
     if (parsed) {
       if (!onlyTrailingComment(parsed.rest)) return null;
-      return { value: parsed.value, nextIndex: idx + 1 };
+      if (!map) return { node: { value: parsed.value, spans: EMPTY_SPANS }, nextIndex: idx + 1 };
+      const closeIdx = combined.length - parsed.rest.length - 1;
+      const span = mapSliceToSpan(map, 1, closeIdx);
+      return { node: { value: parsed.value, spans: span ? [span] : EMPTY_SPANS }, nextIndex: idx + 1 };
     }
     idx++;
     if (idx >= lines.length) return null;
     if (lines[idx].trimmed === "") {
       combined += "\n";
+      map?.push(lines[idx].offset);
       continue;
     }
     if (lines[idx].indent < minContIndent) return null;
     combined += "\n" + lines[idx].trimmed;
+    if (map) {
+      map.push(lines[idx].offset);
+      for (let i = 0; i < lines[idx].trimmed.length; i++) map.push(lines[idx].trimmedOffset + i);
+    }
   }
 }
 
-function parseBlockScalar(lines: RawLine[], startIndex: number, header: string, parentIndent: number): { value: string; nextIndex: number } | null {
+function parseBlockScalar(
+  lines: RawLine[],
+  startIndex: number,
+  header: string,
+  parentIndent: number,
+  includeSpans: boolean,
+): { node: YamlNode; nextIndex: number } | null {
   const match = BLOCK_SCALAR_HEADER.exec(header);
   if (!match) return null;
   const style = match[1];
   const chomp = match[2] || match[5] || "clip";
   const indentDigit = match[3] || match[4];
   const rawContent: string[] = [];
+  const lineIndices: number[] = [];
   let idx = startIndex + 1;
   while (idx < lines.length) {
     const raw = lines[idx].raw;
     if (raw.trim() === "") {
       rawContent.push("");
+      lineIndices.push(idx);
       idx++;
       continue;
     }
     if (lines[idx].indent <= parentIndent) break;
     rawContent.push(raw);
+    lineIndices.push(idx);
     idx++;
   }
   while (rawContent.length > 0 && rawContent[rawContent.length - 1] === "" && chomp === "-") {
     rawContent.pop();
+    lineIndices.pop();
   }
   let blockIndent = indentDigit ? parentIndent + Number(indentDigit) : Infinity;
   if (!indentDigit) {
@@ -414,7 +527,7 @@ function parseBlockScalar(lines: RawLine[], startIndex: number, header: string, 
       }
     }
   }
-  if (!Number.isFinite(blockIndent)) return { value: "", nextIndex: idx };
+  if (!Number.isFinite(blockIndent)) return { node: { value: "", spans: EMPTY_SPANS }, nextIndex: idx };
   const dedented = rawContent.map(line => (line === "" ? "" : line.slice(Math.min(line.length, blockIndent))));
   let out = "";
   if (style === "|") {
@@ -433,9 +546,18 @@ function parseBlockScalar(lines: RawLine[], startIndex: number, header: string, 
       else out += " " + curr;
     }
   }
-  if (chomp === "-") out = out.replace(/\n+$/, "");
-  else if (chomp === "clip") out = out.replace(/\n+$/, "");
-  return { value: out, nextIndex: idx };
+  if (chomp === "-" || chomp === "clip") out = out.replace(/\n+$/, "");
+  if (!includeSpans) return { node: { value: out, spans: EMPTY_SPANS }, nextIndex: idx };
+  const spans: Array<{ start: number; end: number }> = [];
+  for (const li of lineIndices) {
+    if (lines[li].trimmed === "") continue;
+    const start = style === "|"
+      ? lines[li].offset + Math.min(lines[li].raw.length, blockIndent)
+      : lines[li].trimmedOffset;
+    const end = lines[li].offset + lines[li].raw.length;
+    if (end > start) spans.push({ start, end });
+  }
+  return { node: { value: out, spans }, nextIndex: idx };
 }
 
 function nextMeaningfulLine(lines: RawLine[], fromIndex: number): number {
@@ -444,147 +566,194 @@ function nextMeaningfulLine(lines: RawLine[], fromIndex: number): number {
   return idx;
 }
 
+function plainLineSpan(
+  text: string,
+  baseOffset: number,
+  includeSpans: boolean,
+): { stripped: string; span: { start: number; end: number } | null } {
+  const withoutComment = stripInlineComment(text);
+  let lead = 0;
+  while (lead < withoutComment.length && (withoutComment[lead] === " " || withoutComment[lead] === "\t")) lead++;
+  const cleaned = withoutComment.slice(lead).trimEnd();
+  return {
+    stripped: cleaned,
+    span: includeSpans && cleaned.length > 0 ? { start: baseOffset + lead, end: baseOffset + lead + cleaned.length } : null,
+  };
+}
+
 function parseValueAfterKey(
   lines: RawLine[],
   lineIndex: number,
   rest: string,
+  restOffset: number,
   keyIndent: number,
-): { value: YamlValue; nextIndex: number } | null {
+  includeSpans: boolean,
+): { node: YamlNode; nextIndex: number } | null {
   if (rest === "" || rest.startsWith("#")) {
     const nextIdx = nextMeaningfulLine(lines, lineIndex + 1);
-    if (nextIdx >= lines.length) return { value: null, nextIndex: lines.length };
+    if (nextIdx >= lines.length) return { node: { value: null, spans: EMPTY_SPANS }, nextIndex: lines.length };
     const nextLine = lines[nextIdx];
-    if (nextLine.indent > keyIndent && isSequenceItem(nextLine.trimmed)) {
-      return parseBlockSequence(lines, nextIdx, nextLine.indent);
-    }
-    if (nextLine.indent === keyIndent && isSequenceItem(nextLine.trimmed)) {
-      return parseBlockSequence(lines, nextIdx, keyIndent);
+    if (nextLine.indent >= keyIndent && sequenceItemWithOffset(nextLine)) {
+      return parseBlockSequence(lines, nextIdx, nextLine.indent, includeSpans);
     }
     if (nextLine.indent > keyIndent) {
       if (splitKeyValue(nextLine.trimmed)) {
-        return parseBlockMapping(lines, nextIdx, nextLine.indent);
+        return parseBlockMapping(lines, nextIdx, nextLine.indent, includeSpans);
       }
       const parts: string[] = [];
+      const spans: Array<{ start: number; end: number }> = [];
       let idx = nextIdx;
       while (idx < lines.length) {
         if (isBlankOrComment(lines[idx])) { idx++; continue; }
         if (lines[idx].indent <= keyIndent) break;
-        if (splitKeyValue(lines[idx].trimmed) || isSequenceItem(lines[idx].trimmed)) break;
-        parts.push(stripInlineComment(lines[idx].trimmed));
+        if (splitKeyValue(lines[idx].trimmed) || sequenceItemWithOffset(lines[idx])) break;
+        const piece = plainLineSpan(lines[idx].trimmed, lines[idx].trimmedOffset, includeSpans);
+        parts.push(piece.stripped);
+        if (piece.span) spans.push(piece.span);
         idx++;
       }
-      return { value: parsePlainScalar(parts.join(" ")), nextIndex: idx };
+      const value = parsePlainScalar(parts.join(" "));
+      return { node: { value, spans: value === null ? EMPTY_SPANS : spans }, nextIndex: idx };
     }
-    return { value: null, nextIndex: nextIdx };
+    return { node: { value: null, spans: EMPTY_SPANS }, nextIndex: nextIdx };
   }
 
   if (rest.startsWith("|") || rest.startsWith(">")) {
-    return parseBlockScalar(lines, lineIndex, rest, keyIndent);
+    return parseBlockScalar(lines, lineIndex, rest, keyIndent, includeSpans);
   }
   if (rest.startsWith('"') || rest.startsWith("'")) {
-    return collectQuotedScalar(lines, lineIndex, rest, keyIndent + 1);
+    return collectQuotedScalar(lines, lineIndex, rest, restOffset, keyIndent + 1, includeSpans);
   }
   if (rest.startsWith("[") || rest.startsWith("{")) {
-    const collected = collectFlowLines(lines, lineIndex, rest, keyIndent);
+    const collected = collectFlowLines(lines, lineIndex, rest, restOffset, keyIndent, includeSpans);
     if (!collected) return null;
-    const parsed = parseFlowValue(collected.combined);
-    if (!parsed.ok) return null;
-    return { value: parsed.value, nextIndex: collected.nextIndex };
+    const node = parseFlowValue(collected.combined, collected.map);
+    if (!node) return null;
+    return { node, nextIndex: collected.nextIndex };
   }
 
-  const parts = [stripInlineComment(rest)];
+  const firstPiece = plainLineSpan(rest, restOffset, includeSpans);
+  const parts = [firstPiece.stripped];
+  const spans: Array<{ start: number; end: number }> = firstPiece.span ? [firstPiece.span] : [];
   let idx = lineIndex + 1;
   while (idx < lines.length) {
     if (isBlankOrComment(lines[idx])) break;
     if (lines[idx].indent <= keyIndent) break;
-    if (splitKeyValue(lines[idx].trimmed) || isSequenceItem(lines[idx].trimmed)) break;
-    parts.push(stripInlineComment(lines[idx].trimmed));
+    if (splitKeyValue(lines[idx].trimmed) || sequenceItemWithOffset(lines[idx])) break;
+    const piece = plainLineSpan(lines[idx].trimmed, lines[idx].trimmedOffset, includeSpans);
+    parts.push(piece.stripped);
+    if (piece.span) spans.push(piece.span);
     idx++;
   }
-  return { value: parsePlainScalar(parts.join(" ")), nextIndex: idx };
+  const value = parsePlainScalar(parts.join(" "));
+  return { node: { value, spans: value === null ? EMPTY_SPANS : spans }, nextIndex: idx };
 }
 
-function parseBlockSequence(lines: RawLine[], startIndex: number, seqIndent: number): { value: YamlValue[]; nextIndex: number } | null {
-  const items: YamlValue[] = [];
+function parseBlockSequence(
+  lines: RawLine[],
+  startIndex: number,
+  seqIndent: number,
+  includeSpans: boolean,
+): { node: YamlNode; nextIndex: number } | null {
+  const values: YamlValue[] = [];
+  const items: YamlNode[] | undefined = includeSpans ? [] : undefined;
   let idx = startIndex;
   while (idx < lines.length) {
     if (isBlankOrComment(lines[idx])) { idx++; continue; }
     if (lines[idx].indent < seqIndent) break;
     if (lines[idx].indent > seqIndent) return null;
-    const seq = isSequenceItem(lines[idx].trimmed);
+    const seq = sequenceItemWithOffset(lines[idx]);
     if (!seq) break;
-    const itemRest = seq.itemRest;
+    const { itemRest, itemOffset } = seq;
     if (itemRest === "" || itemRest.startsWith("#")) {
       const nextIdx = nextMeaningfulLine(lines, idx + 1);
       if (nextIdx < lines.length && lines[nextIdx].indent > seqIndent) {
-        if (isSequenceItem(lines[nextIdx].trimmed)) {
-          const sub = parseBlockSequence(lines, nextIdx, lines[nextIdx].indent);
+        if (sequenceItemWithOffset(lines[nextIdx])) {
+          const sub = parseBlockSequence(lines, nextIdx, lines[nextIdx].indent, includeSpans);
           if (!sub) return null;
-          items.push(sub.value);
+          values.push(sub.node.value);
+          items?.push(sub.node);
           idx = sub.nextIndex;
           continue;
         }
         if (splitKeyValue(lines[nextIdx].trimmed)) {
-          const sub = parseBlockMapping(lines, nextIdx, lines[nextIdx].indent);
+          const sub = parseBlockMapping(lines, nextIdx, lines[nextIdx].indent, includeSpans);
           if (!sub) return null;
-          items.push(sub.value);
+          values.push(sub.node.value);
+          items?.push(sub.node);
           idx = sub.nextIndex;
           continue;
         }
       }
-      items.push(null);
+      values.push(null);
+      items?.push({ value: null, spans: EMPTY_SPANS });
       idx = nextIdx;
       continue;
     }
     const inlineKv = splitKeyValue(itemRest);
     if (inlineKv) {
       const entryIndent = seqIndent + 2;
-      const firstVal = parseValueAfterKey(lines, idx, inlineKv.rest, seqIndent + 1);
+      const firstVal = parseValueAfterKey(lines, idx, inlineKv.rest, itemOffset + inlineKv.restIndex, seqIndent + 1, includeSpans);
       if (!firstVal) return null;
-      const obj: Record<string, YamlValue> = { [inlineKv.key]: firstVal.value };
+      const obj: Record<string, YamlValue> = { [inlineKv.key]: firstVal.node.value };
+      const entries: Record<string, YamlNode> | undefined = includeSpans ? { [inlineKv.key]: firstVal.node } : undefined;
       let nextIdx = firstVal.nextIndex;
       const peek = nextMeaningfulLine(lines, nextIdx);
-      if (peek < lines.length && lines[peek].indent >= entryIndent && !isSequenceItem(lines[peek].trimmed)) {
-        const restMap = parseBlockMapping(lines, peek, lines[peek].indent);
+      if (peek < lines.length && lines[peek].indent >= entryIndent && !sequenceItemWithOffset(lines[peek])) {
+        const restMap = parseBlockMapping(lines, peek, lines[peek].indent, includeSpans);
         if (!restMap) return null;
-        Object.assign(obj, restMap.value);
+        Object.assign(obj, restMap.node.value as Record<string, YamlValue>);
+        if (entries && restMap.node.entries) Object.assign(entries, restMap.node.entries);
         nextIdx = restMap.nextIndex;
       }
-      items.push(obj);
+      values.push(obj);
+      items?.push({ value: obj, spans: EMPTY_SPANS, entries });
       idx = nextIdx;
       continue;
     }
     if (itemRest.startsWith("|") || itemRest.startsWith(">")) {
-      const block = parseBlockScalar(lines, idx, itemRest, seqIndent);
+      const block = parseBlockScalar(lines, idx, itemRest, seqIndent, includeSpans);
       if (!block) return null;
-      items.push(block.value);
+      values.push(block.node.value);
+      items?.push(block.node);
       idx = block.nextIndex;
       continue;
     }
     if (itemRest.startsWith('"') || itemRest.startsWith("'")) {
-      const quoted = collectQuotedScalar(lines, idx, itemRest, seqIndent + 1);
+      const quoted = collectQuotedScalar(lines, idx, itemRest, itemOffset, seqIndent + 1, includeSpans);
       if (!quoted) return null;
-      items.push(quoted.value);
+      values.push(quoted.node.value);
+      items?.push(quoted.node);
       idx = quoted.nextIndex;
       continue;
     }
     if (itemRest.startsWith("[") || itemRest.startsWith("{")) {
-      const collected = collectFlowLines(lines, idx, itemRest, seqIndent + 1);
+      const collected = collectFlowLines(lines, idx, itemRest, itemOffset, seqIndent + 1, includeSpans);
       if (!collected) return null;
-      const parsed = parseFlowValue(collected.combined);
-      if (!parsed.ok) return null;
-      items.push(parsed.value);
+      const node = parseFlowValue(collected.combined, collected.map);
+      if (!node) return null;
+      values.push(node.value);
+      items?.push(node);
       idx = collected.nextIndex;
       continue;
     }
-    items.push(parsePlainScalar(itemRest));
+    const piece = plainLineSpan(itemRest, itemOffset, includeSpans);
+    const scalar = parsePlainScalar(itemRest);
+    values.push(scalar);
+    items?.push({ value: scalar, spans: scalar !== null && piece.span ? [piece.span] : EMPTY_SPANS });
     idx++;
   }
-  return { value: items, nextIndex: idx };
+  return { node: { value: values, spans: EMPTY_SPANS, items }, nextIndex: idx };
 }
 
-function parseBlockMapping(lines: RawLine[], startIndex: number, mapIndent: number): { value: Record<string, YamlValue>; nextIndex: number } | null {
+function parseBlockMapping(
+  lines: RawLine[],
+  startIndex: number,
+  mapIndent: number,
+  includeSpans: boolean,
+): { node: YamlNode; nextIndex: number } | null {
   const result: Record<string, YamlValue> = {};
+  const entries: Record<string, YamlNode> | undefined = includeSpans ? {} : undefined;
   let idx = startIndex;
   while (idx < lines.length) {
     if (isBlankOrComment(lines[idx])) { idx++; continue; }
@@ -592,27 +761,48 @@ function parseBlockMapping(lines: RawLine[], startIndex: number, mapIndent: numb
     if (lines[idx].indent > mapIndent) return null;
     const kv = splitKeyValue(lines[idx].trimmed);
     if (!kv) return null;
-    const parsed = parseValueAfterKey(lines, idx, kv.rest, mapIndent);
+    const parsed = parseValueAfterKey(lines, idx, kv.rest, lines[idx].trimmedOffset + kv.restIndex, mapIndent, includeSpans);
     if (!parsed) return null;
-    result[kv.key] = parsed.value;
+    result[kv.key] = parsed.node.value;
+    if (entries) entries[kv.key] = parsed.node;
     idx = parsed.nextIndex;
   }
-  return { value: result, nextIndex: idx };
+  return { node: { value: result, spans: EMPTY_SPANS, entries }, nextIndex: idx };
 }
 
-function toRawLines(yamlBody: string): RawLine[] | null {
+function toRawLines(markdown: string, yamlStart: number, yamlEnd: number): RawLine[] | null {
+  if (yamlEnd <= yamlStart) return [];
+  let sliceEnd = yamlEnd;
+  if (sliceEnd > yamlStart && markdown[sliceEnd - 1] === "\n") {
+    sliceEnd--;
+    if (sliceEnd > yamlStart && markdown[sliceEnd - 1] === "\r") sliceEnd--;
+  }
   const lines: RawLine[] = [];
-  for (const rawLine of yamlBody.split(/\r?\n/)) {
+  let pos = yamlStart;
+  while (pos <= sliceEnd) {
+    const nl = markdown.indexOf("\n", pos);
+    const rawEnd = nl < 0 || nl > sliceEnd ? sliceEnd : (nl > pos && markdown[nl - 1] === "\r" ? nl - 1 : nl);
+    const raw = markdown.slice(pos, rawEnd);
     let indent = 0;
     let hasLeadingTab = false;
-    for (let i = 0; i < rawLine.length; i++) {
-      if (rawLine[i] === " ") indent++;
-      else if (rawLine[i] === "\t") { hasLeadingTab = true; break; }
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] === " ") indent++;
+      else if (raw[i] === "\t") { hasLeadingTab = true; break; }
       else break;
     }
-    const trimmed = rawLine.trim();
+    const trimmed = raw.trim();
     if (hasLeadingTab && trimmed !== "" && !trimmed.startsWith("#")) return null;
-    lines.push({ raw: rawLine, indent, trimmed });
+    let leadWs = indent;
+    while (leadWs < raw.length && (raw[leadWs] === " " || raw[leadWs] === "\t")) leadWs++;
+    lines.push({
+      raw,
+      indent,
+      trimmed,
+      offset: pos,
+      trimmedOffset: trimmed ? pos + leadWs : pos,
+    });
+    if (nl < 0 || nl >= sliceEnd) break;
+    pos = nl + 1;
   }
   return lines;
 }
@@ -626,42 +816,92 @@ function scalarToString(value: YamlValue | undefined): string | undefined {
   return undefined;
 }
 
-function extractAuthorName(value: YamlValue): string | undefined {
-  const direct = scalarToString(value);
-  if (direct) return direct;
-  if (value && typeof value === "object" && !Array.isArray(value)) {
-    const name = value.name ?? value.literal;
-    const directName = scalarToString(name);
-    if (directName) return directName;
-    if (name && typeof name === "object" && !Array.isArray(name)) {
-      const literal = scalarToString(name.literal);
-      if (literal) return literal;
-      const parts = [scalarToString(name.given), scalarToString(name.family)].filter(Boolean);
-      if (parts.length) return parts.join(" ");
-    }
-    const parts = [scalarToString(value.given), scalarToString(value.family)].filter(Boolean);
-    if (parts.length) return parts.join(" ");
+function lookupCaseInsensitive<T>(entries: Record<string, T>, target: string): T | undefined {
+  if (Object.prototype.hasOwnProperty.call(entries, target)) return entries[target];
+  const lower = target.toLowerCase();
+  for (const [key, value] of Object.entries(entries)) {
+    if (key.toLowerCase() === lower) return value;
   }
   return undefined;
 }
 
-function extractAuthors(entries: Record<string, YamlValue>): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const add = (name: string | undefined) => {
-    if (!name) return;
-    if (!seen.has(name)) { seen.add(name); out.push(name); }
-  };
-  for (const key of ["author", "authors", "creator"]) {
-    const val = lookupCaseInsensitive(entries, key);
-    if (val === undefined || val === null) continue;
-    if (Array.isArray(val)) {
-      for (const item of val) add(extractAuthorName(item));
-    } else {
-      add(extractAuthorName(val));
+function extractAuthorNameAndSpans(
+  value: YamlValue,
+  node?: YamlNode,
+): { name: string; spans: Array<{ start: number; end: number }> } | undefined {
+  const direct = scalarToString(value);
+  if (direct) return { name: direct, spans: node?.spans ?? EMPTY_SPANS };
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const nameVal = value.name ?? value.literal;
+    const nameNode = node?.entries ? (node.entries.name ?? node.entries.literal) : undefined;
+    const directName = scalarToString(nameVal);
+    if (directName) return { name: directName, spans: nameNode?.spans ?? EMPTY_SPANS };
+    if (nameVal && typeof nameVal === "object" && !Array.isArray(nameVal)) {
+      const literal = scalarToString(nameVal.literal);
+      if (literal) return { name: literal, spans: nameNode?.entries?.literal?.spans ?? EMPTY_SPANS };
+      const given = scalarToString(nameVal.given);
+      const family = scalarToString(nameVal.family);
+      const parts = [given, family].filter(Boolean);
+      if (parts.length) {
+        return {
+          name: parts.join(" "),
+          spans: [
+            ...(given && nameNode?.entries?.given ? nameNode.entries.given.spans : EMPTY_SPANS),
+            ...(family && nameNode?.entries?.family ? nameNode.entries.family.spans : EMPTY_SPANS),
+          ],
+        };
+      }
+    }
+    const given = scalarToString(value.given);
+    const family = scalarToString(value.family);
+    const parts = [given, family].filter(Boolean);
+    if (parts.length) {
+      return {
+        name: parts.join(" "),
+        spans: [
+          ...(given && node?.entries?.given ? node.entries.given.spans : EMPTY_SPANS),
+          ...(family && node?.entries?.family ? node.entries.family.spans : EMPTY_SPANS),
+        ],
+      };
     }
   }
-  return out;
+  return undefined;
+}
+
+function splitCommaScalarSpans(
+  markdown: string,
+  spans: Array<{ start: number; end: number }>,
+): Array<Array<{ start: number; end: number }>> | null {
+  if (!spans.length) return null;
+  let sawComma = false;
+  const groups: Array<Array<{ start: number; end: number }>> = [];
+  let current: Array<{ start: number; end: number }> = [];
+  for (const s of spans) {
+    const rawSlice = markdown.slice(s.start, s.end);
+    if (!rawSlice.includes(",")) {
+      const lead = rawSlice.length - rawSlice.trimStart().length;
+      const cleaned = rawSlice.trim();
+      if (cleaned) current.push({ start: s.start + lead, end: s.start + lead + cleaned.length });
+      continue;
+    }
+    sawComma = true;
+    const parts = rawSlice.split(",");
+    let cursor = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const lead = part.length - part.trimStart().length;
+      const cleaned = part.trim();
+      if (cleaned) current.push({ start: s.start + cursor + lead, end: s.start + cursor + lead + cleaned.length });
+      if (i < parts.length - 1) {
+        groups.push(current);
+        current = [];
+      }
+      cursor += part.length + 1;
+    }
+  }
+  if (!sawComma) return null;
+  groups.push(current);
+  return groups;
 }
 
 function extractTagList(entries: Record<string, YamlValue>, keys: string[]): string[] {
@@ -693,34 +933,111 @@ function extractTagList(entries: Record<string, YamlValue>, keys: string[]): str
   return out;
 }
 
-function lookupCaseInsensitive(entries: Record<string, YamlValue>, target: string): YamlValue | undefined {
-  if (Object.prototype.hasOwnProperty.call(entries, target)) return entries[target];
-  const lower = target.toLowerCase();
-  for (const [key, value] of Object.entries(entries)) {
-    if (key.toLowerCase() === lower) return value;
-  }
-  return undefined;
-}
+function normalizeMetadataAndSpans(
+  entries: Record<string, YamlValue>,
+  nodeEntries: Record<string, YamlNode> | undefined,
+  markdown: string,
+  includeSpans: boolean,
+): { properties: DocumentMetadata | null; visibleSpans?: FrontmatterVisibleSpan[] } {
+  const visibleSpans: FrontmatterVisibleSpan[] | undefined = includeSpans ? [] : undefined;
 
-function normalizeMetadata(entries: Record<string, YamlValue>): DocumentMetadata | null {
   const title = scalarToString(lookupCaseInsensitive(entries, "title"));
+  if (title && visibleSpans && nodeEntries) {
+    const titleNode = lookupCaseInsensitive(nodeEntries, "title");
+    if (titleNode) {
+      for (const s of titleNode.spans) {
+        if (s.end > s.start) visibleSpans.push({ start: s.start, end: s.end, field: "title", fieldOrdinal: 0 });
+      }
+    }
+  }
+
+  const authors: string[] = [];
+  const seenAuthors = new Set<string>();
+  for (const key of ["author", "authors", "creator"]) {
+    const val = lookupCaseInsensitive(entries, key);
+    if (val === undefined || val === null) continue;
+    const node = nodeEntries ? lookupCaseInsensitive(nodeEntries, key) : undefined;
+    if (Array.isArray(val)) {
+      for (let i = 0; i < val.length; i++) {
+        const extracted = extractAuthorNameAndSpans(val[i], node?.items?.[i]);
+        if (!extracted || seenAuthors.has(extracted.name)) continue;
+        seenAuthors.add(extracted.name);
+        authors.push(extracted.name);
+        if (visibleSpans) {
+          for (const s of extracted.spans) {
+            if (s.end > s.start) visibleSpans.push({ start: s.start, end: s.end, field: "author", fieldOrdinal: 0 });
+          }
+        }
+      }
+    } else {
+      const extracted = extractAuthorNameAndSpans(val, node);
+      if (extracted && !seenAuthors.has(extracted.name)) {
+        seenAuthors.add(extracted.name);
+        authors.push(extracted.name);
+        if (visibleSpans) {
+          for (const s of extracted.spans) {
+            if (s.end > s.start) visibleSpans.push({ start: s.start, end: s.end, field: "author", fieldOrdinal: 0 });
+          }
+        }
+      }
+    }
+  }
+
+  const tags: string[] = [];
+  const seenTags = new Set<string>();
+  const addTag = (raw: string | undefined, spans: Array<{ start: number; end: number }>) => {
+    if (!raw) return;
+    const trimmed = raw.trim();
+    if (!trimmed || seenTags.has(trimmed)) return;
+    seenTags.add(trimmed);
+    const ord = tags.length;
+    tags.push(trimmed);
+    if (visibleSpans) {
+      for (const s of spans) {
+        if (s.end > s.start) visibleSpans.push({ start: s.start, end: s.end, field: "tag", fieldOrdinal: ord });
+      }
+    }
+  };
+  for (const key of ["tags", "tag", "keywords"]) {
+    const val = lookupCaseInsensitive(entries, key);
+    if (val === undefined || val === null) continue;
+    const node = nodeEntries ? lookupCaseInsensitive(nodeEntries, key) : undefined;
+    if (Array.isArray(val)) {
+      for (let i = 0; i < val.length; i++) {
+        addTag(scalarToString(val[i]), node?.items?.[i]?.spans ?? EMPTY_SPANS);
+      }
+    } else {
+      const str = scalarToString(val);
+      if (!str) continue;
+      const nodeSpans = node?.spans ?? EMPTY_SPANS;
+      if (str.includes(",")) {
+        const rawParts = str.split(",");
+        const splitGroups = visibleSpans ? splitCommaScalarSpans(markdown, nodeSpans) : null;
+        for (let i = 0; i < rawParts.length; i++) {
+          addTag(rawParts[i], splitGroups ? (splitGroups[i] ?? EMPTY_SPANS) : nodeSpans);
+        }
+      } else {
+        addTag(str, nodeSpans);
+      }
+    }
+  }
+
   const subtitle = scalarToString(lookupCaseInsensitive(entries, "subtitle"));
-  const authors = extractAuthors(entries);
   const date = scalarToString(lookupCaseInsensitive(entries, "date"));
   const description =
     scalarToString(lookupCaseInsensitive(entries, "description")) ??
     scalarToString(lookupCaseInsensitive(entries, "subject")) ??
     scalarToString(lookupCaseInsensitive(entries, "abstract"));
-  const tags = extractTagList(entries, ["tags", "tag", "keywords"]);
   const aliases = extractTagList(entries, ["aliases", "alias"]);
 
-  if (!title && !subtitle && !authors.length && !date && !description && !tags.length && !aliases.length) {
-    return null;
-  }
-  return { title, subtitle, authors, date, description, tags, aliases };
+  const properties = (!title && !subtitle && !authors.length && !date && !description && !tags.length && !aliases.length)
+    ? null
+    : { title, subtitle, authors, date, description, tags, aliases };
+
+  return includeSpans ? { properties, visibleSpans } : { properties };
 }
 
-export function parseFrontmatter(markdown: string): ParsedFrontmatter | null {
+export function parseFrontmatter(markdown: string, options?: ParseFrontmatterOptions): ParsedFrontmatter | null {
   let cursor = markdown.startsWith("\uFEFF") ? 1 : 0;
   if (!markdown.startsWith("---", cursor)) return null;
   cursor += 3;
@@ -735,7 +1052,7 @@ export function parseFrontmatter(markdown: string): ParsedFrontmatter | null {
   let frontmatterEnd = -1;
 
   while (lineStart <= markdown.length) {
-    let lineEnd = markdown.indexOf("\n", lineStart);
+    const lineEnd = markdown.indexOf("\n", lineStart);
     let nextLineStart: number;
     let contentEnd: number;
     if (lineEnd < 0) {
@@ -757,25 +1074,30 @@ export function parseFrontmatter(markdown: string): ParsedFrontmatter | null {
 
   if (yamlEnd < 0 || frontmatterEnd < 0) return null;
 
-  const yamlSlice = markdown.slice(yamlStart, yamlEnd).replace(/\r?\n$/, "");
-  const lines = yamlSlice === "" ? [] : toRawLines(yamlSlice);
+  const includeSpans = Boolean(options?.includeSpans);
+  const lines = toRawLines(markdown, yamlStart, yamlEnd);
   if (!lines) return null;
 
   const firstMeaningful = nextMeaningfulLine(lines, 0);
   let entries: Record<string, YamlValue> = {};
+  let nodeEntries: Record<string, YamlNode> | undefined = includeSpans ? {} : undefined;
   if (firstMeaningful < lines.length) {
     if (lines[firstMeaningful].indent !== 0) return null;
-    const parsed = parseBlockMapping(lines, firstMeaningful, 0);
+    const parsed = parseBlockMapping(lines, firstMeaningful, 0, includeSpans);
     if (!parsed || nextMeaningfulLine(lines, parsed.nextIndex) < lines.length) return null;
-    entries = parsed.value;
+    entries = parsed.node.value as Record<string, YamlValue>;
+    nodeEntries = parsed.node.entries;
   }
 
-  return {
+  const normalized = normalizeMetadataAndSpans(entries, nodeEntries, markdown, includeSpans);
+  const result: ParsedFrontmatter = {
     raw: markdown.slice(0, frontmatterEnd),
     end: frontmatterEnd,
     entries,
-    properties: normalizeMetadata(entries),
+    properties: normalized.properties,
   };
+  if (includeSpans) result.visibleSpans = normalized.visibleSpans ?? [];
+  return result;
 }
 
 /**
@@ -790,500 +1112,6 @@ export function maskFrontmatter(markdown: string): string {
   return prefix + markdown.slice(fm.end);
 }
 
-export type FrontmatterVisibleField = "title" | "author" | "tag";
-
-export interface FrontmatterVisibleSpan {
-  /** Inclusive canonical UTF-16 start offset in the Markdown document. */
-  start: number;
-  /** Exclusive canonical UTF-16 end offset in the Markdown document. */
-  end: number;
-  /** Rendered metadata field category in DocumentProperties. */
-  field: FrontmatterVisibleField;
-  /** 0-based index among `[data-frontmatter-field="<field>"]` elements. */
-  fieldOrdinal: number;
-}
-
-interface SpanLine {
-  raw: string;
-  indent: number;
-  trimmed: string;
-  offset: number;
-  trimmedOffset: number;
-}
-
-interface SpanNode {
-  value: YamlValue;
-  spans: Array<{ start: number; end: number }>;
-  items?: SpanNode[];
-  entries?: Record<string, SpanNode>;
-}
-
-function mapSliceToSpan(map: number[], relStart: number, relEnd: number): { start: number; end: number } | null {
-  if (relEnd < relStart || map.length === 0) return null;
-  if (relEnd === relStart) {
-    const pos = map[Math.min(relStart, map.length - 1)] ?? 0;
-    return { start: pos, end: pos };
-  }
-  const start = map[relStart];
-  const last = map[relEnd - 1];
-  if (start === undefined || last === undefined) return null;
-  return { start, end: last + 1 };
-}
-
-function makeDirectMap(startOffset: number, length: number): number[] {
-  const map = new Array<number>(length);
-  for (let i = 0; i < length; i++) map[i] = startOffset + i;
-  return map;
-}
-
-function splitKeyValueWithIndex(
-  trimmedLine: string,
-  allowCompactFlowColon = false,
-): { key: string; rest: string; restIndex: number } | null {
-  if (!trimmedLine || trimmedLine.startsWith("#")) return null;
-  if (trimmedLine.startsWith("- ") || trimmedLine === "-" || trimmedLine.startsWith("-\t")) return null;
-  if (trimmedLine.startsWith('"') || trimmedLine.startsWith("'")) {
-    const parsed = trimmedLine.startsWith('"') ? parseDoubleQuoted(trimmedLine) : parseSingleQuoted(trimmedLine);
-    if (!parsed) return null;
-    let idx = trimmedLine.length - parsed.rest.length;
-    while (idx < trimmedLine.length && (trimmedLine[idx] === " " || trimmedLine[idx] === "\t")) idx++;
-    if (trimmedLine[idx] !== ":") return null;
-    idx++;
-    if (!allowCompactFlowColon && idx < trimmedLine.length && trimmedLine[idx] !== " " && trimmedLine[idx] !== "\t") return null;
-    while (idx < trimmedLine.length && (trimmedLine[idx] === " " || trimmedLine[idx] === "\t")) idx++;
-    return { key: parsed.value, rest: trimmedLine.slice(idx), restIndex: idx };
-  }
-  if (/^[\[\]{}|>*&!%@]/.test(trimmedLine)) return null;
-  for (let i = 0; i < trimmedLine.length; i++) {
-    if (trimmedLine[i] !== ":") continue;
-    const next = trimmedLine[i + 1];
-    if (allowCompactFlowColon || next === undefined || next === " " || next === "\t") {
-      const key = trimmedLine.slice(0, i).trim();
-      if (!key || /[\[\]{}"']/.test(key)) return null;
-      let restIndex = i + 1;
-      while (restIndex < trimmedLine.length && (trimmedLine[restIndex] === " " || trimmedLine[restIndex] === "\t")) restIndex++;
-      return { key, rest: trimmedLine.slice(restIndex), restIndex };
-    }
-  }
-  return null;
-}
-
-function splitTopLevelCommasWithRanges(inner: string): Array<{ part: string; start: number }> | null {
-  const parts: Array<{ part: string; start: number }> = [];
-  let start = 0;
-  let depthBracket = 0;
-  let depthBrace = 0;
-  for (let i = 0; i < inner.length; i++) {
-    const ch = inner[i];
-    if (ch === '"') {
-      const parsed = parseDoubleQuoted(inner.slice(i));
-      if (!parsed) return null;
-      i = inner.length - parsed.rest.length - 1;
-      continue;
-    }
-    if (ch === "'") {
-      const parsed = parseSingleQuoted(inner.slice(i));
-      if (!parsed) return null;
-      i = inner.length - parsed.rest.length - 1;
-      continue;
-    }
-    if (ch === "[") depthBracket++;
-    else if (ch === "]") { if (--depthBracket < 0) return null; }
-    else if (ch === "{") depthBrace++;
-    else if (ch === "}") { if (--depthBrace < 0) return null; }
-    else if (ch === "," && depthBracket === 0 && depthBrace === 0) {
-      parts.push({ part: inner.slice(start, i), start });
-      start = i + 1;
-    }
-  }
-  if (depthBracket !== 0 || depthBrace !== 0) return null;
-  parts.push({ part: inner.slice(start), start });
-  return parts;
-}
-
-function parseFlowSpanNode(raw: string, map: number[]): SpanNode | null {
-  let lead = 0;
-  while (lead < raw.length && (raw[lead] === " " || raw[lead] === "\t" || raw[lead] === "\r" || raw[lead] === "\n")) lead++;
-  let endIdx = raw.length;
-  while (endIdx > lead && (raw[endIdx - 1] === " " || raw[endIdx - 1] === "\t" || raw[endIdx - 1] === "\r" || raw[endIdx - 1] === "\n")) endIdx--;
-  const trimmed = raw.slice(lead, endIdx);
-  const subMap = map.slice(lead, endIdx);
-  if (!trimmed) return { value: null, spans: [] };
-  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
-    const parsed = trimmed.startsWith('"') ? parseDoubleQuoted(trimmed) : parseSingleQuoted(trimmed);
-    if (!parsed || !onlyTrailingComment(parsed.rest)) return null;
-    const closeIdx = trimmed.length - parsed.rest.length - 1;
-    const span = mapSliceToSpan(subMap, 1, closeIdx);
-    return { value: parsed.value, spans: span ? [span] : [] };
-  }
-  if (trimmed.startsWith("[")) {
-    if (!trimmed.endsWith("]")) return null;
-    const inner = trimmed.slice(1, -1);
-    const innerMap = subMap.slice(1, -1);
-    if (!inner.trim()) return { value: [], spans: [], items: [] };
-    const parts = splitTopLevelCommasWithRanges(inner);
-    if (!parts) return null;
-    const items: SpanNode[] = [];
-    for (const { part, start } of parts) {
-      if (!part.trim()) continue;
-      const itemNode = parseFlowSpanNode(part, innerMap.slice(start, start + part.length));
-      if (!itemNode) return null;
-      items.push(itemNode);
-    }
-    return { value: items.map(i => i.value), spans: [], items };
-  }
-  if (trimmed.startsWith("{")) {
-    if (!trimmed.endsWith("}")) return null;
-    const inner = trimmed.slice(1, -1);
-    const innerMap = subMap.slice(1, -1);
-    if (!inner.trim()) return { value: {}, spans: [], entries: {} };
-    const pairs = splitTopLevelCommasWithRanges(inner);
-    if (!pairs) return null;
-    const entries: Record<string, SpanNode> = {};
-    const out: Record<string, YamlValue> = {};
-    for (const { part, start } of pairs) {
-      if (!part.trim()) continue;
-      let pairLead = 0;
-      while (pairLead < part.length && (part[pairLead] === " " || part[pairLead] === "\t")) pairLead++;
-      const pairTrimmed = part.slice(pairLead).trimEnd();
-      const kv = splitKeyValueWithIndex(pairTrimmed, true);
-      if (!kv) return null;
-      const valStartInInner = start + pairLead + kv.restIndex;
-      const valNode = parseFlowSpanNode(kv.rest, innerMap.slice(valStartInInner, valStartInInner + kv.rest.length));
-      if (!valNode) return null;
-      entries[kv.key] = valNode;
-      out[kv.key] = valNode.value;
-    }
-    return { value: out, spans: [], entries };
-  }
-  const withoutComment = stripInlineComment(trimmed);
-  let cleanLead = 0;
-  while (cleanLead < withoutComment.length && (withoutComment[cleanLead] === " " || withoutComment[cleanLead] === "\t")) cleanLead++;
-  const cleaned = withoutComment.slice(cleanLead).trimEnd();
-  const scalar = parsePlainScalar(trimmed);
-  const span = scalar !== null && cleaned.length > 0 ? mapSliceToSpan(subMap, cleanLead, cleanLead + cleaned.length) : null;
-  return { value: scalar, spans: span ? [span] : [] };
-}
-
-function collectFlowWithMap(
-  lines: SpanLine[],
-  startIndex: number,
-  initialRest: string,
-  initialOffset: number,
-  minContIndent: number,
-): { combined: string; map: number[]; nextIndex: number } | null {
-  const firstStripped = stripFlowLineComment(initialRest);
-  let combined = firstStripped;
-  const map = makeDirectMap(initialOffset, firstStripped.length);
-  let idx = startIndex;
-  while (true) {
-    const state = flowBalanceState(combined);
-    if (state === "error") return null;
-    if (state === "balanced") return { combined, map, nextIndex: idx + 1 };
-    idx++;
-    if (idx >= lines.length) return null;
-    if (lines[idx].trimmed === "" || lines[idx].trimmed.startsWith("#")) continue;
-    if (lines[idx].indent < minContIndent) return null;
-    const nextStripped = stripFlowLineComment(lines[idx].trimmed);
-    combined += " " + nextStripped;
-    map.push(lines[idx].trimmedOffset > 0 ? lines[idx].trimmedOffset - 1 : lines[idx].trimmedOffset);
-    for (let i = 0; i < nextStripped.length; i++) map.push(lines[idx].trimmedOffset + i);
-  }
-}
-
-function collectQuotedWithMap(
-  lines: SpanLine[],
-  startIndex: number,
-  initialRest: string,
-  initialOffset: number,
-  minContIndent: number,
-): { node: SpanNode; nextIndex: number } | null {
-  const quote = initialRest[0];
-  let combined = initialRest;
-  const map = makeDirectMap(initialOffset, initialRest.length);
-  let idx = startIndex;
-  while (true) {
-    const parsed = quote === '"' ? parseDoubleQuoted(combined) : parseSingleQuoted(combined);
-    if (parsed) {
-      if (!onlyTrailingComment(parsed.rest)) return null;
-      const closeIdx = combined.length - parsed.rest.length - 1;
-      const span = mapSliceToSpan(map, 1, closeIdx);
-      return { node: { value: parsed.value, spans: span ? [span] : [] }, nextIndex: idx + 1 };
-    }
-    idx++;
-    if (idx >= lines.length) return null;
-    if (lines[idx].trimmed === "") {
-      combined += "\n";
-      map.push(lines[idx].offset);
-      continue;
-    }
-    if (lines[idx].indent < minContIndent) return null;
-    combined += "\n" + lines[idx].trimmed;
-    map.push(lines[idx].offset);
-    for (let i = 0; i < lines[idx].trimmed.length; i++) map.push(lines[idx].trimmedOffset + i);
-  }
-}
-
-function parseBlockScalarWithSpans(
-  lines: SpanLine[],
-  startIndex: number,
-  header: string,
-  parentIndent: number,
-): { node: SpanNode; nextIndex: number } | null {
-  const rawLines: RawLine[] = lines.map(l => ({ raw: l.raw, indent: l.indent, trimmed: l.trimmed }));
-  const parsed = parseBlockScalar(rawLines, startIndex, header, parentIndent);
-  if (!parsed) return null;
-  const spans: Array<{ start: number; end: number }> = [];
-  for (let i = startIndex + 1; i < parsed.nextIndex; i++) {
-    if (lines[i].trimmed === "") continue;
-    spans.push({ start: lines[i].trimmedOffset, end: lines[i].offset + lines[i].raw.length });
-  }
-  return { node: { value: parsed.value, spans }, nextIndex: parsed.nextIndex };
-}
-
-function nextMeaningfulSpanLine(lines: SpanLine[], fromIndex: number): number {
-  let idx = fromIndex;
-  while (idx < lines.length && (lines[idx].trimmed === "" || lines[idx].trimmed.startsWith("#"))) idx++;
-  return idx;
-}
-
-function plainLineSpan(text: string, baseOffset: number): { stripped: string; span: { start: number; end: number } | null } {
-  const withoutComment = stripInlineComment(text);
-  let lead = 0;
-  while (lead < withoutComment.length && (withoutComment[lead] === " " || withoutComment[lead] === "\t")) lead++;
-  const cleaned = withoutComment.slice(lead).trimEnd();
-  return {
-    stripped: cleaned,
-    span: cleaned.length > 0 ? { start: baseOffset + lead, end: baseOffset + lead + cleaned.length } : null,
-  };
-}
-
-function parseSpanValueAfterKey(
-  lines: SpanLine[],
-  lineIndex: number,
-  rest: string,
-  restOffset: number,
-  keyIndent: number,
-): { node: SpanNode; nextIndex: number } | null {
-  if (rest === "" || rest.startsWith("#")) {
-    const nextIdx = nextMeaningfulSpanLine(lines, lineIndex + 1);
-    if (nextIdx >= lines.length) return { node: { value: null, spans: [] }, nextIndex: lines.length };
-    const nextLine = lines[nextIdx];
-    if (nextLine.indent >= keyIndent && isSequenceItem(nextLine.trimmed)) {
-      return parseSpanBlockSequence(lines, nextIdx, nextLine.indent);
-    }
-    if (nextLine.indent > keyIndent) {
-      if (splitKeyValue(nextLine.trimmed)) {
-        return parseSpanBlockMapping(lines, nextIdx, nextLine.indent);
-      }
-      const parts: string[] = [];
-      const spans: Array<{ start: number; end: number }> = [];
-      let idx = nextIdx;
-      while (idx < lines.length) {
-        if (lines[idx].trimmed === "" || lines[idx].trimmed.startsWith("#")) { idx++; continue; }
-        if (lines[idx].indent <= keyIndent) break;
-        if (splitKeyValue(lines[idx].trimmed) || isSequenceItem(lines[idx].trimmed)) break;
-        const piece = plainLineSpan(lines[idx].trimmed, lines[idx].trimmedOffset);
-        parts.push(piece.stripped);
-        if (piece.span) spans.push(piece.span);
-        idx++;
-      }
-      const value = parsePlainScalar(parts.join(" "));
-      return { node: { value, spans: value === null ? [] : spans }, nextIndex: idx };
-    }
-    return { node: { value: null, spans: [] }, nextIndex: nextIdx };
-  }
-  if (rest.startsWith("|") || rest.startsWith(">")) {
-    return parseBlockScalarWithSpans(lines, lineIndex, rest, keyIndent);
-  }
-  if (rest.startsWith('"') || rest.startsWith("'")) {
-    return collectQuotedWithMap(lines, lineIndex, rest, restOffset, keyIndent + 1);
-  }
-  if (rest.startsWith("[") || rest.startsWith("{")) {
-    const collected = collectFlowWithMap(lines, lineIndex, rest, restOffset, keyIndent);
-    if (!collected) return null;
-    const node = parseFlowSpanNode(collected.combined, collected.map);
-    if (!node) return null;
-    return { node, nextIndex: collected.nextIndex };
-  }
-  const firstPiece = plainLineSpan(rest, restOffset);
-  const parts = [firstPiece.stripped];
-  const spans: Array<{ start: number; end: number }> = firstPiece.span ? [firstPiece.span] : [];
-  let idx = lineIndex + 1;
-  while (idx < lines.length) {
-    if (lines[idx].trimmed === "" || lines[idx].trimmed.startsWith("#")) break;
-    if (lines[idx].indent <= keyIndent) break;
-    if (splitKeyValue(lines[idx].trimmed) || isSequenceItem(lines[idx].trimmed)) break;
-    const piece = plainLineSpan(lines[idx].trimmed, lines[idx].trimmedOffset);
-    parts.push(piece.stripped);
-    if (piece.span) spans.push(piece.span);
-    idx++;
-  }
-  const value = parsePlainScalar(parts.join(" "));
-  return { node: { value, spans: value === null ? [] : spans }, nextIndex: idx };
-}
-
-function sequenceItemWithOffset(line: SpanLine): { itemRest: string; itemOffset: number } | null {
-  if (line.trimmed === "-") return { itemRest: "", itemOffset: line.trimmedOffset + 1 };
-  if (line.trimmed.startsWith("- ") || line.trimmed.startsWith("-\t")) {
-    let idx = 1;
-    while (idx < line.trimmed.length && (line.trimmed[idx] === " " || line.trimmed[idx] === "\t")) idx++;
-    return { itemRest: line.trimmed.slice(idx), itemOffset: line.trimmedOffset + idx };
-  }
-  return null;
-}
-
-function parseSpanBlockSequence(lines: SpanLine[], startIndex: number, seqIndent: number): { node: SpanNode; nextIndex: number } | null {
-  const items: SpanNode[] = [];
-  let idx = startIndex;
-  while (idx < lines.length) {
-    if (lines[idx].trimmed === "" || lines[idx].trimmed.startsWith("#")) { idx++; continue; }
-    if (lines[idx].indent < seqIndent) break;
-    if (lines[idx].indent > seqIndent) return null;
-    const seq = sequenceItemWithOffset(lines[idx]);
-    if (!seq) break;
-    const { itemRest, itemOffset } = seq;
-    if (itemRest === "" || itemRest.startsWith("#")) {
-      const nextIdx = nextMeaningfulSpanLine(lines, idx + 1);
-      if (nextIdx < lines.length && lines[nextIdx].indent > seqIndent) {
-        if (isSequenceItem(lines[nextIdx].trimmed)) {
-          const sub = parseSpanBlockSequence(lines, nextIdx, lines[nextIdx].indent);
-          if (!sub) return null;
-          items.push(sub.node);
-          idx = sub.nextIndex;
-          continue;
-        }
-        if (splitKeyValue(lines[nextIdx].trimmed)) {
-          const sub = parseSpanBlockMapping(lines, nextIdx, lines[nextIdx].indent);
-          if (!sub) return null;
-          items.push(sub.node);
-          idx = sub.nextIndex;
-          continue;
-        }
-      }
-      items.push({ value: null, spans: [] });
-      idx = nextIdx;
-      continue;
-    }
-    const inlineKv = splitKeyValueWithIndex(itemRest);
-    if (inlineKv) {
-      const entryIndent = seqIndent + 2;
-      const firstVal = parseSpanValueAfterKey(lines, idx, inlineKv.rest, itemOffset + inlineKv.restIndex, seqIndent + 1);
-      if (!firstVal) return null;
-      const entries: Record<string, SpanNode> = { [inlineKv.key]: firstVal.node };
-      const obj: Record<string, YamlValue> = { [inlineKv.key]: firstVal.node.value };
-      let nextIdx = firstVal.nextIndex;
-      const peek = nextMeaningfulSpanLine(lines, nextIdx);
-      if (peek < lines.length && lines[peek].indent >= entryIndent && !isSequenceItem(lines[peek].trimmed)) {
-        const restMap = parseSpanBlockMapping(lines, peek, lines[peek].indent);
-        if (!restMap) return null;
-        Object.assign(entries, restMap.node.entries);
-        Object.assign(obj, restMap.node.value as Record<string, YamlValue>);
-        nextIdx = restMap.nextIndex;
-      }
-      items.push({ value: obj, spans: [], entries });
-      idx = nextIdx;
-      continue;
-    }
-    if (itemRest.startsWith("|") || itemRest.startsWith(">")) {
-      const block = parseBlockScalarWithSpans(lines, idx, itemRest, seqIndent);
-      if (!block) return null;
-      items.push(block.node);
-      idx = block.nextIndex;
-      continue;
-    }
-    if (itemRest.startsWith('"') || itemRest.startsWith("'")) {
-      const quoted = collectQuotedWithMap(lines, idx, itemRest, itemOffset, seqIndent + 1);
-      if (!quoted) return null;
-      items.push(quoted.node);
-      idx = quoted.nextIndex;
-      continue;
-    }
-    if (itemRest.startsWith("[") || itemRest.startsWith("{")) {
-      const collected = collectFlowWithMap(lines, idx, itemRest, itemOffset, seqIndent + 1);
-      if (!collected) return null;
-      const node = parseFlowSpanNode(collected.combined, collected.map);
-      if (!node) return null;
-      items.push(node);
-      idx = collected.nextIndex;
-      continue;
-    }
-    const piece = plainLineSpan(itemRest, itemOffset);
-    const scalar = parsePlainScalar(itemRest);
-    items.push({ value: scalar, spans: scalar !== null && piece.span ? [piece.span] : [] });
-    idx++;
-  }
-  return { node: { value: items.map(i => i.value), spans: [], items }, nextIndex: idx };
-}
-
-function parseSpanBlockMapping(lines: SpanLine[], startIndex: number, mapIndent: number): { node: SpanNode; nextIndex: number } | null {
-  const entries: Record<string, SpanNode> = {};
-  const result: Record<string, YamlValue> = {};
-  let idx = startIndex;
-  while (idx < lines.length) {
-    if (lines[idx].trimmed === "" || lines[idx].trimmed.startsWith("#")) { idx++; continue; }
-    if (lines[idx].indent < mapIndent) break;
-    if (lines[idx].indent > mapIndent) return null;
-    const kv = splitKeyValueWithIndex(lines[idx].trimmed);
-    if (!kv) return null;
-    const parsed = parseSpanValueAfterKey(lines, idx, kv.rest, lines[idx].trimmedOffset + kv.restIndex, mapIndent);
-    if (!parsed) return null;
-    entries[kv.key] = parsed.node;
-    result[kv.key] = parsed.node.value;
-    idx = parsed.nextIndex;
-  }
-  return { node: { value: result, spans: [], entries }, nextIndex: idx };
-}
-
-function lookupSpanNodeCaseInsensitive(entries: Record<string, SpanNode>, target: string): SpanNode | undefined {
-  if (Object.prototype.hasOwnProperty.call(entries, target)) return entries[target];
-  const lower = target.toLowerCase();
-  for (const [key, node] of Object.entries(entries)) {
-    if (key.toLowerCase() === lower) return node;
-  }
-  return undefined;
-}
-
-function extractAuthorNodeSpans(node: SpanNode): { name: string; spans: Array<{ start: number; end: number }> } | null {
-  const direct = scalarToString(node.value);
-  if (direct) return { name: direct, spans: node.spans };
-  if (node.entries) {
-    const nameNode = node.entries.name ?? node.entries.literal;
-    if (nameNode) {
-      const directName = scalarToString(nameNode.value);
-      if (directName) return { name: directName, spans: nameNode.spans };
-      if (nameNode.entries) {
-        if (nameNode.entries.literal && scalarToString(nameNode.entries.literal.value)) {
-          return { name: scalarToString(nameNode.entries.literal.value)!, spans: nameNode.entries.literal.spans };
-        }
-        const givenNode = nameNode.entries.given;
-        const familyNode = nameNode.entries.family;
-        const given = scalarToString(givenNode?.value);
-        const family = scalarToString(familyNode?.value);
-        const parts = [given, family].filter(Boolean);
-        if (parts.length) {
-          return {
-            name: parts.join(" "),
-            spans: [...(given && givenNode ? givenNode.spans : []), ...(family && familyNode ? familyNode.spans : [])],
-          };
-        }
-      }
-    }
-    const givenNode = node.entries.given;
-    const familyNode = node.entries.family;
-    const given = scalarToString(givenNode?.value);
-    const family = scalarToString(familyNode?.value);
-    const parts = [given, family].filter(Boolean);
-    if (parts.length) {
-      return {
-        name: parts.join(" "),
-        spans: [...(given && givenNode ? givenNode.spans : []), ...(family && familyNode ? familyNode.spans : [])],
-      };
-    }
-  }
-  return null;
-}
-
 /**
  * Return canonical UTF-16 source spans for frontmatter values rendered in
  * DocumentProperties (`title`, `author`, and `tags`) in exact display order.
@@ -1291,141 +1119,5 @@ function extractAuthorNodeSpans(node: SpanNode): { name: string; spans: Array<{ 
  * `date`, `description`, `aliases`, etc.).
  */
 export function frontmatterVisibleValueSpans(markdown: string): FrontmatterVisibleSpan[] {
-  const fm = parseFrontmatter(markdown);
-  if (!fm || !fm.properties) return [];
-  const { title, authors, tags } = fm.properties;
-  if (!title && !authors.length && !tags.length) return [];
-
-  let cursor = markdown.startsWith("\uFEFF") ? 1 : 0;
-  cursor += 3;
-  while (cursor < markdown.length && (markdown[cursor] === " " || markdown[cursor] === "\t")) cursor++;
-  if (markdown[cursor] === "\r" && markdown[cursor + 1] === "\n") cursor += 2;
-  else if (markdown[cursor] === "\n") cursor += 1;
-  const yamlStart = cursor;
-
-  let lineStart = cursor;
-  let yamlEnd = -1;
-  while (lineStart <= markdown.length) {
-    const lineEnd = markdown.indexOf("\n", lineStart);
-    const contentEnd = lineEnd < 0 ? markdown.length : (lineEnd > lineStart && markdown[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd);
-    if (/^(?:---|\.\.\.)[ \t]*$/.test(markdown.slice(lineStart, contentEnd))) {
-      yamlEnd = lineStart;
-      break;
-    }
-    if (lineEnd < 0) break;
-    lineStart = lineEnd + 1;
-  }
-  if (yamlEnd <= yamlStart) return [];
-
-  let sliceEnd = yamlEnd;
-  if (sliceEnd > yamlStart && markdown[sliceEnd - 1] === "\n") {
-    sliceEnd--;
-    if (sliceEnd > yamlStart && markdown[sliceEnd - 1] === "\r") sliceEnd--;
-  }
-
-  const lines: SpanLine[] = [];
-  let pos = yamlStart;
-  while (pos <= sliceEnd) {
-    const nl = markdown.indexOf("\n", pos);
-    const rawEnd = nl < 0 || nl > sliceEnd ? sliceEnd : (nl > pos && markdown[nl - 1] === "\r" ? nl - 1 : nl);
-    const raw = markdown.slice(pos, rawEnd);
-    let indent = 0;
-    while (indent < raw.length && raw[indent] === " ") indent++;
-    let leadWs = indent;
-    while (leadWs < raw.length && (raw[leadWs] === " " || raw[leadWs] === "\t")) leadWs++;
-    const trimmed = raw.trim();
-    lines.push({
-      raw,
-      indent,
-      trimmed,
-      offset: pos,
-      trimmedOffset: trimmed ? pos + leadWs : pos,
-    });
-    if (nl < 0 || nl >= sliceEnd) break;
-    pos = nl + 1;
-  }
-
-  const first = nextMeaningfulSpanLine(lines, 0);
-  if (first >= lines.length || lines[first].indent !== 0) return [];
-  const rootParsed = parseSpanBlockMapping(lines, first, 0);
-  if (!rootParsed || !rootParsed.node.entries) return [];
-  const entries = rootParsed.node.entries;
-
-  const result: FrontmatterVisibleSpan[] = [];
-
-  if (title) {
-    const titleNode = lookupSpanNodeCaseInsensitive(entries, "title");
-    if (titleNode) {
-      for (const s of titleNode.spans) {
-        if (s.end > s.start) result.push({ start: s.start, end: s.end, field: "title", fieldOrdinal: 0 });
-      }
-    }
-  }
-
-  if (authors.length > 0) {
-    const seenAuthors = new Set<string>();
-    for (const key of ["author", "authors", "creator"]) {
-      const node = lookupSpanNodeCaseInsensitive(entries, key);
-      if (!node) continue;
-      const candidates = node.items ?? [node];
-      for (const item of candidates) {
-        const extracted = extractAuthorNodeSpans(item);
-        if (!extracted || seenAuthors.has(extracted.name)) continue;
-        seenAuthors.add(extracted.name);
-        for (const s of extracted.spans) {
-          if (s.end > s.start) result.push({ start: s.start, end: s.end, field: "author", fieldOrdinal: 0 });
-        }
-      }
-    }
-  }
-
-  if (tags.length > 0) {
-    const seenTags = new Set<string>();
-    let tagOrdinal = 0;
-    const addTagSpans = (rawTag: string, spans: Array<{ start: number; end: number }>) => {
-      const trimmed = rawTag.trim();
-      if (!trimmed || seenTags.has(trimmed)) return;
-      seenTags.add(trimmed);
-      const ord = tagOrdinal++;
-      for (const s of spans) {
-        if (s.end > s.start) result.push({ start: s.start, end: s.end, field: "tag", fieldOrdinal: ord });
-      }
-    };
-    for (const key of ["tags", "tag", "keywords"]) {
-      const node = lookupSpanNodeCaseInsensitive(entries, key);
-      if (!node) continue;
-      if (node.items) {
-        for (const item of node.items) {
-          const str = scalarToString(item.value);
-          if (str) addTagSpans(str, item.spans);
-        }
-      } else {
-        const str = scalarToString(node.value);
-        if (!str) continue;
-        if (str.includes(",") && node.spans.length === 1) {
-          const base = node.spans[0];
-          const rawSlice = markdown.slice(base.start, base.end);
-          if (rawSlice.includes(",")) {
-            let cursorIdx = 0;
-            for (const part of rawSlice.split(",")) {
-              const lead = part.length - part.trimStart().length;
-              const cleaned = part.trim();
-              if (cleaned) {
-                addTagSpans(cleaned, [{ start: base.start + cursorIdx + lead, end: base.start + cursorIdx + lead + cleaned.length }]);
-              }
-              cursorIdx += part.length + 1;
-            }
-            continue;
-          }
-        }
-        if (str.includes(",")) {
-          for (const part of str.split(",")) addTagSpans(part, node.spans);
-        } else {
-          addTagSpans(str, node.spans);
-        }
-      }
-    }
-  }
-
-  return result;
+  return parseFrontmatter(markdown, { includeSpans: true })?.visibleSpans ?? [];
 }

@@ -1,6 +1,6 @@
 import {visit} from 'unist-util-visit';
-import {headingSlug} from './headingSlug';
 import {parseFrontmatter} from './frontmatter';
+import {encodeMarkdownDestination,formatWikilinkMarkdown,isLikelyInlineLinkDestination,parseOriginalWikilinkSlice} from './workspaceLinks';
 
 interface Edit {start:number;end:number;text:string}
 interface Stage {value:string;originalOffset:(offset:number)=>number}
@@ -298,13 +298,19 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
     const nextStart=rangeStart+delta,slice=source.slice(rangeStart,rangeEnd);
     slice.replace(regex,(...args:any[])=>{
       const localStart=args[args.length-2] as number,matchText=args[0] as string,text=replacement(...args);
+      if(text===matchText)return matchText;
       edits.push({start:rangeStart+localStart,end:rangeStart+localStart+matchText.length,text});
       delta+=text.length-matchText.length;
       return matchText;
     });
     nextRanges.push([nextStart,rangeEnd+delta]);
   }
+  if(!edits.length)return {stage:{value:source,originalOffset:offset=>offset},ranges};
   return {stage:replaceStage(source,edits),ranges:nextRanges};
+}
+
+export interface NormalizeMarkdownOptions {
+  encodeLinkDestinations?: boolean;
 }
 
 function isUnmaskedEscaped(source:string,mask:Uint8Array,at:number):boolean {
@@ -313,9 +319,9 @@ function isUnmaskedEscaped(source:string,mask:Uint8Array,at:number):boolean {
   return (slashes&1)===1;
 }
 
-function stripPercentComments(source:string):Stage {
-  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
-  const mask=computeCodeMask(source),edits:Edit[]=[];
+function computeCodeAndMathMask(source:string):Uint8Array {
+  const mask=computeCodeMask(source);
+  if(!source.includes('$'))return mask;
   for(let i=0;i<source.length;){
     if(mask[i]||source[i]!=='$'||isUnmaskedEscaped(source,mask,i)){i++;continue;}
     if(source[i+1]==='$'&&!mask[i+1]){
@@ -339,6 +345,12 @@ function stripPercentComments(source:string):Stage {
     }
     if(close>=0){mask.fill(1,i,close+1);i=close+1;}else i++;
   }
+  return mask;
+}
+
+function stripPercentComments(source:string):Stage {
+  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
+  const mask=computeCodeAndMathMask(source),edits:Edit[]=[];
   const isDelim=(at:number)=>at+1<source.length&&source[at]==='%'&&source[at+1]==='%'&&!mask[at]&&!mask[at+1]&&!isUnmaskedEscaped(source,mask,at);
   for(let i=0;i+1<source.length;){
     if(!isDelim(i)){i++;continue;}
@@ -353,26 +365,40 @@ function stripPercentComments(source:string):Stage {
 
 /** Render-only syntax normalization with a sparse offset map. Source positions
  * always address the original note, including frontmatter and wiki/callout edits. */
-export function normalizeMarkdownSource(markdown:string):Stage {
+export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdownOptions={}):Stage {
+  const encodeLinks=Boolean(options.encodeLinkDestinations);
   const stages:Stage[]=[];let value=markdown;
   const add=(stage:Stage)=>{stages.push(stage);value=stage.value;};
   const fm=parseFrontmatter(value);
   if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
   else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
   add(stripPercentComments(value));
-  let ranges=unmaskedRangesFromMask(computeCodeMask(value));
-  const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
-  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path:string,spec?:string)=>{
-    const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
-    const alt=sized?(sized[1]?.trim()||path):(spec??path);
-    return `![${alt}](${encodeURI(path)})${sized?`{width=${sized[2]}}`:''}`;
-  });
-  addUnmasked(/\[\[(#[^\[\r\n\]]+?)\]\]/g,(_all,target:string)=>{const [id,label]=target.split('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;});
-  addUnmasked(/\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,target,label)=>`[${label??target}](${target.endsWith('.md')?target:`${target}.md`})`);
+  const hasWikilinks=value.includes('[[');
+  const hasSpacedInlineDest=encodeLinks&&value.includes('](')&&/\]\([^\r\n()]*[ \t]/.test(value);
+  if(hasWikilinks||hasSpacedInlineDest){
+    let ranges=unmaskedRangesFromMask(computeCodeAndMathMask(value));
+    const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
+    if(value.includes('![[')){
+      addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,rawPath:string,spec?:string)=>{
+        const path=spec!==undefined&&rawPath.endsWith('\\')?rawPath.slice(0,-1):rawPath;
+        const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
+        const rawCaption=sized?sized[1]:undefined;
+        const cleanCaption=rawCaption!==undefined&&rawCaption.endsWith('\\')?rawCaption.slice(0,-1):rawCaption;
+        const alt=sized?(cleanCaption?.trim()||path):(spec??path);
+        return `![${alt}](${encodeLinks?encodeMarkdownDestination(path.trim()):encodeURI(path)})${sized?`{width=${sized[2]}}`:''}`;
+      });
+    }
+    if(value.includes('[[')){
+      addUnmasked(/\[\[([^\[\r\n\]]+?)\]\]/g,(all,inner:string)=>formatWikilinkMarkdown(inner,encodeLinks)??all);
+    }
+    if(hasSpacedInlineDest){
+      addUnmasked(/(!?\[(?:\\.|\[[^\r\n\[\]]*\]|[^\[\]\r\n])*\]\()([^<>\r\n()]+?)((?:\s+(?:"[^"\r\n]*"|'[^'\r\n]*'))?)(\))/g,(all,open:string,dest:string,title:string,close:string)=>isLikelyInlineLinkDestination(dest)?`${open}${encodeMarkdownDestination(dest)}${title}${close}`:all);
+    }
+  }
   add(normalizeCalloutBlocks(value,false));
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};
 }
-export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown).value;}
+export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown,{encodeLinkDestinations:true}).value;}
 
 export function remarkImageAttributes() {
   return (tree:any)=>{
@@ -395,11 +421,21 @@ export function remarkImageAttributes() {
 export function remarkSourceSyntax(this:any){
   const parser=this.parser;
   this.parser=(source:string,file:any)=>{
-    const normalized=normalizeMarkdownSource(source),tree=parser(normalized.value,file);
+    const normalized=normalizeMarkdownSource(source,{encodeLinkDestinations:true}),tree=parser(normalized.value,file);
     if(normalized.value===source)return tree;
     const lines=[0];for(let i=0;i<source.length;i++)if(source[i]==='\n')lines.push(i+1);
     const point=(value:any)=>{const offset=normalized.originalOffset(value.offset);let low=0,high=lines.length;while(low<high){const mid=(low+high)>>>1;if(lines[mid]<=offset)low=mid+1;else high=mid;}return {offset,line:low,column:offset-lines[low-1]+1};};
-    visit(tree,(node:any)=>{if(node.position)node.position={start:point(node.position.start),end:point(node.position.end)};});
+    visit(tree,(node:any)=>{
+      if(!node.position)return;
+      node.position={start:point(node.position.start),end:point(node.position.end)};
+      if(node.type==='link'&&typeof node.position.start?.offset==='number'&&typeof node.position.end?.offset==='number'){
+        const parsed=parseOriginalWikilinkSlice(source.slice(node.position.start.offset,node.position.end.offset));
+        if(parsed&&!parsed.sameNote){
+          const hProperties={...(node.data as any)?.hProperties,'data-wikilink':parsed.target,...(parsed.fragment?{'data-heading-fragment':parsed.fragment}:{})};
+          node.data={...node.data,hProperties};
+        }
+      }
+    });
     return tree;
   };
 }

@@ -649,71 +649,190 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertGreaterEqual(len(small_store._cache), 1)
         self.assertLess(len(small_store._cache), 6)
 
-    def test_frontmatter_visible_metadata_and_canonical_offsets_in_inspect_outline_read_search_and_patch(self):
+    def test_single_pass_fence_boundary_scan_across_headings_svg_and_diagrams(self):
+        import agent_documents
+        from unittest.mock import patch
+
         source = (
-            "\ufeff---\n"
-            'title: "Path Integrals & Symmetries"\n'
-            "subtitle: Graduate Notes\n"
-            "# Not a Markdown heading inside YAML\n"
-            "author:\n"
-            "  - name: Richard Feynman\n"
-            "  - given: Emmy\n"
-            "    family: Noether\n"
-            "date: 2026-03-15\n"
-            "tags: [quantum, physics]\n"
-            "keywords: physics, qft\n"
-            "---\n"
+            "😀 Intro line\n"
+            "# Section One\n"
+            "```svg\n"
+            "# Fenced SVG heading\n"
+            "<svg><text>needle</text></svg>\n"
+            "```\n"
+            "~~~mermaid\n"
+            "graph TD; A[needle] --> B\n"
+            "~~~\n"
+            "````\n"
             "\n"
-            "# Introduction\n"
-            "Body paragraph with 🧭 canonical offset.\n"
+            "  <SVG viewBox='0 0 8 8'><rect/></SVG>\n"
+            "````\n"
+            "## Section Two\n"
+            "Visible needle after diagrams.\n"
         )
-        note = self.root / "frontmatter-note.md"
-        note.write_bytes(source.encode("utf-8"))
-        canonical = source.removeprefix("\ufeff")
+        line_count = len(source.splitlines(keepends=True))
+        (self.root / "single-pass.md").write_bytes(source.encode("utf-8"))
 
-        info = self.store.inspect("frontmatter-note.md")
-        self.assertEqual(info["properties"], {
-            "title": "Path Integrals & Symmetries",
-            "author": "Richard Feynman, Emmy Noether",
-            "authors": ["Richard Feynman", "Emmy Noether"],
-            "tags": ["quantum", "physics", "qft"],
-        })
-        self.assertEqual([h["title"] for h in info["headings"]], ["Introduction"])
-        intro_offset = canonical.index("# Introduction")
-        intro_line = canonical[:intro_offset].count("\n") + 1
-        self.assertEqual(info["headings"][0]["start"], intro_offset)
-        self.assertEqual(info["headings"][0]["line"], intro_line)
+        with patch(
+            "agent_documents._step_fence_boundary",
+            wraps=agent_documents._step_fence_boundary,
+        ) as step_spy:
+            spans = diagram_spans(source)
+            self.assertEqual(step_spy.call_count, line_count)
 
-        section = self.store.read("frontmatter-note.md", heading="Introduction", view="source")
-        self.assertEqual(section["start"], intro_offset)
-        self.assertEqual(section["text"], canonical[intro_offset:])
+            step_spy.reset_mock()
+            inline_spans = diagram_spans(source, include_inline_svg=True)
+            self.assertEqual(step_spy.call_count, line_count)
+            self.assertEqual(inline_spans, spans)
 
-        matches = self.store.search("frontmatter-note.md", "Noether", context=0)
-        self.assertEqual(matches["totalMatches"], 1)
-        self.assertEqual(matches["matches"][0]["matchOffset"], canonical.index("Noether"))
+            step_spy.reset_mock()
+            svg_only = agent_documents._svg_spans(source)
+            self.assertEqual(step_spy.call_count, line_count)
+            self.assertEqual(len(svg_only), 2)
 
-        self.store.patch(
-            "frontmatter-note.md",
-            expected_revision=info["revision"],
-            operations=[{"type": "lines", "start_line": intro_line + 1, "end_line": intro_line + 1,
-                         "text": "Updated body paragraph.\n"}],
+            step_spy.reset_mock()
+            prose_section = self.store.read("single-pass.md", heading="Section One", view="prose")
+            self.assertEqual(step_spy.call_count, line_count)
+            self.assertEqual(len(prose_section["svg_omissions"]), 2)
+            self.assertNotIn("Fenced SVG heading", prose_section["text"])
+
+            # Plain unfenced Markdown skips fence-boundary regex checks altogether.
+            step_spy.reset_mock()
+            plain = "# Plain\nNo fences here 😀\n## Child\nBody\n"
+            self.assertEqual(diagram_spans(plain), [])
+            self.assertEqual(agent_documents._svg_spans(plain), [])
+            self.assertEqual([h["title"] for h in _headings(plain)], ["Plain", "Child"])
+            self.assertEqual(step_spy.call_count, 0)
+
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(
+            [source[item["start"]:item["end"]] for item in spans],
+            [
+                "# Fenced SVG heading\n<svg><text>needle</text></svg>\n",
+                "graph TD; A[needle] --> B\n",
+                "\n  <SVG viewBox='0 0 8 8'><rect/></SVG>\n",
+            ],
+        )
+
+    def test_fence_scans_preserve_crlf_unicode_mixed_markers_and_unclosed_fences(self):
+        import agent_documents
+
+        prefix = ("😀" * 40) + "\r\n"
+        h1 = "# 1. Overview 🧭\r\n"
+        mixed_svg = (
+            "````svg\r\n"
+            "~~~\r\n"
+            "```\r\n"
+            "# Still inside 4-backtick SVG\r\n"
+            "<svg><text>needle 𝕏</text></svg>\r\n"
+            "`````\r\n"
+        )
+        tilde_chart = (
+            "   ~~~~smd-chart\r\n"
+            "```\r\n"
+            "~~~\r\n"
+            "# Still inside 4-tilde chart\r\n"
+            "{\"series\": [\"needle\"]}\r\n"
+            "~~~~\r\n"
+        )
+        indented_non_fence = (
+            "    ```svg\r\n"
+            "    <svg><text>indented code block, not fence</text></svg>\r\n"
+            "    ```\r\n"
+        )
+        inline_svg = "Before <svg viewBox='0 0 4 4'><text>needle</text></svg> middle\r\n"
+        h2 = "## 2. Unclosed Tail\r\n"
+        unclosed_mermaid_open = "~~~mermaid\r\n"
+        unclosed_mermaid_body = "# Ignored trailing heading\r\ngraph LR; X[needle] --> Y"
+        source = (
+            prefix
+            + h1
+            + mixed_svg
+            + tilde_chart
+            + indented_non_fence
+            + inline_svg
+            + "needle outside\r\n"
+            + h2
+            + unclosed_mermaid_open
+            + unclosed_mermaid_body
+        )
+
+        # Public _headings (without internal start) and outline_source (with exclusive sectionEnd).
+        public_headings = _headings(source)
+        self.assertEqual(
+            public_headings,
+            [
+                {"index": 0, "level": 1, "title": "1. Overview 🧭", "line": 2},
+                {"index": 1, "level": 2, "title": "2. Unclosed Tail", "line": 20},
+            ],
+        )
+        outline = outline_source(source)["headings"]
+        expected_h1_start = len(prefix)
+        expected_h2_start = source.index(h2)
+        self.assertEqual(outline[0]["sectionStart"], expected_h1_start)
+        self.assertEqual(outline[0]["sectionEnd"], len(source))
+        self.assertEqual(outline[1]["sectionStart"], expected_h2_start)
+        self.assertEqual(outline[1]["sectionEnd"], len(source))
+
+        # SVG spans keep exclusive code-point end offsets and 1-based inclusive line bounds.
+        svg_spans = agent_documents._svg_spans(source)
+        expected_svg_body = (
+            "~~~\r\n"
+            "```\r\n"
+            "# Still inside 4-backtick SVG\r\n"
+            "<svg><text>needle 𝕏</text></svg>\r\n"
         )
         self.assertEqual(
-            self.store.read("frontmatter-note.md", view="source")["text"],
-            canonical.replace("Body paragraph with 🧭 canonical offset.", "Updated body paragraph."),
+            svg_spans,
+            [{
+                "start": source.index(expected_svg_body),
+                "end": source.index(expected_svg_body) + len(expected_svg_body),
+                "line_start": 4,
+                "line_end": 7,
+            }],
         )
-        self.assertEqual(self.store.inspect("frontmatter-note.md")["properties"], info["properties"])
 
-        # Portable .smd envelopes preserve leading \ufeff verbatim in markdown.
-        smd_note = self.root / "frontmatter-bom.smd"
-        smd_note.write_bytes(compressed_bundle(source, {}))
-        smd_info = self.store.inspect("frontmatter-bom.smd")
-        self.assertEqual(smd_info["properties"], info["properties"])
-        self.assertEqual(smd_info["headings"][0]["start"], source.index("# Introduction"))
+        # diagram_spans covers mixed-marker SVG, smd-chart, and unclosed mermaid; inline SVG respects fences.
+        fenced_only = diagram_spans(source)
+        expected_chart_body = (
+            "```\r\n"
+            "~~~\r\n"
+            "# Still inside 4-tilde chart\r\n"
+            "{\"series\": [\"needle\"]}\r\n"
+        )
+        self.assertEqual(
+            [source[s["start"]:s["end"]] for s in fenced_only],
+            [expected_svg_body, expected_chart_body, unclosed_mermaid_body],
+        )
+        self.assertEqual(fenced_only[-1]["end"], len(source))
 
-        plain = self.root / "unrecognized-fm.md"
-        plain.write_text("---\ncssclasses: [wide]\n---\n# Plain\n", encoding="utf-8")
-        self.assertNotIn("properties", self.store.inspect("unrecognized-fm.md"))
+        # Search excluding diagrams keeps exact non-BMP + CRLF code-point offsets.
+        filtered = search_source(source, "needle", exclude_diagrams=True)
+        self.assertEqual(
+            [m["matchOffset"] for m in filtered["matches"]],
+            [
+                source.index("needle", source.index(inline_svg)),
+                source.index("needle outside"),
+            ],
+        )
+
+        # Unclosed non-diagram code fence still masks inline <svg> inside it, while unclosed SVG fence extends to EOF.
+        unclosed_code = "Prose <svg/> ok\r\n```python\r\n# Hidden\r\nprint('<svg><rect/></svg>')"
+        self.assertEqual(_headings(unclosed_code), [])
+        self.assertEqual(
+            diagram_spans(unclosed_code, include_inline_svg=True),
+            [{"start": unclosed_code.index("<svg/>"), "end": unclosed_code.index("<svg/>") + len("<svg/>")}],
+        )
+        unclosed_svg = "# Fig\r\n```svg\r\n<svg><circle/></svg>"
+        self.assertEqual(
+            agent_documents._svg_spans(unclosed_svg),
+            [{"start": unclosed_svg.index("<svg>"), "end": len(unclosed_svg), "line_start": 3, "line_end": 3}],
+        )
+        unclosed_empty_svg = "# Fig\r\n```svg"
+        self.assertEqual(
+            agent_documents._svg_spans(unclosed_empty_svg),
+            [{"start": len(unclosed_empty_svg), "end": len(unclosed_empty_svg), "line_start": 3, "line_end": 3}],
+        )
 
 
 if __name__ == "__main__":

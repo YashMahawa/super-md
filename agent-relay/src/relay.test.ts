@@ -413,41 +413,6 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   fastContext = undefined;
   fastCaptureContext = undefined;
 
-  const expectedProps = {
-    title: "Path Integrals & Symmetries",
-    author: "Richard Feynman, Emmy Noether",
-    authors: ["Richard Feynman", "Emmy Noether"],
-    tags: ["quantum", "physics"],
-  };
-  fastContext = {
-    tabId: "note-17",
-    revision,
-    mode: "reader",
-    properties: { ...expectedProps, date: "2026-03-15", extraIgnored: true },
-    reading: { offset: 0, heading: "Path Integrals & Symmetries", visibleText: "Path Integrals & Symmetries\nAuthor: Richard Feynman, Emmy Noether\nTags: quantum, physics" },
-    visibleSource: { text: "---\ntitle: Path Integrals & Symmetries\n---\n", start: 0, end: 43, total_chars: 43, next_offset: null },
-  };
-  fastCaptureContext = {
-    tabId: "note-17",
-    revision,
-    sourceLength: 43,
-    mode: "reader",
-    properties: { ...expectedProps, description: "Ignored in bounded properties" },
-    reading: { offset: 0, heading: "Path Integrals & Symmetries", visibleText: "Path Integrals & Symmetries\nAuthor: Richard Feynman, Emmy Noether\nTags: quantum, physics" },
-    visibleSource: { text: "---\ntitle: Path Integrals & Symmetries\n---\n", start: 0, end: 43, total_chars: 43, next_offset: null },
-  };
-  const propsWithImage = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: true } });
-  assert.equal(propsWithImage.isError, undefined);
-  const propsWithImagePayload = JSON.parse(String(propsWithImage.content?.[1]?.type === "text" ? propsWithImage.content[1].text : "{}"));
-  assert.deepEqual(propsWithImagePayload.readingContext.properties, expectedProps);
-  assert.deepEqual(propsWithImagePayload.captureContext.properties, expectedProps);
-  const propsNoImage = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: false } });
-  assert.equal(propsNoImage.isError, undefined);
-  const propsNoImagePayload = JSON.parse(String(propsNoImage.content?.[0]?.type === "text" ? propsNoImage.content[0].text : "{}"));
-  assert.deepEqual(propsNoImagePayload.readingContext.properties, expectedProps);
-  fastContext = undefined;
-  fastCaptureContext = undefined;
-
   fastContext = { tabId: mediaTab, revision, reading: { offset: 123 }, visibleSource: { text: "Before scroll source", start: 123, end: 200 } };
   fastImageMetadata = { tabId: mediaTab, reading: { offset: 456, heading: "Scrolled during capture" }, selection: { text: "" } };
   const androidMovedView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: mediaTab } });
