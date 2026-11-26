@@ -33,6 +33,7 @@ ApplicationWindow {
     flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var reader: readerLoader.item
     property bool sidebar: true
     property bool settingsOpen: false
@@ -295,6 +296,15 @@ ApplicationWindow {
         readerRecoveryMessage = "Reopening the document reader…"
         scheduleReaderRemount(0)
     }
+    function chooseSaveDestination(dialogTitle, folderUrl, fileUrl) {
+        const dialog = saveDestinationComponent.createObject(window, {
+            title: dialogTitle,
+            portableNote: Boolean(viewState.portable),
+            currentFolder: folderUrl,
+            selectedFile: fileUrl
+        })
+        dialog.open()
+    }
     function showExport(share) { sharing = share; outputFormat = "pdf"; exportDialog.open() }
     function chooseExportDestination() {
         // A fresh native chooser for every operation: some portal helpers keep
@@ -333,15 +343,15 @@ ApplicationWindow {
         }
         function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } flushDialog.canClose = canClose; flushDialog.open() } }
         function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } closeDialog.open() } }
-        function onSaveRequested(name) { saveDialog.title = "Save note"; saveDialog.selectedFile = studio.defaultSaveLocation(name); saveDialog.open() }
-        function onSaveAsRequested(name) { saveDialog.title = "Save as"; saveDialog.selectedFile = studio.defaultSaveAsLocation(name); saveDialog.open() }
+        function onSaveRequested(name) { window.chooseSaveDestination("Save note", studio.defaultSaveFolder(), studio.defaultSaveLocation(name)) }
+        function onSaveAsRequested(name) { window.chooseSaveDestination("Save as", studio.defaultSaveAsFolder(), studio.defaultSaveAsLocation(name)) }
         function onSaveConflictRequested(name) { flushDialog.close(); closeDialog.close(); saveConflictDialog.title = name + " changed on disk"; if (!saveConflictDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } saveConflictDialog.open() } }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
         function onFontPickerRequested() { fontDialog.open() }
         function onThemePickerRequested() { themeDialog.open() }
-        function onThemeExportRequested() { themeExportDialog.open() }
+        function onThemeExportRequested() { themeExportDialog.selectedFile = studio.defaultThemeExportLocation("My theme.supermd-theme.json"); themeExportDialog.open() }
         function onReaderLoad(payload) {
             const script = "(function(){if(!window.supermdLoad)return false;window.supermdLoad(" + payload + ");window.supermdChromeInset?.(" + (studio.readerFullscreen ? 56 : 0) + ");document.documentElement.style.setProperty('--native-visible-chrome-inset','" + window.readerVisibleChromeInset + "px');return true})()"
             window.runDocumentScript(script)
@@ -414,7 +424,7 @@ ApplicationWindow {
     }
     FileDialog { id:fontDialog;title:"Import a font";fileMode:FileDialog.OpenFile;nameFilters:["Fonts (*.ttf *.otf)"];onAccepted:studio.importFont(selectedFile.toString()) }
     FileDialog { id:themeDialog;title:"Import a Super MD theme";fileMode:FileDialog.OpenFile;nameFilters:["Theme files (*.json)"];onAccepted:studio.importCustomTheme(selectedFile.toString()) }
-    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultSaveLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
+    FileDialog { id:themeExportDialog;title:"Export editable theme";fileMode:FileDialog.SaveFile;defaultSuffix:"json";selectedFile:studio.defaultThemeExportLocation("My theme.supermd-theme.json");nameFilters:["Theme files (*.json)"];onAccepted:studio.exportCustomTheme(selectedFile.toString()) }
     // Qt's chrome never scales. Keyboard/pinch zoom is routed to the content pane.
 
     header: Column {
@@ -500,21 +510,23 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     viewState: window.viewState
+                    sidebarState: window.sidebarState
                     shortcutLabels: window.shortcutLabels
                 }
-                OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
+                OutlineList { objectName: "sidebarOutlineList"; visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebarState.outline || []; noteId: sidebarState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
                 Label { text: "Recent notes"; font.weight: Font.DemiBold; color: viewState.colors.text }
                 RecentNotes {
+                    objectName: "sidebarRecentNotes"
                     Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(240, viewState.recent.length * 40)
+                    Layout.preferredHeight: Math.min(240, sidebarState.recent.length * 40)
                     clip: true
-                    model: viewState.recent
-                    pinned: studio.pinnedRecent
+                    model: sidebarState.recent
+                    pinned: sidebarState.pinned
                     onOpenRequested: path => studio.openNote(path)
                     onPinRequested: path => studio.pinRecent(path)
                 }
-                Label { visible: !viewState.folder && !viewState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
+                Label { visible: !sidebarState.folder && !sidebarState.recent.length; text: "Open any folder for quick access. Your notes stay ordinary files."; wrapMode: Text.WordWrap; Layout.fillWidth: true; color: viewState.colors.muted }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
                 ActionButton { objectName: "newWindowButton"; text: "New window"; tonal: true; Layout.fillWidth: true; ToolTip.text: window.hintWithShortcut("New window", "new_window"); onClicked: studio.command("window") }
             }
@@ -792,7 +804,7 @@ ApplicationWindow {
         ColumnLayout {
             anchors.fill: parent
             RowLayout { Label { text: "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.fillWidth: true } ActionButton { glyph: "X"; compact: true; ToolTip.text: "Close contents"; onClicked: contentsPopup.close() } }
-            OutlineList { Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; window.focusReader() } }
+            OutlineList { objectName: "popupOutlineList"; Layout.fillWidth: true; Layout.fillHeight: true; entries: sidebarState.outline || []; noteId: sidebarState.active; onChosen: { contentsPopup.close(); window.chromeAwake = false; window.focusReader() } }
         }
     }
     AppDialog {
@@ -812,7 +824,18 @@ ApplicationWindow {
     FileDialog { id: openDialog; title: "Open note"; nameFilters: ["Notes (*.md *.smd *.fmd *.markdown *.txt)", "All files (*)"]; onAccepted: studio.openNote(selectedFile.toString()) }
     FolderDialog { id: folderDialog; title: "Open folder"; onAccepted: studio.openFolder(selectedFolder.toString()) }
     FolderDialog { id: noteFolderDialog; title: "Default location for new notes"; onAccepted: studio.setNoteLocation(selectedFolder.toString()) }
-    FileDialog { id: saveDialog; title: "Save note"; fileMode: FileDialog.SaveFile; nameFilters: viewState.portable ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]; onAccepted: studio.saveAs(selectedFile.toString()); onRejected: studio.resolveClose("cancel") }
+    Component {
+        id: saveDestinationComponent
+        FileDialog {
+            property bool portableNote: false
+            objectName: "saveDestination"
+            title: "Save note"
+            fileMode: FileDialog.SaveFile
+            nameFilters: portableNote ? ["Portable Super MD (*.smd)", "Markdown (*.md)"] : ["Markdown (*.md)", "Portable Super MD (*.smd)"]
+            onAccepted: { studio.saveAs(selectedFile.toString()); destroy() }
+            onRejected: { studio.resolveClose("cancel"); destroy() }
+        }
+    }
     Component {
         id: exportDestinationComponent
         FileDialog {

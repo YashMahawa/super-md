@@ -1,6 +1,10 @@
 """Control the per-user application service over its private local socket."""
 import argparse,hashlib,json,os,subprocess,sys,time
 from pathlib import Path
+try:
+    from .core.paths import DESKTOP_DIR
+except ImportError:
+    from core.paths import DESKTOP_DIR
 
 def _daemon_command(*,executable=None,frozen=None,platform=None,env=None):
     frozen=getattr(sys,'frozen',False) if frozen is None else bool(frozen)
@@ -21,7 +25,7 @@ def _daemon_command(*,executable=None,frozen=None,platform=None,env=None):
     if platform.startswith('win'):
         windowed=exe.with_name('pythonw.exe')
         if windowed.is_file():exe=windowed
-    return [str(exe),str(Path(__file__).with_name('main.py')),'--background','--agent-access']
+    return [str(exe),str(DESKTOP_DIR/'main.py'),'--background','--agent-access']
 
 def main(argv):
     parser=argparse.ArgumentParser(description='Super MD background service')
@@ -205,7 +209,7 @@ def main(argv):
                         if status is not None and status.get('ok',False) and status.get('running'):
                             running=True
                         break
-                time.sleep(.2)
+                time.sleep(.05)
         if not running:
             detail=f' (exit code {daemon_exit_code})' if daemon_exit_code is not None else ''
             raise ValueError(f'Background service did not start{detail}; inspect its local log')
