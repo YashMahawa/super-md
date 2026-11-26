@@ -334,6 +334,20 @@ export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:st
   const changed=(direction==='undo'?undo:redo)({state:cached.state,dispatch:transaction=>{cached.state=transaction.state;}});
   return changed?cached.state.doc.toString():undefined;
 }
+if(typeof window!=="undefined"){
+  window.addEventListener("supermd-sync-cached-editor",(event:Event)=>{
+    const detail=(event as CustomEvent<{id?:string;before?:string;after?:string}>).detail;
+    if(!detail||typeof detail.id!=="string"||typeof detail.before!=="string"||typeof detail.after!=="string")return;
+    if(detail.before===detail.after||visibleEditors.has(detail.id))return;
+    const cached=sessions.get(detail.id);
+    if(!cached||cached.state.doc.toString()!==detail.before)return;
+    const edit=textEdit(detail.before,detail.after);
+    cached.state=cached.state.update({
+      changes:{from:edit.from,to:edit.from+edit.remove,insert:edit.insert},
+      annotations:[Transaction.addToHistory.of(false),isolateHistory.of("full")],
+    }).state;
+  });
+}
 export function editorFindQuery(id:string,query:string,caseSensitive:boolean,options?:{wholeWord?:boolean;regexp?:boolean}) {
   const wholeWord=!!options?.wholeWord,regexp=!!options?.regexp;
   visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,wholeWord,regexp,literal:!regexp}))});
@@ -595,27 +609,11 @@ export default function Editor({ sessionId = "default", documentPath = null, val
         appearance.current.of(editorTheme())
       ]
     };
-    let state: EditorState;
-    let usedCachedState = false;
-    if (cached) {
-      usedCachedState = true;
-      const previous = cached.state.doc.toString();
-      if (previous === value) {
-        state = cached.state;
-      } else {
-        const edit = textEdit(previous, value);
-        state = cached.state.update({
-          changes: { from: edit.from, to: edit.from + edit.remove, insert: edit.insert },
-          annotations: [Transaction.addToHistory.of(false), isolateHistory.of("full")],
-        }).state;
-      }
-    } else {
-      state = EditorState.create(config);
-    }
+    let state = cached?.state.doc.toString() === value ? cached.state : EditorState.create(config);
     if (incoming) {
       try {
         const restored = EditorState.fromJSON(incoming.state, config, {history: historyField});
-        if (restored.doc.toString() === value) { state = restored; usedCachedState = false; }
+        if (restored.doc.toString() === value) state = restored;
       } catch { /* Invalid/oversized optional view state must not block the note. */ }
     }
     const mountedView = new EditorView({ state, parent: host.current });
@@ -627,7 +625,7 @@ export default function Editor({ sessionId = "default", documentPath = null, val
       scrollTop: () => editorScrollTop(sessionId),
       applyAnchor: (anchor, focus) => applyAnchorToEditorView(mountedView, anchor, focus),
     });
-    if (cached && usedCachedState && cached.typewriterActive !== initialTypewriter) {
+    if (cached && state === cached.state && cached.typewriterActive !== initialTypewriter) {
       mountedView.dispatch({ effects: typewriter.current.reconfigure(typewriterScrollExtension(initialTypewriter)) });
     }
     appliedTypewriter.current = initialTypewriter;
