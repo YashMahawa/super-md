@@ -104,6 +104,244 @@ fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitl
     assert!(!output.status.success());assert!(String::from_utf8_lossy(&output.stderr).contains("explicit download"));assert!(!w.file("remote.pdf").exists());
 }
 
+#[test]
+fn cli_export_renders_vector_diagrams_sized_images_multiline_code_and_page_breaks() {
+    let w = Workspace::new();
+    let badge = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"40\"><rect width=\"120\" height=\"40\" fill=\"#386a57\"/></svg>";
+    fs::write(w.file("badge.svg"), badge).unwrap();
+    fs::create_dir_all(w.file("assets")).unwrap();
+    use base64::Engine;
+    let plot_png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        .unwrap();
+    fs::write(w.file("assets/plot.png"), &plot_png).unwrap();
+    let note = [
+        "# CLI Complete Export",
+        "",
+        "![[badge.svg|180]]",
+        "",
+        "<img src=\"badge.svg\" width=\"120px\" />",
+        "",
+        "<img alt=\"A > B\" title='Threshold > 0' src=\"assets/plot.png\" width=\"300\">",
+        "",
+        "```smd-tree",
+        r#"{"values":["8","4","12"]}"#,
+        "```",
+        "",
+        "```smd-diagram",
+        r#"{"width":240,"height":100,"nodes":[{"id":"a","label":"A","x":60,"y":50},{"id":"b","label":"B","x":180,"y":50}],"edges":[{"from":"a","to":"b"}]}"#,
+        "```",
+        "",
+        "```svg",
+        "<svg viewBox=\"0 0 80 30\"><rect width=\"80\" height=\"30\" fill=\"#2463b3\"/></svg>",
+        "```",
+        "",
+        "\\newpage",
+        "",
+        "SECOND_CLI_PAGE",
+        "",
+        "```python",
+        "def doc():",
+        "    \"\"\"line one",
+        "    line two\"\"\"",
+        "    return 1",
+        "```",
+    ].join("\n");
+    fs::write(w.file("rich.md"), note).unwrap();
+    success(w.run(&["export", "rich.md", "rich.pdf"]));
+    pdf(&w.file("rich.pdf"));
+    let pdf_bytes = fs::read(w.file("rich.pdf")).unwrap();
+    let pdf_latin1 = String::from_utf8_lossy(&pdf_bytes);
+    assert!(
+        pdf_latin1.contains("/Subtype /Image") || pdf_latin1.contains("/Subtype/Image"),
+        "Quoted-attribute raster HTML <img> must be embedded in CLI PDF"
+    );
+    let page_objects: usize = [b"/Type /Page".as_slice(), b"/Type/Page".as_slice()]
+        .into_iter()
+        .map(|needle| {
+            pdf_bytes
+                .windows(needle.len())
+                .enumerate()
+                .filter(|(i, win)| *win == needle && !pdf_bytes.get(i + needle.len()).is_some_and(|b| b.is_ascii_alphanumeric()))
+                .count()
+        })
+        .sum();
+    assert!(page_objects >= 2, "Expected at least 2 PDF pages, got {page_objects}");
+    if let Ok(out) = Command::new("pdftotext").arg(w.file("rich.pdf")).arg("-").output() {
+        if cfg!(target_os = "linux") && std::env::var_os("SUPERMD_TEST_NON_POPPLER").is_none() {
+            assert!(out.status.success());
+        }
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let pages: Vec<&str> = text.split('\u{000c}').filter(|p| !p.trim().is_empty()).collect();
+            assert!(pages.len() >= 2);
+            let last = pages.last().unwrap();
+            assert!(last.contains("SECOND_CLI_PAGE"));
+            assert!(last.contains("line two"));
+            assert!(!pages[0].contains("SECOND_CLI_PAGE"));
+        }
+    }
+
+    fs::write(w.file("unsafe.md"), "```svg\n<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>\n```").unwrap();
+    assert!(!w.run(&["export", "unsafe.md", "unsafe.pdf"]).status.success());
+    assert!(!w.file("unsafe.pdf").exists());
+}
+
+#[test]
+fn unpack_extracts_markdown_and_assets_portably_and_rolls_back_on_collision_failure_or_symlink() {
+    let w = Workspace::new();
+    let svg_a = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"#386a57\"/></svg>";
+    let svg_b = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><circle cx=\"12\" cy=\"12\" r=\"9\" fill=\"#6750a4\"/></svg>";
+    fs::write(w.file("first.svg"), svg_a).unwrap();
+    fs::write(w.file("second.svg"), svg_b).unwrap();
+    fs::write(w.file("lesson.md"), "# Lesson\n\n![First](first.svg)\n\n![Second](second.svg)\n").unwrap();
+    assert!(success(w.run(&["--help"])).contains("unpack NOTE OUTPUT_DIR"));
+    success(w.run(&["pack", "lesson.md", "lesson.smd"]));
+
+    let unpacked_stdout = success(w.run(&["unpack", "lesson.smd", "unpacked"]));
+    assert!(!unpacked_stdout.contains("base64"));
+    let summary: serde_json::Value = serde_json::from_str(&unpacked_stdout).unwrap();
+    assert_eq!(summary["assets"], 2);
+    let unpacked_md = fs::read_to_string(w.file("unpacked/lesson.md")).unwrap();
+    assert!(unpacked_md.contains("# Lesson"));
+    assert!(unpacked_md.contains("assets/image-1.svg"));
+    assert!(unpacked_md.contains("assets/image-2.svg"));
+    assert_eq!(fs::read(w.file("unpacked/assets/image-1.svg")).unwrap(), svg_a);
+    assert_eq!(fs::read(w.file("unpacked/assets/image-2.svg")).unwrap(), svg_b);
+
+    // Reserved/unsafe FAT & Windows stem characters (including dotted reserved prefixes) fall back to portable filenames.
+    fs::copy(w.file("lesson.smd"), w.file("CON.smd")).unwrap();
+    success(w.run(&["unpack", "CON.smd", "fat-safe/nested"]));
+    assert!(w.file("fat-safe/nested/Note.md").exists());
+    assert_eq!(fs::read(w.file("fat-safe/nested/assets/image-1.svg")).unwrap(), svg_a);
+
+    fs::copy(w.file("lesson.smd"), w.file("CON.chapter.smd")).unwrap();
+    success(w.run(&["unpack", "CON.chapter.smd", "fat-safe-dotted"]));
+    assert!(w.file("fat-safe-dotted/Note.md").exists());
+    assert!(!w.file("fat-safe-dotted/CON.chapter.md").exists());
+
+    #[cfg(not(windows))]
+    {
+        fs::copy(w.file("lesson.smd"), w.file("lpt1.notes.smd")).unwrap();
+        success(w.run(&["unpack", "lpt1.notes.smd", "fat-safe-lpt1"]));
+        assert!(w.file("fat-safe-lpt1/Note.md").exists());
+        assert!(!w.file("fat-safe-lpt1/lpt1.notes.md").exists());
+    }
+
+    // Assets with reserved Windows/FAT device basenames fail preflight before creating any output.
+    {
+        use base64::Engine;
+        let data_url = format!("data:image/svg+xml;base64,{}", base64::engine::general_purpose::STANDARD.encode(svg_a));
+        for reserved_asset in ["assets/CON.svg", "assets/aux.diagram.svg", "assets/com1.svg", "assets/lpt1.notes.svg"] {
+            let envelope = serde_json::json!({
+                "format": "supermd-smd",
+                "version": 1,
+                "markdown": format!("# Bad asset\n\n![ok](assets/a-first.svg)\n\n![bad]({reserved_asset})\n"),
+                "assets": {
+                    "assets/a-first.svg": data_url,
+                    reserved_asset: data_url,
+                }
+            });
+            fs::write(w.file("reserved-asset.smd"), envelope.to_string()).unwrap();
+            assert!(!w.run(&["unpack", "reserved-asset.smd", "reserved-asset-out/nested"]).status.success());
+            assert!(!w.file("reserved-asset-out").exists());
+
+            let existing_out = w.file("reserved-asset-existing");
+            let _ = fs::remove_dir_all(&existing_out);
+            fs::create_dir(&existing_out).unwrap();
+            assert!(!w.run(&["unpack", "reserved-asset.smd", "reserved-asset-existing"]).status.success());
+            assert!(fs::read_dir(&existing_out).unwrap().next().is_none());
+        }
+    }
+
+    // Repeating unpack into the same directory fails without modifying existing files.
+    fs::write(w.file("unpacked/lesson.md"), "user edited markdown").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "unpacked"]).status.success());
+    assert_eq!(fs::read_to_string(w.file("unpacked/lesson.md")).unwrap(), "user edited markdown");
+
+    // Pre-existing Markdown file aborts before creating assets/ or writing any image.
+    fs::create_dir(w.file("collide-md")).unwrap();
+    fs::write(w.file("collide-md/lesson.md"), "keep existing md").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "collide-md"]).status.success());
+    assert_eq!(fs::read_to_string(w.file("collide-md/lesson.md")).unwrap(), "keep existing md");
+    assert!(!w.file("collide-md/assets").exists());
+
+    // Pre-existing second asset aborts before writing image-1.svg or lesson.md.
+    fs::create_dir_all(w.file("collide-asset/assets")).unwrap();
+    fs::write(w.file("collide-asset/assets/image-2.svg"), b"keep existing asset").unwrap();
+    assert!(!w.run(&["unpack", "lesson.smd", "collide-asset"]).status.success());
+    assert_eq!(fs::read(w.file("collide-asset/assets/image-2.svg")).unwrap(), b"keep existing asset");
+    assert!(!w.file("collide-asset/assets/image-1.svg").exists());
+    assert!(!w.file("collide-asset/lesson.md").exists());
+
+    // Plain Markdown notes are rejected without creating the destination folder.
+    assert!(!w.run(&["unpack", "lesson.md", "plain-out"]).status.success());
+    assert!(!w.file("plain-out").exists());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let outside = w.file("outside");
+        fs::create_dir(&outside).unwrap();
+
+        let link_root = w.file("symlink-out");
+        symlink(&outside, &link_root).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/nested"]).status.success());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        // Existing subdirectories inside a symlinked ancestor (relative and absolute) are also rejected.
+        let existing_inside = outside.join("existing-sub");
+        fs::create_dir(&existing_inside).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/existing-sub"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "symlink-out/existing-sub/nested"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", link_root.join("existing-sub").to_str().unwrap()]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", link_root.join("existing-sub/nested").to_str().unwrap()]).status.success());
+
+        let real_parent = w.file("real-parent");
+        fs::create_dir(&real_parent).unwrap();
+        symlink(&outside, real_parent.join("symlink-mid")).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "real-parent/symlink-mid/existing-sub"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "real-parent/symlink-mid/existing-sub/nested"]).status.success());
+        assert!(fs::read_dir(&existing_inside).unwrap().next().is_none());
+        fs::remove_dir(&existing_inside).unwrap();
+
+        let nested = w.file("with-symlink-assets");
+        fs::create_dir(&nested).unwrap();
+        symlink(&outside, nested.join("assets")).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "with-symlink-assets"]).status.success());
+        assert!(!nested.join("lesson.md").exists());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+        let dangling = w.file("dangling-link");
+        symlink(w.file("missing-target"), &dangling).unwrap();
+        assert!(!w.run(&["unpack", "lesson.smd", "dangling-link"]).status.success());
+        assert!(!w.run(&["unpack", "lesson.smd", "dangling-link/nested"]).status.success());
+        assert!(!w.file("missing-target").exists());
+
+        // Mid-unpack write failure (after assets/* are created, when lesson.md fails to open)
+        // rolls back every newly written asset while leaving existing unrelated files intact.
+        let midrun = w.file("rollback-midrun");
+        fs::create_dir_all(midrun.join("assets")).unwrap();
+        fs::write(midrun.join("assets/unrelated.txt"), b"keep me").unwrap();
+        let mut readonly = fs::metadata(&midrun).unwrap().permissions();
+        readonly.set_mode(0o555);
+        fs::set_permissions(&midrun, readonly).unwrap();
+        let probe_blocked = fs::File::create(midrun.join("probe")).is_err();
+        if probe_blocked {
+            assert!(!w.run(&["unpack", "lesson.smd", "rollback-midrun"]).status.success());
+            assert!(!midrun.join("assets/image-1.svg").exists());
+            assert!(!midrun.join("assets/image-2.svg").exists());
+            assert!(!midrun.join("lesson.md").exists());
+            assert_eq!(fs::read(midrun.join("assets/unrelated.txt")).unwrap(), b"keep me");
+        }
+        let mut restore = fs::metadata(&midrun).unwrap().permissions();
+        restore.set_mode(0o755);
+        fs::set_permissions(&midrun, restore).unwrap();
+    }
+}
+
 fn inflate_pdf_streams(bytes: &[u8]) -> String {
     use std::io::Read;
     let mut text = String::from_utf8_lossy(bytes).into_owned();

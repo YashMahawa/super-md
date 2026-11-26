@@ -4,7 +4,7 @@ import {flushSync} from 'react-dom';
 import {caretRangeAtPoint} from './caretPoint';
 import {refreshDocumentExtent} from './documentZoom';
 import {scrollInputVersion} from './scrollAnchor';
-const blocks=new Map<HTMLElement,string>();
+const blocks=new WeakMap<HTMLElement,string>();
 const pendingAnchors=new WeakSet<HTMLElement>();
 type ScrollSource={range:Range;node:Node;offset:number;input:number};
 const scrollSources=new WeakMap<HTMLElement,ScrollSource>();
@@ -112,18 +112,46 @@ export function registerWindowedText(element:HTMLElement,text:string):()=>void {
   blocks.set(element,text);return()=>{blocks.delete(element);};
 }
 export interface WindowedMatch {element:HTMLElement;ordinal:number}
-export function windowedMatches(host:Element,query:string,caseSensitive=false):WindowedMatch[]|null {
-  if(!host.querySelector('[data-windowed-block]'))return null;
-  const result:WindowedMatch[]=[];
-  if(!query.trim())return result;
-  const pattern=new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),caseSensitive?"gu":"giu");
-  for(const [element,text] of blocks){
-    if(!host.contains(element))continue;
-    pattern.lastIndex=0;let ordinal=0;
-    while(pattern.exec(text)){result.push({element,ordinal:ordinal++});if(result.length>=5000)return result;}
+export interface SearchMatchOptions {caseSensitive?:boolean;wholeWord?:boolean;regexp?:boolean}
+export type SearchMatchConfig = boolean | SearchMatchOptions;
+export function normalizeSearchOptions(options:SearchMatchConfig=false):Required<SearchMatchOptions> {
+  return typeof options==='boolean'?{caseSensitive:options,wholeWord:false,regexp:false}:{caseSensitive:!!options.caseSensitive,wholeWord:!!options.wholeWord,regexp:!!options.regexp};
+}
+export function compileSearchPattern(query:string,options:SearchMatchConfig=false,allowWhitespace=false):{pattern:RegExp|null;error:string} {
+  const {caseSensitive,wholeWord,regexp}=normalizeSearchOptions(options);
+  if(!query||(!allowWhitespace&&!regexp&&!query.trim()))return {pattern:null,error:''};
+  const raw=regexp?query:query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),flags=caseSensitive?'gmu':'gimu';
+  try{
+    const base=new RegExp(raw,flags);
+    return {pattern:wholeWord?new RegExp(`(?<![\\p{L}\\p{N}_])(?:${raw})(?![\\p{L}\\p{N}_])`,flags):base,error:''};
+  }catch{
+    return {pattern:null,error:'Invalid regular expression'};
   }
-  // Registration order may change after a Live edit. Restore document order.
-  return result.sort((a,b)=>a.element===b.element?a.ordinal-b.ordinal:a.element.compareDocumentPosition(b.element)&Node.DOCUMENT_POSITION_FOLLOWING?-1:1);
+}
+export function nextSearchMatch(pattern:RegExp,text:string):RegExpExecArray|null {
+  let match:RegExpExecArray|null;
+  while((match=pattern.exec(text))){
+    if(match[0].length>0)return match;
+    if(match.index>=text.length)return null;
+    pattern.lastIndex=match.index+((text.codePointAt(match.index)??0)>0xffff?2:1);
+  }
+  return null;
+}
+export function windowedMatches(host:Element,query:string,options:SearchMatchConfig=false):WindowedMatch[]|null {
+  const windowedBlocks=host.hasAttribute('data-windowed-block')?[host as HTMLElement]:host.querySelectorAll<HTMLElement>('[data-windowed-block]');
+  if(!windowedBlocks.length)return null;
+  const result:WindowedMatch[]=[];
+  const {pattern}=compileSearchPattern(query,options,false);
+  if(!pattern)return result;
+  // Query mounted block wrappers directly in DOM tree order so Live edits never
+  // require O(M log M) compareDocumentPosition sorting or misorder 5,000+ caps.
+  for(const element of windowedBlocks){
+    const text=blocks.get(element);
+    if(!text)continue;
+    pattern.lastIndex=0;let ordinal=0;
+    while(nextSearchMatch(pattern,text)){result.push({element,ordinal:ordinal++});if(result.length>=5000)return result;}
+  }
+  return result;
 }
 export function revealWindowed(element:HTMLElement):void {
   element.closest('[data-windowed-block]')?.dispatchEvent(new Event('supermd-reveal-window'));

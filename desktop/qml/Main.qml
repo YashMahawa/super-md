@@ -9,6 +9,12 @@ import QtWebChannel
 ApplicationWindow {
     id: window
     signal readerViewChanged(var readerView)
+    onReaderViewChanged: function(view) {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view)
+    }
+    Component.onCompleted: {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader)
+    }
     width: 1320
     height: 880
     minimumWidth: 760
@@ -111,11 +117,12 @@ ApplicationWindow {
     function syncVisibleReaderChrome() {
         window.runDocumentScript("document.documentElement.style.setProperty('--native-visible-chrome-inset','" + readerVisibleChromeInset + "px')")
     }
-    function openFind() {
+    function openFind(replace) {
         if (!reader) return
         const target = reader
+        const script = replace ? "window.supermdFind?.(true)" : "window.supermdFind?.()"
         target.forceActiveFocus()
-        target.runJavaScript("window.supermdFind?.()", function() {
+        target.runJavaScript(script, function() {
             if (window.reader === target) target.forceActiveFocus()
         })
     }
@@ -136,6 +143,9 @@ ApplicationWindow {
         // application shortcuts are disabled while the modal is open.
         if (modalDialogCount > 0) return false
         if (["copy", "cut", "paste", "select_all"].includes(action) && window.nativeTextEditorFocused()) return false
+        if (["bold", "italic", "inline_code", "link", "heading", "list", "quote", "inline_math"].includes(action)) {
+            return !modalDialogCount && !window.nativeTextEditorFocused() && !viewState.readerOverlay && viewState.mode !== "reader"
+        }
         if (action === "undo" || action === "redo") return !modalDialogCount && !viewState.readerOverlay
         if (action === "close_tab") return !modalDialogCount
         if (action === "dismiss") return !modalDialogCount && !contentsPopup.visible
@@ -175,7 +185,21 @@ ApplicationWindow {
         case "cut": window.nativeReaderEditAction("cut"); break
         case "paste": window.nativeReaderEditAction("paste"); break
         case "select_all": window.nativeReaderEditAction("select_all"); break
-        case "find": window.openFind(); break
+        case "bold":
+        case "italic":
+        case "inline_code":
+        case "link":
+        case "heading":
+        case "list":
+        case "quote":
+        case "inline_math":
+            window.focusReader()
+            studio.command("format_" + action)
+            break
+        case "find": window.openFind(false); break
+        case "replace": window.openFind(true); break
+        case "find_next": window.focusReader(); studio.command("find_next"); break
+        case "find_previous": window.focusReader(); studio.command("find_previous"); break
         case "search_folder": studio.openFolderSearch(); break
         case "close_tab": studio.closeTabSafely(viewState.active); break
         case "next_tab": studio.cycleTab(1); break
@@ -191,6 +215,9 @@ ApplicationWindow {
         case "zoom_out": window.runDocumentScript("window.supermdZoomBy?.(1/1.1)"); break
         case "zoom_reset": window.runDocumentScript("window.supermdResetZoom?.()"); break
         case "typewriter_scroll": studio.setting("typewriterScroll", JSON.stringify(!viewState.settings.typewriterScroll)); break
+        case "new_folder_note": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewFolderNote(); break
+        case "new_subfolder": sidebar = true; sidebarSection = "folder"; folderSidebar.triggerNewSubfolder(); break
+        case "rename_entry": folderSidebar.triggerRenameSelectedOrActive(); break
         }
     }
     function focusReader() { if (reader) reader.forceActiveFocus() }
@@ -276,6 +303,10 @@ ApplicationWindow {
         function onWorkspaceSearchChanged() {
             if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
             else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
+        }
+        function onWorkspaceFolderDropped() {
+            window.sidebar = true
+            window.sidebarSection = "folder"
         }
     }
     onViewStateChanged: {
@@ -412,33 +443,13 @@ ApplicationWindow {
                 spacing: 12
                 Label { text: sidebarSection === "folder" ? "Your files" : "Contents"; font.pixelSize: 22; font.weight: Font.DemiBold }
                 ModeGroup { Layout.fillWidth: true; choices: [{key:"folder",label:"Folder"},{key:"contents",label:"Contents"}]; selected: sidebarSection; onChosen: key => sidebarSection = key }
-                ActionButton { visible: sidebarSection === "folder"; text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true; onClicked: studio.chooseFolder() }
-                ActionButton { objectName: "sidebarFolderSearchButton"; visible: sidebarSection === "folder"; text: "Search across notes"; glyph: "MagnifyingGlass"; compact: true; tonal: true; Layout.fillWidth: true; ToolTip.text: "Search across notes (" + (window.shortcutLabels.search_folder || "Ctrl+Shift+F") + ")"; onClicked: studio.openFolderSearch() }
-                RowLayout {
-                    visible: sidebarSection === "folder" && !!viewState.folder
-                    Layout.fillWidth: true
-                    Label { text: viewState.folder.split("/").pop(); Layout.fillWidth: true; elide: Text.ElideMiddle }
-                    ActionButton { glyph: "X"; compact: true; Accessible.name: "Close folder"; ToolTip.text: "Close folder (notes stay open)"; onClicked: studio.closeFolder() }
-                }
-                TextField { id: filter; visible: sidebarSection === "folder" && !!viewState.folder; Layout.fillWidth: true; placeholderText: "Filter files"; selectByMouse: true }
-                ListView {
+                FolderSidebar {
+                    id: folderSidebar
                     visible: sidebarSection === "folder"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    clip: true
-                    model: viewState.files
-                    delegate: ItemDelegate {
-                        id: fileEntry
-                        required property var modelData
-                        width: ListView.view.width - 20
-                        height: visible ? 42 : 0
-                        visible: !filter.text || modelData.directory || modelData.name.toLowerCase().includes(filter.text.toLowerCase())
-                        leftPadding: 8 + modelData.depth * 16
-                        text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
-                        onClicked: modelData.directory ? studio.toggleDirectory(modelData.path) : studio.openNote(modelData.path)
-                        Hint { requested: fileEntry.hovered; text: modelData.path }
-                    }
-                    ScrollBar.vertical: ExpressiveScrollBar { }
+                    viewState: window.viewState
+                    shortcutLabels: window.shortcutLabels
                 }
                 OutlineList { visible: sidebarSection === "contents"; Layout.fillWidth: true; Layout.fillHeight: true; entries: viewState.outline || []; noteId: viewState.active }
                 Rectangle { Layout.fillWidth: true; height: 1; color: viewState.colors.outline }
@@ -507,8 +518,7 @@ ApplicationWindow {
                         color: viewState.colors["surface-high"]
                         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
                     }
-                    RowLayout {
-                        anchors.fill: parent
+                    contentItem: RowLayout {
                         spacing: 10
                         ToolButton {
                             enabled: false
@@ -578,7 +588,7 @@ ApplicationWindow {
                     backgroundColor: window.color
                     webChannel: WebChannel { id: documentChannel; Component.onCompleted: registerObject("studio", studio) }
                     settings.localContentCanAccessRemoteUrls: false
-                    settings.localContentCanAccessFileUrls: true
+                    settings.localContentCanAccessFileUrls: false
                     settings.javascriptCanOpenWindows: false
                     settings.fullScreenSupportEnabled: false
                     onContextMenuRequested: function(request) {
@@ -656,10 +666,19 @@ ApplicationWindow {
                         }
                     }
                     onNavigationRequested: function(request) {
-                        if (window.readerRecoveryLoading && request.url.toString() === "about:blank") return
-                        if (request.url.toString().split("#")[0] !== readerUrl.toString()) {
+                        const target = request.url.toString()
+                        if (!request.isMainFrame) {
+                            if (target === "about:blank") return
+                            const readerBase = readerUrl.toString().replace(/\/[^/]*([?#].*)?$/, "")
+                            const rel = target.startsWith(readerBase) ? target.slice(readerBase.length) : ""
+                            if (/^\/assets\/mermaid-sandbox-[A-Za-z0-9_-]+\.html$/.test(rel) || rel === "/@mermaid-sandbox.html") return
                             request.reject()
-                            if (request.url.toString().startsWith("https://") || request.url.toString().startsWith("http://")) Qt.openUrlExternally(request.url)
+                            return
+                        }
+                        if (window.readerRecoveryLoading && target === "about:blank") return
+                        if (target.split("#")[0] !== readerUrl.toString()) {
+                            request.reject()
+                            if (target.startsWith("https://") || target.startsWith("http://")) Qt.openUrlExternally(request.url)
                         }
                     }
                     }

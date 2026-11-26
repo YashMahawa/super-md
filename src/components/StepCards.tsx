@@ -1,4 +1,4 @@
-import {useEffect,useId,useMemo,useRef,useState, type CSSProperties, type KeyboardEvent, type ReactNode} from "react";
+import {useEffect,useId,useLayoutEffect,useMemo,useRef,useState, type CSSProperties, type KeyboardEvent, type ReactNode} from "react";
 import {createPortal} from "react-dom";
 import {setReaderOverlay} from "../readerOverlays";
 import {zoomTranslation,type Point} from "../focalZoom";
@@ -6,6 +6,7 @@ import {wheelIntent} from "../wheelIntent";
 import InlineDiagram,{parseDiagram,type DiagramSpec} from "./InlineDiagram";
 import {parseBinaryTree} from "./BinaryTree";
 import {parseChartSpec} from "../chartModel";
+import {remember,stepIndices} from "../renderedOutputs";
 
 export interface StepCard { label:string; image?:string; diagram?:DiagramSpec; chart?:string; description?:string; markdown?:string; alt?:string }
 export interface StepDeck { title:string; steps:StepCard[] }
@@ -45,11 +46,18 @@ export function parseStepDeck(source:string):StepDeck|null {
   } catch {return null;}
 }
 
+function nearbySteps(target:number,count:number):Set<number> {
+  const result=new Set<number>([0,1,2]);
+  for(let i=Math.max(0,target-1);i<=Math.min(Math.max(0,count-1),target+2);i++)result.add(i);
+  return result;
+}
+
 /** One diagram at a time; keyboard, buttons and native range slider. */
 export default function StepCards({source,renderImage,renderChart,renderMarkdown,sourceStart,sourceEnd}:{source:string;renderImage:(src:string,alt:string)=>ReactNode;renderChart?:(source:string)=>ReactNode;renderMarkdown?:(source:string)=>ReactNode;sourceStart?:number;sourceEnd?:number}) {
   const deck=useMemo(()=>parseStepDeck(source),[source]);
   const deckInstanceId=useId();
-  const [index,setIndex]=useState(0);
+  const count=deck?.steps.length??0;
+  const [index,setIndex]=useState(()=>{const saved=stepIndices.get(source);return count&&saved!==undefined?Math.max(0,Math.min(saved,count-1)):0;});
   const hovered=useRef(false);
   const region=useRef<HTMLElement>(null);
   const figureRef=useRef<HTMLDivElement>(null);
@@ -58,6 +66,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   const [expanded,setExpanded]=useState(false);
   const [placeholderHeight,setPlaceholderHeight]=useState(0);
   const openTimer=useRef(0);
+  const restoreFocusFrame=useRef(0);
   const skipRestoreFocus=useRef(false);
   const liveBlockRef=useRef<HTMLElement|null>(null);
   const expandedRef=useRef(expanded);expandedRef.current=expanded;
@@ -74,11 +83,34 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   const fit=()=>{zoomRef.current=100;setZoom(100);translate({x:0,y:0});pointers.current.clear();};
   // Mount nearby slides ahead of time. Once loaded, a slide stays mounted so
   // moving back, forward, or dragging the slider never re-fetches its asset.
-  const [mounted,setMounted]=useState<Set<number>>(()=>new Set([0,1,2]));
-  useEffect(()=>{setIndex(0);setMounted(new Set([0,1,2]));setFigureHeight(null);setFitWidth(null);setExpanded(false);},[source]);
-  const count=deck?.steps.length??0;
-  const current=Math.min(index,count-1);
+  const [mounted,setMounted]=useState<Set<number>>(()=>nearbySteps(index,count));
+  const current=count?Math.min(index,count-1):0;
   const currentRef=useRef(current);currentRef.current=current;
+  const zoomableVisual=Boolean(deck?.steps[current]?.image||deck?.steps[current]?.diagram);
+  const zoomableRef=useRef(zoomableVisual);zoomableRef.current=zoomableVisual;
+  const previousDeck=useRef<{source:string;title?:string;label?:string;index:number}>({source,title:deck?.title,label:deck?.steps[current]?.label,index:current});
+  useEffect(()=>{
+    const prev=previousDeck.current;
+    if(prev.source===source){previousDeck.current={source,title:deck?.title,label:deck?.steps[current]?.label,index:current};return;}
+    setFigureHeight(null);setFitWidth(null);
+    if(!deck){setExpanded(false);previousDeck.current={source,title:undefined,label:undefined,index:0};return;}
+    const sameStepLabel=prev.label!==undefined&&deck.steps[prev.index]?.label===prev.label;
+    const movedLabelIndex=prev.label!==undefined?deck.steps.findIndex(s=>s.label===prev.label):-1;
+    const sameTitle=prev.title!==undefined&&deck.title===prev.title;
+    if(sameTitle||sameStepLabel||movedLabelIndex>=0){
+      const nextIndex=sameStepLabel?prev.index:movedLabelIndex>=0?movedLabelIndex:Math.min(prev.index,deck.steps.length-1);
+      setIndex(nextIndex);
+      setMounted(old=>{const upcoming=nearbySteps(nextIndex,deck.steps.length);for(const item of old)if(item<deck.steps.length)upcoming.add(item);return upcoming;});
+      if(nextIndex>0||stepIndices.has(prev.source))remember(stepIndices,source,nextIndex);
+      previousDeck.current={source,title:deck.title,label:deck.steps[nextIndex]?.label,index:nextIndex};
+      return;
+    }
+    const saved=stepIndices.get(source);
+    const nextIndex=saved!==undefined?Math.max(0,Math.min(saved,deck.steps.length-1)):0;
+    setIndex(nextIndex);setMounted(nearbySteps(nextIndex,deck.steps.length));setExpanded(false);
+    previousDeck.current={source,title:deck.title,label:deck.steps[nextIndex]?.label,index:nextIndex};
+  },[source,deck]);
+  useEffect(()=>{if(deck)previousDeck.current={source,title:deck.title,label:deck.steps[current]?.label,index:current};},[source,deck,current]);
   useEffect(()=>{fit();region.current?.querySelector('.step-cards-notes')?.scrollTo?.(0,0);},[current,expanded]);
   useEffect(()=>{
     const host=figureRef.current;
@@ -107,6 +139,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   },[deck,current,expanded]);
   const go=(next:number)=>{
     const target=Math.max(0,Math.min(next,count-1));
+    remember(stepIndices,source,target);
     setMounted(prev=>{
       const upcoming=new Set(prev);
       for(let i=Math.max(0,target-1);i<=Math.min(count-1,target+2);i++)upcoming.add(i);
@@ -126,13 +159,15 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
     window.addEventListener('supermd-live-edit-opened',onLiveOpen);
     return()=>{cancelOpen();node?.removeEventListener('supermd-step-expand',open);node?.removeEventListener('dblclick',cancelOpen);window.removeEventListener('supermd-live-edit-opened',onLiveOpen);};
   },[expanded]);
-  useEffect(()=>{
+  useEffect(()=>()=>{if(restoreFocusFrame.current)cancelAnimationFrame(restoreFocusFrame.current);},[]);
+  useLayoutEffect(()=>{
     if(!expanded)return;
+    if(restoreFocusFrame.current){cancelAnimationFrame(restoreFocusFrame.current);restoreFocusFrame.current=0;}
     setReaderOverlay('step-viewer',true);
     document.querySelector<HTMLButtonElement>('.step-viewer-close')?.focus();
     const key=(event:globalThis.KeyboardEvent)=>{
       if(event.key==='Escape'){event.preventDefault();event.stopImmediatePropagation();setExpanded(false);return;}
-      if((event.ctrlKey||event.metaKey)&&['+','=','-','0'].includes(event.key)){event.preventDefault();event.stopImmediatePropagation();scale(event.key==='0'?100:zoomRef.current+(event.key==='-'?-10:10));return;}
+      if((event.ctrlKey||event.metaKey)&&['+','=','-','0'].includes(event.key)){if(!zoomableRef.current)return;event.preventDefault();event.stopImmediatePropagation();scale(event.key==='0'?100:zoomRef.current+(event.key==='-'?-10:10));return;}
       if(event.key==='Tab'){
         const items=Array.from(document.querySelectorAll<HTMLElement>('.step-viewer button:not(:disabled),.step-viewer input,.step-viewer a[href],.step-viewer summary'));
         if(event.shiftKey&&document.activeElement===items[0]){event.preventDefault();items.at(-1)?.focus();}
@@ -147,15 +182,15 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
         navigation.current(currentRef.current+(event.key==='ArrowRight'?1:-1));
       }
     };
-    const native=(event:Event)=>{const detail=(event as CustomEvent<number|{factor:number;point?:Point}>).detail;scale(zoomRef.current*(typeof detail==='number'?detail:detail.factor),typeof detail==='number'?undefined:detail.point);};
-    const reset=()=>fit();
+    const native=(event:Event)=>{if(!zoomableRef.current)return;const detail=(event as CustomEvent<number|{factor:number;point?:Point}>).detail;scale(zoomRef.current*(typeof detail==='number'?detail:detail.factor),typeof detail==='number'?undefined:detail.point);};
+    const reset=()=>{if(zoomableRef.current)fit();};
     const surface=figureRef.current;
-    const wheel=(event:WheelEvent)=>{if((event.target as Element)?.closest('.interactive-chart'))return;event.preventDefault();event.stopPropagation();if(wheelIntent(event)==='pan')translate({x:panRef.current.x-event.deltaX,y:panRef.current.y-event.deltaY});else scale(zoomRef.current*Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY});};
-    const nativePan=(event:Event)=>{const {dx,dy}=(event as CustomEvent<{dx:number;dy:number}>).detail;event.preventDefault();translate({x:panRef.current.x-dx,y:panRef.current.y-dy});};
+    const wheel=(event:WheelEvent)=>{if(!zoomableRef.current||(event.target as Element)?.closest('.interactive-chart'))return;event.preventDefault();event.stopPropagation();if(wheelIntent(event)==='pan')translate({x:panRef.current.x-event.deltaX,y:panRef.current.y-event.deltaY});else scale(zoomRef.current*Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY});};
+    const nativePan=(event:Event)=>{if(!zoomableRef.current)return;const {dx,dy}=(event as CustomEvent<{dx:number;dy:number}>).detail;event.preventDefault();translate({x:panRef.current.x-dx,y:panRef.current.y-dy});};
     document.addEventListener('keydown',key,true);
     window.addEventListener('supermd-image-zoom',native);window.addEventListener('supermd-image-reset',reset);
     surface?.addEventListener('wheel',wheel,{passive:false});surface?.addEventListener('supermd-canvas-pan',nativePan);
-    return()=>{document.removeEventListener('keydown',key,true);window.removeEventListener('supermd-image-zoom',native);window.removeEventListener('supermd-image-reset',reset);surface?.removeEventListener('wheel',wheel);surface?.removeEventListener('supermd-canvas-pan',nativePan);setReaderOverlay('step-viewer',false);if(skipRestoreFocus.current)skipRestoreFocus.current=false;else requestAnimationFrame(()=>region.current?.focus({preventScroll:true}));};
+    return()=>{document.removeEventListener('keydown',key,true);window.removeEventListener('supermd-image-zoom',native);window.removeEventListener('supermd-image-reset',reset);surface?.removeEventListener('wheel',wheel);surface?.removeEventListener('supermd-canvas-pan',nativePan);setReaderOverlay('step-viewer',false);if(skipRestoreFocus.current)skipRestoreFocus.current=false;else restoreFocusFrame.current=requestAnimationFrame(()=>{restoreFocusFrame.current=0;region.current?.focus({preventScroll:true});});};
   },[expanded]);
   useEffect(()=>{
     const key=(event:globalThis.KeyboardEvent)=>{
@@ -173,11 +208,14 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   };
   if(!deck)return <section className="step-cards step-cards-error" role="alert">Invalid step cards. Use a fenced <code>smd-steps</code> block with a title and 2–40 labeled steps.</section>;
   const step=deck.steps[current];
-  const card=<section className={"step-cards"+(!step.markdown?" is-visual-only":"")+(!step.image&&!step.diagram&&!step.chart?" has-no-visual":"")+(expanded?" is-expanded":"")} style={{...(fitWidth?{'--step-image-fit-width':`${fitWidth}px`}:{}),...(figureHeight?{'--step-figure-height':`${figureHeight}px`}:{}),'--step-viewer-transform':`translate(${pan.x}px,${pan.y}px) scale(${zoom/100})`} as CSSProperties} role="region" tabIndex={0} aria-label={deck.title+": interactive steps"} ref={region} onPointerEnter={()=>{hovered.current=true;}} onPointerLeave={()=>{hovered.current=false;}} onKeyDown={onKeyDown} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}>
+  const hasVisual=Boolean(step.image||step.diagram||step.chart);
+  const enlargeButton=!expanded?<button type="button" className="step-cards-enlarge" aria-label="Enlarge slide" onClick={enlarge}>⤢</button>:null;
+  const card=<section className={"step-cards"+(!step.markdown?" is-visual-only":"")+(!hasVisual?" has-no-visual":"")+(expanded?" is-expanded":"")} style={{...(fitWidth?{'--step-image-fit-width':`${fitWidth}px`}:{}),...(figureHeight?{'--step-figure-height':`${figureHeight}px`}:{}),'--step-viewer-transform':`translate(${pan.x}px,${pan.y}px) scale(${zoom/100})`} as CSSProperties} role="region" tabIndex={0} aria-label={deck.title+": interactive steps"} ref={region} onPointerEnter={()=>{hovered.current=true;}} onPointerLeave={()=>{hovered.current=false;}} onKeyDown={onKeyDown} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}>
     <div className="step-cards-layout">
-    <div className={'step-cards-stage'+(expanded?' image-viewer-canvas':'')} ref={figureRef} onClick={event=>{if(!expanded&&event.target instanceof Element&&event.target.closest('.step-cards-inline-figure svg')){const live=region.current?.closest('.live-block');if(!live){enlarge();return;}if(openTimer.current){window.clearTimeout(openTimer.current);openTimer.current=0;}if(event.detail>1)return;openTimer.current=window.setTimeout(()=>{openTimer.current=0;if(region.current?.isConnected&&!live.querySelector('textarea'))enlarge();},180);}}}
+    {!hasVisual&&enlargeButton}
+    <div className={'step-cards-stage'+(expanded&&zoomableVisual?' image-viewer-canvas':'')} ref={figureRef} onClick={event=>{if(!expanded&&event.target instanceof Element&&event.target.closest('.step-cards-inline-figure svg')){const live=region.current?.closest('.live-block');if(!live){enlarge();return;}if(openTimer.current){window.clearTimeout(openTimer.current);openTimer.current=0;}if(event.detail>1)return;openTimer.current=window.setTimeout(()=>{openTimer.current=0;if(region.current?.isConnected&&!live.querySelector('textarea'))enlarge();},180);}}} onDoubleClick={()=>{if(expanded&&zoomableVisual)fit();}}
       onPointerDown={event=>{
-        if(!expanded||step.chart||event.button!==0)return;
+        if(!expanded||!zoomableVisual||event.button!==0)return;
         event.currentTarget.setPointerCapture(event.pointerId);pointers.current.set(event.pointerId,{x:event.clientX,y:event.clientY});
         if(pointers.current.size===2){const [a,b]=[...pointers.current.values()];gesture.current={distance:Math.hypot(a.x-b.x,a.y-b.y),center:{x:(a.x+b.x)/2,y:(a.y+b.y)/2}};}
       }} onPointerMove={event=>{
@@ -186,7 +224,7 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
         if(pointers.current.size===2){const [a,b]=[...pointers.current.values()],center={x:(a.x+b.x)/2,y:(a.y+b.y)/2},distance=Math.hypot(a.x-b.x,a.y-b.y);if(gesture.current.distance){scale(zoomRef.current*distance/gesture.current.distance,gesture.current.center);translate({x:panRef.current.x+center.x-gesture.current.center.x,y:panRef.current.y+center.y-gesture.current.center.y});}gesture.current={distance,center};}
         else translate({x:panRef.current.x+event.clientX-old.x,y:panRef.current.y+event.clientY-old.y});
       }} onPointerUp={event=>pointers.current.delete(event.pointerId)} onPointerCancel={event=>pointers.current.delete(event.pointerId)}>
-      {!expanded&&<button type="button" className="step-cards-enlarge" aria-label="Enlarge slide" onClick={enlarge}>⤢</button>}
+      {hasVisual&&enlargeButton}
       {deck.steps.some(slide=>slide.image)&&<div className={"step-cards-figure-stack"+(step.image?"":" is-inactive")} style={step.image && figureHeight?{height:figureHeight}:undefined}>
         {deck.steps.map((slide,i)=>mounted.has(i)&&slide.image&&
           <div key={i} className={"step-cards-figure "+(i===current?"is-current":"is-offstage")} aria-hidden={i!==current} inert={i!==current}>
@@ -216,5 +254,5 @@ export default function StepCards({source,renderImage,renderChart,renderMarkdown
   </section>;
   const liveBlock=expanded?liveBlockRef.current:(region.current?.closest<HTMLElement>('.live-block')??null);
   const editSource=()=>{skipRestoreFocus.current=true;setExpanded(false);if(liveBlock?.isConnected)liveBlock.dispatchEvent(new CustomEvent('supermd-edit-block',{bubbles:true}));};
-  return expanded?<><div className="step-cards-placeholder" style={{height:placeholderHeight}} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar"><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button aria-label="Fit slide image" onClick={fit}>Fit</button>{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
+  return expanded?<><div className="step-cards-placeholder" data-output-pinned="true" style={{height:placeholderHeight}} data-step-deck-id={deckInstanceId} data-deck-title={deck.title} data-step-index={current} data-step-label={step.label} data-step-count={count} data-source-start={sourceStart} data-source-end={sourceEnd}/>{createPortal(<div className="image-viewer step-viewer markdown-body" data-independent-zoom role="dialog" aria-modal="true" aria-label="Slide viewer"><div className="step-viewer-toolbar">{zoomableVisual&&<><output aria-label="Slide image zoom">{Math.round(zoom)}%</output><button type="button" aria-label="Fit slide image" onClick={fit}>Fit</button></>}{liveBlock?.isConnected&&<button type="button" onClick={editSource}>Edit source</button>}<button type="button" className="step-viewer-close" aria-label="Close slide viewer" onClick={()=>setExpanded(false)}>Close</button></div>{card}</div>,document.body)}</>:card;
 }

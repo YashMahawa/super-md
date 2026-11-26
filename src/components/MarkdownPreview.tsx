@@ -17,8 +17,8 @@ import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import DocumentProperties from "./DocumentProperties";
 import {DocumentAppearance} from '../documentAppearance';
-import {svgDataBackdrop} from '../svgImage';
-import {adaptSvgData} from '../svgTheme';
+import {svgDataBackdrop,svgImage} from '../svgImage';
+import {adaptSvgData,decodeSvgDataUri} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
 import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
@@ -131,10 +131,22 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     window.addEventListener('supermd-asset-access-restored',restored);
     return()=>window.removeEventListener('supermd-asset-access-restored',restored);
   },[documentPath,embedded,error,isRemote,src]);
+  const isSvgData=/^data:image\/svg\+xml(?:[;,]|$)/i.test(resolved);
   const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
-  const adaptedSource=useMemo(()=>adaptsSvg&&svgBacking?adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'):resolved,[resolved,svgBacking,appearance,adaptsSvg]);
+  const adapted=useMemo(()=>{
+    if(!resolved||!isSvgData)return {src:resolved,error:''};
+    try{
+      if(adaptsSvg&&svgBacking)return {src:adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'),error:''};
+      svgImage(decodeSvgDataUri(resolved));
+      return {src:resolved,error:''};
+    }catch(reason){
+      return {src:'',error:reason instanceof Error?reason.message:String(reason)};
+    }
+  },[resolved,isSvgData,svgBacking,appearance,adaptsSvg]);
+  const adaptedSource=adapted.src;
+  const displayError=error||adapted.error;
   // A one-time approval belongs to the exact URL the user approved. Keeping
   // that scope in state avoids a passive-effect reset window when `src` changes.
   const allowed = allowedOnceSource === src || trustedImageHosts.includes(host);
@@ -168,18 +180,18 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     return () => { active = false; };
   }, [documentPath, embedded, isRemote, src, allowed, assetEpoch, permissionRetry]);
   useEffect(()=>{
-    if(!resolved||error||isRemote&&!allowed)return;
-    const svg=resolved.startsWith('data:image/svg+xml');
-    return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>{const comma=resolved.indexOf(',');return resolved.slice(0,comma).includes(';base64')?new TextDecoder().decode(Uint8Array.from(atob(resolved.slice(comma+1)),value=>value.charCodeAt(0))):decodeURIComponent(resolved.slice(comma+1));}}:{})});
-  },[resolved,error,isRemote,allowed,alt]);
+    if(!resolved||displayError||isRemote&&!allowed)return;
+    const svg=isSvgData;
+    return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>decodeSvgDataUri(resolved)}:{})});
+  },[resolved,displayError,isSvgData,isRemote,allowed,alt]);
   const readonlyAttr = editable ? undefined : "true";
   if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button type="button" onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button type="button" onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
-  if (error) return <span ref={mediaElement} className="image-error" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role={editable ? "group" : "img"} aria-label={alt || "Image unavailable"}><span>Image unavailable: {alt || src}<small>{error}</small></span>{editable && <span className="image-error-actions"><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}</span>;
+  if (displayError) return <span ref={mediaElement} className="image-error" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role={editable ? "group" : "img"} aria-label={alt || "Image unavailable"}><span>Image unavailable: {alt || src}<small>{displayError}</small></span>{editable && <span className="image-error-actions"><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}</span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
-  return <span ref={mediaElement} className={`note-image ${resolved.startsWith('data:image/svg+xml')?'note-image--diagram':''} ${sizing?'image-loading':''}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
+  return <span ref={mediaElement} className={`note-image ${isSvgData?'note-image--diagram':''} ${sizing?'image-loading':''}`} style={sizing?{width:'100%',boxSizing:'border-box'}:undefined} data-note-image-source={src} data-note-image-readonly={readonlyAttr} tabIndex={0} aria-label={`Image: ${alt || "Image"}`}>
     {sizing&&<span role="status">Loading image…</span>}
-    <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={resolved.startsWith('data:image/svg+xml')?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
+    <img ref={imageElement} draggable={false} data-media-adapted={adaptsSvg&&svgBacking?'true':undefined} data-media-kind={isSvgData?'svg':'image'} data-light-ink={svgBacking==='#222026'?'true':undefined} style={{...(svgBacking?{'--svg-contrast-backing':svgBacking}:{}),...(sizing?{position:'absolute',height:0,visibility:'hidden'}:{})} as React.CSSProperties} src={adaptedSource} alt={alt} loading="lazy" decoding="async" onLoad={()=>{if(sizedSource!==resolved)commitMediaLayout(imageElement.current,()=>setSizedSource(resolved));}} onError={() => commitMediaLayout(imageElement.current,()=>setError("The image could not be decoded or loaded."))} />
   </span>;
 }
 
@@ -296,21 +308,28 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
   if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)} />);
   if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)} />);
-  if (language === "smd-steps") return protectedBlock(
-    <StepCards
-      source={source}
-      sourceStart={srcStart}
-      sourceEnd={srcEnd}
-      renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
-      renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
-      renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
-    />
+  if (language === "smd-steps") return (
+    <CodeBlockBoundary key={language} source={source}>
+      <StepCards
+        source={source}
+        sourceStart={srcStart}
+        sourceEnd={srcEnd}
+        renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+        renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
+        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+      />
+    </CodeBlockBoundary>
   );
   if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
   if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
   if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
   if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />);
-  return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source} /><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre>{children}</pre></details></div>;
+  const sourceText = liveStateRef.current.markdown;
+  const lineBreak = srcStart !== undefined ? sourceText.indexOf("\n", srcStart) : -1;
+  const fenced = lineBreak >= 0 && (srcEnd === undefined || lineBreak < srcEnd) && /^[ \t>]*(`{3,}|~{3,})/.test(sourceText.slice(srcStart, lineBreak));
+  const bodyStart = fenced ? lineBreak + 1 : srcStart;
+  const bodyEnd = fenced && bodyStart !== undefined ? Math.min(srcEnd ?? bodyStart + source.length, bodyStart + source.length) : srcEnd;
+  return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source} /><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre data-source-start={bodyStart} data-source-end={bodyEnd}>{children}</pre></details></div>;
 };
 
 const MARKDOWN_COMPONENTS: Components = {

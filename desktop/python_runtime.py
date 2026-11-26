@@ -4,6 +4,7 @@ Nothing here runs on open or export. Cells run only after an explicit Run, and
 local Python is trusted user code, not a sandbox.
 """
 from __future__ import annotations
+from collections.abc import Sequence
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 BUNDLED = "bundled"
@@ -161,7 +163,16 @@ def probe(executable: str, timeout: float = 6) -> dict | None:
 def _bin(prefix: Path) -> list[Path]:
     return [prefix / "Scripts" / "python.exe", prefix / "python.exe"] if sys.platform == "win32" else [prefix / "bin" / "python3", prefix / "bin" / "python"]
 
-def candidates(managed: Path, folders: list[str] = ()) -> list[Path]:
+def _usable_python(path: Path) -> str:
+    candidate = Path(os.path.abspath(path.expanduser()))
+    sibling = Path(str(candidate).replace("/sbin/", "/bin/"))
+    if sibling != candidate and sibling.is_file():
+        candidate = sibling
+    if NAME.match(candidate.name) and candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return ""
+
+def candidates(managed: Path, folders: Sequence[str] = ()) -> list[Path]:
     home = Path.home()
     found: list[Path] = []
     def add_prefix(prefix: Path):
@@ -171,7 +182,14 @@ def candidates(managed: Path, folders: list[str] = ()) -> list[Path]:
     for variable in ("VIRTUAL_ENV", "CONDA_PREFIX"):
         if os.environ.get(variable):
             add_prefix(Path(os.environ[variable]))
+    seen_folders: set[str] = set()
     for folder in folders:
+        if not folder:
+            continue
+        folder_key = os.path.normcase(os.path.abspath(os.fspath(folder)))
+        if folder_key in seen_folders:
+            continue
+        seen_folders.add(folder_key)
         current = Path(folder)
         for _ in range(4):
             for name in (".venv", "venv", "env", ".env"):
@@ -210,19 +228,40 @@ def candidates(managed: Path, folders: list[str] = ()) -> list[Path]:
             found.append(Path(located))
     if not frozen():
         found.append(Path(sys.executable))
-    unique, seen = [], set()
+    unique: list[Path] = []
+    seen: set[tuple[str, str]] = set()
     for path in found:
         sibling = Path(str(path).replace("/sbin/", "/bin/"))
         if sibling != path and sibling.is_file():
             path = sibling  # Merged-/usr systems list python under sbin first on PATH.
-        key = os.path.normcase(os.path.abspath(path))
-        if key not in seen and path.is_file() and NAME.match(path.name):
+        if not path.is_file() or not NAME.match(path.name):
+            continue
+        key = (
+            os.path.normcase(os.path.abspath(os.path.dirname(path))),
+            os.path.normcase(os.path.realpath(path)),
+        )
+        if key not in seen:
             seen.add(key)
             unique.append(path)
     return unique
 
-def discover(managed: Path, folders: list[str] = ()) -> list[dict]:
-    """Detected interpreters, best first: managed env, environments with matplotlib, then the rest."""
+class _DiscoverFlight:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: list[dict] = []
+        self.error: BaseException | None = None
+
+_DISCOVER_LOCK = threading.Lock()
+_INFLIGHT_DISCOVER: dict[tuple[str, tuple[str, ...]], _DiscoverFlight] = {}
+
+def _discover_key(managed: Path, folders: Sequence[str]) -> tuple[str, tuple[str, ...]]:
+    managed_key = os.path.normcase(os.path.abspath(os.fspath(managed)))
+    folders_key = tuple(
+        dict.fromkeys(os.path.normcase(os.path.abspath(os.fspath(folder))) for folder in folders if folder)
+    )
+    return (managed_key, folders_key)
+
+def _discover_once(managed: Path, folders: Sequence[str] = ()) -> list[dict]:
     results, prefixes = [], set()
     if bundled_available():
         results.append({"path": BUNDLED, "label": "Built-in Python", "detail": "Included with Super MD: numpy and matplotlib", "matplotlib": True, "managed": False, "venv": False})
@@ -248,15 +287,61 @@ def discover(managed: Path, folders: list[str] = ()) -> list[dict]:
     results.sort(key=lambda item: (item["path"] != BUNDLED, not item["managed"], not item["matplotlib"]))
     return results
 
-def preferred(managed: Path) -> str:
+def discover(managed: Path, folders: Sequence[str] = ()) -> list[dict]:
+    """Detected interpreters, best first: managed env, environments with matplotlib, then the rest."""
+    flight_key = _discover_key(managed, folders)
+    with _DISCOVER_LOCK:
+        flight = _INFLIGHT_DISCOVER.get(flight_key)
+        leader = flight is None
+        if flight is None:
+            flight = _DiscoverFlight()
+            _INFLIGHT_DISCOVER[flight_key] = flight
+    if leader:
+        try:
+            flight.result = _discover_once(managed, folders)
+        except BaseException as error:
+            flight.error = error
+        finally:
+            with _DISCOVER_LOCK:
+                if _INFLIGHT_DISCOVER.get(flight_key) is flight:
+                    _INFLIGHT_DISCOVER.pop(flight_key, None)
+            flight.event.set()
+    else:
+        flight.event.wait()
+    if flight.error is not None:
+        raise flight.error
+    return [dict(item) for item in flight.result]
+
+def default_python(managed: Path) -> str:
+    """Choose a direct default interpreter without spawning probe subprocesses."""
     if bundled_available():
         return BUNDLED
-    for item in discover(managed):
+    direct: list[Path] = list(_bin(managed))
+    for variable in ("VIRTUAL_ENV", "CONDA_PREFIX"):
+        value = os.environ.get(variable)
+        if value:
+            direct.extend(_bin(Path(value).expanduser()))
+    if not frozen() and sys.executable:
+        direct.append(Path(sys.executable))
+    for path in direct:
+        chosen = _usable_python(path)
+        if chosen:
+            return chosen
+    for name in ("python3", "python", *(f"python3.{minor}" for minor in range(16, 8, -1))):
+        located = shutil.which(name)
+        if located:
+            chosen = _usable_python(Path(located))
+            if chosen:
+                return chosen
+    return ""
+
+def preferred(managed: Path, folders: Sequence[str] = ()) -> str:
+    if bundled_available():
+        return BUNDLED
+    for item in discover(managed, folders):
         if item["matplotlib"]:
             return item["path"]
-    if not frozen():
-        return sys.executable
-    return shutil.which("python3") or shutil.which("python") or ""
+    return default_python(managed)
 
 def setup_environment(managed: Path, report=lambda text: None) -> str:
     """Create an app-owned virtual environment and install numpy + matplotlib into it."""

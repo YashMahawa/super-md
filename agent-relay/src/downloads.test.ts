@@ -14,7 +14,7 @@ test('only completed bounded exports receive expiring file capabilities',()=>{
 });
 
 test('downloads stream bounded chunks and verify the complete artifact for every format',async()=>{
- for(const format of ['pdf','md','smd']){
+ for(const format of ['pdf','md','mdzip','smd']){
   const data=Buffer.alloc(EXPORT_CHUNK_BYTES+17,42),downloads=new ExportDownloads(),lease=downloads.issue('g','d','j',meta(data,format))!;
   const chunks:Buffer[]=[],requests:number[]=[];
   for await(const chunk of downloads.stream(lease.token,async(info,offset,limit)=>{

@@ -44,7 +44,19 @@ Pane {
         onAccepted: studio.clearStorageCategory(page.pendingCleanup)
         contentItem: Label { width: 360; wrapMode: Text.WordWrap; text: page.pendingCleanup === "execution-results" ? "Remove app-generated Python result previews. Saved notes, exported images and recovery data will not be touched. This cannot be undone." : "Remove cached update verification/download state. Installed versions and Downloads outside app storage remain unchanged. This cannot be undone." }
     }
-    Component.onCompleted: studio.refreshPython()
+    property bool completed: false
+    property bool pythonScanned: false
+    readonly property bool pythonSectionVisible: page.section === "python" && (page.ownerPopup ? page.ownerPopup.visible : page.visible)
+    function ensurePythonScanned() {
+        if (!page.completed || page.pythonScanned || !page.pythonSectionVisible) return
+        page.pythonScanned = true
+        studio.refreshPython()
+    }
+    onPythonSectionVisibleChanged: ensurePythonScanned()
+    Component.onCompleted: {
+        page.completed = true
+        ensurePythonScanned()
+    }
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 28
@@ -246,6 +258,7 @@ Pane {
                 }
                 ColumnLayout {
                     visible: page.section === "python"
+                    onVisibleChanged: page.ensurePythonScanned()
                     Layout.fillWidth: true
                     spacing: 16
                 Label { text: "Python"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
@@ -298,7 +311,7 @@ Pane {
                     Layout.fillWidth: true
                     spacing: 8
                     ActionButton { objectName: "setupPython"; text: "Set up Python"; glyph: "DownloadSimple"; prominent: !page.pythonReady; tonal: page.pythonReady; enabled: !studio.pythonBusy; ToolTip.text: "Creates a private Python environment with numpy and matplotlib"; onClicked: studio.setupPython() }
-                    ActionButton { text: "Scan again"; glyph: "ArrowClockwise"; tonal: true; enabled: !studio.pythonBusy; onClicked: studio.refreshPython() }
+                    ActionButton { objectName: "rescanPython"; text: "Scan again"; glyph: "ArrowClockwise"; tonal: true; enabled: !studio.pythonBusy; onClicked: { page.pythonScanned = true; studio.refreshPython() } }
                 }
                 Label { text: "Custom interpreter path"; Layout.topMargin: 4 }
                 TextField { objectName: "pythonPath"; Layout.fillWidth: true; text: viewState.settings.python === "bundled" ? "" : viewState.settings.python; placeholderText: studio.pythonBundled ? "Using built-in Python" : "/path/to/venv/bin/python"; selectByMouse: true; onEditingFinished: if (text.trim().length && text.trim() !== viewState.settings.python) page.save("python", text.trim()) }

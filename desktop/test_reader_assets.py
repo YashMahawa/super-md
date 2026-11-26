@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,7 +9,15 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtGui import QGuiApplication
-from reader_assets import ReaderAssetStore, resolve_source
+from reader_assets import (
+    READER_HOST,
+    READER_SCHEME,
+    ReaderAssetStore,
+    ReaderBundleSchemeHandler,
+    reader_bundle_url,
+    resolve_bundle_file,
+    resolve_source,
+)
 from studio import Session, Studio
 
 
@@ -131,6 +140,7 @@ class ReaderAssetTests(unittest.TestCase):
 
     def test_studio_resolver_returns_a_live_note_scoped_capability(self):
         session = Session(True)
+        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             tab = studio._current()
@@ -165,6 +175,7 @@ class ReaderAssetTests(unittest.TestCase):
 
     def test_studio_resolver_uses_legacy_fallback_when_capability_capacity_is_full(self):
         session = Session(True)
+        session.settings["python"] = sys.executable
         studio = Studio(True, session)
         try:
             tab = studio._current()
@@ -178,6 +189,420 @@ class ReaderAssetTests(unittest.TestCase):
             self.assertEqual(replies[0][2], "")
             self.assertIsNone(json.loads(replies[0][1])["url"])
             self.assertEqual(len(session.reader_assets), 0)
+        finally:
+            studio.stop()
+            studio.pool.shutdown(wait=True, cancel_futures=True)
+            session.writes.shutdown(wait=True)
+
+    def test_reader_bundle_scheme_serves_contained_dist_files_and_rejects_escapes_or_symlinks(self):
+        self.assertEqual(reader_bundle_url().toString(), f"{READER_SCHEME}://{READER_HOST}/qt-reader.html")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dist = root / "dist"
+            assets = dist / "assets"
+            assets.mkdir(parents=True)
+            (dist / "qt-reader.html").write_text("<!doctype html><title>ok</title>", encoding="utf-8")
+            (assets / "reader.js").write_text("export default 1;", encoding="utf-8")
+            (dist / "secret.exe").write_bytes(b"MZ")
+            outside = root / "outside.html"
+            outside.write_text("outside", encoding="utf-8")
+            (dist / "linked.html").symlink_to(outside)
+
+            resolved_html, html_mime = resolve_bundle_file(dist, "/qt-reader.html")
+            self.assertEqual(resolved_html, (dist / "qt-reader.html").resolve())
+            self.assertEqual(html_mime, "text/html")
+
+            handler = ReaderBundleSchemeHandler(dist)
+            device, js_mime = handler.open_bundle_device("/assets/reader.js")
+            try:
+                self.assertEqual(js_mime, "text/javascript")
+                self.assertEqual(bytes(device.readAll()), b"export default 1;")
+            finally:
+                device.close()
+
+            for blocked in (
+                "/../outside.html",
+                "/%2e%2e/outside.html",
+                "/linked.html",
+                "/secret.exe",
+                "/",
+                "qt-reader.html",
+            ):
+                with self.assertRaises(PermissionError, msg=blocked):
+                    resolve_bundle_file(dist, blocked)
+
+            qml_source = (Path(__file__).resolve().parent / "qml" / "Main.qml").read_text(encoding="utf-8")
+            self.assertIn("settings.localContentCanAccessFileUrls: false", qml_source)
+            self.assertNotIn("settings.localContentCanAccessFileUrls: true", qml_source)
+
+    def test_production_main_qml_renders_fallback_mermaid_sandbox_and_rejects_untrusted_subframes(self):
+        import subprocess
+        import sys
+
+        desktop_dir = Path(__file__).resolve().parent
+        dist_dir = desktop_dir.parent / "dist"
+        if not (dist_dir / "qt-reader.html").is_file():
+            self.skipTest("dist/qt-reader.html is not built")
+
+        probe_code = """
+import json, os, sys, time
+from pathlib import Path
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["QT_QUICK_BACKEND"] = "software"
+os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
+os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+from PySide6.QtCore import QFile, QIODevice, QMetaObject, QObject, QTimer, QUrl, Q_ARG, Slot
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtWebEngineCore import QWebEngineProfile
+from PySide6.QtWebEngineQuick import QtWebEngineQuick
+from PySide6.QtWidgets import QApplication
+from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
+from studio import ROOT, Session, Studio
+
+QQuickStyle.setStyle("Material")
+register_reader_schemes()
+QtWebEngineQuick.initialize()
+app = QApplication(["Super MD Main.qml Mermaid sandbox test"])
+opened_external = []
+
+class UrlCatcher(QObject):
+    @Slot(QUrl)
+    def handleUrl(self, url):
+        opened_external.append(url.toString())
+
+catcher = UrlCatcher()
+QDesktopServices.setUrlHandler("https", catcher, "handleUrl")
+QDesktopServices.setUrlHandler("http", catcher, "handleUrl")
+
+bundle_handler = ReaderBundleSchemeHandler(ROOT / "dist", app)
+QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
+session = Session(True)
+session.settings["python"] = sys.executable
+studio = Studio(True, session)
+studio.settings["welcomed"] = True
+studio.mode = "reader"
+note = next(t for t in studio.tabs if t["id"] == studio.active)
+note["content"] = (
+    "# Qt Sandbox Check\\n\\n"
+    "```mermaid\\n"
+    "gantt\\n"
+    "  title Sandbox Schedule\\n"
+    "  dateFormat YYYY-MM-DD\\n"
+    "  Phase 1 :a1, 2026-09-01, 3d\\n"
+    "  Phase 2 :after a1, 2d\\n"
+    "```\\n"
+)
+note["saved"] = note["content"]
+
+channel = QFile(":/qtwebchannel/qwebchannel.js")
+if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
+    raise RuntimeError("Qt WebChannel runtime is unavailable")
+channel_script = bytes(channel.readAll()).decode()
+
+engine = QQmlApplicationEngine()
+engine.rootContext().setContextProperty("studio", studio)
+engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
+engine.rootContext().setContextProperty("channelScript", channel_script)
+engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(ROOT / "public" / "brand-mark-fixed.svg")))
+engine.load(QUrl.fromLocalFile(str(ROOT / "desktop" / "qml" / "Main.qml")))
+if not engine.rootObjects():
+    raise RuntimeError("Main.qml failed to load")
+window = engine.rootObjects()[0]
+studio.host_window = window
+window.show()
+
+deadline = time.monotonic() + 20.0
+probe_sent = False
+
+def poll():
+    global probe_sent
+    if studio.message.startswith("QML_SANDBOX:"):
+        payload = json.loads(studio.message.removeprefix("QML_SANDBOX:"))
+        payload["openedExternal"] = list(opened_external)
+        print("QML_SANDBOX_RESULT:" + json.dumps(payload), flush=True)
+        app.exit(0)
+        return
+    if time.monotonic() >= deadline:
+        print("QML_SANDBOX_TIMEOUT:" + json.dumps({"ready": studio.ready, "message": studio.message}), flush=True)
+        app.exit(2)
+        return
+    if studio.ready and not probe_sent:
+        script = '''(()=>{
+          const img = document.querySelector('.mermaid img');
+          const err = document.querySelector('.render-error,.image-error');
+          if (err) {
+            window.SuperMD?.post('q', 'export_failed', JSON.stringify({error: 'QML_SANDBOX:' + JSON.stringify({ok: false, error: err.textContent})}));
+            return;
+          }
+          if (!img || !img.complete || img.naturalWidth <= 0) return;
+          if (window.__probeSent) return;
+          window.__probeSent = true;
+          const svg = decodeURIComponent(img.src.split(',').slice(1).join(','));
+          const sandboxFrame = document.documentElement.querySelector('iframe[data-mermaid-sandbox]');
+          // Attempt untrusted subframe navigations; CSP + Main.qml must block without opening external browser.
+          const evil = document.createElement('iframe');
+          evil.src = 'https://evil.example/subframe';
+          document.documentElement.appendChild(evil);
+          setTimeout(() => {
+            evil.remove();
+            window.SuperMD?.post('q', 'export_failed', JSON.stringify({error: 'QML_SANDBOX:' + JSON.stringify({
+              ok: true,
+              naturalWidth: img.naturalWidth,
+              hasMermaidEngine: svg.includes('data-diagram-engine="mermaid"'),
+              sandboxAttr: sandboxFrame?.getAttribute('sandbox') ?? null,
+              inBody: sandboxFrame ? document.body.contains(sandboxFrame) : null
+            })}));
+          }, 150);
+        })()'''
+        QMetaObject.invokeMethod(window, "runDocumentScript", Q_ARG("QVariant", script))
+    QTimer.singleShot(200, poll)
+
+QTimer.singleShot(200, poll)
+code = app.exec()
+studio.stop()
+for eng in (engine,):
+    eng.deleteLater()
+studio.pool.shutdown(wait=False, cancel_futures=True)
+session.writes.shutdown(wait=True)
+QDesktopServices.unsetUrlHandler("https")
+QDesktopServices.unsetUrlHandler("http")
+sys.exit(code)
+"""
+        proc = subprocess.run(
+            [sys.executable, "-c", probe_code],
+            cwd=str(desktop_dir),
+            capture_output=True,
+            text=True,
+            timeout=35,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+        marker = next((line for line in proc.stdout.splitlines() if line.startswith("QML_SANDBOX_RESULT:")), "")
+        self.assertTrue(marker, msg=proc.stdout)
+        result = json.loads(marker.removeprefix("QML_SANDBOX_RESULT:"))
+        self.assertTrue(result["ok"], msg=result)
+        self.assertGreater(result["naturalWidth"], 80)
+        self.assertTrue(result["hasMermaidEngine"])
+        self.assertEqual(result["sandboxAttr"], "allow-scripts")
+        self.assertIs(result["inBody"], False)
+        self.assertEqual(result["openedExternal"], [])
+
+    def test_opening_smd_and_streaming_embedded_raster_decodes_once_and_evicts_on_invalidation(self):
+        import time
+        import documents
+
+        session = Session(True)
+        session.settings["python"] = sys.executable
+        studio = Studio(True, session)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                raw_one = b"\x89PNG\r\n\x1a\n" + (b"raster-one-" * 64)
+                raw_two = b"\x89PNG\r\n\x1a\n" + (b"raster-two-" * 64)
+                assets = {
+                    "assets/one.png": "data:image/png;base64," + base64.b64encode(raw_one).decode("ascii"),
+                    "assets/two.png": "data:image/png;base64," + base64.b64encode(raw_two).decode("ascii"),
+                }
+                smd_path = root / "gallery.smd"
+                smd_path.write_bytes(documents.compressed_bundle("# Gallery\n\n![](assets/one.png)\n![](assets/two.png)\n", assets))
+
+                replies = []
+                studio.replied.connect(lambda identifier, value, error: replies.append((identifier, value, error)))
+
+                with patch.object(documents.base64, "b64decode", wraps=base64.b64decode) as b64_spy:
+                    content, loaded_assets, portable = documents.open_note(smd_path)
+                    # Normal cold open payload-validates embedded assets once.
+                    self.assertEqual(b64_spy.call_count, 2)
+                    b64_spy.reset_mock()
+                    tab = studio._current()
+                    tab.update(
+                        path=str(smd_path), name=smd_path.name, content=content, saved=content,
+                        assets=loaded_assets, saved_assets=dict(loaded_assets), portable=portable,
+                    )
+
+                    with patch.object(studio, "_submit", side_effect=lambda action, done, *_a, **_kw: done(action(), None)):
+                        for source, expected_bytes in (("assets/one.png", raw_one), ("assets/two.png", raw_two)):
+                            replies.clear()
+                            studio.post("res", "resolve_reader_asset", json.dumps({
+                                "documentPath": tab["id"], "source": source,
+                            }))
+                            response = json.loads(replies[0][1])
+                            token = response["url"].split("//", 1)[1].split("?", 1)[0]
+                            fingerprint = response["url"].split("v=", 1)[1]
+                            grant = session.reader_assets.lookup(token, fingerprint)
+                            self.assertIsNotNone(grant)
+                            device = session.reader_assets.open_payload(grant)
+                            try:
+                                self.assertEqual(bytes(device.readAll()), expected_bytes)
+                            finally:
+                                device.close()
+                            # Repeat resolution + stream: still 0 additional decodes.
+                            replies.clear()
+                            studio.post("res2", "resolve_reader_asset", json.dumps({
+                                "documentPath": tab["id"], "source": source,
+                            }))
+                            device2 = session.reader_assets.open_payload(grant)
+                            device2.close()
+
+                    # Opening + resolving + streaming 2 rasters decoded each raster exactly once (1.0x).
+                    self.assertEqual(b64_spy.call_count, 2)
+                    self.assertEqual(session.reader_assets.cached_bytes, len(raw_one) + len(raw_two))
+
+                # Changing tab["assets"][source] immediately invalidates and evicts that asset's cached bytes.
+                first_token = next(
+                    tok for tok, g in session.reader_assets._grants.items() if g.source == "assets/one.png"
+                )
+                first_grant = session.reader_assets._grants[first_token]
+                first_fp = first_grant.fingerprint
+                tab["assets"]["assets/one.png"] = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\nreplaced").decode("ascii")
+                self.assertEqual(session.reader_assets.cached_bytes, len(raw_two))
+                self.assertIsNone(session.reader_assets.lookup(first_token, first_fp))
+                with self.assertRaises(ValueError):
+                    session.reader_assets.open_payload(first_grant)
+
+                # Closing the tab revokes remaining grants and evicts all cached bytes for that tab.
+                studio.newNote()
+                studio._finish_remove_tab(tab["id"])
+                self.assertEqual(session.reader_assets.cached_bytes, 0)
+                self.assertEqual(len(session.reader_assets), 0)
+
+                # Payload byte cap evicts oldest cached payloads while keeping capabilities bounded.
+                active = studio._current()
+                p1 = b"\x89PNG\r\n\x1a\n" + (b"1" * 100)
+                p2 = b"\x89PNG\r\n\x1a\n" + (b"2" * 100)
+                active["assets"]["assets/p1.png"] = "data:image/png;base64," + base64.b64encode(p1).decode("ascii")
+                active["assets"]["assets/p2.png"] = "data:image/png;base64," + base64.b64encode(p2).decode("ascii")
+                session.reader_assets.MAX_PAYLOAD_BYTES = len(p1) + 10
+                session.reader_assets.register(studio.window_id, active["id"], "assets/p1.png", resolve_source(active, "assets/p1.png"))
+                session.reader_assets.register(studio.window_id, active["id"], "assets/p2.png", resolve_source(active, "assets/p2.png"))
+                self.assertLessEqual(session.reader_assets.cached_bytes, session.reader_assets.MAX_PAYLOAD_BYTES)
+                self.assertEqual(session.reader_assets.cached_bytes, len(p2))
+
+                # Window retirement (revoke_owner) evicts all remaining cached bytes.
+                studio.stop()
+                self.assertEqual(session.reader_assets.cached_bytes, 0)
+        finally:
+            studio.stop()
+            studio.pool.shutdown(wait=True, cancel_futures=True)
+            session.writes.shutdown(wait=True)
+
+    def test_studio_save_text_skips_base64_decode_and_detects_external_or_corrupt_smd(self):
+        import time
+        import documents
+
+        session = Session(True)
+        session.settings["python"] = sys.executable
+        studio = Studio(True, session)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                png = b"\x89PNG\r\n\x1a\n" + (b"autosave-raster-" * 100)
+                assets = {"assets/pic.png": "data:image/png;base64," + base64.b64encode(png).decode("ascii")}
+                note = root / "autosave.smd"
+                documents.write_portable(note, "# Original\n", assets)
+
+                def wait_for_save():
+                    deadline = time.monotonic() + 3.0
+                    while studio.saving and time.monotonic() < deadline:
+                        self.app.processEvents()
+                        time.sleep(0.005)
+                    self.app.processEvents()
+
+                with patch.object(documents.base64, "b64decode", wraps=base64.b64decode) as b64_spy:
+                    content, loaded_assets, portable = documents.open_note(note)
+                    tab = studio._current()
+                    tab.update(
+                        path=str(note), name=note.name, content="# Autosaved edit\n", saved=content,
+                        assets=loaded_assets, saved_assets=dict(loaded_assets), portable=portable,
+                    )
+                    studio._save_text(tab, note, automatic=True)
+                    wait_for_save()
+                    self.assertEqual(tab["saved"], "# Autosaved edit\n")
+                    self.assertEqual(documents.open_note(note)[0], "# Autosaved edit\n")
+
+                    tab["content"] = "# Manual save edit\n"
+                    studio._save_text(tab, note, automatic=False)
+                    wait_for_save()
+                    self.assertEqual(tab["saved"], "# Manual save edit\n")
+                    self.assertEqual(b64_spy.call_count, 0)
+
+                    # External Markdown edit pauses autosave without decoding images or overwriting disk.
+                    documents.write_portable(note, "# External change\n", loaded_assets)
+                    tab["content"] = "# Local draft\n"
+                    studio._save_text(tab, note, automatic=True)
+                    wait_for_save()
+                    self.assertEqual(documents.open_note(note)[0], "# External change\n")
+                    self.assertIn("Autosave paused", studio.message)
+
+                    # Truncated/concatenated GZIP and invalid envelopes on disk also fail autosave without decoding images.
+                    raw_disk = note.read_bytes()
+                    exact_25mb_len = (documents.MAX_IMAGE // 3) * 4 + 4
+                    over_25mb = "A" * (exact_25mb_len - 1) + "="
+                    for damaged in (
+                        raw_disk[:-4],
+                        raw_disk + raw_disk,
+                        json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# External change\n",
+                                    "assets": {"assets/../escape.png": "data:image/png;base64,eA=="}}).encode("utf-8"),
+                        json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# External change\n",
+                                    "assets": {"assets/pic.png": "data:image/jpeg;base64,eA=="}}).encode("utf-8"),
+                        json.dumps({"format": "supermd-smd", "version": 1, "markdown": "# External change\n",
+                                    "assets": {"assets/huge.png": "data:image/png;base64," + over_25mb}}).encode("utf-8"),
+                    ):
+                        note.write_bytes(damaged)
+                        studio.message = ""
+                        studio._save_text(tab, note, automatic=True)
+                        wait_for_save()
+                        self.assertEqual(note.read_bytes(), damaged)
+                    self.assertEqual(b64_spy.call_count, 0)
+
+                # Damaged .smd with invalid base64 image is rejected on Studio open and cannot be rewritten by save.
+                import gzip
+                corrupt_smd = root / "corrupt-image.smd"
+                corrupt_bytes = gzip.compress(json.dumps({
+                    "format": "supermd-smd",
+                    "version": 1,
+                    "markdown": "# Corrupted image\n\n![](assets/bad.png)\n",
+                    "assets": {"assets/bad.png": "data:image/png;base64,@@@@"},
+                }).encode("utf-8"))
+                corrupt_smd.write_bytes(corrupt_bytes)
+
+                def run_sync(action, done, *_a, **_kw):
+                    try:
+                        done(action(), None)
+                    except Exception as err:
+                        done(None, str(err))
+
+                with patch.object(studio, "_submit", side_effect=run_sync):
+                    studio._open_note(str(corrupt_smd), explicit=True)
+                    self.assertFalse(any(t.get("path") == str(corrupt_smd) for t in studio.tabs))
+
+                    _, struct_bad_assets, _ = documents.open_note(corrupt_smd, decode_assets=False)
+                    bad_tab = studio._current()
+                    bad_tab.update(
+                        path=str(corrupt_smd),
+                        name=corrupt_smd.name,
+                        content="# Attempted edit\n",
+                        saved="# Corrupted image\n\n![](assets/bad.png)\n",
+                        assets=dict(struct_bad_assets),
+                        saved_assets=dict(struct_bad_assets),
+                        portable=True,
+                    )
+                    studio._save_text(bad_tab, corrupt_smd, automatic=False)
+                    self.assertEqual(corrupt_smd.read_bytes(), corrupt_bytes)
+                    self.assertNotEqual(bad_tab["saved"], "# Attempted edit\n")
+
+                    replies = []
+                    studio.replied.connect(lambda identifier, value, error: replies.append((identifier, value, error)))
+                    studio.post("save-fmd", "export_fmd_native", json.dumps({
+                        "save": True,
+                        "id": bad_tab["id"],
+                        "content": "# Attempted export save\n",
+                        "originalContent": "# Attempted export save\n",
+                        "assets": dict(struct_bad_assets),
+                    }))
+                    self.assertEqual(corrupt_smd.read_bytes(), corrupt_bytes)
+                    self.assertTrue(replies and replies[-1][2])
         finally:
             studio.stop()
             studio.pool.shutdown(wait=True, cancel_futures=True)

@@ -12,10 +12,13 @@ import mimetypes
 import os
 import re
 import stat
+import sys
 import tempfile
 import threading
 import unicodedata
+from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
@@ -29,9 +32,36 @@ MAX_SEARCH_RESULTS = 25
 MAX_OUTLINE_PAGE = 80
 MAX_QUERY_CHARS = 500
 MAX_ASSET_BYTES = documents.MAX_IMAGE
+MAX_ENVELOPE_CACHE_BYTES = 128 * 1024 * 1024
 _HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 _LOCK_GUARD = threading.Lock()
+
+
+@dataclass
+class _CachedEnvelope:
+    stat_key: tuple[int, int, int, int] | None
+    path_str: str
+    text: str
+    assets: dict[str, str]
+    portable: bool
+    revision: str
+    raw_size: int
+    envelope_bytes: int = 0
+    decoded_bytes: int = 0
+    decoded_assets: OrderedDict[str, tuple[str, bytes, str]] = field(default_factory=OrderedDict)
+
+    def __post_init__(self) -> None:
+        if self.envelope_bytes <= 0:
+            self.envelope_bytes = (
+                sys.getsizeof(self.text)
+                + sys.getsizeof(self.revision)
+                + sum(sys.getsizeof(name) + sys.getsizeof(data) for name, data in self.assets.items())
+            )
+
+    @property
+    def total_bytes(self) -> int:
+        return self.envelope_bytes + self.decoded_bytes
 
 
 class AgentDocumentError(ValueError):
@@ -168,7 +198,10 @@ def _symlink_component(path: Path) -> Path | None:
 class DocumentStore:
     """A collection of explicitly allowed roots and bounded note operations."""
 
-    def __init__(self, roots: list[str | os.PathLike[str]], *, allow_empty: bool = False):
+    MAX_CACHE_BYTES = MAX_ENVELOPE_CACHE_BYTES
+
+    def __init__(self, roots: list[str | os.PathLike[str]], *, allow_empty: bool = False,
+                 max_cache_bytes: int | None = None):
         if not roots and not allow_empty:
             raise AgentDocumentError("At least one explicit workspace root is required")
         normalized: list[Path] = []
@@ -184,6 +217,10 @@ class DocumentStore:
                 aliases.append((supplied, root))
         self.roots = tuple(normalized)
         self._root_aliases = tuple(sorted(aliases, key=lambda pair: len(pair[0].parts), reverse=True))
+        self._cache_lock = threading.Lock()
+        self._cache: OrderedDict[tuple[int, int, int, int], _CachedEnvelope] = OrderedDict()
+        self._cache_bytes = 0
+        self._max_cache_bytes = self.MAX_CACHE_BYTES if max_cache_bytes is None else max(0, max_cache_bytes)
 
     def resolve(self, value: str | os.PathLike[str], *, must_exist: bool = True) -> Path:
         """Resolve a caller path under one configured root; reject symlinks."""
@@ -229,40 +266,254 @@ class DocumentStore:
             raise AgentDocumentError("Document exceeds the 120 MB file limit")
         return data
 
-    def _load(self, path: Path) -> tuple[str, dict[str, str], bool, bytes]:
-        raw = self._read_raw(path)
+    @staticmethod
+    def _try_stat_key(path: Path) -> tuple[int, int, int, int] | None:
         try:
-            text, assets, portable = documents.decode_note_bytes(raw, path)
+            info = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_size)
+
+    def _evict_key_locked(self, key: tuple[int, int, int, int]) -> None:
+        removed = self._cache.pop(key, None)
+        if removed is not None:
+            self._cache_bytes -= removed.total_bytes
+
+    def _invalidate_path_locked(self, path: Path, extra_key: tuple[int, int, int, int] | None = None) -> None:
+        path_str = str(path)
+        if extra_key is not None:
+            self._evict_key_locked(extra_key)
+        for key, entry in list(self._cache.items()):
+            if entry.path_str == path_str:
+                self._evict_key_locked(key)
+
+    def _enforce_cache_budget_locked(self, *, preserve: _CachedEnvelope | None = None) -> None:
+        budget = max(0, self._max_cache_bytes)
+        if self._cache_bytes <= budget:
+            return
+        for key in list(self._cache.keys()):
+            if self._cache_bytes <= budget:
+                return
+            entry = self._cache[key]
+            if entry is preserve:
+                continue
+            self._evict_key_locked(key)
+        if preserve is not None and preserve.stat_key in self._cache and self._cache_bytes > budget:
+            while preserve.decoded_assets and self._cache_bytes > budget:
+                _, (_, payload, _) = preserve.decoded_assets.popitem(last=False)
+                delta = len(payload)
+                preserve.decoded_bytes -= delta
+                self._cache_bytes -= delta
+            if self._cache_bytes > budget:
+                self._evict_key_locked(preserve.stat_key)
+
+    def _cache_put_locked(self, entry: _CachedEnvelope) -> None:
+        key = entry.stat_key
+        if key is None:
+            return
+        self._invalidate_path_locked(Path(entry.path_str), key)
+        budget = max(0, self._max_cache_bytes)
+        if entry.envelope_bytes > budget:
+            return
+        self._cache[key] = entry
+        self._cache_bytes += entry.total_bytes
+        self._enforce_cache_budget_locked(preserve=entry)
+
+    def _cache_lookup(self, path: Path, key: tuple[int, int, int, int] | None) -> _CachedEnvelope | None:
+        if key is None:
+            return None
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            if key[1] == 0 and entry.path_str != str(path):
+                return None
+            self._cache.move_to_end(key)
+            return entry
+
+    def _load_entry(self, path: Path) -> _CachedEnvelope:
+        before_stat = self._try_stat_key(path)
+        if before_stat is not None and before_stat[3] > documents.MAX_FILE:
+            raise AgentDocumentError("Document exceeds the 120 MB file limit")
+        cached = self._cache_lookup(path, before_stat)
+        if cached is not None:
+            return cached
+        raw = self._read_raw(path)
+        after_stat = self._try_stat_key(path)
+        try:
+            text, assets, portable = documents.decode_note_bytes(raw, path, decode_assets=False)
         except (ValueError, OSError, UnicodeError) as exc:
             raise AgentDocumentError(str(exc)) from exc
-        return text, assets, portable, raw
+        revision = digest_bytes(raw)
+        stable = before_stat is not None and after_stat == before_stat and len(raw) == before_stat[3]
+        entry = _CachedEnvelope(
+            stat_key=before_stat if stable else None,
+            path_str=str(path),
+            text=text,
+            assets=dict(assets),
+            portable=portable,
+            revision=revision,
+            raw_size=len(raw),
+        )
+        with self._cache_lock:
+            if stable:
+                self._cache_put_locked(entry)
+            else:
+                self._invalidate_path_locked(path, before_stat)
+                if after_stat is not None:
+                    self._evict_key_locked(after_stat)
+        return entry
+
+    def _decode_entry_asset(self, entry: _CachedEnvelope, asset_name: str) -> tuple[str, bytes, str]:
+        with self._cache_lock:
+            cached = entry.decoded_assets.get(asset_name)
+            if cached is not None:
+                entry.decoded_assets.move_to_end(asset_name)
+                if entry.stat_key is not None and self._cache.get(entry.stat_key) is entry:
+                    self._cache.move_to_end(entry.stat_key)
+                return cached
+        mime, payload = documents.image_data(entry.assets[asset_name])
+        record = (mime, payload, digest_bytes(payload))
+        with self._cache_lock:
+            existing = entry.decoded_assets.get(asset_name)
+            if existing is not None:
+                entry.decoded_assets.move_to_end(asset_name)
+                return existing
+            in_cache = entry.stat_key is not None and self._cache.get(entry.stat_key) is entry
+            entry.decoded_assets[asset_name] = record
+            entry.decoded_bytes += len(payload)
+            if in_cache:
+                self._cache.move_to_end(entry.stat_key)
+                self._cache_bytes += len(payload)
+                self._enforce_cache_budget_locked(preserve=entry)
+        return record
+
+    def _entry_asset_metadata(self, entry: _CachedEnvelope, *, offset: int = 0, limit: int = 50) -> list[dict]:
+        result = []
+        for name in list(entry.assets.keys())[offset:offset + limit]:
+            try:
+                mime, payload, sha256 = self._decode_entry_asset(entry, name)
+                result.append(_asset_record(name, mime, len(payload), sha256))
+            except (ValueError, TypeError):
+                result.append(_asset_record(name, invalid=True))
+        return result
+
+    def _record_written_snapshot(
+        self,
+        path: Path,
+        *,
+        old_stat: tuple[int, int, int, int] | None,
+        text: str,
+        assets: dict[str, str],
+        portable: bool,
+        data: bytes,
+        revision: str,
+        prior_decoded: dict[str, tuple[str, bytes, str]] | None = None,
+    ) -> None:
+        new_stat = self._try_stat_key(path)
+        can_cache = (
+            new_stat is not None
+            and new_stat[3] == len(data)
+            and (portable or not text.lstrip().startswith("{"))
+        )
+        decoded_map: OrderedDict[str, tuple[str, bytes, str]] = OrderedDict()
+        decoded_bytes = 0
+        if can_cache and prior_decoded:
+            for name, record in prior_decoded.items():
+                if name in assets:
+                    decoded_map[name] = record
+                    decoded_bytes += len(record[1])
+        with self._cache_lock:
+            self._invalidate_path_locked(path, old_stat)
+            if can_cache:
+                entry = _CachedEnvelope(
+                    stat_key=new_stat,
+                    path_str=str(path),
+                    text=text,
+                    assets=dict(assets),
+                    portable=portable,
+                    revision=revision,
+                    raw_size=len(data),
+                    decoded_bytes=decoded_bytes,
+                    decoded_assets=decoded_map,
+                )
+                self._cache_put_locked(entry)
+
+    def _load(self, path: Path) -> tuple[str, dict[str, str], bool, bytes]:
+        with _path_lock(path):
+            before_stat = self._try_stat_key(path)
+            cached = self._cache_lookup(path, before_stat)
+            raw = self._read_raw(path)
+            after_stat = self._try_stat_key(path)
+            if (cached is not None and before_stat is not None and after_stat == before_stat
+                    and len(raw) == cached.raw_size and digest_bytes(raw) == cached.revision):
+                if cached.portable:
+                    try:
+                        documents.validate({
+                            "format": "supermd-smd", "version": 1,
+                            "markdown": cached.text, "assets": cached.assets,
+                        })
+                    except ValueError as exc:
+                        raise AgentDocumentError(str(exc)) from exc
+                return cached.text, dict(cached.assets), cached.portable, raw
+            try:
+                text, assets, portable = documents.decode_note_bytes(raw, path)
+            except (ValueError, OSError, UnicodeError) as exc:
+                raise AgentDocumentError(str(exc)) from exc
+            stable = before_stat is not None and after_stat == before_stat and len(raw) == before_stat[3]
+            with self._cache_lock:
+                if stable:
+                    entry = _CachedEnvelope(
+                        stat_key=before_stat,
+                        path_str=str(path),
+                        text=text,
+                        assets=dict(assets),
+                        portable=portable,
+                        revision=digest_bytes(raw),
+                        raw_size=len(raw),
+                    )
+                    self._cache_put_locked(entry)
+                else:
+                    self._invalidate_path_locked(path, before_stat)
+                    if after_stat is not None:
+                        self._evict_key_locked(after_stat)
+            return text, dict(assets), portable, raw
+
+    def read_markdown(self, path_value: str) -> str:
+        path = self.resolve(path_value)
+        with _path_lock(path):
+            return self._load_entry(path).text
 
     def inspect(self, path_value: str) -> dict:
         path = self.resolve(path_value)
         with _path_lock(path):
-            text, assets, portable, raw = self._load(path)
-        outline = outline_source(text)
+            entry = self._load_entry(path)
+            assets = self._entry_asset_metadata(entry, limit=40)
+        outline = outline_source(entry.text)
         headings = outline["headings"]
         return {
-            "path": self.display_path(path), "format": "smd" if portable or path.suffix.lower() == ".smd" else "markdown",
-            "portable": portable, "revision": digest_bytes(raw), "sha256": digest_bytes(raw),
-            "bytes": len(raw), "characters": len(text), "lines": len(text.splitlines()),
+            "path": self.display_path(path), "format": "smd" if entry.portable or path.suffix.lower() == ".smd" else "markdown",
+            "portable": entry.portable, "revision": entry.revision, "sha256": entry.revision,
+            "bytes": entry.raw_size, "characters": len(entry.text), "lines": len(entry.text.splitlines()),
             "heading_count": outline["total"], "headings": headings,
             "headings_truncated": outline["truncated"], "next_heading_offset": outline["nextOffset"],
-            "assets": _asset_metadata(assets, limit=40), "asset_count": len(assets),
+            "assets": assets, "asset_count": len(entry.assets),
         }
 
     def outline(self, path_value: str, *, offset: int = 0, limit: int = MAX_OUTLINE_PAGE) -> dict:
         path = self.resolve(path_value)
         with _path_lock(path):
-            text, _, _, raw = self._load(path)
-        return {"path": self.display_path(path), "revision": digest_bytes(raw), **outline_source(text, offset, limit)}
+            entry = self._load_entry(path)
+        return {"path": self.display_path(path), "revision": entry.revision, **outline_source(entry.text, offset, limit)}
 
     def read(self, path_value: str, *, offset: int = 0, limit: int = MAX_PAGE_CHARS,
              heading: int | str | None = None, view: str = "prose") -> dict:
         path = self.resolve(path_value)
         with _path_lock(path):
-            text, _, _, raw = self._load(path)
+            entry = self._load_entry(path)
+        text = entry.text
         if not isinstance(offset, int) or offset < 0 or offset > len(text):
             raise AgentDocumentError("offset must be between 0 and the document character count")
         if not isinstance(limit, int) or limit < 1 or limit > MAX_PAGE_CHARS:
@@ -271,8 +522,12 @@ class DocumentStore:
             raise AgentDocumentError("view must be 'prose' or 'source'")
         document_length = len(text)
         section_start, section_end = 0, document_length
+        headings, spans = _read_headings_and_svg_spans(
+            text,
+            include_headings=heading is not None,
+            include_svg=view == "prose",
+        )
         if heading is not None:
-            headings = _headings(text, include_internal=True)
             item = resolve_heading(headings, heading)
             section_start, section_end = item["sectionStart"], item["sectionEnd"]
         if offset > section_end:
@@ -280,14 +535,13 @@ class DocumentStore:
         start = offset if heading is None else max(section_start, offset)
         end = section_end
         offset = start
-        spans = _svg_spans(text) if view == "prose" else []
         page_end = (_prose_page_end(offset, limit, end, spans) if view == "prose"
                     else min(end, offset + limit))
         page_text = text[offset:page_end]
         omitted = []
         if view == "prose":
             page_text, omitted = _elide_svg_page(text, offset, page_end, spans)
-        return {"path": self.display_path(path), "revision": digest_bytes(raw), "start": offset,
+        return {"path": self.display_path(path), "revision": entry.revision, "start": offset,
                 "end": page_end, "total_chars": section_end - section_start, "next_offset": page_end if page_end < end else None,
                 "truncated": page_end < end, "view": view, "text": page_text,
                 "returned_chars": len(page_text), "svg_omissions": omitted,
@@ -298,9 +552,9 @@ class DocumentStore:
                regex: bool = False, exclude_diagrams: bool = False) -> dict:
         path = self.resolve(path_value)
         with _path_lock(path):
-            text, _, _, raw = self._load(path)
-        result = search_source(text, query, limit, context, offset, case_sensitive, whole_word, regex, exclude_diagrams)
-        return {"path": self.display_path(path), "revision": digest_bytes(raw), "query": query, **result}
+            entry = self._load_entry(path)
+        result = search_source(entry.text, query, limit, context, offset, case_sensitive, whole_word, regex, exclude_diagrams)
+        return {"path": self.display_path(path), "revision": entry.revision, "query": query, **result}
 
     def create(self, path_value: str, content: str, *, expected_absent: bool = True) -> dict:
         path = self.resolve(path_value, must_exist=False)
@@ -308,12 +562,17 @@ class DocumentStore:
             raise AgentDocumentError("content must be UTF-8 text no larger than 20 MB")
         if path.exists():
             raise RevisionConflict("A file already exists at this path; creation never overwrites")
-        data = _serialize(path, content, {})
+        portable = path.suffix.lower() == ".smd"
+        data = _serialize(path, content, {}, portable=portable)
+        revision = digest_bytes(data)
         with _path_lock(path):
             if path.exists():
                 raise RevisionConflict("A file was created at this path while this request was running")
             _create_once(path, data)
-        return {"path": self.display_path(path), "revision": digest_bytes(data), "sha256": digest_bytes(data),
+            self._record_written_snapshot(
+                path, old_stat=None, text=content, assets={}, portable=portable, data=data, revision=revision,
+            )
+        return {"path": self.display_path(path), "revision": revision, "sha256": revision,
                 "bytes": len(data), "characters": len(content), "created": True}
 
     def patch(self, path_value: str, *, expected_revision: str, operations: list[dict]) -> dict:
@@ -322,51 +581,61 @@ class DocumentStore:
             raise AgentDocumentError("expected_revision must be the 64-character SHA-256 from inspect/read")
         validate_patch_operations(operations)
         with _path_lock(path):
-            text, assets, portable, raw = self._load(path)
-            actual = digest_bytes(raw)
+            entry = self._load_entry(path)
+            actual = entry.revision
             if actual != expected_revision:
                 raise RevisionConflict("Document changed since it was read; inspect it again before editing")
-            edited, operation_results = apply_patch_operations_detailed(text, operations)
+            edited, operation_results = apply_patch_operations_detailed(entry.text, operations)
             if len(edited.encode("utf-8")) > 20_000_000:
                 raise AgentDocumentError("Edited Markdown exceeds the 20 MB limit")
-            data = _serialize(path, edited, assets, portable=portable)
+            data = _serialize(path, edited, entry.assets, portable=entry.portable)
             # Recheck immediately before atomic replace to catch ordinary
             # external writers that do not participate in our lock protocol.
             if digest_bytes(self._read_raw(path)) != expected_revision:
+                with self._cache_lock:
+                    self._invalidate_path_locked(path, entry.stat_key)
                 raise RevisionConflict("Document changed during the edit; no changes were saved")
+            with self._cache_lock:
+                prior_decoded = dict(entry.decoded_assets)
             _atomic_replace(path, data)
+            new_revision = digest_bytes(data)
+            self._record_written_snapshot(
+                path, old_stat=entry.stat_key, text=edited, assets=entry.assets,
+                portable=entry.portable, data=data, revision=new_revision, prior_decoded=prior_decoded,
+            )
         return {"path": self.display_path(path), "previous_revision": actual,
-                "revision": digest_bytes(data), "sha256": digest_bytes(data), "bytes": len(data),
+                "revision": new_revision, "sha256": new_revision, "bytes": len(data),
                 "characters": len(edited), "operations": len(operations), "applied": len(operation_results),
                 "operation_results": operation_results, "saved": True}
 
     def assets(self, path_value: str, *, offset: int = 0, limit: int = 50) -> dict:
         path = self.resolve(path_value)
         with _path_lock(path):
-            _, assets, _, raw = self._load(path)
-        if not isinstance(offset, int) or not isinstance(limit, int) or offset < 0 or not 1 <= limit <= 50:
-            raise AgentDocumentError("asset offset must be nonnegative and limit must be 1–50")
-        page = _asset_metadata(assets, offset=offset, limit=limit)
+            entry = self._load_entry(path)
+            if not isinstance(offset, int) or not isinstance(limit, int) or offset < 0 or not 1 <= limit <= 50:
+                raise AgentDocumentError("asset offset must be nonnegative and limit must be 1–50")
+            page = self._entry_asset_metadata(entry, offset=offset, limit=limit)
         next_offset = offset + len(page)
-        return {"path": self.display_path(path), "revision": digest_bytes(raw), "assets": page,
-                "total": len(assets), "next_offset": next_offset if next_offset < len(assets) else None}
+        total = len(entry.assets)
+        return {"path": self.display_path(path), "revision": entry.revision, "assets": page,
+                "total": total, "next_offset": next_offset if next_offset < total else None}
 
     def read_asset(self, path_value: str, asset_name: str, *, expected_revision: str) -> dict:
         """Return explicitly requested embedded bytes, never part of metadata reads."""
         path = self.resolve(path_value)
         with _path_lock(path):
-            _, assets, _, raw = self._load(path)
-            revision = digest_bytes(raw)
+            entry = self._load_entry(path)
+            revision = entry.revision
             if revision != expected_revision:
                 raise RevisionConflict("Document changed since it was read; inspect again before extracting")
-            if asset_name not in assets:
+            if asset_name not in entry.assets:
                 raise AgentDocumentError("Asset not found; call document_assets for exact names")
             try:
-                mime, payload = documents.image_data(assets[asset_name])
+                mime, payload, sha256 = self._decode_entry_asset(entry, asset_name)
             except ValueError as exc:
                 raise AgentDocumentError(str(exc)) from exc
             return {"asset": asset_name, "mime_type": mime, "data": payload,
-                    "bytes": len(payload), "sha256": digest_bytes(payload), "revision": revision}
+                    "bytes": len(payload), "sha256": sha256, "revision": revision}
 
     def attach_asset(self, path_value: str, asset_path_value: str, *, expected_revision: str,
                      name: str | None = None) -> dict:
@@ -382,10 +651,11 @@ class DocumentStore:
         if mime is None:
             raise AgentDocumentError("Asset type must be PNG, JPEG, SVG, GIF, WebP, or AVIF")
         filename = name or asset_path.name
+        asset_sha = digest_bytes(raw_asset)
         if name is None and not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename):
             original_ext = Path(filename).suffix
             stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename).stem).strip(".-_") or "asset"
-            filename = f"{stem[:120]}-{digest_bytes(raw_asset)[:8]}{original_ext}"
+            filename = f"{stem[:120]}-{asset_sha[:8]}{original_ext}"
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
             raise AgentDocumentError("Asset name must be a simple filename (letters, digits, dot, underscore, hyphen)")
         named_ext = Path(filename).suffix.lower().lstrip(".")
@@ -394,23 +664,34 @@ class DocumentStore:
         elif documents.MIMES.get(named_ext) != mime:
             raise AgentDocumentError("Asset name extension must match the image type")
         asset_key = "assets/" + filename
-        data_url = f"data:{mime};base64," + base64.b64encode(raw_asset).decode("ascii")
+        data_url = f"data:{mime};base64," + documents.encode_base64_chunked(raw_asset)
+        documents._cache_validated_asset(data_url, mime, len(raw_asset))
         with _path_lock(path):
-            text, assets, portable, raw = self._load(path)
-            if digest_bytes(raw) != expected_revision:
+            entry = self._load_entry(path)
+            if entry.revision != expected_revision:
                 raise RevisionConflict("Document changed since it was read; inspect it again before editing")
-            if not portable:
+            if not entry.portable:
                 raise AgentDocumentError("Attach is for portable .smd notes; create/copy as .smd to keep assets self-contained")
-            if asset_key in assets:
+            if asset_key in entry.assets:
                 raise AgentDocumentError(f"An asset named {asset_key} already exists; choose another name")
-            updated = dict(assets)
+            updated = dict(entry.assets)
             updated[asset_key] = data_url
-            data = _serialize(path, text, updated, portable=True)
+            data = _serialize(path, entry.text, updated, portable=True)
             if digest_bytes(self._read_raw(path)) != expected_revision:
+                with self._cache_lock:
+                    self._invalidate_path_locked(path, entry.stat_key)
                 raise RevisionConflict("Document changed during the edit; no changes were saved")
+            with self._cache_lock:
+                prior_decoded = dict(entry.decoded_assets)
+            prior_decoded[asset_key] = (mime, raw_asset, asset_sha)
             _atomic_replace(path, data)
-        return {"path": self.display_path(path), "asset": _asset_metadata({asset_key: data_url})[0],
-                "previous_revision": expected_revision, "revision": digest_bytes(data), "saved": True}
+            new_revision = digest_bytes(data)
+            self._record_written_snapshot(
+                path, old_stat=entry.stat_key, text=entry.text, assets=updated,
+                portable=True, data=data, revision=new_revision, prior_decoded=prior_decoded,
+            )
+        return {"path": self.display_path(path), "asset": _asset_record(asset_key, mime, len(raw_asset), asset_sha),
+                "previous_revision": expected_revision, "revision": new_revision, "saved": True}
 
     def replace_asset(self, path_value: str, asset_id: str, asset_path_value: str, *,
                       expected_revision: str) -> dict:
@@ -428,34 +709,46 @@ class DocumentStore:
         if not isinstance(asset_id, str) or not asset_id or len(asset_id) > 256:
             raise AgentDocumentError("asset_id must be an exact ID or asset name from document_assets")
         with _path_lock(path):
-            text, assets, portable, raw = self._load(path)
-            revision = digest_bytes(raw)
+            entry = self._load_entry(path)
+            revision = entry.revision
             if revision != expected_revision:
                 raise RevisionConflict("Document changed since it was read; inspect again before replacing an asset")
-            asset_name = _resolve_asset_id(assets, asset_id)
-            if not portable:
+            asset_name = _resolve_asset_id(entry.assets, asset_id)
+            if not entry.portable:
                 raise AgentDocumentError("Asset replacement requires a portable .smd note")
             extension_mime = documents.MIMES.get(asset_name.rsplit(".", 1)[-1].lower())
             if extension_mime != mime:
                 raise AgentDocumentError("Replacement image must keep the current asset MIME type and extension")
             try:
-                old_mime, old_data = documents.image_data(assets[asset_name])
+                old_mime, old_data, old_sha = self._decode_entry_asset(entry, asset_name)
             except ValueError as exc:
                 raise AgentDocumentError(str(exc)) from exc
             if old_mime != mime:
                 raise AgentDocumentError("Asset reference MIME type is inconsistent with its extension")
             if old_data == raw_asset:
-                record = _asset_metadata({asset_name: assets[asset_name]})[0]
-                return {"path": self.display_path(path), "asset": record, "previous_revision": revision,
-                        "revision": revision, "saved": False, "changed": False}
-            updated = dict(assets)
-            updated[asset_name] = f"data:{mime};base64," + base64.b64encode(raw_asset).decode("ascii")
-            data = _serialize(path, text, updated, portable=True)
+                return {"path": self.display_path(path), "asset": _asset_record(asset_name, old_mime, len(old_data), old_sha),
+                        "previous_revision": revision, "revision": revision, "saved": False, "changed": False}
+            updated = dict(entry.assets)
+            new_url = f"data:{mime};base64," + documents.encode_base64_chunked(raw_asset)
+            documents._cache_validated_asset(new_url, mime, len(raw_asset))
+            updated[asset_name] = new_url
+            data = _serialize(path, entry.text, updated, portable=True)
             if digest_bytes(self._read_raw(path)) != expected_revision:
+                with self._cache_lock:
+                    self._invalidate_path_locked(path, entry.stat_key)
                 raise RevisionConflict("Document changed during replacement; no changes were saved")
+            new_sha = digest_bytes(raw_asset)
+            with self._cache_lock:
+                prior_decoded = dict(entry.decoded_assets)
+            prior_decoded[asset_name] = (mime, raw_asset, new_sha)
             _atomic_replace(path, data)
-        return {"path": self.display_path(path), "asset": _asset_metadata({asset_name: updated[asset_name]})[0],
-                "previous_revision": revision, "revision": digest_bytes(data), "saved": True, "changed": True}
+            new_revision = digest_bytes(data)
+            self._record_written_snapshot(
+                path, old_stat=entry.stat_key, text=entry.text, assets=updated,
+                portable=True, data=data, revision=new_revision, prior_decoded=prior_decoded,
+            )
+        return {"path": self.display_path(path), "asset": _asset_record(asset_name, mime, len(raw_asset), new_sha),
+                "previous_revision": revision, "revision": new_revision, "saved": True, "changed": True}
 
     def extract_asset(self, path_value: str, asset_name: str, output_value: str, *,
                       expected_revision: str) -> dict:
@@ -464,13 +757,13 @@ class DocumentStore:
         if output == path:
             raise AgentDocumentError("Extraction output must be a separate path")
         with _path_lock(path):
-            _, assets, _, raw = self._load(path)
-            if digest_bytes(raw) != expected_revision:
+            entry = self._load_entry(path)
+            if entry.revision != expected_revision:
                 raise RevisionConflict("Document changed since it was read; inspect it again before extracting")
-            if asset_name not in assets:
+            if asset_name not in entry.assets:
                 raise AgentDocumentError("Asset not found; call document_assets for exact names")
             try:
-                _, payload = documents.image_data(assets[asset_name])
+                _, payload, sha256 = self._decode_entry_asset(entry, asset_name)
             except ValueError as exc:
                 raise AgentDocumentError(str(exc)) from exc
             if len(payload) > MAX_ASSET_BYTES:
@@ -480,7 +773,7 @@ class DocumentStore:
                 raise RevisionConflict("Extraction never overwrites an existing file")
             _create_once(output, payload)
         return {"path": self.display_path(output), "asset": asset_name, "bytes": len(payload),
-                "sha256": digest_bytes(payload), "extracted": True}
+                "sha256": sha256, "extracted": True}
 
     def display_path(self, path: Path) -> str:
         for root in self.roots:
@@ -491,16 +784,34 @@ class DocumentStore:
         return str(path)
 
 
+def _asset_record(
+    name: str,
+    mime: str | None = None,
+    size: int | None = None,
+    sha256: str | None = None,
+    *,
+    invalid: bool = False,
+) -> dict:
+    record = {
+        "id": hashlib.sha256(name.encode("utf-8")).hexdigest(),
+        "name": name,
+        "mime": mime,
+        "bytes": size,
+        "sha256": sha256,
+    }
+    if invalid:
+        record["invalid"] = True
+    return record
+
+
 def _asset_metadata(assets: dict[str, str], *, offset: int = 0, limit: int = 50) -> list[dict]:
     result = []
     for name, data in list(assets.items())[offset:offset + limit]:
         try:
             mime, payload = documents.image_data(data)
-            result.append({"id": hashlib.sha256(name.encode("utf-8")).hexdigest(), "name": name,
-                           "mime": mime, "bytes": len(payload), "sha256": digest_bytes(payload)})
+            result.append(_asset_record(name, mime, len(payload), digest_bytes(payload)))
         except (ValueError, TypeError):
-            result.append({"id": hashlib.sha256(name.encode("utf-8")).hexdigest(), "name": name,
-                           "mime": None, "bytes": None, "sha256": None, "invalid": True})
+            result.append(_asset_record(name, invalid=True))
     return result
 
 
@@ -513,30 +824,176 @@ def _resolve_asset_id(assets: dict[str, str], asset_id: str) -> str:
     return matches[0]
 
 
-def _headings(text: str, *, include_internal: bool = False) -> list[dict]:
-    found = []
+_SVG_FENCE_LANGUAGES = frozenset({"svg", "svg+xml", "image/svg+xml"})
+_DIAGRAM_FENCE_LANGUAGES = _SVG_FENCE_LANGUAGES | {"mermaid", "smd-chart"}
+
+
+@dataclass(frozen=True)
+class _FencedSpan:
+    fence_start: int
+    fence_end: int
+    body_start: int
+    body_end: int
+    line_start: int
+    line_end: int
+    is_svg: bool
+    is_diagram: bool
+
+    def to_svg_dict(self) -> dict:
+        return {
+            "start": self.body_start,
+            "end": self.body_end,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+        }
+
+
+@dataclass
+class _OpenFence:
+    char: str
+    size: int
+    fence_start: int
+    body_start: int
+    line_start: int
+    svg_tagged: bool = False
+    diagram_tagged: bool = False
+    probe: list[str] = field(default_factory=list)
+
+    def is_svg(self) -> bool:
+        return self.svg_tagged or "".join(self.probe).lstrip().lower().startswith("<svg")
+
+    def to_span(self, *, fence_end: int, body_end: int, line_end: int) -> _FencedSpan:
+        is_svg = self.is_svg()
+        return _FencedSpan(
+            fence_start=self.fence_start,
+            fence_end=fence_end,
+            body_start=self.body_start,
+            body_end=body_end,
+            line_start=self.line_start,
+            line_end=max(self.line_start, line_end),
+            is_svg=is_svg,
+            is_diagram=self.diagram_tagged or is_svg,
+        )
+
+
+def _step_fence_boundary(
+    body: str,
+    opened: _OpenFence | None,
+    *,
+    offset: int,
+    line_len: int,
+    line_number: int,
+    inspect_info: bool,
+) -> tuple[bool, _OpenFence | None, _FencedSpan | None]:
+    """Parse one line for CommonMark fence boundaries."""
+    match = _FENCE.match(body)
+    if match is None:
+        return False, opened, None
+    marker = match.group(1)
+    if opened is None:
+        language = ""
+        if inspect_info:
+            info = body[match.end():].strip().split(None, 1)
+            language = info[0].casefold() if info else ""
+        svg_tagged = language in _SVG_FENCE_LANGUAGES
+        return True, _OpenFence(
+            char=marker[0],
+            size=len(marker),
+            fence_start=offset,
+            body_start=offset + line_len,
+            line_start=line_number + 1,
+            svg_tagged=svg_tagged,
+            diagram_tagged=svg_tagged or language in _DIAGRAM_FENCE_LANGUAGES,
+        ), None
+    if marker[0] == opened.char and len(marker) >= opened.size:
+        closed = (
+            opened.to_span(
+                fence_end=offset + line_len,
+                body_end=offset,
+                line_end=line_number - 1,
+            )
+            if inspect_info else None
+        )
+        return True, None, closed
+    return True, opened, None
+
+
+def _scan_read_only(
+    text: str,
+    *,
+    collect_headings: bool = False,
+    collect_fences: bool = False,
+) -> tuple[list[dict], list[_FencedSpan]]:
+    has_fences = "```" in text or "~~~" in text
+    if not collect_headings and not (collect_fences and has_fences):
+        return [], []
+    headings: list[dict] = []
+    fences: list[_FencedSpan] = []
     offset = 0
     line_number = 1
-    fence_char = None
-    fence_size = 0
+    opened: _OpenFence | None = None
     for line in text.splitlines(keepends=True):
+        line_len = len(line)
         body = line.rstrip("\r\n")
-        fm = _FENCE.match(body)
-        if fm:
-            marker = fm.group(1)
-            char, size = marker[0], len(marker)
-            if fence_char is None:
-                fence_char, fence_size = char, size
-            elif char == fence_char and size >= fence_size:
-                fence_char = None
-            offset += len(line); line_number += 1
-            continue
-        if fence_char is None:
-            match = _HEADING.match(body)
-            if match:
-                found.append({"index": len(found), "level": len(match.group(1)), "title": match.group(2)[:300],
-                              "line": line_number, "start": offset})
-        offset += len(line); line_number += 1
+        if has_fences:
+            is_fence_line, opened, closed = _step_fence_boundary(
+                body,
+                opened,
+                offset=offset,
+                line_len=line_len,
+                line_number=line_number,
+                inspect_info=collect_fences,
+            )
+            if closed is not None:
+                fences.append(closed)
+            if is_fence_line:
+                offset += line_len
+                line_number += 1
+                continue
+        if opened is None:
+            if collect_headings:
+                match = _HEADING.match(body)
+                if match:
+                    headings.append({
+                        "index": len(headings),
+                        "level": len(match.group(1)),
+                        "title": match.group(2)[:300],
+                        "line": line_number,
+                        "start": offset,
+                    })
+        elif collect_fences and not opened.svg_tagged and len(opened.probe) < 4:
+            opened.probe.append(body[:512])
+        offset += line_len
+        line_number += 1
+    if opened is not None and collect_fences:
+        fences.append(
+            opened.to_span(
+                fence_end=len(text),
+                body_end=len(text),
+                line_end=line_number - 1,
+            )
+        )
+    return headings, fences
+
+
+def _read_headings_and_svg_spans(
+    text: str,
+    *,
+    include_headings: bool,
+    include_svg: bool,
+) -> tuple[list[dict], list[dict]]:
+    found, fences = _scan_read_only(
+        text,
+        collect_headings=include_headings,
+        collect_fences=include_svg,
+    )
+    headings = _heading_sections(text, found) if include_headings else []
+    svg_spans = [span.to_svg_dict() for span in fences if span.is_svg] if include_svg else []
+    return headings, svg_spans
+
+
+def _headings(text: str, *, include_internal: bool = False) -> list[dict]:
+    found, _ = _scan_read_only(text, collect_headings=True)
     if include_internal:
         return _heading_sections(text, found)
     return [{k: v for k, v in item.items() if k != "start"} for item in found]
@@ -643,36 +1100,11 @@ _INLINE_SVG_CLOSE = re.compile(r"</svg\s*>", re.IGNORECASE)
 
 def diagram_spans(text: str, *, include_inline_svg: bool = False) -> list[dict]:
     """Return diagram body ranges as code-point `{start, end}` offsets; end is exclusive."""
-    spans = list(_svg_spans(text))
-    fenced_blocks: list[tuple[int, int]] = []
-    offset = 0
-    opened = None
-    for line in text.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        match = _FENCE.match(body)
-        if match:
-            marker = match.group(1)
-            if opened is None:
-                info = body[match.end():].strip().split(None, 1)
-                language = info[0].casefold() if info else ""
-                opened = {
-                    "char": marker[0],
-                    "size": len(marker),
-                    "fence_start": offset,
-                    "body_start": offset + len(line),
-                    "diagram": language in ("svg", "svg+xml", "image/svg+xml", "mermaid", "smd-chart"),
-                }
-            elif marker[0] == opened["char"] and len(marker) >= opened["size"]:
-                fenced_blocks.append((opened["fence_start"], offset + len(line)))
-                if opened["diagram"]:
-                    spans.append({"start": opened["body_start"], "end": offset})
-                opened = None
-        offset += len(line)
-    if opened is not None:
-        fenced_blocks.append((opened["fence_start"], len(text)))
-        if opened["diagram"]:
-            spans.append({"start": opened["body_start"], "end": len(text)})
-    if include_inline_svg and ("<svg" in text or "<SVG" in text or "<svg" in text.lower()):
+    _, fences = _scan_read_only(text, collect_fences=True)
+    spans = [{"start": span.body_start, "end": span.body_end} for span in fences if span.is_diagram]
+    if not include_inline_svg:
+        return spans
+    if "<" in text:
         cursor = 0
         fence_idx = 0
         while True:
@@ -680,10 +1112,10 @@ def diagram_spans(text: str, *, include_inline_svg: bool = False) -> list[dict]:
             if open_match is None:
                 break
             start = open_match.start()
-            while fence_idx < len(fenced_blocks) and fenced_blocks[fence_idx][1] <= start:
+            while fence_idx < len(fences) and fences[fence_idx].fence_end <= start:
                 fence_idx += 1
-            if fence_idx < len(fenced_blocks) and fenced_blocks[fence_idx][0] <= start < fenced_blocks[fence_idx][1]:
-                cursor = fenced_blocks[fence_idx][1]
+            if fence_idx < len(fences) and fences[fence_idx].fence_start <= start < fences[fence_idx].fence_end:
+                cursor = fences[fence_idx].fence_end
                 continue
             if open_match.group(0).rstrip().endswith("/>"):
                 spans.append({"start": start, "end": open_match.end()})
@@ -745,6 +1177,7 @@ def search_source(source: str, query: str, limit: int = 10, context: int = 100, 
     total = 0
     remaining = 0
     cursor = 0
+    span_idx = 0
     while True:
         match = pattern.search(source, cursor)
         if match is None:
@@ -757,8 +1190,11 @@ def search_source(source: str, query: str, limit: int = 10, context: int = 100, 
         if whole_word and ((start > 0 and _word_character(source[start - 1])) or
                            (end < len(source) and _word_character(source[end]))):
             continue
-        if exclude_diagrams and any(start < span["end"] and end > span["start"] for span in spans):
-            continue
+        if exclude_diagrams:
+            while span_idx < len(spans) and spans[span_idx]["end"] <= start:
+                span_idx += 1
+            if span_idx < len(spans) and start < spans[span_idx]["end"] and end > spans[span_idx]["start"]:
+                continue
         total += 1
         if start < offset:
             continue
@@ -775,37 +1211,8 @@ def search_source(source: str, query: str, limit: int = 10, context: int = 100, 
 
 
 def _svg_spans(text: str) -> list[dict]:
-    spans = []
-    offset = 0
-    line_number = 1
-    opened = None
-    for line in text.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        match = _FENCE.match(body)
-        if match:
-            marker = match.group(1)
-            if opened is None:
-                info = body[match.end():].strip().split(None, 1)
-                language = info[0].casefold() if info else ""
-                opened = {"char": marker[0], "size": len(marker), "body_start": offset + len(line),
-                          "line_start": line_number + 1, "svg": language in ("svg", "svg+xml", "image/svg+xml"),
-                          "probe": []}
-            elif marker[0] == opened["char"] and len(marker) >= opened["size"]:
-                if opened["svg"] or "".join(opened["probe"]).lstrip().lower().startswith("<svg"):
-                    spans.append({"start": opened["body_start"], "end": offset,
-                                  "line_start": opened["line_start"], "line_end": max(opened["line_start"], line_number - 1)})
-                opened = None
-            offset += len(line)
-            line_number += 1
-            continue
-        if opened is not None and len(opened["probe"]) < 4:
-            opened["probe"].append(body[:512])
-        offset += len(line)
-        line_number += 1
-    if opened is not None and (opened["svg"] or "".join(opened["probe"]).lstrip().lower().startswith("<svg")):
-        spans.append({"start": opened["body_start"], "end": len(text), "line_start": opened["line_start"],
-                      "line_end": max(opened["line_start"], line_number - 1)})
-    return spans
+    _, fences = _scan_read_only(text, collect_fences=True)
+    return [span.to_svg_dict() for span in fences if span.is_svg]
 
 
 def _prose_page_end(start: int, limit: int, max_end: int, spans: list[dict]) -> int:
@@ -854,7 +1261,10 @@ def _elide_svg_page(text: str, start: int, end: int, spans: list[dict] | None = 
 def _serialize(path: Path, text: str, assets: dict[str, str], *, portable: bool | None = None) -> bytes:
     use_portable = (path.suffix.lower() == ".smd") if portable is None else portable
     if use_portable:
-        return documents.compressed_bundle(text, assets)
+        try:
+            return documents.compressed_bundle(text, assets)
+        except ValueError as exc:
+            raise AgentDocumentError(str(exc)) from exc
     if assets:
         raise AgentDocumentError("A Markdown file cannot embed portable assets")
     return text.encode("utf-8")

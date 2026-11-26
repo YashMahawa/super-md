@@ -2,14 +2,14 @@ type Evaluator = (variables: Record<string, number>) => number;
 
 const functions: Record<string, (...values: number[]) => number> = {
   sin: Math.sin, cos: Math.cos, tan: Math.tan, asin: Math.asin, acos: Math.acos,
-  atan: Math.atan, sqrt: Math.sqrt, abs: Math.abs, exp: Math.exp, log: Math.log,
+  atan: Math.atan, sqrt: Math.sqrt, abs: Math.abs, exp: Math.exp, ln: Math.log, log: Math.log,
   log10: Math.log10, floor: Math.floor, ceil: Math.ceil, round: Math.round,
   min: Math.min, max: Math.max, pow: Math.pow,
 };
 
 const tokenPattern = /\s*(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|[A-Za-z_][A-Za-z_0-9]*|\*\*|[()+*/^%,-])/y;
 
-export function compileMathExpression(source: string): Evaluator {
+export function compileMathExpression(source: string, allowedVariables?: ReadonlySet<string>): Evaluator {
   if (source.length > 4096) throw new Error("Chart expression is too long (maximum 4096 characters)");
   const normalized = source.replace(/\bMath\.(PI|E|[A-Za-z_][A-Za-z_0-9]*)/g, (_match, name: string) => name === "PI" ? "pi" : name === "E" ? "e" : name);
   const tokens: string[] = [];
@@ -49,6 +49,7 @@ export function compileMathExpression(source: string): Evaluator {
     }
     if (token === "pi") return () => Math.PI;
     if (token === "e") return () => Math.E;
+    if (allowedVariables && !allowedVariables.has(token)) throw new Error(`Unknown chart variable: ${token}`);
     return (variables) => Object.hasOwn(variables, token) ? variables[token] : Number.NaN;
   };
   const parseUnary = (): Evaluator => {

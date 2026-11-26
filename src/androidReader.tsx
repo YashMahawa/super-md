@@ -2,9 +2,9 @@ import { createRoot } from "react-dom/client";
 import {flushSync} from 'react-dom';
 import {createGapSelection,type GapSelection} from './gapSelection';
 import {FrameScrollQueue,zoomFrameStep} from './frameMotion';
-import {agentCharLength,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,applyAgentPatchesDetailed} from './agentOperations';
+import {agentCharLength,agentCodePointOffset,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,agentUtf16Offset,applyAgentPatchesDetailed,countCodePointsRange} from './agentOperations';
 import {suggestMathRepairs,applyMathRepairs} from './mathRepair';
-import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange} from './agentView';
+import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange,type AgentDiagramOptions} from './agentView';
 import {mediaBytes} from './mediaExport';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import "@fontsource-variable/manrope";
@@ -21,12 +21,13 @@ import "./styles.css";
 import "./androidReader.css";
 import "./customTheme.css";
 import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
-import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
+import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, formatEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import { extractSelectedText } from "./copySource";
-import {readingOffset,revealReadingOffset} from "./readingPosition";
+import {readingOffset} from "./readingPosition";
+import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
-import LiveEditor from "./components/LiveEditor";
+import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
 import {ReaderEdits,type SourceChange} from './readerEdits';
@@ -34,7 +35,7 @@ import { preparePdf } from "./preparePdf";
 import type { ExportOptions,ReaderAccessibilityPreference } from "./types";
 import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
-import { dismissReaderOverlay } from "./readerOverlays";
+import { dismissReaderOverlay, hasReaderOverlay } from "./readerOverlays";
 import { prepareFmd } from "./documentMedia";
 import { prepareMarkdownExport } from "./markdownExport";
 import ImageViewer from "./components/ImageViewer";
@@ -67,16 +68,30 @@ function isTextEntryField(target: EventTarget | null): boolean {
 }
 interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing';completed:number;total:number;cancelRequested?:boolean}
 
-interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; rendered?: ReturnType<typeof exportRenderedViews> }
+interface NoteView { editor?: PortableEditorSession; history?:NoteHistory; top?: number; anchor?: SharedSourceAnchor; rendered?: ReturnType<typeof exportRenderedViews> }
+function parseImportedAnchor(raw: unknown): SharedSourceAnchor | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const candidate = raw as Record<string, unknown>;
+  if (typeof candidate.offset !== "number" || !Number.isFinite(candidate.offset) || candidate.offset < 0) return undefined;
+  if (typeof candidate.zoom !== "number" || !Number.isFinite(candidate.zoom) || candidate.zoom <= 0) return undefined;
+  if (candidate.mode !== "reader" && candidate.mode !== "live" && candidate.mode !== "editor" && candidate.mode !== "split") return undefined;
+  return {
+    offset: candidate.offset,
+    ...(typeof candidate.caretOffset === "number" && Number.isFinite(candidate.caretOffset) && candidate.caretOffset >= 0 ? { caretOffset: candidate.caretOffset } : {}),
+    mode: candidate.mode,
+    zoom: candidate.zoom,
+    ...(typeof candidate.readingTop === "number" && Number.isFinite(candidate.readingTop) && candidate.readingTop >= 0 ? { readingTop: candidate.readingTop } : {}),
+    ...(typeof candidate.editorTop === "number" && Number.isFinite(candidate.editorTop) && candidate.editorTop >= 0 ? { editorTop: candidate.editorTop } : {}),
+  };
+}
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
-declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (initialQuery?: string, options?: { caseSensitive?: boolean }) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
+declare global { interface Window { supermdLoad?: (state: ReaderState) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
 interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
-type AgentDiagramOptions={documentPath?:string|null;python?:string};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
   if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
   const diagram=agentDiagrams(content,diagramOptions).find(item=>item.id===request.diagramId);if(!diagram)throw Error('Diagram not found in this revision');
@@ -122,8 +137,10 @@ function Reader() {
   const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
+  const [searchReplace,setSearchReplace] = useState(false);
   const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
   const searchSeedNonce = useRef(0);
+  const searchingRef = useRef(false); searchingRef.current = searching;
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
   const cancelPdfExport=useCallback(async()=>{
@@ -143,8 +160,9 @@ function Reader() {
     return()=>{delete window.supermdExportPhase;};
   },[]);
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
+  const trustedHostsRef = useRef(trustedHosts); trustedHostsRef.current = trustedHosts;
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
-  const trustHost = useCallback((host:string)=>setTrustedHosts(current=>current.includes(host)?current:[...current,host]),[]);
+  const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
   const reference = useRef(state); reference.current = state;
   const changeTypewriter = useCallback((enabled: boolean) => {
     setTypewriterScroll(enabled, { persist: false });
@@ -190,11 +208,15 @@ function Reader() {
     // geometry mid-drag; desktop selection stays on its compositor geometry.
     if(!selectingText.current)document.querySelectorAll<HTMLElement>('.android-reading').forEach(settleDocumentZoom);
   },240);};
-  const modeOffset=useRef<number|null>(null);
+  const modeAnchor=useRef<SharedSourceAnchor|null>(null);
+  const splitPane=useRef<SplitAnchorPane|null>(null);
+  const restoringSplit=useRef(false);
+  const restoringSplitSeq=useRef(0);
+  const splitScrollTops=useRef<{editor:number|null;preview:number|null}>({editor:null,preview:null});
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
-  useEffect(() => {
+  useLayoutEffect(() => {
     const nativeScroll=new FrameScrollQueue((scroller,dx,dy)=>{
       const reading=scroller.matches('.android-reading');
       if(reading){cancelHeadingNavigation(scroller);rememberWindowedScrollSource(scroller,dy);if(Math.abs(dy)>2)requestChrome('hide');}
@@ -223,8 +245,9 @@ function Reader() {
         if(seededFind&&typeof seededFind.query==='string'){
           searchSeedNonce.current+=1;
           setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchReplace(false);
           setSearching(true);
-          requestAnimationFrame(()=>window.dispatchEvent(new Event("supermd-find-focus")));
+          requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:false}})));
         }
       };
       if(contentUnchanged&&(!old||old.id!==rest.id))return;
@@ -246,22 +269,55 @@ function Reader() {
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
         const root=document.querySelector<HTMLElement>(".android-reading");
-        modeOffset.current=old.mode==="editor"?(editorReadingOffset(old.id)??0):root?readingOffset(root):0;
+        const captured=captureSharedAnchor({
+          id:old.id,
+          mode:old.mode,
+          zoom:zoomReference.current,
+          readingRoot:root,
+          preferredSplitPane:splitPane.current,
+        });
+        modeAnchor.current=captured;
+        splitPane.current=null;
+        if(next.mode==="editor"||next.mode==="split"){
+          primeEditorAnchor(next.id,{offset:captured.offset,caretOffset:captured.caretOffset});
+        }else{
+          primeEditorAnchor(next.id,null);
+        }
       }
       if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind();return;}
       if (old && old.id !== next.id) {
         savePosition.current();
-        noteViews.current.set(old.id, {top: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0});
+        const outgoingAnchor=captureSharedAnchor({
+          id:old.id,
+          mode:old.mode,
+          zoom:zoomReference.current,
+          readingRoot:document.querySelector<HTMLElement>(".android-reading"),
+          preferredSplitPane:splitPane.current,
+        });
+        noteViews.current.set(old.id, {top: outgoingAnchor.readingTop ?? 0, anchor: outgoingAnchor, rendered: exportRenderedViews(old.content)});
         if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
+        modeAnchor.current=null;
+        splitPane.current=null;
       }
-      if(old&&old.id===next.id&&old.path!==next.path&&next.restorePosition!==false){savePosition.current();const location=loadReadingLocation(old.path);if(location)saveReadingLocation(next.path,location);}
+      if(old&&old.id===next.id&&old.path!==next.path&&next.restorePosition!==false){
+        savePosition.current();
+        const oldPath=old.path===old.id?null:old.path;
+        const nextPath=next.path===next.id?null:next.path;
+        if(nextPath){
+          const snap=captureSharedAnchor({id:old.id,mode:old.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});
+          const location=loadReadingLocation(oldPath)??{top:old.mode==="editor"?(snap.editorTop??0):(snap.readingTop??0),offset:snap.offset,zoom:zoomReference.current,mode:old.mode};
+          saveReadingLocation(nextPath,location);
+          void invoke("reading_position",{id:next.id,location}).catch(()=>{});
+        }
+      }
       if (next.viewState && old?.id !== next.id) {
         importEditorSession(next.id, next.viewState.editor);
         importRenderedViews(next.content, next.viewState.rendered);
         const history=next.viewState.history;
         if(validHistory(history))histories.current.set(next.id,{undo:structuredClone(history.undo),redo:structuredClone(history.redo),last:0});
         trimHistories(next.id);
-        noteViews.current.set(next.id, {top:next.viewState.top});
+        const importedAnchor=parseImportedAnchor(next.viewState.anchor);
+        noteViews.current.set(next.id, {top:next.viewState.top, ...(importedAnchor?{anchor:importedAnchor}:{})});
       }
       // Native snapshots may have been queued before the latest pinch frame.
       // Within one workspace mode the reader owns its gesture scale; explicit
@@ -284,7 +340,20 @@ function Reader() {
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
-      if(isTextEntryField(document.activeElement)){document.execCommand(direction);return;}
+      const active=document.activeElement;
+      if(active instanceof HTMLTextAreaElement && active.closest('.live-active-block')){
+        const current=reference.current;
+        const previousContent=current?.content;
+        replaying.current=true;
+        const applied=replayActiveLiveBlockHistory(direction);
+        if(applied&&current&&previousContent!==undefined){
+          const history=histories.current.get(current.id);
+          if(history)replayHistory(history,previousContent,direction);
+        }
+        replaying.current=false;
+        if(applied)return;
+      }
+      if(isTextEntryField(active)){document.execCommand(direction);return;}
       const current=reference.current;if(!current)return;
       replaying.current=true;
       const history=histories.current.get(current.id);const next=history?replayHistory(history,current.content,direction):undefined;
@@ -292,6 +361,15 @@ function Reader() {
       else if(current.mode==="editor"||current.mode==="split")editorHistory(current.id,direction);
       else {const cached=cachedEditorHistory(current.id,direction,current.content);if(cached!==undefined)update(cached);}
       replaying.current=false;
+    };
+    window.supermdFormat=action=>{
+      if(hasReaderOverlay())return false;
+      const active=document.activeElement;
+      if(active instanceof HTMLElement&&active.closest('.cm-panels,.cm-search'))return false;
+      const current=reference.current;if(!current||current.mode==="reader")return false;
+      if(current.mode==="live")return formatActiveLiveBlock(action);
+      if(current.mode==="editor"||current.mode==="split")return formatEditorSession(current.id,action);
+      return false;
     };
     window.supermdZoomBy = (factor,focus=cursor.current) => {
       zoomGestureAt.current=Date.now();
@@ -316,7 +394,7 @@ function Reader() {
       window.clearTimeout(zoomTimer.current);const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>void invoke("zoom_changed",{zoom:target,fullscreen}),220);
     };
     window.supermdSetZoom=(value,requestedAt)=>{if(requestedAt!==undefined&&requestedAt<zoomGestureAt.current)return;window.clearTimeout(zoomTimer.current);cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));zoomReference.current=next;applyZoomStyle();settleSelection();};
-    window.supermdHeading=(id,offset)=>{markScrollInput();if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
+    window.supermdHeading=(id,offset)=>{markScrollInput();if(reference.current?.mode==="editor"){window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset??0}));return;}if(reference.current?.mode==="split"&&offset!==undefined){splitPane.current="preview";revealEditorOffset(reference.current.id,offset);}const root=document.querySelector(".android-reading");if(root)navigateToHeading(root,id);};
     window.supermdResetZoom = () => { if (document.querySelector(".image-viewer")) { window.dispatchEvent(new Event("supermd-image-reset")); return; } window.supermdZoomBy?.(100/(zoomTarget.current??zoomReference.current)); };
     window.supermdRepairMath = () => setRepairing(true);
     window.supermdToggleTypewriter = () => changeTypewriter(!(reference.current?.typewriterScroll ?? false));
@@ -331,7 +409,13 @@ function Reader() {
       if(held&&(modifier||canvas||(!selectingText.current&&!window.getSelection()?.toString()))){gapSelection.current?.cancelStationary();if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
       if(canvas){canvas.dispatchEvent(new CustomEvent("supermd-canvas-pan",{detail:{dx,dy},cancelable:true}));return;}
       const scroller=target?.closest<HTMLElement>(".android-reading,.cm-scroller,.image-viewer-canvas,.math-repair-list,.media-dialog") || document.querySelector<HTMLElement>('.android-reading');
-      if(scroller)nativeScroll.scroll(scroller,dx,dy);
+      if(scroller){
+        if(reference.current?.mode==="split"){
+          const pane=detectSplitPaneFromTarget(scroller);
+          if(pane)splitPane.current=pane;
+        }
+        nativeScroll.scroll(scroller,dx,dy);
+      }
     };
     window.supermdFlush = operation => {
       savePosition.current();
@@ -352,7 +436,7 @@ function Reader() {
       let id = current.id;
       if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
       else if (operation.action === "detach_tab") id = operation.target;
-      const view = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader" ? {editor:exportEditorSession(id),history:histories.current.get(id), ...(id === current.id ? {top:document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? 0,rendered:exportRenderedViews(current.content)} : noteViews.current.get(id))} : undefined;
+      const view = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader" ? {editor:exportEditorSession(id),history:histories.current.get(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
       void (async()=>{
         if(current.editProtocol===1)await edits.current!.flush(current.id);
         // Snapshot after the acknowledgement barrier, including edits made while waiting.
@@ -360,16 +444,31 @@ function Reader() {
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
-    window.supermdFind = (initialQuery, options) => {
+    window.supermdFind = (replaceOrQuery, options) => {
       if(document.querySelector('.theme-guide-dialog'))return;
+      const requestedReplace=typeof replaceOrQuery==="boolean"?replaceOrQuery:Boolean(options?.replace);
+      const openReplace=requestedReplace&&reference.current?.mode!=="reader";
       flushSync(()=>{
-        if(typeof initialQuery==='string'){
+        if(typeof replaceOrQuery==='string'){
           searchSeedNonce.current+=1;
-          setSearchSeed({query:initialQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:replaceOrQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchReplace(openReplace);
+        } else if(!searchingRef.current) {
+          setSearchReplace(openReplace);
         }
         setSearching(true);
       });
-      window.dispatchEvent(new Event("supermd-find-focus"));
+      window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:openReplace}}));
+    };
+    window.supermdFindStep = (direction = 1) => {
+      if(document.querySelector('.theme-guide-dialog'))return;
+      const step=direction<0?-1:1;
+      if(!searchingRef.current){
+        flushSync(()=>{setSearchReplace(false);setSearching(true);});
+        requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-step",{detail:step})));
+        return;
+      }
+      window.dispatchEvent(new CustomEvent("supermd-find-step",{detail:step}));
     };
     const flushExportNote = async (current: ReaderState) => {
       if (current.editProtocol === 1) await edits.current!.flush(current.id);
@@ -391,7 +490,7 @@ function Reader() {
       exportOwner.current=owner;setPdfExport({id:owner.id,phase:'preparing',completed:0,total:0});
       try {
         const latest = await flushExportNote(current);
-        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
+        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,trustedImageHosts:trustedHostsRef.current,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
         owner.controller.signal.throwIfAborted();
         owner.phase='typesetting';setPdfExport({id:owner.id,phase:'typesetting',completed:0,total:0});
         await invoke("export_pdf_native", { ...prepared, options: {...options, themeAccent: latest.colors.primary}, id: latest.id,jobId:owner.id }); }
@@ -408,7 +507,7 @@ function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; };
+    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; delete window.supermdFindStep; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -499,60 +598,189 @@ function Reader() {
     let measure=requestAnimationFrame(()=>{measure=requestAnimationFrame(()=>hosts.forEach(host=>{host.dataset.measured="true";}));});
     return()=>cancelAnimationFrame(measure);
   }, [state?.id, state?.mode]);
+  useEffect(()=>{
+    const trackInput=(event:Event)=>{
+      if(reference.current?.mode!=="split")return;
+      const pane=detectSplitPaneFromTarget(event.target);
+      if(pane){
+        const scroller=pane==="editor"?document.querySelector(".cm-scroller"):document.querySelector(".android-reading");
+        clearProgrammaticAnchorScroll(scroller);
+        splitPane.current=pane;
+      }
+    };
+    const trackScroll=(event:Event)=>{
+      if(reference.current?.mode!=="split"||restoringSplit.current)return;
+      const pane=detectSplitPaneFromTarget(event.target);
+      if(!pane||!(event.target instanceof HTMLElement))return;
+      if(isProgrammaticAnchorScroll(event.target))return;
+      const recorded=splitScrollTops.current[pane];
+      if(recorded!==null&&Math.abs(event.target.scrollTop-recorded)<=2)return;
+      splitScrollTops.current[pane]=event.target.scrollTop;
+      splitPane.current=pane;
+    };
+    const inputEvents=["wheel","pointerdown","touchstart","keydown","focusin"] as const;
+    inputEvents.forEach(name=>document.addEventListener(name,trackInput,{capture:true,passive:true}));
+    document.addEventListener("scroll",trackScroll,{capture:true,passive:true});
+    return()=>{
+      inputEvents.forEach(name=>document.removeEventListener(name,trackInput,true));
+      document.removeEventListener("scroll",trackScroll,true);
+    };
+  },[]);
   useLayoutEffect(() => {
     if (!state) return;
     const startingInput=scrollInputVersion();
-    const saved=state.restorePosition!==false?(state.readingLocation??loadReadingLocation(state.path===state.id?null:state.path)):undefined;
-    const top = noteViews.current.get(state.id)?.top ?? (saved?.mode===state.mode&&Math.abs(saved.zoom-zoomReference.current)<1?saved.top:undefined);
-    if(modeOffset.current!==null){
-      const offset=modeOffset.current;modeOffset.current=null;
+    const initialContent=state.content;
+    const shouldStop=()=>
+      reference.current?.id!==state.id||
+      reference.current?.mode!==state.mode||
+      reference.current?.content!==initialContent||
+      scrollInputVersion()!==startingInput||
+      Boolean(window.getSelection()?.toString())||
+      Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
+    const runGuarded=(fn:()=>void)=>{
+      if(state.mode==="split"){
+        const seq=++restoringSplitSeq.current;
+        restoringSplit.current=true;
+        fn();
+        splitScrollTops.current={
+          editor:document.querySelector<HTMLElement>(".cm-scroller")?.scrollTop??null,
+          preview:document.querySelector<HTMLElement>(".android-reading")?.scrollTop??null,
+        };
+        requestAnimationFrame(()=>{if(restoringSplitSeq.current===seq)restoringSplit.current=false;});
+      }else{
+        splitScrollTops.current={editor:null,preview:null};
+        fn();
+      }
+    };
+    if(modeAnchor.current!==null){
+      const anchor=modeAnchor.current;modeAnchor.current=null;
+      if(state.mode==="editor"||state.mode==="split"){
+        primeEditorAnchor(state.id,{offset:anchor.offset,caretOffset:anchor.caretOffset});
+      }else{
+        primeEditorAnchor(state.id,null);
+      }
       // The new view settles over several frames (editor mount, zoom geometry,
       // lazy math and fonts). Re-apply the source anchor until it is stable,
-      // and stop as soon as the person scrolls or types.
+      // and stop as soon as the person scrolls, types or opens search/live edit.
       let stopped=false;const stop=()=>{stopped=true;};
-      const inputs=["wheel","touchstart","keydown","pointerdown"] as const;
+      const inputs=["wheel","touchstart","keydown","pointerdown","supermd-goto-offset"] as const;
       inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      let firstPass=true;
       const apply=()=>{
-        if(stopped||scrollInputVersion()!==startingInput)return;
-        if(state.mode==="editor")window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:offset}));
-        else {const host=document.querySelector<HTMLElement>(".android-reading");if(host)revealReadingOffset(host,offset);}
+        if(stopped||shouldStop())return;
+        const updateSelection=firstPass;
+        firstPass=false;
+        runGuarded(()=>{
+          applySharedAnchor({
+            id:state.id,
+            targetMode:state.mode,
+            targetZoom:zoomReference.current,
+            anchor,
+            readingRoot:document.querySelector<HTMLElement>(".android-reading"),
+            allowExactTop:false,
+            updateSelection,
+          });
+        });
       };
-      requestAnimationFrame(()=>{apply();requestAnimationFrame(apply);});
+      apply();
+      let innerFrame=0;
+      const outerFrame=requestAnimationFrame(()=>{apply();innerFrame=requestAnimationFrame(apply);});
       const timers=[120,320,700].map(delay=>window.setTimeout(apply,delay));
-      window.setTimeout(()=>inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true})),760);
-      return()=>{stopped=true;timers.forEach(window.clearTimeout);};
+      return()=>{stopped=true;cancelAnimationFrame(outerFrame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
     }
-    if(top===undefined&&!saved)return;
+    const cachedView=noteViews.current.get(state.id);
+    const saved=state.restorePosition!==false?(state.readingLocation??loadReadingLocation(state.path===state.id?null:state.path)):undefined;
+    const savedMode:AnchorViewMode=saved?.mode==="editor"||saved?.mode==="live"||saved?.mode==="split"?saved.mode:"reader";
+    const resolvedAnchor:SharedSourceAnchor|undefined=cachedView?.anchor
+      ??(cachedView?.top!==undefined?{offset:0,mode:state.mode,zoom:zoomReference.current,readingTop:cachedView.top}:undefined)
+      ??(saved?{offset:saved.offset,mode:savedMode,zoom:saved.zoom,...(savedMode==="editor"?{editorTop:saved.top}:{readingTop:saved.top})}:undefined);
+    if(!resolvedAnchor){
+      primeEditorAnchor(state.id,null);
+      const host=document.querySelector<HTMLElement>(".android-reading");
+      if(host)host.scrollTop=0;
+      return;
+    }
+    if(state.mode==="editor"||state.mode==="split"){
+      const sameGeometry=resolvedAnchor.mode===state.mode&&Math.abs(resolvedAnchor.zoom-zoomReference.current)<1;
+      if(sameGeometry&&resolvedAnchor.editorTop!==undefined){
+        primeEditorAnchor(state.id,{offset:resolvedAnchor.offset,top:resolvedAnchor.editorTop});
+      }else{
+        primeEditorAnchor(state.id,{offset:resolvedAnchor.offset,caretOffset:resolvedAnchor.caretOffset});
+      }
+    }else{
+      primeEditorAnchor(state.id,null);
+    }
     let stopped=false;
     const stop=()=>{stopped=true;};
-    const inputs=['wheel','touchstart','pointerdown','keydown'] as const;
+    const inputs=['wheel','touchstart','pointerdown','keydown','supermd-goto-offset'] as const;
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+    let firstPass=true;
     const restore=()=>{
-      if(stopped||scrollInputVersion()!==startingInput)return;
-      const host=document.querySelector<HTMLElement>('.android-reading');
-      if(host){if(top!==undefined)host.scrollTop=Math.max(0,top);else if(saved)revealReadingOffset(host,saved.offset);}
-      else if(saved)window.dispatchEvent(new CustomEvent('supermd-goto-offset',{detail:saved.offset}));
+      if(stopped||shouldStop())return;
+      const updateSelection=firstPass;
+      firstPass=false;
+      runGuarded(()=>{
+        applySharedAnchor({
+          id:state.id,
+          targetMode:state.mode,
+          targetZoom:zoomReference.current,
+          anchor:resolvedAnchor,
+          readingRoot:document.querySelector<HTMLElement>(".android-reading"),
+          allowExactTop:true,
+          updateSelection,
+        });
+      });
     };
-    const frame=requestAnimationFrame(()=>{restore();requestAnimationFrame(restore);});
+    restore();
+    let innerFrame=0;
+    const frame=requestAnimationFrame(()=>{restore();innerFrame=requestAnimationFrame(restore);});
     const timers=[120,320,700].map(delay=>window.setTimeout(restore,delay));
-    return()=>{stopped=true;cancelAnimationFrame(frame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    return()=>{stopped=true;cancelAnimationFrame(frame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
   }, [state?.id, state?.mode]);
   useEffect(()=>{
     if(!state||state.restorePosition===false)return;
     const path=state.path===state.id?null:state.path;if(!path)return;
-    const root=document.querySelector<HTMLElement>('.android-reading,.cm-scroller');if(!root)return;
+    const roots=Array.from(document.querySelectorAll<HTMLElement>('.android-reading,.cm-scroller'));
+    if(!roots.length)return;
     let timer=0;
-    const save=()=>{if(root.isConnected){const location={top:root.scrollTop,offset:state.mode==='editor'?(editorReadingOffset(state.id)??0):readingOffset(root),zoom:zoomReference.current,mode:state.mode};saveReadingLocation(path,location);void invoke('reading_position',{id:state.id,location}).catch(()=>{});}};
+    const save=()=>{
+      if(!roots.some(node=>node.isConnected))return;
+      const snap=captureSharedAnchor({
+        id:state.id,
+        mode:state.mode,
+        zoom:zoomReference.current,
+        readingRoot:document.querySelector<HTMLElement>('.android-reading'),
+        preferredSplitPane:splitPane.current,
+      });
+      const location:ReadingLocation={
+        top:Math.max(0,state.mode==='editor'?(snap.editorTop??0):(snap.readingTop??0)),
+        offset:snap.offset,
+        zoom:zoomReference.current,
+        mode:state.mode,
+      };
+      saveReadingLocation(path,location);
+      void invoke('reading_position',{id:state.id,location}).catch(()=>{});
+    };
     const scroll=()=>{window.clearTimeout(timer);timer=window.setTimeout(save,900);};
     savePosition.current=save;
-    root.addEventListener('scroll',scroll,{passive:true});window.addEventListener('pagehide',save);document.addEventListener('visibilitychange',save);
+    roots.forEach(node=>node.addEventListener('scroll',scroll,{passive:true}));
+    window.addEventListener('pagehide',save);document.addEventListener('visibilitychange',save);
     // A native/heading jump can finish before this passive effect subscribes.
     // Persist its settled viewport too, even if no later scroll event arrives.
     scroll();
-    return()=>{window.clearTimeout(timer);save();root.removeEventListener('scroll',scroll);window.removeEventListener('pagehide',save);document.removeEventListener('visibilitychange',save);savePosition.current=()=>{};};
+    return()=>{window.clearTimeout(timer);save();roots.forEach(node=>node.removeEventListener('scroll',scroll));window.removeEventListener('pagehide',save);document.removeEventListener('visibilitychange',save);savePosition.current=()=>{};};
   },[state?.id,state?.mode,state?.path,state?.restorePosition]);
-  useEffect(() => {
-    const find=(event:KeyboardEvent)=>{if(document.documentElement.dataset.host==='qt')return;if((event.ctrlKey || event.metaKey) && event.key.toLowerCase()==="f"){event.preventDefault();event.stopImmediatePropagation();window.supermdFind?.();}};
+  useLayoutEffect(() => {
+    const find=(event:KeyboardEvent)=>{
+      if(document.documentElement.dataset.host==='qt')return;
+      if(!event.ctrlKey&&!event.metaKey&&!event.altKey&&event.key==="F3"){
+        event.preventDefault();event.stopImmediatePropagation();window.supermdFindStep?.(event.shiftKey?-1:1);return;
+      }
+      if((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey){
+        const key=event.key.toLowerCase();
+        if(key==="f"||key==="h"){event.preventDefault();event.stopImmediatePropagation();window.supermdFind?.(key==="h");}
+      }
+    };
     const history=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt')return;
       if(!(event.ctrlKey||event.metaKey)||event.altKey)return;
@@ -563,6 +791,11 @@ function Reader() {
       if(isTextEntryField(event.target))return;
       event.preventDefault();event.stopImmediatePropagation();window.supermdHistory?.(key==="y"||event.shiftKey?"redo":"undo");
     };
+    const historyBoundary=()=>{
+      const current=reference.current;if(!current)return;
+      const entry=histories.current.get(current.id);
+      if(entry)entry.last=0;
+    };
     const typewriterKey=(event:KeyboardEvent)=>{
       if(document.documentElement.dataset.host==='qt'||event.defaultPrevented)return;
       if(!isTypewriterShortcutEvent(event))return;
@@ -571,8 +804,34 @@ function Reader() {
     document.addEventListener("keydown",find,true);
     document.addEventListener("keydown",history,true);
     document.addEventListener("keydown",typewriterKey);
-    return()=>{document.removeEventListener("keydown",find,true);document.removeEventListener("keydown",history,true);document.removeEventListener("keydown",typewriterKey);};
+    window.addEventListener("supermd-history-boundary",historyBoundary);
+    return()=>{document.removeEventListener("keydown",find,true);document.removeEventListener("keydown",history,true);document.removeEventListener("keydown",typewriterKey);window.removeEventListener("supermd-history-boundary",historyBoundary);};
   },[changeTypewriter]);
+  const editorFocusReported=useRef<boolean|null>(null);
+  const syncEditorFocus=useCallback(()=>{
+    const current=reference.current;
+    let focused=false;
+    if(current&&current.mode!=="reader"&&!hasReaderOverlay()){
+      const active=document.activeElement;
+      if(active instanceof HTMLElement&&!active.closest(".cm-panels,.cm-search")){
+        if(current.mode==="live")focused=active.matches(".live-active-block textarea");
+        else if(current.mode==="editor"||current.mode==="split")focused=!!active.closest(".cm-editor .cm-content");
+      }
+    }
+    if(editorFocusReported.current!==focused){
+      editorFocusReported.current=focused;
+      if(document.documentElement.dataset.host!=="qt")void invoke("editor_focus_changed",{focused}).catch(()=>{});
+    }
+  },[]);
+  useEffect(()=>{
+    let timer=0;
+    const onFocusIn=()=>{window.clearTimeout(timer);syncEditorFocus();};
+    const onFocusOut=()=>{window.clearTimeout(timer);timer=window.setTimeout(syncEditorFocus,0);};
+    document.addEventListener("focusin",onFocusIn,true);
+    document.addEventListener("focusout",onFocusOut,true);
+    return()=>{window.clearTimeout(timer);document.removeEventListener("focusin",onFocusIn,true);document.removeEventListener("focusout",onFocusOut,true);};
+  },[syncEditorFocus]);
+  useEffect(()=>{syncEditorFocus();},[state?.id,state?.mode,searching,repairing,themeGuide,syncEditorFocus]);
   useEffect(() => {
     let tap=0;
     const click=(event:MouseEvent)=>{
@@ -833,8 +1092,17 @@ function Reader() {
           visibleText=[visibleText,`${primaryDeck.deckTitle} — ${primaryDeck.notesText}`].filter(Boolean).join('\n').slice(0,2000);
         }
 
-        const sourceOffset=agentCharLength(note.content.slice(0,offset)),sourceLimit=Math.max(1,Math.min(requestedContextLimit,agentCharLength(note.content.slice(offset,range?.end??offset+requestedContextLimit))));
-        const allDiagrams=agentDiagrams(note.content,diagramOptions);
+        const visibleRange=range??{start:offset,end:Math.min(note.content.length,offset+requestedContextLimit)};
+        const sourceOffset=agentCodePointOffset(note.content,offset),sourceLimit=Math.max(1,Math.min(requestedContextLimit,countCodePointsRange(note.content,offset,visibleRange.end)));
+        let diagramScanRange:{start:number;end:number}|null=activeDecks.some(deck=>deck.expanded&&deck.start===undefined)?null:{...visibleRange};
+        if(diagramScanRange){
+          for(const deck of activeDecks){
+            if(deck.expanded&&deck.start!==undefined&&deck.end!==undefined){
+              diagramScanRange={start:Math.min(diagramScanRange.start,deck.start),end:Math.max(diagramScanRange.end,deck.end)};
+            }
+          }
+        }
+        const allDiagrams=agentDiagrams(note.content,diagramScanRange?{...diagramOptions,range:diagramScanRange}:diagramOptions);
         const filteredDiagrams=allDiagrams.filter(item=>{
           if(activeDecks.some(deck=>deck.expanded&&(deck.start!==undefined?item.start===deck.start:item.deckTitle===deck.deckTitle)))return true;
           return range?item.end>range.start&&item.start<range.end:item.start>=offset&&item.start<offset+requestedContextLimit;
@@ -850,16 +1118,18 @@ function Reader() {
         const pythonCells:Array<Record<string,unknown>>=[];
         let cellOrdinal=0;
         const walkPython=(node:any)=>{
+          if(pythonCells.length>=8)return;
+          if(node.position?.start?.offset!==undefined&&node.position?.end?.offset!==undefined&&(node.position.end.offset<=visibleRange.start||node.position.start.offset>=visibleRange.end))return;
           if(node.type==='code'&&['python','py'].includes(String(node.lang||'').toLowerCase())&&node.position?.start?.offset!==undefined&&node.position?.end?.offset!==undefined){
-            const ordinal=cellOrdinal++;
             const cellStart=node.position.start.offset,cellEnd=node.position.end.offset;
+            const pyIndex=analysis.pythonCells.findIndex(cell=>cell.offset===cellStart&&cell.source===String(node.value||''));
+            const ordinal=pyIndex>=0?pyIndex:cellOrdinal++;
             const inRange=range?cellEnd>range.start&&cellStart<range.end:cellStart>=offset&&cellStart<offset+requestedContextLimit;
             if(inRange&&pythonCells.length<8){
-              const pyCell=analysis.pythonCells.find(cell=>cell.offset===cellStart&&cell.source===String(node.value||''));
-              const duplicateOrdinal=pyCell?.ordinal??0;
+              const duplicateOrdinal=pyIndex>=0?analysis.pythonCells[pyIndex].ordinal:0;
               const cached=inspectCachedPythonOutput(node.value,{document:note.path??null,cell:String(duplicateOrdinal),interpreter:note.python||'embedded'});
               if(cached){
-                const codeStart=agentCharLength(note.content.slice(0,cellStart)),codeEnd=agentCharLength(note.content.slice(0,cellEnd));
+                const codeStart=agentCodePointOffset(note.content,cellStart),codeEnd=agentCodePointOffset(note.content,cellEnd);
                 const figures=cached.images.filter(safePythonFigure).slice(0,16).map((_,idx)=>`diagram:python:${codeStart}:${idx}`);
                 const stdoutLimit=500,stderrLimit=500;
                 pythonCells.push({
@@ -880,7 +1150,10 @@ function Reader() {
         };
         walkPython(analysis.tree);
 
-        const visiblePage=agentRead(range?note.content.slice(0,range.end):note.content,sourceOffset,sourceLimit);
+        const splitRangeEnd=!!range&&range.end>0&&range.end<note.content.length&&note.content.charCodeAt(range.end-1)>=0xd800&&note.content.charCodeAt(range.end-1)<=0xdbff&&note.content.charCodeAt(range.end)>=0xdc00&&note.content.charCodeAt(range.end)<=0xdfff;
+        const visiblePage=splitRangeEnd
+          ?agentRead(note.content.slice(0,range!.end),sourceOffset,sourceLimit)
+          :agentRead(note.content,sourceOffset,sourceLimit,undefined,'prose',range?Math.max(sourceOffset,agentCodePointOffset(note.content,range.end)):undefined);
         // The viewport bounds the page text, not the document's pagination.
         const visibleSource={...visiblePage,total_chars:base.sourceLength,next_offset:visiblePage.end<base.sourceLength?visiblePage.end:null,truncated:visiblePage.end<base.sourceLength};
         const portalViewer=primaryDeck?.expanded?document.querySelector<HTMLElement>('.step-viewer'):null;
@@ -916,9 +1189,12 @@ function Reader() {
           const vs=contextPayload.visibleSource as Record<string,unknown>;
           const currentText=String(vs.text??'');
           if(currentText.length<=200)break;
-          const trimmed=Array.from(currentText).slice(0,Math.max(200,Math.floor(Array.from(currentText).length*0.7))).join('');
-          const nextEnd=(vs.start as number)+agentCharLength(trimmed);
-          contextPayload.visibleSource={...vs,text:trimmed,returned_chars:agentCharLength(trimmed),end:nextEnd,next_offset:nextEnd<base.sourceLength?nextEnd:null,truncated:nextEnd<base.sourceLength};
+          const currentChars=agentCharLength(currentText);
+          if(currentChars<=200)break;
+          const targetChars=Math.max(200,Math.floor(currentChars*0.7));
+          const trimmed=currentText.slice(0,agentUtf16Offset(currentText,targetChars));
+          const nextEnd=(vs.start as number)+targetChars;
+          contextPayload.visibleSource={...vs,text:trimmed,returned_chars:targetChars,end:nextEnd,next_offset:nextEnd<base.sourceLength?nextEnd:null,truncated:nextEnd<base.sourceLength};
         }
         return contextPayload;
       }
@@ -950,13 +1226,17 @@ function Reader() {
         return response;
       }
       if(request.action==='export_document'){
-        const format=request.format;if(!['pdf','smd','md'].includes(String(format)))throw Error('Export format must be pdf, smd or md');
+        const format=String(request.format);if(!['pdf','smd','md','mdzip'].includes(format))throw Error('Export format must be pdf, smd, md or mdzip');
         const suppliedOptions=request.options&&typeof request.options==='object'&&!Array.isArray(request.options)?request.options as Record<string,unknown>:{};
+        const rawArchive=Object.prototype.hasOwnProperty.call(suppliedOptions,'archive')?suppliedOptions.archive:(request as Record<string,unknown>).archive;
+        if(rawArchive!==undefined&&typeof rawArchive!=='boolean')throw Error('Export archive option must be a boolean');
+        if(rawArchive===true&&format!=='md'&&format!=='mdzip')throw Error('Archive mode is only supported for Markdown exports');
+        const archive=format==='mdzip'||rawArchive===true;
         const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
-        const exportContent=section?.text??note.content,{section:_section,...exportOptions}=suppliedOptions;
-        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded'):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path);
+        const exportContent=section?.text??note.content,{section:_section,archive:_archive,...exportOptions}=suppliedOptions;
+        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
-        const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format,filename:request.filename,options:exportOptions});
+        const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format:archive?'mdzip':format,...(archive?{archive:true}:{}),filename:request.filename,options:exportOptions});
         return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
       }
       throw Error('Unsupported live reader action');
@@ -1010,13 +1290,14 @@ function Reader() {
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchSeed(null);}} onChange={update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed}/>}
+    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed} initialReplace={searchReplace}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
-    <MediaTools key={state.id} documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const content = reference.current!.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
+    <MediaTools documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const current = reference.current; if (!current || current.id !== state.id) return; const content = current.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} onTypewriterChange={changeTypewriter} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
     {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
     {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
-createRoot(document.getElementById("root")!).render(<Reader />);
+const mountReaderRoot = () => createRoot(document.getElementById("root")!).render(<Reader />);
+if ((globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT) mountReaderRoot(); else flushSync(mountReaderRoot);
