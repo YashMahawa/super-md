@@ -50,6 +50,10 @@ from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import ExactWriteAborted, LatestWriteExecutor
+if __package__:
+    from . import studio_session
+else:
+    import studio_session
 import updates
 import app_integration
 import python_runtime
@@ -559,11 +563,11 @@ def _snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -> dict:
 
 
 def _asset_identity(value):
-    return id(value)
+    return studio_session.asset_identity(value)
 
 
 def _noop_done(*_):
-    pass
+    return studio_session.noop_done(*_)
 
 
 class _StoppedFileWatcher:
@@ -611,225 +615,31 @@ class Session(QObject):
     locationChanged = Signal(str,str)
     def __init__(self,isolated=False,data=None):
         super().__init__()
-        self.data = Path(data) if data is not None else (Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio")
-        self.data=self.data.resolve()
-        self.data.mkdir(parents=True,exist_ok=True)
-        self.font_store = FontStore(self.data)
-        self.python_outputs = PythonOutputs(self.data/"derived-python")
-        self.reader_assets = ReaderAssetStore(self.reader_asset_is_current, self.reader_asset_payload)
-        self.closed_note_store = ClosedNoteStore(self.data/"closed-notes")
-        try:self.closed_tabs = self.closed_note_store.load_index_strict();self.closed_note_error=""
-        except (OSError,ValueError,TypeError) as error:self.closed_tabs=[];self.closed_note_error=str(error)
-        self.writes = LatestWriteExecutor(max_workers=1,thread_name_prefix="supermd-save")
-        self.settings = copy.deepcopy(DEFAULTS)
-        self.recent = []
-        self.pinned = []
-        self.workspace = {}
-        self.window_workspaces = {}
-        self.startup_paths = []
-        self.startup_active = ""
-        self.startup_entries = []
-        self.startup_active_id = ""
-        self.startup_folder = ""
-        self.startup_expanded = []
-        self.startup_windows = []
-        self._pending_startup_windows = []
-        self.quitting = False
-        self.locations = {}
-        self.drafts = {}
-        self.windows = {}
-        self._agent_stage_queue = deque()
-        self._agent_staging_active = False
-        self.custom_theme = None
-        self.theme_epoch = 0
-        self.theme_revision = 0
-        self.theme_source = ""
-        self.active_theme_kind = "builtin"
-        self.active_theme_id = ""
-        self.saved_themes = []
-        self.theme_restored = False
-        self._load_theme_library()
-        self.initial_recovery = []
-        try:
-            stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
-            self.settings.update({k:v for k,v in stored["settings"].items() if k in DEFAULTS})
-            if not stored["settings"].get("widthMigrated") and stored["settings"].get("widthPercent") == 80:
-                self.settings["widthPercent"] = 90  # 80% was the old default, not a choice.
-            self.settings["pdf"] = {**DEFAULT_PDF, **self.settings.get("pdf", {})}
-            self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
-            self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
-        except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
-        # Local MCP access and cloud relay reconnection are explicit, persisted
-        # opt-ins; each desktop launch mints a fresh temporary loopback token.
-        self.settings["agentAccessEnabled"] = self.settings.get("agentAccessEnabled") is True
-        self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
-        shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
-        self.settings["shortcuts"] = shortcuts or default_shortcuts()
-        try:
-            workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
-            self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
-            self.startup_active=workspace.get("active","") if isinstance(workspace.get("active"),str) else ""
-            self.startup_entries=[entry for entry in workspace.get("tabs",[]) if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)][:100]
-            self.startup_active_id=workspace.get("activeId","") if isinstance(workspace.get("activeId"),str) else ""
-            self.startup_folder=workspace.get("folder","") if isinstance(workspace.get("folder"),str) else ""
-            self.startup_expanded=[p for p in workspace.get("expanded",[]) if isinstance(p,str)][:500] if isinstance(workspace.get("expanded"),list) else []
-            raw_windows=workspace.get("windows",[])
-            if isinstance(raw_windows,list):
-                for item in raw_windows[:20]:
-                    if not isinstance(item,dict):
-                        continue
-                    w_tabs=[entry for entry in item.get("tabs",[]) if isinstance(entry,dict) and isinstance(entry.get("id"),str) and isinstance(entry.get("path"),str)][:100]
-                    w_paths=list(dict.fromkeys(entry["path"] for entry in w_tabs if entry["path"]))[:100]
-                    w_folder=item.get("folder","") if isinstance(item.get("folder"),str) else ""
-                    w_expanded=[p for p in item.get("expanded",[]) if isinstance(p,str)][:500] if isinstance(item.get("expanded"),list) else []
-                    self.startup_windows.append({
-                        "tabs": w_tabs,
-                        "paths": w_paths,
-                        "active": item.get("active","") if isinstance(item.get("active"),str) else "",
-                        "activeId": item.get("activeId","") if isinstance(item.get("activeId"),str) else "",
-                        "folder": w_folder,
-                        "expanded": w_expanded,
-                    })
-            self._pending_startup_windows=list(self.startup_windows)
-        except (OSError,ValueError,TypeError,AttributeError): pass
-        try:
-            locations=json.loads((self.data/"reading-positions.json").read_text(encoding="utf-8"))
-            if isinstance(locations,dict):self.locations=dict(list(locations.items())[-200:])
-        except (OSError,ValueError,TypeError):pass
-        try:
-            recovered = json.loads((self.data/"recovery.json").read_text(encoding="utf-8"))
-            for tab in recovered:
-                if not isinstance(tab,dict) or any(not isinstance(tab.get(key),str) for key in ("name","content","path","saved")):
-                    raise ValueError("Invalid draft recovery")
-                bundle(tab["content"],tab.get("assets",{}))
-                self.initial_recovery.append(tab)
-        except (OSError,ValueError,TypeError): pass
-        # A crash can land after an active-tab recovery write but before the
-        # small closed-tab index is refreshed. Prefer the active recovery entry.
-        active_ids={entry.get("id") for entry in self.startup_entries if isinstance(entry,dict)}
-        for win_spec in self.startup_windows:
-            active_ids.update(entry.get("id") for entry in win_spec.get("tabs",[]) if isinstance(entry,dict))
-        active_ids.update(tab.get("id") for tab in self.initial_recovery)
-        kept=[ref for ref in self.closed_tabs if ref.get("id") not in active_ids]
-        if kept != self.closed_tabs:
-            self.closed_tabs=kept
-            try:self.closed_note_store.save_index(kept)
-            except OSError:pass
-        self.workspace_links = WorkspaceLinkCache()
+        studio_session.init_session(self, isolated, data)
 
     def is_quitting(self) -> bool:
-        background = getattr(self, "background", None)
-        return bool(self.quitting or (background is not None and getattr(background, "quitting", False)))
+        return studio_session.session_is_quitting(self)
 
     def has_pending_startup_windows(self) -> bool:
-        return bool(self.settings.get("startup", "restore") == "restore" and self._pending_startup_windows)
+        return studio_session.has_pending_startup_windows(self)
 
     def _load_theme_library(self):
-        library_path = self.data / "theme-library.json"
-        themes_dir = self.data / "themes"
-        if library_path.is_file():
-            try:
-                raw = json.loads(library_path.read_text(encoding="utf-8"))
-                saved = []
-                for item in raw.get("saved", []):
-                    if not isinstance(item, dict):
-                        continue
-                    entry_id = item.get("id", "")
-                    name = item.get("name", "")
-                    source = item.get("source", "")
-                    if (
-                        isinstance(entry_id, str)
-                        and re.fullmatch(r"[0-9a-f]{8,64}", entry_id)
-                        and isinstance(name, str)
-                        and name.strip()
-                        and isinstance(source, str)
-                        and (themes_dir / f"{entry_id}.json").is_file()
-                    ):
-                        saved.append({"id": entry_id, "name": name, "source": source})
-                self.saved_themes = saved
-                active = raw.get("active", {}) if isinstance(raw.get("active"), dict) else {}
-                kind = active.get("kind", "builtin")
-                active_id = active.get("id", "") if isinstance(active.get("id"), str) else ""
-                if kind == "saved":
-                    matched = next((item for item in saved if item["id"] == active_id), None)
-                    if matched is not None:
-                        self.active_theme_kind = "saved"
-                        self.active_theme_id = matched["id"]
-                        self.theme_source = matched["source"]
-                elif kind == "preset" and active_id:
-                    self.active_theme_kind = "preset"
-                    self.active_theme_id = active_id
-                    self.theme_source = ""
-            except (OSError, ValueError, TypeError, AttributeError):
-                pass
-            return
-        legacy_source = ""
-        try:
-            legacy_source = json.loads((self.data / "theme-source.json").read_text(encoding="utf-8")).get("path", "")
-            if not isinstance(legacy_source, str):
-                legacy_source = ""
-        except (OSError, ValueError, AttributeError):
-            legacy_source = ""
-        legacy_theme = self.data / "theme.json"
-        if legacy_theme.is_file():
-            try:
-                parsed = json.loads(legacy_theme.read_text(encoding="utf-8"))
-                name = parsed.get("name") if isinstance(parsed, dict) and isinstance(parsed.get("name"), str) and parsed.get("name").strip() else "Imported theme"
-                entry_id = uuid.uuid4().hex
-                themes_dir.mkdir(parents=True, exist_ok=True)
-                atomic_json(themes_dir / f"{entry_id}.json", parsed)
-                self.saved_themes = [{"id": entry_id, "name": name, "source": legacy_source}]
-                self.active_theme_kind = "saved"
-                self.active_theme_id = entry_id
-                self.theme_source = legacy_source
-                atomic_json(library_path, {"active": {"kind": "saved", "id": entry_id}, "saved": self.saved_themes})
-            except (OSError, ValueError, TypeError):
-                self.theme_source = legacy_source
-        else:
-            self.theme_source = legacy_source
+        return studio_session.load_theme_library(self)
 
     def reader_asset_is_current(self, grant):
-        return self.reader_asset_source_is_current(grant.owner_id, grant.tab_id, grant.source,
-                                                   grant.embedded_identity, grant.path)
+        return studio_session.reader_asset_is_current(self, grant)
 
     def reader_asset_source_is_current(self, owner_id, tab_id, source, embedded_identity, path):
-        studio = self.windows.get(owner_id)
-        if not studio or studio.retired:
-            return False
-        tab = next((item for item in studio.tabs if item["id"] == tab_id), None)
-        if tab is None:
-            return False
-        if source in tab.get("assets", {}):
-            # Asset strings are immutable; identity keeps request validation
-            # cheap for large embedded images and replacement revokes access.
-            return id(tab["assets"][source]) == embedded_identity
-        try:
-            return str(note_file_path(tab, source)) == path
-        except (OSError, ValueError):
-            return False
+        return studio_session.reader_asset_source_is_current(self, owner_id, tab_id, source, embedded_identity, path)
 
     def reader_asset_payload(self, grant):
-        studio = self.windows.get(grant.owner_id)
-        if not studio or studio.retired:
-            return None
-        tab = next((item for item in studio.tabs if item["id"] == grant.tab_id), None)
-        if tab is None:
-            return None
-        payload = tab.get("assets", {}).get(grant.source)
-        return payload if isinstance(payload, str) and id(payload) == grant.embedded_identity else None
+        return studio_session.reader_asset_payload(self, grant)
 
     def _enqueue_agent_stage(self, runner) -> None:
-        self._agent_stage_queue.append(runner)
-        if not self._agent_staging_active:
-            self._advance_agent_stage_queue()
+        studio_session.enqueue_agent_stage(self, runner)
 
     def _advance_agent_stage_queue(self) -> None:
-        while self._agent_stage_queue:
-            runner = self._agent_stage_queue.popleft()
-            self._agent_staging_active = True
-            if runner():
-                return
-        self._agent_staging_active = False
+        studio_session.advance_agent_stage_queue(self)
 
 class Studio(QObject):
     changed = Signal()
@@ -3113,222 +2923,45 @@ class Studio(QObject):
         return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
 
     def _submit(self, action, done, busy=True, executor=None):
-        if self.retired:return
-        target=executor or self.pool
-        if getattr(target,"_shutdown",False):return
-        if busy:
-            self.busy += 1
-            self._emit(False)
-        future = target.submit(action)
-        def completed(f):
-            if self.retired or f.cancelled():return
-            try:
-                value,error=f.result(),None
-            except Exception as reason:
-                value,error=None,str(reason)
-            if self.retired or (done is _noop_done and not busy and error is None):return
-            try:self.completed.emit((done,value,error,busy))
-            except RuntimeError:pass  # The QObject may have been retired meanwhile.
-        future.add_done_callback(completed)
+        return studio_session.submit(self, action, done, busy, executor)
 
     @Slot(object)
     def _complete(self, result):
-        if self.retired:return
-        done, value, error, busy = result
-        if busy:
-            self.busy -= 1
-        if error:
-            self.message = error
-            self.pending_close = ""
-        done(value, error)
-        self._emit(False)
+        studio_session.complete(self, result)
 
     def _submit_write(self, action, done, *, on_retired=None):
-        token = uuid.uuid4().hex
-        invoked = False
-
-        def notify_retired():
-            nonlocal invoked
-            with self._write_callback_lock:
-                if invoked:
-                    return
-                invoked = True
-                self._pending_write_retirements.pop(token, None)
-            if on_retired is not None:
-                on_retired()
-
-        if self.retired or getattr(self.writes, "_shutdown", False):
-            notify_retired()
-            return False
-
-        if on_retired is not None:
-            with self._write_callback_lock:
-                self._pending_write_retirements[token] = notify_retired
-
-        try:
-            future = self.writes.submit(action)
-        except RuntimeError:
-            notify_retired()
-            return False
-
-        def completed(f):
-            if f.cancelled():
-                notify_retired()
-                return
-            try:
-                value, error = f.result(), None
-            except Exception as reason:
-                value, error = None, str(reason)
-            if self.retired:
-                notify_retired()
-                return
-            try:
-                self.backgroundWriteCompleted.emit((token, done, notify_retired, value, error))
-            except RuntimeError:
-                notify_retired()
-
-        future.add_done_callback(completed)
-        return True
+        return studio_session.submit_write(self, action, done, on_retired=on_retired)
 
     @Slot(object)
     def _complete_background_write(self, payload):
-        token, done, notify_retired, value, error = payload
-        if self.retired:
-            notify_retired()
-            return
-        with self._write_callback_lock:
-            self._pending_write_retirements.pop(token, None)
-        done(value, error)
+        studio_session.complete_background_write(self, payload)
 
     def _submit_exact_recovery_write(self, action, done, *, on_retired=None, on_enqueued=None):
-        token = uuid.uuid4().hex
-        invoked = False
-
-        def notify_retired():
-            nonlocal invoked
-            with self._write_callback_lock:
-                if invoked:
-                    return
-                invoked = True
-                self._pending_write_retirements.pop(token, None)
-            if on_retired is not None:
-                on_retired()
-
-        if self.retired or getattr(self.writes, "_shutdown", False):
-            notify_retired()
-            return False
-
-        if on_retired is not None:
-            with self._write_callback_lock:
-                self._pending_write_retirements[token] = notify_retired
-
-        def exact_completed(status, rev, error):
-            if self.retired:
-                notify_retired()
-                return
-            try:
-                self.backgroundWriteCompleted.emit((token, done, notify_retired, (status, rev, error), None))
-            except RuntimeError:
-                notify_retired()
-
-        try:
-            self.writes.submit_latest_exact(
-                "recovery", action, None, exact_completed, on_enqueued=on_enqueued
-            )
-        except RuntimeError:
-            notify_retired()
-            return False
-        return True
+        return studio_session.submit_exact_recovery_write(self, action, done, on_retired=on_retired, on_enqueued=on_enqueued)
 
     def _preferences(self,notify=True):
-        if self.retired or getattr(self.writes, "_shutdown", False): return
-        data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
-        self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
-        if notify:self.session.changed.emit()
+        studio_session.preferences(self, notify)
 
     def _save_positions(self):
-        data=json.dumps(self.session.locations).encode()
-        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
+        studio_session.save_positions(self)
 
     def _submit_startup_snapshot(self):
-        # Clean tabs need only paths, never another copy of their image bytes.
-        window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed")]
-        self.session.workspace[self.window_id] = window_tabs
-        self.session.window_workspaces[self.window_id] = {
-            "folder": self.folder,
-            "expanded": sorted(self.expanded) if self.folder else [],
-            "active": self._current()["path"],
-            "activeId": self.active,
-        }
-        entries = [entry for tabs in self.session.workspace.values() for entry in tabs]
-        windows_payload = []
-        for wid, w_tabs in self.session.workspace.items():
-            meta = self.session.window_workspaces.get(wid, {})
-            w_folder = meta.get("folder", "")
-            windows_payload.append({
-                "windowId": wid,
-                "tabs": w_tabs,
-                "active": meta.get("active", ""),
-                "activeId": meta.get("activeId", ""),
-                "folder": w_folder,
-                "expanded": meta.get("expanded", []) if w_folder else [],
-            })
-        primary_folder = windows_payload[0]["folder"] if windows_payload else self.folder
-        primary_expanded = windows_payload[0]["expanded"] if windows_payload else (sorted(self.expanded) if self.folder else [])
-        workspace = {
-            "paths": list(dict.fromkeys(t["path"] for t in entries if t["path"])),
-            "tabs": entries,
-            "active": self._current()["path"],
-            "activeId": self.active,
-            "folder": primary_folder,
-            "expanded": primary_expanded,
-            "windows": windows_payload,
-        }
-        self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
+        studio_session.submit_startup_snapshot(self)
 
     def _window_recovery_drafts(self, tabs=None):
-        source_tabs = self.tabs if tabs is None else tabs
-        return [
-            _snapshot_tab_state(t, include_view_state=False)
-            for t in source_tabs
-            if (self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed"))
-            and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged") or t.get("agent_unreviewed"))
-        ]
+        return studio_session.window_recovery_drafts(self, tabs)
 
     def _combined_recovery_drafts(self, window_drafts):
-        combined = []
-        replaced = False
-        for wid, tabs in self.session.drafts.items():
-            if wid == self.window_id:
-                combined.extend(window_drafts)
-                replaced = True
-            else:
-                combined.extend(tabs)
-        if not replaced:
-            combined.extend(window_drafts)
-        return combined
+        return studio_session.combined_recovery_drafts(self, window_drafts)
 
     def _recover(self):
-        self._submit_startup_snapshot()
-        # Snapshot only unsaved or agent-staged tabs. Asset bytes stay in recovery, never in displayed source.
-        window_drafts = self._window_recovery_drafts()
-        self.session.drafts[self.window_id] = window_drafts
-        drafts = self._combined_recovery_drafts(window_drafts)
-        self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
+        studio_session.recover(self)
 
     def _notify_recovery_write(self,category,error):
-        try:self.completed.emit((self._recovery_write_completed,(category,error),None,False))
-        except RuntimeError:pass
+        studio_session.notify_recovery_write(self, category, error)
 
     def _recovery_write_completed(self,result,_error):
-        category,error=result
-        notice={
-            "startup":"Couldn't save the current workspace state. Keep Super MD open and retry.",
-            "recovery":"Couldn't save draft recovery data. Keep Super MD open and retry.",
-        }[category]
-        if error:self.message=notice
-        elif self.message==notice:self.message=""
-        self._emit(False)
+        studio_session.recovery_write_completed(self, result, _error)
 
     @Property(bool, notify=changed)
     def dropBlocked(self):
