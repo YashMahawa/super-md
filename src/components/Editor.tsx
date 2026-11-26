@@ -245,6 +245,12 @@ export function editorCaretOffset(id:string):number|undefined {
   return Math.max(firstContentOffsetOnLine(view.state,head),head);
 }
 export { primeEditorAnchor, revealEditorOffset, type PendingEditorAnchor };
+function flushEditorScrollMeasure(editor:EditorView):void {
+  if(editor.scrollDOM.clientHeight>0&&typeof Range!=="undefined"&&typeof Range.prototype.getClientRects==="function"&&!(editor as unknown as {updateState?:number}).updateState){
+    (editor as EditorView&{measure?:(flush?:boolean)=>void}).measure?.(false);
+  }
+  markProgrammaticAnchorScroll(editor.scrollDOM);
+}
 function applyAnchorToEditorView(editor:EditorView,anchor:PendingEditorAnchor,focus=false):void {
   markProgrammaticAnchorScroll(editor.scrollDOM);
   editor.requestMeasure({
@@ -253,6 +259,7 @@ function applyAnchorToEditorView(editor:EditorView,anchor:PendingEditorAnchor,fo
   });
   if(anchor.top!==undefined){
     editor.scrollDOM.scrollTop=Math.max(0,anchor.top);
+    markProgrammaticAnchorScroll(editor.scrollDOM);
     if(focus)editor.focus();
     return;
   }
@@ -271,6 +278,7 @@ function applyAnchorToEditorView(editor:EditorView,anchor:PendingEditorAnchor,fo
       const coords=rect.height>0?editor.coordsAtPos(caret):null;
       if(coords&&coords.bottom>rect.bottom-24){
         editor.dispatch({effects:EditorView.scrollIntoView(caret,{y:"nearest",yMargin:24})});
+        flushEditorScrollMeasure(editor);
       }
     }
   }else{
@@ -279,6 +287,7 @@ function applyAnchorToEditorView(editor:EditorView,anchor:PendingEditorAnchor,fo
       effects:EditorView.scrollIntoView(target,{y:"start",yMargin:16}),
       annotations:Transaction.addToHistory.of(false),
     });
+    flushEditorScrollMeasure(editor);
     if(canMoveSelection&&caret===undefined){
       const head=editor.state.selection.main.head;
       const rect=editor.scrollDOM.getBoundingClientRect();
@@ -617,8 +626,8 @@ export default function Editor({ sessionId = "default", documentPath = null, val
     describeSelection(mountedView.state);
     const pending = consumePendingEditorAnchor(sessionId);
     if (pending) applyAnchorToEditorView(mountedView, pending);
-    else if (incoming) mountedView.scrollDOM.scrollTop = Math.max(0, incoming.top);
-    else if (cached) mountedView.scrollDOM.scrollTop = cached.top;
+    else if (incoming) { markProgrammaticAnchorScroll(mountedView.scrollDOM); mountedView.scrollDOM.scrollTop = Math.max(0, incoming.top); }
+    else if (cached) { markProgrammaticAnchorScroll(mountedView.scrollDOM); mountedView.scrollDOM.scrollTop = cached.top; }
     if (!pending && !cached && !incoming && initialTypewriter) mountedView.dispatch({ effects: centerCursorEffect(mountedView.state) });
     if (mountedView.state.doc.length > PROOFREADING_MAX_CHARS) setProofRange(sourceProofreadingRange(mountedView));
     let scrollTimer: ReturnType<typeof setTimeout> | undefined;
