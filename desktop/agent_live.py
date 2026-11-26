@@ -1228,7 +1228,7 @@ def _qt_bridge_class():
         @staticmethod
         def _is_async_native_action(payload: dict[str, Any]) -> bool:
             action = payload.get("action")
-            return action in ("save_document", "replace_tab_asset") or (
+            return action in ("patch_tab", "save_document", "replace_tab_asset") or (
                 action == "asset_action" and payload.get("assetAction") == "attach"
             )
 

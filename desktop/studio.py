@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 import weakref
 import zipfile
+from collections import deque
 from pathlib import Path
 try:
     import shiboken6
@@ -636,6 +637,8 @@ class Session(QObject):
         self.locations = {}
         self.drafts = {}
         self.windows = {}
+        self._agent_stage_queue = deque()
+        self._agent_staging_active = False
         self.custom_theme = None
         self.theme_epoch = 0
         self.theme_revision = 0
@@ -813,6 +816,19 @@ class Session(QObject):
         payload = tab.get("assets", {}).get(grant.source)
         return payload if isinstance(payload, str) and id(payload) == grant.embedded_identity else None
 
+    def _enqueue_agent_stage(self, runner) -> None:
+        self._agent_stage_queue.append(runner)
+        if not self._agent_staging_active:
+            self._advance_agent_stage_queue()
+
+    def _advance_agent_stage_queue(self) -> None:
+        while self._agent_stage_queue:
+            runner = self._agent_stage_queue.popleft()
+            self._agent_staging_active = True
+            if runner():
+                return
+        self._agent_staging_active = False
+
 class Studio(QObject):
     changed = Signal()
     shortcutsChanged = Signal()
@@ -906,6 +922,8 @@ class Studio(QObject):
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
         self._closing_tabs: set[str] = set()
+        self._staging_tabs: set[str] = set()
+        self._max_agent_stage_attempts = 3
         self.note_watcher = QFileSystemWatcher(self)
         self.note_watcher.fileChanged.connect(self._external_note_changed)
         self.note_watcher.directoryChanged.connect(self._external_note_changed)
@@ -1486,7 +1504,7 @@ class Studio(QObject):
         self._watch_notes(force=True)
         for tab in self.tabs:
             path=tab["path"]
-            if not path or not ({path,str(Path(path).parent)} & changed) or tab["id"] in self.saving:continue
+            if not path or not ({path,str(Path(path).parent)} & changed) or tab["id"] in self.saving or tab["id"] in self._staging_tabs:continue
             was_dirty=self._is_dirty(tab)
             try:
                 stat_result=Path(path).stat();stamp=(stat_result.st_mtime_ns,stat_result.st_size)
@@ -2550,7 +2568,7 @@ class Studio(QObject):
         self._submit(prepare,done,False)
 
     def _can_move(self):
-        return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
+        return not (self.retired or self.busy or self.saving or self._staging_tabs or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
 
     @Slot(str, str, result=bool)
     def canReceiveTab(self, source_id, tab_id):
@@ -2585,7 +2603,7 @@ class Studio(QObject):
         if self.active == tab_id: self.active = self.tabs[min(old, len(self.tabs)-1)]["id"]
         # Update both owners before writing one recovery snapshot: never duplicate
         # or temporarily lose a dirty note in the durable recovery stream.
-        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if (self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed")) and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged") or t.get("agent_unreviewed"))]
+        self.session.drafts[self.window_id] = self._window_recovery_drafts()
         target._recover()
         self._emit(); target._emit()
         if emptied: QTimer.singleShot(0, self.allowClose.emit)
@@ -3012,6 +3030,44 @@ class Studio(QObject):
             self._pending_write_retirements.pop(token, None)
         done(value, error)
 
+    def _submit_exact_recovery_write(self, action, done, *, on_retired=None):
+        token = uuid.uuid4().hex
+        invoked = False
+
+        def notify_retired():
+            nonlocal invoked
+            with self._write_callback_lock:
+                if invoked:
+                    return
+                invoked = True
+                self._pending_write_retirements.pop(token, None)
+            if on_retired is not None:
+                on_retired()
+
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            notify_retired()
+            return False
+
+        if on_retired is not None:
+            with self._write_callback_lock:
+                self._pending_write_retirements[token] = notify_retired
+
+        def exact_completed(status, rev, error):
+            if self.retired:
+                notify_retired()
+                return
+            try:
+                self.backgroundWriteCompleted.emit((token, done, notify_retired, (status, rev, error), None))
+            except RuntimeError:
+                notify_retired()
+
+        try:
+            self.writes.submit_latest_exact("recovery", action, None, exact_completed)
+        except RuntimeError:
+            notify_retired()
+            return False
+        return True
+
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
         data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
@@ -3022,7 +3078,7 @@ class Studio(QObject):
         data=json.dumps(self.session.locations).encode()
         self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
 
-    def _recover(self):
+    def _submit_startup_snapshot(self):
         # Clean tabs need only paths, never another copy of their image bytes.
         window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed")]
         self.session.workspace[self.window_id] = window_tabs
@@ -3057,9 +3113,35 @@ class Studio(QObject):
             "windows": windows_payload,
         }
         self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
+
+    def _window_recovery_drafts(self, tabs=None):
+        source_tabs = self.tabs if tabs is None else tabs
+        return [
+            _snapshot_tab_state(t, include_view_state=False)
+            for t in source_tabs
+            if (self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed"))
+            and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged") or t.get("agent_unreviewed"))
+        ]
+
+    def _combined_recovery_drafts(self, window_drafts):
+        combined = []
+        replaced = False
+        for wid, tabs in self.session.drafts.items():
+            if wid == self.window_id:
+                combined.extend(window_drafts)
+                replaced = True
+            else:
+                combined.extend(tabs)
+        if not replaced:
+            combined.extend(window_drafts)
+        return combined
+
+    def _recover(self):
+        self._submit_startup_snapshot()
         # Snapshot only unsaved or agent-staged tabs. Asset bytes stay in recovery, never in displayed source.
-        self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if (self._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed")) and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged") or t.get("agent_unreviewed"))]
-        drafts = [tab for tabs in self.session.drafts.values() for tab in tabs]
+        window_drafts = self._window_recovery_drafts()
+        self.session.drafts[self.window_id] = window_drafts
+        drafts = self._combined_recovery_drafts(window_drafts)
         self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
 
     def _notify_recovery_write(self,category,error):
@@ -4086,7 +4168,7 @@ class Studio(QObject):
     def _autosave(self):
         if not self.settings["autosave"]: return
         for tab in self.tabs:
-            if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and not tab.get("agent_staged") and tab["id"] not in self.saving:
+            if tab["path"] and self._is_dirty(tab) and not tab.get("conflict") and not tab.get("agent_staged") and tab["id"] not in self.saving and tab["id"] not in self._staging_tabs:
                 self._save_text(tab,Path(tab["path"]),automatic=True)
 
     def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = ""):
@@ -4324,7 +4406,7 @@ class Studio(QObject):
             return
         for win in list(self.session.windows.values()):
             for tab in win.tabs:
-                if tab["id"] in win.saving and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
+                if (tab["id"] in win.saving or tab["id"] in getattr(win, "_staging_tabs", ())) and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
                     self.message = "Wait for the current save to finish."
                     self._emit(False)
                     return
@@ -4360,7 +4442,7 @@ class Studio(QObject):
     @Slot(str, str)
     def renameNote(self, id, name):
         tab = next((t for t in self.tabs if t["id"] == id),None)
-        if not tab or id in self.saving: return
+        if not tab or id in self.saving or id in self._staging_tabs: return
         try:
             has_saved = bool(tab.get("path"))
             existing_ext = folder_ops.note_extension(tab["name"])
@@ -4749,45 +4831,372 @@ class Studio(QObject):
                 "nextOffset": next_offset if next_offset < total else None,
                 "body": base64.b64encode(body).decode("ascii")}
 
+    _RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot for the agent patch; retry the patch"
+    _RECOVERY_ERROR_SUPERSEDED = "Could not confirm draft recovery snapshot for the agent patch because the recovery write was superseded; retry the patch"
+    _RECOVERY_NOTICE = "Couldn't save draft recovery data. Keep Super MD open and retry."
+
+    def _validate_and_compute_patch_tab(self, args, *, bridge_revision_json: bool = False):
+        tab_id = args.get("tabId")
+        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+        if tab is None or tab_id in getattr(self, "_closing_tabs", ()):
+            raise ValueError("The requested live tab is no longer open")
+        staging_tabs = getattr(self, "_staging_tabs", None)
+        if staging_tabs is not None and tab_id in staging_tabs:
+            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
+        saving = getattr(self, "saving", None)
+        if saving is not None and tab_id in saving:
+            raise ValueError("A save is already in progress for this tab; retry after it finishes")
+        expected = args.get("expectedRevision")
+        previous = tab["content"]
+        revision = hashlib.sha256(previous.encode("utf-8")).hexdigest()
+        if not isinstance(expected, str) or expected != revision:
+            if bridge_revision_json and expected is not None:
+                raise ValueError(json.dumps({
+                    "error": "Revision conflict; inspect the current note before retrying",
+                    "currentRevision": revision,
+                    "sourceLength": len(previous),
+                }))
+            raise ValueError("Live tab revision changed; inspect it again before editing")
+        operations = args.get("operations")
+        if not isinstance(operations, list) or len(operations) > 100:
+            raise ValueError("operations must contain at most 100 edits")
+        if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > 64_000:
+            raise ValueError("Patch operations exceed the 64 KB limit")
+        from agent_documents import apply_patch_operations_detailed
+        edited, operation_results = apply_patch_operations_detailed(previous, operations)
+        changed = edited != previous
+        return tab, tab_id, previous, revision, edited, operation_results, changed
+
+    def _build_staged_recovery_candidate(self, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool):
+        existing_edits = list(current_tab.get("agent_edits") or [])
+        if changed:
+            next_seq = max(
+                getattr(self, "_agent_edit_seq", 0),
+                max((int(item.get("seq", 0)) for item in existing_edits if isinstance(item, dict)), default=0),
+            ) + 1
+            candidate_edits = Studio._bound_agent_edits(
+                existing_edits + [{"seq": next_seq, "before": previous, "after": edited}]
+            )
+            candidate_tab = {
+                **current_tab,
+                "content": edited,
+                "agent_staged": True,
+                "agent_unreviewed": True,
+                "agent_edits": candidate_edits,
+            }
+        else:
+            next_seq = getattr(self, "_agent_edit_seq", 0)
+            candidate_edits = existing_edits
+            candidate_tab = dict(current_tab)
+        replaced_tabs = [candidate_tab if item["id"] == tab_id else item for item in self.tabs]
+        window_drafts = self._window_recovery_drafts(replaced_tabs)
+        all_drafts = self._combined_recovery_drafts(window_drafts)
+        return all_drafts, candidate_edits, next_seq
+
+    def _commit_staged_patch_tab(
+        self,
+        current_tab: dict,
+        tab_id: str,
+        edited: str,
+        operation_results: list,
+        changed: bool,
+        candidate_edits: list[dict],
+        next_seq: int,
+    ) -> dict:
+        if changed:
+            current_tab["content"] = edited
+            self._agent_edit_seq = max(getattr(self, "_agent_edit_seq", 0), next_seq)
+            current_tab["agent_edits"] = candidate_edits
+            current_tab["agent_unreviewed"] = True
+            if self.active != tab_id:
+                current_tab["agent_staged"] = True
+                self._agent_jump_tab_id = tab_id
+            else:
+                current_tab["agent_staged"] = False
+                if (
+                    self.settings.get("autosave")
+                    and current_tab.get("path")
+                    and self._is_dirty(current_tab)
+                    and not current_tab.get("conflict")
+                ):
+                    self.autosave_timer.start(900)
+        if getattr(self, "message", "") == self._RECOVERY_NOTICE:
+            self.message = ""
+        self.session.drafts[self.window_id] = self._window_recovery_drafts()
+        self._submit_startup_snapshot()
+        if changed:
+            self._emit(load=(self.active == tab_id))
+        return {
+            "tabId": tab_id,
+            "windowId": self.window_id,
+            "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
+            "sourceLength": len(edited),
+            "changed": changed,
+            "applied": len(operation_results),
+            "operation_results": operation_results,
+            "isDirty": edited != current_tab["saved"],
+        }
+
+    def _stage_inactive_patch_tab_sync(self, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool) -> dict:
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            raise ValueError("The target desktop window was closed")
+        max_attempts = max(1, int(getattr(self, "_max_agent_stage_attempts", 3)))
+        timeout = float(getattr(self, "_agent_stage_sync_timeout", 10.0))
+        had_recovery_timer = self.recovery_timer.isActive()
+        if had_recovery_timer:
+            self.recovery_timer.stop()
+        any_wrote_candidate = False
+        self._staging_tabs.add(tab_id)
+        try:
+            for attempt in range(max_attempts):
+                if self.retired or getattr(self.writes, "_shutdown", False):
+                    if any_wrote_candidate and not getattr(self.writes, "_shutdown", False):
+                        self._recover()
+                    raise ValueError("The target desktop window was closed")
+                current_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if current_tab is None or tab_id in self._closing_tabs:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("The requested live tab is no longer open")
+                if current_tab["content"] != previous:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("Live tab revision changed; inspect it again before editing")
+                if self.recovery_timer.isActive():
+                    had_recovery_timer = True
+                    self.recovery_timer.stop()
+                all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
+                    tab_id, current_tab, previous, edited, changed
+                )
+                wrote_holder = [False]
+
+                def write_action(snapshot=all_drafts, holder=wrote_holder):
+                    atomic_json(self.data / "recovery.json", snapshot)
+                    holder[0] = True
+
+                rev, outcome = self.writes.submit_latest_exact("recovery", write_action)
+                try:
+                    status, _done_rev, write_error = outcome.result(timeout=timeout)
+                except concurrent.futures.TimeoutError as exc:
+                    raise RuntimeError(self._RECOVERY_ERROR_FAILED) from exc
+                if wrote_holder[0]:
+                    any_wrote_candidate = True
+                if self.retired or getattr(self.writes, "_shutdown", False):
+                    raise ValueError("The target desktop window was closed")
+                now_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if now_tab is None or tab_id in self._closing_tabs:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("The requested live tab is no longer open")
+                if now_tab["content"] != previous:
+                    if any_wrote_candidate:
+                        self._recover()
+                    raise ValueError("Live tab revision changed; inspect it again before editing")
+                if status == "failed" or write_error is not None:
+                    if any_wrote_candidate:
+                        self._recover()
+                    elif had_recovery_timer:
+                        self.recovery_timer.start(800)
+                    raise RuntimeError(self._RECOVERY_ERROR_FAILED) from write_error
+                if (
+                    status == "committed"
+                    and self.writes.committed_revision("recovery") == rev
+                    and self.writes.latest_revision("recovery") == rev
+                ):
+                    return self._commit_staged_patch_tab(
+                        now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq
+                    )
+                if attempt + 1 < max_attempts:
+                    continue
+                if any_wrote_candidate:
+                    self._recover()
+                elif had_recovery_timer:
+                    self.recovery_timer.start(800)
+                raise RuntimeError(self._RECOVERY_ERROR_SUPERSEDED)
+            raise RuntimeError(self._RECOVERY_ERROR_SUPERSEDED)
+        finally:
+            self._staging_tabs.discard(tab_id)
+
+    def _stage_inactive_patch_tab_async(self, args, on_complete) -> None:
+        tab, tab_id, previous, revision, edited, operation_results, changed = self._validate_and_compute_patch_tab(
+            args, bridge_revision_json=True
+        )
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            raise ValueError("The target desktop window was closed")
+        if tab_id == self.active:
+            result = self._agent_document_action(args)
+            on_complete(result, None)
+            return
+        if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
+            on_complete({
+                "tabId": tab_id,
+                "windowId": self.window_id,
+                "revision": revision,
+                "sourceLength": len(edited),
+                "changed": False,
+                "applied": len(operation_results),
+                "operation_results": operation_results,
+                "isDirty": False,
+            }, None)
+            return
+
+        max_attempts = max(1, int(getattr(self, "_max_agent_stage_attempts", 3)))
+        queue_token = uuid.uuid4().hex
+        finished_flag = False
+        active_in_queue = False
+        had_recovery_timer = False
+        any_wrote_candidate = False
+
+        self._staging_tabs.add(tab_id)
+
+        def finish_stage(result, error):
+            nonlocal finished_flag
+            if finished_flag:
+                return
+            finished_flag = True
+            with self._write_callback_lock:
+                self._pending_write_retirements.pop(queue_token, None)
+            self._staging_tabs.discard(tab_id)
+            if active_in_queue:
+                self.session._advance_agent_stage_queue()
+            on_complete(result, error)
+
+        with self._write_callback_lock:
+            self._pending_write_retirements[queue_token] = lambda: finish_stage(
+                None, "The target desktop window was closed"
+            )
+
+        def run_attempt(attempt: int) -> None:
+            nonlocal had_recovery_timer, any_wrote_candidate
+            if finished_flag:
+                return
+            if self.retired or getattr(self.writes, "_shutdown", False):
+                if any_wrote_candidate and not getattr(self.writes, "_shutdown", False):
+                    self._recover()
+                finish_stage(None, "The target desktop window was closed")
+                return
+            current_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+            if current_tab is None or tab_id in self._closing_tabs:
+                if any_wrote_candidate:
+                    self._recover()
+                finish_stage(None, "The requested live tab is no longer open")
+                return
+            if current_tab["content"] != previous:
+                if any_wrote_candidate:
+                    self._recover()
+                cur_rev = hashlib.sha256(current_tab["content"].encode("utf-8")).hexdigest()
+                finish_stage(None, json.dumps({
+                    "error": "Revision conflict; inspect the current note before retrying",
+                    "currentRevision": cur_rev,
+                    "sourceLength": len(current_tab["content"]),
+                }))
+                return
+            if self.recovery_timer.isActive():
+                had_recovery_timer = True
+                self.recovery_timer.stop()
+            all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
+                tab_id, current_tab, previous, edited, changed
+            )
+            wrote_holder = [False]
+
+            def write_action(snapshot=all_drafts, holder=wrote_holder):
+                atomic_json(self.data / "recovery.json", snapshot)
+                holder[0] = True
+
+            def on_write_done(outcome_tuple, _err_str):
+                nonlocal any_wrote_candidate
+                if finished_flag:
+                    return
+                status, rev, write_error = outcome_tuple
+                if wrote_holder[0]:
+                    any_wrote_candidate = True
+                if self.retired or getattr(self.writes, "_shutdown", False):
+                    finish_stage(None, "The target desktop window was closed")
+                    return
+                now_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
+                if now_tab is None or tab_id in self._closing_tabs:
+                    if any_wrote_candidate:
+                        self._recover()
+                    finish_stage(None, "The requested live tab is no longer open")
+                    return
+                if now_tab["content"] != previous:
+                    if any_wrote_candidate:
+                        self._recover()
+                    cur_rev = hashlib.sha256(now_tab["content"].encode("utf-8")).hexdigest()
+                    finish_stage(None, json.dumps({
+                        "error": "Revision conflict; inspect the current note before retrying",
+                        "currentRevision": cur_rev,
+                        "sourceLength": len(now_tab["content"]),
+                    }))
+                    return
+                if status == "failed" or write_error is not None:
+                    if any_wrote_candidate:
+                        self._recover()
+                    elif had_recovery_timer:
+                        self.recovery_timer.start(800)
+                    finish_stage(None, self._RECOVERY_ERROR_FAILED)
+                    return
+                if (
+                    status == "committed"
+                    and self.writes.committed_revision("recovery") == rev
+                    and self.writes.latest_revision("recovery") == rev
+                ):
+                    result = self._commit_staged_patch_tab(
+                        now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq
+                    )
+                    finish_stage(result, None)
+                    return
+                if attempt + 1 < max_attempts:
+                    run_attempt(attempt + 1)
+                    return
+                if any_wrote_candidate:
+                    self._recover()
+                elif had_recovery_timer:
+                    self.recovery_timer.start(800)
+                finish_stage(None, self._RECOVERY_ERROR_SUPERSEDED)
+
+            self._submit_exact_recovery_write(
+                write_action,
+                on_write_done,
+                on_retired=lambda: finish_stage(None, "The target desktop window was closed"),
+            )
+
+        def start_queued() -> bool:
+            nonlocal active_in_queue
+            if finished_flag:
+                return False
+            with self._write_callback_lock:
+                self._pending_write_retirements.pop(queue_token, None)
+            active_in_queue = True
+            run_attempt(0)
+            return not finished_flag
+
+        self.session._enqueue_agent_stage(start_queued)
+
     def _agent_document_action(self, args):
         action = args.get("action")
         if action == "patch_tab":
-            tab_id = args.get("tabId")
-            tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-            if tab is None:
-                raise ValueError("The requested live tab is no longer open")
-            expected = args.get("expectedRevision")
-            revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
-            if not isinstance(expected, str) or expected != revision:
-                raise ValueError("Live tab revision changed; inspect it again before editing")
-            operations = args.get("operations")
-            if not isinstance(operations, list) or len(operations) > 100:
-                raise ValueError("operations must contain at most 100 edits")
-            if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > 64_000:
-                raise ValueError("Patch operations exceed the 64 KB limit")
-            from agent_documents import apply_patch_operations_detailed
-            previous = tab["content"]
-            edited, operation_results = apply_patch_operations_detailed(previous, operations)
-            changed = edited != previous
-            if changed:
-                tab["content"] = edited
-                self._append_agent_edit(tab, previous, edited)
-                tab["agent_unreviewed"] = True
-                if tab_id != self.active:
-                    tab["agent_staged"] = True
-                    self._agent_jump_tab_id = tab_id
-                    self.recovery_timer.stop()
-                    self._recover()
-                    self._emit(load=False)
-                else:
+            tab, tab_id, previous, revision, edited, operation_results, changed = self._validate_and_compute_patch_tab(args)
+            if tab_id == self.active:
+                if changed:
+                    tab["content"] = edited
+                    self._append_agent_edit(tab, previous, edited)
+                    tab["agent_unreviewed"] = True
                     self.recovery_timer.start(800)
                     self.autosave_timer.start(900)
                     self._emit(load=True)
-            return {"tabId": tab_id, "windowId": self.window_id,
-                    "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
-                    "sourceLength": len(edited), "changed": changed,
-                    "applied": len(operation_results), "operation_results": operation_results,
-                    "isDirty": edited != tab["saved"]}
+                return {"tabId": tab_id, "windowId": self.window_id,
+                        "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
+                        "sourceLength": len(edited), "changed": changed,
+                        "applied": len(operation_results), "operation_results": operation_results,
+                        "isDirty": edited != tab["saved"]}
+            if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
+                return {"tabId": tab_id, "windowId": self.window_id,
+                        "revision": revision,
+                        "sourceLength": len(edited), "changed": False,
+                        "applied": len(operation_results), "operation_results": operation_results,
+                        "isDirty": False}
+            return self._stage_inactive_patch_tab_sync(tab_id, previous, edited, operation_results, changed)
         if action == "replace_tab_asset":
             return self._replace_tab_asset_native(args)
         if action == "asset_action" and args.get("assetAction") == "attach":
@@ -4832,6 +5241,9 @@ class Studio(QObject):
             tab = next((item for item in self.tabs if item["id"] == tab_id), None)
             if tab is None:
                 raise ValueError("The requested live tab is no longer open")
+            staging = getattr(self, "_staging_tabs", None)
+            if staging is not None and tab_id in staging:
+                raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
             expected = args.get("expectedRevision")
             revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
             if not isinstance(expected, str) or expected != revision:
@@ -4963,6 +5375,9 @@ class Studio(QObject):
 
     def _agent_document_action_async(self, args, on_complete):
         action = args.get("action")
+        if action == "patch_tab":
+            self._stage_inactive_patch_tab_async(args, on_complete)
+            return
         if action == "save_document":
             prepared = Studio._prepare_save_document(self, args)
         elif action == "replace_tab_asset":
@@ -5010,6 +5425,9 @@ class Studio(QObject):
         saving = getattr(self, "saving", None)
         if saving is not None and tab_id in saving:
             raise ValueError("A save is already in progress for this tab; retry after it finishes")
+        staging = getattr(self, "_staging_tabs", None)
+        if staging is not None and tab_id in staging:
+            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
         content_snapshot = tab["content"]
         revision = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
         if args.get("expectedRevision") != revision:
