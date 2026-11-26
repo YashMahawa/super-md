@@ -357,12 +357,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun diskMatchesBaseline(target: Uri, note: Note, baselineAssets: JSONObject? = null): Boolean =
         if (note.portable) {
             val expectedAssets = baselineAssets ?: baselinePortableAssets(note)
-            val disk = resolver.openInputStream(target)?.use(media::openFmd) ?: error("Cannot read the current portable note")
-            try {
-                disk.markdown == note.saved && portableAssetsMatch(expectedAssets, media.portableAssets(disk.directory))
-            } finally {
-                deletePortableDirectoryIfUnreferenced(disk.directory)
-            }
+            resolver.openInputStream(target)?.use { stream ->
+                media.portableEnvelopeMatches(stream, note.saved, expectedAssets)
+            } ?: error("Cannot read the current portable note")
         } else {
             val current = resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") }
                 ?: error("Cannot read the current note")
@@ -2367,54 +2364,56 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val target = documentAccess.resolve(Uri.parse(latest.uri ?: error("This portable note has no saved destination")), writing = true)
                 val backup = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot read the current portable note")
-                val disk = backup.inputStream().use(media::openFmd)
+                require(
+                    agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true) &&
+                        media.portableEnvelopeMatches(backup.inputStream(), note.saved, assets),
+                ) {
+                    "The portable note changed on disk; reopen it before saving"
+                }
+                staged.outputStream().use { media.writeFmd(it, note.content, assets, assets) }
+                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
+                val stagedBytes = staged.readBytes()
+                val reuseExisting = note.assetDirectory != null && media.hasExactLocalPortableAssets(note.assetDirectory, assets)
+                val nextDirectory = if (reuseExisting) {
+                    note.assetDirectory!!
+                } else {
+                    media.materializePortableDirectory(assets, reuseFromDirectory = note.assetDirectory).also { openedDirectory = it }
+                }
+                val latestBytes = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
+                    ?: error("Cannot recheck the portable note before saving")
+                require(latestBytes.contentEquals(backup)) { "The portable note changed on disk; no changes were saved" }
                 try {
-                    require(portableSaveSnapshotMatches(note, expectedRevision, disk.markdown, assets, media.portableAssets(disk.directory))) {
-                        "The portable note changed on disk; reopen it before saving"
-                    }
-                    staged.outputStream().use { media.writeFmd(it, note.content, assets) }
-                    verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
-                    val stagedBytes = staged.readBytes()
-                    val opened = staged.inputStream().use(media::openFmd)
-                    openedDirectory = opened.directory
-                    val latestBytes = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
-                        ?: error("Cannot recheck the portable note before saving")
-                    require(latestBytes.contentEquals(backup)) { "The portable note changed on disk; no changes were saved" }
-                    try {
-                        resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } }
-                            ?: error("Cannot save the portable note")
-                        withContext(Dispatchers.Main) {
-                            val current = mutable.value.tabs.firstOrNull { it.id == id }
-                            require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
-                                "The note changed while it was saving; the portable file was restored"
-                            }
-                            recordPortableBaseline(id, opened.directory)
-                            autosavePending.remove(id)
-                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = opened.directory, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = state.agentJumpTabId?.takeUnless { it == id }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
-                            mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
-                            openedDirectory = null
+                    resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } }
+                        ?: error("Cannot save the portable note")
+                    withContext(Dispatchers.Main) {
+                        val current = mutable.value.tabs.firstOrNull { it.id == id }
+                        require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
+                            "The note changed while it was saving; the portable file was restored"
                         }
-                    } catch (error: Exception) {
-                        runCatching {
-                            val current = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
-                                ?: error("Cannot inspect the portable note after the failed write")
-                            when (portableSaveRecovery(current, backup, stagedBytes)) {
-                                PortableSaveRecovery.ORIGINAL_INTACT -> Unit
-                                PortableSaveRecovery.RESTORE_OUR_WRITE -> {
-                                    resolver.openOutputStream(target, "wt")?.use { it.write(backup); it.flush() }
-                                        ?: error("Cannot restore the previous portable note")
-                                    val restored = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
-                                    require(restored != null && restored.contentEquals(backup)) { "Cannot confirm restoration of the previous portable note" }
-                                }
-                                PortableSaveRecovery.LEAVE_CONCURRENT_BYTES -> error("The portable destination changed after the write; it was left intact to avoid overwriting newer bytes")
-                            }
-                        }.getOrElse { rollbackError ->
-                            throw IllegalStateException("The portable save failed and the destination was not overwritten during recovery. Inspect it or reopen it from disk before editing.", rollbackError)
-                        }
-                        throw error
+                        recordPortableBaseline(id, nextDirectory)
+                        autosavePending.remove(id)
+                        change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = nextDirectory, agentStaged = false, agentUnreviewed = false) else it }, agentJumpTabId = state.agentJumpTabId?.takeUnless { it == id }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
+                        mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
+                        openedDirectory = null
                     }
-                } finally {
-                    disk.directory.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
+                } catch (error: Exception) {
+                    runCatching {
+                        val current = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
+                            ?: error("Cannot inspect the portable note after the failed write")
+                        when (portableSaveRecovery(current, backup, stagedBytes)) {
+                            PortableSaveRecovery.ORIGINAL_INTACT -> Unit
+                            PortableSaveRecovery.RESTORE_OUR_WRITE -> {
+                                resolver.openOutputStream(target, "wt")?.use { it.write(backup); it.flush() }
+                                    ?: error("Cannot restore the previous portable note")
+                                val restored = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
+                                require(restored != null && restored.contentEquals(backup)) { "Cannot confirm restoration of the previous portable note" }
+                            }
+                            PortableSaveRecovery.LEAVE_CONCURRENT_BYTES -> error("The portable destination changed after the write; it was left intact to avoid overwriting newer bytes")
+                        }
+                    }.getOrElse { rollbackError ->
+                        throw IllegalStateException("The portable save failed and the destination was not overwritten during recovery. Inspect it or reopen it from disk before editing.", rollbackError)
+                    }
+                    throw error
                 }
             }
         } } finally {
@@ -2506,7 +2505,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } finally { staged.delete() }
     }
     private fun collectNativePortableAssets(note: Note): JSONObject {
-        val assets = JSONObject(media.portableAssets(note.assetDirectory).toString())
+        val existing = media.portableAssets(note.assetDirectory)
+        val assets = JSONObject()
+        existing.keys().forEach { key -> assets.put(key, existing.getString(key)) }
         val sources = JSONArray(markdownImageSourcesJson(note.content))
         for (i in 0 until sources.length()) {
             val source = sources.getString(i)
@@ -2978,6 +2979,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         newFolderPrefix: String? = null,
         folderTreeRaw: String? = null,
         statusMessage: String? = null,
+        preRenameFolderState: Map<StudioViewModel, Pair<Long, String>> = emptyMap(),
     ) {
         if (remaps.isEmpty() && oldFolderPrefix == null) return
         remapPersistedMetadata(remaps)
@@ -3021,7 +3023,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val vmFolder = vm.mutable.value.folder
             if (vmFolder != null && (folderTreeRaw == null || sameDocumentUri(vmFolder, folderTreeRaw))) {
-                val currentRel = vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+                val preRename = preRenameFolderState[vm]
+                val currentRel = if (preRename != null && vm.listFolderSeq == preRename.first) {
+                    preRename.second
+                } else {
+                    vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+                }
                 val nextListed = if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
                     remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
                 } else {
@@ -3225,6 +3232,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val folderUri = Uri.parse(folderRaw)
         val parentRel = parentRelativePath(cleanRelative)
         val currentName = cleanRelative.substringAfterLast('/')
+        val preRenameFolderState = liveStudioViewModels(this).associateWith { vm ->
+            vm.listFolderSeq to vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+        }
 
         val (actualNewName, actualNewRelative, remaps) = withContext(Dispatchers.IO) {
             documentWrites.withLock {
@@ -3316,6 +3326,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             newFolderPrefix = if (isDirectory) actualNewRelative else null,
             folderTreeRaw = folderRaw,
             statusMessage = "Renamed to $actualNewName",
+            preRenameFolderState = preRenameFolderState,
         )
     }
 
@@ -3627,8 +3638,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 check(target.renameTo(backupAsset)) { "Could not safely stage the current image" }
                 check(temporaryAsset.renameTo(target)) { backupAsset.renameTo(target); error("Could not stage the replacement image") }
                 replaced = true
+                media.invalidateLocalAsset(target)
                 if (!backup.contentEquals(incomingBytes) && target.lastModified() == previousModified && previousModified > 0L) {
                     target.setLastModified(maxOf(System.currentTimeMillis(), previousModified + 1_000L))
+                    media.invalidateLocalAsset(target)
                 }
                 stagedNote.outputStream().use { media.writeLocalPortable(it, note.content, note.assetDirectory) }
                 verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)
@@ -3646,6 +3659,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if (replaced) {
                     target.delete()
                     backupAsset.renameTo(target)
+                    media.invalidateLocalAsset(target)
                 }
                 throw error
             } finally {
@@ -3708,8 +3722,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val newData = media.portableImageData(mime, incomingBytes)
             val uri = Uri.parse(note.uri)
             val backup = resolver.openInputStream(uri)?.use { readLimited(it, 120_000_000) } ?: error("Cannot read the current portable note")
-            val diskNote = backup.inputStream().use(media::openFmd)
-            val diskAssetsDir = diskNote.directory
             val stagedNote = File(getApplication<Application>().cacheDir, "agent-attach-${UUID.randomUUID()}.smd.gz")
             var writeAttempted = false
             var openedDir: String? = null
@@ -3723,14 +3735,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 writeAttempted = false
             }
             try {
-                require(diskNote.markdown == note.saved && sameAssets(currentAssets, media.portableAssets(diskAssetsDir))) {
+                require(media.portableEnvelopeMatches(backup.inputStream(), note.saved, currentAssets)) {
                     "The portable note changed on disk; reopen it before attaching an image"
                 }
                 requireSameSnapshot()
-                val updated = JSONObject(currentAssets.toString()).put(newKey, newData)
-                stagedNote.outputStream().use { media.writeFmd(it, note.content, updated) }
+                val updated = JSONObject()
+                currentAssets.keys().forEach { key -> updated.put(key, currentAssets.getString(key)) }
+                updated.put(newKey, newData)
+                stagedNote.outputStream().use { media.writeFmd(it, note.content, updated, currentAssets) }
                 verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)
-                openedDir = stagedNote.inputStream().use(media::openFmd).directory
+                openedDir = media.materializePortableDirectory(
+                    updated,
+                    reuseFromDirectory = directory,
+                    predecodedBytes = mapOf(newKey to (mime to incomingBytes)),
+                )
                 val currentDiskBytes = resolver.openInputStream(uri)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot recheck the current portable note before saving")
                 require(currentDiskBytes.contentEquals(backup)) { "The portable note changed on disk; no changes were saved" }
@@ -3776,7 +3794,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 throw error
             } finally {
                 stagedNote.delete()
-                File(getApplication<Application>().filesDir, "portable-assets/$diskAssetsDir").deleteRecursively()
                 openedDir?.takeIf { it != mutable.value.tabs.find { tab -> tab.id == id }?.assetDirectory }
                     ?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
             }
@@ -3874,13 +3891,24 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
             val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
+            var materializedDirectory: String? = null
             try {
-                staged.outputStream().use { media.writeFmd(it, content, assets) }
-                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
-                // Extract assets independently so a saved draft can immediately resolve
-                // new portable references without carrying binary data in its state.
+                // Reuse existing extracted assets when unchanged; otherwise materialize only changed/new assets
+                // before writing the archive so new assets are Base64-decoded once rather than twice.
                 val rebinding = save || rebindId != null
-                val opened = if (rebinding) staged.inputStream().use(media::openFmd) else null
+                val nextDirectory = if (rebinding) {
+                    val reuseExisting = save && rebindId == null && note.assetDirectory != null &&
+                        media.hasExactLocalPortableAssets(note.assetDirectory, assets)
+                    if (reuseExisting) {
+                        note.assetDirectory!!
+                    } else {
+                        media.materializePortableDirectory(assets, reuseFromDirectory = note.assetDirectory).also {
+                            materializedDirectory = it
+                        }
+                    }
+                } else null
+                staged.outputStream().use { media.writeFmd(it, content, assets, savedPortableAssets[effectiveId]) }
+                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
                 resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
                 documentAccess.persist(destination)
                 val savedName = if (rebindId != null) {
@@ -3893,7 +3921,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         portableDestinationIsNew = false
                         portableSaveAsNoteId = null
                         autosavePending.remove(effectiveId)
-                        recordPortableBaseline(effectiveId, opened!!.directory)
+                        recordPortableBaseline(effectiveId, nextDirectory!!)
                         change { s ->
                             s.copy(
                                 tabs = s.tabs.map {
@@ -3904,7 +3932,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                         assetsDirty = false,
                                         uri = destination.toString(),
                                         relative = openRel ?: it.relative,
-                                        assetDirectory = opened.directory,
+                                        assetDirectory = nextDirectory,
                                         agentStaged = false,
                                         agentUnreviewed = false,
                                     ) else it
@@ -3916,6 +3944,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                 message = if (rebindId != null) "Saved" else "Portable note saved",
                             )
                         }
+                        materializedDirectory = null
                         mutable.value.tabs.find { it.id == effectiveId }?.let(::remember)
                         if (openRel != null) mutable.value.folder?.let { listFolder(Uri.parse(it), listedRelative) }
                         if (closeAfterSaveNoteId == effectiveId) {
@@ -3928,7 +3957,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported")
                     }
                 }
-            } finally { staged.delete() }
+            } finally {
+                materializedDirectory?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
+                staged.delete()
+            }
         } }
         closeTargetId?.let { close(it) }
     }
