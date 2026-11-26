@@ -31,16 +31,16 @@ internal enum class ReaderUrlDecision {
 
 /**
  * Classifies main-frame and subresource URL navigations inside the Android reader WebView.
- * Never opens `appassets.androidplatform.net` URLs in an external browser.
+ * Allows only the bundled offline reader entrypoint on the main frame and its opaque-origin
+ * Mermaid sandbox subframe, and never opens `appassets.androidplatform.net` URLs externally.
  */
 internal fun classifyReaderNavigationUrl(url: Uri?, isForMainFrame: Boolean): ReaderUrlDecision {
     if (url == null) return ReaderUrlDecision.BLOCK_INTERNAL
+    if (!shouldOverrideReaderNavigation(url, isForMainFrame)) {
+        return ReaderUrlDecision.ALLOW_READER
+    }
     if (url.host.equals("appassets.androidplatform.net", ignoreCase = true)) {
-        return if (url.scheme.equals("https", ignoreCase = true) && url.path == "/assets/web/android-reader.html") {
-            ReaderUrlDecision.ALLOW_READER
-        } else {
-            ReaderUrlDecision.BLOCK_INTERNAL
-        }
+        return ReaderUrlDecision.BLOCK_INTERNAL
     }
     val scheme = url.scheme?.lowercase()
     if (isForMainFrame && scheme in setOf("https", "http", "mailto")) {

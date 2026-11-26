@@ -74,11 +74,14 @@ class RelativeNoteNavigationTest {
 
         val readerRequest = fakeRequest("https://appassets.androidplatform.net/assets/web/android-reader.html", mainFrame = true)
         assertFalse(client.shouldOverrideUrlLoading(web, readerRequest))
+        assertFalse(client.shouldOverrideUrlLoading(web, fakeRequest("https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html", mainFrame = false)))
+        assertFalse(client.shouldOverrideUrlLoading(web, fakeRequest("about:blank", mainFrame = false)))
         assertNull(shadowOf(app).nextStartedActivity)
 
         for (blockedUrl in listOf(
             "https://appassets.androidplatform.net/assets/web/Lecture%202.md",
             "https://appassets.androidplatform.net/assets/web/study.smd",
+            "https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html",
             "https://appassets.androidplatform.net/outside.md",
             "http://appassets.androidplatform.net/assets/web/Lecture%202.md",
         )) {
