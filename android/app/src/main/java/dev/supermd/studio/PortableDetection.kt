@@ -26,3 +26,6 @@ internal fun isValidCompatPortableAssetKey(source: String): Boolean =
 
 internal fun isValidPortableAssetNameOrKey(value: String): Boolean =
     isValidPortableAssetFilename(value.removePrefix("assets/"))
+
+internal fun isValidCompatPortableAssetNameOrKey(value: String): Boolean =
+    isValidCompatPortableAssetFilename(value.removePrefix("assets/"))

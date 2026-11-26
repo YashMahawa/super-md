@@ -200,4 +200,41 @@ pub fn pack(markdown: &str, mut load: impl FnMut(&str) -> Result<String>) -> Res
         let mut trailing = encoded.clone(); trailing.push(0);
         assert!(PortableDocument::decode_bytes(&trailing).is_err());
     }
+    #[test] fn decodes_and_round_trips_existing_159_char_basename_and_caps_new_names_at_150() {
+        let svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='16' height='16'><circle cx='8' cy='8' r='6' fill='#386a57'/></svg>";
+        let svg_data = format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg_bytes));
+        let basename_159 = format!("{}.svg", "b".repeat(155));
+        assert_eq!(basename_159.len(), 159);
+        let key_159 = format!("assets/{basename_159}");
+        let markdown = format!("# Existing Envelope\n\n![Figure](<{key_159}>)\n");
+        let raw_envelope = serde_json::json!({
+            "format": "supermd-smd",
+            "version": 1,
+            "markdown": markdown,
+            "assets": { &key_159: svg_data },
+        })
+        .to_string();
+
+        let decoded = PortableDocument::decode(&raw_envelope).unwrap();
+        assert_eq!(decoded.markdown, markdown);
+        assert_eq!(image_bytes(&decoded.assets[&key_159]).unwrap().1, svg_bytes);
+
+        let reencoded_json = decoded.encode().unwrap();
+        let reopened_json = PortableDocument::decode(&reencoded_json).unwrap();
+        assert_eq!(reopened_json.markdown, markdown);
+        assert_eq!(reopened_json.assets, decoded.assets);
+
+        let reencoded_gzip = decoded.encode_compressed().unwrap();
+        let reopened_gzip = PortableDocument::decode_bytes(&reencoded_gzip).unwrap();
+        assert_eq!(reopened_gzip.markdown, markdown);
+        assert_eq!(image_bytes(&reopened_gzip.assets[&key_159]).unwrap().1, svg_bytes);
+
+        let max_new_150 = format!("assets/{}.svg", "b".repeat(146));
+        let over_new_151 = format!("assets/{}.svg", "b".repeat(147));
+        assert_eq!(max_new_150.strip_prefix("assets/").unwrap().len(), 150);
+        assert_eq!(over_new_151.strip_prefix("assets/").unwrap().len(), 151);
+        assert!(new_asset_name(&max_new_150));
+        assert!(!new_asset_name(&over_new_151));
+        assert!(!new_asset_name(&key_159));
+    }
 }

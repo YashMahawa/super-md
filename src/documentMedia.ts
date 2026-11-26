@@ -91,8 +91,8 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 }
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
-export async function prepareFmd(markdown: string, documentPath: string | null) {
-  const portableDoc = /\.(?:smd|fmd)$/i.test(documentPath || "");
+export async function prepareFmd(markdown: string, documentPath: string | null, options?: { portable?: boolean }) {
+  const portableDoc = options?.portable ?? /\.(?:smd|fmd)$/i.test(documentPath || "");
   const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
   const tree = processor.parse(maskFrontmatter(markdown));
   const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
@@ -143,7 +143,7 @@ export async function prepareFmd(markdown: string, documentPath: string | null) 
     const rewritten = new Map<string, string>();
     const offset = work.length;
     for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
-    for(const step of deck.steps) if(typeof step.markdown==='string') work.push(prepareFmd(step.markdown,documentPath).then(prepared=>{step.markdown=prepared.content;Object.assign(assets,prepared.assets);}));
+    for(const step of deck.steps) if(typeof step.markdown==='string') work.push(prepareFmd(step.markdown,documentPath,{portable:portableDoc}).then(prepared=>{step.markdown=prepared.content;Object.assign(assets,prepared.assets);}));
     // All corresponding assets must finish loading before serializing this deck.
     const waiting = work.splice(offset);
     work.push(Promise.all(waiting).then(() => {
