@@ -281,9 +281,12 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         with patch("studio._is_windows", return_value=True), patch.object(Path, "rename", flaky_win_rename):
             evt = self.studio._suspend_watches_for_prefix(str(src_retry), is_dir=False, new_path=str(dst_retry))
             self.assertFalse(evt.is_set())
+            self.assertEqual(len(self.studio._active_watch_suspensions()), 1)
             studio_assets_rename.rename_path_with_windows_retry(src_retry, dst_retry)
             self.studio._sync_path_change(str(src_retry), str(dst_retry), is_dir=False, on_rebound=evt.set)
         self.assertTrue(evt.is_set() and dst_retry.is_file() and len(attempts) == 2)
+        self.studio._suspend_watches_for_prefix(str(dst_retry), is_dir=False)
+        self.assertEqual(self.studio._active_watch_suspensions(), [])
         _, saved_assets, is_portable = open_note(smd_path)
         self.assertTrue(is_portable)
         self.assertEqual(set(saved_assets), {"assets/diagram.svg", "assets/pixel.png"})

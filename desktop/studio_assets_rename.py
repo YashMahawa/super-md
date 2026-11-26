@@ -1,6 +1,6 @@
 """Unified folder creation, watched file/folder renames, and portable .smd asset staging for Studio."""
 from __future__ import annotations
-import base64, contextlib, hashlib, os, re, sys, threading, time, uuid
+import base64, contextlib, hashlib, os, re, sys, threading, time, uuid, weakref
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,17 +45,35 @@ def rename_path_with_windows_retry(before: Path, after: Path) -> None:
             time.sleep(delay)
             delay = min(0.05, delay * 2.0)
 
+def _suspension_event(ev_or_ref: Any) -> threading.Event | None:
+    return ev_or_ref() if isinstance(ev_or_ref, weakref.ReferenceType) else ev_or_ref
+
+def active_watch_suspensions(session: Any) -> list[tuple[str, str, bool, threading.Event, str]]:
+    with session._watch_suspension_lock:
+        kept, resolved = [], []
+        for item in session._watch_suspensions:
+            ev = _suspension_event(item[3])
+            if ev is not None and not ev.is_set():
+                kept.append(item)
+                resolved.append((item[0], item[1], item[2], ev, item[4] if len(item) > 4 else ""))
+        if len(kept) != len(session._watch_suspensions):
+            session._watch_suspensions[:] = kept
+        return resolved
+
 def suspend_watches_for_prefix(studio_obj: Any, target_path: str, *, is_dir: bool, new_path: str = "") -> threading.Event:
     resume_event = threading.Event()
     parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
-    entry = (target_path, parent_str, is_dir, resume_event, new_path)
+    stored_entry = (target_path, parent_str, is_dir, weakref.ref(resume_event), new_path)
     session = getattr(studio_obj, "session", None)
     susp_lock = getattr(session, "_watch_suspension_lock", None)
     if susp_lock is not None:
         with susp_lock:
-            session._watch_suspensions[:] = [item for item in session._watch_suspensions if not item[3].is_set()]
-            session._watch_suspensions.append(entry)
-    entry_list = [entry]
+            session._watch_suspensions[:] = [
+                item for item in session._watch_suspensions
+                if (ev := _suspension_event(item[3])) is not None and not ev.is_set()
+            ]
+            session._watch_suspensions.append(stored_entry)
+    entry_list = [(target_path, parent_str, is_dir, resume_event, new_path)]
     fallback_hit = lambda p: (
         folder_ops.matches_path_prefix(p, target_path, is_directory=is_dir)
         or bool(new_path and folder_ops.matches_path_prefix(p, new_path, is_directory=is_dir))
@@ -374,7 +392,10 @@ def submit_rename(
             suspension_released = True
         resume_event.set()
         with session._watch_suspension_lock:
-            session._watch_suspensions[:] = [item for item in session._watch_suspensions if not item[3].is_set()]
+            session._watch_suspensions[:] = [
+                item for item in session._watch_suspensions
+                if (ev := _suspension_event(item[3])) is not None and not ev.is_set()
+            ]
         session._pending_rename_cleanups.pop(token, None)
         with studio_obj._write_callback_lock:
             studio_obj._pending_write_retirements.pop(token, None)

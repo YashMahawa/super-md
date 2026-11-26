@@ -128,11 +128,11 @@ describe("ReadingSearch DOM behavior", () => {
     host.remove();
   });
 
-  it("maps body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
+  it("maps displayed metadata and body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
-    let current = "---\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
+    let current = "---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
     const changes: string[] = [];
 
     await act(async () => {
@@ -151,22 +151,118 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => setInputValue(searchInput, "Alpha"));
     await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
 
-    // Body search ignores rendered YAML properties, counting only the 1 body match.
-    expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+    // Rendered search includes displayed title, author, and tags (3 matches) + 1 body match = 4, excluding description.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 4");
     const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    // Match 1 in DOM order is displayed title ("Alpha Study"), which is source match 4 / 5 in YAML key order!
     act(() => nextButton.click());
-    expect(host.querySelector("output")?.textContent).toBe("1 / 1");
-
-    // Toggling Replace in source maps that active body match to source match 2 / 2 (after frontmatter title).
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
     const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
     act(() => replaceToggle.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(host.querySelector("output")?.textContent).toBe("4 / 5");
+    // Toggle Replace back off -> returns to 1 / 4!
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
+
+    // Step to match 4 / 4 (Alpha body.) and toggle Replace in source -> maps to source match 5 / 5!
+    act(() => nextButton.click()); // 2 / 4 (author: Dr. Alpha)
+    act(() => nextButton.click()); // 3 / 4 (tag: alpha-tag)
+    act(() => nextButton.click()); // 4 / 4 (Alpha body.)
+    expect(host.querySelector("output")?.textContent).toBe("4 / 4");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("5 / 5");
 
     const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
     const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
     act(() => setInputValue(replaceInput, "Beta"));
     act(() => buttons[0].click());
-    expect(changes.at(-1)).toBe("---\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+    expect(changes.at(-1)).toBe("---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  it("maps quoted, folded, flow, and duplicate frontmatter values across Replace in source while redacting hidden fields", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    let current = [
+      "---",
+      "subtitle: Hidden Orbit Subtitle",
+      "tags: ['orbit-one', \"orbit-two\", orbit-one]",
+      "author:",
+      "  - { given: \"Ada\", family: \"Orbit\" }",
+      "  - \"Ada Orbit\"",
+      "  - 'Grace Orbit'",
+      "description: >",
+      "  Hidden Orbit description",
+      "title: >-",
+      "  Folded Orbit",
+      "  Atlas",
+      "aliases: [OrbitAlias]",
+      "---",
+      "",
+      "Body Orbit conclusion.",
+    ].join("\n");
+    const changes: string[] = [];
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Orbit"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Rendered matches:
+    // 1: title ("Folded Orbit Atlas")
+    // 2: author #1 ("Ada Orbit", deduplicated)
+    // 3: author #2 ("Grace Orbit")
+    // 4: tag #1 ('orbit-one', deduplicated)
+    // 5: tag #2 ("orbit-two")
+    // 6: body ("Body Orbit conclusion.")
+    // Excluded from rendered Find: subtitle, duplicate tag 'orbit-one', duplicate author "Ada Orbit", description, aliases.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 6");
+
+    const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+
+    // Step to match 3 / 6 ("Grace Orbit" — second author in the single <dd data-frontmatter-field="author">)
+    act(() => nextButton.click()); // 1 / 6: folded title
+    act(() => nextButton.click()); // 2 / 6: flow author Ada Orbit
+    act(() => nextButton.click()); // 3 / 6: quoted author Grace Orbit
+    expect(host.querySelector("output")?.textContent).toBe("3 / 6");
+
+    // Source matches for "Orbit" (11 total):
+    // 0: subtitle, 1: 'orbit-one', 2: "orbit-two", 3: duplicate orbit-one,
+    // 4: { family: "Orbit" }, 5: duplicate "Ada Orbit", 6: 'Grace Orbit',
+    // 7: description, 8: folded title, 9: OrbitAlias, 10: Body Orbit
+    // Match 3 / 6 ('Grace Orbit') maps to source index 6 -> "7 / 11"!
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("7 / 11");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 6");
+
+    // Step to match 5 / 6 ("orbit-two" tag after deduplicated 'orbit-one') -> source index 2 -> "3 / 11"!
+    act(() => nextButton.click()); // 4 / 6: 'orbit-one'
+    act(() => nextButton.click()); // 5 / 6: "orbit-two"
+    expect(host.querySelector("output")?.textContent).toBe("5 / 6");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 11");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
+    act(() => setInputValue(replaceInput, "phase"));
+    act(() => buttons[0].click());
+    expect(changes.at(-1)).toContain('tags: [\'orbit-one\', "phase-two", orbit-one]');
 
     act(() => root.unmount());
     host.remove();
@@ -398,5 +494,174 @@ describe("ReadingSearch DOM behavior", () => {
     cleanups.forEach((fn) => fn());
     act(() => root.unmount());
     host.remove();
+  });
+
+  it("re-aligns offscreen source reveals across multi-wave window layout changes and cancels on newer selection or manual scroll", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const part0 = "## Intro\n\ntoken-01 start.";
+    const part1 = "## Middle\n\ntoken-25 middle.";
+    const part2 = "## Tail\n\ntoken-45 tail.";
+    let current = `${part0}\n\n${part1}\n\n${part2}`;
+    const computeOffsets = (text: string) => {
+      const blocks = text.split("\n\n## ").map((chunk, idx) => (idx === 0 ? chunk : `## ${chunk}`));
+      const starts: number[] = [];
+      const ends: number[] = [];
+      let cursor = 0;
+      for (const b of blocks) {
+        starts.push(cursor);
+        ends.push(cursor + b.length);
+        cursor += b.length + 2;
+      }
+      return { starts, ends };
+    };
+
+    const scrollTargets: Element[] = [];
+    const origScrollIntoView = Element.prototype.scrollIntoView;
+    let simulatedScrollHeight = 12000;
+    let simulatedScrollTop = 0;
+
+    const renderScene = () => {
+      const { starts, ends } = computeOffsets(current);
+      root.render(
+        <div className="android-document">
+          <ReadingSearch
+            content={current}
+            close={() => {}}
+            initialReplace
+            onChange={(next) => {
+              current = next;
+              renderScene();
+            }}
+          />
+          <section className="android-reading">
+            <div className="document-page">
+              <div className="markdown-body">
+                <section data-windowed-block="" data-windowed-mounted="true" data-source-start={starts[0]} data-source-end={ends[0]}>
+                  <h2>Intro</h2><p>{current.slice(starts[0], ends[0]).split("\n\n")[1]}</p>
+                </section>
+                <section data-windowed-block="" data-windowed-mounted="false" data-source-start={starts[1]} data-source-end={ends[1]}>
+                  <span aria-hidden="true" />
+                </section>
+                <section data-windowed-block="" data-windowed-mounted="false" data-source-start={starts[2]} data-source-end={ends[2]}>
+                  <span aria-hidden="true" />
+                </section>
+              </div>
+            </div>
+          </section>
+        </div>
+      );
+    };
+
+    try {
+      await act(async () => { renderScene(); });
+      const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => simulatedScrollHeight });
+      Object.defineProperty(scroller, "scrollTop", {
+        configurable: true,
+        get: () => simulatedScrollTop,
+        set: (v: number) => { simulatedScrollTop = v; },
+      });
+      Element.prototype.scrollIntoView = function () {
+        scrollTargets.push(this);
+        simulatedScrollTop = 5000;
+      };
+
+      const sections = () => Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      const attachReveal = (idx: number, heading: string, bodyFn: () => string) => {
+        const el = sections()[idx];
+        el.addEventListener("supermd-reveal-window", () => {
+          el.setAttribute("data-windowed-mounted", "true");
+          el.innerHTML = `<h2>${heading}</h2><p>${bodyFn()}</p>`;
+        });
+      };
+      attachReveal(1, "Middle", () => "token-25 middle.");
+      attachReveal(2, "Tail", () => "token-45 tail.");
+
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      act(() => setInputValue(searchInput, "token-\\d+"));
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      act(() => regexBtn.click());
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      // Step to 1 / 3 (Intro), then 2 / 3 (offscreen Middle / token-25).
+      act(() => nextBtn.click());
+      scrollTargets.length = 0;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      expect(sections()[1].getAttribute("data-windowed-mounted")).toBe("true");
+      expect(scrollTargets.length).toBeGreaterThanOrEqual(1);
+
+      // Drain initial RAF chain, then simulate delayed multi-wave WindowedBlock shrinkage.
+      for (let i = 0; i < 5; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+      scrollTargets.length = 0;
+      simulatedScrollHeight = 11100;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(1);
+      expect(scrollTargets[0].textContent).toContain("token-25");
+
+      // Wave 2 shrinkage also re-aligns token-25.
+      scrollTargets.length = 0;
+      simulatedScrollHeight = 10400;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(1);
+      expect(scrollTargets[0].textContent).toContain("token-25");
+
+      // Manual wheel scroll cancels further settle passes immediately.
+      scrollTargets.length = 0;
+      act(() => { scroller.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 120 })); });
+      simulatedScrollHeight = 9900;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(0);
+
+      // Single Replace on 2 / 3 advances to 2 / 2 (Tail / token-45), settles across window changes,
+      // and cancels if the user manually scrolls scroller.scrollTop.
+      const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+      act(() => setInputValue(replaceInput, "item-done"));
+      const replaceSingle = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+      await act(async () => { replaceSingle.click(); });
+      attachReveal(2, "Tail", () => "token-45 tail.");
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+      expect(sections()[2].getAttribute("data-windowed-mounted")).toBe("true");
+
+      for (let i = 0; i < 5; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+      scrollTargets.length = 0;
+      simulatedScrollHeight = 9200;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(1);
+      expect(scrollTargets[0].textContent).toContain("token-45");
+
+      // Newer selection (stepping to 1 / 2) cancels Tail settling and switches target to Intro.
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+      for (let i = 0; i < 5; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+      scrollTargets.length = 0;
+      // Direct manual scrollTop change + scroll event cancels active Intro settle.
+      simulatedScrollTop = 1234;
+      act(() => { scroller.dispatchEvent(new Event("scroll")); });
+      simulatedScrollHeight = 8800;
+      act(() => { scroller.dispatchEvent(new Event("supermd-window-change")); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scrollTargets.length).toBe(0);
+    } finally {
+      Element.prototype.scrollIntoView = origScrollIntoView;
+      act(() => root.unmount());
+      host.remove();
+    }
   });
 });
