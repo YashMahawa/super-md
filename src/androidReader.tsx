@@ -663,7 +663,7 @@ function Reader() {
       // lazy math and fonts). Re-apply the source anchor until it is stable,
       // and stop as soon as the person scrolls, types or opens search/live edit.
       let stopped=false;const stop=()=>{stopped=true;};
-      const inputs=["wheel","touchstart","keydown","pointerdown"] as const;
+      const inputs=["wheel","touchstart","keydown","pointerdown","supermd-goto-offset"] as const;
       inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
       let firstPass=true;
       const apply=()=>{
@@ -712,7 +712,7 @@ function Reader() {
     }
     let stopped=false;
     const stop=()=>{stopped=true;};
-    const inputs=['wheel','touchstart','pointerdown','keydown'] as const;
+    const inputs=['wheel','touchstart','pointerdown','keydown','supermd-goto-offset'] as const;
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
     let firstPass=true;
     const restore=()=>{
@@ -753,7 +753,7 @@ function Reader() {
         preferredSplitPane:splitPane.current,
       });
       const location:ReadingLocation={
-        top:state.mode==='editor'?(snap.editorTop??0):(snap.readingTop??0),
+        top:Math.max(0,state.mode==='editor'?(snap.editorTop??0):(snap.readingTop??0)),
         offset:snap.offset,
         zoom:zoomReference.current,
         mode:state.mode,

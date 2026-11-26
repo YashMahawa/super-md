@@ -675,7 +675,7 @@ export default function App() {
       Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
     let stopped = false;
     const stop = () => { stopped = true; };
-    const inputs = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
+    const inputs = ["wheel", "touchstart", "pointerdown", "keydown", "supermd-goto-offset"] as const;
     inputs.forEach((name) => window.addEventListener(name, stop, { capture: true, passive: true }));
     let firstPass = true;
     const apply = () => {

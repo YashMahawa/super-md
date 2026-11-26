@@ -5,6 +5,7 @@ import {createRoot,type Root} from "react-dom/client";
 import MarkdownPreview from "./components/MarkdownPreview";
 import LiveEditor from "./components/LiveEditor";
 import {readingCaretOffset,readingOffset,revealReadingOffset} from "./readingPosition";
+import {applyDocumentZoom} from "./documentZoom";
 import {applySharedAnchor,captureSharedAnchor,detectSplitPaneFromTarget} from "./sourceAnchor";
 
 (globalThis as unknown as {IS_REACT_ACT_ENVIRONMENT?:boolean}).IS_REACT_ACT_ENVIRONMENT=true;
@@ -258,5 +259,60 @@ describe("readingPosition on deep nested checklists",()=>{
       allowExactTop:true,
     });
     expect(readingRoot.scrollTop).toBe(410);
+  });
+
+  it("refreshes zoomed document-page extent and clamps negative readingTop during same-geometry anchor restore",()=>{
+    host=document.createElement("div");
+    host.innerHTML=`<div class="document-space"><div class="document-page"><p data-source-start="0" data-source-end="50">zoomed</p></div></div>`;
+    document.body.appendChild(host);
+    const space=host.querySelector<HTMLElement>(".document-space")!;
+    const page=host.querySelector<HTMLElement>(".document-page")!;
+    let pageHeight=400;
+    Object.defineProperty(host,"clientWidth",{value:600,configurable:true});
+    Object.defineProperty(host,"clientHeight",{value:400,configurable:true});
+    Object.defineProperty(page,"offsetHeight",{get:()=>pageHeight,configurable:true});
+    host.getBoundingClientRect=()=>({
+      top:0,bottom:400,left:0,right:600,width:600,height:400,x:0,y:0,toJSON:()=>({}),
+    } as DOMRect);
+    page.getBoundingClientRect=()=>({
+      top:0,bottom:pageHeight,left:16,right:584,width:568,height:pageHeight,x:16,y:0,toJSON:()=>({}),
+    } as DOMRect);
+
+    applyDocumentZoom(host,150,100);
+    expect(space.style.height).toBe("600px");
+
+    // Simulate document content expanding before restoring an exact zoomed scrollTop.
+    pageHeight=900;
+    applySharedAnchor({
+      id:"zoomed-note",
+      targetMode:"reader",
+      targetZoom:150,
+      anchor:{
+        offset:0,
+        mode:"reader",
+        zoom:150,
+        readingTop:820,
+      },
+      readingRoot:host,
+      allowExactTop:true,
+    });
+    expect(space.style.height).toBe("1350px");
+    expect(host.scrollTop).toBe(820);
+
+    // Overscroll negative readingTop clamps cleanly to 0.
+    applySharedAnchor({
+      id:"zoomed-note",
+      targetMode:"reader",
+      targetZoom:150,
+      anchor:{
+        offset:0,
+        mode:"reader",
+        zoom:150,
+        readingTop:-24,
+      },
+      readingRoot:host,
+      allowExactTop:true,
+    });
+    expect(host.scrollTop).toBe(0);
   });
 });

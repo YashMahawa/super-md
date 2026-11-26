@@ -178,6 +178,7 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
       { content: draftAContent, common },
     );
     const cmScroller = page.locator(".cm-scroller");
+    await expect(cmScroller).toBeVisible();
     const targetOffset = draftAContent.indexOf("- [ ] 2.3.2.b.iv Secondary Deep Leaf Target");
     expect(targetOffset).toBeGreaterThan(1000);
     await page.evaluate((offset) => window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: offset })), targetOffset);

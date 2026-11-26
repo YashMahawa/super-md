@@ -1,3 +1,4 @@
+import {refreshDocumentExtent} from "./documentZoom";
 import {readingCaretOffset,readingOffset,revealReadingOffset} from "./readingPosition";
 
 export type AnchorViewMode = "reader" | "live" | "editor" | "split";
@@ -172,6 +173,7 @@ export function applySharedAnchor(options:{
       if(readingRoot){
         if(anchor.readingTop!==undefined){
           markProgrammaticAnchorScroll(readingRoot);
+          if(readingRoot.querySelector(".document-page"))refreshDocumentExtent(readingRoot);
           readingRoot.scrollTop=Math.max(0,anchor.readingTop);
         }else revealReadingOffset(readingRoot,anchor.offset,anchor.caretOffset);
       }
@@ -182,6 +184,7 @@ export function applySharedAnchor(options:{
     if(readingRoot){
       if(anchor.readingTop!==undefined){
         markProgrammaticAnchorScroll(readingRoot);
+        if(readingRoot.querySelector(".document-page"))refreshDocumentExtent(readingRoot);
         readingRoot.scrollTop=Math.max(0,anchor.readingTop);
       }else revealReadingOffset(readingRoot,anchor.offset,anchor.caretOffset);
     }
