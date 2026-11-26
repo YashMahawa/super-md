@@ -35,6 +35,11 @@ data class Note(val id: String = UUID.randomUUID().toString(), val name: String 
     val requiresCloseConfirmation get() = if (uri == null) (content.isNotBlank() || assetsDirty) && dirty else dirty
 }
 private class ExternalConflictDetectedException : RuntimeException()
+internal data class OpenDocumentTarget(
+    val uri: Uri,
+    val externalIntentFlags: Int? = null,
+    val externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
+)
 internal const val MAX_AGENT_SNAPSHOT_BYTES = 2 * 1024 * 1024
 internal enum class PortableSaveRecovery { ORIGINAL_INTACT, RESTORE_OUR_WRITE, LEAVE_CONCURRENT_BYTES }
 internal fun agentContentRevision(content: String): String = java.security.MessageDigest.getInstance("SHA-256")
@@ -125,7 +130,23 @@ private val pythonExecution = kotlinx.coroutines.sync.Mutex()
 
 class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
-    private val documentAccess = DocumentAccess(app)
+    private val confirmedTreeDocumentKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val documentAccess = DocumentAccess(
+        context = app,
+        activeFolderUriProvider = { runCatching { mutable.value.folder?.let(Uri::parse) }.getOrNull() },
+        relativeHintProvider = { target ->
+            runCatching {
+                mutable.value.tabs.firstOrNull { it.uri != null && !it.relative.isNullOrEmpty() && sameDocument(Uri.parse(it.uri), target) }?.relative
+                    ?: recentMutable.value.firstOrNull { !it.relative.isNullOrEmpty() && sameDocument(Uri.parse(it.uri), target) }?.relative
+            }.getOrNull()
+        },
+        isConfirmedTreeChildProvider = { treeUri, documentId ->
+            val key = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
+            key in confirmedTreeDocumentKeys ||
+                runCatching { mutable.value.files.any { !it.directory && it.uri == key } }.getOrDefault(false)
+        },
+        onConfirmedTreeKeys = { keys -> confirmedTreeDocumentKeys.addAll(keys) },
+    )
     private val accessRequestsMutable = MutableStateFlow<DocumentAccessRequest?>(null)
     val documentAccessRequests = accessRequestsMutable.asStateFlow()
     private val blockedDocumentWrites = mutableSetOf<String>()
@@ -304,18 +325,53 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     @Volatile internal var readerFlushRequester: (suspend (String) -> Boolean)? = null
     private val readerActionMutex = Mutex()
     private val openRequests = OpenRequestGate()
-    private val openIntentDispatcher = OpenIntentDispatcher<Uri>()
+    private val openIntentDispatcher = OpenIntentDispatcher<OpenDocumentTarget> { left, right -> left.uri == right.uri }
     internal val openDispatcherSessionId: String = java.util.UUID.randomUUID().toString()
     private var initialOpenIntentUri: String? = null
-    fun requestOpen(uri: Uri, relative: String? = null) = openIntentDispatcher.request(uri, relative)
+    fun requestOpen(uri: Uri, relative: String? = null) =
+        openIntentDispatcher.request(OpenDocumentTarget(uri, externalIntentFlags = null), relative)
     fun requestInitialOpen(uri: Uri) {
         val key = uri.toString()
         if (initialOpenIntentUri == key) return
         initialOpenIntentUri = key
         requestOpen(uri)
     }
-    internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>?) = openIntentDispatcher.attach(handler)
-    internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<Uri>) = openIntentDispatcher.detach(handler)
+    internal fun requestExternalOpen(
+        uri: Uri,
+        intentFlags: Int,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
+    ) = openIntentDispatcher.request(
+        OpenDocumentTarget(uri, externalIntentFlags = intentFlags, externalCaller = caller),
+    )
+    internal fun requestInitialExternalOpen(
+        uri: Uri,
+        intentFlags: Int,
+        caller: ExternalIntentCaller = ExternalIntentCaller(),
+    ) {
+        val key = uri.toString()
+        if (initialOpenIntentUri == key) return
+        initialOpenIntentUri = key
+        requestExternalOpen(uri, intentFlags, caller)
+    }
+    internal fun handleExpiredExternalOpenGrant(uri: Uri, initial: Boolean) {
+        if (initial) {
+            val key = uri.toString()
+            if (initialOpenIntentUri == key) return
+            initialOpenIntentUri = key
+        }
+        val existing = mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
+        requestDocumentAccess(uri.toString(), existing, writing = false, explicit = true)
+    }
+    internal fun rejectExternalOpen(uri: Uri, reason: String, initial: Boolean) {
+        if (initial) {
+            val key = uri.toString()
+            if (initialOpenIntentUri == key) return
+            initialOpenIntentUri = key
+        }
+        fail("Could not open note: $reason")
+    }
+    internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>?) = openIntentDispatcher.attach(handler)
+    internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>) = openIntentDispatcher.detach(handler)
     private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
         if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) {
             action()
@@ -361,6 +417,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun remember(note: Note) {
         val uri = note.uri ?: return
+        canonicalTreeDocumentKey(Uri.parse(uri))?.let(confirmedTreeDocumentKeys::add)
         storeRecent(listOf(RecentNote(note.name,uri,note.relative,recentMutable.value.any {sameDocumentUri(it.uri,uri)&&it.pinned}))+recentMutable.value.filterNot {sameDocumentUri(it.uri,uri)})
     }
     private fun storeRecent(notes:List<RecentNote>) {
@@ -378,6 +435,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val closingNoteIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val closedNoteMutex = Mutex()
     private var listedRelative = ""
+    private var listFolderSeq = 0L
+    private var listFolderJob: Job? = null
     private val mutable = MutableStateFlow(restore())
     private val viewModelRetired = AtomicBoolean(false)
     private val recoveryWriter = LatestRecoveryWriter<StudioState, RecoverySnapshotSignature>(
@@ -728,23 +787,38 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         metadataJob?.cancel()
         metadataJob=viewModelScope.launch {
             delay(200)
-            val uris=(mutable.value.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
-            val metadata=withContext(Dispatchers.IO) {
-                uris.mapNotNull {raw->
-                    val uri=Uri.parse(raw)
-                    if(uri.scheme!="content")return@mapNotNull null
-                    when(val info=queryProviderMetadata {
-                        resolver.query(uri,arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),null,null,null)?.use {cursor->
-                            if(cursor.moveToFirst())ProviderMetadata.Found(cursor.getString(0)) else ProviderMetadata.Missing
-                        }
-                    }) {
-                        is ProviderMetadata.Found->info.name?.takeIf {it.isNotBlank()}?.let {raw to it}
-                        ProviderMetadata.Missing->raw to null
-                        ProviderMetadata.Unavailable->null
-                    }
-                }.toMap()
+            val beforeIo=mutable.value
+            val folderSnapshot=beforeIo.folder
+            val relativeSnapshot=normalizeFolderRelative(beforeIo.folderRelative.ifEmpty { listedRelative })
+            val listSeqSnapshot=listFolderSeq
+            val uris=(beforeIo.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
+            val relativeHints=buildMap {
+                recentMutable.value.forEach {r->if(!r.relative.isNullOrEmpty())put(r.uri,r.relative)}
+                beforeIo.tabs.forEach {t->if(t.uri!=null&&!t.relative.isNullOrEmpty())put(t.uri,t.relative)}
             }
+            val confirmedSnapshot=buildSet {
+                addAll(confirmedTreeDocumentKeys)
+                beforeIo.files.forEach {entry->canonicalTreeDocumentKey(Uri.parse(entry.uri))?.let(::add)}
+            }
+            val refreshSnapshot=withContext(Dispatchers.IO) {
+                refreshSafWorkspaceMetadata(
+                    resolver = resolver,
+                    documentAccess = documentAccess,
+                    uris = uris,
+                    relativeHints = relativeHints,
+                    folderUriRaw = folderSnapshot,
+                    listedRelative = relativeSnapshot,
+                    confirmedTreeKeys = confirmedSnapshot,
+                )
+            }
+            confirmedTreeDocumentKeys.addAll(refreshSnapshot.confirmedTreeKeys)
+            val metadata=refreshSnapshot.metadata
             val removed=metadata.filterValues {it==null}.keys
+            removed.forEach { raw ->
+                val parsed = Uri.parse(raw)
+                canonicalTreeDocumentKey(parsed)?.let(confirmedTreeDocumentKeys::remove)
+                confirmedTreeDocumentKeys.removeIf { key -> sameDocument(Uri.parse(key), parsed) }
+            }
             val s=mutable.value
             val discarded=s.tabs.filter {it.uri in removed}
             val recovered=discarded.filter {it.dirty}.map {it.copy(name="Recovered ${it.name}",uri=null,saved="")}
@@ -759,7 +833,26 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
             val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(recents!=recentMutable.value)storeRecent(recents)
-            mutable.value.folder?.let {listFolder(Uri.parse(it),mutable.value.folderRelative.ifEmpty { listedRelative })}
+            val currentFolder=mutable.value.folder
+            if(currentFolder!=null) {
+                val currentRelative=normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { listedRelative })
+                if(currentFolder==folderSnapshot&&currentRelative==relativeSnapshot&&listFolderSeq==listSeqSnapshot&&refreshSnapshot.folderListing!=null) {
+                    refreshSnapshot.folderListing.fold(
+                        onSuccess = {listing->
+                            listedRelative=listing.effectiveRelative
+                            if(listing.effectiveRelative!=relativeSnapshot) {
+                                windowPrefs.edit().putBoolean("folderMigrated",true).putString("folderRelative",listing.effectiveRelative).apply()
+                            }
+                            if(mutable.value.folderRelative!=listing.effectiveRelative||mutable.value.files!=listing.entries) {
+                                mutable.value=mutable.value.copy(folderRelative=listing.effectiveRelative,files=listing.entries)
+                            }
+                        },
+                        onFailure = {error->fail("Could not list folder: ${error.message}")},
+                    )
+                } else {
+                    listFolder(Uri.parse(currentFolder),currentRelative)
+                }
+            }
         }
     }
     private val folderSearchMutable = MutableStateFlow(FolderSearchState())
@@ -769,6 +862,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private var folderSearchJob: Job? = null
 
     init {
+        if (snapshot.exists()) {
+            mutable.value.tabs.mapNotNull { it.uri?.let(Uri::parse)?.let(::canonicalTreeDocumentKey) }.forEach(confirmedTreeDocumentKeys::add)
+        }
         mutable.value.tabs.filter { it.portable && it.uri != null && !it.assetsDirty }.forEach { recordPortableBaseline(it.id, it.assetDirectory) }
         prefs.registerOnSharedPreferenceChangeListener(preferencesChanged)
         observeActive()
@@ -1851,7 +1947,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val extension=note.name.substringAfterLast('.',"md")
             if(!name.contains('.'))name+=".$extension"
             require(name.substringAfterLast('.').equals(extension,true)) {"Rename keeps the note format. Use Export to change formats."}
-            val uri=note.uri?.let {withContext(Dispatchers.IO) {DocumentsContract.renameDocument(resolver,Uri.parse(it),name)?.toString() ?: error("This provider does not support renaming. Use Save as instead.")}}
+            val uri=note.uri?.let {withContext(Dispatchers.IO) {val target=documentAccess.resolve(Uri.parse(it),writing=true);DocumentsContract.renameDocument(resolver,target,name)?.toString() ?: error("This provider does not support renaming. Use Save as instead.")}}
             change {s->s.copy(tabs=s.tabs.map {if(it.id==id)it.copy(name=name,uri=uri,relative=it.relative?.let {r->r.substringBeforeLast('/',"").let {parent->if(parent.isEmpty())name else "$parent/$name"}}) else it})}
             mutable.value.tabs.find {it.id==id}?.let(::remember)
         } catch(error:Exception){fail("Could not rename note: ${error.message}")}
@@ -1876,24 +1972,48 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
         mutable.value.tabs.firstOrNull { it.id == (existing?.id ?: note.id) }?.let(::remember)
     }
-    fun open(uri: Uri, relative: String? = null): Job {
+    fun open(uri: Uri, relative: String? = null): Job =
+        openDocument(uri, relative)
+    internal fun openDocument(
+        uri: Uri,
+        relative: String? = null,
+        externalIntentFlags: Int? = null,
+        externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
+    ): Job {
         val request = openRequests.begin()
         return viewModelScope.launch {
         try {
             val note = withContext(Dispatchers.IO) {
-                documentAccess.persist(uri)
-                val target = documentAccess.resolve(uri)
+                val app = getApplication<Application>()
+                val target = if (externalIntentFlags != null) {
+                    // External Intents must prove their own live caller grant; never manufacture
+                    // access from persisted SAF folder trees or untrusted app-private paths.
+                    uri
+                } else {
+                    documentAccess.persist(uri)
+                    documentAccess.resolve(uri)
+                }
                 val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
                 // Reopening an existing draft must still validate its grant,
                 // but must never reload older disk bytes over its edits.
                 if (existing != null) {
-                    resolver.openInputStream(target)?.use { } ?: error("Document permission is unavailable; choose it again")
+                    val verifyStream = if (externalIntentFlags != null) {
+                        ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
+                    } else {
+                        resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+                    }
+                    verifyStream.use { }
                     return@withContext existing.copy(uri = target.toString())
                 }
-                val name = resolveDisplayName(target)
-                    ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
-                    ?: "Note.md"
-                resolver.openInputStream(target)?.use { stream ->
+                val inputStream = if (externalIntentFlags != null) {
+                    ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
+                } else {
+                    resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+                }
+                inputStream.use { stream ->
+                    val name = resolveDisplayName(target)
+                        ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
+                        ?: "Note.md"
                     val buffered = stream.buffered()
                     buffered.mark(65536)
                     val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
@@ -1901,7 +2021,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
                     if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory).also { recordPortableBaseline(it.id, opened.directory) } }
                     else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF"); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
-                } ?: error("Document permission is unavailable; choose it again")
+                }
             }
             if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
             if (!openRequests.isCurrent(request)) {
@@ -1935,7 +2055,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         require(note.portable && note.uri != null) { "This portable note has no saved destination" }
         require(agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true)) { "The note changed since the supplied revision; no changes were saved" }
         val assets = media.portableAssets(note.assetDirectory)
-        val target = documentAccess.resolve(Uri.parse(note.uri), writing = true)
         val staged = File(getApplication<Application>().cacheDir, "agent-portable-save-${UUID.randomUUID()}.smd.gz")
         var openedDirectory: String? = null
         try { withContext(Dispatchers.IO) {
@@ -1944,6 +2063,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 require(latest == note && agentContentRevision(latest.content).equals(expectedRevision, ignoreCase = true)) {
                     "The note changed since the supplied revision; no changes were saved"
                 }
+                val target = documentAccess.resolve(Uri.parse(latest.uri ?: error("This portable note has no saved destination")), writing = true)
                 val backup = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot read the current portable note")
                 val disk = backup.inputStream().use(media::openFmd)
@@ -2344,10 +2464,25 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             withContext(Dispatchers.IO) { documentAccess.persist(uri) }
             listedRelative = ""
             windowPrefs.edit().putBoolean("folderMigrated", true).putString("folder", uri.toString()).putString("folderRelative", "").apply()
-            change { it.copy(folder = uri.toString(), folderRelative = "") }; listFolder(uri, "")
+            change { it.copy(folder = uri.toString(), folderRelative = "") }
+            val listJob = listFolder(uri, "")
+            if (blockedDocumentWrites.isNotEmpty()) {
+                listJob.join()
+                val candidates = blockedDocumentWrites.toList()
+                val unblocked = withContext(Dispatchers.IO) {
+                    if (!documentAccess.hasWriteGrant(uri)) emptyList()
+                    else candidates.filter { raw ->
+                        val resolved = documentAccess.resolve(Uri.parse(raw), writing = true)
+                        resolved.toString() != raw && documentAccess.hasWriteGrant(resolved)
+                    }
+                }
+                unblocked.forEach(::clearDocumentAccessFailure)
+            }
         } catch (error: Exception) { fail("Could not open folder: ${error.message}") }
     }
     fun closeFolder() {
+        listFolderSeq++
+        listFolderJob?.cancel()
         listedRelative = ""
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").remove("folderRelative").apply()
         change { it.copy(folder = null, folderRelative = "", files = emptyList()) }
@@ -2360,38 +2495,40 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         listFolder(Uri.parse(folderUri), parent)
         return true
     }
-    fun listFolder(uri: Uri, relative: String) = viewModelScope.launch {
-        val requestedRelative = normalizeFolderRelative(relative)
-        listedRelative = requestedRelative
-        mutable.value = mutable.value.copy(folderRelative = requestedRelative)
-        if (mutable.value.folder != null) {
-            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", requestedRelative).apply()
+    fun listFolder(uri: Uri, relative: String): Job {
+        val seq = ++listFolderSeq
+        val invalidPath = hasInvalidSafFolderRelative(relative)
+        val requestedRelative = if (invalidPath) listedRelative else normalizeFolderRelative(relative)
+        if (!invalidPath) {
+            listedRelative = requestedRelative
+            mutable.value = mutable.value.copy(folderRelative = requestedRelative)
+            if (mutable.value.folder != null) {
+                windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", requestedRelative).apply()
+            }
         }
-        try {
-            val (effectiveRelative, entries) = withContext(Dispatchers.IO) {
-                var folder = DocumentFile.fromTreeUri(getApplication(), Uri.parse(mutable.value.folder ?: uri.toString())) ?: error("Choose the folder again to restore access")
-                val resolvedParts = mutableListOf<String>()
-                for (part in requestedRelative.split('/').filter { it.isNotEmpty() }) {
-                    val next = folder.findFile(part)?.takeIf { it.isDirectory } ?: break
-                    folder = next
-                    resolvedParts += part
+        listFolderJob?.cancel()
+        return viewModelScope.launch {
+            try {
+                require(!invalidPath) { "Invalid folder path" }
+                val targetFolder = Uri.parse(mutable.value.folder ?: uri.toString())
+                val pass = SafProjectionPass(resolver)
+                val listing = withContext(Dispatchers.IO) {
+                    listSafFolderListing(resolver, documentAccess, targetFolder, requestedRelative, pass)
                 }
-                val actualRelative = resolvedParts.joinToString("/")
-                val items = folder.listFiles().mapNotNull { f ->
-                    val name = f.name ?: return@mapNotNull null
-                    if (name.startsWith('.')) return@mapNotNull null
-                    if (f.isDirectory || isSearchableNoteName(name)) {
-                        FileEntry(name, f.uri.toString(), f.isDirectory, (if (actualRelative.isEmpty()) "" else "$actualRelative/") + name)
-                    } else null
-                }.sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() })
-                actualRelative to items
+                confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                if (seq == listFolderSeq) {
+                    listedRelative = listing.effectiveRelative
+                    if (mutable.value.folder != null && listing.effectiveRelative != requestedRelative) {
+                        windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", listing.effectiveRelative).apply()
+                    }
+                    mutable.value = mutable.value.copy(folderRelative = listing.effectiveRelative, files = listing.entries)
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (seq == listFolderSeq) fail("Could not list folder: ${error.message}")
             }
-            listedRelative = effectiveRelative
-            if (mutable.value.folder != null && effectiveRelative != requestedRelative) {
-                windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", effectiveRelative).apply()
-            }
-            mutable.value = mutable.value.copy(folderRelative = effectiveRelative, files = entries)
-        } catch (error: Exception) { fail("Could not list folder: ${error.message}") }
+        }.also { listFolderJob = it }
     }
 
     fun openFolderSearch(initialQuery: String? = null) {

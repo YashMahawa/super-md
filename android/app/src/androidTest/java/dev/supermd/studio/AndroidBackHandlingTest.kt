@@ -178,7 +178,7 @@ class AndroidBackHandlingTest {
     @Test fun sourceSearchBackDismissesNativeFindAndCodeMirrorSearchKeepingDraftAndPreservesSecondBack() {
         val workspace = UUID.randomUUID().toString().also(workspaces::add)
         val initial = "# Source Back Test\n\nAlpha needle in source mode."
-        val editedFirst = "# Source Back Test\n\nAlpha needle in source mode.\nDraft kept after Find in note."
+        val editedFirst = "# Source Back Test\n\nAlpha needle in source mode.\nDraft needle kept after Find in note."
         val editedSecond = "$editedFirst\nDraft kept after CodeMirror search and system Back."
 
         ActivityScenario.launch<MainActivity>(
@@ -207,20 +207,29 @@ class AndroidBackHandlingTest {
                 "document.querySelector('.android-source .cm-content')?.textContent?.includes('Alpha needle in source mode.')",
             ) { it == "true" }
 
-            // Edit Source draft directly inside CodeMirror and open native Source Find (ReadingSearch).
+            // Edit Source draft directly inside CodeMirror and open native Source Find/Replace + step matches (#83).
             focusReaderWebView(scenario)
-            appendCodeMirrorText(scenario, "\nDraft kept after Find in note.")
+            appendCodeMirrorText(scenario, "\nDraft needle kept after Find in note.")
             waitUntil { isReaderSynchronized(scenario, editedFirst) }
             javascriptUntil(
                 scenario,
                 """(() => {
                     if (!document.querySelector('.reading-search input')) {
-                        window.supermdFind?.('needle');
+                        window.supermdFind?.('needle', { replace: true });
                     }
                     const input = document.querySelector('.reading-search input');
-                    return Boolean(input && input.value === 'needle');
+                    const replaceInput = document.querySelector('.reading-search .search-replace input[aria-label="Replacement text"]');
+                    const count = document.querySelector('.reading-search output')?.textContent?.trim();
+                    return Boolean(input && input.value === 'needle' && replaceInput && count === '1 / 2');
                 })()""",
             ) { it == "true" }
+            scenario.onActivity { activity ->
+                activity.stepReaderFind?.invoke(1)
+            }
+            javascriptUntil(
+                scenario,
+                "document.querySelector('.reading-search output')?.textContent?.trim()",
+            ) { it == "2 / 2" }
             waitUntil {
                 modelState(scenario).readerOverlay && hasEnabledBackCallbacks(scenario)
             }

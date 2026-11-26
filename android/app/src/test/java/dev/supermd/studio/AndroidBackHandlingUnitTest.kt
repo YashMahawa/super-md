@@ -477,4 +477,64 @@ class AndroidBackHandlingUnitTest {
             shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
         }
     }
+
+    @Test fun findReplaceAndMatchStepShortcutsCoexistWithDismissibleBackAndEscape() {
+        val prefs = app.getSharedPreferences("studio", Context.MODE_PRIVATE)
+        prefs.edit().putBoolean("welcomed", true).putBoolean("motion", false).commit()
+        val workspace = java.util.UUID.randomUUID().toString().also(workspaceKeys::add)
+        val intent = android.content.Intent(app, MainActivity::class.java).putExtra("workspace", workspace)
+        val controller = Robolectric.buildActivity(MainActivity::class.java, intent).setup()
+        try {
+            val activity = controller.get()
+            val model = androidx.lifecycle.ViewModelProvider(activity)[StudioViewModel::class.java]
+            idleUntil { !activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+
+            val openedReplaceFlags = mutableListOf<Boolean>()
+            val stepDirections = mutableListOf<Int>()
+            var dismissCalls = 0
+            activity.openReaderFind = { replace -> openedReplaceFlags += replace }
+            activity.stepReaderFind = { direction -> stepDirections += direction }
+            activity.dismissDocument = {
+                dismissCalls += 1
+                applyReaderDismissResult(
+                    model,
+                    JSONObject.quote(
+                        JSONObject()
+                            .put("dismissed", true)
+                            .put("overlay", false)
+                            .put("image", false)
+                            .put("dismissible", false)
+                            .toString(),
+                    ),
+                )
+            }
+
+            assertTrue(
+                activity.handleShortcut(
+                    android.view.KeyEvent(0L, 0L, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_H, 0, android.view.KeyEvent.META_CTRL_ON),
+                ),
+            )
+            assertEquals(listOf(true), openedReplaceFlags)
+
+            assertTrue(
+                activity.handleShortcut(
+                    android.view.KeyEvent(0L, 0L, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_F3, 0, 0),
+                ),
+            )
+            assertEquals(listOf(1), stepDirections)
+
+            model.readerDismissible(true)
+            idleUntil { activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+            assertTrue(
+                activity.handleShortcut(
+                    android.view.KeyEvent(0L, 0L, android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_ESCAPE, 0, 0),
+                ),
+            )
+            assertEquals(1, dismissCalls)
+            idleUntil { !model.state.value.readerDismissible && !activity.onBackPressedDispatcher.hasEnabledCallbacks() }
+        } finally {
+            runCatching { controller.pause().stop().destroy() }
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(32))
+        }
+    }
 }

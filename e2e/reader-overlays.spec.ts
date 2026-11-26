@@ -142,12 +142,16 @@ test('Android Back dismisses active Live edits and Source search synchronously w
   await expect(page.locator('.android-source .cm-content')).toBeVisible();
   await page.evaluate(()=>{
     window.dispatchEvent(new CustomEvent('supermd-goto-offset',{detail:1000000}));
-    window.dispatchEvent(new CustomEvent('supermd-format',{detail:{block:true,prefix:'\nDraft line kept across Source search Back.'}}));
-    window.supermdFind?.('needle');
+    window.dispatchEvent(new CustomEvent('supermd-format',{detail:{block:true,prefix:'\nDraft line kept across Source search Back with needle beta.'}}));
+    window.supermdFind?.('needle',{replace:true});
   });
   const sourceFindField=page.getByRole('searchbox',{name:'Find in note'});
   await expect(sourceFindField).toHaveValue('needle');
   await expect(sourceFindField).toBeFocused();
+  await expect(page.getByRole('textbox',{name:'Replacement text'})).toBeVisible();
+  await expect(page.getByRole('search').locator('output')).toHaveText('1 / 2');
+  await page.evaluate(()=>window.supermdFindStep?.(1));
+  await expect(page.getByRole('search').locator('output')).toHaveText('2 / 2');
   await page.waitForTimeout(750);
   await expect(sourceFindField).toBeFocused();
   expect(await page.evaluate(()=>document.documentElement.dataset.readerOverlay)).toBe('true');
@@ -160,7 +164,7 @@ test('Android Back dismisses active Live edits and Source search synchronously w
   });
   expect(firstFindBack).toEqual({dismissed:true,overlay:false,dismissible:false});
   await expect(page.locator('.reading-search')).toHaveCount(0);
-  await expect(page.locator('.android-source .cm-content')).toContainText('Draft line kept across Source search Back.');
+  await expect(page.locator('.android-source .cm-content')).toContainText('Draft line kept across Source search Back with needle beta.');
   await page.screenshot({path:'/tmp/android-source-search-after-back.png'});
   expect(await page.evaluate(()=>Boolean(window.supermdDismiss?.()))).toBe(false);
 
@@ -178,7 +182,7 @@ test('Android Back dismisses active Live edits and Source search synchronously w
   });
   expect(cmSearchBack).toEqual({dismissed:true,overlay:false,dismissible:false});
   await expect(page.locator('.cm-search')).toHaveCount(0);
-  await expect(page.locator('.android-source .cm-content')).toContainText('Draft line kept across Source search Back.');
+  await expect(page.locator('.android-source .cm-content')).toContainText('Draft line kept across Source search Back with needle beta.');
   expect(await page.evaluate(()=>Boolean(window.supermdDismiss?.()))).toBe(false);
 
   const dismissibleSignals=await page.evaluate(()=>((window as any).__bridgeEvents as Array<{command:string;args:{open:boolean}}>).filter(e=>e.command==='reader_dismissible_changed').map(e=>e.args.open));
