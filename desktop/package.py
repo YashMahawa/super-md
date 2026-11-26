@@ -14,8 +14,14 @@ if __package__:
     from .core.paths import SOURCE_ROOT
     from .scripts.package_runtime import wayland_dependencies
 else:
-    from core.paths import SOURCE_ROOT
-    from scripts.package_runtime import wayland_dependencies
+    try:
+        from core.paths import SOURCE_ROOT
+        from scripts.package_runtime import wayland_dependencies
+    except ModuleNotFoundError as _exc:
+        if _exc.name not in ("core", "core.paths", "scripts", "scripts.package_runtime"):
+            raise
+        from desktop.core.paths import SOURCE_ROOT
+        from desktop.scripts.package_runtime import wayland_dependencies
 
 ROOT = SOURCE_ROOT
 OUTPUT = ROOT / "desktop/dist"
