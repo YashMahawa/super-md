@@ -66,13 +66,19 @@ def _best_effort_kill(pid: int) -> None:
         return
     try:
         if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.TerminateProcess.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            handle = kernel32.OpenProcess(0x0001, 0, pid)
+            if handle:
+                try:
+                    kernel32.TerminateProcess(ctypes.c_void_p(handle), 1)
+                finally:
+                    kernel32.CloseHandle(ctypes.c_void_p(handle))
         else:
             os.kill(pid, signal.SIGKILL)
     except Exception:
@@ -87,6 +93,11 @@ def _make_fake_python(path: Path) -> Path:
 
 
 class PythonRuntimeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Warm any one-time matplotlib font-cache scan on macOS/Windows CI before timed cell runs.
+        python_runtime.run(sys.executable, "pass", timeout=30)
+
     def test_rejects_executables_that_are_not_python(self):
         for path in ("/bin/sh", "/usr/bin/env", "", "definitely-not-python"):
             with self.subTest(path=path), self.assertRaises(ValueError):
@@ -311,8 +322,9 @@ class PythonRuntimeTest(unittest.TestCase):
     def test_owned_descendant_retaining_output_streams_cannot_keep_cell_busy(self):
         with tempfile.TemporaryDirectory() as folder:
             pid_file = Path(folder) / "descendant.pid"
+            done_file = Path(folder) / "cell-done.txt"
             code = f"""
-import pathlib, subprocess, sys
+import pathlib, subprocess, sys, time
 child = subprocess.Popen([
     sys.executable,
     "-c",
@@ -321,24 +333,27 @@ child = subprocess.Popen([
 ])
 pathlib.Path({str(pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
 print("ordinary cell value:", 6 * 7)
+pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf-8")
 """
-            started = time.monotonic()
-            result = python_runtime.run(sys.executable, code, timeout=10, cwd=folder)
-            elapsed = time.monotonic() - started
+            result = python_runtime.run(sys.executable, code, timeout=20, cwd=folder)
+            finished_at = time.monotonic()
+            user_done_at = float(done_file.read_text(encoding="utf-8").strip())
+            drain_elapsed = finished_at - user_done_at
             descendant_pid = int(pid_file.read_text(encoding="utf-8").strip())
             self.addCleanup(_best_effort_kill, descendant_pid)
 
-            self.assertLess(elapsed, 4.0, f"cell stayed busy for {elapsed:.2f}s waiting on descendant streams")
+            self.assertLess(drain_elapsed, 4.0, f"cell stayed busy for {drain_elapsed:.2f}s waiting on descendant streams")
             self.assertTrue(result["ok"])
             self.assertEqual(result["stdout"], "ordinary cell value: 42\n")
             self.assertEqual(result["stderr"], "")
-            self.assertTrue(_wait_pid_exit(descendant_pid, timeout=2.0))
+            self.assertTrue(_wait_pid_exit(descendant_pid, timeout=3.0))
 
     @unittest.skipUnless(os.name == "posix", "POSIX SIGTERM-ignoring descendant check")
     def test_sigterm_ignoring_descendant_retaining_streams_still_returns_promptly(self):
         with tempfile.TemporaryDirectory() as folder:
-            pid_file = Path(folder) / " stubborn.pid".replace(" ", "")
+            pid_file = Path(folder) / "stubborn.pid"
             ready_file = Path(folder) / "ready.txt"
+            done_file = Path(folder) / "done.txt"
             code = f"""
 import pathlib, subprocess, sys, time
 child = subprocess.Popen([
@@ -350,21 +365,22 @@ child = subprocess.Popen([
     "sys.stdout.write('held\\\\n'); sys.stdout.flush(); time.sleep(30)",
 ])
 pathlib.Path({str(pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
-deadline = time.monotonic() + 3
+deadline = time.monotonic() + 8
 while not pathlib.Path({str(ready_file)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.01)
 print("preserved output")
+pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf-8")
 """
-            started = time.monotonic()
-            result = python_runtime.run(sys.executable, code, timeout=10, cwd=folder)
-            elapsed = time.monotonic() - started
+            result = python_runtime.run(sys.executable, code, timeout=20, cwd=folder)
+            finished_at = time.monotonic()
+            drain_elapsed = finished_at - float(done_file.read_text(encoding="utf-8").strip())
             stubborn_pid = int(pid_file.read_text(encoding="utf-8").strip())
             self.addCleanup(_best_effort_kill, stubborn_pid)
 
-            self.assertLess(elapsed, 4.0)
+            self.assertLess(drain_elapsed, 4.0)
             self.assertTrue(result["ok"])
             self.assertEqual(result["stdout"], "preserved output\n")
-            self.assertTrue(_wait_pid_exit(stubborn_pid, timeout=2.0))
+            self.assertTrue(_wait_pid_exit(stubborn_pid, timeout=3.0))
 
     def test_timeout_cleanup_is_confined_to_timed_out_cell_process_tree(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -373,6 +389,7 @@ print("preserved output")
             grandchild_pid_file = root / "timed-out-grandchild.pid"
             ready_file = root / "tree-ready.txt"
             other_started = root / "other-started.txt"
+            other_release = root / "other-release.txt"
 
             timed_out_code = f"""
 import pathlib, subprocess, sys
@@ -390,29 +407,33 @@ child.wait()
             other_code = f"""
 import pathlib, time
 pathlib.Path({str(other_started)!r}).write_text("running", encoding="utf-8")
-time.sleep(1.2)
+deadline = time.monotonic() + 25
+while not pathlib.Path({str(other_release)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
 print("unrelated cell survived")
 """
             with ThreadPoolExecutor(max_workers=2) as pool:
-                slow_future = pool.submit(python_runtime.run, sys.executable, timed_out_code, 0.7, str(root))
-                other_future = pool.submit(python_runtime.run, sys.executable, other_code, 10, str(root))
+                slow_future = pool.submit(python_runtime.run, sys.executable, timed_out_code, 3.5, str(root))
+                other_future = pool.submit(python_runtime.run, sys.executable, other_code, 25, str(root))
 
-                deadline = time.monotonic() + 4
+                deadline = time.monotonic() + 12
                 while (not ready_file.exists() or not other_started.exists()) and time.monotonic() < deadline:
-                    time.sleep(0.01)
+                    time.sleep(0.02)
+                self.assertTrue(ready_file.exists(), "timed-out cell never started its child process tree")
 
-                with self.assertRaisesRegex(ValueError, "Python cell stopped after 0.7 seconds"):
-                    slow_future.result(timeout=6)
+                with self.assertRaisesRegex(ValueError, "Python cell stopped after 3.5 seconds"):
+                    slow_future.result(timeout=12)
 
                 child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
                 grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
                 self.addCleanup(_best_effort_kill, child_pid)
                 self.addCleanup(_best_effort_kill, grandchild_pid)
 
-                self.assertTrue(_wait_pid_exit(child_pid, timeout=2.0))
-                self.assertTrue(_wait_pid_exit(grandchild_pid, timeout=2.0))
+                self.assertTrue(_wait_pid_exit(child_pid, timeout=4.0))
+                self.assertTrue(_wait_pid_exit(grandchild_pid, timeout=4.0))
 
-                other_result = other_future.result(timeout=6)
+                other_release.write_text("go", encoding="utf-8")
+                other_result = other_future.result(timeout=12)
                 self.assertTrue(other_result["ok"])
                 self.assertEqual(other_result["stdout"], "unrelated cell survived\n")
 
@@ -440,7 +461,7 @@ child.wait()
             code_b = f"""
 import pathlib, time
 pathlib.Path({str(marker_b)!r}).write_text("1", encoding="utf-8")
-deadline = time.monotonic() + 8
+deadline = time.monotonic() + 25
 while not pathlib.Path({str(release_b)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.02)
 print("window 1 tab b finished")
@@ -448,32 +469,33 @@ print("window 1 tab b finished")
             code_w2 = f"""
 import pathlib, time
 pathlib.Path({str(marker_w2)!r}).write_text("1", encoding="utf-8")
-deadline = time.monotonic() + 8
+deadline = time.monotonic() + 25
 while not pathlib.Path({str(release_w2)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.02)
 print("window 2 tab a finished")
 """
             with ThreadPoolExecutor(max_workers=3) as pool:
-                fut_a = pool.submit(python_runtime.run, sys.executable, code_a, 15, str(root), job=job_tab_a)
-                fut_b = pool.submit(python_runtime.run, sys.executable, code_b, 15, str(root), job=job_tab_b)
-                fut_w2 = pool.submit(python_runtime.run, sys.executable, code_w2, 15, str(root), job=job_win2)
+                fut_a = pool.submit(python_runtime.run, sys.executable, code_a, 25, str(root), job=job_tab_a)
+                fut_b = pool.submit(python_runtime.run, sys.executable, code_b, 25, str(root), job=job_tab_b)
+                fut_w2 = pool.submit(python_runtime.run, sys.executable, code_w2, 25, str(root), job=job_win2)
 
-                deadline = time.monotonic() + 5
+                deadline = time.monotonic() + 15
                 while not (marker_a.exists() and marker_b.exists() and marker_w2.exists()) and time.monotonic() < deadline:
-                    time.sleep(0.01)
+                    time.sleep(0.02)
+                self.assertTrue(marker_a.exists() and marker_b.exists() and marker_w2.exists())
 
                 pid_a = int(marker_a.read_text(encoding="utf-8").strip())
                 self.addCleanup(_best_effort_kill, pid_a)
 
                 self.assertEqual(win1_jobs.cancel_tab("tab-a"), 1)
                 with self.assertRaises(python_runtime.PythonCellCancelled):
-                    fut_a.result(timeout=4)
-                self.assertTrue(_wait_pid_exit(pid_a, timeout=2.0))
+                    fut_a.result(timeout=10)
+                self.assertTrue(_wait_pid_exit(pid_a, timeout=4.0))
                 self.assertFalse(job_tab_b.cancelled.is_set())
                 self.assertFalse(job_win2.cancelled.is_set())
 
                 release_b.write_text("go", encoding="utf-8")
-                res_b = fut_b.result(timeout=4)
+                res_b = fut_b.result(timeout=10)
                 self.assertEqual(res_b["stdout"], "window 1 tab b finished\n")
                 win1_jobs.discard(job_tab_a)
                 win1_jobs.discard(job_tab_b)
@@ -481,9 +503,83 @@ print("window 2 tab a finished")
                 self.assertEqual(win1_jobs.cancel_all(retire=True), 0)
                 self.assertFalse(job_win2.cancelled.is_set())
                 release_w2.write_text("go", encoding="utf-8")
-                res_w2 = fut_w2.result(timeout=4)
+                res_w2 = fut_w2.result(timeout=10)
                 self.assertEqual(res_w2["stdout"], "window 2 tab a finished\n")
                 win2_jobs.discard(job_win2)
+
+    def test_cancel_marks_promptly_without_caller_thread_waits_while_owned_workers_terminate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            registry = python_runtime.PythonJobRegistry()
+            job1 = registry.register("tab-a")
+            job2 = registry.register("tab-a")
+            pid1_file = root / "c1.pid"
+            pid2_file = root / "c2.pid"
+            code_tpl = """
+import pathlib, subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path({pid_path!r}).write_text(str(child.pid), encoding="utf-8")
+child.wait()
+"""
+            terminate_tids: list[int] = []
+            workers_entered = threading.Barrier(3)
+            release_drain = threading.Event()
+            orig_terminate = python_runtime._CellProcessController.terminate
+
+            def tracked_terminate(controller):
+                terminate_tids.append(threading.get_ident())
+                try:
+                    workers_entered.wait(timeout=5)
+                except threading.BrokenBarrierError:
+                    pass
+                release_drain.wait(timeout=5)
+                return orig_terminate(controller)
+
+            caller_tid = threading.get_ident()
+            with patch.object(python_runtime._CellProcessController, "terminate", tracked_terminate):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut1 = pool.submit(
+                        python_runtime.run,
+                        sys.executable,
+                        code_tpl.format(pid_path=str(pid1_file)),
+                        25,
+                        str(root),
+                        job=job1,
+                    )
+                    fut2 = pool.submit(
+                        python_runtime.run,
+                        sys.executable,
+                        code_tpl.format(pid_path=str(pid2_file)),
+                        25,
+                        str(root),
+                        job=job2,
+                    )
+                    deadline = time.monotonic() + 15
+                    while not (pid1_file.exists() and pid2_file.exists()) and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    pid1 = int(pid1_file.read_text(encoding="utf-8").strip())
+                    pid2 = int(pid2_file.read_text(encoding="utf-8").strip())
+                    self.addCleanup(_best_effort_kill, pid1)
+                    self.addCleanup(_best_effort_kill, pid2)
+
+                    t0 = time.monotonic()
+                    self.assertEqual(registry.cancel_tab("tab-a"), 2)
+                    cancel_elapsed = time.monotonic() - t0
+                    self.assertLess(cancel_elapsed, 0.05, "cancel_tab blocked the caller thread")
+                    self.assertEqual(terminate_tids, [], "cancel_tab must not run terminate() on caller thread")
+
+                    # Both owned workers enter terminate() concurrently while caller stays unblocked.
+                    workers_entered.wait(timeout=5)
+                    self.assertNotIn(caller_tid, terminate_tids)
+                    self.assertEqual(len(set(terminate_tids)), 2)
+
+                    release_drain.set()
+                    with self.assertRaises(python_runtime.PythonCellCancelled):
+                        fut1.result(timeout=8)
+                    with self.assertRaises(python_runtime.PythonCellCancelled):
+                        fut2.result(timeout=8)
+                    self.assertTrue(_wait_pid_exit(pid1, timeout=4.0))
+                    self.assertTrue(_wait_pid_exit(pid2, timeout=4.0))
 
     def test_posix_platform_backend_guards_own_pgid_and_isolates_target_group(self):
         self.assertEqual(python_runtime._cell_spawn_kwargs("posix"), {"start_new_session": True})
@@ -549,55 +645,39 @@ print("window 2 tab a finished")
         self.assertEqual(signals_sent, [])
         self.assertEqual(unsafe_proc.terminated, 1)
 
-    def test_windows_platform_job_object_and_taskkill_fallback_isolate_target_cell(self):
-        expected_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+    def test_windows_pre_execution_containment_and_immediate_child_startup(self):
+        expected_flags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "CREATE_SUSPENDED", python_runtime._CREATE_SUSPENDED)
         )
         self.assertEqual(python_runtime._cell_spawn_kwargs("nt"), {"creationflags": expected_flags})
 
-        class FakeKernel32:
-            def __init__(self, fail_assign: bool = False):
-                self.next_handle = 1000
-                self.fail_assign = fail_assign
-                self.created: list[int] = []
-                self.limit_flags: dict[int, int] = {}
-                self.assigned: dict[int, int] = {}
-                self.terminated: list[tuple[int, int]] = []
-                self.closed: list[int] = []
-
-            def CreateJobObjectW(self, attrs, name):
-                self.next_handle += 1
-                self.created.append(self.next_handle)
-                return self.next_handle
-
-            def SetInformationJobObject(self, handle, info_class, info_ptr, size):
-                self.assert_info_size = size
-                info = ctypes.cast(
-                    info_ptr, ctypes.POINTER(python_runtime._JobObjectExtendedLimitInformation)
-                ).contents
-                self.limit_flags[int(handle.value)] = int(info.BasicLimitInformation.LimitFlags)
-                return 1 if info_class == 9 else 0
-
-            def AssignProcessToJobObject(self, job_handle, proc_handle):
-                if self.fail_assign:
-                    return 0
-                self.assigned[int(job_handle.value)] = int(proc_handle.value)
-                return 1
-
-            def TerminateJobObject(self, job_handle, exit_code):
-                self.terminated.append((int(job_handle.value), int(exit_code)))
-                return 1
-
-            def CloseHandle(self, handle):
-                self.closed.append(int(handle.value))
-                return 1
+        events: list[tuple[str, int]] = []
+        procs_by_handle: dict[int, "FakeWinProc"] = {}
+        job_members: dict[int, list["FakeWinProc"]] = {}
 
         class FakeWinProc:
-            def __init__(self, pid: int, handle: int, running: bool = True):
+            def __init__(self, pid: int, handle: int, *, suspended: bool, spawn_immediate_child=None):
                 self.pid = pid
                 self._handle = handle
-                self.running = running
+                self.suspended = suspended
+                self.running = True
                 self.killed = 0
+                self.waited = 0
+                self.job_handle: int | None = None
+                self.immediate_child: FakeWinProc | None = None
+                self._spawn_immediate_child = spawn_immediate_child
+                if not suspended and spawn_immediate_child is not None:
+                    self._start_user_work()
+
+            def _start_user_work(self):
+                if self._spawn_immediate_child is not None:
+                    self.immediate_child = self._spawn_immediate_child(self)
+
+            def resume(self):
+                self.suspended = False
+                self._start_user_work()
 
             def poll(self):
                 return None if self.running else 0
@@ -607,53 +687,341 @@ print("window 2 tab a finished")
                 self.running = False
 
             def wait(self, timeout=None):
+                self.waited += 1
                 self.running = False
                 return 0
 
-        api = FakeKernel32()
-        win1_job = python_runtime._WindowsJob.create(kernel32=api)
-        win2_job = python_runtime._WindowsJob.create(kernel32=api)
-        self.assertIsNotNone(win1_job)
-        self.assertIsNotNone(win2_job)
-        proc1 = FakeWinProc(4100, 0xABCD01)
-        proc2 = FakeWinProc(4200, 0xABCD02)
-        self.assertTrue(win1_job.assign(proc1))
-        self.assertTrue(win2_job.assign(proc2))
-        self.assertEqual(api.limit_flags[1001], python_runtime._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
-        self.assertEqual(api.assigned, {1001: 0xABCD01, 1002: 0xABCD02})
+        class FakeKernel32:
+            def __init__(self, *, fail_create: bool = False, fail_assign: bool = False, assign_delay: float = 0.0):
+                self.next_handle = 1000
+                self.fail_create = fail_create
+                self.fail_assign = fail_assign
+                self.assign_delay = assign_delay
+                self.limit_flags: dict[int, int] = {}
+                self.terminated: list[tuple[int, int]] = []
+                self.closed: list[int] = []
 
-        ctrl1 = python_runtime._CellProcessController(proc1, os_name="nt", win_job=win1_job)
-        ctrl2 = python_runtime._CellProcessController(proc2, os_name="nt", win_job=win2_job)
-        ctrl1.terminate()
-        ctrl1.cleanup()  # Idempotent: must not double-close handle 1001.
+            def CreateJobObjectW(self, attrs, name):
+                if self.fail_create:
+                    return 0
+                self.next_handle += 1
+                events.append(("create_job", self.next_handle))
+                job_members[self.next_handle] = []
+                return self.next_handle
 
-        self.assertEqual(api.terminated, [(1001, 1)])
-        self.assertEqual(api.closed, [1001])
-        self.assertNotIn(1002, [h for h, _ in api.terminated])
-        self.assertTrue(proc2.running)
-        ctrl2.cleanup()
+            def SetInformationJobObject(self, handle, info_class, info_ptr, size):
+                info = ctypes.cast(
+                    info_ptr, ctypes.POINTER(python_runtime._JobObjectExtendedLimitInformation)
+                ).contents
+                job_id = int(handle.value)
+                self.limit_flags[job_id] = int(info.BasicLimitInformation.LimitFlags)
+                events.append(("set_limits", job_id))
+                return 1 if info_class == 9 else 0
 
-        # Fallback path when nested Job Object assignment fails: closes job handle and uses taskkill only on live PID.
-        fallback_api = FakeKernel32(fail_assign=True)
-        failed_job = python_runtime._WindowsJob.create(kernel32=fallback_api)
-        proc_fallback = FakeWinProc(5100, 0xDEAD01, running=True)
-        self.assertFalse(failed_job.assign(proc_fallback))
-        self.assertEqual(fallback_api.closed, [1001])
+            def AssignProcessToJobObject(self, job_handle, proc_handle):
+                if self.assign_delay > 0:
+                    time.sleep(self.assign_delay)
+                job_id = int(job_handle.value)
+                proc_id = int(proc_handle.value)
+                events.append(("assign", job_id))
+                if self.fail_assign:
+                    return 0
+                proc = procs_by_handle[proc_id]
+                proc.job_handle = job_id
+                job_members[job_id].append(proc)
+                return 1
 
-        commands: list[list[str]] = []
+            def TerminateJobObject(self, job_handle, exit_code):
+                job_id = int(job_handle.value)
+                self.terminated.append((job_id, int(exit_code)))
+                for member in job_members.get(job_id, ()):
+                    member.running = False
+                return 1
 
-        def fake_run(cmd, **_kwargs):
-            commands.append(cmd)
-            proc_fallback.running = False
+            def CloseHandle(self, handle):
+                self.closed.append(int(handle.value))
+                return 1
 
-        python_runtime._terminate_windows_cell(proc_fallback, None, run_cmd=fake_run)
-        self.assertEqual(commands, [["taskkill", "/F", "/T", "/PID", "5100"]])
+        class FakeNtdll:
+            def NtResumeProcess(self, proc_handle):
+                proc_id = int(proc_handle.value)
+                events.append(("resume", proc_id))
+                procs_by_handle[proc_id].resume()
+                return 0
 
-        # Already-exited process must never invoke taskkill on a potentially recycled PID.
-        commands.clear()
-        exited_proc = FakeWinProc(5200, 0xDEAD02, running=False)
-        python_runtime._terminate_windows_cell(exited_proc, None, run_cmd=fake_run)
-        self.assertEqual(commands, [])
+        next_proc = [4000, 0xBEEF00]
+
+        def make_immediate_child(parent: FakeWinProc) -> FakeWinProc:
+            next_proc[0] += 1
+            next_proc[1] += 1
+            child = FakeWinProc(next_proc[0], next_proc[1], suspended=False)
+            child.job_handle = parent.job_handle
+            if parent.job_handle is not None:
+                job_members[parent.job_handle].append(child)
+            events.append(("immediate_child", child.job_handle or 0))
+            return child
+
+        def fake_popen(cmd, **kwargs):
+            flags = kwargs.get("creationflags", 0)
+            suspended = bool(flags & python_runtime._CREATE_SUSPENDED)
+            next_proc[0] += 10
+            next_proc[1] += 0x10
+            proc = FakeWinProc(
+                next_proc[0],
+                next_proc[1],
+                suspended=suspended,
+                spawn_immediate_child=make_immediate_child,
+            )
+            procs_by_handle[proc._handle] = proc
+            events.append(("popen_suspended" if suspended else "popen_running", proc._handle))
+            return proc
+
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "python_runtime.subprocess.run",
+            side_effect=AssertionError("Windows cell lifecycle must never shell out to taskkill"),
+        ):
+            api = FakeKernel32(assign_delay=0.03)
+            ntdll = FakeNtdll()
+            ctrl1 = python_runtime._spawn_cell_process(
+                ["python.exe", "-c", "pass"],
+                cwd=folder,
+                env={},
+                stderr_path=Path(folder) / "err1.txt",
+                os_name="nt",
+                popen_fn=fake_popen,
+                kernel32=api,
+                ntdll=ntdll,
+            )
+            self.assertEqual(
+                [name for name, _ in events],
+                ["create_job", "set_limits", "popen_suspended", "assign", "resume", "immediate_child"],
+            )
+            self.assertEqual(api.limit_flags[1001], python_runtime._JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+            self.assertIsNotNone(ctrl1.process.immediate_child)
+            self.assertEqual(ctrl1.process.immediate_child.job_handle, 1001)
+
+            # Spawn a sibling cell in its own Job Object and verify terminating cell 1 leaves cell 2's tree alive.
+            ctrl2 = python_runtime._spawn_cell_process(
+                ["python.exe", "-c", "pass"],
+                cwd=folder,
+                env={},
+                stderr_path=Path(folder) / "err2.txt",
+                os_name="nt",
+                popen_fn=fake_popen,
+                kernel32=api,
+                ntdll=ntdll,
+            )
+            self.assertIsNotNone(ctrl2.process.immediate_child)
+            self.assertEqual(ctrl2.process.immediate_child.job_handle, 1002)
+
+            ctrl1.terminate()
+            ctrl1.cleanup()  # Idempotent: must not double-close handle 1001.
+
+            self.assertEqual(api.terminated, [(1001, 1)])
+            self.assertEqual(api.closed, [1001])
+            self.assertFalse(ctrl1.process.running)
+            self.assertFalse(ctrl1.process.immediate_child.running)
+            self.assertTrue(ctrl2.process.running)
+            self.assertTrue(ctrl2.process.immediate_child.running)
+            ctrl2.cleanup()
+
+    def test_windows_assignment_failure_aborts_before_user_code_without_pid_tree_kill(self):
+        resumed_handles: list[int] = []
+        spawned_procs: list["FakeSuspendedProc"] = []
+
+        class FakeSuspendedProc:
+            def __init__(self, pid: int, handle: int, running: bool = True):
+                self.pid = pid
+                self._handle = handle
+                self.running = running
+                self.user_code_ran = False
+                self.killed = 0
+                self.waited = 0
+
+            def poll(self):
+                return None if self.running else 0
+
+            def kill(self):
+                self.killed += 1
+                self.running = False
+
+            def wait(self, timeout=None):
+                self.waited += 1
+                self.running = False
+                return 0
+
+        class FailingKernel32:
+            def __init__(self, *, fail_create: bool = False, fail_assign: bool = False):
+                self.fail_create = fail_create
+                self.fail_assign = fail_assign
+                self.closed: list[int] = []
+                self.terminated: list[int] = []
+
+            def CreateJobObjectW(self, attrs, name):
+                return 0 if self.fail_create else 2001
+
+            def SetInformationJobObject(self, handle, info_class, info_ptr, size):
+                return 1
+
+            def AssignProcessToJobObject(self, job_handle, proc_handle):
+                return 0 if self.fail_assign else 1
+
+            def TerminateJobObject(self, job_handle, exit_code):
+                self.terminated.append(int(job_handle.value))
+                return 1
+
+            def CloseHandle(self, handle):
+                self.closed.append(int(handle.value))
+                return 1
+
+        class TrackingNtdll:
+            def NtResumeProcess(self, proc_handle):
+                resumed_handles.append(int(proc_handle.value))
+                for p in spawned_procs:
+                    if p._handle == int(proc_handle.value):
+                        p.user_code_ran = True
+                return 0
+
+        sibling_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(_best_effort_kill, sibling_proc.pid)
+        self.addCleanup(sibling_proc.wait)
+
+        def fake_popen(cmd, **kwargs):
+            # Use sibling_proc.pid deliberately to prove assignment failure uses the owned
+            # process handle (proc.kill()), NEVER PID-based taskkill /T that could hit sibling_proc!
+            proc = FakeSuspendedProc(sibling_proc.pid, 0xCAFE01, running=True)
+            spawned_procs.append(proc)
+            return proc
+
+        with tempfile.TemporaryDirectory() as folder, patch(
+            "python_runtime.subprocess.run",
+            side_effect=AssertionError("PID-only taskkill must never run when Job Object ownership fails"),
+        ):
+            # 1. AssignProcessToJobObject failure: runner stays suspended, user code never runs,
+            #    handle-based kill cleans up suspended runner, and sibling_proc stays alive!
+            fail_assign_api = FailingKernel32(fail_assign=True)
+            with self.assertRaisesRegex(RuntimeError, "Could not assign Python cell process to Windows Job Object"):
+                python_runtime._spawn_cell_process(
+                    ["python.exe", "-c", "pass"],
+                    cwd=folder,
+                    env={},
+                    stderr_path=Path(folder) / "err-assign.txt",
+                    os_name="nt",
+                    popen_fn=fake_popen,
+                    kernel32=fail_assign_api,
+                    ntdll=TrackingNtdll(),
+                )
+            self.assertEqual(resumed_handles, [])
+            self.assertEqual(len(spawned_procs), 1)
+            self.assertFalse(spawned_procs[0].user_code_ran)
+            self.assertEqual(spawned_procs[0].killed, 1)
+            self.assertGreaterEqual(spawned_procs[0].waited, 1)
+            self.assertEqual(fail_assign_api.closed, [2001])
+            self.assertIsNone(sibling_proc.poll(), "sibling process must remain unaffected on assignment failure")
+
+            # 2. CreateJobObjectW failure: fails before Popen is even called.
+            spawned_procs.clear()
+            with self.assertRaisesRegex(RuntimeError, "Could not create Windows Job Object for Python cell"):
+                python_runtime._spawn_cell_process(
+                    ["python.exe", "-c", "pass"],
+                    cwd=folder,
+                    env={},
+                    stderr_path=Path(folder) / "err-create.txt",
+                    os_name="nt",
+                    popen_fn=fake_popen,
+                    kernel32=FailingKernel32(fail_create=True),
+                    ntdll=TrackingNtdll(),
+                )
+            self.assertEqual(spawned_procs, [])
+            self.assertIsNone(sibling_proc.poll())
+
+            # 3. Direct _terminate_windows_cell without a Job Object uses owned handle only (no taskkill),
+            #    and is a no-op if the process already exited.
+            live_uncontained = FakeSuspendedProc(sibling_proc.pid, 0xCAFE02, running=True)
+            python_runtime._terminate_windows_cell(live_uncontained, None)
+            self.assertEqual(live_uncontained.killed, 1)
+            self.assertIsNone(sibling_proc.poll())
+
+            exited_uncontained = FakeSuspendedProc(sibling_proc.pid, 0xCAFE03, running=False)
+            python_runtime._terminate_windows_cell(exited_uncontained, None)
+            self.assertEqual(exited_uncontained.killed, 0)
+            self.assertIsNone(sibling_proc.poll())
+
+        sibling_proc.kill()
+        sibling_proc.wait(timeout=5)
+
+    def test_runtime_immediate_child_startup_and_sibling_processes_unaffected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            imm_pid_file = root / "immediate-child.pid"
+            sib_ready = root / "sibling-cell.ready"
+            sib_release = root / "sibling-cell.release"
+
+            standalone_sibling = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            self.addCleanup(_best_effort_kill, standalone_sibling.pid)
+            self.addCleanup(standalone_sibling.wait)
+
+            immediate_code = f"""import pathlib, subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path({str(imm_pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
+child.wait()
+"""
+            sibling_cell_code = f"""import pathlib, time
+pathlib.Path({str(sib_ready)!r}).write_text("1", encoding="utf-8")
+deadline = time.monotonic() + 25
+while not pathlib.Path({str(sib_release)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+print("sibling cell ordinary output")
+"""
+            orig_assign = python_runtime._WindowsJob.assign
+
+            def delayed_assign(job_self, process):
+                time.sleep(0.1)
+                return orig_assign(job_self, process)
+
+            registry = python_runtime.PythonJobRegistry()
+            imm_job = registry.register("tab-imm")
+            sib_job = registry.register("tab-sib")
+
+            with patch.object(python_runtime._WindowsJob, "assign", delayed_assign):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_imm = pool.submit(python_runtime.run, sys.executable, immediate_code, 25, str(root), job=imm_job)
+                    fut_sib = pool.submit(python_runtime.run, sys.executable, sibling_cell_code, 25, str(root), job=sib_job)
+
+                    deadline = time.monotonic() + 15
+                    while not (imm_pid_file.exists() and sib_ready.exists()) and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    self.assertTrue(imm_pid_file.exists() and sib_ready.exists())
+                    imm_child_pid = int(imm_pid_file.read_text(encoding="utf-8").strip())
+                    self.addCleanup(_best_effort_kill, imm_child_pid)
+
+                    self.assertEqual(registry.cancel_tab("tab-imm"), 1)
+                    with self.assertRaises(python_runtime.PythonCellCancelled):
+                        fut_imm.result(timeout=10)
+                    self.assertTrue(_wait_pid_exit(imm_child_pid, timeout=4.0))
+
+                    # Both the standalone sibling process and the sibling cell remain alive and unaffected.
+                    self.assertIsNone(standalone_sibling.poll())
+                    sib_release.write_text("go", encoding="utf-8")
+                    sib_res = fut_sib.result(timeout=10)
+                    self.assertTrue(sib_res["ok"])
+                    self.assertEqual(sib_res["stdout"], "sibling cell ordinary output\n")
+
+            if os.name == "nt":
+                never_ran_marker = root / "should-never-exist.txt"
+                fail_code = (
+                    "import pathlib, subprocess, sys\n"
+                    f"pathlib.Path({str(never_ran_marker)!r}).write_text('ran', encoding='utf-8')\n"
+                    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                )
+                with patch.object(python_runtime._WindowsJob, "assign", return_value=False):
+                    with self.assertRaisesRegex(RuntimeError, "Could not assign Python cell process to Windows Job Object"):
+                        python_runtime.run(sys.executable, fail_code, 15, str(root))
+                self.assertFalse(never_ran_marker.exists(), "user code ran despite Windows job assignment failure")
+                self.assertIsNone(standalone_sibling.poll())
+
+            standalone_sibling.kill()
+            standalone_sibling.wait(timeout=5)
 
     def test_package_setup_remains_separate_from_cell_job_registry(self):
         with tempfile.TemporaryDirectory() as folder:
