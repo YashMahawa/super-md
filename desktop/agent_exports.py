@@ -16,11 +16,11 @@ from typing import Any
 
 try:
     from . import documents
-    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component, normalize_fence_language
+    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _scan_read_only, _symlink_component
     from .frontmatter import strip_frontmatter
 except ImportError:
     import documents
-    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component, normalize_fence_language
+    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _scan_read_only, _symlink_component
     from frontmatter import strip_frontmatter
 
 DEFAULT_PDF_OPTIONS = {
@@ -245,21 +245,8 @@ def _image_destinations(markdown: str) -> list[str]:
 
 
 def _contains_unsupported_diagrams(markdown: str) -> bool:
-    markdown = strip_frontmatter(markdown)
-    fence_char = None
-    fence_size = 0
-    for line in markdown.splitlines():
-        match = _FENCE.match(line)
-        if not match:
-            continue
-        marker = match.group(1)
-        if fence_char is None:
-            if normalize_fence_language(line[match.end():]) in ("mermaid", "smd-chart"):
-                return True
-            fence_char, fence_size = marker[0], len(marker)
-        elif marker[0] == fence_char and len(marker) >= fence_size:
-            fence_char = None
-    return False
+    _, fences = _scan_read_only(strip_frontmatter(markdown), collect_fences=True)
+    return any(span.language in ("mermaid", "smd-chart") for span in fences)
 
 
 def _resolve_image_assets(store: DocumentStore, note: Path, markdown: str,

@@ -57,6 +57,9 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("zoom_out", "Zoom out", [f"{primary}+-"]),
         ("zoom_reset", "Reset zoom", [f"{primary}+0"]),
         ("typewriter_scroll", "Toggle typewriter scrolling", [f"{primary}+Alt+T"]),
+        ("new_folder_note", "New note in folder", [f"{primary}+Alt+N"]),
+        ("new_subfolder", "New subfolder", [f"{primary}+Alt+Shift+N"]),
+        ("rename_entry", "Rename note or folder", ["F2"]),
     )
 
 

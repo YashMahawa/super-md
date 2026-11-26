@@ -108,11 +108,20 @@ class AgentExportsTest(unittest.TestCase):
         with self.assertRaises(RevisionConflict):
             export_pdf(self.store, "asset.md", "art.pdf", engine=self.engine)
         chart = self.root / "chart.md"
-        for header in ("```mermaid", "```{mermaid}", "```{.mermaid}", "```{mermaid, fig-width=6}"):
-            chart.write_text(f"{header}\ngraph TD; A-->B\n```\n", encoding="utf-8")
+        for body in (
+            "```mermaid\ngraph TD; A-->B\n```\n",
+            "```{mermaid}\ngraph TD; A-->B\n```\n",
+            "```{.mermaid}\ngraph TD; A-->B\n```\n",
+            "```{mermaid, fig-width=6}\ngraph TD; A-->B\n```\n",
+            "~~~{.mermaid echo=false}\ngraph TD; A-->B",
+        ):
+            chart.write_text(body, encoding="utf-8")
             with self.assertRaisesRegex(AgentDocumentError, "does not render Mermaid"):
                 export_pdf(self.store, "chart.md", "chart.pdf", engine=self.engine)
             self.assertFalse((self.root / "chart.pdf").exists())
+        chart.write_text("```{mermaid\nplain code with unclosed brace\n```\n", encoding="utf-8")
+        export_pdf(self.store, "chart.md", "unclosed-brace.pdf", engine=self.engine)
+        self.assertTrue((self.root / "unclosed-brace.pdf").read_bytes().startswith(b"%PDF-"))
 
     def test_pdf_export_discovers_html_and_obsidian_images_and_renders_standalone_diagrams_and_breaks(self):
         from agent_exports import _image_destinations

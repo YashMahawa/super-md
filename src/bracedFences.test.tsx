@@ -237,5 +237,11 @@ describe("braced Python and Mermaid fence parsing", () => {
 
     const hits = agentSearch(source, "needle", 10, 0, { excludeDiagrams: true });
     expect(hits.matches.map(m => m.line)).toEqual([1, 7, 9]);
+
+    const unclosedMermaid = "Outside needle\n```{.mermaid, fig-width=6}\ngraph LR\n  needle --> B";
+    expect(agentSearch(unclosedMermaid, "needle", 10, 0, { excludeDiagrams: true }).matches.map(m => m.line)).toEqual([1]);
+
+    const unclosedBrace = "Outside needle\n```{mermaid\nneedle in plain code\n```";
+    expect(agentSearch(unclosedBrace, "needle", 10, 0, { excludeDiagrams: true }).matches.map(m => m.line)).toEqual([1, 3]);
   });
 });
