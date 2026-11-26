@@ -6,15 +6,17 @@ import {visit} from 'unist-util-visit';
 import type {Root} from 'mdast';
 import {remarkObsidianMath} from './obsidianMath';
 import {remarkSvgBlocks} from './svgBlocks';
-import {remarkSourceSyntax} from './markdownSource';
+import {remarkImageAttributes,remarkSourceSyntax} from './markdownSource';
+import {remarkStudySyntax} from './studySyntax';
+import {parseFrontmatter,type ParsedFrontmatter} from './frontmatter';
 import {headingSlug} from './headingSlug';
 
 export interface SourceBlock {start:number;end:number;text:string}
 export interface OutlineEntry {id:string;title:string;level:number;offset:number}
 export interface PythonCellSource {source:string;ordinal:number;offset:number}
-export interface DocumentAnalysis {tree:Root;blocks:SourceBlock[];outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
+export interface DocumentAnalysis {tree:Root;blocks:SourceBlock[];bodyBlocks:SourceBlock[];frontmatter:ParsedFrontmatter|null;outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
 export interface SourceDocumentAnalysis {source:string;analysis:DocumentAnalysis}
-const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).use(remarkSvgBlocks);
+const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use([remarkImageAttributes,remarkSvgBlocks,remarkStudySyntax]);
 const cache=new Map<string,{value:DocumentAnalysis;weight:number}>();let retained=0;
 const LIMIT=8_000_000;
 function textOf(node:any):string{return typeof node.value==='string'?node.value:(node.children||[]).map(textOf).join('');}
@@ -23,6 +25,7 @@ function textOf(node:any):string{return typeof node.value==='string'?node.value:
  * derived syntax is cached; source remains owned by the document/revision. */
 export function analyzeDocument(source:string):DocumentAnalysis {
   const hit=cache.get(source);if(hit){cache.delete(source);cache.set(source,hit);return hit.value;}
+  const frontmatter=parseFrontmatter(source),fmEnd=frontmatter?.end??0;
   const tree=processor.runSync(processor.parse(source),source) as Root;
   const outline:OutlineEntry[]=[],tasks:number[]=[],pythonCells:PythonCellSource[]=[],counts=new Map<string,number>(),pythonCounts=new Map<string,number>();let weight=source.length*2;
   visit(tree,(node:any)=>{
@@ -43,7 +46,8 @@ export function analyzeDocument(source:string):DocumentAnalysis {
   });
   const nodes=tree.children.filter(node=>node.position?.start.offset!==undefined);
   const blocks=nodes.length?nodes.map((node,index)=>{const start=index?node.position!.start.offset!:0,end=nodes[index+1]?.position?.start.offset??source.length;return {start,end,text:source.slice(start,end)};}):[{start:0,end:source.length,text:source}];
-  const value={tree,blocks,outline,tasks,pythonCells};
+  const bodyBlocks=nodes.length?nodes.map((node,index)=>{const firstStart=fmEnd?Math.max(fmEnd,source.lastIndexOf('\n',node.position!.start.offset!-1)+1):0,start=index?node.position!.start.offset!:firstStart,end=nodes[index+1]?.position?.start.offset??source.length;return {start,end,text:source.slice(start,end)};}):[{start:fmEnd,end:source.length,text:source.slice(fmEnd)}];
+  const value={tree,blocks,bodyBlocks,frontmatter,outline,tasks,pythonCells};
   if(weight<=LIMIT){cache.set(source,{value,weight});retained+=weight;while(retained>LIMIT||cache.size>16){const first=cache.keys().next().value!;retained-=cache.get(first)!.weight;cache.delete(first);}}
   return value;
 }

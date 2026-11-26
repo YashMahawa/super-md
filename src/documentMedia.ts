@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
+import { maskFrontmatter } from "./frontmatter";
 import { remarkObsidianMath } from "./obsidianMath";
 
 export interface ImportedImage { source: string; alt: string }
@@ -13,7 +14,7 @@ export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&"
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
 export function imageRanges(markdown: string): ImageRange[] {
-  const tree = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath).parse(markdown);
+  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
   const definitions = new Map<string, string>(); const result: ImageRange[] = [];
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
   visit(tree, (node: any) => {
@@ -54,9 +55,27 @@ export async function importImageUrl(url: string): Promise<ImportedImage> {
   return (await invoke<ImportedImage[]>("import_images", { images: [{ name, data: result.body }] }))[0];
 }
 export function readImage(file: File): Promise<string> {
-  if (!/^image\/(png|jpeg|gif|webp|avif|svg\+xml)$/.test(file.type) && !/\.svg$/i.test(file.name)) return Promise.reject(new Error(`Unsupported image: ${file.name}`));
+  const mimeFromExt =
+    /\.png$/i.test(file.name) ? "image/png" :
+    /\.jpe?g$/i.test(file.name) ? "image/jpeg" :
+    /\.gif$/i.test(file.name) ? "image/gif" :
+    /\.webp$/i.test(file.name) ? "image/webp" :
+    /\.avif$/i.test(file.name) ? "image/avif" :
+    /\.svg$/i.test(file.name) ? "image/svg+xml" : "";
+  const normalizedType = file.type.split(";")[0].trim().toLowerCase();
+  const effectiveType = /^image\/(png|jpeg|gif|webp|avif|svg\+xml)$/.test(normalizedType)
+    ? normalizedType
+    : (!normalizedType || normalizedType === "application/octet-stream" || ((normalizedType === "text/xml" || normalizedType === "application/xml") && mimeFromExt === "image/svg+xml"))
+      ? mimeFromExt
+      : "";
+  if (!effectiveType) return Promise.reject(new Error(`Unsupported image: ${file.name}`));
   if (file.size > 25_000_000) return Promise.reject(new Error("Images must be smaller than 25 MB."));
-  return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result).replace(/^data:application\/octet-stream/, "data:image/svg+xml")); reader.onerror = () => reject(reader.error); reader.readAsDataURL(file.type ? file : new Blob([file], { type: "image/svg+xml" })); });
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).replace(/^data:[^;]+/, `data:${effectiveType}`));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file.type === effectiveType ? file : new Blob([file], { type: effectiveType }));
+  });
 }
 export async function importImageFiles(files: File[]): Promise<ImportedImage[]> {
   if (files.length > 32 || files.reduce((sum, file) => sum + file.size, 0) > 75_000_000) throw new Error("Insert at most 32 images / 75 MB at a time.");
@@ -66,8 +85,8 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
 export async function prepareFmd(markdown: string, documentPath: string | null) {
-  const processor = unified().use(remarkParse).use(remarkGfm).use(remarkMath).use(remarkObsidianMath);
-  const tree = processor.parse(markdown);
+  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
+  const tree = processor.parse(maskFrontmatter(markdown));
   const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
   const shared = new Map<string, Promise<string>>();
   const edits: Array<{ start: number; end: number; value: string }> = [];

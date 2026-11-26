@@ -1,0 +1,147 @@
+package dev.supermd.studio
+
+import android.net.Uri
+import androidx.webkit.WebViewAssetLoader
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import java.io.ByteArrayInputStream
+
+@RunWith(RobolectricTestRunner::class)
+class ReaderBridgeInterceptorTest {
+    private fun createLoader(capabilities: ReaderAssetCapabilities): WebViewAssetLoader {
+        val context = RuntimeEnvironment.getApplication()
+        val assetHandler = ReaderAssetPathHandler(
+            capabilities,
+            open = { _, _, fingerprint ->
+                OpenReaderAsset("image/png", fingerprint, ByteArrayInputStream(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)))
+            },
+            noteIsOpen = { true },
+        )
+        return WebViewAssetLoader.Builder()
+            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
+            .addPathHandler("/reader-assets/", assetHandler)
+            .build()
+    }
+
+    @Test
+    fun blocksDirectExternalHttpHttpsFileAndUnmappedRequestsNeverReturningNull() {
+        val capabilities = ReaderAssetCapabilities()
+        val loader = createLoader(capabilities)
+
+        for (blockedUrl in listOf(
+            "https://evil.example/beacon.png",
+            "http://evil.example/beacon.png",
+            "file:///etc/hosts",
+            "content://media/external/images/media/1",
+            "https://appassets.androidplatform.net/unmapped/secret.txt",
+        )) {
+            val response = interceptReaderRequest(loader, Uri.parse(blockedUrl), "GET")
+            assertNotNull("Expected non-null blocking response for $blockedUrl", response)
+            assertEquals("Expected 403 for $blockedUrl", 403, response.statusCode)
+            assertEquals("no-store", response.responseHeaders["Cache-Control"])
+            assertEquals(-1, response.data.read())
+        }
+
+        val postAttempt = interceptReaderRequest(
+            loader,
+            Uri.parse("https://appassets.androidplatform.net/assets/web/android-reader.html"),
+            "POST",
+        )
+        assertEquals(403, postAttempt.statusCode)
+    }
+
+    @Test
+    fun servesRegisteredReaderAssetCapabilitiesAndReportsMissingBundledAssetsAs404() {
+        val capabilities = ReaderAssetCapabilities()
+        val capability = capabilities.register("note-1", "diagrams/chart.png", "image/png", "rev-1")!!
+        val loader = createLoader(capabilities)
+
+        val assetUrl = "${ReaderAssetPathHandler.URL_PREFIX}${capability.token}?v=${capability.fingerprint}"
+        val assetResponse = interceptReaderRequest(loader, Uri.parse(assetUrl), "GET")
+        assertEquals(200, assetResponse.statusCode)
+        assertEquals("image/png", assetResponse.mimeType)
+        assertEquals(0x89, assetResponse.data.read() and 0xFF)
+        assetResponse.data.close()
+
+        val missingBundled = interceptReaderRequest(
+            loader,
+            Uri.parse("https://appassets.androidplatform.net/assets/web/does-not-exist.js"),
+            "GET",
+        )
+        assertEquals(404, missingBundled.statusCode)
+        assertEquals("no-store", missingBundled.responseHeaders["Cache-Control"])
+
+        val fakeHtmlLoader = WebViewAssetLoader.Builder()
+            .addPathHandler("/assets/") { path ->
+                if (path == "web/android-reader.html") {
+                    android.webkit.WebResourceResponse(
+                        "text/html",
+                        null,
+                        ByteArrayInputStream("<!doctype html><html></html>".toByteArray(Charsets.UTF_8)),
+                    )
+                } else {
+                    null
+                }
+            }
+            .build()
+        val htmlResponse = interceptReaderRequest(
+            fakeHtmlLoader,
+            Uri.parse("https://appassets.androidplatform.net/assets/web/android-reader.html"),
+            "GET",
+        )
+        assertEquals("text/html", htmlResponse.mimeType)
+        assertEquals("UTF-8", htmlResponse.encoding)
+        htmlResponse.data.close()
+    }
+
+    @Test
+    fun allowsMainReaderAndMermaidSandboxSubframeWhileOverridingUntrustedNavigations() {
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("https://appassets.androidplatform.net/assets/web/android-reader.html"),
+                isForMainFrame = true,
+            ),
+        )
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("https://appassets.androidplatform.net/assets/web/android-reader.html#section-1"),
+                isForMainFrame = true,
+            ),
+        )
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html"),
+                isForMainFrame = false,
+            ),
+        )
+        assertFalse(
+            shouldOverrideReaderNavigation(
+                Uri.parse("about:blank"),
+                isForMainFrame = false,
+            ),
+        )
+
+        for ((blockedUrl, mainFrame) in listOf(
+            "https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html" to true,
+            "https://appassets.androidplatform.net/assets/web/android-reader.html" to false,
+            "https://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html?x=1" to false,
+            "https://appassets.androidplatform.net/assets/web/assets/other.html" to false,
+            "http://appassets.androidplatform.net/assets/web/assets/mermaid-sandbox-jTIoFmLD.html" to false,
+            "https://evil.example/subframe.html" to false,
+            "https://evil.example/page.html" to true,
+            "file:///etc/hosts" to false,
+            "data:text/html,<script>alert(1)</script>" to false,
+        )) {
+            assertTrue(
+                "Expected navigation override for $blockedUrl (mainFrame=$mainFrame)",
+                shouldOverrideReaderNavigation(Uri.parse(blockedUrl), isForMainFrame = mainFrame),
+            )
+        }
+    }
+}

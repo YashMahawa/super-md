@@ -15,17 +15,257 @@ import org.json.JSONObject
 import java.io.File
 import java.io.InputStream
 import java.io.BufferedInputStream
+import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.URL
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.Deflater
 import java.util.zip.GZIPOutputStream
 
+internal const val PORTABLE_GZIP_LEVEL = 3
+private const val MAX_VALIDATED_ASSETS = 512
+private const val MAX_CACHED_LOCAL_ASSETS = 256
+private const val MAX_CACHED_LOCAL_CHARS = 48_000_000L
+
 /** Attachments live outside Markdown and recovery snapshots. FMD is the shareable envelope. */
 class MediaStorage(private val context: Context) {
+    companion object {
+        const val UNSUPPORTED_DROP_IMAGE_MESSAGE = "Only supported images (PNG, JPEG, GIF, WebP, AVIF, or SVG) can be dropped into a note."
+        private val SUPPORTED_IMAGE_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
+
+        internal fun resolveDroppedImageMime(name: String?, providerMime: String?): String? {
+            val extMime = when (name?.substringAfterLast('.', "")?.lowercase()) {
+                "png" -> "image/png"
+                "jpg", "jpeg" -> "image/jpeg"
+                "gif" -> "image/gif"
+                "webp" -> "image/webp"
+                "avif" -> "image/avif"
+                "svg" -> "image/svg+xml"
+                else -> null
+            }
+            val normalized = providerMime?.substringBefore(';')?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+            if (normalized != null) {
+                if (normalized in SUPPORTED_IMAGE_MIMES) return normalized
+                if (normalized.startsWith("image/")) return null
+                if (normalized == "application/octet-stream") return extMime
+                if ((normalized == "text/xml" || normalized == "application/xml") && extMime == "image/svg+xml") return extMime
+                return null
+            }
+            return extMime
+        }
+    }
+    data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int)
     private val attachments = File(context.filesDir, "attachments").apply { mkdirs() }
     private val bundles = File(context.filesDir, "portable-assets").apply { mkdirs() }
+
+    internal val portableBase64Decodes = AtomicInteger(0)
+    internal val portableBase64Encodes = AtomicInteger(0)
+    internal val portableAssetExtractions = AtomicInteger(0)
+
+    internal fun resetPortableCounters() {
+        portableBase64Decodes.set(0)
+        portableBase64Encodes.set(0)
+        portableAssetExtractions.set(0)
+    }
+
+    private data class ValidatedAssetMeta(
+        val ref: WeakReference<String>,
+        val mime: String,
+        val decodedSize: Int,
+    )
+
+    private data class LocalFileStamp(
+        val canonicalPath: String,
+        val length: Long,
+        val lastModifiedNanos: Long,
+        val creationTimeNanos: Long,
+        val fileKey: Any?,
+    )
+
+    private data class CachedLocalAsset(
+        val mime: String,
+        val decodedSize: Int,
+        val dataUrl: String,
+    )
+
+    private val cacheLock = Any()
+    private val validatedAssetMeta = LinkedHashMap<Int, MutableList<ValidatedAssetMeta>>(128, 0.75f, true)
+    private val localFileCache = LinkedHashMap<LocalFileStamp, CachedLocalAsset>(64, 0.75f, true)
+    private var cachedLocalChars = 0L
+    private var invalidationEpoch = 0L
+
+    internal var localFileBytesReader: (File) -> ByteArray = { it.readBytes() }
+
+    internal fun cachedLocalAssetCount(): Int = synchronized(cacheLock) { localFileCache.size }
+
+    private fun cacheableAppAssetFile(file: File): File? {
+        if (runCatching { Files.isSymbolicLink(file.toPath()) }.getOrDefault(true)) return null
+        return containedFile(bundles, file) ?: containedFile(attachments, file)
+    }
+
+    private fun localFileStampOrNull(canonical: File): LocalFileStamp? {
+        val attrs = runCatching {
+            Files.readAttributes(canonical.toPath(), BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        }.getOrNull() ?: return null
+        if (!attrs.isRegularFile) return null
+        return LocalFileStamp(
+            canonicalPath = canonical.path,
+            length = attrs.size(),
+            lastModifiedNanos = attrs.lastModifiedTime().to(TimeUnit.NANOSECONDS),
+            creationTimeNanos = attrs.creationTime().to(TimeUnit.NANOSECONDS),
+            fileKey = attrs.fileKey(),
+        )
+    }
+
+    internal fun invalidateLocalAsset(file: File) {
+        val targetPath = runCatching { file.canonicalPath }.getOrDefault(file.absolutePath)
+        val targetPrefix = targetPath + File.separator
+        synchronized(cacheLock) {
+            invalidationEpoch++
+            val iterator = localFileCache.entries.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (entry.key.canonicalPath == targetPath || entry.key.canonicalPath.startsWith(targetPrefix)) {
+                    cachedLocalChars -= entry.value.dataUrl.length
+                    iterator.remove()
+                }
+            }
+        }
+    }
+
+    private fun cacheValidatedDataUrl(data: String, mime: String, decodedSize: Int) {
+        if (data.length > 34_000_000) return
+        val hash = System.identityHashCode(data)
+        synchronized(cacheLock) {
+            val bucket = validatedAssetMeta.getOrPut(hash) { mutableListOf() }
+            bucket.removeAll { it.ref.get() == null || it.ref.get() === data }
+            bucket.add(ValidatedAssetMeta(WeakReference(data), mime, decodedSize))
+            while (validatedAssetMeta.size > MAX_VALIDATED_ASSETS) {
+                val eldestKey = validatedAssetMeta.entries.firstOrNull()?.key ?: break
+                validatedAssetMeta.remove(eldestKey)
+            }
+        }
+    }
+
+    private fun lookupValidatedMeta(data: String): Pair<String, Int>? {
+        val hash = System.identityHashCode(data)
+        synchronized(cacheLock) {
+            val bucket = validatedAssetMeta[hash] ?: return null
+            val iterator = bucket.iterator()
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                val target = entry.ref.get()
+                if (target == null) {
+                    iterator.remove()
+                } else if (target === data) {
+                    return entry.mime to entry.decodedSize
+                }
+            }
+            if (bucket.isEmpty()) validatedAssetMeta.remove(hash)
+        }
+        return null
+    }
+
+    private fun putCachedLocalAssetLocked(stamp: LocalFileStamp, mime: String, decodedSize: Int, dataUrl: String) {
+        localFileCache.remove(stamp)?.let { cachedLocalChars -= it.dataUrl.length }
+        localFileCache[stamp] = CachedLocalAsset(mime, decodedSize, dataUrl)
+        cachedLocalChars += dataUrl.length
+        while (localFileCache.size > MAX_CACHED_LOCAL_ASSETS || cachedLocalChars > MAX_CACHED_LOCAL_CHARS) {
+            val eldest = localFileCache.entries.firstOrNull() ?: break
+            cachedLocalChars -= eldest.value.dataUrl.length
+            localFileCache.remove(eldest.key)
+        }
+    }
+
+    private fun cacheStableLocalAsset(
+        canonical: File,
+        expectedStamp: LocalFileStamp,
+        expectedEpoch: Long,
+        mime: String,
+        decodedSize: Int,
+        dataUrl: String,
+    ) {
+        cacheValidatedDataUrl(dataUrl, mime, decodedSize)
+        if (dataUrl.length.toLong() > MAX_CACHED_LOCAL_CHARS) return
+        synchronized(cacheLock) {
+            if (invalidationEpoch != expectedEpoch) return
+            val currentStamp = localFileStampOrNull(canonical) ?: return
+            if (currentStamp != expectedStamp) return
+            putCachedLocalAssetLocked(expectedStamp, mime, decodedSize, dataUrl)
+        }
+    }
+
+    private fun cacheWrittenLocalAsset(file: File, mime: String, decodedSize: Int, dataUrl: String) {
+        cacheValidatedDataUrl(dataUrl, mime, decodedSize)
+        if (dataUrl.length.toLong() > MAX_CACHED_LOCAL_CHARS) return
+        val canonical = cacheableAppAssetFile(file) ?: return
+        val beforeEpoch = synchronized(cacheLock) { invalidationEpoch }
+        val beforeStamp = localFileStampOrNull(canonical) ?: return
+        if (beforeStamp.length != decodedSize.toLong()) return
+        synchronized(cacheLock) {
+            if (invalidationEpoch != beforeEpoch) return
+            val afterStamp = localFileStampOrNull(canonical) ?: return
+            if (afterStamp != beforeStamp) return
+            putCachedLocalAssetLocked(beforeStamp, mime, decodedSize, dataUrl)
+        }
+    }
+
+    private fun parsePortableDataHeader(data: String): Pair<String, Int> {
+        require(data.length <= 34_000_000) { "Image exceeds 25 MB" }
+        val comma = data.indexOf(',')
+        require(comma > 0) { "Unsupported image data" }
+        val header = data.substring(0, comma)
+        require(header.matches(Regex("data:image/(png|jpeg|gif|webp|avif|svg\\+xml);base64"))) { "Unsupported image data" }
+        return header.removePrefix("data:").removeSuffix(";base64") to (comma + 1)
+    }
+
+    private fun requireValidBase64Payload(data: String, start: Int): Boolean {
+        var nonWsCount = 0
+        var paddingCount = 0
+        var sawWhitespace = false
+        for (index in start until data.length) {
+            when (val ch = data[index]) {
+                ' ', '\n', '\r', '\t' -> sawWhitespace = true
+                '=' -> {
+                    nonWsCount++
+                    paddingCount++
+                    require(paddingCount <= 2) { "Invalid base64 image data" }
+                }
+                in 'A'..'Z', in 'a'..'z', in '0'..'9', '+', '/' -> {
+                    require(paddingCount == 0) { "Invalid base64 image data" }
+                    nonWsCount++
+                }
+                else -> throw IllegalArgumentException("Invalid base64 image data")
+            }
+        }
+        require(nonWsCount % 4 == 0) { "Invalid base64 image data" }
+        return !sawWhitespace
+    }
+
+    private fun validateAssetMeta(data: String, knownValidated: String? = null): Pair<String, Int> {
+        lookupValidatedMeta(data)?.let { return it }
+        if (knownValidated != null && knownValidated.length == data.length && knownValidated == data) {
+            lookupValidatedMeta(knownValidated)?.let { meta ->
+                cacheValidatedDataUrl(data, meta.first, meta.second)
+                return meta
+            }
+        }
+        val localMatch = synchronized(cacheLock) {
+            localFileCache.values.firstOrNull { it.dataUrl.length == data.length && it.dataUrl == data }
+        }
+        if (localMatch != null) {
+            cacheValidatedDataUrl(data, localMatch.mime, localMatch.decodedSize)
+            return localMatch.mime to localMatch.decodedSize
+        }
+        val (type, bytes) = decode(data)
+        return type to bytes.size
+    }
 
     fun createEmptyPortableDirectory(): String {
         val id = UUID.randomUUID().toString()
@@ -34,21 +274,51 @@ class MediaStorage(private val context: Context) {
     }
     private val key = Regex("assets/[a-zA-Z0-9_.-]{1,150}")
     private fun gzip(output: java.io.OutputStream) = object : GZIPOutputStream(output, 8192) {
-        init { def.setLevel(Deflater.BEST_COMPRESSION) }
+        init { def.setLevel(PORTABLE_GZIP_LEVEL) }
     }
     fun validKey(source: String) = key.matches(source) && source.substringAfter('/') !in listOf(".", "..")
     private fun mime(name: String) = when(name.substringAfterLast('.').lowercase()) {
         "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"; "avif" -> "image/avif"; "svg" -> "image/svg+xml"; else -> error("Choose a supported image (PNG, JPEG, GIF, WebP, AVIF or SVG)")
     }
     private fun decode(data: String): Pair<String, ByteArray> {
-        require(data.length <= 34_000_000) { "Image exceeds 25 MB" }
-        val header = data.substringBefore(',')
-        require(header.matches(Regex("data:image/(png|jpeg|gif|webp|avif|svg\\+xml);base64"))) { "Unsupported image data" }
-        val bytes = Base64.decode(data.substringAfter(','), Base64.DEFAULT)
+        val (mimeType, payloadStart) = parsePortableDataHeader(data)
+        val canonicalNoWhitespace = requireValidBase64Payload(data, payloadStart)
+        portableBase64Decodes.incrementAndGet()
+        val bytes = Base64.decode(data.substring(payloadStart), Base64.DEFAULT)
         require(bytes.size <= 25_000_000) { "Image exceeds 25 MB" }
-        return header.removePrefix("data:").removeSuffix(";base64") to bytes
+        if (canonicalNoWhitespace) {
+            cacheValidatedDataUrl(data, mimeType, bytes.size)
+        }
+        return mimeType to bytes
     }
-    fun data(file: File): String { require(file.length() <= 25_000_000); return "data:${mime(file.name)};base64," + Base64.encodeToString(file.readBytes(), Base64.NO_WRAP) }
+    fun data(file: File): String {
+        require(file.length() <= 25_000_000)
+        val expectedMime = mime(file.name)
+        val cacheableCanonical = cacheableAppAssetFile(file)
+        val beforeEpoch = synchronized(cacheLock) { invalidationEpoch }
+        val beforeStamp = cacheableCanonical?.let(::localFileStampOrNull)
+        if (beforeStamp != null) {
+            synchronized(cacheLock) {
+                if (invalidationEpoch == beforeEpoch) {
+                    localFileCache[beforeStamp]?.takeIf { it.mime == expectedMime }
+                } else {
+                    null
+                }
+            }?.let { return it.dataUrl }
+        }
+        val readTarget = cacheableCanonical ?: file
+        val bytes = localFileBytesReader(readTarget)
+        require(bytes.size <= 25_000_000)
+        portableBase64Encodes.incrementAndGet()
+        val encoded = "data:$expectedMime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        if (cacheableCanonical != null && beforeStamp != null && bytes.size.toLong() == beforeStamp.length) {
+            val afterStamp = localFileStampOrNull(cacheableCanonical)
+            if (afterStamp != null && afterStamp == beforeStamp) {
+                cacheStableLocalAsset(cacheableCanonical, beforeStamp, beforeEpoch, expectedMime, bytes.size, encoded)
+            }
+        }
+        return encoded
+    }
     private fun store(name: String, type: String, bytes: ByteArray): JSONObject {
         val extension = when(type.substringBefore(';')) { "image/png" -> "png"; "image/jpeg" -> "jpg"; "image/gif" -> "gif"; "image/webp" -> "webp"; "image/avif" -> "avif"; "image/svg+xml" -> "svg"; else -> error("Unsupported image type") }
         require(bytes.size <= 25_000_000)
@@ -63,7 +333,9 @@ class MediaStorage(private val context: Context) {
         require(mime in setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")) { "Unsupported image type" }
         require(bytes.size in 1..1_048_576) { "Relay supplied assets are limited to 1 MiB" }
         requireMediaSignature(mime, bytes)
-        return "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        val encoded = "data:$mime;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+        cacheValidatedDataUrl(encoded, mime, bytes.size)
+        return encoded
     }
 
     /** Return every extracted asset in a portable note, including currently unlinked originals. */
@@ -78,9 +350,9 @@ class MediaStorage(private val context: Context) {
             val source = "assets/${file.name}"
             if (!validKey(source)) return@forEach
             val value = data(file)
-            val (type, bytes) = decode(value)
+            val (type, byteSize) = validateAssetMeta(value)
             require(mime(source) == type) { "Portable image extension does not match its type" }
-            require(bytes.size <= 25_000_000) { "Portable image exceeds 25 MB" }
+            require(byteSize <= 25_000_000) { "Portable image exceeds 25 MB" }
             result.put(source, value)
         }
         return result
@@ -146,17 +418,71 @@ class MediaStorage(private val context: Context) {
         for (i in 0 until images.length()) { val image = images.getJSONObject(i); val (type, bytes) = decode(image.getString("data")); total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }; result.put(store(image.optString("name", "Image"), type, bytes)) }
         return result
     }
+    private fun resolveUriDisplayName(uri: Uri): String? =
+        androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name
+            ?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+
+    private fun isSafeExternalUri(uri: Uri): Boolean {
+        return when (uri.scheme?.lowercase()) {
+            "content" -> {
+                val authority = uri.authority?.lowercase().orEmpty()
+                authority.isNotEmpty() && authority != "${context.packageName.lowercase()}.share"
+            }
+            "file" -> {
+                val rawPath = uri.path ?: return false
+                val canonical = runCatching { File(rawPath).canonicalPath }.getOrNull() ?: return false
+                val privateRoot = runCatching { context.filesDir.parentFile?.canonicalPath }.getOrNull()
+                privateRoot == null || (canonical != privateRoot && !canonical.startsWith(privateRoot + File.separator))
+            }
+            else -> false
+        }
+    }
+
     fun importUris(uris: List<Uri>): JSONArray {
         require(uris.size in 1..32)
         var total = 0L; val result = JSONArray()
         for (uri in uris) {
-            val name = androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name ?: "Image"
-            val type = context.contentResolver.getType(uri)?.takeIf { it.startsWith("image/") } ?: mime(name)
+            require(isSafeExternalUri(uri)) { "Unsupported image URI" }
+            val name = resolveUriDisplayName(uri) ?: "Image"
+            val type = imageMime(name, context.contentResolver.getType(uri))
             val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
+            requireMediaSignature(type, bytes)
             total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
             result.put(store(name, type, bytes))
         }
         return result
+    }
+
+    fun importDroppedUris(uris: List<Uri>): DroppedImageBatch {
+        if (uris.isEmpty()) return DroppedImageBatch(JSONArray(), 0)
+        var total = 0L
+        var skipped = 0
+        val result = JSONArray()
+        for (uri in uris) {
+            if (!isSafeExternalUri(uri)) {
+                skipped++
+                continue
+            }
+            val name = resolveUriDisplayName(uri)
+            val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+            val resolvedMime = resolveDroppedImageMime(name, providerMime)
+            if (resolvedMime == null) {
+                skipped++
+                continue
+            }
+            require(result.length() < 32) { "Insert at most 32 images at a time" }
+            val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
+            val validSignature = runCatching { requireMediaSignature(resolvedMime, bytes) }.isSuccess
+            if (!validSignature) {
+                skipped++
+                continue
+            }
+            total += bytes.size
+            require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+            result.put(store(name ?: "Image", resolvedMime, bytes))
+        }
+        return DroppedImageBatch(result, skipped)
     }
 
     /** Save a requested browser image/diagram into Downloads or the user's configured note folder. */
@@ -292,7 +618,7 @@ class MediaStorage(private val context: Context) {
             "image/gif" -> require(bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII) in listOf("GIF87a", "GIF89a")) { "GIF signature is invalid" }
             "image/webp" -> require(bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP") { "WebP signature is invalid" }
             "image/avif" -> require(bytes.size >= 12 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp" && String(bytes, 8, 4, Charsets.US_ASCII) in setOf("avif", "avis")) { "AVIF signature is invalid" }
-            "image/svg+xml" -> require(String(bytes, 0, minOf(bytes.size, 4096), Charsets.UTF_8).contains(Regex("<svg(?:\\s|>)", RegexOption.IGNORE_CASE))) { "SVG document is invalid" }
+            "image/svg+xml" -> require(String(bytes, 0, minOf(bytes.size, 4096), Charsets.UTF_8).contains(Regex("<svg(?:\\s|>|/)", RegexOption.IGNORE_CASE))) { "SVG document is invalid" }
             "text/plain" -> require(bytes.none { it == 0.toByte() }) { "Text media contains binary data" }
         }
     }
@@ -414,8 +740,18 @@ class MediaStorage(private val context: Context) {
                     "markdown" -> { markdown = reader.nextString(); require(markdown!!.toByteArray().size <= 20_000_000) { "FMD Markdown exceeds 20 MB" } }
                     "assets" -> { reader.beginObject(); while(reader.hasNext()) {
                         val source = reader.nextName(); require(validKey(source)) { "Invalid FMD asset name" }; require(++assetCount <= 512) { "FMD contains more than 512 images" }
-                        val (type, bytes) = decode(reader.nextString()); require(mime(source) == type) { "Image extension does not match its type" }; total += bytes.size; require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
-                        File(root, source.substringAfter('/')).writeBytes(bytes)
+                        val rawValue = reader.nextString()
+                        val (type, bytes) = decode(rawValue); require(mime(source) == type) { "Image extension does not match its type" }; total += bytes.size; require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
+                        val targetFile = File(root, source.substringAfter('/'))
+                        targetFile.writeBytes(bytes)
+                        portableAssetExtractions.incrementAndGet()
+                        val expectedLen = ("data:$type;base64,".length) + ((bytes.size + 2) / 3) * 4
+                        val canonicalUrl = if (rawValue.length == expectedLen && lookupValidatedMeta(rawValue) != null) {
+                            rawValue
+                        } else {
+                            "data:$type;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+                        }
+                        cacheWrittenLocalAsset(targetFile, type, bytes.size, canonicalUrl)
                     }; reader.endObject() }
                     else -> error("Unknown portable-file field")
                 }
@@ -423,13 +759,24 @@ class MediaStorage(private val context: Context) {
             }
             require(format in listOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) { "Unsupported portable SMD file" }
             return Opened(markdown!!, directory)
-        } catch (error: Exception) { root.deleteRecursively(); throw error }
+        } catch (error: Exception) { invalidateLocalAsset(root); root.deleteRecursively(); throw error }
     }
     fun writeFmd(output: java.io.OutputStream, markdown: String, assets: JSONObject) {
-        require(markdown.toByteArray().size <= 20_000_000 && assets.length() <= 512)
-        // Validate everything before the destination stream is written.
+        writeFmd(output, markdown, assets, null)
+    }
+    internal fun writeFmd(output: java.io.OutputStream, markdown: String, assets: JSONObject, validatedAssets: JSONObject?) {
+        require(markdown.toByteArray(Charsets.UTF_8).size <= 20_000_000 && assets.length() <= 512)
+        // Validate everything before the destination stream is written, reusing already-validated unchanged assets.
         var total = 0L
-        assets.keys().forEach { source -> require(validKey(source)); val (type, bytes) = decode(assets.getString(source)); require(mime(source) == type) { "Image extension does not match its type" }; total += bytes.size; require(total <= 75_000_000) }
+        assets.keys().forEach { source ->
+            require(validKey(source)) { "Invalid FMD asset name" }
+            val rawValue = assets.getString(source)
+            val known = validatedAssets?.optString(source)?.takeIf { it.isNotEmpty() }
+            val (type, byteSize) = validateAssetMeta(rawValue, known)
+            require(mime(source) == type) { "Image extension does not match its type" }
+            total += byteSize
+            require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
+        }
         val boundedCompressed = object : java.io.FilterOutputStream(output) {
             var bytes = 0L
             override fun write(value: Int) { require(++bytes <= 120_000_000) { "FMD exceeds 120 MB" }; out.write(value) }
@@ -441,31 +788,255 @@ class MediaStorage(private val context: Context) {
             override fun write(value: Int) { require(++bytes <= 120_000_000) { "FMD JSON exceeds 120 MB" }; out.write(value) }
             override fun write(buffer: ByteArray, offset: Int, length: Int) { require(bytes + length <= 120_000_000) { "FMD JSON exceeds 120 MB" }; out.write(buffer, offset, length); bytes += length }
         }
-        JsonWriter(boundedJson.writer()).use { writer ->
+        JsonWriter(boundedJson.writer(Charsets.UTF_8)).use { writer ->
             writer.beginObject().name("format").value("supermd-smd").name("version").value(1).name("markdown").value(markdown).name("assets").beginObject()
             assets.keys().forEach { source -> writer.name(source).value(assets.getString(source)) }
             writer.endObject().endObject()
         }
     }
-    fun portableMarkdown(input: InputStream): String {
+
+    /** Stream-validate an on-disk portable archive against an expected baseline without extracting unchanged assets. */
+    internal fun portableEnvelopeMatches(input: InputStream, expectedMarkdown: String, expectedAssets: JSONObject): Boolean {
+        val sniff = if (input.markSupported()) input else BufferedInputStream(input)
+        sniff.mark(2)
+        val gzip = sniff.read() == 0x1f && sniff.read() == 0x8b
+        sniff.reset()
+        val content = if (gzip) StrictGzipInputStream(sniff) else sniff
+        var format = ""
+        var version = 0
+        var markdown: String? = null
+        var total = 0L
+        var assetCount = 0
+        var allAssetsMatched = true
+        val seenSources = HashSet<String>()
+        val bounded = object : java.io.FilterInputStream(content) {
+            var bytesRead = 0L
+            override fun read(): Int {
+                val value = super.read()
+                if (value >= 0) require(++this.bytesRead <= 120_000_000) { "FMD exceeds 120 MB" }
+                return value
+            }
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                val size = super.read(buffer, offset, length)
+                if (size > 0) {
+                    this.bytesRead += size
+                    require(this.bytesRead <= 120_000_000) { "FMD exceeds 120 MB" }
+                }
+                return size
+            }
+        }
+        val limitedText = object : java.io.FilterReader(bounded.reader(Charsets.UTF_8)) {
+            var quoted = false
+            var escaped = false
+            var length = 0
+            override fun read(buffer: CharArray, offset: Int, size: Int): Int {
+                val count = super.read(buffer, offset, size)
+                for (i in offset until offset + maxOf(count, 0)) {
+                    val c = buffer[i]
+                    if (quoted) {
+                        require(++length <= 34_000_000) { "FMD token is too large" }
+                        if (escaped) escaped = false else if (c == '\\') escaped = true else if (c == '"') quoted = false
+                    } else if (c == '"') {
+                        quoted = true
+                        length = 0
+                    }
+                }
+                return count
+            }
+        }
+        JsonReader(limitedText.buffered()).use { reader ->
+            reader.beginObject()
+            while (reader.hasNext()) {
+                when (reader.nextName()) {
+                    "format" -> format = reader.nextString()
+                    "version" -> version = reader.nextInt()
+                    "markdown" -> {
+                        markdown = reader.nextString()
+                        require(markdown!!.toByteArray(Charsets.UTF_8).size <= 20_000_000) { "FMD Markdown exceeds 20 MB" }
+                    }
+                    "assets" -> {
+                        reader.beginObject()
+                        while (reader.hasNext()) {
+                            val source = reader.nextName()
+                            require(validKey(source)) { "Invalid FMD asset name" }
+                            if (seenSources.add(source)) {
+                                require(++assetCount <= 512) { "FMD contains more than 512 images" }
+                            } else {
+                                require(assetCount <= 512) { "FMD contains more than 512 images" }
+                            }
+                            val rawValue = reader.nextString()
+                            val expectedValue = if (expectedAssets.has(source)) expectedAssets.getString(source) else null
+                            if (expectedValue != null && rawValue == expectedValue) {
+                                val (type, byteSize) = validateAssetMeta(rawValue, expectedValue)
+                                require(mime(source) == type) { "Image extension does not match its type" }
+                                total += byteSize
+                                require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
+                            } else {
+                                val (type, bytes) = decode(rawValue)
+                                require(mime(source) == type) { "Image extension does not match its type" }
+                                total += bytes.size
+                                require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
+                                val canonical = "data:$type;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+                                if (expectedValue == null || canonical != expectedValue) {
+                                    allAssetsMatched = false
+                                }
+                            }
+                        }
+                        reader.endObject()
+                    }
+                    else -> error("Unknown portable-file field")
+                }
+            }
+            reader.endObject()
+            require(reader.peek() == android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the FMD envelope" }
+        }
+        require(format in listOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) { "Unsupported portable SMD file" }
+        return markdown == expectedMarkdown && allAssetsMatched && seenSources.size == expectedAssets.length()
+    }
+
+    internal fun hasExactLocalPortableAssets(directory: String?, assets: JSONObject): Boolean {
+        if (directory == null || !Regex("[a-f0-9-]{36}").matches(directory)) return false
+        val expectedBundlesRoot = runCatching {
+            context.filesDir.canonicalFile.toPath().resolve(bundles.name).normalize().toFile()
+        }.getOrNull() ?: return false
+        val root = runCatching { File(bundles, directory).canonicalFile }.getOrNull() ?: return false
+        val bundlesRoot = runCatching { bundles.canonicalFile }.getOrNull() ?: return false
+        if (bundlesRoot != expectedBundlesRoot || root.parentFile != bundlesRoot || !root.isDirectory) return false
+        val entries = root.listFiles() ?: return false
+        if (entries.any { !it.isFile || !validKey("assets/${it.name}") }) return false
+        if (entries.size != assets.length()) return false
+        for (file in entries) {
+            val source = "assets/${file.name}"
+            if (!assets.has(source)) return false
+            val expected = assets.getString(source)
+            val actual = runCatching { data(file) }.getOrNull() ?: return false
+            if (actual != expected) return false
+        }
+        return true
+    }
+
+    internal fun materializePortableDirectory(
+        assets: JSONObject,
+        reuseFromDirectory: String? = null,
+        predecodedBytes: Map<String, Pair<String, ByteArray>> = emptyMap(),
+    ): String {
+        require(assets.length() <= 512) { "FMD contains more than 512 images" }
+        val directory = UUID.randomUUID().toString()
+        val root = File(bundles, directory).apply { mkdirs() }
+        try {
+            var total = 0L
+            assets.keys().forEach { source ->
+                require(validKey(source)) { "Invalid FMD asset name" }
+                val rawValue = assets.getString(source)
+                val destFile = File(root, source.substringAfter('/'))
+                val reusableFile = if (reuseFromDirectory != null) local(source, reuseFromDirectory) else null
+                val reusableData = reusableFile?.let { runCatching { data(it) }.getOrNull() }
+                val predecoded = predecodedBytes[source]
+                if (reusableFile != null && reusableData != null && reusableData == rawValue) {
+                    val (type, byteSize) = validateAssetMeta(rawValue, reusableData)
+                    require(mime(source) == type) { "Image extension does not match its type" }
+                    total += byteSize
+                    require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
+                    reusableFile.copyTo(destFile, overwrite = true)
+                    cacheWrittenLocalAsset(destFile, type, byteSize, reusableData)
+                } else if (predecoded != null) {
+                    val (type, bytes) = predecoded
+                    require(bytes.size <= 25_000_000) { "Image exceeds 25 MB" }
+                    require(mime(source) == type) { "Image extension does not match its type" }
+                    total += bytes.size
+                    require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
+                    destFile.writeBytes(bytes)
+                    portableAssetExtractions.incrementAndGet()
+                    cacheWrittenLocalAsset(destFile, type, bytes.size, rawValue)
+                } else {
+                    val (type, bytes) = decode(rawValue)
+                    require(mime(source) == type) { "Image extension does not match its type" }
+                    total += bytes.size
+                    require(total <= 75_000_000) { "FMD assets exceed 75 MB" }
+                    destFile.writeBytes(bytes)
+                    portableAssetExtractions.incrementAndGet()
+                    val canonicalUrl = "data:$type;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP)
+                    cacheWrittenLocalAsset(destFile, type, bytes.size, canonicalUrl)
+                }
+            }
+            return directory
+        } catch (error: Exception) {
+            invalidateLocalAsset(root)
+            root.deleteRecursively()
+            throw error
+        }
+    }
+    fun portableMarkdown(input: InputStream, stopAfterMarkdown: Boolean = false, maxMarkdownBytes: Int = 20_000_000): String {
         // Our envelope puts source before assets. Never load image bytes merely
         // to check whether a portable note's source changed externally.
         val sniff=if(input.markSupported())input else BufferedInputStream(input)
         sniff.mark(2);val gzip=sniff.read()==0x1f&&sniff.read()==0x8b;sniff.reset()
         val content=if(gzip)StrictGzipInputStream(sniff) else sniff
         val bounded=object:java.io.FilterInputStream(content){var consumed=0L;override fun read():Int {val value=super.read();if(value>=0)require(++consumed<=120_000_000);return value};override fun read(buffer:ByteArray,offset:Int,length:Int):Int {val size=super.read(buffer,offset,length);if(size>0){consumed+=size;require(consumed<=120_000_000)};return size}}
-        val limitedText=object:java.io.FilterReader(bounded.reader()){var quoted=false;var escaped=false;var tokenLength=0;override fun read(buffer:CharArray,offset:Int,size:Int):Int{val count=super.read(buffer,offset,size);for(i in offset until offset+maxOf(count,0)){val c=buffer[i];if(quoted){require(++tokenLength<=34_000_000){"Portable token is too large"};if(escaped)escaped=false else if(c=='\\')escaped=true else if(c=='\"')quoted=false}else if(c=='\"'){quoted=true;tokenLength=0}};return count}}
-        var markdown:String?=null
-        JsonReader(limitedText.buffered()).use {reader->
+        val limitedText=object:java.io.FilterReader(bounded.reader(Charsets.UTF_8)){var quoted=false;var escaped=false;var tokenLength=0;override fun read(buffer:CharArray,offset:Int,size:Int):Int{val count=super.read(buffer,offset,size);for(i in offset until offset+maxOf(count,0)){val c=buffer[i];if(quoted){require(++tokenLength<=34_000_000){"Portable token is too large"};if(escaped)escaped=false else if(c=='\\')escaped=true else if(c=='\"')quoted=false}else if(c=='\"'){quoted=true;tokenLength=0}};return count}}
+        var format: String? = null
+        var version: Int? = null
+        var markdown: String? = null
+        JsonReader(limitedText.buffered()).use { reader ->
             reader.beginObject()
-            while(reader.hasNext()){val name=reader.nextName();if(name=="markdown"){val source=reader.nextString();require(source.toByteArray().size<=20_000_000);markdown=source}else reader.skipValue()}
+            while (reader.hasNext()) {
+                when (reader.nextName()) {
+                    "format" -> { format = reader.nextString(); require(!stopAfterMarkdown || format in setOf("supermd-smd", "supermd-fmd")) }
+                    "version" -> { version = reader.nextInt(); require(!stopAfterMarkdown || version == 1) }
+                    "markdown" -> { val source = reader.nextString(); require(source.toByteArray(Charsets.UTF_8).size <= maxMarkdownBytes); markdown = source }
+                    else -> reader.skipValue()
+                }
+                if (stopAfterMarkdown && format in setOf("supermd-smd", "supermd-fmd") && version == 1 && markdown != null) {
+                    return markdown!!
+                }
+            }
             reader.endObject()
-            require(reader.peek()==android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the portable envelope" }
+            if (!stopAfterMarkdown) {
+                require(reader.peek() == android.util.JsonToken.END_DOCUMENT) { "Unexpected data after the portable envelope" }
+            }
         }
+        if (stopAfterMarkdown) require(format in setOf("supermd-smd", "supermd-fmd") && version == 1)
         return markdown ?: error("Portable source is unavailable")
     }
+
+    internal fun readSearchableNote(
+        input: InputStream,
+        maxPlainBytes: Int = 5_000_000,
+        maxPortableMarkdownBytes: Int = 20_000_000,
+    ): String? {
+        val buffered = if (input.markSupported()) input else BufferedInputStream(input, 65_536)
+        buffered.mark(65_536)
+        val prefix = ByteArray(32_768)
+        var prefixLen = 0
+        while (prefixLen < prefix.size) {
+            val count = buffered.read(prefix, prefixLen, prefix.size - prefixLen)
+            if (count <= 0) break
+            prefixLen += count
+        }
+        buffered.reset()
+        if (prefixLen == 0) return ""
+        val headBytes = prefix.copyOfRange(0, prefixLen)
+        val isGzip = portableGzipHeader(headBytes)
+        val headerPreview = if (!isGzip) {
+            runCatching { String(headBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') }.getOrDefault("")
+        } else ""
+        if (isGzip || portableEnvelopeHeader(headerPreview)) {
+            return runCatching { portableMarkdown(buffered, stopAfterMarkdown = true, maxMarkdownBytes = maxPortableMarkdownBytes) }.getOrNull()
+        }
+        if (headBytes.any { it == 0.toByte() }) return null
+        return runCatching {
+            val raw = readLimited(buffered, maxPlainBytes)
+            if (raw.any { it == 0.toByte() }) return null
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(raw))
+                .toString()
+                .removePrefix("\uFEFF")
+        }.getOrNull()
+    }
     fun writeLocalPortable(output: java.io.OutputStream, markdown: String, directory: String?) {
-        val sources=JSONArray(PdfEngine.imageSources(markdown))
+        val sources=JSONArray(markdownImageSourcesJson(markdown))
         val files=(0 until sources.length()).map {sources.getString(it)}.distinct().filter {it.startsWith("assets/")}.map {source->source to (local(source,directory) ?: error("Save manually to resolve a new image: $source"))}
         require(files.size<=512 && files.sumOf {it.second.length()}<=75_000_000 && markdown.toByteArray().size<=20_000_000)
         val boundedCompressed=object:java.io.FilterOutputStream(output){var bytes=0L;override fun write(value:Int){require(++bytes<=120_000_000);out.write(value)};override fun write(buffer:ByteArray,offset:Int,length:Int){require(bytes+length<=120_000_000);out.write(buffer,offset,length);bytes+=length}}

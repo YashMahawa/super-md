@@ -32,18 +32,58 @@ class ThemeArtworkTest {
         val variant=JSONObject().put("colors",JSONObject()).put("artwork",JSONObject().put("sidebar",art).put("reader",art))
         return JSONObject().put("format","supermd-theme").put("version",1).put("name","Artwork test").put("accent","blue").put("variants",JSONObject().put("dark",variant)).toString()
     }
+    private fun awaitActivityFramePresented() {
+        compose.waitForIdle()
+        compose.waitUntil(10_000) {
+            val ready = java.util.concurrent.atomic.AtomicBoolean(false)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                val activity = compose.activity
+                val decor = activity.window.decorView
+                ready.set(activity.hasWindowFocus() && decor.isAttachedToWindow && decor.isShown && decor.width > 0 && decor.height > 0)
+            }
+            ready.get()
+        }
+        val committed = java.util.concurrent.CountDownLatch(1)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val decor = compose.activity.window.decorView
+            decor.viewTreeObserver.registerFrameCommitCallback { committed.countDown() }
+            decor.postInvalidateOnAnimation()
+        }
+        committed.await(3, java.util.concurrent.TimeUnit.SECONDS)
+    }
     @Test fun nativeArtworkPaintsRealPixelsChangesAndCanBeHidden() {
         val state=mutableStateOf(StudioState(customTheme=theme("#ff0000"),theme="dark"))
         compose.activity.runOnUiThread {compose.activity.setContent {Box(Modifier.fillMaxSize().background(Color.Black).themeArtwork(state.value,"sidebar"))}}
         fun painted(r:Int,b:Int) {
-            compose.waitForIdle()
+            awaitActivityFramePresented()
+            val samplePoint = IntArray(2)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                val decor = compose.activity.window.decorView
+                val loc = IntArray(2)
+                decor.getLocationOnScreen(loc)
+                samplePoint[0] = loc[0] + decor.width / 2
+                samplePoint[1] = loc[1] + decor.height / 2
+            }
             var latest:android.graphics.Bitmap?=null
             var seen="no frame"
+            var attempts=0
             try {
                 compose.waitUntil(15000){
+                    if (attempts++ > 0) {
+                        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                            compose.activity.window.decorView.postInvalidateOnAnimation()
+                        }
+                        android.os.SystemClock.sleep(100)
+                    }
                     latest?.recycle()
                     val bitmap=InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot();latest=bitmap
-                    if(bitmap==null)false else {val c=bitmap.getPixel(bitmap.width/2,bitmap.height/2);seen="#%08x".format(c);kotlin.math.abs(android.graphics.Color.red(c)-r)<=2&&android.graphics.Color.green(c)<=2&&kotlin.math.abs(android.graphics.Color.blue(c)-b)<=2}
+                    if(bitmap==null)false else {
+                        val px=samplePoint[0].coerceIn(0,bitmap.width-1)
+                        val py=samplePoint[1].coerceIn(0,bitmap.height-1)
+                        val c=bitmap.getPixel(px,py)
+                        seen="#%08x".format(c)
+                        kotlin.math.abs(android.graphics.Color.red(c)-r)<=2&&android.graphics.Color.green(c)<=2&&kotlin.math.abs(android.graphics.Color.blue(c)-b)<=2
+                    }
                 }
             }catch(error:androidx.compose.ui.test.ComposeTimeoutException){throw AssertionError("Artwork must present RGB($r,0,$b); observed $seen",error)}
             finally {
@@ -64,13 +104,18 @@ class ThemeArtworkTest {
             compose.runOnIdle {state.value=state.value.copy(customTheme=raster.toString())};painted(25,0)
         }}finally{bitmap.recycle()}
     }
-    @Test fun portableThemeShareIncludesControlsWithoutChangingTheImportedFile() {
+    @Test fun portableThemeSharePreservesCanonicalThemeAndIsolatesArtworkFromPatternControls() {
         val original=theme("#ff0000")
         val state=StudioState(customTheme=original,patternKind="paws",patternOpacity=.08f,patternSize=30f,patternSpacing=96f)
+        val style=themeStyle(themeDocument(original),"dark",true,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing)
+        assertEquals("paws",style.getJSONObject("background").getString("pattern"))
+        assertEquals(30.0,style.getJSONObject("background").getDouble("size"),.001)
+        assertEquals(.1,style.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
+        val hiddenPattern=themeStyle(themeDocument(original),"dark",true,"none",0f,state.patternSize,state.patternSpacing)
+        assertEquals(.1,hiddenPattern.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
         val output=JSONObject(themeForSharing(state));val selected=output.getJSONObject("variants").getJSONObject("dark")
-        assertEquals("paws",selected.getJSONObject("background").getString("pattern"))
-        assertEquals(30.0,selected.getJSONObject("background").getDouble("size"),.001)
-        assertEquals(.08,selected.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
+        assertFalse(selected.has("background"))
+        assertEquals(.1,selected.getJSONObject("artwork").getJSONObject("reader").getDouble("opacity"),.001)
         assertEquals(.1,selected.getJSONObject("artwork").getJSONObject("sidebar").getDouble("opacity"),.001)
         assertEquals(original,state.customTheme)
         assertFalse(JSONObject(PdfEngine.validateTheme(output.toString())).has("error"))

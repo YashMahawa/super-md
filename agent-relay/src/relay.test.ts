@@ -173,7 +173,7 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   const docOptionsProps = (docProps.options as { properties?: Record<string, Record<string, unknown>> } | undefined)?.properties ?? {};
   assert.deepEqual(Object.keys(docOptionsProps), [
     "pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed",
-    "section", "offset", "background", "saveAs", "discardChanges", "title", "format", "repairIndices", "filename", "jobId", "limit", "width", "quality",
+    "section", "offset", "background", "saveAs", "discardChanges", "archive", "title", "format", "repairIndices", "filename", "jobId", "limit", "width", "quality",
   ]);
   for (const opToolName of ["patch_tab", "document_action"] as const) {
     const opsItems = ((toolsByName.get(opToolName)!.inputSchema as { properties: Record<string, Record<string, unknown>> }).properties.operations?.items ?? {}) as { oneOf?: Array<Record<string, unknown>> };
@@ -376,6 +376,40 @@ test("relay auth, bounded device RPC, Streamable HTTP, legacy SSE and disconnect
   assert.equal(movedContext.captureContext.sourceRange.start, 900);
   assert.equal(movedContext.captureContext.nativeTabId, "note-17");
   assert.equal(movedContext.readingContextAlignedWithCapture, true);
+  fastContext = undefined;
+  fastCaptureContext = undefined;
+
+  fastContext = {
+    tabId: "note-17",
+    revision,
+    mode: "reader",
+    reading: { offset: 10, heading: "Walkthrough", visibleText: "Gradient Descent — Step 3: Optimum\nZero slope reached." },
+    activeStep: { deckTitle: "Gradient Descent", stepLabel: "Step 3: Optimum", stepIndex: 2, stepCount: 3, activeStep: true, expanded: true },
+    visibleSource: { text: "# Walkthrough", start: 0, end: 13, total_chars: 13, next_offset: null },
+  };
+  fastCaptureContext = {
+    tabId: "note-17",
+    revision,
+    sourceLength: 13,
+    mode: "reader",
+    reading: { offset: 0, heading: "Walkthrough", visibleText: "Gradient Descent — Step 3: Optimum\nZero slope reached." },
+    activeStep: { deckTitle: "Gradient Descent", stepLabel: "Step 3: Optimum", stepIndex: 2, stepCount: 3, activeStep: true, expanded: true },
+    visibleSource: { text: "# Walkthrough", start: 0, end: 13, total_chars: 13, next_offset: null },
+    diagrams: [{ id: "diagram:step:2:2", kind: "smd-diagram", sourceStart: 2, sourceEnd: 13, sourceChars: 11, preview: "Gradient Descent — Step 3: Optimum", deckTitle: "Gradient Descent", stepLabel: "Step 3: Optimum", stepIndex: 2, stepCount: 3, activeStep: true }],
+    pythonCells: [{ ordinal: 0, sourceStart: 0, sourceEnd: 13, ok: true, stdout: "converged\n", stderr: "", figureIds: ["diagram:python:0:0"] }],
+  };
+  const stepPortalView = await http.callTool({ name: "view_current", arguments: { deviceId, tabId: qualifiedDesktopTab, includeImage: true } });
+  assert.equal(stepPortalView.isError, undefined);
+  const stepPortalPayload = JSON.parse(String(stepPortalView.content?.[1]?.type === "text" ? stepPortalView.content[1].text : "{}"));
+  assert.equal(stepPortalPayload.readingContext.activeStep.stepIndex, 2);
+  assert.equal(stepPortalPayload.readingContext.activeStep.deckTitle, "Gradient Descent");
+  assert.equal(stepPortalPayload.readingContext.activeStep.stepLabel, "Step 3: Optimum");
+  assert.equal(stepPortalPayload.readingContext.activeStep.stepCount, 3);
+  assert.equal(stepPortalPayload.readingContext.activeStep.activeStep, true);
+  assert.equal(stepPortalPayload.readingContext.diagrams[0].stepIndex, 2);
+  assert.equal(stepPortalPayload.readingContext.diagrams[0].activeStep, true);
+  assert.equal(stepPortalPayload.readingContext.reading.visibleText.includes("Zero slope reached."), true);
+  assert.deepEqual(stepPortalPayload.readingContext.pythonCells[0].figureIds, ["diagram:python:0:0"]);
   fastContext = undefined;
   fastCaptureContext = undefined;
 
