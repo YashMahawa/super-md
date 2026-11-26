@@ -692,7 +692,7 @@ function isSplitUtf16Surrogate(text: string, index: number): boolean {
   return prev >= 0xd800 && prev <= 0xdbff && curr >= 0xdc00 && curr <= 0xdfff;
 }
 
-function isValidSeedOccurrence(
+export function isValidSeedOccurrence(
   content: string,
   seedRange: SourceRange,
   query: string,
@@ -742,6 +742,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     setHiddenSourceHit(false);
     hiddenSourceAnchorRef.current = null;
     pendingReplaceIndex.current = null;
+    if (index !== -1) updateIndex(-1);
     setQuery(seed.query.slice(0, 200));
     if (seed.caseSensitive !== undefined) setCaseSensitive(Boolean(seed.caseSensitive));
     if (wholeWord) setWholeWord(false);
@@ -1360,6 +1361,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const runAutoSelect = pendingAutoSelect.current;
       const seedRange = runAutoSelect ? pendingSeedRange.current : null;
       const seedMatchText = runAutoSelect ? pendingSeedMatchText.current : undefined;
+      const hasValidSeedRange = Boolean(seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText));
+      const hasStaleSeedRange = Boolean(seedRange && !hasValidSeedRange);
       pendingAutoSelect.current = false;
       pendingSeedRange.current = null;
       pendingSeedMatchText.current = undefined;
@@ -1382,7 +1385,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         if (runAutoSelect) {
           setHiddenSourceHit(false);
           hiddenSourceAnchorRef.current = null;
-          if (seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText)) {
+          if (hasValidSeedRange && seedRange) {
             const seedSourceIndex = findMatchingSourceRangeIndex(activeRanges, seedRange);
             if (seedSourceIndex >= 0) {
               updateIndex(seedSourceIndex);
@@ -1397,7 +1400,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             if (sliceIdx >= 0) revealAndHighlightSource(sliceIdx, sliceRanges, content, true, sliceText, true);
             return;
           }
-          if (activeRanges.length) {
+          if (!hasStaleSeedRange && activeRanges.length) {
             updateIndex(0);
             revealAndHighlightSource(0, activeRanges, content, true);
             return;
@@ -1418,7 +1421,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         return;
       }
       const nextWindowed = host ? windowedMatches(host, query, filterOptions) : null;
-      if (runAutoSelect && seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText) && host) {
+      if (runAutoSelect && hasValidSeedRange && seedRange && host) {
         const seedSourceRanges = getSourceRanges();
         const seedSourceIndex = findMatchingSourceRangeIndex(seedSourceRanges, seedRange);
         const targetRange = seedSourceIndex >= 0 ? seedSourceRanges[seedSourceIndex] : seedRange;
@@ -1629,7 +1632,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         setWindowed(nextWindowed);
         setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
         if (runAutoSelect) {
-          if (nextWindowed.length) { selectWindowedMatch(0, nextWindowed, host); return; }
+          if (!hasStaleSeedRange && nextWindowed.length) { selectWindowedMatch(0, nextWindowed, host); return; }
           updateIndex(-1);
         } else if (!criteriaChanged && !contentChanged && indexRef.current >= nextWindowed.length) {
           updateIndex(nextWindowed.length - 1);
@@ -1645,7 +1648,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
       setMatches(result);
       if (runAutoSelect) {
-        if (result.length) {
+        if (!hasStaleSeedRange && result.length) {
           if (registry && HighlightClass) registry.set("smd-search", new HighlightClass(...result));
           selectDomMatch(0, result, host);
           return;

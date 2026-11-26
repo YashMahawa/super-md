@@ -484,12 +484,110 @@ test("Seeded folder-search handoff reveals exact offscreen windowed occurrences 
     await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
     await expect(section35).toBeInViewport();
 
-    // 5. Stale-result fallback: third occurrence edited out before handoff -> falls back to 1 / 2 and brings 1st match into viewport.
+    // 5. Stale result after an edit + cross-note anchor restoration:
+    //    - Scroll Note A to Section 18, switch to Note B via valid seeded occurrence (3 / 3), then switch back to Note A -> Section 18 anchor restored!
+    //    - Edit Note B's 3rd occurrence out, then switch from Note A to Note B with the stale 3rd-occurrence seed ->
+    //      Note B restores its cross-note anchor at Section 35 and shows passive "0 / 2" WITHOUT jumping to Occurrence #1!
+    const otherNoteContent =
+      `# Secondary Note\n\nIntro AuroraPin in note A.\n\n` +
+      Array.from({ length: 36 }, (_, i) =>
+        i === 18 ? `## Other Section 18\n\nAnchored paragraph in note A.\n\n${filler}` : `## Other Section ${i}\n\n${filler}`,
+      ).join("");
+    await page.evaluate(() => window.supermdDismiss?.());
+    await page.evaluate(
+      ({ otherNoteContent, mode }) =>
+        window.supermdLoad?.({
+          id: `other-note-${mode}`,
+          content: otherNoteContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+        }),
+      { otherNoteContent, mode },
+    );
+    const otherSection18Offset = otherNoteContent.indexOf("## Other Section 18");
+    await page.evaluate(
+      ({ otherNoteContent, mode, otherSection18Offset }) =>
+        window.supermdLoad?.({
+          id: `other-note-${mode}`,
+          content: otherNoteContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          pendingHeading: { heading: "Other Section 18", token: `other-heading-${mode}` },
+          viewState: { top: 0, anchor: { offset: otherSection18Offset, mode, zoom: 100 } },
+        }),
+      { otherNoteContent, mode, otherSection18Offset },
+    );
+    const otherSection18 = page.locator("p", { hasText: "Anchored paragraph in note A." });
+    await expect(otherSection18).toBeInViewport();
+    await page.evaluate(() => {
+      document.querySelector<HTMLElement>(".android-reading")?.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+
+    // Jump from Note A -> Note B's 3rd occurrence (valid cross-note seededFind).
+    await page.evaluate(
+      ({ content, mode, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { content, mode, thirdStart },
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+    await expect(section35).toBeInViewport();
+
+    // Switch back from Note B -> Note A while .reading-search remains open: Note A's cross-note anchor at Other Section 18 is preserved!
+    await page.evaluate(
+      ({ otherNoteContent, mode }) =>
+        window.supermdLoad?.({
+          id: `other-note-${mode}`,
+          content: otherNoteContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+        }),
+      { otherNoteContent, mode },
+    );
+    await expect(otherSection18).toBeInViewport();
+
+    // Edit Note B so the 3rd occurrence is removed, then open the stale 3rd-occurrence result on Note B:
+    // Note B restores its cross-note anchor at Section 35 and shows "0 / 2" WITHOUT jumping to Occurrence #1 at the top!
     const editedContent = content.slice(0, thirdStart) + "EditedOut" + content.slice(thirdStart + "AuroraPin".length);
     await page.evaluate(
       ({ editedContent, mode, thirdStart }) =>
         window.supermdLoad?.({
-          id: `seeded-stale-${mode}`,
+          id: `seeded-${mode}`,
           content: editedContent,
           path: null,
           mode,
@@ -507,11 +605,44 @@ test("Seeded folder-search handoff reveals exact offscreen windowed occurrences 
             matchText: "AuroraPin",
           },
         }),
-      { editedContent, mode, thirdStart }
+      { editedContent, mode, thirdStart },
     );
-    await expect(page.locator(".reading-search output")).toHaveText("1 / 2");
+    await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+    const editedSection35 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Deep offscreen EditedOut occurrence three." });
+    await expect(editedSection35).toBeVisible();
+    await expect(editedSection35).toBeInViewport();
     const introMatch = page.locator("p").filter({ hasText: "Intro AuroraPin occurrence one." });
-    await expect(introMatch).toBeVisible();
-    await expect(introMatch).toBeInViewport();
+    await expect(introMatch).not.toBeInViewport();
+
+    // Same-note stale supermdFind after an insertion before old offsets also stays at Section 35 without jumping to Occurrence #1 or #2.
+    const shiftedContent = "Prepended edit line.\n\n" + editedContent;
+    await page.evaluate(
+      ({ shiftedContent, mode, secondStart }) => {
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content: shiftedContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+        });
+        window.supermdFind?.("AuroraPin", {
+          caseSensitive: true,
+          sourceStart: secondStart,
+          sourceEnd: secondStart + "AuroraPin".length,
+          matchText: "AuroraPin",
+        });
+      },
+      { shiftedContent, mode, secondStart },
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+    await expect(editedSection35).toBeInViewport();
+    await expect(introMatch).not.toBeInViewport();
   }
 });

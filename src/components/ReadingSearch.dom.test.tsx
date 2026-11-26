@@ -725,12 +725,15 @@ describe("ReadingSearch DOM behavior", () => {
     }
   });
 
-  it("falls back to ordinary seeded Find on stale offsets from same-offset replacement or prior insertion while keeping valid Unicode-folded and hidden-source hits", async () => {
+  it("falls back passively on stale offsets from same-offset replacement or prior insertion without jumping to a different occurrence while keeping valid Unicode-folded and hidden-source hits", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
     const origHighlight = (window as typeof window & { Highlight?: unknown }).Highlight;
     const origCss = (globalThis as typeof globalThis & { CSS?: unknown }).CSS;
+    const scrolled: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
 
     class MockHighlight {
       ranges: Range[];
@@ -749,6 +752,7 @@ describe("ReadingSearch DOM behavior", () => {
         sourceSession?: string,
       ) => {
         highlightMap.clear();
+        scrolled.length = 0;
         await act(async () => {
           root.render(
             <div className="android-document">
@@ -785,9 +789,10 @@ describe("ReadingSearch DOM behavior", () => {
         matchText: "AuroraSignal",
         nonce: 101,
       });
-      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
-      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
       expect(highlightMap.get("smd-search")?.ranges.map(r => r.toString())).toEqual(["AuroraSignal"]);
+      expect(scrolled).toHaveLength(0);
 
       // 1b. Replacement at the same offsets when NO matches remain anywhere in the note (including inside a hidden URL):
       //     Must report "No matches" and highlight nothing, NOT "In Markdown source" or the replacement slice.
@@ -804,8 +809,9 @@ describe("ReadingSearch DOM behavior", () => {
       expect(host.querySelector("output")?.textContent).toBe("No matches");
       expect(highlightMap.get("smd-search-current")).toBeUndefined();
       expect(highlightMap.get("smd-search")?.ranges ?? []).toHaveLength(0);
+      expect(scrolled).toHaveLength(0);
 
-      // 1c. Source/Split session with stale replacement at same offsets also falls back to ordinary seeded Find without highlighting unrelated slice.
+      // 1c. Source/Split session with stale replacement at same offsets stays passive at 0 / 2 without jumping to occurrence 1.
       await renderNote(
         replacedSecondSameOffsets,
         {
@@ -818,7 +824,9 @@ describe("ReadingSearch DOM behavior", () => {
         },
         "source-session-stale",
       );
-      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
 
       // 2. Insertion before the old offset (both non-overlapping and partially overlapping shifted offsets):
       //    Must NOT highlight the unrelated shifted slice or fuzzy-match the neighbor; falls back to ordinary seeded Find (1 / 2).
@@ -831,8 +839,10 @@ describe("ReadingSearch DOM behavior", () => {
         matchText: "AuroraSignal",
         nonce: 104,
       });
-      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
-      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(highlightMap.get("smd-search")?.ranges.map(r => r.toString())).toEqual(["AuroraSignal", "AuroraSignal"]);
+      expect(scrolled).toHaveLength(0);
 
       // Partially overlapping 3-char insertion before old offset (shifts "AuroraSignal" by +3 so old [from, to) overlaps new [from+3, to+3)):
       const overlappingInsertNote = "Hi " + scannedNote;
@@ -843,8 +853,9 @@ describe("ReadingSearch DOM behavior", () => {
         sourceEnd: scannedHits[1].to,
         nonce: 105,
       });
-      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
-      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
 
       // 2b. Insertion that shifts a differently-cased variant onto the exact old offsets when matchText identity was captured:
       //     Scanned "AURORASIGNAL" at [0, 12), then "aurorasignal " was prepended so [0, 12) now holds "aurorasignal".
@@ -857,7 +868,9 @@ describe("ReadingSearch DOM behavior", () => {
         matchText: "AuroraSignal", // mismatched identity -> falls back to ordinary seeded Find (1 / 2) instead of 2 / 2
         nonce: 106,
       });
-      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
 
       // 2c. Shortened note where old seedRange extends past EOF (previously clamped to content.length):
       await renderNote("Short AuroraSignal.", {
@@ -868,8 +881,9 @@ describe("ReadingSearch DOM behavior", () => {
         matchText: "AuroraSignal",
         nonce: 107,
       });
-      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
-      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("AuroraSignal");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
 
       // 3. Valid Unicode case-folding ("strasse" -> "Straße", "istanbul" -> "İstanbul") and deliberate hidden-source hits still validate and reveal!
       const unicodeAndHidden = "İstanbul Café on Große Straße with [doc](https://example.com/Straße).";
@@ -897,6 +911,7 @@ describe("ReadingSearch DOM behavior", () => {
       expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
       expect(highlightMap.get("smd-search-current")).toBeUndefined();
     } finally {
+      Element.prototype.scrollIntoView = origScroll;
       Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
       Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
       act(() => root.unmount());
@@ -1028,7 +1043,7 @@ describe("ReadingSearch DOM behavior", () => {
       expect(host.querySelector(".search-replace")).not.toBeNull();
       expect(host.querySelector("output")?.textContent).toBe("3 / 4");
 
-      // Stale folder-search range arriving while wholeWord + regexp + Replace are active resets filters and falls back to 1 / 4.
+      // Stale folder-search range arriving while wholeWord + regexp + Replace are active resets filters and stays passive at 0 / 4 without jumping.
       act(() => {
         wholeWordBtn.click();
         regexBtn.click();
@@ -1044,7 +1059,8 @@ describe("ReadingSearch DOM behavior", () => {
       }, true);
       expect(wholeWordBtn.getAttribute("aria-pressed")).toBe("false");
       expect(regexBtn.getAttribute("aria-pressed")).toBe("false");
-      expect(host.querySelector("output")?.textContent).toBe("1 / 4");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 4");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
 
       // 3. Unmounted windowed block occurrence handoff mounts the block, selects exact occurrence, and maps Ctrl+H to source.
       const block0 = "Intro AuroraToken paragraph.";

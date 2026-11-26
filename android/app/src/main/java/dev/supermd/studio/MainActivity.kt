@@ -793,7 +793,20 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
             else (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlush(noteId) ?: false
         }
-        onDispose { model.readerFlushRequester = null }
+        model.readerFlushStatusRequester = { noteId ->
+            val current = web
+            if (!readerReady || current == null) {
+                if (model.readerStateIsNativeAuthoritative(noteId)) ReaderFlushStatus.ACKNOWLEDGED
+                else ReaderFlushStatus.FAILED
+            } else {
+                (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlushStatus(noteId)
+                    ?: ReaderFlushStatus.FAILED
+            }
+        }
+        onDispose {
+            model.readerFlushRequester = null
+            model.readerFlushStatusRequester = null
+        }
     }
     DisposableEffect(activity, model, readerReady) {
         val handler = if (readerReady) {
