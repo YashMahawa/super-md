@@ -336,13 +336,20 @@ def _write_gzip_json(target, value: dict) -> None:
             ).encode("utf-8")
             write_bytes(head)
             first = True
+            ascii_chunk = 1_048_576
             for name, data in assets.items():
                 if (isinstance(name, str) and _SAFE_ASSET_NAME.fullmatch(name)
                         and _is_cached_validated_asset(data)):
-                    write_bytes((b"" if first else b",") + b'"' + name.encode("ascii") + b'":"')
-                    for offset in range(0, len(data), _B64_DECODE_CHUNK):
-                        write_bytes(data[offset:offset + _B64_DECODE_CHUNK].encode("ascii"))
-                    write_bytes(b'"')
+                    prefix = (b"" if first else b",") + b'"' + name.encode("ascii") + b'":"'
+                    if len(data) <= ascii_chunk * 4:
+                        write_bytes(prefix + data.encode("ascii") + b'"')
+                    else:
+                        write_bytes(prefix)
+                        end = len(data)
+                        for offset in range(0, end, ascii_chunk):
+                            next_offset = offset + ascii_chunk
+                            chunk = data[offset:next_offset].encode("ascii")
+                            write_bytes(chunk + b'"' if next_offset >= end else chunk)
                 else:
                     entry = (
                         ("" if first else ",")
@@ -387,14 +394,17 @@ def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
         return
     import time
     deadline = time.monotonic() + 1.0
+    delay = 0.005
     while True:
         try:
             os.replace(source, target)
             return
         except PermissionError as error:
-            if getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if getattr(error, "winerror", None) not in (5, 32) or remaining <= 0:
                 raise
-            time.sleep(0.04)
+            time.sleep(min(delay, remaining))
+            delay = min(0.04, delay * 2)
 
 def write_portable(
     path: Path,
@@ -409,7 +419,7 @@ def write_portable(
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(handle, "wb") as raw:
-            if path.exists() and hasattr(os, "fchmod"):
+            if os.name != "nt" and hasattr(os, "fchmod") and path.exists():
                 os.fchmod(raw.fileno(), stat.S_IMODE(path.stat().st_mode))
 
             class _HashingWriter:
