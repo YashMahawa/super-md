@@ -146,6 +146,7 @@ class WorkspaceLinkResolverTest {
         assertFalse(promptResult.getBoolean("opened"))
         assertTrue(promptResult.optBoolean("promptedFolderAccess"))
         assertNotNull(model.state.value.folderAccessPrompt)
+        assertTrue(shouldBlockNativeDrop(model.state.value.copy(welcomed = true, busy = false)))
         assertEquals("# Index with unsaved edits\n", model.state.value.tabs.single { it.id == indexTab.id }.content)
 
         // Granting folder permission resolves the nested wikilink, opens tab, sets pendingHeading, and updates recent
@@ -158,6 +159,7 @@ class WorkspaceLinkResolverTest {
             model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), subNoteUri) } &&
                 model.state.value.folderAccessPrompt == null
         }
+        assertFalse(shouldBlockNativeDrop(model.state.value.copy(welcomed = true, busy = false)))
 
         val subTab = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), subNoteUri) }
         assertEquals(subTab.id, model.state.value.activeId)
