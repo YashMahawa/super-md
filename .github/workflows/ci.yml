@@ -170,10 +170,9 @@ jobs:
           path: |
             ${{ runner.temp }}/reader-assets-report.json
             ${{ runner.temp }}/python-wheel-inventory.json
-      - run: node --test scripts/release-guards.test.mjs
-      - run: node --test scripts/verify-phosphor-icons.test.mjs
-      - run: npx vitest run
-      - run: npm run test:pdf
+      - name: Run standalone Node script test suites
+        run: npm run test:scripts
+      - run: npm test
       - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - name: Test native state, file safety, themes and actual Qt menu geometry
         timeout-minutes: 8
