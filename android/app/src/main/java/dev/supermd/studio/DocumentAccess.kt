@@ -234,12 +234,12 @@ internal sealed interface SafReadAccess {
     data object Denied : SafReadAccess
 }
 
-internal class DocumentAccess(
+internal open class DocumentAccess(
     private val context: Context,
-    private val activeFolderUriProvider: (() -> Uri?)? = null,
-    private val relativeHintProvider: ((Uri) -> String?)? = null,
-    private val isConfirmedTreeChildProvider: ((treeUri: Uri, documentId: String) -> Boolean)? = null,
-    private val onConfirmedTreeKeys: ((Set<String>) -> Unit)? = null,
+    internal val activeFolderUriProvider: (() -> Uri?)? = null,
+    internal val relativeHintProvider: ((Uri) -> String?)? = null,
+    internal val isConfirmedTreeChildProvider: ((treeUri: Uri, documentId: String) -> Boolean)? = null,
+    internal val onConfirmedTreeKeys: ((Set<String>) -> Unit)? = null,
 ) {
     private data class CandidateTreeGrant(
         val canonicalTree: Uri,
@@ -263,7 +263,10 @@ internal class DocumentAccess(
             if (testGrants.isEmpty()) osGrants else osGrants + testGrants
         }
 
-    fun hasWriteGrant(uri: Uri): Boolean {
+    fun hasWriteGrant(
+        uri: Uri,
+        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = isConfirmedTreeChildProvider,
+    ): Boolean {
         if (uri.scheme != "content") return false
         val write = Intent.FLAG_GRANT_WRITE_URI_PERMISSION
         if (!DocumentsContract.isTreeUri(uri)) {
@@ -286,17 +289,16 @@ internal class DocumentAccess(
             return granted(uri, write) || granted(canonicalTree, write)
         }
         if (docId.isEmpty() || '\u0000' in docId) return false
-        val plainDoc = DocumentsContract.buildDocumentUri(authority, docId)
         val treeContainsDoc = if (knownPathProvider) {
             parseExternalStorageDocumentId(docId) != null && isKnownPathContainedInTree(authority, treeRoot, docId)
         } else {
-            isConfirmedTreeChildProvider == null ||
-                docId == treeRoot ||
-                isConfirmedTreeChildProvider.invoke(canonicalTree, docId)
+            docId == treeRoot ||
+                isConfirmedTreeChild?.invoke(canonicalTree, docId) == true
         }
         if (!treeContainsDoc) {
-            return granted(plainDoc, write)
+            return false
         }
+        val plainDoc = DocumentsContract.buildDocumentUri(authority, docId)
         val canonicalDoc = DocumentsContract.buildDocumentUriUsingTree(canonicalTree, docId)
         return granted(uri, write) || granted(canonicalDoc, write) || granted(canonicalTree, write) || granted(plainDoc, write)
     }
@@ -340,12 +342,13 @@ internal class DocumentAccess(
             val descriptor = resolver.openFileDescriptor(readTarget, "r")
                 ?: return DocumentWriteGuardOutcome.ORDINARY_PROVIDER_ERROR
             descriptor.use { }
-            if (hasWriteGrant(writeTarget)) {
+            val effectiveWriteTarget = if (hasWriteGrant(writeTarget)) writeTarget else readTarget
+            if (hasWriteGrant(effectiveWriteTarget)) {
                 DocumentWriteGuardOutcome.ACCESSIBLE
             } else if (
                 uri.authority != "${context.packageName}.share" &&
-                hasReadGrant(readTarget) &&
-                !hasWriteGrant(writeTarget)
+                hasAnyReadOrPendingGrant(readTarget) &&
+                !hasWriteGrant(effectiveWriteTarget)
             ) {
                 DocumentWriteGuardOutcome.PERMISSION_DENIED
             } else {
@@ -360,7 +363,7 @@ internal class DocumentAccess(
     }
 
     /** Reuse a user-granted containing tree; never manufacture access outside that tree. */
-    fun resolve(uri: Uri, writing: Boolean = false): Uri {
+    open fun resolve(uri: Uri, writing: Boolean = false): Uri {
         if (uri.scheme != "content") return uri
         val read = Intent.FLAG_GRANT_READ_URI_PERMISSION
         val write = Intent.FLAG_GRANT_WRITE_URI_PERMISSION
