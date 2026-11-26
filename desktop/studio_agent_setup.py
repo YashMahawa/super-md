@@ -2,6 +2,10 @@
 from __future__ import annotations
 import io, json, os, sys, threading, zipfile
 from pathlib import Path
+try:
+    from .core.paths import DESKTOP_DIR
+except ImportError:
+    from core.paths import DESKTOP_DIR
 
 def _agent_cloud():
     try:
@@ -68,7 +72,7 @@ def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen
             console_python = executable_path.with_name("python.exe")
             if console_python.is_file():
                 executable_path = console_python
-        script = Path(cli_script or Path(__file__).with_name("agent_cli.py")).expanduser().resolve()
+        script = Path(cli_script or DESKTOP_DIR / "agent_cli.py").expanduser().resolve()
         command, args = str(executable_path), [str(script), "mcp"]
     for root_path in _normalize_mcp_roots(roots):
         args.extend(["--root", root_path])
