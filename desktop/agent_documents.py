@@ -23,9 +23,10 @@ from pathlib import Path
 from typing import Iterator
 
 try:  # package import and direct-script import are both supported
-    from . import documents
+    from . import documents, frontmatter
 except ImportError:
     import documents
+    import frontmatter
 
 MAX_PAGE_CHARS = 12_000
 MAX_SEARCH_RESULTS = 25
@@ -493,10 +494,12 @@ class DocumentStore:
             assets = self._entry_asset_metadata(entry, limit=40)
         outline = outline_source(entry.text)
         headings = outline["headings"]
+        props = frontmatter.extract_visible_metadata(entry.text)
         return {
             "path": self.display_path(path), "format": "smd" if entry.portable or path.suffix.lower() == ".smd" else "markdown",
             "portable": entry.portable, "revision": entry.revision, "sha256": entry.revision,
             "bytes": entry.raw_size, "characters": len(entry.text), "lines": len(entry.text.splitlines()),
+            **({"properties": props} if props else {}),
             "heading_count": outline["total"], "headings": headings,
             "headings_truncated": outline["truncated"], "next_heading_offset": outline["nextOffset"],
             "assets": assets, "asset_count": len(entry.assets),
@@ -827,7 +830,11 @@ def _headings(text: str, *, include_internal: bool = False) -> list[dict]:
     line_number = 1
     fence_char = None
     fence_size = 0
+    fm_end = frontmatter.frontmatter_end(text)
     for line in text.splitlines(keepends=True):
+        if offset < fm_end:
+            offset += len(line); line_number += 1
+            continue
         body = line.rstrip("\r\n")
         fm = _FENCE.match(body)
         if fm:

@@ -4,6 +4,7 @@ import { setReaderOverlay } from "../readerOverlays";
 import { ArrowUpIcon, ArrowDownIcon, XIcon, TextAaIcon, TextboxIcon, AsteriskIcon, ArrowsClockwiseIcon } from "@phosphor-icons/react";
 import { editorFindQuery, editorFindRange } from "./Editor";
 import { windowedMatches, revealWindowed, compileSearchPattern, nextSearchMatch, normalizeSearchOptions, type WindowedMatch, type SearchMatchConfig, type SearchMatchOptions } from "../windowedSearch";
+import { parseFrontmatter, frontmatterVisibleValueSpans, type FrontmatterVisibleField, type FrontmatterVisibleSpan } from "../frontmatter";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import { refreshDocumentExtent } from "../documentZoom";
 export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
@@ -148,8 +149,8 @@ function sourceBounds(el: Element, content?: string): { start: number; end: numb
       if (prev instanceof HTMLElement && prev.classList.contains("code-container")) ordinal++;
     }
     if (regionStart === 0) {
-      const fm = content.match(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/);
-      if (fm) regionStart = fm[0].length;
+      const fm = parseFrontmatter(content);
+      if (fm) regionStart = fm.end;
     }
     let regionEnd = content.length;
     for (let next = el.nextElementSibling; next; next = next.nextElementSibling) {
@@ -309,8 +310,77 @@ function sameDomRange(a: Range, b: Range): boolean {
   return a.startContainer === b.startContainer && a.startOffset === b.startOffset && a.endContainer === b.endContainer && a.endOffset === b.endOffset;
 }
 
+function findFrontmatterFieldElement(host: Element, field: FrontmatterVisibleField, fieldOrdinal: number): HTMLElement | null {
+  const header = host.matches("[data-frontmatter-properties],.document-properties")
+    ? host
+    : host.querySelector("[data-frontmatter-properties],.document-properties");
+  if (!header) return null;
+  const list = header.querySelectorAll<HTMLElement>(`[data-frontmatter-field="${field}"]`);
+  return list[fieldOrdinal] ?? null;
+}
+
+function orderedFrontmatterSourceIndices(
+  spans: FrontmatterVisibleSpan[],
+  ranges: SourceRange[],
+  field: FrontmatterVisibleField,
+  fieldOrdinal: number,
+): number[] {
+  const indices: number[] = [];
+  for (const span of spans) {
+    if (span.field !== field || span.fieldOrdinal !== fieldOrdinal) continue;
+    for (let i = 0; i < ranges.length; i++) {
+      const candidate = ranges[i];
+      if (candidate.from >= span.start && candidate.to <= span.end && !indices.includes(i)) {
+        indices.push(i);
+      }
+    }
+  }
+  return indices;
+}
+
+function mapFrontmatterSourceRangeToDomRange(
+  host: Element,
+  content: string,
+  ranges: SourceRange[],
+  activeIndex: number,
+  query: string,
+  options: SearchMatchConfig = false,
+): Range | null {
+  const target = ranges[activeIndex];
+  if (!target) return null;
+  const spans = frontmatterVisibleValueSpans(content);
+  if (!spans.length) return null;
+  const matchSpan = spans.find(s => target.from >= s.start && target.to <= s.end);
+  if (!matchSpan) return null;
+  const fieldEl = findFrontmatterFieldElement(host, matchSpan.field, matchSpan.fieldOrdinal);
+  if (!fieldEl) return null;
+  const domRanges = readingMatches(fieldEl, query, options);
+  if (!domRanges.length) return null;
+  const orderedIndices = orderedFrontmatterSourceIndices(spans, ranges, matchSpan.field, matchSpan.fieldOrdinal);
+  const ordinal = orderedIndices.indexOf(activeIndex);
+  return ordinal >= 0 ? (domRanges[ordinal] ?? null) : null;
+}
+
 function mapDomRangeToSourceIndex(host: Element, content: string, ranges: SourceRange[], domRange: Range, query: string, options: SearchMatchConfig = false): number {
   const common = domRange.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? domRange.commonAncestorContainer as Element : domRange.commonAncestorContainer.parentElement;
+  const fmFieldEl = common?.closest<HTMLElement>("[data-frontmatter-field]");
+  if (fmFieldEl) {
+    const rawField = fmFieldEl.getAttribute("data-frontmatter-field");
+    if (rawField === "title" || rawField === "author" || rawField === "tag") {
+      const header = fmFieldEl.closest("[data-frontmatter-properties],.document-properties") ?? host;
+      const siblings = Array.from(header.querySelectorAll<HTMLElement>(`[data-frontmatter-field="${rawField}"]`));
+      const fieldOrdinal = siblings.indexOf(fmFieldEl);
+      if (fieldOrdinal >= 0) {
+        const domRanges = readingMatches(fmFieldEl, query, options);
+        const ordinal = domRanges.findIndex(r => sameDomRange(r, domRange));
+        if (ordinal >= 0) {
+          const spans = frontmatterVisibleValueSpans(content);
+          const orderedIndices = orderedFrontmatterSourceIndices(spans, ranges, rawField, fieldOrdinal);
+          if (orderedIndices[ordinal] !== undefined) return orderedIndices[ordinal];
+        }
+      }
+    }
+  }
   const owner = common?.closest<HTMLElement>("[data-source-start],.code-container");
   if (owner) {
     const domRanges = directOwnerDomRanges(owner, query, options);
@@ -350,8 +420,8 @@ export function resolveSourceHighlightRange(host: Element, content: string, rang
   const target = ranges[activeIndex];
   if (!target) return null;
   const block = findContainingBlock(host, target, content);
-  if (!block) return null;
-  return mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options);
+  if (block) return mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options);
+  return mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
 }
 
 export function readingMatches(host: Element, query: string, options: SearchMatchConfig = false): Range[] {
@@ -362,8 +432,9 @@ export function readingMatches(host: Element, query: string, options: SearchMatc
   let text = "", node: Node | null, block: Element | null = null;
   while ((node = walker.nextNode())) {
     const parent = node.parentElement;
-    if (!parent || parent.closest("button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools,.image-loading,.image-error,.remote-image-card,[data-frontmatter-properties],.document-properties")) continue;
-    const nextBlock = parent.closest("p,h1,h2,h3,h4,li,pre,td,summary");
+    if (!parent || parent.closest("button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools,.image-loading,.image-error,.remote-image-card")) continue;
+    if (parent.closest("[data-frontmatter-properties],.document-properties") && !parent.closest("[data-frontmatter-field]")) continue;
+    const nextBlock = parent.closest("p,h1,h2,h3,h4,li,pre,td,summary,[data-frontmatter-field]");
     if (block !== nextBlock) { text += "\n"; block = nextBlock; }
     const value = node.textContent || "";
     parts.push({ node: node as Text, start: text.length, end: text.length + value.length });
@@ -468,8 +539,23 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const host = findReadingHost();
     if (!sr || !host) return -1;
     const block = findContainingBlock(host, sr, content);
-    if (!block) return -1;
     const liveWindowed = windowed && windowed.every(w => w.element.isConnected && host.contains(w.element)) ? windowed : windowedMatches(host, query, filterOptions);
+    if (!block) {
+      const fmResolved = mapFrontmatterSourceRangeToDomRange(host, content, sourceRanges, sourceIdx, query, filterOptions);
+      if (!fmResolved) return -1;
+      if (liveWindowed) {
+        for (let i = 0; i < liveWindowed.length; i++) {
+          const w = liveWindowed[i];
+          if (w.element.contains(fmResolved.startContainer)) {
+            const wRange = readingMatches(w.element, query, filterOptions)[w.ordinal];
+            if (wRange && sameDomRange(wRange, fmResolved)) return i;
+          }
+        }
+        return -1;
+      }
+      const liveMatches = matches.length && matches[0].startContainer.nodeType === Node.TEXT_NODE && host.contains(matches[0].startContainer) ? matches : readingMatches(host, query, filterOptions);
+      return liveMatches.findIndex(m => sameDomRange(m, fmResolved));
+    }
     if (liveWindowed) {
       if (!liveWindowed.length) return -1;
       if (!block.closest('[data-windowed-mounted="false"]')) {
@@ -515,9 +601,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!host) return;
     const initialBlock = findContainingBlock(host, range, sourceText);
     if (!initialBlock) {
-      registry?.delete("smd-search-current");
+      const fmDomRange = mapFrontmatterSourceRangeToDomRange(host, sourceText, ranges, targetIndex, query, filterOptions);
+      if (registry && HighlightClass) {
+        if (scroll) registry.set("smd-search", new HighlightClass(...readingMatches(host, query, filterOptions)));
+        registry.delete("smd-search-current");
+        if (fmDomRange) registry.set("smd-search-current", new HighlightClass(fmDomRange));
+      }
       if (scroll) {
-        const fallback = host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
+        const fmTarget = fmDomRange
+          ? (fmDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? fmDomRange.startContainer as Element : fmDomRange.startContainer.parentElement)
+          : null;
+        const fallback = fmTarget ?? host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
         scrollTargetIntoView(fallback, host);
       }
       return;

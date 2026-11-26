@@ -137,11 +137,29 @@ export function nextSearchMatch(pattern:RegExp,text:string):RegExpExecArray|null
   }
   return null;
 }
+function frontmatterHeaderText(header:Element):string {
+  const walker=header.ownerDocument.createTreeWalker(header,NodeFilter.SHOW_TEXT);
+  let text='',node:Node|null,block:Element|null=null;
+  while((node=walker.nextNode())){
+    const parent=node.parentElement;
+    if(!parent||!parent.closest('[data-frontmatter-field]')||parent.closest('button,input,textarea,svg,annotation,.katex-mathml,.chart-controls,.chart-toolbar,.chart-legend,.image-edit-tools,.image-loading,.image-error,.remote-image-card'))continue;
+    const nextBlock=parent.closest('p,h1,h2,h3,h4,li,pre,td,summary,[data-frontmatter-field]');
+    if(block!==nextBlock){text+='\n';block=nextBlock;}
+    text+=node.textContent||'';
+  }
+  return text;
+}
 export function windowedMatches(host:Element,query:string,options:SearchMatchConfig=false):WindowedMatch[]|null {
   if(!host.querySelector('[data-windowed-block]'))return null;
   const result:WindowedMatch[]=[];
   const {pattern}=compileSearchPattern(query,options,false);
   if(!pattern)return result;
+  for(const header of host.querySelectorAll<HTMLElement>('[data-frontmatter-properties],.document-properties')){
+    const headerText=frontmatterHeaderText(header);
+    if(!headerText)continue;
+    pattern.lastIndex=0;let ordinal=0;
+    while(nextSearchMatch(pattern,headerText)){result.push({element:header,ordinal:ordinal++});if(result.length>=5000)return result;}
+  }
   for(const [element,text] of blocks){
     if(!host.contains(element))continue;
     pattern.lastIndex=0;let ordinal=0;

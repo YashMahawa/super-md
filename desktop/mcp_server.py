@@ -836,6 +836,32 @@ def build_mcp_server(roots: list[str], live_client=None):
             cells.append(entry)
         return cells or None
 
+    def _bounded_properties(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, Any] = {}
+        title = _bounded_text(value.get("title"), 300)
+        if title is not None and title.strip():
+            result["title"] = title
+        author = _bounded_text(value.get("author"), 500)
+        if author is not None and author.strip():
+            result["author"] = author
+        if isinstance(value.get("authors"), list):
+            authors = [
+                item[:200] for item in value["authors"]
+                if isinstance(item, str) and item.strip()
+            ][:20]
+            if authors:
+                result["authors"] = authors
+        if isinstance(value.get("tags"), list):
+            tags = [
+                item[:100] for item in value["tags"]
+                if isinstance(item, str) and item.strip()
+            ][:50]
+            if tags:
+                result["tags"] = tags
+        return result or None
+
     def _viewport_contexts(image: dict[str, Any], tab_id: str,
                            expected_revision: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
         nested = image.get("context") if isinstance(image.get("context"), dict) else None
@@ -861,6 +887,9 @@ def build_mcp_server(roots: list[str], live_client=None):
         zoom = source.get("zoom", metadata.get("zoom") if metadata else None)
         if isinstance(zoom, (int, float)) and not isinstance(zoom, bool):
             capture_ctx["zoom"] = zoom
+        props = _bounded_properties(source.get("properties", metadata.get("properties") if metadata else None))
+        if props is not None:
+            capture_ctx["properties"] = props
         raw_reading = source.get("reading", metadata.get("reading") if metadata else None)
         if isinstance(raw_reading, dict):
             reading: dict[str, Any] = {}
@@ -1008,6 +1037,12 @@ def build_mcp_server(roots: list[str], live_client=None):
                 normalized["pythonCells"] = bounded_cells
             else:
                 normalized.pop("pythonCells", None)
+        if "properties" in normalized:
+            bounded_props = _bounded_properties(normalized.get("properties"))
+            if bounded_props is not None:
+                normalized["properties"] = bounded_props
+            else:
+                normalized.pop("properties", None)
         raw_ctx_tab = normalized.get("tabId")
         reading_context = dict(normalized)
         if isinstance(raw_ctx_tab, str) and raw_ctx_tab and raw_ctx_tab != resolved_tab:
@@ -1062,7 +1097,10 @@ def build_mcp_server(roots: list[str], live_client=None):
             }
             capture_context, captured_reading = _viewport_contexts(image, resolved_tab, revision)
             if captured_reading is not None:
-                final_reading_context = {**captured_reading, "target": target}
+                merged_capture = dict(captured_reading)
+                if "properties" not in merged_capture and "properties" in reading_context:
+                    merged_capture["properties"] = reading_context["properties"]
+                final_reading_context = {**merged_capture, "target": target}
                 reading_context_source = "viewport_capture"
                 aligned = True
             else:

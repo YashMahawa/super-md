@@ -649,6 +649,72 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertGreaterEqual(len(small_store._cache), 1)
         self.assertLess(len(small_store._cache), 6)
 
+    def test_frontmatter_visible_metadata_and_canonical_offsets_in_inspect_outline_read_search_and_patch(self):
+        source = (
+            "\ufeff---\n"
+            'title: "Path Integrals & Symmetries"\n'
+            "subtitle: Graduate Notes\n"
+            "# Not a Markdown heading inside YAML\n"
+            "author:\n"
+            "  - name: Richard Feynman\n"
+            "  - given: Emmy\n"
+            "    family: Noether\n"
+            "date: 2026-03-15\n"
+            "tags: [quantum, physics]\n"
+            "keywords: physics, qft\n"
+            "---\n"
+            "\n"
+            "# Introduction\n"
+            "Body paragraph with 🧭 canonical offset.\n"
+        )
+        note = self.root / "frontmatter-note.md"
+        note.write_bytes(source.encode("utf-8"))
+        canonical = source.removeprefix("\ufeff")
+
+        info = self.store.inspect("frontmatter-note.md")
+        self.assertEqual(info["properties"], {
+            "title": "Path Integrals & Symmetries",
+            "author": "Richard Feynman, Emmy Noether",
+            "authors": ["Richard Feynman", "Emmy Noether"],
+            "tags": ["quantum", "physics", "qft"],
+        })
+        self.assertEqual([h["title"] for h in info["headings"]], ["Introduction"])
+        intro_offset = canonical.index("# Introduction")
+        intro_line = canonical[:intro_offset].count("\n") + 1
+        self.assertEqual(info["headings"][0]["start"], intro_offset)
+        self.assertEqual(info["headings"][0]["line"], intro_line)
+
+        section = self.store.read("frontmatter-note.md", heading="Introduction", view="source")
+        self.assertEqual(section["start"], intro_offset)
+        self.assertEqual(section["text"], canonical[intro_offset:])
+
+        matches = self.store.search("frontmatter-note.md", "Noether", context=0)
+        self.assertEqual(matches["totalMatches"], 1)
+        self.assertEqual(matches["matches"][0]["matchOffset"], canonical.index("Noether"))
+
+        self.store.patch(
+            "frontmatter-note.md",
+            expected_revision=info["revision"],
+            operations=[{"type": "lines", "start_line": intro_line + 1, "end_line": intro_line + 1,
+                         "text": "Updated body paragraph.\n"}],
+        )
+        self.assertEqual(
+            self.store.read("frontmatter-note.md", view="source")["text"],
+            canonical.replace("Body paragraph with 🧭 canonical offset.", "Updated body paragraph."),
+        )
+        self.assertEqual(self.store.inspect("frontmatter-note.md")["properties"], info["properties"])
+
+        # Portable .smd envelopes preserve leading \ufeff verbatim in markdown.
+        smd_note = self.root / "frontmatter-bom.smd"
+        smd_note.write_bytes(compressed_bundle(source, {}))
+        smd_info = self.store.inspect("frontmatter-bom.smd")
+        self.assertEqual(smd_info["properties"], info["properties"])
+        self.assertEqual(smd_info["headings"][0]["start"], source.index("# Introduction"))
+
+        plain = self.root / "unrecognized-fm.md"
+        plain.write_text("---\ncssclasses: [wide]\n---\n# Plain\n", encoding="utf-8")
+        self.assertNotIn("properties", self.store.inspect("unrecognized-fm.md"))
+
 
 if __name__ == "__main__":
     unittest.main()

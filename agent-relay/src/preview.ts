@@ -197,6 +197,31 @@ function boundedPythonCells(value: unknown): unknown[] | undefined {
   return cells.length ? cells : undefined;
 }
 
+export function boundedProperties(value: unknown): Record<string, unknown> | undefined {
+  const source = record(value);
+  if (!source) return undefined;
+  const result: Record<string, unknown> = {};
+  const title = textField(source.title, 300);
+  if (title !== undefined && title.trim().length > 0) result.title = title;
+  const author = textField(source.author, 500);
+  if (author !== undefined && author.trim().length > 0) result.author = author;
+  if (Array.isArray(source.authors)) {
+    const authors = source.authors
+      .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .slice(0, 20)
+      .map((item) => item.slice(0, 200));
+    if (authors.length) result.authors = authors;
+  }
+  if (Array.isArray(source.tags)) {
+    const tags = source.tags
+      .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .slice(0, 50)
+      .map((item) => item.slice(0, 100));
+    if (tags.length) result.tags = tags;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
 /** Extract bounded image-time context. Desktop captures can include source; Android metadata includes position only. */
 export function viewportContexts(image: Record<string, unknown>, requestedTab: string, expectedRevision: string): ViewportContexts {
   const nested = record(image.context);
@@ -207,6 +232,7 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   const mode = textField(source.mode ?? metadata?.mode, 64);
   const zoomValue = source.zoom ?? metadata?.zoom;
   const zoom = typeof zoomValue === "number" && Number.isFinite(zoomValue) ? zoomValue : undefined;
+  const properties = boundedProperties(source.properties ?? metadata?.properties);
   const reading = boundedReading(source.reading ?? metadata?.reading);
   const selection = boundedSelection(source.selection ?? metadata?.selection);
   const viewport = boundedViewport(source.viewport ?? metadata?.viewport);
@@ -222,6 +248,7 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   if (typeof source.revision === "string" && source.revision !== expectedRevision) captureContext.contextRevision = source.revision;
   if (mode !== undefined) captureContext.mode = mode;
   if (zoom !== undefined) captureContext.zoom = zoom;
+  if (properties) captureContext.properties = properties;
   if (reading) captureContext.reading = reading;
   if (selection) captureContext.selection = selection;
   if (viewport) captureContext.viewport = viewport;

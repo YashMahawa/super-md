@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import sharp from "sharp";
-import { makeJpegPreview, MAX_PREVIEW_OUTPUT_BYTES, MAX_ACTIVE_PREVIEWS, MAX_QUEUED_PREVIEWS, normalizeReadingContext, previewQueueState, viewportContexts } from "./preview.js";
+import { boundedProperties, makeJpegPreview, MAX_PREVIEW_OUTPUT_BYTES, MAX_ACTIVE_PREVIEWS, MAX_QUEUED_PREVIEWS, normalizeReadingContext, previewQueueState, viewportContexts } from "./preview.js";
 
 test("reading context restores full-source pagination from the authoritative code-point length", () => {
   const legacy = {
@@ -162,4 +162,47 @@ test("boundedDiagrams and viewportContexts preserve StepCards active slide metad
   assert.deepEqual(captured.capturedReadingContext?.pythonCells, [
     { ordinal: 0, sourceStart: 200, sourceEnd: 260, ok: true, stdout: "loss=0.02\n", stderr: "", figureIds: ["diagram:python:200:0"] },
   ]);
+});
+
+test("boundedProperties and viewportContexts preserve bounded title, author, authors, and tags", () => {
+  assert.equal(boundedProperties(null), undefined);
+  assert.equal(boundedProperties({ title: "   ", date: "2026-03-15" }), undefined);
+  assert.deepEqual(boundedProperties({
+    title: "t".repeat(400),
+    author: "a".repeat(600),
+    authors: ["Emmy Noether", "", 42, "x".repeat(250)],
+    tags: ["quantum", "  ", null, "k".repeat(150)],
+    description: "ignored",
+  }), {
+    title: "t".repeat(300),
+    author: "a".repeat(500),
+    authors: ["Emmy Noether", "x".repeat(200)],
+    tags: ["quantum", "k".repeat(100)],
+  });
+
+  const revision = "f".repeat(64);
+  const captured = viewportContexts({
+    tabId: "fm-note",
+    revision,
+    sourceLength: 80,
+    mode: "reader",
+    properties: {
+      title: "Path Integrals & Symmetries",
+      author: "Richard Feynman, Emmy Noether",
+      authors: ["Richard Feynman", "Emmy Noether"],
+      tags: ["quantum", "physics"],
+      subtitle: "excluded",
+    },
+    reading: { offset: 0, heading: "Path Integrals & Symmetries", visibleText: "Path Integrals & Symmetries" },
+    visibleSource: { text: "---\ntitle: Path Integrals & Symmetries\n---\n", start: 0, end: 43, total_chars: 80, next_offset: 43, truncated: true },
+  }, "window:desktop:fm-note", revision);
+
+  const expected = {
+    title: "Path Integrals & Symmetries",
+    author: "Richard Feynman, Emmy Noether",
+    authors: ["Richard Feynman", "Emmy Noether"],
+    tags: ["quantum", "physics"],
+  };
+  assert.deepEqual(captured.captureContext.properties, expected);
+  assert.deepEqual(captured.capturedReadingContext?.properties, expected);
 });

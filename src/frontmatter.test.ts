@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { maskFrontmatter, parseFrontmatter } from "./frontmatter";
+import { frontmatterVisibleValueSpans, maskFrontmatter, parseFrontmatter } from "./frontmatter";
 
 describe("YAML frontmatter parser", () => {
   it("recognizes UTF-8 BOM, trailing spaces, dot closers, empty blocks, CRLF, and EOF closers", () => {
@@ -113,5 +113,36 @@ describe("YAML frontmatter parser", () => {
     expect(masked.indexOf("# Real Heading")).toBe(source.indexOf("# Real Heading"));
     expect(masked.indexOf("![Real](chart.png)")).toBe(source.indexOf("![Real](chart.png)"));
     expect(masked).not.toContain("missing.png");
+  });
+
+  it("maps displayed title, author, and tags to exact canonical UTF-16 value spans in display order", () => {
+    const source = [
+      "\uFEFF---",
+      "date: 2026-03-15 # hidden date and comment",
+      "tags: [quantum, physics] # inline tag comment",
+      "keywords: physics, qft",
+      "author:",
+      "  - name: Richard Feynman",
+      "    affiliation: Caltech",
+      "  - given: Emmy",
+      "    family: Noether",
+      "subtitle: Perturbative Notes",
+      'title: "Path Integrals & Symmetries"',
+      "aliases: [QFT Notes]",
+      "...",
+      "# Body Heading",
+    ].join("\r\n");
+
+    const spans = frontmatterVisibleValueSpans(source);
+    expect(spans.map((s) => ({ field: s.field, fieldOrdinal: s.fieldOrdinal, text: source.slice(s.start, s.end) }))).toEqual([
+      { field: "title", fieldOrdinal: 0, text: "Path Integrals & Symmetries" },
+      { field: "author", fieldOrdinal: 0, text: "Richard Feynman" },
+      { field: "author", fieldOrdinal: 0, text: "Emmy" },
+      { field: "author", fieldOrdinal: 0, text: "Noether" },
+      { field: "tag", fieldOrdinal: 0, text: "quantum" },
+      { field: "tag", fieldOrdinal: 1, text: "physics" },
+      { field: "tag", fieldOrdinal: 2, text: "qft" },
+    ]);
+    expect(frontmatterVisibleValueSpans("# No frontmatter\nBody")).toEqual([]);
   });
 });

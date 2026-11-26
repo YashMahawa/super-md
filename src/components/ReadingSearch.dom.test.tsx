@@ -128,11 +128,11 @@ describe("ReadingSearch DOM behavior", () => {
     host.remove();
   });
 
-  it("maps body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
+  it("maps displayed metadata and body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
-    let current = "---\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
+    let current = "---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
     const changes: string[] = [];
 
     await act(async () => {
@@ -151,22 +151,32 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => setInputValue(searchInput, "Alpha"));
     await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
 
-    // Body search ignores rendered YAML properties, counting only the 1 body match.
-    expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+    // Rendered search includes displayed title, author, and tags (3 matches) + 1 body match = 4, excluding description.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 4");
     const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    // Match 1 in DOM order is displayed title ("Alpha Study"), which is source match 4 / 5 in YAML key order!
     act(() => nextButton.click());
-    expect(host.querySelector("output")?.textContent).toBe("1 / 1");
-
-    // Toggling Replace in source maps that active body match to source match 2 / 2 (after frontmatter title).
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
     const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
     act(() => replaceToggle.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(host.querySelector("output")?.textContent).toBe("4 / 5");
+    // Toggle Replace back off -> returns to 1 / 4!
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
+
+    // Step to match 4 / 4 (Alpha body.) and toggle Replace in source -> maps to source match 5 / 5!
+    act(() => nextButton.click()); // 2 / 4 (author: Dr. Alpha)
+    act(() => nextButton.click()); // 3 / 4 (tag: alpha-tag)
+    act(() => nextButton.click()); // 4 / 4 (Alpha body.)
+    expect(host.querySelector("output")?.textContent).toBe("4 / 4");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("5 / 5");
 
     const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
     const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
     act(() => setInputValue(replaceInput, "Beta"));
     act(() => buttons[0].click());
-    expect(changes.at(-1)).toBe("---\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+    expect(changes.at(-1)).toBe("---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
 
     act(() => root.unmount());
     host.remove();

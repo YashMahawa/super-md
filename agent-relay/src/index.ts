@@ -11,7 +11,7 @@ import { toNodeHandler } from "@modelcontextprotocol/node";
 import { z } from "zod";
 import { MAX_FRAME_BYTES, MAX_PENDING, REQUEST_TIMEOUT_MS, validateRpcRequest, validReply, type RpcRequest } from "./protocol.js";
 import { ExportDownloads, attachmentHeader, waitForDownloadDrain } from "./downloads.js";
-import { decodeViewportBase64, makeJpegPreview, normalizeReadingContext, viewportContexts } from "./preview.js";
+import { boundedProperties, decodeViewportBase64, makeJpegPreview, normalizeReadingContext, viewportContexts } from "./preview.js";
 
 type Pending = { resolve: (value: { result?: unknown; error?: string }) => void; timer: NodeJS.Timeout };
 type Device = {
@@ -325,7 +325,13 @@ function registerTools(server: McpServer, group: Group): void {
     const context = contextResponse.result as Record<string, unknown> | undefined;
     if (!context || typeof context.tabId !== "string" || !context.tabId || typeof context.revision !== "string" || !REVISION_RE.test(context.revision)) return textResult({ error: "The app returned invalid reading context for the selected tab." }, true);
     const normalizedContext = normalizeReadingContext(context) ?? context;
-    const readingContext = normalizedContext.tabId === tab ? normalizedContext : { ...normalizedContext, tabId: tab, nativeTabId: normalizedContext.tabId };
+    const baseReadingContext: Record<string, unknown> = normalizedContext.tabId === tab ? { ...normalizedContext } : { ...normalizedContext, tabId: tab, nativeTabId: normalizedContext.tabId };
+    if ("properties" in baseReadingContext) {
+      const sanitizedProps = boundedProperties(baseReadingContext.properties);
+      if (sanitizedProps) baseReadingContext.properties = sanitizedProps;
+      else delete baseReadingContext.properties;
+    }
+    const readingContext = baseReadingContext;
 
     let previewInfo: { mimeType: "image/jpeg" | "image/png"; byteLength: number; width: number; height: number; serverMs?: number; previewOnly: boolean } | undefined;
     let previewContent: { type: "image"; data: string; mimeType: string } | undefined;
@@ -350,7 +356,9 @@ function registerTools(server: McpServer, group: Group): void {
       const capture = viewportContexts(image, tab, context.revision);
       captureContext = capture.captureContext;
       if (capture.capturedReadingContext) {
-        finalReadingContext = capture.capturedReadingContext;
+        finalReadingContext = readingContext.properties && !capture.capturedReadingContext.properties
+          ? { ...capture.capturedReadingContext, properties: readingContext.properties }
+          : capture.capturedReadingContext;
         readingContextSource = "viewport_capture";
         readingContextAlignedWithCapture = true;
       } else {
