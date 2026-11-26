@@ -846,35 +846,33 @@ describe("ReadingSearch DOM behavior", () => {
       const winHits = sourceMatches(windowedDoc, "AuroraToken", true);
       expect(winHits).toHaveLength(3);
 
+      const renderWindowed = (
+        seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number } | null,
+      ) =>
+        act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch
+                content={windowedDoc}
+                close={() => {}}
+                onChange={() => {}}
+                seed={seed}
+              />
+              <section className="android-reading">
+                <div className="markdown-body">
+                  <div id="win-block-1" data-windowed-block="" data-windowed-mounted="true" data-source-start="0" data-source-end={String(block0.length)}>
+                    <p data-source-start="0" data-source-end={String(block0.length)}>{block0}</p>
+                  </div>
+                  <div id="win-block-2" data-windowed-block="" data-windowed-mounted="false" data-source-start={String(block1Start)} data-source-end={String(windowedDoc.length)} />
+                </div>
+              </section>
+            </div>
+          );
+        });
+
       let unregisterWindowed0: (() => void) | null = null;
       let unregisterWindowed1: (() => void) | null = null;
-      await act(async () => {
-        root.render(
-          <div className="android-document">
-            <ReadingSearch
-              content={windowedDoc}
-              close={() => {}}
-              onChange={() => {}}
-              seed={{
-                query: "AuroraToken",
-                caseSensitive: true,
-                sourceStart: winHits[2].from,
-                sourceEnd: winHits[2].to,
-                matchText: "AuroraToken",
-                nonce: 206,
-              }}
-            />
-            <section className="android-reading">
-              <div className="markdown-body">
-                <div id="win-block-1" data-windowed-block="" data-windowed-mounted="true" data-source-start="0" data-source-end={String(block0.length)}>
-                  <p data-source-start="0" data-source-end={String(block0.length)}>{block0}</p>
-                </div>
-                <div id="win-block-2" data-windowed-block="" data-windowed-mounted="false" data-source-start={String(block1Start)} data-source-end={String(windowedDoc.length)} />
-              </div>
-            </section>
-          </div>
-        );
-      });
+      await renderWindowed(null);
       const winEl0 = host.querySelector<HTMLElement>("#win-block-1")!;
       const winEl = host.querySelector<HTMLElement>("#win-block-2")!;
       unregisterWindowed0 = registerWindowedText(winEl0, block0);
@@ -884,6 +882,15 @@ describe("ReadingSearch DOM behavior", () => {
         winEl.innerHTML = `<p data-source-start="${block1Start}" data-source-end="${windowedDoc.length}">${block1}</p>`;
       });
       try {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+        await renderWindowed({
+          query: "AuroraToken",
+          caseSensitive: true,
+          sourceStart: winHits[2].from,
+          sourceEnd: winHits[2].to,
+          matchText: "AuroraToken",
+          nonce: 206,
+        });
         await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
         expect(winEl.getAttribute("data-windowed-mounted")).toBe("true");
         expect(host.querySelector("output")?.textContent).toBe("3 / 3");

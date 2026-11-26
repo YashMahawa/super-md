@@ -262,6 +262,7 @@ def _webengine_e2e_probe() -> int:
         window.close()
         del engine
         studio.stop()
+        studio._search_pool.shutdown(wait=False, cancel_futures=True)
         studio.pool.shutdown(wait=False, cancel_futures=True)
         session.writes.shutdown(wait=False)
     os._exit(0)
@@ -282,6 +283,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
 
     def tearDown(self):
         self.studio.stop()
+        self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.studio.pool.shutdown(wait=True)
         self.session.writes.shutdown(wait=True)
         self.temp.cleanup()
