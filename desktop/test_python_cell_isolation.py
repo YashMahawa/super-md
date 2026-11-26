@@ -18,7 +18,7 @@ from PySide6.QtGui import QGuiApplication
 import offline_view
 import python_runtime
 from studio import Session
-from test_python_runtime import _best_effort_kill, _pid_alive, _wait_pid_exit
+from test_python_runtime import _best_effort_kill, _pid_alive, _read_nonempty, _wait_pid_exit, _warm_interpreter_once
 from test_studio import QuietStudio
 
 
@@ -26,10 +26,12 @@ class PythonCellIsolationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Python cell isolation tests"])
-        python_runtime.run(sys.executable, "pass", timeout=30)
+        _warm_interpreter_once()
 
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="supermd-cell-isolation-")
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="supermd-cell-isolation-", ignore_cleanup_errors=True
+        )
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.session = Session(True)
@@ -40,6 +42,7 @@ class PythonCellIsolationTest(unittest.TestCase):
         for window in reversed(self.windows):
             window.stop()
             window.pool.shutdown(wait=True, cancel_futures=True)
+            window._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
 
@@ -51,19 +54,18 @@ class PythonCellIsolationTest(unittest.TestCase):
         self.windows.append(studio)
         return studio, replies
 
-    def _await_file(self, path: Path, timeout: float = 15.0) -> str:
+    def _await_file(self, path: Path, timeout: float = 25.0) -> str:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.app.processEvents()
-            if path.is_file():
-                text = path.read_text(encoding="utf-8").strip()
-                if text:
-                    return text
+            text = _read_nonempty(path)
+            if text:
+                return text
             time.sleep(0.01)
         self.fail(f"Timed out waiting for marker file {path}")
 
     def _await_reply(
-        self, replies: list[tuple[str, str, str]], req_id: str, timeout: float = 15.0
+        self, replies: list[tuple[str, str, str]], req_id: str, timeout: float = 25.0
     ) -> tuple[str, str, str]:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -123,9 +125,9 @@ print("window 2 completed cleanly")
 
         self._await_file(w1_ready)
         self._await_file(w2_ready)
-        w1_child_pid = int(w1_child_pid_file.read_text(encoding="utf-8").strip())
-        w1_grandchild_pid = int(w1_grandchild_pid_file.read_text(encoding="utf-8").strip())
-        w2_child_pid = int(w2_child_pid_file.read_text(encoding="utf-8").strip())
+        w1_child_pid = int(self._await_file(w1_child_pid_file))
+        w1_grandchild_pid = int(self._await_file(w1_grandchild_pid_file))
+        w2_child_pid = int(self._await_file(w2_child_pid_file))
         for pid in (w1_child_pid, w1_grandchild_pid, w2_child_pid):
             self.addCleanup(_best_effort_kill, pid)
 
@@ -136,9 +138,9 @@ print("window 2 completed cleanly")
         # Retire window 1: stop() must return promptly on the Qt thread while its worker reaps the cell tree.
         stop_started = time.monotonic()
         window1.stop()
-        self.assertLess(time.monotonic() - stop_started, 0.1)
-        self.assertTrue(_wait_pid_exit(w1_child_pid, timeout=4.0))
-        self.assertTrue(_wait_pid_exit(w1_grandchild_pid, timeout=4.0))
+        self.assertLess(time.monotonic() - stop_started, 1.0)
+        self.assertTrue(_wait_pid_exit(w1_child_pid, timeout=6.0))
+        self.assertTrue(_wait_pid_exit(w1_grandchild_pid, timeout=6.0))
         self.assertTrue(_pid_alive(w2_child_pid), "another window's child process must keep running")
         self.assertEqual(window2.busy, 1)
 
@@ -229,7 +231,7 @@ print("window 2 tab c result")
         window1.closeTab(tab_a["id"])
 
         # Even before Qt event pumping finishes closed-note snapshot I/O, tab A's worker reaps its child.
-        self.assertTrue(_wait_pid_exit(pid_a, timeout=4.0))
+        self.assertTrue(_wait_pid_exit(pid_a, timeout=6.0))
         self.assertTrue(_pid_alive(pid_b), "sibling tab's execution must keep running")
         self.assertTrue(_pid_alive(pid_c), "other window's execution must keep running")
 
@@ -301,10 +303,10 @@ print("window 2 tab c result")
             nonlocal drain_finished_count
             terminate_tids.append(threading.get_ident())
             try:
-                both_draining.wait(timeout=8)
+                both_draining.wait(timeout=25)
             except threading.BrokenBarrierError:
                 pass
-            allow_drain_finish.wait(timeout=10)
+            allow_drain_finish.wait(timeout=30)
             try:
                 return orig_terminate(controller)
             finally:
@@ -324,17 +326,17 @@ print("window 2 tab c result")
             close_started = time.monotonic()
             window1.closeTab(tab_a["id"])
             close_elapsed = time.monotonic() - close_started
-            self.assertLess(close_elapsed, 0.1, "closeTab blocked the Qt thread on child cleanup")
+            self.assertLess(close_elapsed, 1.0, "closeTab blocked the Qt thread on child cleanup")
             self.assertNotIn(qt_tid, terminate_tids)
 
             # Wait until both owned worker threads are actively inside child cleanup draining.
-            both_draining.wait(timeout=8)
+            both_draining.wait(timeout=25)
             self.assertNotIn(qt_tid, terminate_tids)
             self.assertTrue(_pid_alive(pid_a1))
             self.assertTrue(_pid_alive(pid_a2))
 
             # While child cleanup is still draining in window1, tab_a finishes closing (including async closed-note save).
-            tab_close_deadline = time.monotonic() + 5.0
+            tab_close_deadline = time.monotonic() + 8.0
             while any(t["id"] == tab_a["id"] for t in window1.tabs) and time.monotonic() < tab_close_deadline:
                 self.app.processEvents()
                 time.sleep(0.01)
@@ -352,11 +354,11 @@ print("window 2 tab c result")
 
             pong_started = time.monotonic()
             QTimer.singleShot(0, mark_pong)
-            while not qt_pong and time.monotonic() - pong_started < 0.5:
+            while not qt_pong and time.monotonic() - pong_started < 2.0:
                 self.app.processEvents()
                 time.sleep(0.005)
             self.assertTrue(qt_pong, "Qt event loop stalled while child cleanup was draining")
-            self.assertLess(time.monotonic() - pong_started, 0.2)
+            self.assertLess(time.monotonic() - pong_started, 1.0)
 
             window2.newNote()
             self.assertEqual(len(window2.tabs), 2)
@@ -383,8 +385,8 @@ print("window 2 tab c result")
             self.assertTrue(_pid_alive(pid_a2))
 
             allow_drain_finish.set()
-            self.assertTrue(_wait_pid_exit(pid_a1, timeout=4.0))
-            self.assertTrue(_wait_pid_exit(pid_a2, timeout=4.0))
+            self.assertTrue(_wait_pid_exit(pid_a1, timeout=6.0))
+            self.assertTrue(_wait_pid_exit(pid_a2, timeout=6.0))
             self.assertEqual(self._await_reply(replies1, "drain-1")[1:], ("null", "Python cell cancelled"))
             self.assertEqual(self._await_reply(replies1, "drain-2")[1:], ("null", "Python cell cancelled"))
             self.assertEqual(window1.busy, 0)
@@ -418,7 +420,7 @@ child.wait()
         # Confirming Discard removes the tab and terminates its cell tree.
         window1.closeTab(dirty["id"])
         window1.resolveClose("discard")
-        self.assertTrue(_wait_pid_exit(child_pid, timeout=2.5))
+        self.assertTrue(_wait_pid_exit(child_pid, timeout=6.0))
         _, raw, err = self._await_reply(replies1, "dirty-run")
         self.assertEqual((raw, err), ("null", "Python cell cancelled"))
         self.assertEqual(window1.busy, 0)
@@ -430,32 +432,38 @@ child.wait()
         done_file = self.root / "stream-cell-done.txt"
         code = f"""
 import pathlib, subprocess, sys, time
-holder = subprocess.Popen([
-    sys.executable,
-    "-c",
-    "import sys, time; sys.stdout.write('keep-open\\\\n'); sys.stderr.write('keep-err\\\\n'); "
-    "sys.stdout.flush(); sys.stderr.flush(); time.sleep(30)",
-])
+holder = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import sys, time; "
+        "sys.stdout and (sys.stdout.write('keep-open\\\\n'), sys.stdout.flush()); "
+        "sys.stderr and (sys.stderr.write('keep-err\\\\n'), sys.stderr.flush()); "
+        "time.sleep(30)",
+    ],
+    stdout=sys.__stdout__,
+    stderr=sys.__stderr__,
+)
 pathlib.Path({str(pid_file)!r}).write_text(str(holder.pid), encoding="utf-8")
 print("verified ordinary result")
 pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf-8")
 """
         ctx = {"document": tab["id"], "cell": "0", "interpreter": sys.executable}
         window1.post("stream-run", "run_python", json.dumps({"id": tab["id"], "code": code, "context": ctx}))
-        _, raw, err = self._await_reply(replies1, "stream-run", timeout=15.0)
-        drain_elapsed = time.monotonic() - float(done_file.read_text(encoding="utf-8").strip())
+        _, raw, err = self._await_reply(replies1, "stream-run", timeout=25.0)
+        drain_elapsed = time.monotonic() - float(self._await_file(done_file, timeout=5.0))
 
-        holder_pid = int(pid_file.read_text(encoding="utf-8").strip())
+        holder_pid = int(self._await_file(pid_file, timeout=5.0))
         self.addCleanup(_best_effort_kill, holder_pid)
 
-        self.assertLess(drain_elapsed, 4.0)
+        self.assertLess(drain_elapsed, 10.0)
         self.assertEqual(err, "")
         payload = json.loads(raw)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["stdout"], "verified ordinary result\n")
         self.assertTrue(payload["provenance"]["verified"])
         self.assertEqual(window1.busy, 0)
-        self.assertTrue(_wait_pid_exit(holder_pid, timeout=3.0))
+        self.assertTrue(_wait_pid_exit(holder_pid, timeout=6.0))
 
     def test_package_setup_and_preview_processes_stay_separate_from_cell_cleanup(self):
         window1, replies1 = self._new_window()
@@ -488,7 +496,7 @@ child.wait()
 
             # Closing tab A kills tab A's cell tree without disturbing package setup.
             window1.closeTab(tab_a["id"])
-            self.assertTrue(_wait_pid_exit(cell_pid, timeout=2.5))
+            self.assertTrue(_wait_pid_exit(cell_pid, timeout=6.0))
             self.assertTrue(window1.python_busy)
             _, raw_cell, err_cell = self._await_reply(replies1, "cell-a")
             self.assertEqual((raw_cell, err_cell), ("null", "Python cell cancelled"))

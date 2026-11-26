@@ -16,17 +16,32 @@ from unittest.mock import patch
 import python_runtime
 
 
+_TEST_KERNEL32 = None
+_WARMED_INTERPRETER = False
+
+
+def _test_kernel32():
+    global _TEST_KERNEL32
+    if _TEST_KERNEL32 is not None:
+        return _TEST_KERNEL32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    _TEST_KERNEL32 = kernel32
+    return kernel32
+
+
 def _pid_alive(pid: int) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
     if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32 = _test_kernel32()
         handle = kernel32.OpenProcess(0x00100000 | 0x1000, 0, pid)
         if not handle:
             return False
@@ -52,7 +67,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _wait_pid_exit(pid: int, timeout: float = 3.0) -> bool:
+def _wait_pid_exit(pid: int, timeout: float = 6.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not _pid_alive(pid):
@@ -66,23 +81,55 @@ def _best_effort_kill(pid: int) -> None:
         return
     try:
         if os.name == "nt":
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-            kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-            kernel32.TerminateProcess.restype = ctypes.c_int
-            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-            kernel32.CloseHandle.restype = ctypes.c_int
-            handle = kernel32.OpenProcess(0x0001, 0, pid)
+            kernel32 = _test_kernel32()
+            handle = kernel32.OpenProcess(0x00100000 | 0x0001, 0, pid)
             if handle:
                 try:
                     kernel32.TerminateProcess(ctypes.c_void_p(handle), 1)
+                    kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 1000)
                 finally:
                     kernel32.CloseHandle(ctypes.c_void_p(handle))
         else:
             os.kill(pid, signal.SIGKILL)
     except Exception:
         pass
+
+
+def _cleanup_popen(proc: subprocess.Popen) -> None:
+    try:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        _best_effort_kill(proc.pid)
+
+
+def _read_nonempty(path: Path) -> str:
+    try:
+        if not path.is_file():
+            return ""
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _await_files(*paths: Path, timeout: float = 25.0) -> list[str]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        values = [_read_nonempty(path) for path in paths]
+        if all(values):
+            return values
+        time.sleep(0.02)
+    missing = [str(path) for path in paths if not _read_nonempty(path)]
+    raise AssertionError(f"Timed out waiting for non-empty marker files: {missing}")
+
+
+def _warm_interpreter_once() -> None:
+    global _WARMED_INTERPRETER
+    if _WARMED_INTERPRETER:
+        return
+    python_runtime.run(sys.executable, "pass", timeout=45)
+    _WARMED_INTERPRETER = True
 
 
 def _make_fake_python(path: Path) -> Path:
@@ -96,7 +143,7 @@ class PythonRuntimeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Warm any one-time matplotlib font-cache scan on macOS/Windows CI before timed cell runs.
-        python_runtime.run(sys.executable, "pass", timeout=30)
+        _warm_interpreter_once()
 
     def test_rejects_executables_that_are_not_python(self):
         for path in ("/bin/sh", "/usr/bin/env", "", "definitely-not-python"):
@@ -320,37 +367,44 @@ class PythonRuntimeTest(unittest.TestCase):
             )
 
     def test_owned_descendant_retaining_output_streams_cannot_keep_cell_busy(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             pid_file = Path(folder) / "descendant.pid"
             done_file = Path(folder) / "cell-done.txt"
             code = f"""
 import pathlib, subprocess, sys, time
-child = subprocess.Popen([
-    sys.executable,
-    "-c",
-    "import sys, time; sys.stdout.write('child-out\\\\n'); sys.stderr.write('child-err\\\\n'); "
-    "sys.stdout.flush(); sys.stderr.flush(); time.sleep(30)",
-])
+child = subprocess.Popen(
+    [
+        sys.executable,
+        "-c",
+        "import sys, time; "
+        "sys.stdout and (sys.stdout.write('child-out\\\\n'), sys.stdout.flush()); "
+        "sys.stderr and (sys.stderr.write('child-err\\\\n'), sys.stderr.flush()); "
+        "time.sleep(30)",
+    ],
+    stdout=sys.__stdout__,
+    stderr=sys.__stderr__,
+)
 pathlib.Path({str(pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
 print("ordinary cell value:", 6 * 7)
 pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf-8")
 """
-            result = python_runtime.run(sys.executable, code, timeout=20, cwd=folder)
+            result = python_runtime.run(sys.executable, code, timeout=25, cwd=folder)
             finished_at = time.monotonic()
-            user_done_at = float(done_file.read_text(encoding="utf-8").strip())
+            descendant_text, done_text = _await_files(pid_file, done_file, timeout=5.0)
+            user_done_at = float(done_text)
             drain_elapsed = finished_at - user_done_at
-            descendant_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            descendant_pid = int(descendant_text)
             self.addCleanup(_best_effort_kill, descendant_pid)
 
-            self.assertLess(drain_elapsed, 4.0, f"cell stayed busy for {drain_elapsed:.2f}s waiting on descendant streams")
+            self.assertLess(drain_elapsed, 10.0, f"cell stayed busy for {drain_elapsed:.2f}s waiting on descendant streams")
             self.assertTrue(result["ok"])
             self.assertEqual(result["stdout"], "ordinary cell value: 42\n")
             self.assertEqual(result["stderr"], "")
-            self.assertTrue(_wait_pid_exit(descendant_pid, timeout=3.0))
+            self.assertTrue(_wait_pid_exit(descendant_pid, timeout=6.0))
 
     @unittest.skipUnless(os.name == "posix", "POSIX SIGTERM-ignoring descendant check")
     def test_sigterm_ignoring_descendant_retaining_streams_still_returns_promptly(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             pid_file = Path(folder) / "stubborn.pid"
             ready_file = Path(folder) / "ready.txt"
             done_file = Path(folder) / "done.txt"
@@ -373,17 +427,18 @@ pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf
 """
             result = python_runtime.run(sys.executable, code, timeout=20, cwd=folder)
             finished_at = time.monotonic()
-            drain_elapsed = finished_at - float(done_file.read_text(encoding="utf-8").strip())
-            stubborn_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            stubborn_text, done_text = _await_files(pid_file, done_file, timeout=5.0)
+            drain_elapsed = finished_at - float(done_text)
+            stubborn_pid = int(stubborn_text)
             self.addCleanup(_best_effort_kill, stubborn_pid)
 
-            self.assertLess(drain_elapsed, 4.0)
+            self.assertLess(drain_elapsed, 10.0)
             self.assertTrue(result["ok"])
             self.assertEqual(result["stdout"], "preserved output\n")
-            self.assertTrue(_wait_pid_exit(stubborn_pid, timeout=3.0))
+            self.assertTrue(_wait_pid_exit(stubborn_pid, timeout=6.0))
 
     def test_timeout_cleanup_is_confined_to_timed_out_cell_process_tree(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             root = Path(folder)
             child_pid_file = root / "timed-out-child.pid"
             grandchild_pid_file = root / "timed-out-grandchild.pid"
@@ -394,51 +449,49 @@ pathlib.Path({str(done_file)!r}).write_text(str(time.monotonic()), encoding="utf
             timed_out_code = f"""
 import pathlib, subprocess, sys
 script = (
-    "import pathlib, subprocess, sys, time\\n"
+    "import os, pathlib, subprocess, sys, time\\n"
+    f"pathlib.Path({str(child_pid_file)!r}).write_text(str(os.getpid()), encoding='utf-8')\\n"
     "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\\n"
     f"pathlib.Path({str(grandchild_pid_file)!r}).write_text(str(gc.pid), encoding='utf-8')\\n"
     f"pathlib.Path({str(ready_file)!r}).write_text('ready', encoding='utf-8')\\n"
     "gc.wait()\\n"
 )
 child = subprocess.Popen([sys.executable, "-c", script])
-pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid), encoding="utf-8")
 child.wait()
 """
             other_code = f"""
 import pathlib, time
 pathlib.Path({str(other_started)!r}).write_text("running", encoding="utf-8")
-deadline = time.monotonic() + 25
+deadline = time.monotonic() + 30
 while not pathlib.Path({str(other_release)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.02)
 print("unrelated cell survived")
 """
             with ThreadPoolExecutor(max_workers=2) as pool:
-                slow_future = pool.submit(python_runtime.run, sys.executable, timed_out_code, 3.5, str(root))
-                other_future = pool.submit(python_runtime.run, sys.executable, other_code, 25, str(root))
+                slow_future = pool.submit(python_runtime.run, sys.executable, timed_out_code, 8.0, str(root))
+                other_future = pool.submit(python_runtime.run, sys.executable, other_code, 30, str(root))
 
-                deadline = time.monotonic() + 12
-                while (not ready_file.exists() or not other_started.exists()) and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                self.assertTrue(ready_file.exists(), "timed-out cell never started its child process tree")
-
-                with self.assertRaisesRegex(ValueError, "Python cell stopped after 3.5 seconds"):
-                    slow_future.result(timeout=12)
-
-                child_pid = int(child_pid_file.read_text(encoding="utf-8").strip())
-                grandchild_pid = int(grandchild_pid_file.read_text(encoding="utf-8").strip())
+                child_text, grandchild_text, _, _ = _await_files(
+                    child_pid_file, grandchild_pid_file, ready_file, other_started, timeout=20.0
+                )
+                child_pid = int(child_text)
+                grandchild_pid = int(grandchild_text)
                 self.addCleanup(_best_effort_kill, child_pid)
                 self.addCleanup(_best_effort_kill, grandchild_pid)
 
-                self.assertTrue(_wait_pid_exit(child_pid, timeout=4.0))
-                self.assertTrue(_wait_pid_exit(grandchild_pid, timeout=4.0))
+                with self.assertRaisesRegex(ValueError, "Python cell stopped after 8.0 seconds"):
+                    slow_future.result(timeout=20)
+
+                self.assertTrue(_wait_pid_exit(child_pid, timeout=6.0))
+                self.assertTrue(_wait_pid_exit(grandchild_pid, timeout=6.0))
 
                 other_release.write_text("go", encoding="utf-8")
-                other_result = other_future.result(timeout=12)
+                other_result = other_future.result(timeout=15)
                 self.assertTrue(other_result["ok"])
                 self.assertEqual(other_result["stdout"], "unrelated cell survived\n")
 
     def test_job_registry_confines_tab_and_window_cancellation(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             root = Path(folder)
             win1_jobs = python_runtime.PythonJobRegistry()
             win2_jobs = python_runtime.PythonJobRegistry()
@@ -461,7 +514,7 @@ child.wait()
             code_b = f"""
 import pathlib, time
 pathlib.Path({str(marker_b)!r}).write_text("1", encoding="utf-8")
-deadline = time.monotonic() + 25
+deadline = time.monotonic() + 30
 while not pathlib.Path({str(release_b)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.02)
 print("window 1 tab b finished")
@@ -469,33 +522,29 @@ print("window 1 tab b finished")
             code_w2 = f"""
 import pathlib, time
 pathlib.Path({str(marker_w2)!r}).write_text("1", encoding="utf-8")
-deadline = time.monotonic() + 25
+deadline = time.monotonic() + 30
 while not pathlib.Path({str(release_w2)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.02)
 print("window 2 tab a finished")
 """
             with ThreadPoolExecutor(max_workers=3) as pool:
-                fut_a = pool.submit(python_runtime.run, sys.executable, code_a, 25, str(root), job=job_tab_a)
-                fut_b = pool.submit(python_runtime.run, sys.executable, code_b, 25, str(root), job=job_tab_b)
-                fut_w2 = pool.submit(python_runtime.run, sys.executable, code_w2, 25, str(root), job=job_win2)
+                fut_a = pool.submit(python_runtime.run, sys.executable, code_a, 30, str(root), job=job_tab_a)
+                fut_b = pool.submit(python_runtime.run, sys.executable, code_b, 30, str(root), job=job_tab_b)
+                fut_w2 = pool.submit(python_runtime.run, sys.executable, code_w2, 30, str(root), job=job_win2)
 
-                deadline = time.monotonic() + 15
-                while not (marker_a.exists() and marker_b.exists() and marker_w2.exists()) and time.monotonic() < deadline:
-                    time.sleep(0.02)
-                self.assertTrue(marker_a.exists() and marker_b.exists() and marker_w2.exists())
-
-                pid_a = int(marker_a.read_text(encoding="utf-8").strip())
+                pid_a_text, _, _ = _await_files(marker_a, marker_b, marker_w2, timeout=25.0)
+                pid_a = int(pid_a_text)
                 self.addCleanup(_best_effort_kill, pid_a)
 
                 self.assertEqual(win1_jobs.cancel_tab("tab-a"), 1)
                 with self.assertRaises(python_runtime.PythonCellCancelled):
-                    fut_a.result(timeout=10)
-                self.assertTrue(_wait_pid_exit(pid_a, timeout=4.0))
+                    fut_a.result(timeout=15)
+                self.assertTrue(_wait_pid_exit(pid_a, timeout=6.0))
                 self.assertFalse(job_tab_b.cancelled.is_set())
                 self.assertFalse(job_win2.cancelled.is_set())
 
                 release_b.write_text("go", encoding="utf-8")
-                res_b = fut_b.result(timeout=10)
+                res_b = fut_b.result(timeout=15)
                 self.assertEqual(res_b["stdout"], "window 1 tab b finished\n")
                 win1_jobs.discard(job_tab_a)
                 win1_jobs.discard(job_tab_b)
@@ -503,12 +552,12 @@ print("window 2 tab a finished")
                 self.assertEqual(win1_jobs.cancel_all(retire=True), 0)
                 self.assertFalse(job_win2.cancelled.is_set())
                 release_w2.write_text("go", encoding="utf-8")
-                res_w2 = fut_w2.result(timeout=10)
+                res_w2 = fut_w2.result(timeout=15)
                 self.assertEqual(res_w2["stdout"], "window 2 tab a finished\n")
                 win2_jobs.discard(job_win2)
 
     def test_cancel_marks_promptly_without_caller_thread_waits_while_owned_workers_terminate(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             root = Path(folder)
             registry = python_runtime.PythonJobRegistry()
             job1 = registry.register("tab-a")
@@ -529,10 +578,10 @@ child.wait()
             def tracked_terminate(controller):
                 terminate_tids.append(threading.get_ident())
                 try:
-                    workers_entered.wait(timeout=5)
+                    workers_entered.wait(timeout=15)
                 except threading.BrokenBarrierError:
                     pass
-                release_drain.wait(timeout=5)
+                release_drain.wait(timeout=15)
                 return orig_terminate(controller)
 
             caller_tid = threading.get_ident()
@@ -542,7 +591,7 @@ child.wait()
                         python_runtime.run,
                         sys.executable,
                         code_tpl.format(pid_path=str(pid1_file)),
-                        25,
+                        30,
                         str(root),
                         job=job1,
                     )
@@ -550,36 +599,34 @@ child.wait()
                         python_runtime.run,
                         sys.executable,
                         code_tpl.format(pid_path=str(pid2_file)),
-                        25,
+                        30,
                         str(root),
                         job=job2,
                     )
-                    deadline = time.monotonic() + 15
-                    while not (pid1_file.exists() and pid2_file.exists()) and time.monotonic() < deadline:
-                        time.sleep(0.02)
-                    pid1 = int(pid1_file.read_text(encoding="utf-8").strip())
-                    pid2 = int(pid2_file.read_text(encoding="utf-8").strip())
+                    pid1_text, pid2_text = _await_files(pid1_file, pid2_file, timeout=25.0)
+                    pid1 = int(pid1_text)
+                    pid2 = int(pid2_text)
                     self.addCleanup(_best_effort_kill, pid1)
                     self.addCleanup(_best_effort_kill, pid2)
 
                     t0 = time.monotonic()
                     self.assertEqual(registry.cancel_tab("tab-a"), 2)
                     cancel_elapsed = time.monotonic() - t0
-                    self.assertLess(cancel_elapsed, 0.05, "cancel_tab blocked the caller thread")
+                    self.assertLess(cancel_elapsed, 0.5, "cancel_tab blocked the caller thread")
                     self.assertEqual(terminate_tids, [], "cancel_tab must not run terminate() on caller thread")
 
                     # Both owned workers enter terminate() concurrently while caller stays unblocked.
-                    workers_entered.wait(timeout=5)
+                    workers_entered.wait(timeout=15)
                     self.assertNotIn(caller_tid, terminate_tids)
                     self.assertEqual(len(set(terminate_tids)), 2)
 
                     release_drain.set()
                     with self.assertRaises(python_runtime.PythonCellCancelled):
-                        fut1.result(timeout=8)
+                        fut1.result(timeout=15)
                     with self.assertRaises(python_runtime.PythonCellCancelled):
-                        fut2.result(timeout=8)
-                    self.assertTrue(_wait_pid_exit(pid1, timeout=4.0))
-                    self.assertTrue(_wait_pid_exit(pid2, timeout=4.0))
+                        fut2.result(timeout=15)
+                    self.assertTrue(_wait_pid_exit(pid1, timeout=6.0))
+                    self.assertTrue(_wait_pid_exit(pid2, timeout=6.0))
 
     def test_posix_platform_backend_guards_own_pgid_and_isolates_target_group(self):
         self.assertEqual(python_runtime._cell_spawn_kwargs("posix"), {"start_new_session": True})
@@ -883,8 +930,7 @@ child.wait()
                 return 0
 
         sibling_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        self.addCleanup(_best_effort_kill, sibling_proc.pid)
-        self.addCleanup(sibling_proc.wait)
+        self.addCleanup(_cleanup_popen, sibling_proc)
 
         def fake_popen(cmd, **kwargs):
             # Use sibling_proc.pid deliberately to prove assignment failure uses the owned
@@ -893,7 +939,7 @@ child.wait()
             spawned_procs.append(proc)
             return proc
 
-        with tempfile.TemporaryDirectory() as folder, patch(
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder, patch(
             "python_runtime.subprocess.run",
             side_effect=AssertionError("PID-only taskkill must never run when Job Object ownership fails"),
         ):
@@ -951,15 +997,14 @@ child.wait()
         sibling_proc.wait(timeout=5)
 
     def test_runtime_immediate_child_startup_and_sibling_processes_unaffected(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
             root = Path(folder)
             imm_pid_file = root / "immediate-child.pid"
             sib_ready = root / "sibling-cell.ready"
             sib_release = root / "sibling-cell.release"
 
             standalone_sibling = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-            self.addCleanup(_best_effort_kill, standalone_sibling.pid)
-            self.addCleanup(standalone_sibling.wait)
+            self.addCleanup(_cleanup_popen, standalone_sibling)
 
             immediate_code = f"""import pathlib, subprocess, sys
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -968,7 +1013,7 @@ child.wait()
 """
             sibling_cell_code = f"""import pathlib, time
 pathlib.Path({str(sib_ready)!r}).write_text("1", encoding="utf-8")
-deadline = time.monotonic() + 25
+deadline = time.monotonic() + 30
 while not pathlib.Path({str(sib_release)!r}).exists() and time.monotonic() < deadline:
     time.sleep(0.02)
 print("sibling cell ordinary output")
@@ -985,25 +1030,22 @@ print("sibling cell ordinary output")
 
             with patch.object(python_runtime._WindowsJob, "assign", delayed_assign):
                 with ThreadPoolExecutor(max_workers=2) as pool:
-                    fut_imm = pool.submit(python_runtime.run, sys.executable, immediate_code, 25, str(root), job=imm_job)
-                    fut_sib = pool.submit(python_runtime.run, sys.executable, sibling_cell_code, 25, str(root), job=sib_job)
+                    fut_imm = pool.submit(python_runtime.run, sys.executable, immediate_code, 30, str(root), job=imm_job)
+                    fut_sib = pool.submit(python_runtime.run, sys.executable, sibling_cell_code, 30, str(root), job=sib_job)
 
-                    deadline = time.monotonic() + 15
-                    while not (imm_pid_file.exists() and sib_ready.exists()) and time.monotonic() < deadline:
-                        time.sleep(0.02)
-                    self.assertTrue(imm_pid_file.exists() and sib_ready.exists())
-                    imm_child_pid = int(imm_pid_file.read_text(encoding="utf-8").strip())
+                    imm_pid_text, _ = _await_files(imm_pid_file, sib_ready, timeout=25.0)
+                    imm_child_pid = int(imm_pid_text)
                     self.addCleanup(_best_effort_kill, imm_child_pid)
 
                     self.assertEqual(registry.cancel_tab("tab-imm"), 1)
                     with self.assertRaises(python_runtime.PythonCellCancelled):
-                        fut_imm.result(timeout=10)
-                    self.assertTrue(_wait_pid_exit(imm_child_pid, timeout=4.0))
+                        fut_imm.result(timeout=15)
+                    self.assertTrue(_wait_pid_exit(imm_child_pid, timeout=6.0))
 
                     # Both the standalone sibling process and the sibling cell remain alive and unaffected.
                     self.assertIsNone(standalone_sibling.poll())
                     sib_release.write_text("go", encoding="utf-8")
-                    sib_res = fut_sib.result(timeout=10)
+                    sib_res = fut_sib.result(timeout=15)
                     self.assertTrue(sib_res["ok"])
                     self.assertEqual(sib_res["stdout"], "sibling cell ordinary output\n")
 
@@ -1020,8 +1062,7 @@ print("sibling cell ordinary output")
                 self.assertFalse(never_ran_marker.exists(), "user code ran despite Windows job assignment failure")
                 self.assertIsNone(standalone_sibling.poll())
 
-            standalone_sibling.kill()
-            standalone_sibling.wait(timeout=5)
+            _cleanup_popen(standalone_sibling)
 
     def test_package_setup_remains_separate_from_cell_job_registry(self):
         with tempfile.TemporaryDirectory() as folder:

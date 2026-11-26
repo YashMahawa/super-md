@@ -167,7 +167,14 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+_WIN_KERNEL32 = None
+_WIN_NTDLL = None
+
+
 def _load_kernel32():
+    global _WIN_KERNEL32
+    if _WIN_KERNEL32 is not None:
+        return _WIN_KERNEL32
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
     kernel32.CreateJobObjectW.restype = ctypes.c_void_p
@@ -184,13 +191,18 @@ def _load_kernel32():
     kernel32.TerminateJobObject.restype = ctypes.c_int
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_int
+    _WIN_KERNEL32 = kernel32
     return kernel32
 
 
 def _load_ntdll():
+    global _WIN_NTDLL
+    if _WIN_NTDLL is not None:
+        return _WIN_NTDLL
     ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
     ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
     ntdll.NtResumeProcess.restype = ctypes.c_int32
+    _WIN_NTDLL = ntdll
     return ntdll
 
 
@@ -564,6 +576,7 @@ def _spawn_cell_process(
             _reap_owned_process(process)
             raise PythonCellCancelled("Python cell cancelled")
         if not win_job.assign(process):
+            win_job.close(terminate=False)
             _reap_owned_process(process)
             raise RuntimeError("Could not assign Python cell process to Windows Job Object")
         if job is not None and job.cancelled.is_set():
