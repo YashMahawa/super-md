@@ -1,11 +1,35 @@
 // @vitest-environment jsdom
 import {afterEach,expect,it,vi} from 'vitest';
-import {cancelHeadingNavigation,navigateToHeading} from './documentNavigation';
+import {cancelHeadingNavigation,isLocalHref,navigateToHeading,parseRelativeNoteLink} from './documentNavigation';
 
 afterEach(()=>{
   document.documentElement.style.removeProperty('--native-visible-chrome-inset');
   document.body.replaceChildren();
   vi.unstubAllGlobals();
+});
+
+it('classifies local anchors and parses relative note links with optional headings',()=>{
+  expect(isLocalHref('#bayes')).toBe(true);
+  expect(isLocalHref('lecture-2.md')).toBe(true);
+  expect(isLocalHref('Lecture%202.md#bayes-law')).toBe(true);
+  expect(isLocalHref('study.smd')).toBe(true);
+  expect(isLocalHref('../outside.md')).toBe(true);
+  expect(isLocalHref('https://example.org/note.md')).toBe(false);
+  expect(isLocalHref('http://example.org')).toBe(false);
+  expect(isLocalHref('mailto:author@example.org')).toBe(false);
+  expect(isLocalHref('//example.org/note.md')).toBe(false);
+
+  expect(parseRelativeNoteLink('lecture-2.md')).toEqual({target:'lecture-2.md'});
+  expect(parseRelativeNoteLink('study.smd')).toEqual({target:'study.smd'});
+  expect(parseRelativeNoteLink('legacy.fmd')).toEqual({target:'legacy.fmd'});
+  expect(parseRelativeNoteLink('guide.markdown#overview')).toEqual({target:'guide.markdown',heading:'overview'});
+  expect(parseRelativeNoteLink('Lecture%202.md#bayes-law')).toEqual({target:'Lecture%202.md',heading:'bayes-law'});
+  expect(parseRelativeNoteLink('Lecture%202.md#Bayes%20Law')).toEqual({target:'Lecture%202.md',heading:'Bayes Law'});
+  expect(parseRelativeNoteLink('../outside.md')).toEqual({target:'../outside.md'});
+  expect(parseRelativeNoteLink('#bayes')).toBeNull();
+  expect(parseRelativeNoteLink('https://example.org/lecture-2.md')).toBeNull();
+  expect(parseRelativeNoteLink('mailto:user@example.org')).toBeNull();
+  expect(parseRelativeNoteLink('assets/diagram.png')).toBeNull();
 });
 
 it.each([[undefined,16],['209.5px',225.5],['0px',16],['-30px',16],['invalid',16],['9999px',496]] as const)(
