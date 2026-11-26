@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -20,7 +20,7 @@ test("tags and platform versions must agree", () => {
   for (const tag of ["main", "v0.3.0;evil", "v0.3.0-rc1", "../v0.3.0"]) assert.throws(() => versionFromTag(tag));
   assert.throws(() => validateVersions("v0.3.0", { android: "0.2.0" }));
 });
-test("versions CLI validates live manifests and smd-core/Cargo.toml without reading src-tauri", () => {
+test("versions CLI validates package, Tauri, Rust, smd-core, and Android manifests", () => {
   const pkgVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
   assert.equal(
     execFileSync(process.execPath, ["scripts/release-guards.mjs", "versions", `v${pkgVersion}`], {
@@ -39,13 +39,34 @@ test("versions CLI validates live manifests and smd-core/Cargo.toml without read
     /does not match v0\.0\.0/,
   );
 
+  const tauriDir = path.join(repoRoot, "src-tauri");
+  const tauriConf = JSON.parse(readFileSync(path.join(tauriDir, "tauri.conf.json"), "utf8"));
+  for (const iconPath of tauriConf.bundle.icon) {
+    assert.equal(
+      existsSync(path.resolve(tauriDir, iconPath)),
+      true,
+      `Expected Tauri bundle icon ${iconPath} to exist relative to src-tauri/`,
+    );
+  }
+
   const fixture = mkdtempSync(path.join(os.tmpdir(), "supermd-release-guards-"));
   try {
+    mkdirSync(path.join(fixture, "src-tauri"), { recursive: true });
     mkdirSync(path.join(fixture, "smd-core"), { recursive: true });
     mkdirSync(path.join(fixture, "android/app"), { recursive: true });
-    writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ version: pkgVersion }));
-    writeFileSync(path.join(fixture, "smd-core/Cargo.toml"), `[package]\nname = "smd-core"\nversion = "${pkgVersion}"\n`);
-    writeFileSync(path.join(fixture, "android/app/build.gradle.kts"), `defaultConfig { versionName = "${pkgVersion}" }\n`);
+    const writeManifests = ({
+      tauri = pkgVersion,
+      rust = pkgVersion,
+      smdCore = pkgVersion,
+      android = pkgVersion,
+    } = {}) => {
+      writeFileSync(path.join(fixture, "package.json"), JSON.stringify({ version: pkgVersion }));
+      writeFileSync(path.join(fixture, "src-tauri/tauri.conf.json"), JSON.stringify({ version: tauri }));
+      writeFileSync(path.join(fixture, "src-tauri/Cargo.toml"), `[package]\nname = "super-md"\nversion = "${rust}"\n`);
+      writeFileSync(path.join(fixture, "smd-core/Cargo.toml"), `[package]\nname = "smd-core"\nversion = "${smdCore}"\n`);
+      writeFileSync(path.join(fixture, "android/app/build.gradle.kts"), `defaultConfig { versionName = "${android}" }\n`);
+    };
+    writeManifests();
     writeFileSync(path.join(fixture, "README.md"), readFileSync(new URL("../README.md", import.meta.url), "utf8"));
     assert.equal(
       execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
@@ -54,16 +75,23 @@ test("versions CLI validates live manifests and smd-core/Cargo.toml without read
       }).trim(),
       pkgVersion,
     );
-    writeFileSync(path.join(fixture, "smd-core/Cargo.toml"), '[package]\nname = "smd-core"\nversion = "0.1.0"\n');
-    assert.throws(
-      () =>
-        execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
-          cwd: fixture,
-          encoding: "utf8",
-          stdio: "pipe",
-        }),
-      /rust version 0\.1\.0 does not match/,
-    );
+
+    for (const [override, pattern] of [
+      [{ tauri: "0.1.0" }, /tauri version 0\.1\.0 does not match/],
+      [{ rust: "0.1.0" }, /rust version 0\.1\.0 does not match/],
+      [{ smdCore: "0.1.0" }, /smd-core version 0\.1\.0 does not match/],
+    ]) {
+      writeManifests(override);
+      assert.throws(
+        () =>
+          execFileSync(process.execPath, [guardScript, "versions", `v${pkgVersion}`], {
+            cwd: fixture,
+            encoding: "utf8",
+            stdio: "pipe",
+          }),
+        pattern,
+      );
+    }
   } finally {
     rmSync(fixture, { recursive: true, force: true });
   }
