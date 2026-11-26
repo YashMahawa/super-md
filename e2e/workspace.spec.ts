@@ -138,10 +138,22 @@ test("2D graph canvas drags and two-finger moves pan without zooming the note",a
       target.dispatchEvent(new TouchEvent("touchend",{bubbles:true,touches:[]}));
     });
     await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
-    expect(Number(await plot.getAttribute("data-center-x"))).not.toBe(prior);
-    const panBefore=Number(await plot.getAttribute("data-center-x"));
-    await svg.evaluate(node=>{const r=node.getBoundingClientRect();window.supermdNativeWheel?.(30,10,{x:r.left+r.width/2,y:r.top+r.height/2},false);});
+    expect(Number(await plot.getAttribute("data-center-x"))).toBeLessThan(prior);
+    const pinchSettledX=await svg.evaluate(async node=>{
+      await new Promise(requestAnimationFrame);
+      return Number(node.closest(".interactive-chart")!.getAttribute("data-center-x"));
+    });
+    expect(Number(await plot.getAttribute("data-center-x"))).toBe(pinchSettledX);
+    const panBefore=pinchSettledX,panBeforeY=Number(await plot.getAttribute("data-center-y"));
+    const wheelHitSvg=await svg.evaluate(node=>{
+      const r=node.getBoundingClientRect(),point={x:r.left+r.width/2,y:r.top+r.height/2};
+      const hit=Boolean(document.elementFromPoint(point.x,point.y)?.closest(".interactive-chart svg"));
+      window.supermdNativeWheel?.(30,10,point,false);
+      return hit;
+    });
+    expect(wheelHitSvg).toBe(true);
     await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeGreaterThan(panBefore);
+    await expect.poll(()=>plot.getAttribute("data-center-y").then(Number)).toBeLessThan(panBeforeY);
     await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
     await svg.dispatchEvent("wheel",{deltaY:120,deltaMode:1});await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
     // Magnifying the controls belongs to the page, not the plot camera.
