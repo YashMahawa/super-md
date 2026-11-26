@@ -13,6 +13,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -232,6 +233,81 @@ class DraftTitleAndTabHandoffTest {
             Thread.sleep(60)
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(200))
             assertEquals(secondId, model.state.value.active.id)
+            assertTrue(model.state.value.message?.contains("The reader could not confirm its latest edits") == true)
+        }
+    }
+
+    @Test
+    fun workspaceLinkHandoffPreservesOneShotHeadingAndRejectsExactContentFlushMismatch() {
+        withWorkspace { _, temp, model ->
+            val initialId = model.state.value.active.id
+            val mountedReaderNoteId = AtomicReference(initialId)
+            val flushBarrier = ReaderFlushBarrier()
+            val flushedMarkdownByNote = mutableMapOf<String, String>()
+
+            model.readerFlushStatusRequester = { requestedId ->
+                val req = flushBarrier.register("tok-${UUID.randomUUID()}", requestedId)
+                val mountedId = mountedReaderNoteId.get()
+                if (mountedId != requestedId) {
+                    flushBarrier.complete(
+                        token = req.token,
+                        noteId = mountedId,
+                        content = null,
+                        nativeContent = model.state.value.tabs.firstOrNull { it.id == requestedId }?.content,
+                        error = "The active note changed before its edit flush",
+                        wellFormed = true,
+                    )
+                } else {
+                    val nativeContent = model.state.value.tabs.firstOrNull { it.id == requestedId }?.content
+                    flushBarrier.complete(
+                        token = req.token,
+                        noteId = requestedId,
+                        content = flushedMarkdownByNote[requestedId] ?: nativeContent,
+                        nativeContent = nativeContent,
+                        error = null,
+                        wellFormed = true,
+                    )
+                }
+                runBlocking { req.status.await() }
+            }
+
+            val indexFile = File(temp, "Index.md").apply { writeText("# Index\n[[Lecture 2#bayes]]\n") }
+            val lectureFile = File(temp, "Lecture 2.md").apply { writeText("# Lecture 2\n\n## Bayes\nTheorem\n") }
+            val studyFile = File(temp, "Study.md").apply { writeText("# Study\n\n## Summary\nDetails\n") }
+
+            model.openDocument(Uri.fromFile(indexFile))
+            waitUntil { model.state.value.active.uri == Uri.fromFile(indexFile).toString() }
+            val indexId = model.state.value.active.id
+
+            // Before WebView mounts indexId, native workspace link handoff succeeds when native state is authoritative,
+            // schedules dirty autosave on the source note, and emits a one-shot pendingHeading token.
+            model.reading(autosave = true)
+            model.edit(indexId, "# Index\nUpdated [[Lecture 2#bayes]]\n")
+            val opened = runBlocking {
+                model.openWorkspaceLink(Uri.fromFile(indexFile).toString(), "Lecture 2", "bayes", wikilink = true)
+            }
+            assertTrue(opened.getBoolean("opened"))
+            val lectureId = opened.getString("id")
+            assertEquals(lectureId, model.state.value.active.id)
+            val pendingJump = model.state.value.pendingHeading
+            assertNotNull(pendingJump)
+            assertEquals(lectureId, pendingJump!!.noteId)
+            assertEquals("bayes", pendingJump.heading)
+            model.consumePendingHeading(pendingJump.token)
+            assertNull(model.state.value.pendingHeading)
+
+            // Wait for the scheduled dirty autosave on indexFile to persist the flushed native edit.
+            waitUntil { indexFile.readText() == "# Index\nUpdated [[Lecture 2#bayes]]\n" }
+
+            // Once WebView mounts lectureId, an exact-content flush mismatch must fail closed and leave pendingHeading unset.
+            mountedReaderNoteId.set(lectureId)
+            flushedMarkdownByNote[lectureId] = "# Lecture 2\n\n## Unflushed reader divergence\n"
+            val blocked = runBlocking {
+                model.openWorkspaceLink(Uri.fromFile(lectureFile).toString(), "Study.md", "summary", wikilink = false)
+            }
+            assertFalse(blocked.getBoolean("opened"))
+            assertEquals(lectureId, model.state.value.active.id)
+            assertNull(model.state.value.pendingHeading)
             assertTrue(model.state.value.message?.contains("The reader could not confirm its latest edits") == true)
         }
     }
