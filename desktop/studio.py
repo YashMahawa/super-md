@@ -1941,11 +1941,26 @@ class Studio(QObject):
             tab.pop("pendingHeading", None)
         if existing is not None:
             existing_path = existing.get("path") or ""
-            if existing_path and str(local_path(existing_path)) == existing_path:
-                self.openNote(existing_path)
-            else:
-                self.selectTab(existing["id"])
-                self._focus_open_target(self._activation_generation)
+            open_target = path or existing_path
+            if existing_path and open_target:
+                try:
+                    resolved_target = local_path(open_target)
+                    can_route_open = (
+                        not resolved_target.is_dir()
+                        and not Path(existing_path).is_symlink()
+                        and (
+                            existing_path == str(resolved_target)
+                            or folder_ops.same_path(existing_path, resolved_target)
+                            or os.path.samefile(existing_path, str(resolved_target))
+                        )
+                    )
+                except OSError:
+                    can_route_open = False
+                if can_route_open:
+                    self.openNote(open_target)
+                    return
+            self.selectTab(existing["id"])
+            self._focus_open_target(self._activation_generation)
             return
         if path:
             self.openNote(path)
@@ -3630,6 +3645,7 @@ class Studio(QObject):
             except OSError:
                 continue
         self.folder = root_str
+        self._invalidate_folder_index(self.folder)
         self.session.workspace_links.invalidate(self.folder)
         self.expanded = valid_expanded
         self.session.window_workspaces[self.window_id] = {

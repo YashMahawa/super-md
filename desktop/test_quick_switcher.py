@@ -587,6 +587,132 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
         self.assertEqual(loads, [])
         self.assertTrue(any(t["path"] == str(switched_note.resolve()) for t in self.studio.tabs))
 
+    def test_preserves_pr64_workspace_link_cache_and_open_tab_reuse_coexistence(self):
+        ws = self.root / "pr64-coexist"
+        (ws / "specs").mkdir(parents=True)
+        first = ws / "First.md"
+        first.write_text("# First\n\nSee [[Second Note#Overview]]\n", encoding="utf-8")
+        second = ws / "specs" / "Second Note.md"
+        second.write_text("# Second Note\n\n## Overview\n\nBody.\n", encoding="utf-8")
+
+        self.studio.ready = True
+        self.studio.settings["autosave"] = False
+        replies: list[tuple[str, str, str]] = []
+        self.studio.replied.connect(lambda req_id, res, err: replies.append((req_id, res, err)))
+
+        self.studio.openFolder(str(ws))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) > 0))
+        self.studio.openNote(str(first))
+        self.assertTrue(_wait_until(lambda: self.studio._current()["path"] == str(first.resolve())))
+        first_tab_id = self.studio.active
+        self.studio.post(
+            "draft-1",
+            "document_changed",
+            json.dumps({"id": first_tab_id, "content": "# First (unsaved draft)\n"}),
+        )
+
+        # Warm both Session caches: #64 WorkspaceLinkCache (via [[Second Note]]) and Quick Switcher FolderNoteIndex.
+        replies.clear()
+        self.studio.post(
+            "link-open-second",
+            "open_workspace_link",
+            json.dumps(
+                {
+                    "documentPath": str(first.resolve()),
+                    "target": "Second Note",
+                    "fragment": "Overview",
+                    "wikilink": True,
+                }
+            ),
+        )
+        self.assertTrue(_wait_until(lambda: any(r[0] == "link-open-second" for r in replies)))
+        self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == "link-open-second"))["opened"])
+        self.assertEqual(self.studio._current()["path"], str(second.resolve()))
+        second_tab_id = self.studio.active
+        tab_count = len(self.studio.tabs)
+
+        self.studio.openQuickSwitcher()
+        self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+        self.studio.closeQuickSwitcher()
+
+        # Even if an open tab holds a differently-cased path string (as on macOS APFS before canonicalization),
+        # Quick Switcher deduplicates it via inode identity and reuses the open tab while retaining drafts and
+        # promoting recent[0] via #64's open-note flow.
+        first_tab = next(t for t in self.studio.tabs if t["id"] == first_tab_id)
+        alt_first = ws / "FIRST.MD"
+        first_tab["path"] = str(alt_first)
+        real_samefile = os.path.samefile
+        try:
+            with mock.patch.object(
+                os.path,
+                "samefile",
+                side_effect=lambda a, b: True
+                if {str(a), str(b)} == {str(alt_first), str(first.resolve())}
+                else real_samefile(a, b),
+            ):
+                self.studio.openQuickSwitcher()
+                self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+                self.studio.setQuickSwitcherQuery("First.md")
+                first_matches = self.studio.quickSwitcherState["items"]
+                self.assertEqual(len(first_matches), 1)
+                self.assertEqual(first_matches[0]["tabId"], first_tab_id)
+                self.assertTrue(first_matches[0]["open"])
+                self.assertTrue(first_matches[0]["dirty"])
+                self.assertFalse(first_matches[0]["duplicate"])
+
+                self.studio.activateQuickSwitcherItem(first_matches[0]["tabId"], first_matches[0]["path"])
+                self.assertEqual(len(self.studio.tabs), tab_count)
+                self.assertEqual(self.studio.active, first_tab_id)
+                self.assertEqual(self.studio._current()["content"], "# First (unsaved draft)\n")
+                self.assertEqual(self.studio.recent[0], str(first.resolve()))
+                self.assertTrue(all("pendingHeading" not in t for t in self.studio.tabs))
+        finally:
+            first_tab["path"] = str(first.resolve())
+
+        # Creating and renaming notes invalidates both WorkspaceLinkCache and FolderNoteIndex.
+        self.studio.createFolderNote(str(ws / "specs"), "Third Spec", "md")
+        third = (ws / "specs" / "Third Spec.md").resolve()
+        self.assertTrue(
+            _wait_until(lambda: third.is_file() and any(t.get("path") == str(third) for t in self.studio.tabs))
+        )
+
+        self.studio.renameNote(second_tab_id, "Renamed Second.md")
+        renamed_second = (ws / "specs" / "Renamed Second.md").resolve()
+        self.assertTrue(
+            _wait_until(lambda: any(t["id"] == second_tab_id and t["path"] == str(renamed_second) for t in self.studio.tabs))
+        )
+
+        # Quick Switcher immediately indexes Third Spec.md and Renamed Second.md (without stale Second Note.md).
+        self.studio.openQuickSwitcher()
+        self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+        qs_names = {item["name"] for item in self.studio.quickSwitcherState["items"]}
+        self.assertIn("Third Spec.md", qs_names)
+        self.assertIn("Renamed Second.md", qs_names)
+        self.assertNotIn("Second Note.md", qs_names)
+        self.studio.closeQuickSwitcher()
+
+        # #64 WorkspaceLinkCache also resolves [[Renamed Second]] and [[Third Spec]] immediately, reusing open tabs.
+        for req_id, target, expected_path in (
+            ("link-renamed", "Renamed Second", str(renamed_second)),
+            ("link-third", "Third Spec", str(third)),
+        ):
+            replies.clear()
+            self.studio.post(
+                req_id,
+                "open_workspace_link",
+                json.dumps(
+                    {
+                        "documentPath": str(first.resolve()),
+                        "target": target,
+                        "fragment": "",
+                        "wikilink": True,
+                    }
+                ),
+            )
+            self.assertTrue(_wait_until(lambda: any(r[0] == req_id for r in replies)))
+            self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == req_id))["opened"])
+            self.assertEqual(self.studio._current()["path"], expected_path)
+
     def test_qml_quick_switcher_dialog_renders_parent_paths_and_restores_focus_in_qml_scene(self):
         ws = self.root / "qml-scene"
         (ws / "design").mkdir(parents=True)

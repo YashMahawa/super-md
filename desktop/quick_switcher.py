@@ -334,6 +334,35 @@ def build_quick_switcher_candidates(
 
     candidates: list[dict] = []
     by_key: dict[str, dict] = {}
+    open_tab_paths: list[tuple[str, str, dict]] = []
+
+    def _match_open_tab_samefile(candidate_path: str) -> dict | None:
+        if not open_tab_paths or not candidate_path:
+            return None
+        cand_name_cf = Path(candidate_path).name.casefold()
+        for raw_tab_path, tab_name_cf, tab_entry in open_tab_paths:
+            if tab_name_cf != cand_name_cf:
+                continue
+            try:
+                if not Path(candidate_path).is_symlink() and os.path.samefile(raw_tab_path, candidate_path):
+                    return tab_entry
+            except OSError:
+                continue
+        return None
+
+    def _merge_open_tab_disk_path(tab_entry: dict, disk_path: str, disk_key: str) -> None:
+        disk_name = Path(disk_path).name
+        tab_entry["path"] = disk_path
+        if tab_entry["name"].casefold() == disk_name.casefold():
+            tab_entry["name"] = disk_name
+            tab_entry["stem"] = folder_ops.note_stem(disk_name)
+            tab_entry["ext"] = folder_ops.note_extension(disk_name).lower()
+        if disk_key in pinned_keys:
+            tab_entry["pinned"] = True
+        if disk_key in recent_rank_by_key:
+            tab_entry["recent"] = True
+            tab_entry["_recentRank"] = min(tab_entry["_recentRank"], recent_rank_by_key[disk_key])
+        by_key[disk_key] = tab_entry
 
     ordered_tabs = sorted(
         enumerate(tabs_snapshot),
@@ -348,6 +377,8 @@ def build_quick_switcher_candidates(
             continue
         key = canonical_note_key(canon_path) if canon_path else f"tab:{tab_id}"
         if key in by_key:
+            continue
+        if raw_path and _match_open_tab_samefile(raw_path) is not None:
             continue
         entry = {
             "key": key,
@@ -366,6 +397,12 @@ def build_quick_switcher_candidates(
         }
         by_key[key] = entry
         candidates.append(entry)
+        if raw_path:
+            try:
+                if not Path(raw_path).is_symlink():
+                    open_tab_paths.append((raw_path, Path(canon_path).name.casefold(), entry))
+            except OSError:
+                pass
 
     # Include pinned and recent `.md` / `.smd` files on disk.
     combined_recent = list(dict.fromkeys([*pinned_paths, *recent_paths]))
@@ -387,6 +424,10 @@ def build_quick_switcher_candidates(
             continue
         key = canonical_note_key(canon_path)
         if key in by_key:
+            continue
+        samefile_tab = _match_open_tab_samefile(canon_path)
+        if samefile_tab is not None:
+            _merge_open_tab_disk_path(samefile_tab, canon_path, key)
             continue
         entry = {
             "key": key,
@@ -416,6 +457,10 @@ def build_quick_switcher_candidates(
                 continue
             key = canonical_note_key(fpath)
             if key in by_key:
+                continue
+            samefile_tab = _match_open_tab_samefile(fpath)
+            if samefile_tab is not None:
+                _merge_open_tab_disk_path(samefile_tab, fpath, key)
                 continue
             entry = {
                 "key": key,
