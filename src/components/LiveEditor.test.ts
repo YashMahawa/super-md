@@ -1,9 +1,24 @@
 import { describe, expect, it } from "vitest";
-import LiveEditor,{ splitMarkdownBlocks } from "./LiveEditor";
+import LiveEditor,{ formatActiveLiveBlock, replayActiveLiveBlockHistory, splitMarkdownBlocks } from "./LiveEditor";
 import {createElement} from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 import MarkdownPreview from './MarkdownPreview';
 import { editableBlockSpans, indentMarkdownSelection, isFirstLineCursor, isLastLineCursor } from "../liveBlockFlow";
+import {
+  BLOCK_TYPING_COALESCE_MS,
+  MAX_BLOCK_HISTORY,
+  createBlockHistoryState,
+  diffTextSpan,
+  popBlockHistorySnapshot,
+  pushBlockUndoSnapshot,
+  reconcileBlockKeys,
+  recordCoalescedBlockTypingSnapshot,
+  setActiveLiveBlockHandlers,
+  translateRenderedRange,
+  type BlockKeyState,
+  type EditSpan,
+  type EditingSession,
+} from "../liveBlockHistory";
 
 describe("live Markdown blocks", () => {
   it("keeps fenced code and callouts intact across blank lines", () => {
@@ -117,5 +132,71 @@ describe("CommonMark block flow helpers", () => {
     expect(fmSpans).toHaveLength(2);
     expect(withFrontmatter.slice(fmSpans[0].start, fmSpans[0].end)).toBe("# First");
     expect(withFrontmatter.slice(fmSpans[1].start, fmSpans[1].end)).toBe("Second");
+  });
+});
+
+describe("liveBlockHistory helpers", () => {
+  it("computes minimal changed text spans across insertions, deletions, and shared boundaries", () => {
+    expect(diffTextSpan("same text", "same text")).toEqual({ start: 9, oldEnd: 9, newEnd: 9 });
+    expect(diffTextSpan("- [ ] First\n- [ ] Second", "- [x] First\n- [ ] Second")).toEqual({ start: 3, oldEnd: 4, newEnd: 4 });
+    expect(diffTextSpan("# Heading\n\nTail", "# Heading expanded\n\nTail")).toEqual({ start: 9, oldEnd: 9, newEnd: 18 });
+    expect(diffTextSpan("aaaa", "aa")).toEqual({ start: 2, oldEnd: 4, newEnd: 2 });
+  });
+
+  it("caps discrete and coalesced block undo stacks at 60 entries and replays undo/redo cleanly", () => {
+    const history = createBlockHistoryState();
+    for (let i = 0; i < MAX_BLOCK_HISTORY + 5; i++) {
+      pushBlockUndoSnapshot(history, { text: `step-${i}`, start: i, end: i, direction: "none" });
+    }
+    expect(history.undo).toHaveLength(MAX_BLOCK_HISTORY);
+    expect(history.undo[0].text).toBe("step-5");
+    expect(history.undo.at(-1)?.text).toBe("step-64");
+
+    const typing = createBlockHistoryState();
+    recordCoalescedBlockTypingSnapshot(typing, { text: "a", start: 1, end: 1, direction: "none" }, "ab", 1_000);
+    recordCoalescedBlockTypingSnapshot(typing, { text: "ab", start: 2, end: 2, direction: "none" }, "abc", 1_000 + BLOCK_TYPING_COALESCE_MS - 10);
+    expect(typing.undo).toHaveLength(1);
+    recordCoalescedBlockTypingSnapshot(typing, { text: "abc", start: 3, end: 3, direction: "none" }, "abcd", 2_000 + BLOCK_TYPING_COALESCE_MS);
+    expect(typing.undo).toHaveLength(2);
+    recordCoalescedBlockTypingSnapshot(typing, { text: "abcd", start: 4, end: 4, direction: "none" }, "abcd pasted", 2_010 + BLOCK_TYPING_COALESCE_MS);
+    expect(typing.undo).toHaveLength(3);
+
+    const undone = popBlockHistorySnapshot(typing, "undo", { text: "abcd pasted", start: 11, end: 11, direction: "none" });
+    expect(undone?.text).toBe("abcd");
+    expect(typing.redo).toHaveLength(1);
+    const redone = popBlockHistorySnapshot(typing, "redo", undone!);
+    expect(redone?.text).toBe("abcd pasted");
+    pushBlockUndoSnapshot(typing, redone!);
+    expect(typing.redo).toHaveLength(0);
+  });
+
+  it("translates rendered ranges and preserves upstream/downstream block keys across edits", () => {
+    const base = "# Intro\n\nBody\n\nTail";
+    const synced = "# Intro longer\n\nBody\n\nTail";
+    const session: EditingSession = {
+      session: 1, prefix: "", suffix: "\n\nBody\n\nTail", baseMarkdown: base, baseSplitEnd: 7, protectedBlock: false,
+    };
+    expect(translateRenderedRange(0, 7, session, synced)).toEqual([0, 7]);
+    expect(translateRenderedRange(9, 13, session, synced)).toEqual([16, 20]);
+
+    const state: BlockKeyState = { source: "", keys: new Map(), seq: 0 };
+    const spanRef: { current: EditSpan | null } = { current: null };
+    const initialKeys = new Map(reconcileBlockKeys(state, base, splitMarkdownBlocks(base), spanRef));
+    const edited = "# Intro\n\nBody updated\n\nSecond mid\n\nTail";
+    spanRef.current = { baseSource: base, start: 9, oldEnd: 13, newEnd: 33 };
+    const nextBlocks = splitMarkdownBlocks(edited);
+    const nextKeys = reconcileBlockKeys(state, edited, nextBlocks, spanRef);
+    expect(spanRef.current).toBeNull();
+    expect(nextKeys.get(0)).toBe(initialKeys.get(0));
+    expect(nextKeys.get(nextBlocks.at(-1)!.start)).toBe(initialKeys.get(15));
+
+    expect(formatActiveLiveBlock("bold")).toBe(false);
+    expect(replayActiveLiveBlockHistory("undo")).toBe(false);
+    const clear = setActiveLiveBlockHandlers((action) => action === "bold", (dir) => dir === "undo");
+    expect(formatActiveLiveBlock("bold")).toBe(true);
+    expect(formatActiveLiveBlock("unknown")).toBe(false);
+    expect(replayActiveLiveBlockHistory("undo")).toBe(true);
+    clear();
+    expect(formatActiveLiveBlock("bold")).toBe(false);
   });
 });
