@@ -1058,71 +1058,23 @@ def _qt_bridge_class():
                       "format": "smd" if target.get("portable") or str(target["path"]).lower().endswith(".smd") else "markdown",
                       "isDirty": target["content"] != target["saved"]}
             if action == "read_tab":
-                offset, limit = payload.get("offset", 0), payload.get("limit", MAX_SOURCE_PAGE)
-                if offset > len(source):
-                    raise ValueError("offset must be between 0 and the document character count")
-                view = payload.get("view", "prose")
-                section_start, section_end = 0, len(source)
-                heading = payload.get("heading")
-                selected_heading = None
-                spans = None
-                if heading is not None:
-                    try:
-                        try:
-                            from .agent_documents import _read_headings_and_svg_spans, resolve_heading
-                        except ImportError:
-                            from agent_documents import _read_headings_and_svg_spans, resolve_heading
-                        headings, precomputed_spans = _read_headings_and_svg_spans(
-                            source,
-                            include_headings=True,
-                            include_svg=view == "prose",
-                        )
-                        selected_heading = resolve_heading(headings, heading)
-                        section_start = selected_heading["sectionStart"]
-                        section_end = selected_heading["sectionEnd"]
-                        if offset > section_end:
-                            raise ValueError(f"offset must be within the selected section (sectionEnd {section_end})")
-                        offset = max(section_start, offset)
-                        if view == "prose":
-                            spans = precomputed_spans
-                    except ImportError:
-                        raise ValueError("Heading outlines are unavailable") from None
-                end = min(section_end, offset + limit)
-                if view == "prose":
-                    try:
-                        try:
-                            from .agent_documents import _prose_page_end, _svg_spans
-                        except ImportError:
-                            from agent_documents import _prose_page_end, _svg_spans
-                        if spans is None:
-                            spans = _svg_spans(source)
-                        end = _prose_page_end(offset, limit, section_end, spans)
-                    except Exception:
-                        spans = []
-                else:
-                    spans = []
-                page_text = source[offset:end]
-                omitted = []
-                if view == "prose":
-                    try:
-                        try:
-                            from .agent_documents import _elide_svg_page
-                        except ImportError:
-                            from agent_documents import _elide_svg_page
-                        page_text, omitted = _elide_svg_page(source, offset, end, spans)
-                    except Exception:
-                        omitted = []
+                try:
+                    from .agent_documents import read_source
+                except ImportError:
+                    from agent_documents import read_source
+                page = read_source(
+                    source,
+                    offset=payload.get("offset", 0),
+                    limit=payload.get("limit", MAX_SOURCE_PAGE),
+                    heading=payload.get("heading"),
+                    view=payload.get("view", "prose"),
+                )
                 asset_offset, asset_limit = payload.get("assetOffset", 0), payload.get("assetLimit", 0)
                 assets = self._asset_metadata(target, asset_offset, asset_limit) if asset_limit else []
                 asset_count = len(target.get("assets", {}))
-                result = {**common, "offset": offset, "start": offset, "end": end,
-                          "markdown": page_text, "text": page_text, "view": view,
-                          "omissions": omitted, "totalLength": len(source), "total_chars": section_end - section_start,
-                          "sectionStart": section_start, "sectionEnd": section_end, "documentLength": len(source),
-                          "next_offset": end if end < section_end else None, "truncated": end < section_end,
-                          "returned_chars": len(page_text), "svg_omissions": omitted, "assetCount": asset_count}
-                if selected_heading is not None:
-                    result["heading"] = {key: selected_heading[key] for key in ("index", "level", "title", "line")}
+                result = {**common, "offset": page["start"], "markdown": page["text"],
+                          "omissions": page["svg_omissions"], "totalLength": page["documentLength"],
+                          **page, "assetCount": asset_count}
                 if asset_limit:
                     result.update({"assets": assets,
                                    "assetsNextOffset": asset_offset + len(assets) if asset_offset + len(assets) < asset_count else None})

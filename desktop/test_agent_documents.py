@@ -919,6 +919,39 @@ class AgentDocumentsTest(unittest.TestCase):
             [{"start": unclosed_braced_py.index("<svg/>"), "end": unclosed_braced_py.index("<svg/>") + len("<svg/>")}],
         )
 
+    def test_read_source_contract_and_agent_package_facade_identity(self):
+        import agent
+        import agent_documents
+        from agent import fs_ops, patches, source_ops, store
+
+        self.assertIs(agent.AgentDocumentError, AgentDocumentError)
+        self.assertIs(agent.RevisionConflict, RevisionConflict)
+        self.assertIs(source_ops.read_source, agent_documents.read_source)
+        self.assertIs(patches.validate_patch_operations, agent_documents.validate_patch_operations)
+        self.assertIs(fs_ops._path_lock, agent_documents._path_lock)
+        self.assertIs(store.DocumentStore, DocumentStore)
+
+        source = "# Intro\nLead.\n## 1.2 Charts\n```svg\n<svg><circle/></svg>\n```\nBody.\n## 2. End\nTail.\n"
+        prose = source_ops.read_source(source, heading="1.2", view="prose")
+        self.assertEqual(prose["heading"], {"index": 1, "level": 2, "title": "1.2 Charts", "line": 3})
+        self.assertIn("[SVG omitted:", prose["text"])
+        self.assertNotIn("Tail.", prose["text"])
+        self.assertEqual(len(prose["svg_omissions"]), 1)
+        plain = source_ops.read_source(source, view="source", limit=12)
+        self.assertNotIn("heading", plain)
+        self.assertEqual(plain["text"], source[:12])
+        for kwargs in (
+            {"source": None},
+            {"source": source, "offset": True},
+            {"source": source, "offset": -1},
+            {"source": source, "offset": len(source) + 1},
+            {"source": source, "limit": False},
+            {"source": source, "limit": 0},
+            {"source": source, "view": "html"},
+        ):
+            with self.assertRaises(AgentDocumentError):
+                source_ops.read_source(**kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()
