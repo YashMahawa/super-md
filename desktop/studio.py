@@ -60,8 +60,9 @@ from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
+from core.paths import DESKTOP_DIR, resource_root
 
-ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
+ROOT = resource_root()
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
@@ -127,7 +128,7 @@ def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen
             console_python = executable_path.with_name("python.exe")
             if console_python.is_file():
                 executable_path = console_python
-        script = Path(cli_script or Path(__file__).with_name("agent_cli.py")).expanduser().resolve()
+        script = Path(cli_script or DESKTOP_DIR / "agent_cli.py").expanduser().resolve()
         command = str(executable_path)
         args = [str(script), "mcp"]
     for root_path in _normalize_mcp_roots(roots):
