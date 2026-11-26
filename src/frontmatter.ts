@@ -82,7 +82,9 @@ function parseDoubleQuoted(input: string): { value: string; rest: string } | nul
         case "u": {
           const hex = input.slice(i + 1, i + 5);
           if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
-          out += String.fromCodePoint(Number.parseInt(hex, 16));
+          const cp = Number.parseInt(hex, 16);
+          if (cp >= 0xd800 && cp <= 0xdfff) return null;
+          out += String.fromCodePoint(cp);
           i += 4;
           break;
         }
@@ -90,7 +92,7 @@ function parseDoubleQuoted(input: string): { value: string; rest: string } | nul
           const hex = input.slice(i + 1, i + 9);
           if (!/^[0-9a-fA-F]{8}$/.test(hex)) return null;
           const cp = Number.parseInt(hex, 16);
-          if (cp > 0x10ffff) return null;
+          if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return null;
           out += String.fromCodePoint(cp);
           i += 8;
           break;
@@ -630,16 +632,16 @@ function extractAuthorName(value: YamlValue): string | undefined {
   const direct = scalarToString(value);
   if (direct) return direct;
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    const name = value.name ?? value.literal;
+    const name = lookupCaseInsensitive(value, "name") ?? lookupCaseInsensitive(value, "literal");
     const directName = scalarToString(name);
     if (directName) return directName;
     if (name && typeof name === "object" && !Array.isArray(name)) {
-      const literal = scalarToString(name.literal);
+      const literal = scalarToString(lookupCaseInsensitive(name, "literal"));
       if (literal) return literal;
-      const parts = [scalarToString(name.given), scalarToString(name.family)].filter(Boolean);
+      const parts = [scalarToString(lookupCaseInsensitive(name, "given")), scalarToString(lookupCaseInsensitive(name, "family"))].filter(Boolean);
       if (parts.length) return parts.join(" ");
     }
-    const parts = [scalarToString(value.given), scalarToString(value.family)].filter(Boolean);
+    const parts = [scalarToString(lookupCaseInsensitive(value, "given")), scalarToString(lookupCaseInsensitive(value, "family"))].filter(Boolean);
     if (parts.length) return parts.join(" ");
   }
   return undefined;

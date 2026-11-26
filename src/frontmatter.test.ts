@@ -1,5 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { maskFrontmatter, parseFrontmatter } from "./frontmatter";
+import conformanceJson from "../test-fixtures/frontmatter-conformance.json";
+import { maskFrontmatter, parseFrontmatter, type YamlValue } from "./frontmatter";
+
+interface ConformanceCase {
+  id: string;
+  valid: boolean;
+  markdown: string;
+  body: string;
+  entries?: Record<string, YamlValue>;
+  metadata?: {
+    title: string | null;
+    authors: string[];
+    description: string | null;
+    keywords: string[];
+    tags: string[];
+  } | null;
+}
+
+const conformance = conformanceJson as { version: number; cases: ConformanceCase[] };
 
 describe("YAML frontmatter parser", () => {
   it("recognizes UTF-8 BOM, trailing spaces, dot closers, empty blocks, CRLF, and EOF closers", () => {
@@ -113,5 +131,39 @@ describe("YAML frontmatter parser", () => {
     expect(masked.indexOf("# Real Heading")).toBe(source.indexOf("# Real Heading"));
     expect(masked.indexOf("![Real](chart.png)")).toBe(source.indexOf("![Real](chart.png)"));
     expect(masked).not.toContain("missing.png");
+  });
+
+  it("matches shared cross-runtime frontmatter conformance vectors", () => {
+    expect(conformance.version).toBe(1);
+    expect(conformance.cases.length).toBeGreaterThanOrEqual(20);
+    for (const item of conformance.cases) {
+      const parsed = parseFrontmatter(item.markdown);
+      const masked = maskFrontmatter(item.markdown);
+      expect(masked, item.id).toHaveLength(item.markdown.length);
+      for (let i = 0; i < item.markdown.length; i++) {
+        if (item.markdown[i] === "\r" || item.markdown[i] === "\n") {
+          expect(masked[i], item.id).toBe(item.markdown[i]);
+        }
+      }
+      if (!item.valid) {
+        expect(parsed, item.id).toBeNull();
+        expect(masked, item.id).toBe(item.markdown);
+        continue;
+      }
+      expect(parsed, item.id).not.toBeNull();
+      expect(item.markdown.slice(parsed!.end), item.id).toBe(item.body);
+      expect(parsed!.raw + item.body, item.id).toBe(item.markdown);
+      expect(masked.slice(parsed!.end), item.id).toBe(item.body);
+      expect(parsed!.entries, item.id).toEqual(item.entries);
+      if (item.metadata === null) {
+        expect(parsed!.properties, item.id).toBeNull();
+      } else if (item.metadata) {
+        expect(parsed!.properties, item.id).not.toBeNull();
+        expect(parsed!.properties!.title, item.id).toBe(item.metadata.title ?? undefined);
+        expect(parsed!.properties!.authors, item.id).toEqual(item.metadata.authors);
+        expect(parsed!.properties!.description, item.id).toBe(item.metadata.description ?? undefined);
+        expect(parsed!.properties!.tags, item.id).toEqual(item.metadata.tags);
+      }
+    }
   });
 });

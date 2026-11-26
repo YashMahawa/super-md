@@ -5,6 +5,8 @@ import re
 
 _BLOCK_SCALAR_HEADER = re.compile(r"^([|>])(?:([+-])([1-9])?|([1-9])([+-])?)?[ \t]*(?:#.*)?$")
 _CLOSER = re.compile(r"^(?:---|\.\.\.)[ \t]*$")
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "0": "\0", " ": " "}
 
 
 def _parse_double_quoted(text: str) -> tuple[str, str] | None:
@@ -22,25 +24,36 @@ def _parse_double_quoted(text: str) -> tuple[str, str] | None:
             if i >= n:
                 return None
             esc = text[i]
-            if esc == "x":
-                hex_part = text[i + 1:i + 3]
-                if len(hex_part) != 2 or not all(c in "0123456789abcdefABCDEF" for c in hex_part):
+            if esc in _SIMPLE_ESCAPES:
+                out.append(_SIMPLE_ESCAPES[esc])
+                i += 1
+                continue
+            if esc == "\n":
+                i += 1
+                while i < n and text[i] in (" ", "\t"):
+                    i += 1
+                continue
+            if esc in ("x", "u", "U"):
+                width = 2 if esc == "x" else (4 if esc == "u" else 8)
+                hex_part = text[i + 1:i + 1 + width]
+                if len(hex_part) != width or not all(c in _HEX_DIGITS for c in hex_part):
                     return None
-                i += 2
-            elif esc == "u":
-                hex_part = text[i + 1:i + 5]
-                if len(hex_part) != 4 or not all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                cp = int(hex_part, 16)
+                if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
                     return None
-                i += 4
-            elif esc == "U":
-                hex_part = text[i + 1:i + 9]
-                if len(hex_part) != 8 or not all(c in "0123456789abcdefABCDEF" for c in hex_part):
-                    return None
-                if int(hex_part, 16) > 0x10FFFF:
-                    return None
-                i += 8
+                out.append(chr(cp))
+                i += 1 + width
+                continue
             out.append(esc)
             i += 1
+            continue
+        if ch == "\n":
+            while out and out[-1] in (" ", "\t"):
+                out.pop()
+            i += 1
+            while i < n and text[i] in (" ", "\t"):
+                i += 1
+            out.append(" ")
             continue
         out.append(ch)
         i += 1
@@ -61,6 +74,14 @@ def _parse_single_quoted(text: str) -> tuple[str, str] | None:
                 i += 2
                 continue
             return "".join(out), text[i + 1:]
+        if ch == "\n":
+            while out and out[-1] in (" ", "\t"):
+                out.pop()
+            i += 1
+            while i < n and text[i] in (" ", "\t"):
+                i += 1
+            out.append(" ")
+            continue
         out.append(ch)
         i += 1
     return None
@@ -208,11 +229,94 @@ def _flow_state(text: str) -> str:
     return "balanced" if closed_top else "incomplete"
 
 
+def _split_top_level_commas(inner: str) -> list[str] | None:
+    parts: list[str] = []
+    start = 0
+    depth_bracket = 0
+    depth_brace = 0
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch == '"':
+            parsed = _parse_double_quoted(inner[i:])
+            if parsed is None:
+                return None
+            i = n - len(parsed[1])
+            continue
+        if ch == "'":
+            parsed = _parse_single_quoted(inner[i:])
+            if parsed is None:
+                return None
+            i = n - len(parsed[1])
+            continue
+        if ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket -= 1
+            if depth_bracket < 0:
+                return None
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+            if depth_brace < 0:
+                return None
+        elif ch == "," and depth_bracket == 0 and depth_brace == 0:
+            parts.append(inner[start:i])
+            start = i + 1
+        i += 1
+    if depth_bracket != 0 or depth_brace != 0:
+        return None
+    parts.append(inner[start:])
+    return parts
+
+
+def _is_valid_flow_value(raw: str) -> bool:
+    trimmed = raw.strip()
+    if not trimmed:
+        return True
+    if trimmed.startswith('"'):
+        parsed = _parse_double_quoted(trimmed)
+        return parsed is not None and _only_trailing_comment(parsed[1])
+    if trimmed.startswith("'"):
+        parsed = _parse_single_quoted(trimmed)
+        return parsed is not None and _only_trailing_comment(parsed[1])
+    if trimmed.startswith("["):
+        if not trimmed.endswith("]"):
+            return False
+        inner = trimmed[1:-1].strip()
+        if not inner:
+            return True
+        items = _split_top_level_commas(inner)
+        return items is not None and all(not item.strip() or _is_valid_flow_value(item) for item in items)
+    if trimmed.startswith("{"):
+        if not trimmed.endswith("}"):
+            return False
+        inner = trimmed[1:-1].strip()
+        if not inner:
+            return True
+        pairs = _split_top_level_commas(inner)
+        if pairs is None:
+            return False
+        for pair in pairs:
+            if not pair.strip():
+                continue
+            kv = _split_key_value(pair.strip(), True)
+            if kv is None or not _is_valid_flow_value(kv[1]):
+                return False
+        return True
+    if any(c in trimmed for c in "[]{}") and _split_top_level_commas(trimmed) is None:
+        return False
+    return True
+
+
 def _is_valid_yaml_mapping(yaml_body: str) -> bool:
     if not yaml_body:
         return True
     lines: list[tuple[str, int, str]] = []
-    for raw in yaml_body.splitlines():
+    for raw_line in yaml_body.split("\n"):
+        raw = raw_line.removesuffix("\r")
         indent = 0
         leading_tab = False
         for ch in raw:
@@ -267,7 +371,7 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
             if state == "error":
                 return None
             if state == "balanced":
-                return idx + 1
+                return idx + 1 if _is_valid_flow_value(comb) else None
             idx += 1
             if idx >= len(lines):
                 return None
@@ -453,7 +557,9 @@ def frontmatter_end(markdown: str) -> int:
 
     if yaml_end < 0 or fm_end < 0:
         return 0
-    yaml_slice = re.sub(r"\r?\n$", "", markdown[yaml_start:yaml_end])
+    yaml_slice = markdown[yaml_start:yaml_end]
+    if yaml_slice.endswith("\n"):
+        yaml_slice = yaml_slice[:-1].removesuffix("\r")
     if not _is_valid_yaml_mapping(yaml_slice):
         return 0
     return fm_end
