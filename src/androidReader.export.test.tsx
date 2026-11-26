@@ -857,20 +857,24 @@ it("forwards note and host image consent policy to portable in-place save, porta
     previewBridge.onTrustImageHost?.("trusted.example");
   });
 
-  // 1. In-place save (save = true) forwards both note and host policy.
-  await act(async () => {
-    await (window.supermdPortable!(true) as unknown as Promise<void>);
-  });
-  expect(prepareFmdMock).toHaveBeenLastCalledWith(
-    "![Once](https://once.example/a.png)\n![Host](https://trusted.example/b.png)\n",
-    "/vault/ConsentA.smd",
-    expect.objectContaining({
-      noteId: "tab-consent-a",
-      trustedImageHosts: ["trusted.example"],
-      approvedImageUrls: ["https://once.example/a.png"],
-      loadedImageData: new Map([["https://once.example/a.png", png]]),
-    }),
-  );
+  // 1. In-place save (save = true) and portable export (save = false) forward both note and host policy plus cached bytes.
+  for (const saveInPlace of [true, false]) {
+    prepareFmdMock.mockClear();
+    await act(async () => {
+      await (window.supermdPortable!(saveInPlace) as unknown as Promise<void>);
+    });
+    expect(prepareFmdMock).toHaveBeenCalledTimes(1);
+    expect(prepareFmdMock).toHaveBeenLastCalledWith(
+      "![Once](https://once.example/a.png)\n![Host](https://trusted.example/b.png)\n",
+      "/vault/ConsentA.smd",
+      expect.objectContaining({
+        noteId: "tab-consent-a",
+        trustedImageHosts: ["trusted.example"],
+        approvedImageUrls: ["https://once.example/a.png"],
+        loadedImageData: new Map([["https://once.example/a.png", png]]),
+      }),
+    );
+  }
 
   // 2. Agent smd export forwards the same note/host consent policy.
   let agentError = "";
@@ -967,21 +971,24 @@ it("forwards note and host image consent policy to portable in-place save, porta
   });
 
   // Active tab-inflight-other must NOT receive tab-inflight-origin's consent or loaded bytes.
-  await act(async () => {
-    await (window.supermdPortable!(true) as unknown as Promise<void>);
-  });
-  expect(prepareFmdMock).toHaveBeenLastCalledWith(
-    "![Inflight](https://once.example/inflight.png)\n",
-    "/vault/Other.smd",
-    {
-      noteId: "tab-inflight-other",
-      trustedImageHosts: ["trusted.example"],
-      approvedImageUrls: [],
-    },
-  );
+  for (const saveInPlace of [true, false]) {
+    prepareFmdMock.mockClear();
+    await act(async () => {
+      await (window.supermdPortable!(saveInPlace) as unknown as Promise<void>);
+    });
+    expect(prepareFmdMock).toHaveBeenCalledTimes(1);
+    expect(prepareFmdMock).toHaveBeenLastCalledWith(
+      "![Inflight](https://once.example/inflight.png)\n",
+      "/vault/Other.smd",
+      {
+        noteId: "tab-inflight-other",
+        trustedImageHosts: ["trusted.example"],
+        approvedImageUrls: [],
+      },
+    );
+  }
 
   // Returning to tab-inflight-origin preserves both its approval and the bytes resolved after switching away.
-  prepareFmdMock.mockClear();
   await act(async () => {
     window.supermdLoad!({
       id: "tab-inflight-origin",
@@ -996,17 +1003,21 @@ it("forwards note and host image consent policy to portable in-place save, porta
       zoom: 100,
     });
   });
-  await act(async () => {
-    await (window.supermdPortable!(true) as unknown as Promise<void>);
-  });
-  expect(prepareFmdMock).toHaveBeenLastCalledWith(
-    "![Inflight](https://once.example/inflight.png)\n",
-    "/vault/Origin.smd",
-    {
-      noteId: "tab-inflight-origin",
-      trustedImageHosts: ["trusted.example"],
-      approvedImageUrls: ["https://once.example/inflight.png"],
-      loadedImageData: new Map([["https://once.example/inflight.png", png]]),
-    },
-  );
+  for (const saveInPlace of [true, false]) {
+    prepareFmdMock.mockClear();
+    await act(async () => {
+      await (window.supermdPortable!(saveInPlace) as unknown as Promise<void>);
+    });
+    expect(prepareFmdMock).toHaveBeenCalledTimes(1);
+    expect(prepareFmdMock).toHaveBeenLastCalledWith(
+      "![Inflight](https://once.example/inflight.png)\n",
+      "/vault/Origin.smd",
+      {
+        noteId: "tab-inflight-origin",
+        trustedImageHosts: ["trusted.example"],
+        approvedImageUrls: ["https://once.example/inflight.png"],
+        loadedImageData: new Map([["https://once.example/inflight.png", png]]),
+      },
+    );
+  }
 });
