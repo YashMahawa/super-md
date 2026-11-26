@@ -251,4 +251,90 @@ describe('shared source analysis',()=>{
     expect(analysis.blocks.map(b=>b.text).join('')).toBe(source);
     for(const block of analysis.blocks)expect(source.slice(block.start,block.end)).toBe(block.text);
   });
+  it('preserves escapes, code fences, and interleaved inline/display math boundaries without blank lines',()=>{
+    const source=[
+      'Item 1 costs $50 %%stripped_before_flow_math%% and keeps \\%%escaped_one\\%% plus \\$50.',
+      '$$',
+      '%% kept_flow_tex_comment',
+      'a_1 + b_1 = 1',
+      '$$',
+      'Item 2 has $x_2 %% kept_inline_math$, \\\\%%stripped_after_slash%%, \\\\$y_2 %% kept_after_slash$, and costs $75 %%stripped_before_fence%%.',
+      '```python',
+      '%%timeit x = 1',
+      '```',
+      '~~~markdown',
+      '%%kept_tilde_fence%%',
+      '~~~',
+      '> ````markdown',
+      '> ```',
+      '> %%kept_quoted_fence%%',
+      '> ```',
+      '> ````',
+      'Item 3 has $z_3 = 1$, costs $90, and has $$c_3 %% kept_compact_display$$ %%stripped_after_compact%% plus \\$\\$not_math\\$\\$ %%stripped_after_escaped_display%%.',
+      '$$d_4 %% kept_line_display$$ %%stripped_line_display%%',
+      '# Final Section',
+    ].join('\n');
+
+    const normalized=normalizeMarkdownSource(source);
+    expect(normalized.value).not.toContain('stripped_before_flow_math');
+    expect(normalized.value).not.toContain('stripped_before_fence');
+    expect(normalized.value).not.toContain('stripped_after_slash');
+    expect(normalized.value).not.toContain('stripped_after_compact');
+    expect(normalized.value).not.toContain('stripped_after_escaped_display');
+    expect(normalized.value).not.toContain('stripped_line_display');
+    expect(normalized.value).toContain('\\%%escaped_one\\%%');
+    expect(normalized.value).toContain('kept_flow_tex_comment');
+    expect(normalized.value).toContain('$x_2 %% kept_inline_math$');
+    expect(normalized.value).toContain('\\\\$y_2 %% kept_after_slash$');
+    expect(normalized.value).toContain('%%timeit x = 1');
+    expect(normalized.value).toContain('%%kept_tilde_fence%%');
+    expect(normalized.value).toContain('%%kept_quoted_fence%%');
+    expect(normalized.value).toContain('$$c_3 %% kept_compact_display$$');
+    expect(normalized.value).toContain('$$d_4 %% kept_line_display$$');
+    expect(normalized.originalOffset(normalized.value.indexOf('# Final Section'))).toBe(source.indexOf('# Final Section'));
+
+    const analysis=analyzeDocument(source);
+    expect(analysis.outline).toEqual([
+      {id:'final-section',title:'Final Section',level:1,offset:source.indexOf('# Final Section')},
+    ]);
+    expect(analysis.blocks.map(b=>b.text).join('')).toBe(source);
+  });
+  it('scales linearly on large notes with interleaved inline math, display math, percent comments, escapes, and code fences',()=>{
+    const sections:string[]=[];
+    for(let i=0;i<300;i++){
+      sections.push(
+        `Paragraph ${i}: inline $a_${i} + b_${i} = 100\\%$ and $p_${i} %% kept_inline_${i}$ %%strip_inline_${i}%% with budget $50 (\\$escaped, \\%%kept_lit_${i}\\%%) and $$m_${i} %% kept_compact_${i}$$.\n`+
+        `$$\n%% kept_display_${i}\n\\sum_{k=1}^{n} x_k = ${i}\n$$\n`+
+        (i%2===0
+          ?`\`\`\`python\n%%timeit total = ${i}\n\`\`\``
+          :`~~~markdown\n%%kept_fenced_${i}%%\n~~~`),
+      );
+    }
+    const ledger:string[]=[];
+    for(let j=0;j<2400;j++){
+      ledger.push(`Ledger ${j}: allocation $50 to $99 per node (\\$fee, \\%%lit_${j}\\%%) %%strip_ledger_${j}%%`);
+    }
+    sections.push(ledger.join('\n'));
+    sections.push('# Tail Heading');
+    const largeDoc=sections.join('\n\n');
+
+    const start=performance.now();
+    const normalized=normalizeMarkdownSource(largeDoc);
+    const elapsedMs=performance.now()-start;
+
+    // Reverted O(N^2) math lookahead takes >5,000 ms on 2,400 unmatched-$ lines (~260 KB) and corrupts interleaved $$ blocks.
+    expect(elapsedMs).toBeLessThan(800);
+    expect(normalized.value).toContain('kept_inline_0');
+    expect(normalized.value).toContain('kept_compact_299');
+    expect(normalized.value).toContain('kept_display_299');
+    expect(normalized.value).toContain('%%timeit total = 298');
+    expect(normalized.value).toContain('%%kept_fenced_299%%');
+    expect(normalized.value).toContain('\\%%kept_lit_150\\%%');
+    expect(normalized.value).toContain('\\%%lit_2399\\%%');
+    expect(normalized.value).not.toContain('strip_inline_0');
+    expect(normalized.value).not.toContain('strip_inline_299');
+    expect(normalized.value).not.toContain('strip_ledger_0');
+    expect(normalized.value).not.toContain('strip_ledger_2399');
+    expect(normalized.originalOffset(normalized.value.indexOf('# Tail Heading'))).toBe(largeDoc.indexOf('# Tail Heading'));
+  });
 });

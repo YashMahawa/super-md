@@ -28,7 +28,7 @@ const THEMATIC_BREAK=/^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/;
 const TABLE_DELIMITER=/^(?:\|[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)*\|?|:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?)[ \t]*$/;
 
 interface LinePrefix {quoteDepth:number;pos:number;baseCol:number;indent:number;contentPos:number}
-interface ClassifiedLine {start:number;end:number;quoteDepth:number;rest:string;kind:'fence'|'indented'|'blank'|'single'|'paraStart'|'paraCont'|'tableRow';codeStart:number}
+interface ClassifiedLine {start:number;end:number;quoteDepth:number;rest:string;kind:'fence'|'indented'|'blank'|'single'|'paraStart'|'paraCont'|'tableRow';codeStart:number;flowMath?:boolean}
 
 function scanLinePrefix(line:string,maxQuotes=Infinity):LinePrefix {
   let pos=0,col=0,baseCol=0,quoteDepth=0;
@@ -172,12 +172,12 @@ function classifyMarkdownLines(source:string):ClassifiedLine[] {
         continue;
       }
       inParagraph=true;prevQuoteDepth=p.quoteDepth;
-      result.push({start,end,quoteDepth:p.quoteDepth,rest:itemRest,kind:'paraStart',codeStart:end});
+      result.push({start,end,quoteDepth:p.quoteDepth,rest:itemRest,kind:'paraStart',codeStart:end,flowMath:itemRest.startsWith('$$')&&itemRest[2]!=='$'});
       continue;
     }
     const kind=inParagraph?'paraCont':'paraStart';
     inParagraph=true;prevQuoteDepth=p.quoteDepth;
-    result.push({start,end,quoteDepth:p.quoteDepth,rest,kind,codeStart:end});
+    result.push({start,end,quoteDepth:p.quoteDepth,rest,kind,codeStart:end,flowMath:effIndent>=0&&effIndent<=3&&rest.startsWith('$$')&&rest[2]!=='$'});
   }
   return result;
 }
@@ -284,7 +284,7 @@ export function normalizeCalloutBlocks(value:string,skipFrontmatter=true):Stage 
 function unmaskedRangesFromMask(mask:Uint8Array):Array<[number,number]> {
   const ranges:Array<[number,number]>=[];let start=-1;
   for(let i=0;i<mask.length;i++){
-    if(!mask[i]){if(start<0)start=i;}
+    if(!(mask[i]&1)){if(start<0)start=i;}
     else if(start>=0){ranges.push([start,i]);start=-1;}
   }
   if(start>=0)ranges.push([start,mask.length]);
@@ -309,46 +309,105 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
 
 function isUnmaskedEscaped(source:string,mask:Uint8Array,at:number):boolean {
   let slashes=0;
-  for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;
+  for(let j=at-1;j>=0&&!(mask[j]&1)&&source[j]==='\\';j--)slashes++;
   return (slashes&1)===1;
 }
 
-function stripPercentComments(source:string):Stage {
-  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
-  const mask=computeCodeMask(source),edits:Edit[]=[];
-  for(let i=0;i<source.length;){
-    if(mask[i]||source[i]!=='$'||isUnmaskedEscaped(source,mask,i)){i++;continue;}
-    if(source[i+1]==='$'&&!mask[i+1]){
-      if(source[i+2]==='$'){while(i<source.length&&source[i]==='$')i++;continue;}
-      let close=-1;
-      for(let j=i+2;j+1<source.length;j++){
-        if(!mask[j]&&!mask[j+1]&&source[j]==='$'&&source[j+1]==='$'&&source[j+2]!=='$'&&!isUnmaskedEscaped(source,mask,j)){close=j;break;}
+function isInlineWs(source:string,idx:number):boolean {
+  const c=source.charCodeAt(idx);
+  return c<128?(c===32||(c>=9&&c<=13)):/\s/.test(source[idx]);
+}
+
+function stripPercentComments(source:string):{stage:Stage;codeMask:Uint8Array|null} {
+  const firstPercent=source.indexOf('%%');
+  if(firstPercent<0)return {stage:{value:source,originalOffset:offset=>offset},codeMask:null};
+  const lines=classifyMarkdownLines(source),mask=computeCodeMask(source,lines),edits:Edit[]=[];
+  let lineIdx=0,inlineBlockEnd=0,inlineScan=0,displayScan=0;
+  for(let i=source.indexOf('$');i>=0;){
+    if(mask[i]||isUnmaskedEscaped(source,mask,i)){i=source.indexOf('$',i+1);continue;}
+    if(i+1<source.length&&source[i+1]==='$'&&!mask[i+1]){
+      if(i+2<source.length&&source[i+2]==='$'&&!mask[i+2]){
+        let runEnd=i+3;
+        while(runEnd<source.length&&source[runEnd]==='$'&&!mask[runEnd])runEnd++;
+        i=source.indexOf('$',runEnd);continue;
       }
-      if(close>=0){mask.fill(1,i,close+2);i=close+2;}else i+=2;
+      if(displayScan<i+2)displayScan=i+2;
+      let close=-1;
+      while(displayScan+1<source.length){
+        const d=source.indexOf('$$',displayScan);
+        if(d<0){displayScan=source.length;break;}
+        if(mask[d]||mask[d+1]||isUnmaskedEscaped(source,mask,d)){displayScan=d+1;continue;}
+        if(d+2<source.length&&source[d+2]==='$'&&!mask[d+2]){
+          displayScan=d+3;
+          while(displayScan<source.length&&source[displayScan]==='$'&&!mask[displayScan])displayScan++;
+          continue;
+        }
+        close=d;break;
+      }
+      if(close>=0){
+        for(let k=i;k<close+2;k++)mask[k]|=2;
+        displayScan=close+2;
+        i=source.indexOf('$',close+2);
+      }else{
+        i=source.indexOf('$',i+2);
+      }
       continue;
     }
-    const next=source[i+1];
-    if(!next||/\s/.test(next)){i++;continue;}
-    let close=-1;
-    for(let j=i+1;j<source.length;j++){
-      if(source[j]==='\n'){
-        let k=j+1;while(k<source.length&&(source[k]===' '||source[k]==='\t'||source[k]==='\r'))k++;
-        if(source[k]==='\n')break;
+    if(i>=inlineBlockEnd){
+      while(lineIdx<lines.length&&lines[lineIdx].end<=i)lineIdx++;
+      if(lineIdx>=lines.length)inlineBlockEnd=i;
+      else{
+        const cur=lines[lineIdx];
+        if(cur.kind==='fence'||cur.kind==='indented'||cur.kind==='blank')inlineBlockEnd=i;
+        else if(cur.kind==='single'||cur.kind==='tableRow')inlineBlockEnd=cur.end;
+        else{
+          let endLine=lineIdx;
+          while(endLine+1<lines.length&&lines[endLine+1].kind==='paraCont'){
+            const nextLine=lines[endLine+1];
+            if(nextLine.flowMath&&!(mask[nextLine.end-nextLine.rest.length]&1))break;
+            endLine++;
+          }
+          inlineBlockEnd=lines[endLine].end;
+          lineIdx=endLine;
+        }
       }
-      if(!mask[j]&&source[j]==='$'&&source[j+1]!=='$'&&!isUnmaskedEscaped(source,mask,j)&&!/\s/.test(source[j-1])&&!/\d/.test(source[j+1]||'')){close=j;break;}
     }
-    if(close>=0){mask.fill(1,i,close+1);i=close+1;}else i++;
-  }
-  const isDelim=(at:number)=>at+1<source.length&&source[at]==='%'&&source[at+1]==='%'&&!mask[at]&&!mask[at+1]&&!isUnmaskedEscaped(source,mask,at);
-  for(let i=0;i+1<source.length;){
-    if(!isDelim(i)){i++;continue;}
+    if(i+1>=inlineBlockEnd||isInlineWs(source,i+1)){i=source.indexOf('$',i+1);continue;}
+    if(inlineScan<i+1)inlineScan=i+1;
     let close=-1;
-    for(let j=i+2;j+1<source.length;j++){if(isDelim(j)){close=j;break;}}
+    while(inlineScan<inlineBlockEnd){
+      const d=source.indexOf('$',inlineScan);
+      if(d<0||d>=inlineBlockEnd){inlineScan=inlineBlockEnd;break;}
+      if(mask[d]||isUnmaskedEscaped(source,mask,d)){inlineScan=d+1;continue;}
+      if(d+1<source.length&&source[d+1]==='$'&&!mask[d+1]){
+        inlineScan=d+2;
+        while(inlineScan<inlineBlockEnd&&source[inlineScan]==='$'&&!mask[inlineScan])inlineScan++;
+        continue;
+      }
+      const nextCode=source.charCodeAt(d+1);
+      if(!isInlineWs(source,d-1)&&!(nextCode>=48&&nextCode<=57)){close=d;break;}
+      inlineScan=d+1;
+    }
+    if(close>=0){
+      for(let k=i;k<=close;k++)mask[k]|=2;
+      inlineScan=close+1;
+      i=source.indexOf('$',close+1);
+    }else{
+      i=source.indexOf('$',i+1);
+    }
+  }
+  const isDelim=(at:number)=>!mask[at]&&!mask[at+1]&&!isUnmaskedEscaped(source,mask,at);
+  for(let i=firstPercent;i>=0;){
+    if(!isDelim(i)){i=source.indexOf('%%',i+1);continue;}
+    let close=-1;
+    for(let j=source.indexOf('%%',i+2);j>=0;j=source.indexOf('%%',j+1)){
+      if(isDelim(j)){close=j;break;}
+    }
     if(close<0)break;
     edits.push({start:i,end:close+2,text:''});
-    i=close+2;
+    i=source.indexOf('%%',close+2);
   }
-  return edits.length?replaceStage(source,edits):{value:source,originalOffset:offset=>offset};
+  return edits.length?{stage:replaceStage(source,edits),codeMask:null}:{stage:{value:source,originalOffset:offset=>offset},codeMask:mask};
 }
 
 /** Render-only syntax normalization with a sparse offset map. Source positions
@@ -359,8 +418,9 @@ export function normalizeMarkdownSource(markdown:string):Stage {
   const fm=parseFrontmatter(value);
   if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
   else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
-  add(stripPercentComments(value));
-  let ranges=unmaskedRangesFromMask(computeCodeMask(value));
+  const stripped=stripPercentComments(value);
+  add(stripped.stage);
+  let ranges=unmaskedRangesFromMask(stripped.codeMask??computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
   addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path:string,spec?:string)=>{
     const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
