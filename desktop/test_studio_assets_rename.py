@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 
 from PySide6.QtCore import QEvent, QObject
 from PySide6.QtGui import QGuiApplication
-import documents, folder_ops, studio_assets_rename
+import documents, folder_ops, studio, studio_assets_rename, studio_portable_assets
 from documents import open_note, write_portable
 from studio import Session, Studio
 
@@ -211,19 +211,33 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         self.assertEqual(revoked, [])
 
         qt_double = MinimalQtStudio([tab], "tab-1")
+        self.assertEqual(
+            studio_portable_assets.extra_asset_roots(SimpleNamespace(folder=str(self.open_root), settings={"newNoteLocation": str(self.outside_root)})),
+            [self.open_root, self.outside_root],
+        )
         write_calls: list[Path] = []
+        sig_checks: list[str | None] = []
+        validated_paths: list[str] = []
         real_write_portable = documents.write_portable
-        with patch("studio.write_portable", side_effect=lambda p, md, a: (write_calls.append(Path(p)), real_write_portable(p, md, a))[1]):
-            attached = Studio._attach_tab_asset_native(qt_double, {
+        real_sig = studio._matches_media_signature
+        real_validate = studio._validate_local_tab_asset_path
+        with (
+            patch("studio.write_portable", side_effect=lambda p, md, a: (write_calls.append(Path(p)), real_write_portable(p, md, a))[1]),
+            patch("studio._matches_media_signature", side_effect=lambda mime, raw: (sig_checks.append(mime), real_sig(mime, raw))[1]),
+            patch("studio._validate_local_tab_asset_path", side_effect=lambda raw_p, *a, **kw: (validated_paths.append(str(raw_p)), real_validate(raw_p, *a, **kw))[1]),
+        ):
+            attached = studio_portable_assets.attach_tab_asset_native(qt_double, {
                 "tabId": "tab-1", "expectedRevision": rev,
                 "mimeType": "image/png", "body": base64.b64encode(PNG_1X1).decode("ascii"), "assetName": "pixel",
             })
-            replaced = Studio._replace_tab_asset_native(qt_double, {
+            replaced = studio_portable_assets.replace_tab_asset_native(qt_double, {
                 "tabId": "tab-1", "expectedRevision": rev, "assetName": asset_sha_id, "assetPath": str(next_svg),
             })
         self.assertEqual(attached["assetName"], "assets/pixel.png")
         self.assertTrue(replaced["changed"] and replaced["saved"])
         self.assertEqual(write_calls, [smd_path, smd_path])
+        self.assertEqual(sig_checks, ["image/png", "image/svg+xml"])
+        self.assertEqual(validated_paths, [str(next_svg)])
 
         write_portable(smd_path, markdown + "\nExternal modification\n", tab["saved_assets"])
         with self.assertRaisesRegex(ValueError, "The portable note changed on disk; reopen it before attaching an asset"):

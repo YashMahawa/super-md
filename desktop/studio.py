@@ -48,10 +48,10 @@ from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
-try:
-    from . import studio_assets_rename
-except ImportError:
-    import studio_assets_rename
+if __package__:
+    from . import studio_assets_rename, studio_portable_assets
+else:
+    import studio_assets_rename, studio_portable_assets
 from latest_writes import LatestWriteExecutor
 import updates
 import app_integration
@@ -5222,19 +5222,19 @@ class Studio(QObject):
         return tab_id, work, finalize, abort
 
     def _extra_asset_roots(self) -> list[Path]:
-        return studio_assets_rename.extra_asset_roots(self)
+        return studio_portable_assets.extra_asset_roots(self)
 
     def _apply_saved_tab_assets(self, tab_id: str, path: Path, content_snapshot: str,
                                 assets_snapshot: dict, updated: dict, stamp=None) -> None:
-        studio_assets_rename.apply_saved_tab_assets(
+        studio_portable_assets.apply_saved_tab_assets(
             self, tab_id, path, content_snapshot, assets_snapshot, updated, stamp
         )
 
     def _prepare_attach_tab_asset(self, args):
-        return studio_assets_rename.prepare_attach_tab_asset(self, args)
+        return studio_portable_assets.prepare_attach_tab_asset(self, args)
 
     def _attach_tab_asset_native(self, args):
-        return studio_assets_rename.attach_tab_asset_native(self, args)
+        return studio_portable_assets.attach_tab_asset_native(self, args)
 
     @staticmethod
     def _parse_media_envelope(raw: str):
@@ -5351,10 +5351,10 @@ class Studio(QObject):
         return Studio._validate_and_write_media(args, self._media_download_directory())
 
     def _prepare_replace_tab_asset(self, args):
-        return studio_assets_rename.prepare_replace_tab_asset(self, args)
+        return studio_portable_assets.prepare_replace_tab_asset(self, args)
 
     def _replace_tab_asset_native(self, args):
-        return studio_assets_rename.replace_tab_asset_native(self, args)
+        return studio_portable_assets.replace_tab_asset_native(self, args)
 
     def _agent_viewport_pending(self, request_id, tab_id):
         bridge = getattr(self.session, "agent_bridge", None)
