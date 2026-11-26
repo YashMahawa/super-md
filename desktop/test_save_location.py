@@ -38,7 +38,7 @@ class SaveLocationStudioTest(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="supermd-save-loc-")
-        self.root = Path(self.temp.name)
+        self.root = Path(folder_ops.canonical_path_str(self.temp.name))
         self.data_dir = self.root / "app-data"
         self.downloads_dir = self.root / "Downloads"
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -46,6 +46,13 @@ class SaveLocationStudioTest(unittest.TestCase):
         self.session.settings["welcomed"] = True
         self.session.settings["newNoteLocation"] = ""
         self.windows: list[QuietStudio] = []
+
+    def assertSamePath(self, actual: str | os.PathLike[str], expected: str | os.PathLike[str]):
+        self.assertTrue(
+            folder_ops.same_path(actual, expected),
+            f"Expected same path:\n  actual:   {actual}\n  expected: {expected}",
+        )
+        self.assertEqual(Path(actual).name, Path(expected).name)
 
     def tearDown(self):
         for win in list(self.windows):
@@ -185,28 +192,28 @@ class SaveLocationStudioTest(unittest.TestCase):
             canon_open = Path(folder_ops.canonical_path_str(open_dir))
 
             win.setNoteLocation(str(preferred_dir))
-            self.assertEqual(Path(win.defaultSaveFolder().toLocalFile()), preferred_dir)
-            self.assertEqual(
-                Path(win.defaultSaveLocation("Untitled.md").toLocalFile()),
+            self.assertSamePath(win.defaultSaveFolder().toLocalFile(), preferred_dir)
+            self.assertSamePath(
+                win.defaultSaveLocation("Untitled.md").toLocalFile(),
                 preferred_dir / "Untitled.md",
             )
             # Save As on an untitled note also honors the explicit preference.
-            self.assertEqual(
-                Path(win.defaultSaveAsLocation("Untitled.md").toLocalFile()),
+            self.assertSamePath(
+                win.defaultSaveAsLocation("Untitled.md").toLocalFile(),
                 preferred_dir / "Untitled.md",
             )
 
             # If the configured preference directory becomes unavailable, fall back to open folder.
             shutil.rmtree(preferred_dir)
-            self.assertEqual(Path(win.defaultSaveFolder().toLocalFile()), canon_open)
-            self.assertEqual(
-                Path(win.defaultSaveLocation("Untitled.md").toLocalFile()),
+            self.assertSamePath(win.defaultSaveFolder().toLocalFile(), canon_open)
+            self.assertSamePath(
+                win.defaultSaveLocation("Untitled.md").toLocalFile(),
                 canon_open / "Untitled.md",
             )
 
             # Clearing newNoteLocation explicitly also uses the active window's open folder.
             win.settings["newNoteLocation"] = ""
-            self.assertEqual(Path(win.defaultSaveFolder().toLocalFile()), canon_open)
+            self.assertSamePath(win.defaultSaveFolder().toLocalFile(), canon_open)
 
     def test_unavailable_open_folder_or_symlink_falls_back_to_downloads(self):
         transient_dir = self.root / "Transient Folder"
@@ -214,31 +221,49 @@ class SaveLocationStudioTest(unittest.TestCase):
         real_target = self.root / "Real Target"
         real_target.mkdir()
         symlink_dir = self.root / "Symlink Folder"
-        symlink_dir.symlink_to(real_target, target_is_directory=True)
+        created_link = False
+        try:
+            symlink_dir.symlink_to(real_target, target_is_directory=True)
+            created_link = True
+        except OSError:
+            if os.name == "nt":
+                proc = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(symlink_dir), str(real_target)],
+                    capture_output=True,
+                    text=True,
+                )
+                created_link = proc.returncode == 0
+            else:
+                raise
 
         with self._patch_downloads():
             win = self.make_window()
             win.openFolder(str(transient_dir))
-            self.assertEqual(
-                Path(win.defaultSaveFolder().toLocalFile()),
-                Path(folder_ops.canonical_path_str(transient_dir)),
+            self.assertSamePath(
+                win.defaultSaveFolder().toLocalFile(),
+                folder_ops.canonical_path_str(transient_dir),
             )
 
             # Delete the open folder while the window is still open -> falls back to Downloads.
             shutil.rmtree(transient_dir)
-            self.assertEqual(Path(win.defaultSaveFolder().toLocalFile()), self.downloads_dir)
-            self.assertEqual(
-                Path(win.defaultSaveLocation("Untitled.md").toLocalFile()),
+            self.assertSamePath(win.defaultSaveFolder().toLocalFile(), self.downloads_dir)
+            self.assertSamePath(
+                win.defaultSaveLocation("Untitled.md").toLocalFile(),
                 self.downloads_dir / "Untitled.md",
             )
 
             # Replace deleted directory path with a regular file -> still falls back to Downloads.
             transient_dir.write_text("not a directory", encoding="utf-8")
-            self.assertEqual(Path(win.defaultSaveFolder().toLocalFile()), self.downloads_dir)
+            self.assertSamePath(win.defaultSaveFolder().toLocalFile(), self.downloads_dir)
 
-            # Symlinked self.folder is rejected for open-folder save destination -> falls back to Downloads.
-            win.folder = str(symlink_dir)
-            self.assertEqual(Path(win.defaultSaveFolder().toLocalFile()), self.downloads_dir)
+            # Symlinked/junction self.folder is rejected for open-folder save destination -> falls back to Downloads.
+            if created_link:
+                win.folder = str(symlink_dir)
+                self.assertSamePath(win.defaultSaveFolder().toLocalFile(), self.downloads_dir)
+
+            # If Downloads itself is missing/unavailable, falls back to Path.home().
+            shutil.rmtree(self.downloads_dir)
+            self.assertSamePath(win.defaultSaveFolder().toLocalFile(), Path.home())
 
     def test_save_as_from_existing_note_prefers_note_parent_and_handles_missing_parent(self):
         workspace_dir = self.root / "Workspace"
@@ -273,14 +298,14 @@ class SaveLocationStudioTest(unittest.TestCase):
             # If the existing note's parent directory is deleted externally, Save As falls back
             # to _note_save_directory() (preferred_dir -> workspace_dir -> Downloads).
             shutil.rmtree(note_dir)
-            self.assertEqual(Path(win.defaultSaveAsFolder().toLocalFile()), preferred_dir)
+            self.assertSamePath(win.defaultSaveAsFolder().toLocalFile(), preferred_dir)
             win.settings["newNoteLocation"] = ""
-            self.assertEqual(
-                Path(win.defaultSaveAsFolder().toLocalFile()),
-                Path(folder_ops.canonical_path_str(workspace_dir)),
+            self.assertSamePath(
+                win.defaultSaveAsFolder().toLocalFile(),
+                folder_ops.canonical_path_str(workspace_dir),
             )
             shutil.rmtree(workspace_dir)
-            self.assertEqual(Path(win.defaultSaveAsFolder().toLocalFile()), self.downloads_dir)
+            self.assertSamePath(win.defaultSaveAsFolder().toLocalFile(), self.downloads_dir)
 
     def test_export_and_theme_destinations_are_preserved_when_folder_is_open(self):
         workspace_dir = self.root / "Active Course"
@@ -328,12 +353,12 @@ class SaveLocationStudioTest(unittest.TestCase):
 
             # When newNoteLocation is configured, export and theme export continue honoring it.
             win.setNoteLocation(str(preferred_dir))
-            self.assertEqual(
-                Path(win.defaultExportLocation("pdf").toLocalFile()),
+            self.assertSamePath(
+                win.defaultExportLocation("pdf").toLocalFile(),
                 preferred_dir / "Lecture 4.pdf",
             )
-            self.assertEqual(
-                Path(win.defaultThemeExportLocation("My theme.supermd-theme.json").toLocalFile()),
+            self.assertSamePath(
+                win.defaultThemeExportLocation("My theme.supermd-theme.json").toLocalFile(),
                 preferred_dir / "My theme.supermd-theme.json",
             )
 
@@ -345,7 +370,7 @@ class SaveDialogQmlUiTest(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="supermd-save-qml-")
-        self.root = Path(self.temp.name)
+        self.root = Path(folder_ops.canonical_path_str(self.temp.name))
         self.open_folder = self.root / "Open Folder"
         self.open_folder.mkdir()
         self.note_folder = self.root / "Existing Note Folder"
@@ -355,9 +380,14 @@ class SaveDialogQmlUiTest(unittest.TestCase):
 
         source = MAIN.read_text(encoding="utf-8")
         factory = source[source.index("    function chooseSaveDestination("):source.index("    function showExport(")]
-        connections_start = source.index("        function onSaveRequested(name)")
-        connections_end = source.index("        function onReaderLoad(payload)")
-        handlers = source[connections_start:connections_end]
+        save_handlers = source[
+            source.index("        function onSaveRequested(name)"):
+            source.index("        function onSaveConflictRequested(name)")
+        ]
+        theme_handler = next(
+            line for line in source.splitlines() if "function onThemeExportRequested()" in line
+        )
+        handlers = save_handlers + theme_handler + "\n"
         theme_dialog = next(
             line for line in source.splitlines() if "id:themeExportDialog" in line
         )
@@ -514,9 +544,10 @@ class SaveLocationPortalTest(unittest.TestCase):
     )
     def test_portal_receives_open_folder_and_save_as_folder_with_fresh_names(self):
         with tempfile.TemporaryDirectory(prefix="supermd-save-portal-") as tmp:
-            open_dir = Path(tmp) / "Open Course"
+            canon_tmp = Path(folder_ops.canonical_path_str(tmp))
+            open_dir = canon_tmp / "Open Course"
             open_dir.mkdir()
-            note_dir = Path(tmp) / "Saved Chapter"
+            note_dir = canon_tmp / "Saved Chapter"
             note_dir.mkdir()
 
             environment = dict(

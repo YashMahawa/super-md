@@ -4192,10 +4192,16 @@ class Studio(QObject):
         except OSError:
             return None
 
-    @staticmethod
-    def _downloads_fallback_directory() -> Path:
-        raw = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
-        cleaned = folder_ops.strip_extended_length_prefix(str(raw or "").strip()) or str(Path.home())
+    @classmethod
+    def _downloads_fallback_directory(cls) -> Path:
+        raw_downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        downloads = cls._existing_save_directory(raw_downloads)
+        if downloads is not None:
+            return downloads
+        home = cls._existing_save_directory(Path.home())
+        if home is not None:
+            return home
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw_downloads or "").strip()) or str(Path.home())
         return Path(cleaned).expanduser()
 
     def _default_output_directory(self) -> Path:
