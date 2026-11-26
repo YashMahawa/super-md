@@ -5,7 +5,10 @@ import json
 import re
 from pathlib import Path
 from PySide6.QtGui import QFontDatabase
-from documents import atomic_write
+if __package__ and "." in __package__:
+    from ..documents import atomic_write
+else:
+    from documents import atomic_write
 
 class FontStore:
     def __init__(self, data):
