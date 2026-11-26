@@ -1065,21 +1065,28 @@ def _qt_bridge_class():
                 section_start, section_end = 0, len(source)
                 heading = payload.get("heading")
                 selected_heading = None
+                spans = None
                 if heading is not None:
                     try:
                         try:
-                            from .agent_documents import _headings, resolve_heading
+                            from .agent_documents import _read_headings_and_svg_spans, resolve_heading
                         except ImportError:
-                            from agent_documents import _headings, resolve_heading
-                        selected_heading = resolve_heading(_headings(source, include_internal=True), heading)
+                            from agent_documents import _read_headings_and_svg_spans, resolve_heading
+                        headings, precomputed_spans = _read_headings_and_svg_spans(
+                            source,
+                            include_headings=True,
+                            include_svg=view == "prose",
+                        )
+                        selected_heading = resolve_heading(headings, heading)
                         section_start = selected_heading["sectionStart"]
                         section_end = selected_heading["sectionEnd"]
                         if offset > section_end:
                             raise ValueError(f"offset must be within the selected section (sectionEnd {section_end})")
                         offset = max(section_start, offset)
+                        if view == "prose":
+                            spans = precomputed_spans
                     except ImportError:
                         raise ValueError("Heading outlines are unavailable") from None
-                spans = []
                 end = min(section_end, offset + limit)
                 if view == "prose":
                     try:
@@ -1087,10 +1094,13 @@ def _qt_bridge_class():
                             from .agent_documents import _prose_page_end, _svg_spans
                         except ImportError:
                             from agent_documents import _prose_page_end, _svg_spans
-                        spans = _svg_spans(source)
+                        if spans is None:
+                            spans = _svg_spans(source)
                         end = _prose_page_end(offset, limit, section_end, spans)
                     except Exception:
                         spans = []
+                else:
+                    spans = []
                 page_text = source[offset:end]
                 omitted = []
                 if view == "prose":
