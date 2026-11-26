@@ -942,7 +942,7 @@ class AgentDocumentsTest(unittest.TestCase):
             operations=[{"type": "replace", "old": "Body v0", "new": "Body v1"}],
         )
         rev_v1 = patched["revision"]
-        note_path = self.root / "stale-check.smd"
+        note_path = self.store.resolve("stale-check.smd")
         expected_bytes = note_path.read_bytes()
 
         # Warm asset metadata and verify the current revision + decoded assets live in cache.
@@ -1027,7 +1027,7 @@ class AgentDocumentsTest(unittest.TestCase):
         rev0 = self.store.create("atomic-safe.smd", "# Safe\nOriginal text\n")["revision"]
         rev1 = self.store.attach_asset("atomic-safe.smd", "chart.svg", expected_revision=rev0)["revision"]
         rev = self.store.attach_asset("atomic-safe.smd", "a.png", expected_revision=rev1)["revision"]
-        note_path = self.root / "atomic-safe.smd"
+        note_path = self.store.resolve("atomic-safe.smd")
         original_bytes = note_path.read_bytes()
         info = self.store.inspect("atomic-safe.smd")
         chart_id = next(item["id"] for item in info["assets"] if item["name"] == "assets/chart.svg")
@@ -1073,7 +1073,7 @@ class AgentDocumentsTest(unittest.TestCase):
                 for attempt in write_attempts:
                     with self.assertRaisesRegex(OSError, "simulated I/O failure"):
                         attempt()
-                    self.assertEqual(list(self.root.glob(".*agent-tmp")), [])
+                    self.assertEqual(list(note_path.parent.glob(".*agent-tmp")), [])
 
             for attempt in write_attempts:
                 checks = 0
@@ -1088,7 +1088,7 @@ class AgentDocumentsTest(unittest.TestCase):
                 with patch("agent_documents._symlink_component", side_effect=symlink_after_resolve):
                     with self.assertRaisesRegex(AgentDocumentError, "Refusing to replace a symlink path"):
                         attempt()
-                self.assertEqual(list(self.root.glob(".*agent-tmp")), [])
+                self.assertEqual(list(note_path.parent.glob(".*agent-tmp")), [])
 
             # Original note on disk, cached revision, and memoized decoded_assets remain completely untouched.
             self.assertEqual(note_path.read_bytes(), original_bytes)
@@ -1125,7 +1125,7 @@ class AgentDocumentsTest(unittest.TestCase):
 
         rev0 = self.store.create("race.smd", "# Race\nInitial line\n")["revision"]
         rev = self.store.attach_asset("race.smd", "same.svg", expected_revision=rev0)["revision"]
-        note_path = self.root / "race.smd"
+        note_path = self.store.resolve("race.smd")
         before_bytes = note_path.read_bytes()
         info = self.store.inspect("race.smd")
         asset_id = info["assets"][0]["id"]
@@ -1199,6 +1199,51 @@ class AgentDocumentsTest(unittest.TestCase):
             self.assertEqual(note_path.read_bytes(), external_bytes)
             self.assertEqual(self.store.inspect("race.smd")["revision"], external_rev)
             self.assertIn(f"External concurrent edit ({label})", self.store.read("race.smd", view="source")["text"])
+
+    @unittest.skipUnless(os.name == "posix", "directory symlink root aliases require POSIX")
+    def test_writes_through_aliased_root_preserve_canonical_cache_and_revisions(self):
+        real = self.root / "canonical"
+        workspace = real / "workspace"
+        workspace.mkdir(parents=True)
+        alias = self.root / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        aliased_workspace = alias / "workspace"
+        store = DocumentStore([aliased_workspace])
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='3'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='7'/></svg>"
+        (aliased_workspace / "icon.svg").write_bytes(svg_v1)
+        (aliased_workspace / "icon_v2.svg").write_bytes(svg_v2)
+
+        rev0 = store.create(str(aliased_workspace / "aliased.smd"), "# Aliased\nBefore\n")["revision"]
+        rev1 = store.attach_asset(
+            str(aliased_workspace / "aliased.smd"),
+            str(aliased_workspace / "icon.svg"),
+            expected_revision=rev0,
+        )["revision"]
+        rev2 = store.patch(
+            str(aliased_workspace / "aliased.smd"),
+            expected_revision=rev1,
+            operations=[{"type": "replace", "old": "Before", "new": "After"}],
+        )["revision"]
+        info = store.inspect("aliased.smd")
+        asset_id = info["assets"][0]["id"]
+        rev3 = store.replace_asset(
+            str(aliased_workspace / "aliased.smd"),
+            asset_id,
+            str(aliased_workspace / "icon_v2.svg"),
+            expected_revision=rev2,
+        )["revision"]
+
+        canonical_note = store.resolve("aliased.smd")
+        self.assertNotEqual(str(aliased_workspace / "aliased.smd"), str(canonical_note))
+        cached = next(entry for entry in store._cache.values() if entry.path_str == str(canonical_note))
+        self.assertEqual(cached.revision, rev3)
+        self.assertEqual(store.read("aliased.smd", view="source")["text"], "# Aliased\nAfter\n")
+        self.assertEqual(
+            store.read_asset("aliased.smd", "assets/icon.svg", expected_revision=rev3)["data"],
+            svg_v2,
+        )
 
 
 if __name__ == "__main__":
