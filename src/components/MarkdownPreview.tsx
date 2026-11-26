@@ -24,6 +24,7 @@ import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis
 import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
 import {registerMedia,installMediaMenu} from '../mediaExport';
+import {isRemoteImageApproved,normalizeApprovedImageUrls,normalizeTrustedImageHosts,remoteImageHost} from '../remoteImageConsent';
 import type {ReaderAccessibilityPreference} from '../types';
 import type {Components} from 'react-markdown';
 export {normalizeCallouts} from '../markdownSource';
@@ -33,6 +34,7 @@ function ThemedChart({source,dark}:{source:string;dark:boolean}) {const theme=us
 function ThemedSvg({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <SvgDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} ink={theme?.svgAppearance==='auto'?theme.ink:theme?.text} colors={theme?.colors}/>;}
 function ThemedMermaid({source,dark}:{source:string;dark:boolean}) {const theme=useContext(DocumentAppearance);return <MermaidDiagram source={source} dark={theme?.dark??dark} appearance={theme?.svgAppearance} colors={theme?.colors}/>;}
 const EMPTY_TRUSTED_IMAGE_HOSTS: string[] = [];
+const EMPTY_APPROVED_IMAGE_URLS: string[] = [];
 // Keep this component type stable across edits so unchanged paragraphs and
 // their loaded media are not remounted just to classify a standalone figure.
 const MarkdownParagraph:Components['p']=({node,children,...props})=>{
@@ -100,12 +102,13 @@ export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-
 export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
 export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
 
-function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost, editable = false }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void; editable?: boolean }) {
+function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, editable = false }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; approvedImageUrls?: readonly string[]; onTrustImageHost?: (host: string) => void; onApproveImageUrl?: (url: string) => void; onRemoteImageLoaded?: (url: string, data: string) => void; editable?: boolean }) {
   const isRemote = /^https?:\/\//i.test(src);
   const embedded = /^(data:|blob:)/i.test(src);
-  let host = "";
-  if (isRemote) {
-    try { host = new URL(src).host; }
+  const validRemoteHost = isRemote ? remoteImageHost(src) : null;
+  let host = validRemoteHost ?? "";
+  if (isRemote && !host) {
+    try { host = new URL(src).host || "invalid address"; }
     catch { host = "invalid address"; }
   }
   const [allowedOnceSource, setAllowedOnceSource] = useState<string | null>(null);
@@ -149,7 +152,9 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
   const displayError=error||adapted.error;
   // A one-time approval belongs to the exact URL the user approved. Keeping
   // that scope in state avoids a passive-effect reset window when `src` changes.
-  const allowed = allowedOnceSource === src || trustedImageHosts.includes(host);
+  const trustedSet = useMemo(() => normalizeTrustedImageHosts(trustedImageHosts), [trustedImageHosts]);
+  const approvedSet = useMemo(() => normalizeApprovedImageUrls(approvedImageUrls), [approvedImageUrls]);
+  const allowed = Boolean(validRemoteHost) && (allowedOnceSource === src || isRemoteImageApproved(src, trustedSet, approvedSet));
   useEffect(() => {
     let active = true;
     const fail=(reason:string)=>{if(active)commitMediaLayout(mediaElement.current,()=>setError(reason));};
@@ -161,7 +166,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
       // Explicit consent routes through the bounded native fetcher, not a raw
       // remote request from a local WebEngine page. This also works offline after insertion.
       invoke<{body:string}>("fetch_resource",{url:src,image:true})
-        .then(value=>{if(active)commitMediaLayout(mediaElement.current,()=>setResolved(value.body));})
+        .then(value=>{if(active){if(validRemoteHost&&/^data:image\//i.test(value.body))onRemoteImageLoaded?.(src,value.body);commitMediaLayout(mediaElement.current,()=>setResolved(value.body));}})
         .catch(reason=>fail(String(reason)));
       return ()=>{active=false;};
     }
@@ -185,7 +190,7 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
     return registerMedia(imageElement.current,{label:alt||'Image',uri:()=>resolved,...(svg?{svg:()=>decodeSvgDataUri(resolved)}:{})});
   },[resolved,displayError,isSvgData,isRemote,allowed,alt]);
   const readonlyAttr = editable ? undefined : "true";
-  if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button type="button" onClick={() => setAllowedOnceSource(src)}>Load image</button>{onTrustImageHost && <button type="button" onClick={() => onTrustImageHost(host)}>Trust domain</button>}</span></span>;
+  if (isRemote && !allowed) return <span ref={mediaElement} className="remote-image-card" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role="group" aria-label={`Remote image from ${host}`}><span><strong>{alt || "Remote image"}</strong><small>{host} · blocked until you choose to load it</small></span><span className="remote-image-actions"><button type="button" onClick={() => { if (validRemoteHost) { setAllowedOnceSource(src); onApproveImageUrl?.(src); } }}>Load image</button>{onTrustImageHost && validRemoteHost && <button type="button" onClick={() => onTrustImageHost(validRemoteHost)}>Trust domain</button>}</span></span>;
   if (displayError) return <span ref={mediaElement} className="image-error" data-note-image-source={src} data-note-image-readonly={readonlyAttr} role={editable ? "group" : "img"} aria-label={alt || "Image unavailable"}><span>Image unavailable: {alt || src}<small>{displayError}</small></span>{editable && <span className="image-error-actions"><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "replace", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Replace</button><button type="button" onClick={(event) => { event.stopPropagation(); window.dispatchEvent(new CustomEvent("supermd-image-edit", { detail: { action: "remove", image: event.currentTarget.closest("[data-note-image-source]") } })); }}>Remove</button></span>}</span>;
   if (!resolved) return <span ref={mediaElement} className="image-loading" role="status">Loading image…</span>;
   const sizing=sizedSource!==resolved;
@@ -201,7 +206,10 @@ interface Props extends ReaderAccessibilityPreference {
   python: string;
   dark: boolean;
   trustedImageHosts?: string[];
+  approvedImageUrls?: readonly string[];
   onTrustImageHost?: (host: string) => void;
+  onApproveImageUrl?: (url: string) => void;
+  onRemoteImageLoaded?: (url: string, data: string) => void;
   onChange?: (markdown:string)=>void;
   renderBlock?:MarkdownBlockRenderer;
   sourceAnalysis?:SourceDocumentAnalysis;
@@ -219,7 +227,10 @@ interface MarkdownPreviewContextValue {
   python: string;
   dark: boolean;
   trustedImageHosts: string[];
+  approvedImageUrls: readonly string[];
   onTrustImageHost?: (host: string) => void;
+  onApproveImageUrl?: (url: string) => void;
+  onRemoteImageLoaded?: (url: string, data: string) => void;
   editable: boolean;
   liveStateRef: RefObject<MarkdownPreviewLiveState>;
 }
@@ -235,7 +246,10 @@ const MarkdownPreviewContext = createContext<MarkdownPreviewContextValue>({
   python: "",
   dark: false,
   trustedImageHosts: EMPTY_TRUSTED_IMAGE_HOSTS,
+  approvedImageUrls: EMPTY_APPROVED_IMAGE_URLS,
   onTrustImageHost: undefined,
+  onApproveImageUrl: undefined,
+  onRemoteImageLoaded: undefined,
   editable: false,
   liveStateRef: DEFAULT_LIVE_STATE,
 });
@@ -265,8 +279,8 @@ const MarkdownListItem: Components['li'] = ({ node, children, ...props }) => {
 };
 
 const MarkdownImage: Components['img'] = ({ src, alt }) => {
-  const { documentPath, trustedImageHosts, onTrustImageHost, editable } = useContext(MarkdownPreviewContext);
-  return <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} editable={editable} />;
+  const { documentPath, trustedImageHosts, approvedImageUrls, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, editable } = useContext(MarkdownPreviewContext);
+  return <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} editable={editable} />;
 };
 
 const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }) => (
@@ -289,7 +303,7 @@ const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }
 );
 
 const MarkdownPre: Components['pre'] = ({ node, children }) => {
-  const { documentPath, python, dark, trustedImageHosts, onTrustImageHost, liveStateRef } = useContext(MarkdownPreviewContext);
+  const { documentPath, python, dark, trustedImageHosts, approvedImageUrls, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, liveStateRef } = useContext(MarkdownPreviewContext);
   const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
   const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
   const source = textOf(child.props.children).replace(/\n$/, "");
@@ -314,9 +328,9 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
         source={source}
         sourceStart={srcStart}
         sourceEnd={srcEnd}
-        renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+        renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} />}
         renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
-        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} />}
       />
     </CodeBlockBoundary>
   );
@@ -341,7 +355,7 @@ const MARKDOWN_COMPONENTS: Components = {
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const editable=Boolean(onChange);
@@ -349,8 +363,8 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells});
   liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells};
   const previewContext=useMemo<MarkdownPreviewContextValue>(
-    ()=>({documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable,liveStateRef}),
-    [documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable],
+    ()=>({documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable,liveStateRef}),
+    [documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable],
   );
   const resolvedSourceAnalysis=useMemo(
     ()=>sourceAnalysis?.source===markdown?sourceAnalysis:{source:markdown,analysis},

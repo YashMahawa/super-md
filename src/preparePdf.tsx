@@ -8,8 +8,15 @@ import { SKIP, visit } from "unist-util-visit";
 import InteractiveChart from "./components/InteractiveChart";
 import { normalizeCallouts } from "./components/MarkdownPreview";
 import { parseFrontmatter } from "./frontmatter";
-import { mediaAt } from "./mediaExport";
 import { invoke } from "./nativeBridge";
+import {
+  isRemoteImageApproved,
+  loadedReaderImageData,
+  normalizeApprovedImageUrls,
+  normalizeTrustedImageHosts,
+  remoteImageHost,
+  type RemoteImageConsentPolicy,
+} from "./remoteImageConsent";
 import { renderMermaid } from "./mermaidRenderer";
 import { pythonOutput } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
@@ -240,34 +247,12 @@ function liftHtmlImages(tree: any): void {
 function data(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(reader.error); reader.readAsDataURL(blob); });
 }
-function loadedReaderImageData(source: string): string | null {
-  if (typeof document === "undefined") return null;
-  for (const element of document.querySelectorAll<HTMLElement>("[data-note-image-source]")) {
-    if (element.dataset.noteImageSource !== source) continue;
-    const uri = mediaAt(element.querySelector("img"))?.uri?.();
-    if (uri && /^data:image\//i.test(uri)) return uri;
-  }
-  return null;
-}
-
-function remoteImageHost(url: string): string | null {
-  if (!/^https?:\/\//i.test(url)) return null;
-  try {
-    const parsed = new URL(url);
-    return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password && parsed.host
-      ? parsed.host.toLowerCase()
-      : null;
-  } catch {
-    return null;
-  }
-}
 
 export type PdfPreparationPhase = "prepare" | "assets+diagrams";
 export type PdfPreparationProgress = { phase: PdfPreparationPhase; completed: number; total: number };
-export type PreparePdfOptions = {
+export type PreparePdfOptions = RemoteImageConsentPolicy & {
   signal?: AbortSignal;
   onProgress?: (progress: PdfPreparationProgress) => void;
-  trustedImageHosts?: readonly string[];
 };
 
 function cancelledError(): Error {
@@ -293,8 +278,9 @@ function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export async function preparePdf(markdown: string, documentPath: string | null, python = "embedded", options: PreparePdfOptions = {}) {
   let generation = 1;
   const ownerGeneration = generation;
-  const { signal, trustedImageHosts } = options;
-  const trustedHosts = new Set((trustedImageHosts ?? []).map(host => host.trim().toLowerCase()).filter(Boolean));
+  const { signal, trustedImageHosts, approvedImageUrls, loadedImageData } = options;
+  const trustedHosts = normalizeTrustedImageHosts(trustedImageHosts);
+  const approvedUrls = normalizeApprovedImageUrls(approvedImageUrls);
   const invalidate = () => { generation++; };
   signal?.addEventListener("abort", invalidate, { once: true });
   const checkCurrent = () => {
@@ -333,7 +319,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
             const source = step.image
               ? processor.stringify({type:"root",children:[{type:"paragraph",children:[{type:"image",url:step.image,alt:step.alt||step.label}]}]} as any)
               : "```" + (step.diagram ? "svg\n" + stepDiagramSvg(step.diagram) : "smd-chart\n" + step.chart) + "\n```";
-            const prepared = await preparePdf(source, documentPath, python, { signal, trustedImageHosts });
+            const prepared = await preparePdf(source, documentPath, python, { signal, trustedImageHosts, approvedImageUrls, loadedImageData });
             checkCurrent();
             const names = new Map<string,string>();
             for (const [name, body] of Object.entries(prepared.assets)) {
@@ -345,7 +331,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
           }
           let markdown: string|undefined;
           if(step.markdown){
-            const prepared=await preparePdf(step.markdown,documentPath,python,{signal,trustedImageHosts});checkCurrent();
+            const prepared=await preparePdf(step.markdown,documentPath,python,{signal,trustedImageHosts,approvedImageUrls,loadedImageData});checkCurrent();
             markdown=prepared.content;
             for(const [name,body] of Object.entries(prepared.assets)){
               const renamed=`step-${++count}-${name}`;assets[renamed]=body;
@@ -379,12 +365,10 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
         if (/^data:/i.test(rawUrl)) {
           if (!/^data:image\//i.test(rawUrl)) throw new Error("Unsupported PDF image type.");
         } else if (/^https?:\/\//i.test(rawUrl)) {
-          preloadedHtmlData = loadedReaderImageData(rawUrl);
-          if (!preloadedHtmlData) {
+          preloadedHtmlData = loadedReaderImageData(rawUrl, loadedImageData, trustedHosts, approvedUrls);
+          if (!preloadedHtmlData && !isRemoteImageApproved(rawUrl, trustedHosts, approvedUrls)) {
             const host = remoteImageHost(rawUrl);
-            if (!host || !trustedHosts.has(host)) {
-              throw new Error(`Remote image from ${host || rawUrl} requires explicit consent in the reader before exporting PDF.`);
-            }
+            throw new Error(`Remote image from ${host || rawUrl} requires explicit consent in the reader before exporting PDF.`);
           }
         } else if (rawUrl.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(rawUrl)) {
           throw new Error(`Remote image ${rawUrl} requires explicit consent in the reader before exporting PDF.`);
@@ -395,11 +379,9 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
         let url: string = preloadedHtmlData ?? node.url;
         if (!/^data:/i.test(url)) {
           if (fromHtmlImg ? /^https?:\/\//i.test(url) : /^https?:/i.test(url)) {
-            if (fromHtmlImg) {
+            if (fromHtmlImg && !isRemoteImageApproved(url, trustedHosts, approvedUrls)) {
               const host = remoteImageHost(url);
-              if (!host || !trustedHosts.has(host)) {
-                throw new Error(`Remote image from ${host || url} requires explicit consent in the reader before exporting PDF.`);
-              }
+              throw new Error(`Remote image from ${host || url} requires explicit consent in the reader before exporting PDF.`);
             }
             const fetched = await invoke<{ body: string }>("fetch_resource", { url, image: true });
             checkCurrent();

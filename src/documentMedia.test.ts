@@ -1,10 +1,17 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 const { native } = vi.hoisted(() => ({ native: vi.fn() }));
 vi.mock("./nativeBridge", () => ({ invoke: native }));
 import { imageMarkdown, imageRanges, linkDetails, prepareFmd, youtubeUrl } from "./documentMedia";
+import { registerMedia } from "./mediaExport";
 import { readRecent, rememberFile } from "./recentFiles";
 import { svgImage } from "./svgImage";
+
+afterEach(() => {
+  document.body.innerHTML = "";
+  vi.restoreAllMocks();
+  native.mockReset();
+});
 
 describe("portable media", () => {
   it("finds distinct editable image ranges after Obsidian math, excluding code", () => {
@@ -67,6 +74,201 @@ describe("portable media", () => {
   it("renders vector images and rejects active SVG", () => {
     expect(svgImage('<svg><path d="M0 0L10 10"/></svg>')).toContain('xmlns="http://www.w3.org/2000/svg"');
     for (const svg of ['<svg><script>alert(1)</script></svg>', '<svg onload="x()"/>', '<svg><image href="https://evil.test/x.png"/></svg>', '<svg><foreignObject/></svg>', '<svg>']) expect(() => svgImage(svg)).toThrow();
+  });
+
+  it("preserves unapproved remote URLs in prose and unvisited nested slides without network calls while packing local images", async () => {
+    const png = "data:image/png;base64,aGVsbG8=";
+    const svg = "data:image/svg+xml;base64,PHN2Zy8+";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected global fetch"));
+    native.mockImplementation(async (command: string, args: any) => {
+      if (command === "load_asset") return String(args.source).endsWith(".svg") ? svg : png;
+      if (command === "fetch_resource") throw new Error(`unexpected fetch_resource: ${args?.url}`);
+      return null;
+    });
+
+    // An unapproved .remote-image-card placeholder in the reader DOM must never grant consent.
+    const blockedCard = document.createElement("span");
+    blockedCard.className = "remote-image-card";
+    blockedCard.dataset.noteImageSource = "https://untrusted.example/prose.png";
+    document.body.append(blockedCard);
+
+    const deck = {
+      title: "Study sequence",
+      steps: [
+        {
+          label: "Slide 1 (visited)",
+          image: "./slide-local.png",
+          markdown: "Local ![Sub](./nested-local.svg) and unapproved ![Blocked](https://untrusted.example/slide1-md.png)",
+        },
+        { label: "Slide 2 (unvisited)", markdown: "Unvisited ![S2](https://untrusted.example/unvisited-2.png)" },
+        { label: "Slide 3 (unvisited)", description: "Plain text" },
+        { label: "Slide 4 (unvisited)", image: "https://untrusted.example/unvisited-4.png" },
+        {
+          label: "Slide 5 (unvisited)",
+          image: "https://user:pass@trusted.example/credentialed-slide.png",
+          markdown: "![[https://untrusted.example/unvisited-wiki.png|Slide Wiki]]",
+        },
+      ],
+    };
+    const md = [
+      "# Note",
+      "",
+      "![Local](./diagram.png)",
+      "",
+      "![Local Ref][ref-local]",
+      "",
+      "[ref-local]: ./local-ref.svg \"Local Title\"",
+      "",
+      "![[local-wiki.png|Local Wiki]]",
+      "",
+      "![Unapproved](https://untrusted.example/prose.png \"Remote Title\")",
+      "",
+      "![Remote Ref][ref-remote]",
+      "",
+      "[ref-remote]: https://untrusted.example/ref.png \"Keep Remote\"",
+      "",
+      "![[https://untrusted.example/wiki.png|Remote Wiki]]",
+      "",
+      "![Upper](HTTPS://untrusted.example/upper.png)",
+      "",
+      "![Proto](//untrusted.example/protocol-relative.png)",
+      "",
+      "![Cred](https://user:pass@trusted.example/cred.png)",
+      "",
+      '<img src="https://untrusted.example/raw-html.png" width="200">',
+      "",
+      "```smd-steps",
+      JSON.stringify(deck, null, 2),
+      "```",
+      "",
+    ].join("\n");
+
+    const result = await prepareFmd(md, "/notes/study.smd", { trustedImageHosts: ["trusted.example"] });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(native).not.toHaveBeenCalledWith("fetch_resource", expect.anything());
+    const loadedSources = native.mock.calls.filter(([cmd]) => cmd === "load_asset").map(([, args]) => args.source);
+    expect(loadedSources.sort()).toEqual([
+      "./diagram.png",
+      "./local-ref.svg",
+      "./nested-local.svg",
+      "./slide-local.png",
+      "local-wiki.png",
+    ]);
+    expect(Object.keys(result.assets)).toHaveLength(5);
+
+    // Unapproved prose URLs stay intact.
+    expect(result.content).toContain('![Unapproved](https://untrusted.example/prose.png "Remote Title")');
+    expect(result.content).toContain('[ref-remote]: https://untrusted.example/ref.png "Keep Remote"');
+    expect(result.content).toContain("![[https://untrusted.example/wiki.png|Remote Wiki]]");
+    expect(result.content).toContain("![Upper](HTTPS://untrusted.example/upper.png)");
+    expect(result.content).toContain("![Proto](//untrusted.example/protocol-relative.png)");
+    expect(result.content).toContain("![Cred](https://user:pass@trusted.example/cred.png)");
+    expect(result.content).toContain('<img src="https://untrusted.example/raw-html.png" width="200">');
+
+    // Unvisited nested slide remote URLs stay intact while local nested images pack.
+    const packedDeck = JSON.parse(/```smd-steps\n([\s\S]*?)\n```/.exec(result.content)![1]);
+    expect(packedDeck.steps[0].image).toMatch(/^assets\/image-.*\.png$/);
+    expect(packedDeck.steps[0].markdown).toMatch(/!\[Sub\]\(<assets\/image-.*\.svg>\)/);
+    expect(packedDeck.steps[0].markdown).toContain("![Blocked](https://untrusted.example/slide1-md.png)");
+    expect(packedDeck.steps[1].markdown).toBe("Unvisited ![S2](https://untrusted.example/unvisited-2.png)");
+    expect(packedDeck.steps[3].image).toBe("https://untrusted.example/unvisited-4.png");
+    expect(packedDeck.steps[4].image).toBe("https://user:pass@trusted.example/credentialed-slide.png");
+    expect(packedDeck.steps[4].markdown).toBe("![[https://untrusted.example/unvisited-wiki.png|Slide Wiki]]");
+  });
+
+  it("packs approved remote images from note consent and trusted hosts, including unvisited nested slides, while reusing loaded reader data offline", async () => {
+    const domPng = "data:image/png;base64,ZG9tLWxvYWRlZA==";
+    const cachedPng = "data:image/png;base64,Y2FjaGVkLW5vdGU=";
+    const remotePng = "data:image/png;base64,cmVtb3RlLXBuZw==";
+    const remoteSvg = "data:image/svg+xml;base64,PHN2Zy8+";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected global fetch"));
+    native.mockImplementation(async (command: string, args: any) => {
+      if (command === "fetch_resource") {
+        return { body: String(args.url).endsWith(".svg") ? remoteSvg : remotePng };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    });
+
+    // Mounted [data-note-image-source] with registered media simulates an image already loaded in the reader.
+    const loadedSpan = document.createElement("span");
+    loadedSpan.className = "note-image";
+    loadedSpan.dataset.noteImageSource = "https://once.example/dom-approved.png";
+    const loadedImg = document.createElement("img");
+    loadedSpan.append(loadedImg);
+    document.body.append(loadedSpan);
+    const unregister = registerMedia(loadedImg, { label: "DOM Approved", uri: () => domPng });
+
+    try {
+      const deck = {
+        title: "Mixed consent deck",
+        steps: [
+          { label: "Visited", image: "https://once.example/dom-approved.png" },
+          { label: "Unvisited 2", description: "Notes" },
+          { label: "Unvisited 3", description: "Notes" },
+          {
+            label: "Unvisited 4",
+            image: "https://cdn.example/unvisited-approved.png",
+            markdown: "Approved ![Diagram](https://cdn.example/unvisited-nested.svg) and unapproved ![Other](https://once.example/unapproved-sibling.png)",
+          },
+        ],
+      };
+      const md = [
+        "![DOM](https://once.example/dom-approved.png)",
+        "",
+        "![Cached](https://once.example/cached-note.png)",
+        "",
+        "![Explicit Note URL](https://note-only.example/one.png)",
+        "",
+        "![Sibling On Same Host](https://note-only.example/two.png)",
+        "",
+        "```smd-steps",
+        JSON.stringify(deck, null, 2),
+        "```",
+      ].join("\n");
+
+      const result = await prepareFmd(md, "/notes/approved.smd", {
+        trustedImageHosts: ["CDN.EXAMPLE"],
+        approvedImageUrls: ["https://once.example/cached-note.png", "https://note-only.example/one.png"],
+        loadedImageData: {
+          "https://once.example/cached-note.png": cachedPng,
+          "https://note-only.example/two.png": cachedPng,
+        },
+      });
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+      const fetchedUrls = native.mock.calls.filter(([cmd]) => cmd === "fetch_resource").map(([, args]) => args.url);
+      // DOM-loaded and note-cached images reuse memory (zero network calls); unapproved siblings never fetch.
+      expect(fetchedUrls.sort()).toEqual([
+        "https://cdn.example/unvisited-approved.png",
+        "https://cdn.example/unvisited-nested.svg",
+        "https://note-only.example/one.png",
+      ]);
+
+      expect(Object.values(result.assets)).toEqual(expect.arrayContaining([domPng, cachedPng, remotePng, remoteSvg]));
+      expect(result.content).toContain("![Sibling On Same Host](https://note-only.example/two.png)");
+      expect(result.content).not.toContain("https://once.example/dom-approved.png");
+      expect(result.content).not.toContain("https://once.example/cached-note.png");
+      expect(result.content).not.toContain("https://note-only.example/one.png");
+
+      const packedDeck = JSON.parse(/```smd-steps\n([\s\S]*?)\n```/.exec(result.content)![1]);
+      expect(packedDeck.steps[0].image).toMatch(/^assets\/image-.*\.png$/);
+      expect(packedDeck.steps[3].image).toMatch(/^assets\/image-.*\.png$/);
+      expect(packedDeck.steps[3].markdown).toMatch(/!\[Diagram\]\(<assets\/image-.*\.svg>\)/);
+      expect(packedDeck.steps[3].markdown).toContain("![Other](https://once.example/unapproved-sibling.png)");
+    } finally {
+      unregister();
+    }
+  });
+
+  it("keeps smd-steps source byte-for-byte intact and avoids network calls when saving unapproved remote slides in place", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected global fetch"));
+    const md = '# Deck\n\n```smd-steps\n{\n  "title": "Unapproved",\n  "steps": [\n    { "label": "One", "image": "https://untrusted.example/s1.png" },\n    { "label": "Two", "markdown": "![Two](https://untrusted.example/s2.png)" }\n  ]\n}\n```\n';
+    const result = await prepareFmd(md, "/notes/inplace.smd");
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(native).not.toHaveBeenCalled();
+    expect(result.content).toBe(md);
+    expect(result.assets).toEqual({});
   });
 });
 describe("recent files", () => {

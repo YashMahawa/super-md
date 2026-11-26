@@ -7,12 +7,15 @@ const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("../nativeBridge", () => ({ invoke }));
 import MarkdownPreview from "./MarkdownPreview";
 import { DocumentAppearance } from "../documentAppearance";
+import { prepareFmd } from "../documentMedia";
+import { NoteRemoteImageConsentStore } from "../remoteImageConsent";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 let root: Root | null = null;
 afterEach(() => {
   if (root) { act(() => root?.unmount()); root = null; }
   document.body.innerHTML = "";
+  vi.restoreAllMocks();
   invoke.mockReset();
 });
 
@@ -146,6 +149,105 @@ describe("MarkdownPreview streamed local assets", () => {
       root?.render(<MarkdownPreview markdown="![Remote](https://images.example/a.png)" documentPath="/notes/a.md" python="" dark trustedImageHosts={["images.example"]} />);
     });
     expect(invoke).toHaveBeenCalledWith("fetch_resource", { url: "https://images.example/a.png", image: true });
+  });
+
+  it("reuses reader-loaded remote consent offline and skips unvisited nested slides on in-place portable save", async () => {
+    const localSvg = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=";
+    const remotePng = "data:image/png;base64,iVBORw0KGgo=";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected global fetch"));
+    invoke.mockImplementation(async (command: string, args: any) => {
+      if (command === "load_asset") return localSvg;
+      if (command === "fetch_resource") return { body: remotePng };
+      return undefined;
+    });
+
+    const deck = {
+      title: "Nested study deck",
+      steps: [
+        {
+          label: "Step 1",
+          image: "https://once.example/slide0.png",
+          markdown: "Approved ![Inline](https://once.example/slide0-md.png)",
+        },
+        { label: "Step 2", markdown: "Unvisited ![S2](https://blocked.example/slide1-md.png)" },
+        { label: "Step 3", image: "https://blocked.example/slide2-nearby.png" },
+        { label: "Step 4", description: "Plain" },
+        {
+          label: "Step 5",
+          image: "https://blocked.example/slide4-unvisited.png",
+          markdown: "Deep unvisited ![S5](https://blocked.example/slide4-md.png)",
+        },
+      ],
+    };
+    const markdown = [
+      "![Local](images/local.svg)",
+      "",
+      "![Blocked Prose](https://blocked.example/prose.png)",
+      "",
+      "```smd-steps",
+      JSON.stringify(deck, null, 2),
+      "```",
+    ].join("\n");
+
+    const consentStore = new NoteRemoteImageConsentStore();
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const renderWithPolicy = async () => {
+      await act(async () => {
+        root?.render(
+          <MarkdownPreview
+            markdown={markdown}
+            documentPath="/notes/study.smd"
+            python=""
+            dark
+            approvedImageUrls={consentStore.approvedUrls("tab-1")}
+            onApproveImageUrl={(url) => consentStore.approve("tab-1", url)}
+            onRemoteImageLoaded={(url, data) => consentStore.recordLoaded("tab-1", url, data)}
+          />,
+        );
+      });
+    };
+    await renderWithPolicy();
+
+    // Unvisited Slide 5 is not even mounted; Slide 1's two remote cards are blocked until approved.
+    expect(invoke).not.toHaveBeenCalledWith("fetch_resource", expect.anything());
+    expect(host.querySelector('[data-note-image-source="https://blocked.example/slide4-unvisited.png"]')).toBeNull();
+
+    // Approve only Slide 1's figure and Slide 1's nested markdown image.
+    const approveSource = async (source: string) => {
+      const button = host.querySelector<HTMLButtonElement>(`.remote-image-card[data-note-image-source="${source}"] .remote-image-actions button`);
+      expect(button).not.toBeNull();
+      await act(async () => button?.click());
+    };
+    await approveSource("https://once.example/slide0.png");
+    await approveSource("https://once.example/slide0-md.png");
+
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "fetch_resource").map(([, args]) => args.url).sort()).toEqual([
+      "https://once.example/slide0-md.png",
+      "https://once.example/slide0.png",
+    ]);
+
+    // Simulate switching to Source mode (unmounting preview) and saving the portable note in place:
+    // approved images pack from cached reader data with zero network calls, and unapproved/unvisited URLs stay intact.
+    act(() => { root?.unmount(); root = null; });
+    invoke.mockClear();
+
+    const saved = await prepareFmd(markdown, "/notes/study.smd", consentStore.policy("tab-1", []));
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalledWith("fetch_resource", expect.anything());
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("load_asset", { documentPath: "/notes/study.smd", source: "images/local.svg" });
+
+    expect(Object.keys(saved.assets)).toHaveLength(3);
+    expect(saved.content).toContain("![Blocked Prose](https://blocked.example/prose.png)");
+    const savedDeck = JSON.parse(/```smd-steps\n([\s\S]*?)\n```/.exec(saved.content)![1]);
+    expect(savedDeck.steps[0].image).toMatch(/^assets\/image-.*\.png$/);
+    expect(savedDeck.steps[0].markdown).toMatch(/!\[Inline\]\(<assets\/image-.*\.png>\)/);
+    expect(savedDeck.steps[1].markdown).toBe("Unvisited ![S2](https://blocked.example/slide1-md.png)");
+    expect(savedDeck.steps[2].image).toBe("https://blocked.example/slide2-nearby.png");
+    expect(savedDeck.steps[4].image).toBe("https://blocked.example/slide4-unvisited.png");
+    expect(savedDeck.steps[4].markdown).toBe("Deep unvisited ![S5](https://blocked.example/slide4-md.png)");
   });
 
   it("passes whole-document duplicate ordinals and interpreter context to runs", async () => {
