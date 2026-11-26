@@ -65,6 +65,7 @@ export function remarkCallouts() {
     const match = first.value.match(/^\[!([\w-]+)\]([+-]?)[ \t]*/i);
     if (!match) return;
     const type = match[1].toLowerCase();
+    const fold = match[2];
     first.value = first.value.slice(match[0].length);
     // A title is a line of inline Markdown, not just the first text node.
     // Keep emphasis, links and math in their original AST form and split only
@@ -87,14 +88,15 @@ export function remarkCallouts() {
     const parts=split(paragraph.children);
     paragraph.children=parts.body;
     if(!paragraph.children.length)node.children.shift();
-    const title=parts.title.some((child:any)=>child.type!=='text'||child.value.trim())?parts.title:[{type:'text',value:type[0].toUpperCase()+type.slice(1)}];
-    const collapsible = Boolean(match[2]) || type === "answer" || type === "solution";
+    const hasCustomTitle=parts.title.some((child:any)=>child.type!=='text'||child.value.trim());
+    const title=hasCustomTitle?parts.title:[{type:'text',value:type[0].toUpperCase()+type.slice(1)}];
+    const collapsible = Boolean(fold) || type === "answer" || type === "solution";
     node.children.unshift({
       type: "paragraph",
       data: { hName: collapsible ? "summary" : "p", hProperties: { className: "callout-title" } },
       children: title
     });
-    node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:match[2] === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type } };
+    node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:fold === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type, ...(fold ? {"data-callout-fold": fold} : {}), ...(!hasCustomTitle ? {"data-callout-default-title": "true"} : {}) } };
   });
 }
 
