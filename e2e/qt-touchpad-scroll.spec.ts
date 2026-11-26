@@ -307,3 +307,155 @@ test('routes inline and fullscreen study step-cards regions and preserves note z
   await expect.poll(() => page.locator('.document-page').evaluate(el => Number((el as HTMLElement).dataset.scale))).toBeLessThan(scaleBeforeStudyZoom - 0.15);
   expect(await inlineNotes.evaluate(el => el.scrollTop)).toBe(0);
 });
+
+test('preserves shared source anchors across Split, Source, Live, and tab switches after nested touchpad wheel routing', async ({ page }) => {
+  const intro = Array.from(
+    { length: 6 },
+    (_, i) => `## Intro Section ${i + 1}\n\n` + `Introductory background prose for section ${i + 1} before the nested code anchor. `.repeat(6),
+  ).join('\n\n');
+  const tallPython = Array.from({ length: 44 }, (_, i) => `step_metric_${i} = ${i} * 5  # ${'nested_split_anchor_'.repeat(8)}`).join('\n');
+  const outro = Array.from(
+    { length: 10 },
+    (_, i) => `## Followup Section ${i + 1}\n\n` + `Subsequent verification prose for section ${i + 1} below the target anchor. `.repeat(6),
+  ).join('\n\n');
+  const noteA = [
+    '# Split Nested Touchpad Anchor Note',
+    '',
+    '```python {.run}',
+    tallPython,
+    '```',
+    '',
+    intro,
+    '',
+    '## Target Anchor After Nested Chaining',
+    '',
+    '- [ ] Deep split touchpad anchor item ready for Source and Live handoff',
+    '',
+    outro,
+  ].join('\n');
+  const noteB = '# Secondary Scratch Tab\n\n' + 'Short scratch paragraph.\n\n'.repeat(25);
+
+  await loadQtNote(page, noteA, { id: 'split-wheel-tab-a', mode: 'split', restorePosition: true, motion: false });
+  await page.setViewportSize({ width: 1280, height: 820 });
+
+  const reading = page.locator('.android-reading');
+  const cmScroller = page.locator('.cm-scroller');
+  const pySource = page.locator('.android-reading .python-cell .python-source').first();
+  await expect(cmScroller).toBeVisible();
+  await expect(pySource).toBeVisible();
+
+  // 1. In Split preview, touchpad wheel inside .python-source scrolls inner code first, then chains past its bottom boundary to .android-reading.
+  const pyPoint = await centerOf(pySource);
+  await page.evaluate(point => window.supermdNativeWheel?.(45, 60, point, false), pyPoint);
+  await expect.poll(() => pySource.evaluate(el => el.scrollTop)).toBeGreaterThan(40);
+  await expect.poll(() => pySource.evaluate(el => el.scrollLeft)).toBeGreaterThan(30);
+  expect(await reading.evaluate(el => el.scrollTop)).toBe(0);
+
+  const remPyTop = await pySource.evaluate(el => el.scrollHeight - el.clientHeight - el.scrollTop);
+  const targetHeading = page.locator('.android-reading h2', { hasText: 'Target Anchor After Nested Chaining' });
+  const deltaToTarget = await targetHeading.evaluate((el, root) => {
+    const rRect = (root as HTMLElement).getBoundingClientRect();
+    const eRect = el.getBoundingClientRect();
+    return Math.max(200, Math.round(eRect.top - rRect.top - 32));
+  }, await reading.elementHandle());
+
+  const freshPyPoint = await centerOf(pySource);
+  await page.evaluate(
+    ({ point, dy }) => window.supermdNativeWheel?.(0, dy, point, false),
+    { point: freshPyPoint, dy: remPyTop + deltaToTarget },
+  );
+  await expect.poll(() => reading.evaluate(el => el.scrollTop)).toBeGreaterThan(600);
+  await expect
+    .poll(async () => {
+      const [hBox, rBox] = await Promise.all([targetHeading.boundingBox(), reading.boundingBox()]);
+      return Boolean(hBox && rBox && hBox.y >= rBox.y - 20 && hBox.y < rBox.y + rBox.height - 20);
+    })
+    .toBe(true);
+
+  // 2. Transition Split -> Source: because nativeWheel recorded splitPane='preview', Source aligns to Target Anchor After Nested Chaining!
+  await page.evaluate(content => {
+    window.supermdLoad?.({
+      id: 'split-wheel-tab-a',
+      content,
+      path: null,
+      mode: 'editor',
+      dark: false,
+      fullscreen: false,
+      centerLock: true,
+      colors: {},
+      font: 'Manrope',
+      size: 16,
+      zoom: 100,
+      widthPercent: 80,
+      motion: false,
+    });
+  }, noteA);
+  const targetLineInEditor = page.locator('.cm-line', { hasText: 'Target Anchor After Nested Chaining' });
+  await expect
+    .poll(async () => {
+      const [lBox, cBox] = await Promise.all([targetLineInEditor.boundingBox(), cmScroller.boundingBox()]);
+      return Boolean(lBox && cBox && lBox.y + lBox.height > cBox.y && lBox.y < cBox.y + cBox.height);
+    })
+    .toBe(true);
+
+  // 3. Switch to Tab B, switch global mode to Live on Tab B, then switch back to Tab A in Live -> shared anchor is preserved!
+  await page.evaluate(content => {
+    window.supermdLoad?.({
+      id: 'split-wheel-tab-b',
+      content,
+      path: null,
+      mode: 'editor',
+      dark: false,
+      fullscreen: false,
+      centerLock: true,
+      colors: {},
+      font: 'Manrope',
+      size: 16,
+      zoom: 100,
+      widthPercent: 80,
+      motion: false,
+    });
+  }, noteB);
+  await page.evaluate(content => {
+    window.supermdLoad?.({
+      id: 'split-wheel-tab-b',
+      content,
+      path: null,
+      mode: 'live',
+      dark: false,
+      fullscreen: false,
+      centerLock: true,
+      colors: {},
+      font: 'Manrope',
+      size: 16,
+      zoom: 100,
+      widthPercent: 80,
+      motion: false,
+    });
+  }, noteB);
+  await page.evaluate(content => {
+    window.supermdLoad?.({
+      id: 'split-wheel-tab-a',
+      content,
+      path: null,
+      mode: 'live',
+      dark: false,
+      fullscreen: false,
+      centerLock: true,
+      colors: {},
+      font: 'Manrope',
+      size: 16,
+      zoom: 100,
+      widthPercent: 80,
+      motion: false,
+    });
+  }, noteA);
+
+  const targetInLive = page.locator('.live-document h2', { hasText: 'Target Anchor After Nested Chaining' });
+  await expect
+    .poll(async () => {
+      const [lBox, rBox] = await Promise.all([targetInLive.boundingBox(), reading.boundingBox()]);
+      return Boolean(lBox && rBox && lBox.y + lBox.height > rBox.y && lBox.y < rBox.y + rBox.height);
+    })
+    .toBe(true);
+});
