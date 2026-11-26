@@ -16,6 +16,7 @@ from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
+import folder_ops
 from studio import Session
 from test_studio import QuietStudio
 
@@ -55,6 +56,8 @@ ApplicationWindow {{
     property bool sidebar: true
     property string sidebarSection: "folder"
     property bool chromeAwake: true
+    property int contextMenuCount: 0
+    property int modalDialogCount: 0
     property int viewStateEvaluations: 0
     property int sidebarStateEvaluations: 0
     onViewStateChanged: viewStateEvaluations += 1
@@ -89,8 +92,9 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.session = Session(True)
         self.session.settings.update(theme="dark", accent="blue", motion=False, welcomed=True, autosave=False)
         self.studio = QuietStudio(True, self.session)
-        self.workspace = self.studio.data / "NotesWorkspace"
-        (self.workspace / "Coursework").mkdir(parents=True)
+        raw_workspace = self.studio.data / "NotesWorkspace"
+        (raw_workspace / "Coursework").mkdir(parents=True)
+        self.workspace = Path(folder_ops.canonical_path_str(raw_workspace))
         (self.workspace / "Coursework" / "Week 1.md").write_text("# Week 1\n\nLinear systems", encoding="utf-8")
         (self.workspace / "Overview.md").write_text("# Overview\n\nSummary", encoding="utf-8")
         (self.workspace / "Reading.md").write_text("# Reading\n\nChapter 2", encoding="utf-8")
@@ -210,12 +214,19 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         )
         self.wait_until(lambda: len(self._qml_dict("sidebarState")["outline"]) == 2)
 
+        folder_sidebar = self.named("folderSidebar")
         files_view = self.named("folderFilesView")
         outline_list = self.named("sidebarOutlineList")
         recent_notes = self.named("sidebarRecentNotes")
+        self.assertIsNotNone(folder_sidebar)
+        self.assertTrue(folder_sidebar.metaObject().className().startswith("FolderSidebar_QMLTYPE"))
         self.assertIsNotNone(files_view)
         self.assertIsNotNone(outline_list)
         self.assertIsNotNone(recent_notes)
+        self.assertEqual(
+            files_view.property("model").toVariant() if hasattr(files_view.property("model"), "toVariant") else files_view.property("model"),
+            self._qml_dict("sidebarState")["files"],
+        )
 
         self.wait_until(
             lambda: len(self._list_delegates(files_view)) == 3
@@ -251,10 +262,9 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         sidebar_evals_before = self.window.property("sidebarStateEvaluations")
         view_evals_before = self.window.property("viewStateEvaluations")
 
-        # Trigger unrelated global studio.changed events: zoom, status message, busy, overlay, settings, body edit.
+        # Trigger unrelated global studio.changed events: zoom, status message, notifyMessage, busy, overlay, settings, body edit.
         self.studio.setZoom(135)
-        self.studio.message = "Exported preview"
-        self.studio._emit(False)
+        self.studio.notifyMessage("Exported preview")
         self.studio.busy = 1
         self.studio._emit(False)
         self.studio.busy = 0
@@ -284,9 +294,12 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.assertIs(self.studio._recent_slice_cache, recent_cache_before)
         self.assertIs(self.studio._pinned_slice_cache, pinned_cache_before)
 
-        # Delegate instances in folderFilesView and RecentNotes were never destroyed/recreated.
+        # Delegate instances in folderFilesView, RecentNotes, and OutlineList were never destroyed/recreated.
         self.assertEqual(self._list_delegates(files_view), initial_file_delegates)
         self.assertEqual(self._list_delegates(recent_notes), initial_recent_delegates)
+        self.window.setProperty("sidebarSection", "contents")
+        self.assertEqual(self._list_delegates(outline_list), initial_outline_delegates)
+        self.window.setProperty("sidebarSection", "folder")
 
         snap = json.loads(self.studio.snapshot)
         self.assertEqual(snap["zoom"], 135)
@@ -363,9 +376,12 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             json.dumps({"id": untitled_id, "content": "# Draft Plan\n\nSaved content"}),
         )
         self.studio.saveAs(str(saved_draft))
-        self.wait_until(lambda: str(saved_draft) in self.studio.recent and saved_draft.is_file())
+        self.wait_until(
+            lambda: saved_draft.is_file()
+            and any(folder_ops.same_path(p, saved_draft) for p in self.studio.recent)
+        )
         QTest.qWait(30)
-        self.assertEqual(self._qml_dict("sidebarState")["recent"][0], str(saved_draft))
+        self.assertTrue(folder_ops.same_path(self._qml_dict("sidebarState")["recent"][0], saved_draft))
         self.assertFalse(any(t["id"] == untitled_id and t["dirty"] for t in self._qml_dict("viewState")["tabs"]))
 
         # Renaming a saved note updates tabs, recent notes, and folder file listing.
@@ -376,7 +392,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             and any(f["name"] == "Final Plan.md" for f in self.studio.files)
         )
         QTest.qWait(30)
-        self.assertEqual(self._qml_dict("sidebarState")["recent"][0], str(renamed_draft))
+        self.assertTrue(folder_ops.same_path(self._qml_dict("sidebarState")["recent"][0], renamed_draft))
         self.assertIn("Final Plan.md", [f["name"] for f in self._qml_dict("sidebarState")["files"]])
 
         # Closing and reopening the active tab preserves sidebar outline/active sync.
@@ -385,9 +401,9 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         QTest.qWait(30)
         self.assertNotEqual(self._qml_dict("sidebarState")["active"], untitled_id)
         self.studio.reopenTab()
-        self.wait_until(lambda: any(t["path"] == str(renamed_draft) for t in self.studio.tabs))
+        self.wait_until(lambda: any(folder_ops.same_path(t["path"], renamed_draft) for t in self.studio.tabs))
         QTest.qWait(30)
-        self.assertEqual(self.studio._current()["path"], str(renamed_draft))
+        self.assertTrue(folder_ops.same_path(self.studio._current()["path"], renamed_draft))
         self.assertEqual(self._qml_dict("sidebarState")["active"], self.studio.active)
 
         # Cross-window tab move updates both source and destination sidebar states.
@@ -544,13 +560,135 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         try:
             self.wait_until(lambda: any(f["name"] == "Week 2.md" for f in restored_studio.files))
             restored_sidebar = json.loads(restored_studio.sidebarSnapshot)
-            self.assertEqual(restored_sidebar["folder"], str(self.workspace.resolve()))
+            self.assertEqual(restored_sidebar["folder"], folder_ops.canonical_path_str(self.workspace))
             self.assertIn("Week 2.md", [f["name"] for f in restored_sidebar["files"]])
         finally:
             restored_studio.stop()
             restored_studio.pool.shutdown(wait=True)
             restored_studio._search_pool.shutdown(wait=True, cancel_futures=True)
             restored_session.writes.shutdown(wait=True)
+
+    def test_folder_sidebar_create_rename_filter_pinned_recent_and_contents_integration(self):
+        self.studio.openFolder(str(self.workspace))
+        self.wait_until(lambda: len(self.studio.files) == 3)
+
+        folder_sidebar = self.named("folderSidebar")
+        files_view = self.named("folderFilesView")
+        filter_field = self.named("folderFilterField")
+        outline_list = self.named("sidebarOutlineList")
+        popup_outline = self.named("popupOutlineList")
+        recent_notes = self.named("sidebarRecentNotes")
+        create_dialog = self.named("createFolderItemDialog")
+        create_field = self.named("createFolderItemField")
+        rename_dialog = self.named("renameEntryDialog")
+        rename_field = self.named("renameEntryField")
+
+        self.assertIsNotNone(folder_sidebar)
+        self.assertEqual(
+            [d.property("text") for d in self._list_delegates(files_view)],
+            ["▸ Coursework", "Overview.md", "Reading.md"],
+        )
+
+        # Create a new subfolder through FolderSidebar's real dialog & model.
+        folder_sidebar.openCreateDialog("folder", str(self.workspace))
+        self.wait_until(lambda: bool(create_dialog.property("visible")))
+        create_field.setProperty("text", "Labs")
+        create_dialog.accept()
+        labs_dir = self.workspace / "Labs"
+        self.wait_until(
+            lambda: labs_dir.is_dir()
+            and any(f["name"] == "Labs" and f["directory"] and f["expanded"] for f in self._qml_dict("sidebarState")["files"])
+        )
+        self.wait_until(lambda: "▾ Labs" in [d.property("text") for d in self._list_delegates(files_view)])
+
+        # Create a Markdown note inside the new subfolder through FolderSidebar's dialog.
+        folder_sidebar.openCreateDialog("md", str(labs_dir))
+        self.wait_until(lambda: bool(create_dialog.property("visible")))
+        create_field.setProperty("text", "1.2 Signals")
+        create_dialog.accept()
+        created_note = labs_dir / "1.2 Signals.md"
+        self.wait_until(
+            lambda: created_note.is_file()
+            and folder_ops.same_path(self.studio._current()["path"], created_note)
+            and any(f["name"] == "1.2 Signals.md" for f in self._qml_dict("sidebarState")["files"])
+        )
+        self.wait_until(
+            lambda: "▾ Labs" in [d.property("text") for d in self._list_delegates(files_view)]
+            and "1.2 Signals.md" in [d.property("text") for d in self._list_delegates(files_view)]
+            and len(self._list_delegates(recent_notes)) >= 1
+        )
+
+        # Populate Contents outline for the created note and pin it in Recent.
+        created_id = self.studio.active
+        self.studio.post(
+            "out-signals",
+            "document_outline",
+            json.dumps({
+                "id": created_id,
+                "headings": [
+                    {"title": "1.2 Signals", "level": 1, "offset": 0},
+                    {"title": "Fourier Transform", "level": 2, "offset": 18},
+                ],
+            }),
+        )
+        self.studio.pinRecent(str(created_note))
+        self.wait_until(
+            lambda: len(self._qml_dict("sidebarState")["outline"]) == 2
+            and self._qml_dict("sidebarState")["pinned"] == [str(created_note)]
+        )
+        outline_cache_before_rename = self.studio._outline_slice_cache
+
+        # Rename the pinned note via FolderSidebar's rename dialog; outline cache stays valid while files/pinned/recent update.
+        folder_sidebar.openRenameFor(str(created_note), "1.2 Signals.md", False)
+        self.wait_until(lambda: bool(rename_dialog.property("visible")))
+        rename_field.setProperty("text", "1.3 Systems")
+        rename_dialog.accept()
+        renamed_note = labs_dir / "1.3 Systems.md"
+        self.wait_until(
+            lambda: renamed_note.is_file()
+            and self._qml_dict("sidebarState")["pinned"] == [str(renamed_note)]
+            and any(f["name"] == "1.3 Systems.md" for f in self._qml_dict("sidebarState")["files"])
+        )
+        self.wait_until(lambda: "1.3 Systems.md" in [d.property("text") for d in self._list_delegates(files_view)])
+        self.assertIs(self.studio._outline_slice_cache, outline_cache_before_rename)
+
+        # Filter in FolderSidebar, then rename the parent subfolder and verify filtered FolderSidebar delegates & pinned Recent remap.
+        filter_field.setProperty("text", "systems")
+        self.wait_until(
+            lambda: not self.studio._folder_searching
+            and not self.studio.filter_timer.isActive()
+            and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["Labs", "1.3 Systems.md"]
+        )
+        self.wait_until(
+            lambda: [d.property("text") for d in self._list_delegates(files_view)] == ["▾ Labs", "1.3 Systems.md"]
+        )
+
+        folder_sidebar.openRenameFor(str(labs_dir), "Labs", True)
+        self.wait_until(lambda: bool(rename_dialog.property("visible")))
+        rename_field.setProperty("text", "ProblemSets")
+        rename_dialog.accept()
+        renamed_dir = self.workspace / "ProblemSets"
+        remapped_note = renamed_dir / "1.3 Systems.md"
+        self.wait_until(
+            lambda: remapped_note.is_file()
+            and not self.studio._folder_searching
+            and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["ProblemSets", "1.3 Systems.md"]
+            and self._qml_dict("sidebarState")["pinned"] == [str(remapped_note)]
+            and self._qml_dict("sidebarState")["recent"][0] == str(remapped_note)
+        )
+        self.wait_until(
+            lambda: [d.property("text") for d in self._list_delegates(files_view)] == ["▾ ProblemSets", "1.3 Systems.md"]
+        )
+
+        # Switch sidebar to Contents and verify OutlineList delegates and popupOutlineList retain headings & active noteId.
+        self.window.setProperty("sidebarSection", "contents")
+        self.wait_until(lambda: len(self._list_delegates(outline_list)) == 2)
+        self.assertEqual(outline_list.property("noteId"), created_id)
+        self.assertEqual(popup_outline.property("noteId"), created_id)
+        self.assertEqual(
+            [e["title"] for e in self._qml_dict("sidebarState")["outline"]],
+            ["1.2 Signals", "Fourier Transform"],
+        )
 
     def test_pre_outline_tabs_noop_outline_posts_pinned_rename_and_save_as_folder_refresh(self):
         # 1. Fresh/newly opened tabs without any document_outline key must not churn sidebarChanged on unrelated emits.
