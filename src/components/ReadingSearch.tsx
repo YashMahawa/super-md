@@ -239,9 +239,16 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!host) return;
     const initialBlock = findContainingBlock(host, range, sourceText);
     if (!initialBlock) {
-      syncSearchHighlights({ current: null });
+      const fmDomRange = resolveSourceHighlightRange(host, sourceText, ranges, targetIndex, query, filterOptions);
+      syncSearchHighlights({
+        all: scroll ? () => readingMatches(host, query, filterOptions) : undefined,
+        current: fmDomRange,
+      });
       if (scroll) {
-        const fallback = host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
+        const fmTarget = fmDomRange
+          ? (fmDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? fmDomRange.startContainer as Element : fmDomRange.startContainer.parentElement)
+          : null;
+        const fallback = fmTarget ?? host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
         scrollTargetIntoView(fallback, host);
       }
       return;

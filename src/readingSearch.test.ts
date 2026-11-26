@@ -100,20 +100,28 @@ describe("source search",()=>{
     expect(sourceMatches(content,")(?:",{regexp:true,wholeWord:true})).toEqual([]);
 
     const dom=document.createElement("article");
-    dom.innerHTML='<section data-frontmatter-properties class="document-properties"><div>cat item-00</div></section><p>cat category bobcat</p><p>item-12 and item-99</p>';
-    expect(readingMatches(dom,"cat",{wholeWord:true}).map(r=>r.toString())).toEqual(["cat"]);
+    dom.innerHTML='<section data-frontmatter-properties class="document-properties"><h1 data-frontmatter-field="title">Study Note</h1><dl><dt>Author</dt><dd data-frontmatter-field="author">Ada</dd><dt>Date</dt><dd>cat item-00</dd><dt>Tags</dt><dd><span data-frontmatter-field="tag">cat</span><span data-frontmatter-field="tag">dog</span></dd></dl></section><p>cat category bobcat</p><p>item-12 and item-99</p>';
+    expect(readingMatches(dom,"cat",{wholeWord:true}).map(r=>r.toString())).toEqual(["cat","cat"]);
+    expect(readingMatches(dom,"catdog")).toEqual([]);
+    expect(readingMatches(dom,"Author")).toEqual([]);
     expect(readingMatches(dom,"item-(\\d+)",{regexp:true}).map(r=>r.toString())).toEqual(["item-12","item-99"]);
     expect(readingMatches(dom,"[unclosed",{regexp:true})).toEqual([]);
 
     const windowedHost=document.createElement("div");
+    const fmHeader=document.createElement("section");
+    fmHeader.className="document-properties";
+    fmHeader.setAttribute("data-frontmatter-properties","");
+    fmHeader.innerHTML='<h1 data-frontmatter-field="title">cat study</h1><dl><dt>Author</dt><dd data-frontmatter-field="author">Ada</dd><dt>Date</dt><dd>cat-hidden item-00</dd><dt>Tags</dt><dd><span data-frontmatter-field="tag">tagA</span><span data-frontmatter-field="tag">tagB</span></dd></dl>';
     const blockA=document.createElement("section");
     blockA.setAttribute("data-windowed-block","");
-    windowedHost.append(blockA);
+    windowedHost.append(fmHeader,blockA);
     document.body.append(windowedHost);
     const unregister=registerWindowedText(blockA,"cat category item-42");
-    expect(windowedMatches(windowedHost,"cat",{wholeWord:true})).toEqual([{element:blockA,ordinal:0}]);
+    expect(windowedMatches(windowedHost,"cat",{wholeWord:true})).toEqual([{element:fmHeader,ordinal:0},{element:blockA,ordinal:0}]);
+    expect(windowedMatches(windowedHost,"tagAtagB")).toEqual([]);
+    expect(windowedMatches(windowedHost,"Author")).toEqual([]);
     expect(windowedMatches(windowedHost,"item-\\d+",{regexp:true})).toEqual([{element:blockA,ordinal:0}]);
-    expect(windowedMatches(windowedHost,"a*",{regexp:true})).toEqual([{element:blockA,ordinal:0},{element:blockA,ordinal:1}]);
+    expect(windowedMatches(blockA,"a*",{regexp:true})).toEqual([{element:blockA,ordinal:0},{element:blockA,ordinal:1}]);
     expect(windowedMatches(windowedHost,"*invalid",{regexp:true})).toEqual([]);
     unregister();
   });
@@ -150,9 +158,9 @@ describe("source search",()=>{
     expect(literalQuery.literal).toBe(true);
   });
 
-  it("keeps Read mode strictly immutable, maps body matches across YAML frontmatter, opens >12-line code disclosures, and yields Escape to modal overlays",async()=>{
+  it("keeps Read mode strictly immutable, includes displayed metadata in Find, maps body matches across YAML frontmatter, opens >12-line code disclosures, and yields Escape to modal overlays",async()=>{
     const codeLines=Array.from({length:14},(_,i)=>i===12?"const alpha = 42;":`const row_${i} = ${i};`).join("\n");
-    const initial=`---\ntitle: Alpha Study\n---\n\nBody Alpha paragraph.\n\n\`\`\`ts\n${codeLines}\n\`\`\``;
+    const initial=`---\ntitle: Alpha Study\ndescription: Hidden alpha summary\n---\n\nBody Alpha paragraph.\n\n\`\`\`ts\n${codeLines}\n\`\`\``;
     const onClose=vi.fn();
     let setReadMode!:(read:boolean)=>void;
     function ModeHarness(){
@@ -186,14 +194,18 @@ describe("source search",()=>{
     await act(async()=>{setNativeValue(searchInput,"alpha");});
     await flushFrames();
     const output=hostContainer.querySelector(".reading-search output")!;
-    // YAML frontmatter "Alpha Study" is excluded from rendered readingMatches; body + code block have 2 matches.
-    expect(output.textContent).toBe("0 / 2");
+    // Displayed title "Alpha Study" + body + code block have 3 rendered matches; description is excluded.
+    expect(output.textContent).toBe("0 / 3");
 
-    // Step to match 1 (Body Alpha paragraph -> 1 / 2), then switch to Live mode and toggle Replace ON -> maps across frontmatter to 2 / 3!
+    // Step to match 1 (displayed title -> 1 / 3), then match 2 (Body Alpha paragraph -> 2 / 3), then switch to Live mode and toggle Replace ON -> maps across hidden description to 3 / 4!
     const nextBtn=hostContainer.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
     await act(async()=>{nextBtn.click();});
     await flushFrames();
-    expect(output.textContent).toBe("1 / 2");
+    expect(output.textContent).toBe("1 / 3");
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Alpha");
+    await act(async()=>{nextBtn.click();});
+    await flushFrames();
+    expect(output.textContent).toBe("2 / 3");
 
     await act(async()=>{setReadMode(false);});
     await flushFrames();
@@ -201,24 +213,24 @@ describe("source search",()=>{
     expect(replaceToggle).not.toBeNull();
     await act(async()=>{replaceToggle.click();});
     await flushFrames();
-    expect(output.textContent).toBe("2 / 3");
+    expect(output.textContent).toBe("3 / 4");
     expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Alpha");
 
-    // Step to match 3 / 3 inside the >12-line collapsed code-disclosure -> opens details.code-disclosure and highlights "alpha"!
+    // Step to match 4 / 4 inside the >12-line collapsed code-disclosure -> opens details.code-disclosure and highlights "alpha"!
     const codeDisclosure=hostContainer.querySelector<HTMLDetailsElement>("details.code-disclosure")!;
     expect(codeDisclosure.open).toBe(false);
     await act(async()=>{nextBtn.click();});
     await flushFrames();
-    expect(output.textContent).toBe("3 / 3");
+    expect(output.textContent).toBe("4 / 4");
     expect(codeDisclosure.open).toBe(true);
     expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("alpha");
 
-    // Switching back to Read mode while Replace is open closes Replace and maps 3 / 3 back to rendered 2 / 2!
+    // Switching back to Read mode while Replace is open closes Replace and maps 4 / 4 back to rendered 3 / 3!
     await act(async()=>{setReadMode(true);});
     await flushFrames();
     expect(hostContainer.querySelector('button[aria-label="Replace in source"]')).toBeNull();
     expect(hostContainer.querySelector(".search-replace")).toBeNull();
-    expect(output.textContent).toBe("2 / 2");
+    expect(output.textContent).toBe("3 / 3");
 
     // Escape yields when a modal overlay (.image-viewer) is mounted, then closes ReadingSearch once removed.
     const modal=document.createElement("div");
@@ -553,29 +565,33 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
     vi.restoreAllMocks();
   });
 
-  it("translates ordinals bidirectionally across mounted and unmounted windowed blocks while skipping hidden link URLs",()=>{
+  it("translates ordinals bidirectionally across displayed frontmatter and mounted/unmounted windowed blocks while skipping hidden fields and link URLs",()=>{
     const b0="Read [Guide](https://example.com/hit) and hit alpha.";
     const b1="Unmounted [Ref](https://example.com/hit) first hit and second hit.";
-    const fm="---\ntitle: hit frontmatter\n---\n\n";
+    const fm="---\ntitle: hit frontmatter\ndescription: hidden hit summary\n---\n\n";
     const content=`${fm}${b0}\n\n${b1}`;
     const start0=fm.length,end0=start0+b0.length;
     const start1=end0+2,end1=start1+b1.length;
 
     const host=document.createElement("div");
     host.className="android-reading";
+    const fmHeader=document.createElement("section");
+    fmHeader.className="document-properties";
+    fmHeader.setAttribute("data-frontmatter-properties","");
+    fmHeader.innerHTML='<h1 data-frontmatter-field="title">hit frontmatter</h1>';
     const s0=document.createElement("section");
     s0.setAttribute("data-windowed-block","");
     s0.setAttribute("data-windowed-mounted","true");
     s0.setAttribute("data-source-start",String(start0));
     s0.setAttribute("data-source-end",String(end0));
-    s0.innerHTML=`<p data-source-start="${start0}" data-source-end="${end0}">Read <a href="https://example.com/hit" data-source-start="${start0+5}" data-source-end="${start0+37}">Guide</a> and hit alpha.</p>`;
+    s0.innerHTML=`<p data-source-start="${start0}" data-source-end="${start0}">Read <a href="https://example.com/hit" data-source-start="${start0+5}" data-source-end="${start0+37}">Guide</a> and hit alpha.</p>`.replace(`data-source-end="${start0}"`,`data-source-end="${end0}"`);
     const s1=document.createElement("section");
     s1.setAttribute("data-windowed-block","");
     s1.setAttribute("data-windowed-mounted","false");
     s1.setAttribute("data-source-start",String(start1));
     s1.setAttribute("data-source-end",String(end1));
     s1.innerHTML='<span aria-hidden="true"></span>';
-    host.append(s0,s1);
+    host.append(fmHeader,s0,s1);
     document.body.append(host);
 
     const cleanups=[
@@ -583,21 +599,23 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
       registerWindowedText(s1,"Unmounted Ref first hit and second hit."),
     ];
     const ranges=sourceMatches(content,"hit");
-    // Source indices: 0=frontmatter, 1=s0 hidden URL, 2=s0 visible, 3=s1 hidden URL, 4=s1 visible #1, 5=s1 visible #2.
-    expect(ranges).toHaveLength(6);
+    // Source indices: 0=displayed title, 1=hidden description, 2=s0 hidden URL, 3=s0 visible, 4=s1 hidden URL, 5=s1 visible #1, 6=s1 visible #2.
+    expect(ranges).toHaveLength(7);
     const wMatches=windowedMatches(host,"hit")!;
-    expect(wMatches).toHaveLength(3);
+    expect(wMatches).toHaveLength(4);
 
-    expect(translateSourceIndexToRendered(host,content,ranges,0,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,0,"hit",false,wMatches)).toBe(0);
     expect(translateSourceIndexToRendered(host,content,ranges,1,"hit",false,wMatches)).toBe(-1);
-    expect(translateSourceIndexToRendered(host,content,ranges,2,"hit",false,wMatches)).toBe(0);
-    expect(translateSourceIndexToRendered(host,content,ranges,3,"hit",false,wMatches)).toBe(-1);
-    expect(translateSourceIndexToRendered(host,content,ranges,4,"hit",false,wMatches)).toBe(1);
+    expect(translateSourceIndexToRendered(host,content,ranges,2,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,3,"hit",false,wMatches)).toBe(1);
+    expect(translateSourceIndexToRendered(host,content,ranges,4,"hit",false,wMatches)).toBe(-1);
     expect(translateSourceIndexToRendered(host,content,ranges,5,"hit",false,wMatches)).toBe(2);
+    expect(translateSourceIndexToRendered(host,content,ranges,6,"hit",false,wMatches)).toBe(3);
 
-    expect(translateRenderedIndexToSource(host,content,ranges,0,"hit",false,wMatches)).toBe(2);
-    expect(translateRenderedIndexToSource(host,content,ranges,1,"hit",false,wMatches)).toBe(4);
+    expect(translateRenderedIndexToSource(host,content,ranges,0,"hit",false,wMatches)).toBe(0);
+    expect(translateRenderedIndexToSource(host,content,ranges,1,"hit",false,wMatches)).toBe(3);
     expect(translateRenderedIndexToSource(host,content,ranges,2,"hit",false,wMatches)).toBe(5);
+    expect(translateRenderedIndexToSource(host,content,ranges,3,"hit",false,wMatches)).toBe(6);
     expect(translateRenderedIndexToSource(host,content,ranges,9,"hit",false,wMatches)).toBe(-1);
     cleanups.forEach(fn=>fn());
   });
