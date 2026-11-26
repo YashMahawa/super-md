@@ -66,24 +66,7 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   return { ready: true, names: expected };
 }
 
-function retryDelayFromHeaders(headers, nowMs) {
-  const retryAfter = Number(headers?.get?.('retry-after'));
-  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.ceil(retryAfter * 1_000);
-  const resetSeconds = Number(headers?.get?.('x-ratelimit-reset'));
-  if (Number.isFinite(resetSeconds) && resetSeconds > 0) return Math.max(0, Math.ceil(resetSeconds * 1_000 - nowMs));
-  return undefined;
-}
-
-async function isRateLimitedForbidden(response) {
-  if (response.headers?.get?.('x-ratelimit-remaining') === '0') return true;
-  const retryAfter = response.headers?.get?.('retry-after');
-  if (retryAfter !== null && retryAfter !== undefined && retryAfter !== '') return true;
-  if (typeof response.text !== 'function') return false;
-  const body = await response.text().catch(() => '');
-  return /rate limit/i.test(body);
-}
-
-async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
+async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -101,11 +84,7 @@ async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
     throw error;
   }
   if (!response.ok) {
-    const retryDelayMs = retryDelayFromHeaders(response.headers, nowMs);
-    if (response.status >= 500 || response.status === 429) return { retry: true, status: response.status, retryDelayMs };
-    if (response.status === 403 && await isRateLimitedForbidden(response)) {
-      return { retry: true, status: 403, retryDelayMs };
-    }
+    if (response.status >= 500 || response.status === 429) return { retry: true, status: response.status };
     throw new Error(`GitHub Actions API request failed with HTTP ${response.status}`);
   }
   return { value: await response.json() };
@@ -124,46 +103,29 @@ export async function waitForNativeFrontendArtifacts({
   now = Date.now,
 }) {
   const endpoint = assertInputs({ repository, runId, sourceSha, token, apiUrl });
-  frontendArtifactNames(sourceSha);
+  const names = frontendArtifactNames(sourceSha);
   const runPath = `repos/${repository}/actions/runs/${runId}`;
-  const baseHref = `${endpoint.href.replace(/\/?$/, '/')}`;
   const started = now();
   const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
-  const pause = async suggestedMs => {
+  const pause = async () => {
     const left = timeoutMs - (now() - started);
-    if (left > 0) await sleep(Math.min(Math.max(pollIntervalMs, suggestedMs || 0), left));
+    if (left > 0) await sleep(Math.min(pollIntervalMs, left));
   };
-  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()), now());
+  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
   while (now() - started < timeoutMs) {
-    const runResult = await request(new URL(runPath, baseHref));
+    const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (runResult.retry) {
-      await pause(runResult.retryDelayMs);
-      continue;
-    }
-    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, baseHref));
-    if (jobsResult.retry) {
-      await pause(jobsResult.retryDelayMs);
-      continue;
-    }
-    const producerCompleted = Array.isArray(jobsResult.value?.jobs)
-      && jobsResult.value.jobs.filter(job => job.name === PRODUCER_JOB_NAME).length === 1
-      && jobsResult.value.jobs.find(job => job.name === PRODUCER_JOB_NAME)?.status === 'completed'
-      && jobsResult.value.jobs.find(job => job.name === PRODUCER_JOB_NAME)?.conclusion === 'success';
-    if (!producerCompleted) {
-      inspectFrontendArtifactReadiness({
-        repository,
-        runId,
-        sourceSha,
-        run: runResult.value,
-        jobsPage: jobsResult.value,
-        artifactsPage: { total_count: 0, artifacts: [] },
-      });
       await pause();
       continue;
     }
-    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, baseHref));
+    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
+    if (jobsResult.retry) {
+      await pause();
+      continue;
+    }
+    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (artifactsResult.retry) {
-      await pause(artifactsResult.retryDelayMs);
+      await pause();
       continue;
     }
     const state = inspectFrontendArtifactReadiness({
