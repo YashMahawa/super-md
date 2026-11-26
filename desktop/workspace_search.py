@@ -1,6 +1,8 @@
 """Streaming cross-note text search with source-offset-preserving case folding and UTF-16 UI spans."""
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import os
 import threading
 from pathlib import Path
@@ -16,12 +18,19 @@ MAX_SEARCH_MATCHES = 500
 MAX_MATCHES_PER_NOTE = 50
 SNIPPET_MAX_CHARS = 140
 BATCH_SIZE = 20
+SEARCH_WORKERS = 4
+SEARCH_CHUNK_SIZE = 16
+SEARCH_WINDOW_CHUNKS = 4
+_SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=SEARCH_WORKERS, thread_name_prefix="supermd-search")
 
 
 def is_searchable_note_name(name: str) -> bool:
     if not name or name.startswith("."):
         return False
-    return Path(name).suffix.lower() in KNOWN_NOTE_SUFFIXES
+    dot = name.rfind(".")
+    if dot <= 0:
+        return False
+    return name[dot:].lower() in KNOWN_NOTE_SUFFIXES
 
 
 def canonical_note_key(path: str | Path) -> str:
@@ -44,37 +53,39 @@ def walk_folder_notes(
     try:
         if folder_root.is_symlink() or not folder_root.is_dir():
             return []
-        root = folder_root.resolve()
+        root_str = str(folder_root.resolve())
     except OSError:
         return []
 
     results: list[dict] = []
-    stack: list[tuple[Path, int]] = [(root, 0)]
+    stack: list[tuple[str, str, int]] = [(root_str, "", 0)]
     while stack and len(results) < max_entries:
         if cancel_event is not None and cancel_event.is_set():
             return results
-        current, depth = stack.pop()
+        current_dir, rel_prefix, depth = stack.pop()
         if depth > MAX_FOLDER_DEPTH:
             continue
         try:
-            with os.scandir(current) as entries:
+            with os.scandir(current_dir) as entries:
                 dir_items = list(entries)
         except OSError:
             continue
 
-        subdirs: list[Path] = []
+        subdirs: list[tuple[str, str, str]] = []
         files: list[os.DirEntry[str]] = []
         for entry in dir_items:
             if cancel_event is not None and cancel_event.is_set():
                 return results
-            if entry.name.startswith("."):
+            ename = entry.name
+            if ename.startswith("."):
                 continue
             try:
                 if entry.is_symlink():
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    subdirs.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False) and is_searchable_note_name(entry.name):
+                    sub_rel = f"{rel_prefix}/{ename}" if rel_prefix else ename
+                    subdirs.append((ename.lower(), entry.path, sub_rel))
+                elif entry.is_file(follow_symlinks=False) and is_searchable_note_name(ename):
                     files.append(entry)
             except OSError:
                 continue
@@ -83,16 +94,20 @@ def walk_folder_notes(
         for entry in files:
             if len(results) >= max_entries:
                 break
-            full = Path(entry.path)
-            try:
-                rel = full.relative_to(root).as_posix()
-            except ValueError:
-                rel = entry.name
-            results.append({"name": entry.name, "path": str(full), "relative": rel})
+            ename = entry.name
+            epath = entry.path
+            rel = f"{rel_prefix}/{ename}" if rel_prefix else ename
+            results.append({
+                "name": ename,
+                "path": epath,
+                "relative": rel,
+                "canonicalKey": os.path.normcase(epath),
+            })
 
-        subdirs.sort(key=lambda p: p.name.lower(), reverse=True)
-        for sub in subdirs:
-            stack.append((sub, depth + 1))
+        subdirs.sort(key=lambda item: item[0], reverse=True)
+        next_depth = depth + 1
+        for _, sub_path, sub_rel in subdirs:
+            stack.append((sub_path, sub_rel, next_depth))
     return results
 
 
@@ -218,6 +233,16 @@ def _find_line_matches(search_line: str, query: str, *, folded_needle: str, case
     return spans
 
 
+def _might_contain_needle(markdown: str, query: str, folded_needle: str, case_sensitive: bool) -> bool:
+    if "\x00" in query or "\x00" in folded_needle:
+        return True
+    if case_sensitive:
+        return query in markdown
+    if markdown.isascii() and folded_needle.isascii():
+        return folded_needle in markdown.lower()
+    return folded_needle in markdown.casefold()
+
+
 def _scan_note_lines(
     markdown: str,
     query: str,
@@ -229,7 +254,9 @@ def _scan_note_lines(
     remaining_budget: int,
     cancel_event: threading.Event | None = None,
 ) -> tuple[list[dict], bool]:
-    if not markdown or not query:
+    if not markdown or not query or remaining_budget <= 0:
+        return [], False
+    if not _might_contain_needle(markdown, query, folded_needle, case_sensitive):
         return [], False
     searchable = mask_diagram_spans(markdown) if exclude_diagrams else markdown
     raw_lines = markdown.splitlines()
@@ -375,20 +402,16 @@ def stream_text_search(
                     "relative": Path(rpath).name,
                 })
 
+    deduped_candidates: list[dict] = []
     for entry in disk_candidates:
         if cancel_event is not None and cancel_event.is_set():
             return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
         epath = entry["path"]
-        key = canonical_note_key(epath)
+        key = entry.get("canonicalKey") or canonical_note_key(epath)
         if key in seen_paths:
             continue
         seen_paths.add(key)
-
-        markdown = documents.read_searchable_markdown(Path(epath))
-        if markdown is None:
-            continue
-        scanned_files += 1
-        meta = {
+        deduped_candidates.append({
             "key": key,
             "tabId": "",
             "path": epath,
@@ -396,25 +419,93 @@ def stream_text_search(
             "relative": entry.get("relative") or entry["name"],
             "dirty": False,
             "isOpen": False,
-        }
-        found, hit_cap = _scan_note_lines(
-            markdown,
-            query,
-            folded_needle=folded_needle,
-            case_sensitive=case_sensitive,
-            exclude_diagrams=exclude_diagrams,
-            note_meta=meta,
-            remaining_budget=max_matches - len(all_matches),
-            cancel_event=cancel_event,
-        )
-        if found:
-            all_matches.extend(found)
-            pending_batch.extend(found)
-            if len(pending_batch) >= BATCH_SIZE:
-                flush(done=False)
-        if hit_cap or len(all_matches) >= max_matches:
-            truncated = True
-            break
+        })
+
+    stop_workers = threading.Event()
+
+    def _scan_disk_chunk(chunk: list[dict]) -> list[list[dict] | None]:
+        out: list[list[dict] | None] = []
+        for meta in chunk:
+            if stop_workers.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                break
+            markdown = documents.read_searchable_markdown(meta["path"])
+            if markdown is None:
+                out.append(None)
+                continue
+            found, _ = _scan_note_lines(
+                markdown,
+                query,
+                folded_needle=folded_needle,
+                case_sensitive=case_sensitive,
+                exclude_diagrams=exclude_diagrams,
+                note_meta=meta,
+                remaining_budget=MAX_MATCHES_PER_NOTE,
+                cancel_event=cancel_event,
+            )
+            out.append(found)
+        return out
+
+    if deduped_candidates:
+        chunks: list[list[dict]] = []
+        cursor_idx = 0
+        ramp = (4, 4, 8)
+        step_idx = 0
+        total_candidates = len(deduped_candidates)
+        while cursor_idx < total_candidates:
+            step = ramp[step_idx] if step_idx < len(ramp) else SEARCH_CHUNK_SIZE
+            step_idx += 1
+            chunks.append(deduped_candidates[cursor_idx : cursor_idx + step])
+            cursor_idx += step
+        inflight: deque[Future[list[list[dict] | None]]] = deque()
+        next_chunk_idx = 0
+
+        def _submit_window() -> None:
+            nonlocal next_chunk_idx
+            while len(inflight) < SEARCH_WINDOW_CHUNKS and next_chunk_idx < len(chunks):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                chunk = chunks[next_chunk_idx]
+                next_chunk_idx += 1
+                inflight.append(_SEARCH_EXECUTOR.submit(_scan_disk_chunk, chunk))
+
+        try:
+            _submit_window()
+            stop_scan = False
+            while inflight and not stop_scan:
+                if cancel_event is not None and cancel_event.is_set():
+                    for pending_fut in inflight:
+                        pending_fut.cancel()
+                    return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
+                fut = inflight.popleft()
+                _submit_window()
+                chunk_results = fut.result()
+                for found in chunk_results:
+                    if cancel_event is not None and cancel_event.is_set():
+                        for pending_fut in inflight:
+                            pending_fut.cancel()
+                        return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
+                    if found is None:
+                        continue
+                    scanned_files += 1
+                    remaining = max_matches - len(all_matches)
+                    if found and remaining > 0:
+                        accepted = found[:remaining] if len(found) > remaining else found
+                        all_matches.extend(accepted)
+                        pending_batch.extend(accepted)
+                        if len(pending_batch) >= BATCH_SIZE:
+                            flush(done=False)
+                            if cancel_event is not None and cancel_event.is_set():
+                                for pending_fut in inflight:
+                                    pending_fut.cancel()
+                                return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
+                    if len(found) > remaining or len(all_matches) >= max_matches:
+                        truncated = True
+                        stop_scan = True
+                        break
+        finally:
+            stop_workers.set()
+            for pending_fut in inflight:
+                pending_fut.cancel()
 
     if cancel_event is not None and cancel_event.is_set():
         return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}

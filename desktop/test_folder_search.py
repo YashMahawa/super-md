@@ -465,6 +465,142 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertTrue(res["cancelled"])
         self.assertLess(res["scannedFiles"], 60)
 
+    def test_stateless_order_preserving_benchmark_and_disk_freshness(self):
+        for d in range(12):
+            sub = self.root / f"topic_{d:02d}"
+            sub.mkdir(parents=True)
+            for f in range(20):
+                idx = d * 20 + f
+                has_match = (idx % 9 == 3)
+                note_path = sub / (f"note_{f:02d}.smd" if idx == 30 else f"note_{f:02d}.md")
+                body_lines = [
+                    f"# Note {idx:03d} — İstanbul & Straße",
+                    "```mermaid",
+                    "graph TD",
+                    f"  A[Node{idx}] --> B[EigenSpectrum]",
+                    "```",
+                    (
+                        f"Observation {idx}: EigenSpectrum first prose hit and EigenSpectrum second hit."
+                        if has_match
+                        else f"Observation {idx}: Background Hamiltonian prose without target token."
+                    ),
+                ]
+                markdown = "\n".join(body_lines) + "\n"
+                if note_path.suffix == ".smd":
+                    documents.write_portable(note_path, markdown, {"assets/pixel.png": TINY_PNG})
+                else:
+                    note_path.write_text(markdown, encoding="utf-8")
+
+        shadowed_path = self.root / "topic_00" / "note_03.md"
+        tabs = [{
+            "id": "tab-dirty-override",
+            "name": "note_03.md",
+            "path": str(shadowed_path),
+            "content": "# Live Override\n\nEigenSpectrum live unsaved hit.\n",
+            "dirty": True,
+        }]
+
+        # Build exact sequential reference order.
+        seq_entries = []
+        for sub_dir in sorted((p for p in self.root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
+            for note_file in sorted(sub_dir.iterdir(), key=lambda p: p.name.lower()):
+                if note_file.resolve() == shadowed_path.resolve():
+                    continue
+                seq_entries.append(note_file)
+
+        expected_tuples = [("topic_00/note_03.md", 3, 1, "EigenSpectrum live unsaved hit.", True)]
+        for note_file in seq_entries:
+            single = stream_text_search("eigenspectrum", [], [{"path": str(note_file), "name": note_file.name}], None)
+            rel = note_file.relative_to(self.root).as_posix()
+            for m in single["matches"]:
+                expected_tuples.append((rel, m["line"], m["column"], m["snippet"], False))
+
+        # Invert completion timing so early files sleep longer than later files in worker threads.
+        orig_read = documents.read_searchable_markdown
+        read_counts: dict[str, int] = {}
+        count_lock = threading.Lock()
+
+        def jittered_read(path_arg, *args, **kwargs):
+            raw = os.fspath(path_arg)
+            with count_lock:
+                read_counts[raw] = read_counts.get(raw, 0) + 1
+            if "topic_00" in raw or "topic_01" in raw or "topic_02" in raw:
+                time.sleep(0.0015)
+            return orig_read(path_arg, *args, **kwargs)
+
+        streamed_batches: list[dict] = []
+        with patch.object(documents, "read_searchable_markdown", side_effect=jittered_read):
+            res = stream_text_search(
+                "eigenspectrum",
+                tabs,
+                [],
+                self.root,
+                active_id="tab-dirty-override",
+                case_sensitive=False,
+                on_batch=lambda batch, _s, _t, _d: streamed_batches.extend(batch),
+            )
+
+        actual_tuples = [
+            (m["relative"], m["line"], m["column"], m["snippet"], m["dirty"])
+            for m in res["matches"]
+        ]
+        streamed_tuples = [
+            (m["relative"], m["line"], m["column"], m["snippet"], m["dirty"])
+            for m in streamed_batches
+        ]
+        self.assertEqual(actual_tuples, expected_tuples)
+        self.assertEqual(streamed_tuples, expected_tuples)
+        self.assertEqual(res["scannedFiles"], 240)
+        self.assertFalse(res["truncated"])
+        self.assertEqual(read_counts.get(str(shadowed_path), 0), 0, "Open tab path must not be re-read from disk")
+
+        # Truncation must slice at the exact deterministic prefix boundary.
+        trunc_res = stream_text_search(
+            "eigenspectrum",
+            tabs,
+            [],
+            self.root,
+            active_id="tab-dirty-override",
+            case_sensitive=False,
+            max_matches=17,
+        )
+        self.assertTrue(trunc_res["truncated"])
+        self.assertEqual(
+            [(m["relative"], m["line"], m["column"], m["snippet"], m["dirty"]) for m in trunc_res["matches"]],
+            expected_tuples[:17],
+        )
+
+        # Duplicate recent entries (including unnormalized relative segments) must be deduplicated.
+        dup_target = (self.root / "topic_01" / "note_01.md").resolve()
+        norm_dup_target = os.path.normcase(str(dup_target))
+        unnormalized_dup = str(self.root / "topic_01" / ".." / "topic_01" / "note_01.md")
+        recent_reads: list[str] = []
+
+        def counting_read(path_arg, *args, **kwargs):
+            norm = os.path.normcase(str(Path(path_arg).resolve()))
+            if norm == norm_dup_target:
+                recent_reads.append(norm)
+            return orig_read(path_arg, *args, **kwargs)
+
+        with patch.object(documents, "read_searchable_markdown", side_effect=counting_read):
+            rec_res = stream_text_search(
+                "Observation",
+                [],
+                [
+                    {"path": str(dup_target), "name": "note_01.md", "pinned": True},
+                    {"path": unnormalized_dup, "name": "note_01.md", "pinned": False},
+                ],
+                None,
+            )
+        self.assertEqual(len(recent_reads), 1)
+        self.assertEqual(rec_res["scannedFiles"], 1)
+
+        # Stateless freshness: mutating a file on disk is reflected on the very next search with zero cache invalidation.
+        fresh_note = self.root / "topic_05" / "note_00.md"
+        fresh_note.write_text("# Updated on Disk\n\nFreshlyWrittenDiskPhrase appears immediately.\n", encoding="utf-8")
+        fresh_res = stream_text_search("FreshlyWrittenDiskPhrase", tabs, [], self.root, active_id="tab-dirty-override")
+        self.assertEqual([(m["relative"], m["line"]) for m in fresh_res["matches"]], [("topic_05/note_00.md", 3)])
+
     def test_open_search_match_supersedes_pending_sync_for_search_flush(self):
         target = self.root / "target.md"
         target.write_text("# Target\n\nNeedle match here.\n", encoding="utf-8")

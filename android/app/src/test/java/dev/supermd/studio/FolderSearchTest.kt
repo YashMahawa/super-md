@@ -2,6 +2,7 @@ package dev.supermd.studio
 
 import android.net.Uri
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.util.Base64
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.height
@@ -506,5 +507,278 @@ class FolderSearchTest {
         composeRule.onNodeWithContentDescription("More actions").performClick()
         composeRule.onNode(hasText("Search across notes") and hasAnyAncestor(isPopup())).assertIsDisplayed().performClick()
         assertEquals(2, folderSearchClicks)
+    }
+
+    @Test
+    fun safDeduplicationAndOrderPreservingBenchmarkMaintainExactOrderAndStatelessFreshness() = runBlocking {
+        val app = RuntimeEnvironment.getApplication()
+        val media = MediaStorage(app)
+        val authority = "dev.supermd.test.saf.documents"
+        val treeUri = DocumentsContract.buildTreeDocumentUri(authority, "primary:Notes")
+
+        val treeDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "primary:Notes/topic_00/note_07.md")
+        val plainDocUri = DocumentsContract.buildDocumentUri(authority, "primary:Notes/topic_00/note_07.md")
+        val otherDocUri = DocumentsContract.buildDocumentUri(authority, "primary:Notes/topic_00/note_08.md")
+        val otherAuthUri = DocumentsContract.buildDocumentUri("com.example.documents", "primary:Notes/topic_00/note_07.md")
+        val nonDocContentUri = Uri.parse("content://com.example.custom/items/42")
+
+        assertTrue(sameDocument(treeDocUri, plainDocUri))
+        assertEquals(canonicalDocumentKey(treeDocUri), canonicalDocumentKey(plainDocUri))
+        assertNotEquals(canonicalDocumentKey(treeDocUri), canonicalDocumentKey(otherDocUri))
+        assertNotEquals(canonicalDocumentKey(treeDocUri), canonicalDocumentKey(otherAuthUri))
+        assertNotEquals(canonicalDocumentKey(treeDocUri), canonicalDocumentKey(nonDocContentUri))
+        assertEquals("uri:content://com.example.custom/items/42", canonicalDocumentKey(nonDocContentUri))
+
+        data class SafRow(val docId: String, val name: String, val mime: String, val flags: Int = 0)
+
+        val childrenByParent = HashMap<String, List<SafRow>>()
+        val payloads = java.util.concurrent.ConcurrentHashMap<String, ByteArray>()
+        val svgBytes = "<svg xmlns='http://www.w3.org/2000/svg'><circle r='3'/></svg>".toByteArray()
+        val portableAssets = JSONObject().put(
+            "assets/diagram.svg",
+            "data:image/svg+xml;base64," + Base64.encodeToString(svgBytes, Base64.NO_WRAP),
+        )
+
+        val rootChildren = ArrayList<SafRow>(16)
+        for (d in 0 until 15) {
+            val dirRel = "topic_%02d".format(d)
+            val dirDocId = "primary:Notes/$dirRel"
+            rootChildren.add(SafRow(dirDocId, dirRel, DocumentsContract.Document.MIME_TYPE_DIR))
+            val fileRows = ArrayList<SafRow>(42)
+            for (f in 0 until 40) {
+                val idx = d * 40 + f
+                val hasMatch = (idx % 25 == 7)
+                val ext = if (idx == 57) "smd" else "md"
+                val fileName = "note_%02d.%s".format(f, ext)
+                val docId = "$dirDocId/$fileName"
+                val markdown = buildString {
+                    append("# Research Note %03d — İstanbul & Straße\n\n".format(idx))
+                    append("```mermaid\ngraph TD\n  A[Node$idx] --> B[QuantumEigenstate]\n```\n\n")
+                    for (p in 0 until 24) {
+                        if (hasMatch && (p == 6 || p == 18)) {
+                            append("Paragraph $p: QuantumEigenstate observation #$idx-$p in prose.\n")
+                        } else {
+                            append("Paragraph $p: Standard Hamiltonian formulation with linear operators $idx-$p.\n")
+                        }
+                    }
+                }
+                val bytes = if (ext == "smd") {
+                    ByteArrayOutputStream().also { media.writeFmd(it, markdown, portableAssets) }.toByteArray()
+                } else {
+                    markdown.toByteArray(Charsets.UTF_8)
+                }
+                payloads[docId] = bytes
+                fileRows.add(SafRow(docId, fileName, "text/markdown"))
+            }
+            // Include a dotfile and a virtual document to verify SafFastNode skips both.
+            fileRows.add(SafRow("$dirDocId/.hidden.md", ".hidden.md", "text/markdown"))
+            fileRows.add(
+                SafRow(
+                    "$dirDocId/virtual.md",
+                    "virtual.md",
+                    "text/markdown",
+                    DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT,
+                ),
+            )
+            payloads["$dirDocId/.hidden.md"] = "QuantumEigenstate hidden".toByteArray(Charsets.UTF_8)
+            payloads["$dirDocId/virtual.md"] = "QuantumEigenstate virtual".toByteArray(Charsets.UTF_8)
+            childrenByParent[dirDocId] = fileRows
+        }
+        childrenByParent["primary:Notes"] = rootChildren
+
+        val safProvider = object : android.content.ContentProvider() {
+            override fun onCreate(): Boolean = true
+            override fun query(
+                uri: Uri,
+                projection: Array<out String>?,
+                selection: String?,
+                selectionArgs: Array<out String>?,
+                sortOrder: String?,
+            ): android.database.Cursor {
+                Thread.sleep(2L)
+                val cols = projection ?: arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_FLAGS,
+                )
+                val cursor = android.database.MatrixCursor(cols)
+                val segs = uri.pathSegments
+                val parentDocId = if (segs.size >= 5 && segs[0] == "tree" && segs[2] == "document" && segs[4] == "children") {
+                    segs[3]
+                } else {
+                    ""
+                }
+                for (row in childrenByParent[parentDocId].orEmpty()) {
+                    cursor.addRow(
+                        cols.map { col ->
+                            when (col) {
+                                DocumentsContract.Document.COLUMN_DOCUMENT_ID -> row.docId
+                                DocumentsContract.Document.COLUMN_DISPLAY_NAME -> row.name
+                                DocumentsContract.Document.COLUMN_MIME_TYPE -> row.mime
+                                DocumentsContract.Document.COLUMN_FLAGS -> row.flags
+                                else -> null
+                            }
+                        }.toTypedArray(),
+                    )
+                }
+                return cursor
+            }
+            override fun getType(uri: Uri): String? = null
+            override fun insert(uri: Uri, values: android.content.ContentValues?): Uri? = null
+            override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+            override fun update(uri: Uri, values: android.content.ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        }
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(authority, safProvider)
+        val safRoot = resolveSearchRoot(app, treeUri)
+        assertNotNull(safRoot)
+
+        // Open dirty tab uses a PLAIN document URI while SAF tree walk emits tree-built document URIs!
+        val shadowedDocId = "primary:Notes/topic_00/note_07.md"
+        val openDirtyTab = Note(
+            id = "tab-open-saf",
+            name = "note_07.md",
+            uri = DocumentsContract.buildDocumentUri(authority, shadowedDocId).toString(),
+            content = "# Edited Open Tab\n\nQuantumEigenstate live override line.\n",
+            saved = "# Old Saved\n",
+            relative = "topic_00/note_07.md",
+        )
+
+        fun openSafStream(
+            uri: Uri,
+            jitterEarly: Boolean,
+            counter: java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>? = null,
+        ): java.io.InputStream? {
+            val docId = DocumentsContract.getDocumentId(uri)
+            counter?.computeIfAbsent(docId) { java.util.concurrent.atomic.AtomicInteger(0) }?.incrementAndGet()
+            if (jitterEarly) {
+                if (docId.contains("topic_00") || docId.contains("topic_01") || docId.contains("topic_02")) {
+                    Thread.sleep(1L)
+                }
+            } else {
+                Thread.sleep(1L)
+            }
+            return payloads[docId]?.inputStream()
+        }
+
+        // Reference baseline: sequential DFS walk + legacy O(N^2) sameDocument deduplication + sequential scan.
+        val legacyStartNs = System.nanoTime()
+        val legacySeen = ArrayList<Uri>()
+        fun legacyMarkSeen(uriStr: String?): Uri? {
+            if (uriStr.isNullOrBlank()) return null
+            val parsed = Uri.parse(uriStr)
+            if (legacySeen.any { sameDocument(it, parsed) }) return null
+            legacySeen.add(parsed)
+            return parsed
+        }
+        val expectedMatches = ArrayList<FolderSearchMatch>()
+        legacyMarkSeen(openDirtyTab.uri)
+        val tabSingle = streamTextSearch(
+            query = "quantumeigenstate",
+            tabs = listOf(openDirtyTab),
+            recents = emptyList(),
+            folderRoot = null,
+            media = media,
+            openUriStream = { null },
+            activeTabId = openDirtyTab.id,
+        )
+        expectedMatches.addAll(tabSingle.matches)
+        for (dirRow in rootChildren.sortedBy { it.name.lowercase(java.util.Locale.ROOT) }) {
+            Thread.sleep(2L)
+            val fileRows = childrenByParent[dirRow.docId].orEmpty()
+                .filter { !it.name.startsWith('.') && (it.flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) == 0 }
+                .sortedBy { it.name.lowercase(java.util.Locale.ROOT) }
+            for (fileRow in fileRows) {
+                val treeChildUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, fileRow.docId).toString()
+                val parsed = legacyMarkSeen(treeChildUri) ?: continue
+                val single = streamTextSearch(
+                    query = "quantumeigenstate",
+                    tabs = emptyList(),
+                    recents = listOf(RecentNote(fileRow.name, parsed.toString(), relative = "${dirRow.name}/${fileRow.name}")),
+                    folderRoot = null,
+                    media = media,
+                    openUriStream = { u -> openSafStream(u, jitterEarly = false) },
+                )
+                expectedMatches.addAll(single.matches)
+            }
+        }
+        val legacyMs = (System.nanoTime() - legacyStartNs) / 1_000_000.0
+
+        // Optimized run with inverted read jitter on early directories to stress out-of-order worker completion.
+        val openCounts = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+        val streamedBatches = ArrayList<FolderSearchMatch>()
+        val optStartNs = System.nanoTime()
+        val optimizedRes = streamTextSearch(
+            query = "quantumeigenstate",
+            tabs = listOf(openDirtyTab),
+            recents = emptyList(),
+            folderRoot = safRoot,
+            media = media,
+            openUriStream = { u -> openSafStream(u, jitterEarly = true, counter = openCounts) },
+            activeTabId = openDirtyTab.id,
+            onBatch = { batch, _, _, _ -> streamedBatches.addAll(batch) },
+        )
+        val optimizedMs = (System.nanoTime() - optStartNs) / 1_000_000.0
+        println(
+            "BENCHMARK_ANDROID_600_SAF: legacyMs=%.2f optimizedMs=%.2f speedup=%.2fx matches=%d scanned=%d".format(
+                java.util.Locale.ROOT,
+                legacyMs,
+                optimizedMs,
+                legacyMs / optimizedMs.coerceAtLeast(0.01),
+                optimizedRes.matches.size,
+                optimizedRes.scannedFiles,
+            ),
+        )
+
+        assertEquals("Concurrent stateless search must preserve exact sequential match order", expectedMatches, optimizedRes.matches)
+        assertEquals("Streaming batches must preserve exact sequential match order", expectedMatches, streamedBatches)
+        assertEquals(600, optimizedRes.scannedFiles)
+        assertFalse(optimizedRes.truncated)
+        assertNull("Shadowed SAF tree URI for open plain-URI tab must never open an input stream", openCounts[shadowedDocId])
+
+        // Truncation must slice at the exact deterministic prefix boundary.
+        val truncatedRes = streamTextSearch(
+            query = "quantumeigenstate",
+            tabs = listOf(openDirtyTab),
+            recents = emptyList(),
+            folderRoot = safRoot,
+            media = media,
+            openUriStream = { u -> openSafStream(u, jitterEarly = true) },
+            activeTabId = openDirtyTab.id,
+            maxMatches = 19,
+        )
+        assertTrue(truncatedRes.truncated)
+        assertEquals(expectedMatches.take(19), truncatedRes.matches)
+
+        // Duplicate recents mixing plain document URI and tree-built document URI must open stream once.
+        val dupDocId = "primary:Notes/topic_02/note_01.md"
+        val dupCounts = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+        val dupRes = streamTextSearch(
+            query = "Paragraph 0",
+            tabs = emptyList(),
+            recents = listOf(
+                RecentNote("note_01.md", DocumentsContract.buildDocumentUri(authority, dupDocId).toString(), pinned = true),
+                RecentNote("note_01.md", DocumentsContract.buildDocumentUriUsingTree(treeUri, dupDocId).toString(), pinned = false),
+            ),
+            folderRoot = null,
+            media = media,
+            openUriStream = { u -> openSafStream(u, jitterEarly = false, counter = dupCounts) },
+        )
+        assertEquals(1, dupRes.scannedFiles)
+        assertEquals(1, dupCounts[dupDocId]?.get())
+
+        // Stateless freshness: updating SAF document bytes immediately updates next search without stale caches.
+        val mutatedDocId = "primary:Notes/topic_04/note_02.md"
+        payloads[mutatedDocId] = "# Freshly Mutated\n\nImmediateStatelessSafUpdate appears right away.\n".toByteArray(Charsets.UTF_8)
+        val freshRes = streamTextSearch(
+            query = "ImmediateStatelessSafUpdate",
+            tabs = listOf(openDirtyTab),
+            recents = emptyList(),
+            folderRoot = safRoot,
+            media = media,
+            openUriStream = { u -> payloads[DocumentsContract.getDocumentId(u)]?.inputStream() },
+            activeTabId = openDirtyTab.id,
+        )
+        assertEquals(listOf("topic_04/note_02.md" to 3), freshRes.matches.map { it.relative to it.line })
     }
 }
