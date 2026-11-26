@@ -9,6 +9,12 @@ import QtWebChannel
 ApplicationWindow {
     id: window
     signal readerViewChanged(var readerView)
+    onReaderViewChanged: function(view) {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view)
+    }
+    Component.onCompleted: {
+        if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader)
+    }
     width: 1320
     height: 880
     minimumWidth: 760
@@ -298,6 +304,10 @@ ApplicationWindow {
         function onWorkspaceSearchChanged() {
             if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
             else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
+        }
+        function onWorkspaceFolderDropped() {
+            window.sidebar = true
+            window.sidebarSection = "folder"
         }
     }
     onViewStateChanged: {
@@ -671,7 +681,7 @@ ApplicationWindow {
                         if (window.readerRecoveryLoading && target === "about:blank") return
                         if (target.split("#")[0] !== readerUrl.toString()) {
                             request.reject()
-                            if (target.startsWith("https://") || target.startsWith("http://")) Qt.openUrlExternally(request.url)
+                            if (target.startsWith("https://") || target.startsWith("http://") || target.startsWith("mailto:")) Qt.openUrlExternally(request.url)
                         }
                     }
                     }
