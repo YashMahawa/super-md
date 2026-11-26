@@ -571,6 +571,137 @@ class FolderActionsTest {
         }
     }
 
+    @Test
+    fun directoryRenamePreservesSelectedSubfolderAndActiveSearchAcrossConcurrentListingMetadataAndScan() {
+        val courseDir = File(rootDir, "Course").apply { mkdirs() }
+        File(rootDir, "ExistingConflict").mkdirs()
+        File(courseDir, "Week1.md").writeText("# Week 1\n\nSeededNeedle appears in week one.\n")
+        File(courseDir, "Week2 Revised.md").writeText("# Week 2\n\nClosedNeedle appears in week two.\n")
+
+        val mainWindow = newModel()
+        val secondWindow = newModel()
+        mainWindow.setFolder(treeUri)
+        secondWindow.setFolder(treeUri)
+        await {
+            mainWindow.state.value.folder == treeUri.toString() &&
+                secondWindow.state.value.folder == treeUri.toString()
+        }
+
+        val openUri = treeDocUri("root/Course/Week1.md").also(::grantReadWrite)
+        mainWindow.open(openUri, "Course/Week1.md")
+        secondWindow.open(openUri, "Course/Week1.md")
+        await {
+            mainWindow.state.value.active.uri == openUri.toString() &&
+                secondWindow.state.value.active.uri == openUri.toString()
+        }
+
+        mainWindow.pinRecent(openUri.toString())
+        mainWindow.readingPosition(
+            mainWindow.state.value.active.id,
+            JSONObject().put("top", 48.0).put("offset", 6.0).put("zoom", 100.0).put("mode", "live"),
+        )
+
+        mainWindow.openFolderSearch("SeededNeedle")
+        await { !mainWindow.folderSearch.value.scanning && mainWindow.folderSearch.value.matches.size == 1 }
+        mainWindow.openSearchMatch(mainWindow.folderSearch.value.matches.single())
+        await { mainWindow.seededFind.value?.targetUri == openUri.toString() }
+
+        secondWindow.openFolderSearch("ClosedNeedle")
+        await {
+            !secondWindow.folderSearch.value.scanning &&
+                secondWindow.folderSearch.value.matches.any { it.relative == "Course/Week2 Revised.md" }
+        }
+
+        val folderDocUri = treeDocUri("root/Course")
+        val listingEntered = java.util.concurrent.CountDownLatch(1)
+        val releaseSlowQueries = java.util.concurrent.CountDownLatch(1)
+        provider.onChildrenQuery = { parentDocId ->
+            if (parentDocId == "root" && releaseSlowQueries.count > 0L) {
+                listingEntered.countDown()
+                releaseSlowQueries.await(1, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }
+
+        try {
+            // Trigger concurrent listFolder("Course"), refreshMetadata(), and overlapping folder search right before rename.
+            mainWindow.listFolder(treeUri, "Course")
+            assertEquals("Course", mainWindow.state.value.folderRelative)
+            assertTrue("Expected in-flight folder listing to enter IO", listingEntered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            mainWindow.refreshMetadata()
+            secondWindow.refreshMetadata()
+            secondWindow.updateFolderSearch("ClosedNeedle")
+
+            var renameOutcome: Pair<Boolean, String?>? = null
+            mainWindow.renameFolderEntry(folderDocUri, "Course", isDirectory = true, requested = "Semester") { ok, err ->
+                renameOutcome = ok to err
+            }
+            releaseSlowQueries.countDown()
+            provider.onChildrenQuery = null
+
+            val expectedNewNoteUri = treeDocUri("root/Semester/Week1.md").toString()
+            await(debugInfo = {
+                "concurrentRename: outcome=$renameOutcome mainUri=${mainWindow.state.value.active.uri} " +
+                    "secUri=${secondWindow.state.value.active.uri} rel=${mainWindow.state.value.folderRelative} " +
+                    "files=${mainWindow.state.value.files.map { it.relative }} " +
+                    "searchScanning=${secondWindow.folderSearch.value.scanning} " +
+                    "searchMatches=${secondWindow.folderSearch.value.matches.map { it.relative }} " +
+                    "err=${mainWindow.state.value.error}"
+            }) {
+                renameOutcome == (true to null) &&
+                    mainWindow.state.value.active.uri == expectedNewNoteUri &&
+                    secondWindow.state.value.active.uri == expectedNewNoteUri &&
+                    mainWindow.state.value.folderRelative == "Semester" &&
+                    mainWindow.state.value.files.any { it.relative == "Semester/Week1.md" } &&
+                    !secondWindow.folderSearch.value.scanning &&
+                    secondWindow.folderSearch.value.matches.any { it.relative == "Semester/Week2 Revised.md" } &&
+                    secondWindow.folderSearch.value.matches.none { it.relative.startsWith("Course/") }
+            }
+            assertEquals("Semester/Week1.md", mainWindow.state.value.active.relative)
+            assertEquals("Semester/Week1.md", secondWindow.state.value.active.relative)
+            assertEquals(expectedNewNoteUri, mainWindow.seededFind.value?.targetUri)
+            assertTrue(mainWindow.activeMatchesSeedTarget(mainWindow.state.value.active, mainWindow.seededFind.value!!))
+            val pinnedRecent = mainWindow.recent.value.firstOrNull { it.uri == expectedNewNoteUri }
+            assertNotNull(pinnedRecent)
+            assertTrue(pinnedRecent!!.pinned)
+            assertEquals("Semester/Week1.md", pinnedRecent.relative)
+            assertNotNull(mainWindow.readingLocation(expectedNewNoteUri))
+            assertNull(mainWindow.readingLocation(openUri.toString()))
+
+            // Failed directory rename while a folder listing is in flight must restore the selected folder listing cleanly.
+            val failListingEntered = java.util.concurrent.CountDownLatch(1)
+            val releaseFailListing = java.util.concurrent.CountDownLatch(1)
+            provider.onChildrenQuery = { parentDocId ->
+                if (parentDocId == "root" && releaseFailListing.count > 0L) {
+                    failListingEntered.countDown()
+                    releaseFailListing.await(1, java.util.concurrent.TimeUnit.SECONDS)
+                }
+            }
+            val semesterDocUri = treeDocUri("root/Semester")
+            mainWindow.listFolder(treeUri, "Semester")
+            assertTrue(failListingEntered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            var failedOutcome: Pair<Boolean, String?>? = null
+            mainWindow.renameFolderEntry(
+                semesterDocUri,
+                "Semester",
+                isDirectory = true,
+                requested = "ExistingConflict",
+                showGlobalError = false,
+            ) { ok, err ->
+                failedOutcome = ok to err
+            }
+            releaseFailListing.countDown()
+            provider.onChildrenQuery = null
+            await {
+                failedOutcome?.first == false &&
+                    mainWindow.state.value.folderRelative == "Semester" &&
+                    mainWindow.state.value.files.any { it.relative == "Semester/Week1.md" }
+            }
+        } finally {
+            releaseSlowQueries.countDown()
+            provider.onChildrenQuery = null
+        }
+    }
+
     private fun newModel(explicitKey: String? = null): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = explicitKey ?: "folder-actions-${UUID.randomUUID()}".also(workspaceKeys::add)
@@ -613,6 +744,7 @@ class FolderActionsTest {
 
 private class TreeTestDocumentsProvider(private val rootDir: File) : ContentProvider() {
     private var attachedAuthority: String = ""
+    @Volatile var onChildrenQuery: ((String) -> Unit)? = null
 
     fun attach(context: Context, authority: String) {
         attachedAuthority = authority
@@ -699,6 +831,7 @@ private class TreeTestDocumentsProvider(private val rootDir: File) : ContentProv
         val segments = uri.pathSegments
         if (segments.lastOrNull() == "children" && segments.size >= 2) {
             val parentDocId = Uri.decode(segments[segments.size - 2])
+            onChildrenQuery?.invoke(parentDocId)
             val parent = fileForDocId(parentDocId)
             if (!parent.isDirectory) throw FileNotFoundException(parentDocId)
             return MatrixCursor(cols).also { cursor ->
