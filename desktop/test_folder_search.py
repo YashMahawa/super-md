@@ -27,6 +27,8 @@ from shortcuts import default_shortcuts, native_label, normalize_shortcuts
 from studio import Session
 from test_studio import QuietStudio
 from workspace_search import (
+    BATCH_SIZE,
+    MAX_MATCHES_PER_NOTE,
     fold_with_offsets,
     stream_text_search,
     utf16_offset,
@@ -469,6 +471,233 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         )
         self.assertTrue(res["cancelled"])
         self.assertLess(res["scannedFiles"], 60)
+
+    def test_shared_batch_stream_preserves_precedence_and_order_across_open_tabs_and_disk_notes(self):
+        sub = self.root / "sub"
+        sub.mkdir()
+        zeta_disk = self.root / "zeta.md"
+        shadow_disk = self.root / "shadow.md"
+        beta_disk = sub / "beta.md"
+        alpha_disk = self.root / "alpha.md"
+        gamma_disk = self.root / "gamma.md"
+
+        # Disk copies of zeta.md, shadow.md, and sub/beta.md must be shadowed by open tabs.
+        zeta_disk.write_text("SharedHit stale-zeta\n", encoding="utf-8")
+        shadow_disk.write_text("SharedHit stale-shadow\n", encoding="utf-8")
+        beta_disk.write_text("SharedHit stale-beta\n", encoding="utf-8")
+        alpha_disk.write_text(
+            "\n".join(f"alpha-{i} SharedHit" for i in range(1, 6)) + "\n",
+            encoding="utf-8",
+        )
+        gamma_disk.write_text(
+            "\n".join(f"gamma-{i} SharedHit" for i in range(1, 5)) + "\n",
+            encoding="utf-8",
+        )
+
+        # Open tabs are intentionally passed with the active tab NOT first in tabs_snapshot.
+        tabs = [
+            {
+                "id": "tab-unsaved",
+                "name": "Untitled.md",
+                "path": "",
+                "content": "\n".join(f"unsaved-{i} SharedHit" for i in range(1, 9)),
+                "dirty": True,
+            },
+            {
+                "id": "tab-shadow",
+                "name": "shadow.md",
+                "path": str(shadow_disk),
+                "content": "# Clean open tab with zero query matches\n",
+                "dirty": False,
+            },
+            {
+                "id": "tab-active",
+                "name": "zeta.md",
+                "path": str(zeta_disk),
+                "content": "\n".join(f"active-{i} SharedHit" for i in range(1, 8)),
+                "dirty": True,
+            },
+            {
+                "id": "tab-beta",
+                "name": "beta.md",
+                "path": str(beta_disk),
+                "content": "\n".join(f"beta-{i} SharedHit" for i in range(1, 3)),
+                "dirty": False,
+            },
+        ]
+
+        batches: list[tuple[list[tuple[str, int, bool]], int, bool, bool]] = []
+
+        def on_batch(batch: list[dict], scanned: int, truncated: bool, done: bool) -> None:
+            batches.append(([(m["relative"], m["line"], m["isOpen"]) for m in batch], scanned, truncated, done))
+
+        res = stream_text_search(
+            "sharedhit",
+            tabs,
+            [],
+            self.root,
+            active_id="tab-active",
+            case_sensitive=False,
+            on_batch=on_batch,
+        )
+
+        # Precedence order:
+        # 1. Active open tab (zeta.md: 7 matches)
+        # 2. Remaining open tabs in snapshot order (Untitled.md: 8, shadow.md: 0, sub/beta.md: 2) -> 17 in-memory matches (< BATCH_SIZE=20)
+        # 3. Non-shadowed folder notes (alpha.md: 5 -> reaches 22 >= BATCH_SIZE, flushing first shared batch; gamma.md: 4 -> final done=True batch)
+        expected_order = (
+            [("zeta.md", i, True) for i in range(1, 8)]
+            + [("Untitled.md", i, True) for i in range(1, 9)]
+            + [("sub/beta.md", i, True) for i in range(1, 3)]
+            + [("alpha.md", i, False) for i in range(1, 6)]
+            + [("gamma.md", i, False) for i in range(1, 5)]
+        )
+        self.assertEqual([(m["relative"], m["line"], m["isOpen"]) for m in res["matches"]], expected_order)
+        self.assertEqual(res["scannedFiles"], 6)
+        self.assertFalse(res["truncated"])
+        self.assertFalse(res["cancelled"])
+
+        self.assertEqual(len(batches), 2)
+        self.assertGreaterEqual(len(batches[0][0]), BATCH_SIZE)
+        self.assertEqual(batches[0], (expected_order[:22], 5, False, False))
+        self.assertEqual(batches[1], (expected_order[22:], 6, False, True))
+
+        # Without an open folder, recent_snapshot falls back in pinned-first order while open tabs still take precedence.
+        outside_dir = tempfile.TemporaryDirectory(prefix="supermd-recents-")
+        self.addCleanup(outside_dir.cleanup)
+        out_root = Path(outside_dir.name).resolve()
+        unpinned_note = out_root / "unpinned.md"
+        pinned_note = out_root / "pinned.md"
+        unpinned_note.write_text("RecentOrderHit unpinned\n", encoding="utf-8")
+        pinned_note.write_text("RecentOrderHit pinned\n", encoding="utf-8")
+        zeta_disk.write_text("RecentOrderHit stale-zeta\n", encoding="utf-8")
+
+        recent_res = stream_text_search(
+            "RecentOrderHit",
+            [
+                {"id": "t-other", "name": "other.md", "path": "", "content": "RecentOrderHit other\n", "dirty": True},
+                {"id": "t-active", "name": "zeta.md", "path": str(zeta_disk), "content": "RecentOrderHit live-zeta\n", "dirty": True},
+            ],
+            [
+                {"path": str(unpinned_note), "name": "unpinned.md", "pinned": False},
+                {"path": str(zeta_disk), "name": "zeta.md", "pinned": True},
+                {"path": str(pinned_note), "name": "pinned.md", "pinned": True},
+                {"path": str(pinned_note), "name": "pinned.md", "pinned": False},
+            ],
+            None,
+            active_id="t-active",
+        )
+        self.assertEqual(
+            [(m["name"], m["isOpen"], m["snippet"]) for m in recent_res["matches"]],
+            [
+                ("zeta.md", True, "RecentOrderHit live-zeta"),
+                ("other.md", True, "RecentOrderHit other"),
+                ("pinned.md", False, "RecentOrderHit pinned"),
+                ("unpinned.md", False, "RecentOrderHit unpinned"),
+            ],
+        )
+
+    def test_unicode_offsets_preserved_across_in_memory_and_on_disk_batches(self):
+        def utf16_slice(text: str, u16_start: int, u16_end: int) -> str:
+            raw = text.encode("utf-16-le", errors="surrogatepass")
+            return raw[u16_start * 2 : u16_end * 2].decode("utf-16-le", errors="surrogatepass")
+
+        long_prefix = "İstanbul 🧪 " * 9
+        shared_lines = [
+            "İstanbul: Signal",
+            "📓🧪 SIGNAL after astral pair",
+            "Straße: signal",
+            f"{long_prefix}windowed SIGNAL match " + ("z" * 90),
+        ]
+        disk_md = self.root / "unicode-disk.md"
+        disk_smd = self.root / "unicode-portable.smd"
+        disk_md.write_text("\n".join(shared_lines * 4) + "\n", encoding="utf-8")
+        documents.write_portable(disk_smd, "\n".join(shared_lines * 3) + "\n", {})
+
+        tabs = [{
+            "id": "tab-u-batch",
+            "name": "unicode-live.md",
+            "path": "",
+            "content": "\n".join(shared_lines * 3),
+            "dirty": True,
+        }]
+        streamed: list[dict] = []
+        done_flags: list[bool] = []
+
+        def on_batch(batch: list[dict], _scanned: int, _trunc: bool, done: bool) -> None:
+            streamed.extend(batch)
+            done_flags.append(done)
+
+        res = stream_text_search("signal", tabs, [], self.root, case_sensitive=False, on_batch=on_batch)
+        self.assertEqual(streamed, res["matches"])
+        self.assertGreaterEqual(len(done_flags), 2)
+        self.assertTrue(done_flags[-1])
+        self.assertEqual(len(res["matches"]), 40)
+
+        for match in res["matches"]:
+            highlighted = utf16_slice(match["snippet"], match["matchStart"], match["matchEnd"])
+            self.assertEqual(highlighted.casefold(), "signal")
+
+        in_mem_first4 = [(m["column"], m["matchStart"], m["matchEnd"]) for m in res["matches"][:4]]
+        disk_md_first4 = [(m["column"], m["matchStart"], m["matchEnd"]) for m in res["matches"][12:16]]
+        disk_smd_first4 = [(m["column"], m["matchStart"], m["matchEnd"]) for m in res["matches"][28:32]]
+        self.assertEqual(in_mem_first4, disk_md_first4)
+        self.assertEqual(in_mem_first4, disk_smd_first4)
+
+    def test_query_limits_and_early_cap_preserved_across_in_memory_and_on_disk_notes(self):
+        disk_a = self.root / "01_first.md"
+        disk_b = self.root / "02_second.md"
+        disk_a.write_text("\n".join(f"disk-a-{i} CapToken" for i in range(65)) + "\n", encoding="utf-8")
+        disk_b.write_text("\n".join(f"disk-b-{i} CapToken" for i in range(20)) + "\n", encoding="utf-8")
+
+        tabs = [{
+            "id": "tab-cap",
+            "name": "live.md",
+            "path": "",
+            "content": "\n".join(f"live-{i} CapToken" for i in range(65)),
+            "dirty": True,
+        }]
+
+        # Per-note limit (MAX_MATCHES_PER_NOTE=50) applies equally to open tabs and disk notes without global truncation.
+        per_note_res = stream_text_search("CapToken", tabs, [], self.root, max_matches=500)
+        self.assertFalse(per_note_res["truncated"])
+        self.assertEqual(
+            [sum(1 for m in per_note_res["matches"] if m["name"] == name) for name in ("live.md", "01_first.md", "02_second.md")],
+            [MAX_MATCHES_PER_NOTE, MAX_MATCHES_PER_NOTE, 20],
+        )
+
+        # Global cap reached inside open tabs short-circuits before walking the folder on disk.
+        tab_cap_batches: list[tuple[int, bool, bool]] = []
+        with patch("workspace_search.walk_folder_notes", side_effect=AssertionError("Must not walk disk when open tabs hit max_matches")) as spy_walk:
+            tab_cap_res = stream_text_search(
+                "CapToken",
+                tabs,
+                [],
+                self.root,
+                max_matches=25,
+                on_batch=lambda b, _s, trunc, done: tab_cap_batches.append((len(b), trunc, done)),
+            )
+            spy_walk.assert_not_called()
+        self.assertTrue(tab_cap_res["truncated"])
+        self.assertEqual(len(tab_cap_res["matches"]), 25)
+        self.assertEqual(tab_cap_res["scannedFiles"], 1)
+        self.assertEqual(tab_cap_batches, [(25, False, False), (0, True, True)])
+
+        # Global cap spanning an open tab (12 matches) into the first disk note (capped at 13) skips later disk notes.
+        cross_batches: list[tuple[int, int, bool, bool]] = []
+        cross_res = stream_text_search(
+            "CapToken",
+            [{"id": "t-12", "name": "twelve.md", "path": "", "content": "\n".join(f"t-{i} CapToken" for i in range(12)), "dirty": True}],
+            [],
+            self.root,
+            max_matches=25,
+            on_batch=lambda b, s, trunc, done: cross_batches.append((len(b), s, trunc, done)),
+        )
+        self.assertTrue(cross_res["truncated"])
+        self.assertEqual(cross_res["scannedFiles"], 2)
+        self.assertEqual([m["name"] for m in cross_res["matches"]], ["twelve.md"] * 12 + ["01_first.md"] * 13)
+        self.assertEqual([m["line"] for m in cross_res["matches"][12:]], list(range(1, 14)))
+        self.assertEqual(cross_batches, [(25, 2, False, False), (0, 2, True, True)])
 
     def test_open_search_match_supersedes_pending_sync_for_search_flush(self):
         target = self.root / "target.md"

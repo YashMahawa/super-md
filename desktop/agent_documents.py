@@ -522,8 +522,12 @@ class DocumentStore:
             raise AgentDocumentError("view must be 'prose' or 'source'")
         document_length = len(text)
         section_start, section_end = 0, document_length
+        headings, spans = _read_headings_and_svg_spans(
+            text,
+            include_headings=heading is not None,
+            include_svg=view == "prose",
+        )
         if heading is not None:
-            headings = _headings(text, include_internal=True)
             item = resolve_heading(headings, heading)
             section_start, section_end = item["sectionStart"], item["sectionEnd"]
         if offset > section_end:
@@ -531,7 +535,6 @@ class DocumentStore:
         start = offset if heading is None else max(section_start, offset)
         end = section_end
         offset = start
-        spans = _svg_spans(text) if view == "prose" else []
         page_end = (_prose_page_end(offset, limit, end, spans) if view == "prose"
                     else min(end, offset + limit))
         page_text = text[offset:page_end]
@@ -821,30 +824,190 @@ def _resolve_asset_id(assets: dict[str, str], asset_id: str) -> str:
     return matches[0]
 
 
-def _headings(text: str, *, include_internal: bool = False) -> list[dict]:
-    found = []
+_SVG_FENCE_LANGUAGES = frozenset({"svg", "svg+xml", "image/svg+xml"})
+_DIAGRAM_FENCE_LANGUAGES = _SVG_FENCE_LANGUAGES | {"mermaid", "smd-chart"}
+_BRACED_FENCE_HEAD = re.compile(r"^\.?([A-Za-z][A-Za-z0-9_-]*)(?:$|[\s,#])")
+
+
+def normalize_fence_language(raw_info: str) -> str:
+    trimmed = raw_info.strip()
+    if len(trimmed) >= 4 and trimmed.startswith("{") and trimmed.endswith("}"):
+        match = _BRACED_FENCE_HEAD.match(trimmed[1:-1].strip())
+        if match:
+            lower = match.group(1).casefold()
+            if lower in ("python", "py", "mermaid"):
+                return lower
+    parts = trimmed.split(None, 1)
+    return parts[0].casefold() if parts else ""
+
+
+@dataclass(frozen=True)
+class _FencedSpan:
+    fence_start: int
+    fence_end: int
+    body_start: int
+    body_end: int
+    line_start: int
+    line_end: int
+    is_svg: bool
+    is_diagram: bool
+    language: str = ""
+
+    def to_svg_dict(self) -> dict:
+        return {
+            "start": self.body_start,
+            "end": self.body_end,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+        }
+
+
+@dataclass
+class _OpenFence:
+    char: str
+    size: int
+    fence_start: int
+    body_start: int
+    line_start: int
+    language: str = ""
+    svg_tagged: bool = False
+    diagram_tagged: bool = False
+    probe: list[str] = field(default_factory=list)
+
+    def is_svg(self) -> bool:
+        return self.svg_tagged or "".join(self.probe).lstrip().lower().startswith("<svg")
+
+    def to_span(self, *, fence_end: int, body_end: int, line_end: int) -> _FencedSpan:
+        is_svg = self.is_svg()
+        return _FencedSpan(
+            fence_start=self.fence_start,
+            fence_end=fence_end,
+            body_start=self.body_start,
+            body_end=body_end,
+            line_start=self.line_start,
+            line_end=max(self.line_start, line_end),
+            is_svg=is_svg,
+            is_diagram=self.diagram_tagged or is_svg,
+            language=self.language,
+        )
+
+
+def _step_fence_boundary(
+    body: str,
+    opened: _OpenFence | None,
+    *,
+    offset: int,
+    line_len: int,
+    line_number: int,
+    inspect_info: bool,
+) -> tuple[bool, _OpenFence | None, _FencedSpan | None]:
+    """Parse one line for CommonMark fence boundaries."""
+    match = _FENCE.match(body)
+    if match is None:
+        return False, opened, None
+    marker = match.group(1)
+    if opened is None:
+        language = normalize_fence_language(body[match.end():]) if inspect_info else ""
+        svg_tagged = language in _SVG_FENCE_LANGUAGES
+        return True, _OpenFence(
+            char=marker[0],
+            size=len(marker),
+            fence_start=offset,
+            body_start=offset + line_len,
+            line_start=line_number + 1,
+            language=language,
+            svg_tagged=svg_tagged,
+            diagram_tagged=svg_tagged or language in _DIAGRAM_FENCE_LANGUAGES,
+        ), None
+    if marker[0] == opened.char and len(marker) >= opened.size:
+        closed = (
+            opened.to_span(
+                fence_end=offset + line_len,
+                body_end=offset,
+                line_end=line_number - 1,
+            )
+            if inspect_info else None
+        )
+        return True, None, closed
+    return True, opened, None
+
+
+def _scan_read_only(
+    text: str,
+    *,
+    collect_headings: bool = False,
+    collect_fences: bool = False,
+) -> tuple[list[dict], list[_FencedSpan]]:
+    has_fences = "```" in text or "~~~" in text
+    if not collect_headings and not (collect_fences and has_fences):
+        return [], []
+    headings: list[dict] = []
+    fences: list[_FencedSpan] = []
     offset = 0
     line_number = 1
-    fence_char = None
-    fence_size = 0
+    opened: _OpenFence | None = None
     for line in text.splitlines(keepends=True):
+        line_len = len(line)
         body = line.rstrip("\r\n")
-        fm = _FENCE.match(body)
-        if fm:
-            marker = fm.group(1)
-            char, size = marker[0], len(marker)
-            if fence_char is None:
-                fence_char, fence_size = char, size
-            elif char == fence_char and size >= fence_size:
-                fence_char = None
-            offset += len(line); line_number += 1
-            continue
-        if fence_char is None:
-            match = _HEADING.match(body)
-            if match:
-                found.append({"index": len(found), "level": len(match.group(1)), "title": match.group(2)[:300],
-                              "line": line_number, "start": offset})
-        offset += len(line); line_number += 1
+        if has_fences:
+            is_fence_line, opened, closed = _step_fence_boundary(
+                body,
+                opened,
+                offset=offset,
+                line_len=line_len,
+                line_number=line_number,
+                inspect_info=collect_fences,
+            )
+            if closed is not None:
+                fences.append(closed)
+            if is_fence_line:
+                offset += line_len
+                line_number += 1
+                continue
+        if opened is None:
+            if collect_headings:
+                match = _HEADING.match(body)
+                if match:
+                    headings.append({
+                        "index": len(headings),
+                        "level": len(match.group(1)),
+                        "title": match.group(2)[:300],
+                        "line": line_number,
+                        "start": offset,
+                    })
+        elif collect_fences and not opened.svg_tagged and len(opened.probe) < 4:
+            opened.probe.append(body[:512])
+        offset += line_len
+        line_number += 1
+    if opened is not None and collect_fences:
+        fences.append(
+            opened.to_span(
+                fence_end=len(text),
+                body_end=len(text),
+                line_end=line_number - 1,
+            )
+        )
+    return headings, fences
+
+
+def _read_headings_and_svg_spans(
+    text: str,
+    *,
+    include_headings: bool,
+    include_svg: bool,
+) -> tuple[list[dict], list[dict]]:
+    found, fences = _scan_read_only(
+        text,
+        collect_headings=include_headings,
+        collect_fences=include_svg,
+    )
+    headings = _heading_sections(text, found) if include_headings else []
+    svg_spans = [span.to_svg_dict() for span in fences if span.is_svg] if include_svg else []
+    return headings, svg_spans
+
+
+def _headings(text: str, *, include_internal: bool = False) -> list[dict]:
+    found, _ = _scan_read_only(text, collect_headings=True)
     if include_internal:
         return _heading_sections(text, found)
     return [{k: v for k, v in item.items() if k != "start"} for item in found]
@@ -951,36 +1114,11 @@ _INLINE_SVG_CLOSE = re.compile(r"</svg\s*>", re.IGNORECASE)
 
 def diagram_spans(text: str, *, include_inline_svg: bool = False) -> list[dict]:
     """Return diagram body ranges as code-point `{start, end}` offsets; end is exclusive."""
-    spans = list(_svg_spans(text))
-    fenced_blocks: list[tuple[int, int]] = []
-    offset = 0
-    opened = None
-    for line in text.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        match = _FENCE.match(body)
-        if match:
-            marker = match.group(1)
-            if opened is None:
-                info = body[match.end():].strip().split(None, 1)
-                language = info[0].casefold() if info else ""
-                opened = {
-                    "char": marker[0],
-                    "size": len(marker),
-                    "fence_start": offset,
-                    "body_start": offset + len(line),
-                    "diagram": language in ("svg", "svg+xml", "image/svg+xml", "mermaid", "smd-chart"),
-                }
-            elif marker[0] == opened["char"] and len(marker) >= opened["size"]:
-                fenced_blocks.append((opened["fence_start"], offset + len(line)))
-                if opened["diagram"]:
-                    spans.append({"start": opened["body_start"], "end": offset})
-                opened = None
-        offset += len(line)
-    if opened is not None:
-        fenced_blocks.append((opened["fence_start"], len(text)))
-        if opened["diagram"]:
-            spans.append({"start": opened["body_start"], "end": len(text)})
-    if include_inline_svg and ("<svg" in text or "<SVG" in text or "<svg" in text.lower()):
+    _, fences = _scan_read_only(text, collect_fences=True)
+    spans = [{"start": span.body_start, "end": span.body_end} for span in fences if span.is_diagram]
+    if not include_inline_svg:
+        return spans
+    if "<" in text:
         cursor = 0
         fence_idx = 0
         while True:
@@ -988,10 +1126,10 @@ def diagram_spans(text: str, *, include_inline_svg: bool = False) -> list[dict]:
             if open_match is None:
                 break
             start = open_match.start()
-            while fence_idx < len(fenced_blocks) and fenced_blocks[fence_idx][1] <= start:
+            while fence_idx < len(fences) and fences[fence_idx].fence_end <= start:
                 fence_idx += 1
-            if fence_idx < len(fenced_blocks) and fenced_blocks[fence_idx][0] <= start < fenced_blocks[fence_idx][1]:
-                cursor = fenced_blocks[fence_idx][1]
+            if fence_idx < len(fences) and fences[fence_idx].fence_start <= start < fences[fence_idx].fence_end:
+                cursor = fences[fence_idx].fence_end
                 continue
             if open_match.group(0).rstrip().endswith("/>"):
                 spans.append({"start": start, "end": open_match.end()})
@@ -1053,6 +1191,7 @@ def search_source(source: str, query: str, limit: int = 10, context: int = 100, 
     total = 0
     remaining = 0
     cursor = 0
+    span_idx = 0
     while True:
         match = pattern.search(source, cursor)
         if match is None:
@@ -1065,8 +1204,11 @@ def search_source(source: str, query: str, limit: int = 10, context: int = 100, 
         if whole_word and ((start > 0 and _word_character(source[start - 1])) or
                            (end < len(source) and _word_character(source[end]))):
             continue
-        if exclude_diagrams and any(start < span["end"] and end > span["start"] for span in spans):
-            continue
+        if exclude_diagrams:
+            while span_idx < len(spans) and spans[span_idx]["end"] <= start:
+                span_idx += 1
+            if span_idx < len(spans) and start < spans[span_idx]["end"] and end > spans[span_idx]["start"]:
+                continue
         total += 1
         if start < offset:
             continue
@@ -1083,37 +1225,8 @@ def search_source(source: str, query: str, limit: int = 10, context: int = 100, 
 
 
 def _svg_spans(text: str) -> list[dict]:
-    spans = []
-    offset = 0
-    line_number = 1
-    opened = None
-    for line in text.splitlines(keepends=True):
-        body = line.rstrip("\r\n")
-        match = _FENCE.match(body)
-        if match:
-            marker = match.group(1)
-            if opened is None:
-                info = body[match.end():].strip().split(None, 1)
-                language = info[0].casefold() if info else ""
-                opened = {"char": marker[0], "size": len(marker), "body_start": offset + len(line),
-                          "line_start": line_number + 1, "svg": language in ("svg", "svg+xml", "image/svg+xml"),
-                          "probe": []}
-            elif marker[0] == opened["char"] and len(marker) >= opened["size"]:
-                if opened["svg"] or "".join(opened["probe"]).lstrip().lower().startswith("<svg"):
-                    spans.append({"start": opened["body_start"], "end": offset,
-                                  "line_start": opened["line_start"], "line_end": max(opened["line_start"], line_number - 1)})
-                opened = None
-            offset += len(line)
-            line_number += 1
-            continue
-        if opened is not None and len(opened["probe"]) < 4:
-            opened["probe"].append(body[:512])
-        offset += len(line)
-        line_number += 1
-    if opened is not None and (opened["svg"] or "".join(opened["probe"]).lstrip().lower().startswith("<svg")):
-        spans.append({"start": opened["body_start"], "end": len(text), "line_start": opened["line_start"],
-                      "line_end": max(opened["line_start"], line_number - 1)})
-    return spans
+    _, fences = _scan_read_only(text, collect_fences=True)
+    return [span.to_svg_dict() for span in fences if span.is_svg]
 
 
 def _prose_page_end(start: int, limit: int, max_end: int, spans: list[dict]) -> int:

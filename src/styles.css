@@ -212,7 +212,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .zoom-controls { gap: 1px; padding: 2px; border-radius: 999px; background: var(--surface-low); }
 .zoom-controls button { min-width: 26px; height: 25px; display: grid; place-items: center; padding: 3px; border-radius: 7px; color: var(--muted); font-size: .69rem; font-weight: 750; }
 .reading-scroll { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--outline) transparent; }
-.reading-scroll,.live-pane,.android-reading,.cm-scroller { overflow-anchor: none; box-sizing: border-box; }
+.reading-scroll,.live-pane,.android-reading,.cm-scroller { overflow-anchor: none; }
 .markdown-body [data-heading-key] { scroll-margin-top: 24px; }
 .link-thumbnail-preview { width: min(100%,360px); aspect-ratio: 16/9; object-fit: contain; border-radius: 16px; background: var(--surface-low); }
 .image-viewer { position: fixed; inset: 0; z-index: 200; display: grid; grid-template-rows: auto minmax(0,1fr) auto; background: color-mix(in srgb,var(--surface) 96%,transparent); color: var(--text); }
@@ -808,3 +808,6 @@ button.code-copy:active { border-radius:10px; }
  .step-viewer .is-visual-only .step-cards-notes { position:absolute; top:4px; left:4px; z-index:2; max-width:calc(100% - 8px); pointer-events:none; }
  .step-viewer .is-visual-only .step-cards-legacy-note { pointer-events:auto; }
 }
+.reader-link-notice { position:sticky; top:calc(var(--native-chrome-inset,0px) + 12px); z-index:20; display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 14px; padding:10px 14px; border:1px solid var(--outline,var(--code-border)); border-radius:14px; background:var(--surface-high,var(--surface,#fff)); color:var(--text,#20252d); box-shadow:0 4px 18px #0002; font-size:.9em; line-height:1.4; }
+.reader-link-notice button { flex:none; min-height:32px; padding:4px 12px; border:1px solid var(--outline,var(--code-border)); border-radius:999px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.reader-link-notice button:hover,.reader-link-notice button:focus-visible { background:color-mix(in srgb,var(--primary,#6750a4) 14%,transparent); outline:2px solid transparent; }
