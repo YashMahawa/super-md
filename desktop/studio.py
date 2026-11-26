@@ -817,6 +817,7 @@ class Session(QObject):
 
 class Studio(QObject):
     changed = Signal()
+    sidebarChanged = Signal()
     shortcutsChanged = Signal()
     workspaceSearchChanged = Signal()
     workspaceSearchBatch = Signal(int, object, int, bool, bool)
@@ -920,7 +921,9 @@ class Studio(QObject):
         self.external_timer.timeout.connect(self._refresh_external_notes)
         self.active = ""
         self.folder = ""
-        self.files: list[dict] = []
+        self._files: list[dict] = []
+        self._files_revision = 0
+        self._outline_revision = 0
         self.expanded: set[str] = set()
         self.folder_filter = ""
         self._folder_searching = False
@@ -1081,6 +1084,7 @@ class Studio(QObject):
             QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
         if restore_enabled and restore_folder:
             self._restore_workspace_folder(restore_folder, restore_expanded)
+        self._emitted_sidebar_key = self._sidebar_slice_key()
         self._refresh_theme()
         # Only the first real desktop window may restore the user's opted-in
         # cloud connection. The cloud client handles network retry/backoff.
@@ -1110,6 +1114,17 @@ class Studio(QObject):
         self._emit(False)
 
     @property
+    def files(self): return getattr(self, "_files", [])
+
+    @files.setter
+    def files(self, value):
+        current = getattr(self, "_files", None)
+        if current is not None and value == current:
+            return
+        self._files = value
+        self._files_revision = getattr(self, "_files_revision", 0) + 1
+
+    @property
     def recent(self): return self.session.recent
 
     @recent.setter
@@ -1135,6 +1150,8 @@ class Studio(QObject):
             self.session.pinned.append(matched_recent)
         self.recent=self.recent
         self._preferences()
+        for window in tuple(self.session.windows.values()):
+            window._notify_sidebar()
 
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
         assets = dict(assets) if assets else {}
@@ -1151,8 +1168,8 @@ class Studio(QObject):
             return True
         return False
 
-    @Property("QStringList",notify=changed)
-    def pinnedRecent(self):return self.session.pinned
+    @Property("QStringList",notify=sidebarChanged)
+    def pinnedRecent(self):return list(self.session.pinned)
 
     def _current(self):
         if not self.tabs:
@@ -1172,9 +1189,18 @@ class Studio(QObject):
         self._pending_seeded_find = None
         return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
 
+    def _notify_sidebar(self):
+        if self.retired:
+            return
+        key = self._sidebar_slice_key()
+        if key != getattr(self, "_emitted_sidebar_key", None):
+            self._emitted_sidebar_key = key
+            self.sidebarChanged.emit()
+
     def _emit(self, load=True):
         if self.retired: return
         self._watch_notes()
+        self._notify_sidebar()
         self.changed.emit()
         if load and self.ready and self.tabs:
             tab = self._current()
@@ -1539,10 +1565,170 @@ class Studio(QObject):
             self.system_preferences.terminate()
             self.system_preferences.waitForFinished(300)
 
+    def _folder_slice_key(self, files):
+        return (
+            self.folder,
+            self.folder_filter,
+            bool(self._folder_searching),
+            getattr(self, "_files_revision", 0),
+            id(files),
+            len(files),
+        )
+
+    _EMPTY_OUTLINE = ()
+
+    def _tab_outline(self, tab):
+        outline = tab.get("outline")
+        return outline if isinstance(outline, list) and outline else self._EMPTY_OUTLINE
+
+    def _outline_slice_key(self, active_id, outline):
+        return (
+            active_id,
+            getattr(self, "_outline_revision", 0),
+            id(outline),
+            len(outline),
+        )
+
+    def _sidebar_slice_key(self):
+        tab = self._current()
+        active_id = self.active if self.tabs else ""
+        outline = self._tab_outline(tab)
+        files = self.files
+        return (
+            self._folder_slice_key(files),
+            self._outline_slice_key(active_id, outline),
+            (tuple(self.recent), tuple(self.session.pinned)),
+        )
+
+    def _cached_folder_slice_json(self, folder_key, files):
+        cached = getattr(self, "_folder_slice_cache", None)
+        if cached is not None and cached[0] == folder_key:
+            return cached[1]
+        encoded = json.dumps({
+            "folder": self.folder,
+            "folderFilter": self.folder_filter,
+            "folderSearching": bool(self._folder_searching),
+            "files": files,
+        })[1:-1]
+        self._folder_slice_cache = (folder_key, encoded)
+        return encoded
+
+    def _cached_outline_slice_json(self, outline_key, outline):
+        cached = getattr(self, "_outline_slice_cache", None)
+        if cached is not None and cached[0] == outline_key:
+            return cached[1]
+        encoded = json.dumps(outline)
+        self._outline_slice_cache = (outline_key, encoded)
+        return encoded
+
+    def _cached_recent_slice_json(self, recent_tuple):
+        cached = getattr(self, "_recent_slice_cache", None)
+        if cached is not None and cached[0] == recent_tuple:
+            return cached[1]
+        encoded = json.dumps(list(recent_tuple))
+        self._recent_slice_cache = (recent_tuple, encoded)
+        return encoded
+
+    def _cached_pinned_slice_json(self, pinned_tuple):
+        cached = getattr(self, "_pinned_slice_cache", None)
+        if cached is not None and cached[0] == pinned_tuple:
+            return cached[1]
+        encoded = json.dumps(list(pinned_tuple))
+        self._pinned_slice_cache = (pinned_tuple, encoded)
+        return encoded
+
+    def _cached_tabs_slice_json(self):
+        tabs_key = tuple(
+            (t["id"], t["name"], t["path"], self._is_dirty(t), bool(t.get("conflict")))
+            for t in self.tabs
+        )
+        cached = getattr(self, "_tabs_slice_cache", None)
+        if cached is not None and cached[0] == tabs_key:
+            return cached[1]
+        encoded = json.dumps([
+            {"id": tid, "name": name, "path": path, "dirty": dirty, "conflict": conflict}
+            for tid, name, path, dirty, conflict in tabs_key
+        ])
+        self._tabs_slice_cache = (tabs_key, encoded)
+        return encoded
+
+    def _cached_colors_slice_json(self):
+        dark, palette = self._tokens()
+        token_key = getattr(self, "_token_key", None)
+        cached = getattr(self, "_colors_slice_cache", None)
+        if token_key is not None and cached is not None and cached[0] == token_key:
+            return dark, cached[1]
+        encoded = json.dumps(dict(palette))
+        self._colors_slice_cache = (token_key, encoded)
+        return dark, encoded
+
+    @Property(str, notify=sidebarChanged)
+    def sidebarSnapshot(self):
+        tab = self._current()
+        active_id = self.active if self.tabs else ""
+        outline = self._tab_outline(tab)
+        files = self.files
+        folder_key = self._folder_slice_key(files)
+        outline_key = self._outline_slice_key(active_id, outline)
+        recent_tuple = tuple(self.recent)
+        pinned_tuple = tuple(self.session.pinned)
+        sidebar_key = (folder_key, outline_key, (recent_tuple, pinned_tuple))
+        cached = getattr(self, "_sidebar_snapshot_cache", None)
+        if cached is not None and cached[0] == sidebar_key:
+            return cached[1]
+        folder_fragment = self._cached_folder_slice_json(folder_key, files)
+        outline_json = self._cached_outline_slice_json(outline_key, outline)
+        recent_json = self._cached_recent_slice_json(recent_tuple)
+        pinned_json = self._cached_pinned_slice_json(pinned_tuple)
+        encoded = (
+            '{"active": ' + json.dumps(active_id)
+            + ", " + folder_fragment
+            + ', "outline": ' + outline_json
+            + ', "recent": ' + recent_json
+            + ', "pinned": ' + pinned_json
+            + "}"
+        )
+        self._sidebar_snapshot_cache = (sidebar_key, encoded)
+        return encoded
+
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active if self.tabs else "", "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "folderFilter": self.folder_filter, "folderSearching": self._folder_searching, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
+        active_id = self.active if self.tabs else ""
+        outline = self._tab_outline(tab)
+        files = self.files
+        tabs_json = self._cached_tabs_slice_json()
+        folder_fragment = self._cached_folder_slice_json(self._folder_slice_key(files), files)
+        outline_json = self._cached_outline_slice_json(self._outline_slice_key(active_id, outline), outline)
+        recent_json = self._cached_recent_slice_json(tuple(self.recent))
+        dark, colors_json = self._cached_colors_slice_json()
+        head_fragment = json.dumps({
+            "active": active_id,
+            "name": tab["name"],
+            "portable": tab["portable"],
+            "conflict": bool(tab.get("conflict")),
+            "closedCount": len(self.closed_tabs),
+            "settings": self.settings,
+            "mode": self.mode,
+            "fullscreen": self.fullscreen,
+            "readerOverlay": self.reader_overlay,
+            "imageOverlay": self.image_overlay,
+            "readerReady": self.ready,
+            "dark": dark,
+            "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"],
+            "busy": self.busy > 0,
+            "message": self.message,
+            "messageRevision": getattr(self, "_message_revision", 0),
+        })[1:-1]
+        return (
+            '{"tabs": ' + tabs_json
+            + ", " + head_fragment
+            + ', "outline": ' + outline_json
+            + ", " + folder_fragment
+            + ', "recent": ' + recent_json
+            + ', "colors": ' + colors_json
+            + "}"
+        )
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
     def folderSearchState(self):
@@ -3438,6 +3624,10 @@ class Studio(QObject):
     def _start_subfolder_search(self):
         if self.retired:
             return
+        self.filter_timer.stop()
+        if self._search_cancel is not None:
+            self._search_cancel.set()
+            self._search_cancel = None
         folder = self.folder
         needle = self.folder_filter.strip().casefold()
         if not folder or not needle:
@@ -3557,6 +3747,26 @@ class Studio(QObject):
         self._recover()
         self._emit(False)
         self._load_tree()
+
+    def _is_within_open_folder(self, candidate) -> bool:
+        folder = getattr(self, "folder", "")
+        if not folder or not candidate:
+            return False
+        try:
+            return folder_ops.matches_path_prefix(str(candidate), folder, is_directory=True)
+        except (OSError, ValueError):
+            return False
+
+    def _refresh_open_folder_trees(self, *candidates) -> None:
+        if not candidates:
+            return
+        session = getattr(self, "session", None)
+        windows = tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (self,)
+        for window in windows:
+            if getattr(window, "retired", False) or not hasattr(window, "_load_tree"):
+                continue
+            if any(Studio._is_within_open_folder(window, candidate) for candidate in candidates if candidate):
+                window._load_tree()
 
     def _load_tree(self):
         self._tree_generation = getattr(self, "_tree_generation", 0) + 1
@@ -3941,6 +4151,8 @@ class Studio(QObject):
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
+            if str(path) != original_path:
+                self._refresh_open_folder_trees(path, original_path)
             if self.pending_close:
                 self._finish_close()
         def write():
@@ -3980,10 +4192,18 @@ class Studio(QObject):
         for win in list(self.session.windows.values()):
             if win.retired:
                 continue
+            for stamp_key in list(win.note_file_stamps.keys()):
+                if folder_ops.matches_path_prefix(stamp_key, old_path, is_directory=is_dir):
+                    win.note_file_stamps.pop(stamp_key, None)
             for tab in win.tabs:
                 if tab["path"] and folder_ops.matches_path_prefix(tab["path"], old_path, is_directory=is_dir):
                     updated = folder_ops.remap_path_prefix(tab["path"], old_path, new_path, is_directory=is_dir)
                     tab.update(path=updated, name=Path(updated).name)
+                    try:
+                        st = Path(updated).stat()
+                        win.note_file_stamps[updated] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
         for path_set in (self._agent_open_paths, self._agent_owned_files):
             remapped = {folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in path_set}
             path_set.clear()
@@ -5063,6 +5283,8 @@ class Studio(QObject):
             self._agent_open_paths.add(str(resolved_path))
             self._recover()
             self._emit()
+            if path_changed:
+                Studio._refresh_open_folder_trees(self, resolved_path, old_canonical_path or old_path)
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
                     "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
                     "pathChanged": path_changed, "oldPath": old_canonical_path or old_path,
@@ -5695,13 +5917,19 @@ class Studio(QObject):
                 headings = args.get("headings", [])
                 if not isinstance(headings, list) or len(headings) > 2000: raise ValueError("Invalid outline")
                 changed=bool(target and target.get("outline",[])!=headings)
+                name_changed=False
                 if target:
-                    target["outline"] = headings
+                    if changed:
+                        target["outline"] = headings
+                        self._outline_revision = getattr(self, "_outline_revision", 0) + 1
                     if not target["path"] and target["name"].startswith("Untitled") and headings:
                         title = str(headings[0].get("title", "")).strip()
                         title = "".join(c for c in title if c not in '/\\:*?"<>|' and ord(c) >= 32).strip(". ")[:120]
-                        if title: target["name"] = title + (".smd" if target["portable"] else ".md")
-                if changed:self._emit(False)
+                        if title:
+                            new_name = title + (".smd" if target["portable"] else ".md")
+                            name_changed = new_name != target["name"]
+                            target["name"] = new_name
+                if changed or name_changed:self._emit(False)
                 self.replied.emit(id,"true",""); return
             if command == "document_flushed":
                 operation = args.get("operation")
@@ -6140,10 +6368,16 @@ class Studio(QObject):
                         self.message = "Saved"
                         self._recover()
                         self._emit()
+                        if path_changed:
+                            self._refresh_open_folder_trees(save_as)
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
                     self.pending_save_as_tab = ""
-                elif command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                elif command.startswith("export_"):
+                    exported_path = result["path"]
+                    self.message = f"Exported {Path(exported_path).name}"
+                    if is_searchable_note_name(Path(exported_path).name):
+                        self._refresh_open_folder_trees(exported_path)
                 if agent_export_info:
                     record = self._agent_job_records.get(agent_export_info.get("jobId"))
                     if record:
