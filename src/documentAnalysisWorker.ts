@@ -372,11 +372,13 @@ export class DocumentAnalysisWorkerClient {
   }
 }
 
+export const WORKER_ANALYSIS_MIN_CHARS=80_000;
 export const sharedDocumentAnalysisClient=new DocumentAnalysisWorkerClient();
 
 export interface UseDocumentAnalysisOptions {
   enabled?:boolean;
   client?:DocumentAnalysisWorkerClient;
+  minWorkerChars?:number;
 }
 
 export interface DocumentAnalysisState {
@@ -394,8 +396,8 @@ const EMPTY_OUTLINE:OutlineEntry[]=[];
 
 /**
  * Shared off-thread document analysis hook for Reader, Split, Live, and Source
- * modes across Android, desktop, and web, with clean synchronous fallback when
- * Workers are unavailable or fail.
+ * modes across Android, desktop, and web, with synchronous execution for small
+ * (`<= 80,000` chars) or Worker-unsupported documents.
  */
 export function useDocumentAnalysis(
   documentId:string|null,
@@ -405,9 +407,11 @@ export function useDocumentAnalysis(
 ):DocumentAnalysisState {
   const enabled=options.enabled??true;
   const client=options.client??sharedDocumentAnalysisClient;
+  const minWorkerChars=options.minWorkerChars??WORKER_ANALYSIS_MIN_CHARS;
+  const shouldRunSync=!client.isAvailable()||source.length<=minWorkerChars;
 
   const peeked=enabled&&documentId!==null?client.peek(source):null;
-  const syncImmediate=enabled&&documentId!==null&&!peeked&&!client.isAvailable()
+  const syncImmediate=enabled&&documentId!==null&&!peeked&&shouldRunSync
     ? {source,analysis:analyzeDocument(source)}
     : null;
   const immediate=peeked??syncImmediate;
@@ -465,7 +469,7 @@ export function useDocumentAnalysis(
       return;
     }
 
-    if(!client.isAvailable()){
+    if(shouldRunSync){
       const seq=++session.nextSeq;
       session.appliedSeq=seq;
       session.lastImmediateSource=source;
@@ -477,23 +481,26 @@ export function useDocumentAnalysis(
     }
 
     const hasPriorForDoc=retainedRef.current?.documentId===documentId;
-    const coalesceMs=mode==='editor'&&hasPriorForDoc&&source.length>80_000?120:0;
+    const coalesceMs=mode==='editor'&&hasPriorForDoc&&source.length>WORKER_ANALYSIS_MIN_CHARS?120:0;
     const seq=++session.nextSeq;
+    const requestController=new AbortController();
+    const abortRequest=()=>requestController.abort();
+    session.controller.signal.addEventListener('abort',abortRequest,{once:true});
     let timerId:ReturnType<typeof setTimeout>|null=null;
     let cancelledBeforeDispatch=false;
 
     const dispatch=()=>{
-      if(cancelledBeforeDispatch||session.controller.signal.aborted)return;
-      client.request(source,session.controller.signal).then(
+      if(cancelledBeforeDispatch||requestController.signal.aborted||session.controller.signal.aborted)return;
+      client.request(source,requestController.signal).then(
         result=>{
-          if(session.controller.signal.aborted||seq<session.appliedSeq)return;
+          if(requestController.signal.aborted||session.controller.signal.aborted||seq<session.appliedSeq)return;
           session.appliedSeq=seq;
           const next={documentId,value:result};
           retainedRef.current=next;
           setCompleted(prev=>prev?.documentId===documentId&&prev.value===result?prev:next);
         },
         (error:unknown)=>{
-          if(session.controller.signal.aborted||(error instanceof Error&&error.name==='AbortError'))return;
+          if(requestController.signal.aborted||session.controller.signal.aborted||(error instanceof Error&&error.name==='AbortError'))return;
           if(seq<session.appliedSeq)return;
           session.appliedSeq=seq;
           const fallback={source,analysis:analyzeDocument(source)};
@@ -513,8 +520,10 @@ export function useDocumentAnalysis(
     return()=>{
       cancelledBeforeDispatch=true;
       if(timerId!==null)clearTimeout(timerId);
+      session.controller.signal.removeEventListener('abort',abortRequest);
+      requestController.abort();
     };
-  },[enabled,documentId,source,mode,client]);
+  },[enabled,documentId,source,mode,client,shouldRunSync]);
 
   if(!enabled||documentId===null){
     return {pinnedAnalysis:null,exactAnalysis:null,outline:EMPTY_OUTLINE,isReady:false};

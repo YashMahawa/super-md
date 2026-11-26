@@ -97,4 +97,72 @@ class ReaderBarrierSyncTest {
         idleUntil { model.state.value.active.id == firstId }
         assertEquals(listOf(secondId), flushedNotes)
     }
+
+    @Test fun sameTurnNativeEditAndModeSwitchSucceedsBeforeNextComposeLoad() {
+        val store = ViewModelStore().also(stores::add)
+        val key = "barrier-edit-mode-${System.nanoTime()}".also(workspaceKeys::add)
+        val model = StudioViewModel(app, key)
+        store.put("model", model)
+
+        val activeId = model.state.value.active.id
+        val initialContent = model.state.value.active.content
+        val loadedNote = AtomicReference<String?>(activeId)
+        val webViewContent = AtomicReference<String>(initialContent)
+        val webViewFlushError = AtomicReference<String?>(null)
+        model.recordReaderLoad(activeId, initialContent)
+        model.readerLoadedNoteId = { loadedNote.get() }
+        model.readerFlushRequester = { noteId ->
+            val barrier = ReaderFlushBarrier()
+            val req = barrier.register("strict-$noteId", noteId, allowPendingNativeLoad = false)
+            barrier.complete(
+                req.token,
+                noteId,
+                webViewContent.get(),
+                model.state.value.tabs.firstOrNull { it.id == noteId }?.content,
+                dispatchedContent = model.readerDispatchedContent[noteId],
+                error = webViewFlushError.get(),
+            )
+            req.result.await()
+        }
+        model.readerBarrierFlushRequester = { noteId ->
+            val barrier = ReaderFlushBarrier()
+            val req = barrier.register("barrier-$noteId", noteId, allowPendingNativeLoad = true)
+            barrier.complete(
+                req.token,
+                noteId,
+                webViewContent.get(),
+                model.state.value.tabs.firstOrNull { it.id == noteId }?.content,
+                dispatchedContent = model.readerDispatchedContent[noteId],
+                error = webViewFlushError.get(),
+            )
+            req.result.await()
+        }
+
+        // Start in reader mode (e.g. left over from a prior reader-mode action).
+        model.mode("reader")
+        idleUntil { model.state.value.mode == "reader" }
+        assertNull(model.state.value.message)
+
+        // Mutate content and switch mode in the same main-thread turn before Compose's next
+        // LaunchedEffect frame has dispatched supermdLoad(repairedTarget) to WebView.
+        val original = "Given \\frac{a}{b} = c, continue."
+        model.edit(activeId, original)
+        model.mode("live")
+        idleUntil { model.state.value.mode == "live" }
+        assertEquals(original, model.state.value.active.content)
+        assertNull(model.state.value.message)
+
+        // Simulate Compose LaunchedEffect now dispatching supermdLoad(original) to WebView.
+        webViewContent.set(original)
+        model.recordReaderLoad(activeId, original)
+
+        // If WebView holds an unacknowledged conflicting draft, the barrier still rejects mode changes.
+        webViewContent.set("unacknowledged reader draft")
+        webViewFlushError.set("Reader flush conflict")
+        model.edit(activeId, sample)
+        model.mode("reader")
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals("live", model.state.value.mode)
+        assertTrue(model.state.value.message?.contains("could not confirm") == true)
+    }
 }

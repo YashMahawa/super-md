@@ -16,6 +16,7 @@ import { analyzeDocument } from "./documentAnalysis";
 import { svgImage } from "./svgImage";
 import { remarkObsidianMath } from "./obsidianMath";
 import { remarkSvgBlocks } from "./svgBlocks";
+import { remarkBracedFences } from "./fenceLanguage";
 import { remarkStudySyntax } from "./studySyntax";
 import {parseStepDeck} from "./components/StepCards";
 import {parseDiagramSource} from "./components/InlineDiagram";
@@ -310,8 +311,8 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).use(remarkStudySyntax).use(remarkStringify);
   const front = parseFrontmatter(markdown)?.raw || "";
   const normalized = normalizeCallouts(markdown);
-  // parse() runs no transformers: lift raw <svg> markup into svg blocks here.
-  const tree = remarkSvgBlocks()(processor.parse(normalized), { value: normalized });
+  // parse() runs no transformers: lift raw <svg> markup and braced fences here.
+  const tree = remarkBracedFences()(remarkSvgBlocks()(processor.parse(normalized), { value: normalized }));
   liftHtmlImages(tree);
   const work: Array<()=>Promise<void>> = []; const assets: Record<string, string> = {}; let count = 0;
   const referenceDefinitions=new Map<string,any>();
@@ -441,7 +442,6 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
           if (warning) throw new Error(`Chart cannot export: ${warning.textContent}`);
           const graph = parsed.querySelector("svg");
           if (!graph) throw new Error(`Chart cannot export: ${parsed.body.textContent}`);
-          graph.setAttribute("xmlns", "http://www.w3.org/2000/svg");
           graph.querySelectorAll(".chart-axis").forEach((axis) => axis.setAttribute("stroke", "#667085"));
           graph.querySelectorAll(".chart-grid").forEach((axis) => axis.setAttribute("stroke", "#d5dbe5"));
           graph.querySelectorAll("text:not(.chart-curve-label)").forEach((text) => { text.setAttribute("fill", "#20252d"); text.setAttribute("font-size", "14"); });

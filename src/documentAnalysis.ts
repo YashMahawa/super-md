@@ -6,8 +6,10 @@ import {visit} from 'unist-util-visit';
 import type {Root} from 'mdast';
 import {remarkObsidianMath} from './obsidianMath';
 import {remarkSvgBlocks} from './svgBlocks';
+import {remarkBracedFences} from './fenceLanguage';
 import {remarkImageAttributes,remarkSourceSyntax} from './markdownSource';
 import {remarkStudySyntax} from './studySyntax';
+import {remarkEquationReferences} from './equationReferences';
 import {parseFrontmatter,type ParsedFrontmatter} from './frontmatter';
 import {headingSlug} from './headingSlug';
 
@@ -18,7 +20,6 @@ export interface PythonCellSource {source:string;ordinal:number;offset:number}
 export interface DocumentAnalysis {tree:Root;blocks:SourceBlock[];bodyBlocks:SourceBlock[];frontmatter:ParsedFrontmatter|null;outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
 export interface CompactDocumentAnalysis {tree:Root;blockRanges:SourceBlockRange[];bodyBlockRanges:SourceBlockRange[];frontmatter:ParsedFrontmatter|null;outline:OutlineEntry[];tasks:number[];pythonCells:PythonCellSource[]}
 export interface SourceDocumentAnalysis {source:string;analysis:DocumentAnalysis}
-
 function createLazySourceBlock(source:string,start:number,end:number):SourceBlock {
   let sliced:string|undefined;
   return {
@@ -66,7 +67,7 @@ export function hydrateDocumentAnalysis(source:string,compact:CompactDocumentAna
   };
 }
 
-const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use([remarkImageAttributes,remarkSvgBlocks,remarkStudySyntax]);
+const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use([remarkImageAttributes,remarkSvgBlocks,remarkBracedFences,remarkStudySyntax,remarkEquationReferences]);
 const cache=new Map<string,{value:DocumentAnalysis;weight:number}>();let retained=0;
 const LIMIT=8_000_000;
 function textOf(node:any):string{return typeof node.value==='string'?node.value:(node.children||[]).map(textOf).join('');}

@@ -13,12 +13,6 @@ from documents import atomic_json
 import updates
 
 class QuietStudio(Studio):
-    def __init__(self, isolated: bool = False, session: Session | None = None):
-        session = session or Session(isolated)
-        if not session.settings.get("python"):
-            session.settings["python"] = sys.executable
-        super().__init__(isolated, session)
-
     def _refresh_theme(self):
         self.system_dark = True
 
@@ -217,6 +211,7 @@ class StudioTest(unittest.TestCase):
         self.session = Session(True)
         self.windows = []
         self.studio = self.window()
+        self.session.writes.flush(timeout=3)
 
     def window(self):
         window = QuietStudio(True,self.session)
@@ -239,6 +234,7 @@ class StudioTest(unittest.TestCase):
         for window in self.windows:
             window.stop()
             window.pool.shutdown(wait=True,cancel_futures=True)
+            window._search_pool.shutdown(wait=True,cancel_futures=True)
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
 
@@ -319,6 +315,142 @@ class StudioTest(unittest.TestCase):
         studio._choose_default_python()
         studio._submit(lambda:1,lambda *_:self.fail("Retired callback ran"))
         studio._complete((lambda *_:self.fail("Retired callback ran"),None,None,False))
+
+    def test_startup_populates_default_python_before_reader_load_without_probing(self):
+        with (
+            patch("python_runtime.probe", side_effect=AssertionError("startup must not probe Python")),
+            patch("python_runtime.discover", side_effect=AssertionError("startup must not discover Python")),
+        ):
+            fresh_session = Session(True)
+            self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+            self.assertEqual(fresh_session.settings["python"], "")
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            self.assertFalse(fresh_studio.pythonBusy)
+            self.assertTrue(fresh_studio.settings["python"])
+            loads = []
+            fresh_studio.readerLoad.connect(loads.append)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.assertEqual(json.loads(loads[-1])["python"], fresh_studio.settings["python"])
+            self.app.processEvents()
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            saved_session = Session(True)
+            self.addCleanup(lambda: saved_session.writes.shutdown(wait=True))
+            saved_session.settings["python"] = sys.executable
+            saved_studio = QuietStudio(True, saved_session)
+            self.windows.append(saved_studio)
+            self.assertFalse(saved_studio.pythonBusy)
+            self.assertEqual(saved_studio.settings["python"], sys.executable)
+            self.app.processEvents()
+
+    def test_startup_default_python_persists_during_init_without_reader_ready_or_ui_completion(self):
+        fresh_session = Session(True)
+        self.addCleanup(lambda: fresh_session.writes.shutdown(wait=True))
+        submitted_writes = []
+        original_submit = fresh_session.writes.submit
+
+        def record_submit(fn, *args, **kwargs):
+            submitted_writes.append(fn)
+            return original_submit(fn, *args, **kwargs)
+
+        with patch.object(fresh_session.writes, "submit", side_effect=record_submit):
+            fresh_studio = QuietStudio(True, fresh_session)
+            self.windows.append(fresh_studio)
+            # Queued directly during __init__ before any QTimer.singleShot(0) or reader_ready runs.
+            self.assertEqual(len(submitted_writes), 1)
+            fresh_session.writes.flush(timeout=3)
+            stored = json.loads((fresh_session.data / "settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(stored["settings"]["python"], fresh_studio.settings["python"])
+
+            completed_events = []
+            fresh_studio.completed.connect(completed_events.append)
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertEqual(completed_events, [])
+
+            writes_before_ready = len(submitted_writes)
+            fresh_studio.post("ready", "reader_ready", "{}")
+            self.app.processEvents()
+            self.assertEqual(len(submitted_writes), writes_before_ready)
+
+        with patch("studio.atomic_write", side_effect=OSError("disk full")):
+            fresh_studio._preferences(False)
+            fresh_session.writes.flush(timeout=3)
+            self.app.processEvents()
+            self.assertIn("disk full", fresh_studio.message)
+
+    def test_concurrent_refresh_python_and_preferred_share_single_discover_run(self):
+        import concurrent.futures
+        import threading
+        import python_runtime
+
+        studio = self.studio
+        started = threading.Event()
+        release = threading.Event()
+        probe_calls = 0
+        lock = threading.Lock()
+
+        def controlled_probe(executable, timeout=6):
+            nonlocal probe_calls
+            with lock:
+                probe_calls += 1
+            started.set()
+            release.wait(5)
+            return {
+                "version": "3.12.0",
+                "prefix": sys.prefix,
+                "venv": True,
+                "matplotlib": True,
+                "numpy": True,
+                "venvModule": True,
+            }
+
+        with (
+            patch("python_runtime.bundled_available", return_value=False),
+            patch("python_runtime.candidates", return_value=[Path(sys.executable)]),
+            patch("python_runtime.probe", side_effect=controlled_probe),
+        ):
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            self.assertTrue(started.wait(2))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+                preferred_future = caller.submit(python_runtime.preferred, studio.data / "python-env")
+                time.sleep(0.05)
+                release.set()
+                chosen = preferred_future.result(timeout=5)
+            self._wait_for(lambda: not studio.pythonBusy)
+
+        self.assertEqual(probe_calls, 1)
+        self.assertEqual(chosen, sys.executable)
+        self.assertEqual([item["path"] for item in studio.python_choices], [sys.executable])
+
+    def test_default_python_selection_and_refresh_publish_discovered_choices(self):
+        studio = self.studio
+        studio.settings["python"] = ""
+        choices = [{"path": sys.executable, "label": "Virtual environment 3.13.0", "detail": ".venv · numpy + matplotlib ready",
+                    "matplotlib": True, "managed": False, "venv": True, "venvModule": True}]
+        pending = []
+        with patch.object(studio, "_submit", side_effect=lambda action, done, *_: pending.append((action, done))), \
+             patch("python_runtime.default_python", return_value=sys.executable) as default_python, \
+             patch("python_runtime.discover", return_value=choices) as discover:
+            studio._choose_default_python()
+            action, done = pending.pop()
+            done(action(), None)
+            default_python.assert_called_once_with(studio.data / "python-env")
+            self.assertEqual(studio.settings["python"], sys.executable)
+
+            studio.refreshPython()
+            self.assertTrue(studio.pythonBusy)
+            action, done = pending.pop()
+            done(action(), None)
+            discover.assert_called_once()
+            self.assertFalse(studio.pythonBusy)
+            self.assertEqual(json.loads(studio.pythonChoices), choices)
+            self.assertEqual(studio.pythonStatus, "")
 
     def test_pinned_recents_are_first_and_never_evicted_by_recent_opens(self):
         studio=self.studio;studio.recent=["/notes/pinned.md"]
@@ -1065,6 +1197,460 @@ class StudioTest(unittest.TestCase):
         self.assertNotEqual(studio._current()["content"],"Stale draft")
         self.assertEqual(studio.flush_operation["action"],"save")
 
+    def test_open_relative_note_opens_contained_targets_and_emits_one_shot_pending_heading(self):
+        studio = self.studio
+        studio.ready = True
+        loads = []
+        replies = []
+        studio.readerLoad.connect(lambda raw: loads.append(json.loads(raw)))
+        studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
+
+        folder = studio.data / "workspace"
+        sub = folder / "sub"
+        sub.mkdir(parents=True)
+        index_note = folder / "Index.md"
+        task_note = folder / "Task Note.md"
+        lecture_note = folder / "Lecture 2.md"
+        deck_note = sub / "study.smd"
+        index_note.write_text("# Index\n\n[[Task Note]]\n", encoding="utf-8")
+        task_note.write_text("# Task Note\n\nBody\n", encoding="utf-8")
+        lecture_note.write_text("# Lecture 2\n\n## Bayes\n\nPosterior\n", encoding="utf-8")
+        deck_note.write_text("# Portable text deck\n", encoding="utf-8")
+
+        studio.openFolder(str(folder))
+        studio.openNote(str(index_note))
+        self._wait_for(lambda: studio._current()["path"] == str(index_note.resolve()))
+        loads.clear()
+        replies.clear()
+
+        studio.post("rel-1", "open_workspace_link", json.dumps({
+            "documentPath": str(index_note.resolve()),
+            "target": "Task Note",
+            "wikilink": True,
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-1" for r in replies))
+        self.assertEqual(replies[-1][2], "")
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
+        self.assertEqual(studio._current()["path"], str(task_note.resolve()))
+        self.assertNotIn("pendingHeading", loads[-1])
+
+        loads.clear()
+        replies.clear()
+        noncanonical_task_ref = str(task_note.parent) + os.sep + "." + os.sep + task_note.name
+        alias_root = studio.data / "workspace-alias"
+        try:
+            alias_root.symlink_to(folder, target_is_directory=True)
+            noncanonical_task_ref = str(alias_root / task_note.name)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+        studio.post("rel-2", "open_workspace_link", json.dumps({
+            "documentPath": noncanonical_task_ref,
+            "target": "Lecture%202.md",
+            "fragment": "bayes",
+            "wikilink": False,
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-2" for r in replies))
+        self.assertEqual(replies[-1][2], "")
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
+        self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
+        self.assertEqual(len(loads), 1)
+        self.assertIn("content", loads[0])
+        pending = loads[0].get("pendingHeading")
+        self.assertIsInstance(pending, dict)
+        self.assertEqual(pending["heading"], "bayes")
+        self.assertTrue(bool(pending.get("token")))
+
+        # Subsequent emits must not re-send the one-shot pendingHeading.
+        loads.clear()
+        studio._emit()
+        self.assertNotIn("pendingHeading", loads[-1])
+
+        # Opening a subfolder .smd note and navigating back up within the authorized workspace folder succeeds.
+        replies.clear()
+        studio.post("rel-3", "open_relative_note", json.dumps({
+            "documentPath": str(lecture_note.resolve()),
+            "target": "sub/study.smd",
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-3" for r in replies))
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
+        self.assertEqual(studio._current()["path"], str(deck_note.resolve()))
+
+        loads.clear()
+        replies.clear()
+        studio.post("rel-4", "open_workspace_link", json.dumps({
+            "documentPath": str(deck_note.resolve()),
+            "target": "../Lecture%202.md",
+            "fragment": "bayes",
+            "wikilink": False,
+        }))
+        self._wait_for(lambda: any(r[0] == "rel-4" for r in replies))
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
+        self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
+        self.assertEqual(loads[-1].get("pendingHeading", {}).get("heading"), "bayes")
+
+    def test_open_relative_note_rejects_unsaved_notes_traversal_encoded_separators_null_bytes_and_symlinks(self):
+        studio = self.studio
+        studio.ready = True
+        replies = []
+        studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
+
+        # Unsaved note surfaces a status notice.
+        studio.newNote()
+        unsaved_id = studio.active
+        studio.post("unsaved", "open_workspace_link", json.dumps({
+            "documentPath": unsaved_id,
+            "target": "Task%20Note.md",
+            "wikilink": False,
+        }))
+        self._wait_for(lambda: any(r[0] == "unsaved" for r in replies))
+        payload = json.loads(replies[-1][1])
+        self.assertFalse(payload["opened"])
+        self.assertIn("Save this note", payload["message"])
+        self.assertEqual(studio.message, "Save this note before opening linked notes.")
+
+        sandbox = studio.data / "containment"
+        folder = sandbox / "guarded"
+        folder.mkdir(parents=True)
+        outside = sandbox / "outside.md"
+        outside.write_text("# Secret\n", encoding="utf-8")
+        inside = folder / "Inside.md"
+        inside.write_text("# Inside\n", encoding="utf-8")
+        symlink_note = folder / "Symlink.md"
+        has_symlink = False
+        try:
+            symlink_note.symlink_to(outside)
+            has_symlink = True
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+
+        studio.openNote(str(inside))
+        self._wait_for(lambda: studio._current()["path"] == str(inside.resolve()))
+
+        bad_targets = [
+            "../outside.md",
+            "../missing-outside.md",
+            "sub%2f..%2f..%2foutside.md",
+            "sub%5cnote.md",
+            "bad%00.md",
+            "bad\x00.md",
+            "/etc/passwd.md",
+        ]
+        if has_symlink:
+            bad_targets.append("Symlink.md")
+
+        for index, bad_target in enumerate(bad_targets):
+            replies.clear()
+            studio.message = ""
+            req = f"bad-{index}"
+            studio.post(req, "open_workspace_link", json.dumps({
+                "documentPath": str(inside.resolve()),
+                "target": bad_target,
+                "wikilink": False,
+            }))
+            self._wait_for(lambda: any(r[0] == req for r in replies))
+            self.assertEqual(replies[-1][2], "")
+            rejected = json.loads(replies[-1][1])
+            self.assertFalse(rejected["opened"], f"Expected rejection for {bad_target}")
+            self.assertTrue(bool(rejected.get("message")), f"Expected message for {bad_target}")
+            if bad_target.startswith("../"):
+                self.assertIn("outside the authorized folder", rejected["message"])
+            self.assertEqual(studio.message, rejected["message"])
+            self.assertEqual(studio._current()["path"], str(inside.resolve()))
+
+        if not has_symlink:
+            replies.clear()
+            studio.message = ""
+            with patch.object(Path, "is_symlink", autospec=True, side_effect=lambda p: p.name == "MockLink.md"):
+                studio.post("bad-mock-link", "open_workspace_link", json.dumps({
+                    "documentPath": str(inside.resolve()),
+                    "target": "MockLink.md",
+                    "wikilink": False,
+                }))
+                self._wait_for(lambda: any(r[0] == "bad-mock-link" for r in replies))
+            rejected = json.loads(replies[-1][1])
+            self.assertFalse(rejected["opened"])
+            self.assertIn("symlink", rejected["message"])
+
+        def _linux_inotify_fds() -> int | None:
+            fd_dir = Path("/proc/self/fd")
+            if not fd_dir.is_dir():
+                return None
+            total = 0
+            for entry in os.listdir(fd_dir):
+                try:
+                    if "inotify" in os.readlink(fd_dir / entry):
+                        total += 1
+                except OSError:
+                    pass
+            return total
+
+        inotify_before = _linux_inotify_fds()
+        self.assertTrue(studio.note_watcher.files() or studio.note_watcher.directories())
+        studio.stop()
+        self.assertEqual(studio.note_watcher.files(), [])
+        self.assertEqual(studio.note_watcher.directories(), [])
+        inotify_after = _linux_inotify_fds()
+        if inotify_before is not None and inotify_after is not None:
+            self.assertLessEqual(inotify_after, inotify_before - 3)
+
+    def test_open_relative_note_pending_heading_preserves_manual_tab_switch_and_batch_drop(self):
+        from unittest.mock import patch
+
+        studio = self.studio
+        studio.ready = True
+        loads = []
+        studio.readerLoad.connect(lambda payload: loads.append(json.loads(payload)))
+
+        folder = studio.data / "heading-drop-coexist"
+        folder.mkdir(parents=True, exist_ok=True)
+        index_note = folder / "index.md"
+        keep_note = folder / "keep.md"
+        linked_note = folder / "linked.md"
+        drop_a = folder / "drop-a.md"
+        drop_b = folder / "drop-b.md"
+        index_note.write_text("# Index\n\n[[linked#Target]]\n", encoding="utf-8")
+        keep_note.write_text("# Keep\n", encoding="utf-8")
+        linked_note.write_text("# Linked\n\n## Target\n", encoding="utf-8")
+        drop_a.write_text("# Drop A\n", encoding="utf-8")
+        drop_b.write_text("# Drop B\n", encoding="utf-8")
+
+        studio.openFolder(str(folder))
+        studio.openNote(str(index_note))
+        self._wait_for(lambda: studio._current()["path"] == str(index_note.resolve()))
+        studio.openNote(str(keep_note))
+        self._wait_for(lambda: studio._current()["path"] == str(keep_note.resolve()))
+        keep_id = studio.active
+        index_id = next(t["id"] for t in studio.tabs if t["path"] == str(index_note.resolve()))
+        studio.selectTab(index_id)
+
+        replies = []
+        studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
+        pending_reads: list[tuple[object, object]] = []
+
+        def intercept_submit(action, done, *args, **kwargs):
+            # Let background settings writes discard cleanly; capture worker tasks.
+            if done.__name__ == "_noop_done":
+                return
+            pending_reads.append((action, done))
+
+        with patch.object(studio, "_submit", side_effect=intercept_submit):
+            studio.post("rel-coexist", "open_workspace_link", json.dumps({
+                "documentPath": str(index_note.resolve()),
+                "target": "linked.md",
+                "fragment": "target",
+                "wikilink": False,
+            }))
+            self.assertEqual(len(pending_reads), 1)
+            resolve_action, resolve_done = pending_reads.pop()
+            resolve_done(resolve_action(), None)
+            self.assertEqual(len(pending_reads), 1)
+
+            # User manually selects keep_id before the linked note finishes loading.
+            studio.selectTab(keep_id)
+            loads.clear()
+            action, done = pending_reads.pop()
+            done(action(), None)
+
+        self.assertEqual(replies[-1][0], "rel-coexist")
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
+        self.assertEqual(studio.active, keep_id)
+        self.assertEqual(loads, [])
+        linked_tab = next(t for t in studio.tabs if t["path"] == str(linked_note.resolve()))
+        self.assertNotIn("pendingHeading", linked_tab)
+
+        # Selecting linked_tab manually later must restore ordinarily without pendingHeading.
+        studio.selectTab(linked_tab["id"])
+        self.assertEqual(studio.active, linked_tab["id"])
+        self.assertNotIn("pendingHeading", loads[-1])
+
+        # Batch drop still preserves drop order and activates the last dropped note.
+        pending_reads.clear()
+        with patch.object(studio, "_submit", side_effect=intercept_submit):
+            studio.handleExternalDrop(
+                [QUrl.fromLocalFile(str(drop_a)), QUrl.fromLocalFile(str(drop_b))],
+                True,
+            )
+            self.assertEqual(len(pending_reads), 2)
+            # Complete out of order: drop_b (1) then drop_a (0).
+            for idx in (1, 0):
+                action, done = pending_reads[idx]
+                done(action(), None)
+
+        self.assertEqual(studio._current()["path"], str(drop_b.resolve()))
+        tail_paths = [t["path"] for t in studio.tabs[-2:]]
+        self.assertEqual(tail_paths, [str(drop_a.resolve()), str(drop_b.resolve())])
+
+    def test_workspace_folder_and_expanded_subfolders_persist_across_restarts_tray_hides_and_multiwindow_shutdown(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root_a = Path(tmp) / "workspace-a"
+            sub_a = root_a / "math" / "algebra"
+            sub_a.mkdir(parents=True)
+            (root_a / "index.md").write_text("# Index\n")
+            (sub_a / "basis.md").write_text("# Basis\n")
+
+            root_b = Path(tmp) / "workspace-b"
+            sub_b = root_b / "physics"
+            sub_b.mkdir(parents=True)
+            (sub_b / "waves.md").write_text("# Waves\n")
+
+            # Open workspace A and expand nested subfolders in window 1.
+            self.studio.openFolder(str(root_a))
+            self.await_idle()
+            self.studio.toggleDirectory(str(root_a / "math"))
+            self.await_idle()
+            self.studio.toggleDirectory(str(sub_a))
+            self.await_idle()
+
+            # Tray hide preserves in-memory and persisted state (stop isn't called on hide,
+            # and persisted startup.json keeps folder + expanded).
+            self.flush()
+            persisted = json.loads((self.studio.data / "startup.json").read_text())
+            expected_expanded_a = {
+                str(root_a.resolve()),
+                str((root_a / "math").resolve()),
+                str(sub_a.resolve()),
+            }
+            win_entry = next(w for w in persisted["windows"] if w["windowId"] == self.studio.window_id)
+            self.assertEqual(win_entry["folder"], str(root_a.resolve()))
+            self.assertEqual(
+                set(win_entry["expanded"]),
+                expected_expanded_a,
+            )
+
+            # Open window 2 with workspace B and simulate multi-window tray quit
+            # (service.quitting=True before app.aboutToQuit sets session.quitting=True).
+            second = self.window()
+            second.openFolder(str(root_b))
+            self._wait_for(lambda: second.busy == 0)
+            second.toggleDirectory(str(sub_b))
+            self._wait_for(lambda: second.busy == 0)
+            self.flush()
+            expected_expanded_b = {str(root_b.resolve()), str(sub_b.resolve())}
+
+            class FakeService:
+                quitting = True
+
+            self.session.background = FakeService()
+            self.studio.stop()
+            second.stop()
+            self.flush()
+
+            # Restart with startup == "restore": both windows restore their workspace folders & expanded paths.
+            restored_session = Session(True, data=self.studio.data)
+            w1 = w2 = None
+            try:
+                w1 = QuietStudio(True, restored_session)
+                self.assertTrue(restored_session.has_pending_startup_windows())
+                w2 = QuietStudio(True, restored_session)
+                self.assertFalse(restored_session.has_pending_startup_windows())
+                self._wait_for(
+                    lambda: len(json.loads(w1.snapshot)["files"]) > 0
+                    and len(json.loads(w2.snapshot)["files"]) > 0
+                )
+
+                self.assertEqual(w1.folder, str(root_a.resolve()))
+                self.assertEqual(w1.expanded, expected_expanded_a)
+                w1_paths = {entry["path"] for entry in json.loads(w1.snapshot)["files"]}
+                self.assertIn(str((sub_a / "basis.md").resolve()), w1_paths)
+
+                self.assertEqual(w2.folder, str(root_b.resolve()))
+                self.assertEqual(w2.expanded, expected_expanded_b)
+                w2_paths = {entry["path"] for entry in json.loads(w2.snapshot)["files"]}
+                self.assertIn(str((sub_b / "waves.md").resolve()), w2_paths)
+            finally:
+                for w in (w1, w2):
+                    if w is not None:
+                        w.stop()
+                        w.pool.shutdown(wait=True, cancel_futures=True)
+                        w._search_pool.shutdown(wait=True, cancel_futures=True)
+                restored_session.writes.shutdown(wait=True)
+
+            # When startup != "restore", workspace folders are NOT restored on launch.
+            self.session.settings["startup"] = "new"
+            atomic_json(self.studio.data / "settings.json", {"settings": self.session.settings})
+            fresh_session = Session(True, data=self.studio.data)
+            fresh_win = None
+            try:
+                fresh_win = QuietStudio(True, fresh_session)
+                self.assertEqual(fresh_win.folder, "")
+                self.assertEqual(fresh_win.expanded, set())
+                self.assertFalse(fresh_session.has_pending_startup_windows())
+            finally:
+                if fresh_win is not None:
+                    fresh_win.stop()
+                    fresh_win.pool.shutdown(wait=True, cancel_futures=True)
+                    fresh_win._search_pool.shutdown(wait=True, cancel_futures=True)
+                fresh_session.writes.shutdown(wait=True)
+
+    def test_subfolder_search_scans_collapsed_subfolders_skips_hidden_and_symlinks_and_preserves_watchers(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "vault"
+            (root / "courses" / "algebra").mkdir(parents=True)
+            (root / "empty-branch" / "sub").mkdir(parents=True)
+            (root / ".obsidian").mkdir(parents=True)
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+
+            (root / "readme.md").write_text("# Root\n")
+            (root / "courses" / "algebra" / "1.2 Linear Algebra.md").write_text("# LA\n")
+            (root / "courses" / "algebra" / "scratch.txt").write_text("plain text note\n")
+            (root / "empty-branch" / "other.md").write_text("# Unrelated\n")
+            (root / ".obsidian" / "linear-secret.md").write_text("hidden dir\n")
+            (root / ".linear-hidden.md").write_text("hidden file\n")
+            (outside / "linear-external.md").write_text("outside\n")
+            try:
+                (root / "linked-outside").symlink_to(outside, target_is_directory=True)
+                (root / "courses" / "linear-link.md").symlink_to(outside / "linear-external.md")
+            except OSError:
+                pass
+
+            studio = self.studio
+            studio.openFolder(str(root))
+            self.await_idle()
+
+            # Collapsed subfolders are NOT watched at rest.
+            watched_dirs_before = set(studio.note_watcher.directories())
+            expected_root_only = {str(root.resolve())}
+            self.assertIn(str(root.resolve()), watched_dirs_before)
+            self.assertNotIn(str((root / "courses").resolve()), watched_dirs_before)
+            self.assertEqual(studio.expanded, expected_root_only)
+
+            # Search across collapsed subfolders finds matching note & ancestor dirs only.
+            studio.setFolderFilter("linear")
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            names = [item["name"] for item in snap["files"]]
+            self.assertEqual(names, ["courses", "algebra", "1.2 Linear Algebra.md"])
+            self.assertEqual(studio.expanded, expected_root_only, "Search must not mutate expanded folder state")
+            self.assertEqual(
+                set(studio.note_watcher.directories()),
+                watched_dirs_before,
+                "Search must not add collapsed subdirectories to QFileSystemWatcher",
+            )
+
+            # Rapid queries cancel stale searches cleanly and converge on the latest filter.
+            studio.setFolderFilter("readme")
+            studio.setFolderFilter("scratch")
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            self.assertEqual([item["name"] for item in snap["files"]], ["courses", "algebra", "scratch.txt"])
+
+            # Zero matches produces an empty list while preserving folderFilter in snapshot.
+            studio.setFolderFilter("nonexistent-xyz")
+            self._wait_for(lambda: not studio.filter_timer.isActive() and not studio._folder_searching)
+            snap = json.loads(studio.snapshot)
+            self.assertEqual(snap["folderFilter"], "nonexistent-xyz")
+            self.assertEqual(snap["files"], [])
+
+            # Closing (or reopening) folder clears the active filter automatically.
+            studio.closeFolder()
+            self.assertEqual(studio.folder_filter, "")
+            self.assertEqual(json.loads(studio.snapshot)["folderFilter"], "")
+
     def test_bundled_presets_saved_themes_override_resets_and_clean_exports(self):
         import custom_theme
         studio=self.studio;second=self.window()
@@ -1394,3 +1980,58 @@ class StudioTest(unittest.TestCase):
         self.assertFalse(studio._is_dirty(smd_tab))
         self.assertEqual(open_note(copy_smd), ("portable draft ![pic](assets/a.svg)", {"assets/a.svg": svg_a}, True))
         self.assertEqual(open_note(orig_smd), ("external smd", {}, True))
+
+    def test_stopped_and_unreferenced_studios_release_watchers_and_collect_cleanly(self):
+        import gc
+        import weakref
+
+        def inotify_fd_count():
+            if not Path("/proc/self/fd").is_dir():
+                return 0
+            count = 0
+            for entry in os.listdir("/proc/self/fd"):
+                try:
+                    if "inotify" in os.readlink(f"/proc/self/fd/{entry}"):
+                        count += 1
+                except OSError:
+                    pass
+            return count
+
+        gc.collect()
+        baseline_fds = inotify_fd_count()
+
+        watched_note = self.studio.data / "watched-lifecycle.md"
+        watched_note.write_text("# Watched\n", encoding="utf-8")
+
+        transient = Studio(True)
+        transient.openNote(str(watched_note))
+        deadline = time.monotonic() + 3
+        while transient.busy and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.assertTrue(transient.note_watcher.files() or transient.note_watcher.directories())
+        if Path("/proc/self/fd").is_dir():
+            self.assertGreater(inotify_fd_count(), baseline_fds)
+
+        transient_ref = weakref.ref(transient)
+        transient.stop()
+        self.assertEqual(transient.note_watcher.files(), [])
+        self.assertEqual(transient.note_watcher.directories(), [])
+        if Path("/proc/self/fd").is_dir():
+            self.assertEqual(inotify_fd_count(), baseline_fds)
+        del transient
+        gc.collect()
+        self.assertIsNone(transient_ref())
+
+        unstopped = Studio(True)
+        unstopped.openNote(str(watched_note))
+        deadline = time.monotonic() + 3
+        while unstopped.busy and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        unstopped_ref = weakref.ref(unstopped)
+        del unstopped
+        gc.collect()
+        self.assertIsNone(unstopped_ref())
+        if Path("/proc/self/fd").is_dir():
+            self.assertEqual(inotify_fd_count(), baseline_fds)

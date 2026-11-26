@@ -1,5 +1,6 @@
 """CI harness: preserve every native assertion and diagnose stalled Qt drivers."""
 import faulthandler
+import gc
 import os
 import platform
 import sys
@@ -7,6 +8,12 @@ import unittest
 from pathlib import Path
 
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Material")
+
+
+class _CleanupTestResult(unittest.TextTestResult):
+    def stopTest(self, test: unittest.TestCase) -> None:
+        super().stopTest(test)
+        gc.collect()
 
 
 def suite_watchdog_seconds(platform_name: str = sys.platform, machine: str | None = None) -> int:
@@ -28,8 +35,13 @@ if __name__ == "__main__":
     suite_timeout = suite_watchdog_seconds()
     faulthandler.dump_traceback_later(suite_timeout, exit=True)
     try:
-        suite=unittest.defaultTestLoader.discover(str(Path(__file__).parent),pattern="test_*.py")
-        result=unittest.TextTestRunner(verbosity=2).run(suite)
+        desktop_dir = str(Path(__file__).resolve().parent)
+        suite = unittest.defaultTestLoader.discover(
+            start_dir=desktop_dir,
+            pattern="test_*.py",
+            top_level_dir=desktop_dir,
+        )
+        result = unittest.TextTestRunner(verbosity=2, resultclass=_CleanupTestResult).run(suite)
     finally:
         faulthandler.cancel_dump_traceback_later()
     sys.exit(0 if result.wasSuccessful() else 1)

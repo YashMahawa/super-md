@@ -105,7 +105,7 @@ test("outlines nested CommonMark lists with Tab/Shift+Tab, preserves native undo
   const inserted = page.getByRole("textbox", { name: "Edit Markdown block" });
   await expect(inserted).toBeFocused();
   await expect(inserted).toHaveValue("");
-  await inserted.type("Bridge paragraph between list and closing note.");
+  await inserted.pressSequentially("Bridge paragraph between list and closing note.");
 
   // ArrowDown on the last line moves into the next block ("Plain closing note").
   await inserted.press("ArrowDown");
@@ -255,7 +255,7 @@ test("edits diagrams, images, unzoomed charts, and folded blocks via double-clic
   await page.mouse.dblclick(lastBlockBox.x + 80, lastBlockBox.y + lastBlockBox.height + 60);
   const appended = page.getByRole("textbox", { name: "Edit Markdown block" });
   await expect(appended).toBeFocused();
-  await appended.type("Post-diagram takeaway at the bottom of the note.");
+  await appended.pressSequentially("Post-diagram takeaway at the bottom of the note.");
   await expect
     .poll(() => page.evaluate(() => (window as any).latestContent as string))
     .toContain("```\n\nPost-diagram takeaway at the bottom of the note.");

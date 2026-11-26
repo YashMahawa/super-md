@@ -4,7 +4,12 @@ import type { Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { analyzeDocument, toCompactAnalysis, type SourceDocumentAnalysis } from "./documentAnalysis";
 import type { DocumentAnalysisWorkerRequest, DocumentAnalysisWorkerResponse } from "./documentAnalysis.worker";
-import { sharedDocumentAnalysisClient } from "./documentAnalysisWorker";
+import { WORKER_ANALYSIS_MIN_CHARS, sharedDocumentAnalysisClient } from "./documentAnalysisWorker";
+
+function largeNote(heading: string, fillerUnit: string): string {
+  const repeats = Math.ceil((WORKER_ANALYSIS_MIN_CHARS + 2_048) / fillerUnit.length);
+  return `# ${heading}\n\n${fillerUnit.repeat(repeats)}\n`;
+}
 
 const { native, readerTree, workerPool } = vi.hoisted(() => {
   if (typeof document !== "undefined") {
@@ -82,6 +87,7 @@ vi.mock("./components/Editor", () => ({
   editorViewContext: () => undefined,
   editorHistory: () => false,
   exportEditorSession: () => undefined,
+  formatEditorSession: () => false,
   importEditorSession: () => {},
   cachedEditorHistory: () => undefined,
 }));
@@ -157,10 +163,11 @@ it("waits for background worker analysis and DOM commit before resolving get_con
     root?.render(readerTree.element);
   });
 
+  const secondTabLarge = largeNote("Second tab", "Freshly activated alpha study paragraph for background worker analysis. ");
   await act(async () => {
     window.supermdLoad!({
       id: "tab-live",
-      content: "# Second tab\n\nFreshly activated body.\n",
+      content: secondTabLarge,
       path: "/vault/Second.md",
       mode: "reader",
       dark: false,
@@ -199,15 +206,18 @@ it("waits for background worker analysis and DOM commit before resolving get_con
   expect(viewport.height).toBe(680);
   expect(reading.heading).toBe("Second tab");
 
-  // Wholesale external replacement on the SAME tab id retains the reading container
-  // while get_context waits for the new worker analysis + DOM commit before resolving.
+  // Wholesale external replacement with an unrelated document on the SAME tab id
+  // must unmount stale "Second tab" DOM while worker analysis is in flight (preventing
+  // stale Run/diagram/heading elements from matching the new fixture), while get_context
+  // waits for the new worker analysis + DOM commit before resolving.
   const existingReading = host.querySelector(".android-reading");
   expect(existingReading).not.toBeNull();
 
+  const immersiveBase = largeNote("Immersive reading", "Replaced omega reference section with distinct lineage for external reload anchoring. ");
   await act(async () => {
     window.supermdLoad!({
       id: "tab-live",
-      content: "# Immersive reading\n\nReplaced note body.\n",
+      content: immersiveBase,
       path: "/vault/Second.md",
       mode: "reader",
       dark: false,
@@ -219,8 +229,9 @@ it("waits for background worker analysis and DOM commit before resolving get_con
     });
   });
 
-  // Container stays mounted across same-tab updates so scroll anchors survive.
-  expect(host.querySelector(".android-reading")).toBe(existingReading);
+  // Unrelated note replacement must not leave stale "Second tab" DOM mounted.
+  expect(host.querySelector(".android-reading")).toBeNull();
+  expect(host.querySelector("h1")).toBeNull();
 
   let replacedSettled = false;
   const replacedContextPromise = new Promise<{ result: Record<string, unknown> | null; error: string }>((resolve) => {
@@ -246,8 +257,54 @@ it("waits for background worker analysis and DOM commit before resolving get_con
   const { result: replacedContext, error: replacedError } = await replacedContextPromise;
   expect(replacedError).toBe("");
   expect((replacedContext!.reading as { heading: string }).heading).toBe("Immersive reading");
-  expect(host.querySelector(".android-reading")).toBe(existingReading);
+  const immersiveReading = host.querySelector(".android-reading");
+  expect(immersiveReading).not.toBeNull();
   expect(host.querySelector("h1")?.textContent).toBe("Immersive reading");
+
+  // Incremental external edit to the SAME document retains .android-reading so scroll
+  // anchors survive while get_context still awaits the updated worker analysis.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-live",
+      content: `${immersiveBase}\n## External update\nFresh text.\n`,
+      path: "/vault/Second.md",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  expect(host.querySelector(".android-reading")).toBe(immersiveReading);
+
+  let incrementalSettled = false;
+  const incrementalContextPromise = new Promise<{ result: Record<string, unknown> | null; error: string }>((resolve) => {
+    window.supermdAgentRequest!(
+      { requestId: "ctx-3", action: "get_context", tabId: "tab-live" },
+      (result, error) => {
+        incrementalSettled = true;
+        resolve({ result: result as Record<string, unknown> | null, error });
+      },
+    );
+  });
+
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(incrementalSettled).toBe(false);
+
+  await act(async () => {
+    workerPool.instances.forEach((worker) => worker.flushAll());
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  });
+
+  const { result: incrementalContext, error: incrementalError } = await incrementalContextPromise;
+  expect(incrementalError).toBe("");
+  expect(incrementalContext!.sourceLength).toBeGreaterThan(immersiveBase.length);
+  expect(host.querySelector(".android-reading")).toBe(immersiveReading);
 });
 
 it("hides desktop fullscreen chrome on wheel even before the initial worker analysis mounts .android-reading", async () => {
@@ -260,10 +317,11 @@ it("hides desktop fullscreen chrome on wheel even before the initial worker anal
   });
 
   try {
+    const fullscreenLarge = largeNote("Fullscreen note", "Desktop fullscreen study paragraph before initial worker completion. ");
     await act(async () => {
       window.supermdLoad!({
         id: "desktop-fullscreen-load",
-        content: "# Fullscreen note\n\nBody text.\n",
+        content: fullscreenLarge,
         path: null,
         mode: "reader",
         dark: false,
@@ -308,18 +366,39 @@ it("signals reader_ready without pre-spawning a worker and settles android_flush
   expect(native).toHaveBeenCalledWith(
     "document_flushed",
     expect.objectContaining({
-      id: "welcome-id",
+      id: "",
       token: "early-token",
       error: expect.stringContaining("not loaded"),
     }),
   );
 
-  // Once supermdLoad runs, android_flush resolves immediately even while background worker analysis is still pending.
+  // Small notes (<= 80,000 chars) mount synchronously without spawning a background worker.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "small-ext",
+      editProtocol: 1,
+      content: "# Small External Open\n\nImmediate synchronous body.\n",
+      path: "content://share/small.md",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  expect(workerPool.instances).toHaveLength(0);
+  expect(host.querySelector(".android-reading")).not.toBeNull();
+  expect(host.querySelector("h1")?.textContent).toBe("Small External Open");
+
+  // Large notes (> 80,000 chars) spawn the background worker and still settle android_flush immediately while pending.
+  const firstExternalLarge = largeNote("First External Open", "Large external markdown body analyzed off-thread. ");
   await act(async () => {
     window.supermdLoad!({
       id: "first-ext",
       editProtocol: 1,
-      content: "# First External Open\n\nFirst body.\n",
+      content: firstExternalLarge,
       path: "content://share/first.md",
       mode: "live",
       dark: false,
@@ -341,6 +420,6 @@ it("signals reader_ready without pre-spawning a worker and settles android_flush
   expect(native).toHaveBeenCalledWith("document_flushed", {
     id: "first-ext",
     token: "loaded-token",
-    content: "# First External Open\n\nFirst body.\n",
+    content: firstExternalLarge,
   });
 });

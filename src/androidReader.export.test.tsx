@@ -194,6 +194,117 @@ it("forwards the active note Python interpreter when preparing Markdown and Mark
   });
 });
 
+it("bundles companion assets and supports archive mode for agent export_document requests", async () => {
+  prepareMarkdown.mockResolvedValue({
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+  });
+  native.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "agent_export_native") {
+      return { accepted: true, jobId: (args as { requestId?: string } | undefined)?.requestId };
+    }
+    return null;
+  });
+
+  await mountReader();
+
+  const content = "# Study\n\n![Diagram](diagram.svg)\n";
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-agent-export",
+      content,
+      path: "/vault/Study.md",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+      python: "/opt/venv/bin/python",
+    });
+  });
+
+  const context = await callLiveAgent({ action: "get_context", tabId: "tab-agent-export" });
+
+  await callLiveAgent({
+    action: "export_document",
+    tabId: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-md",
+    format: "md",
+    filename: "Study.md",
+    options: { pageSize: "a4" },
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: false,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-md",
+    format: "md",
+    filename: "Study.md",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: { pageSize: "a4" },
+  });
+
+  prepareMarkdown.mockClear();
+  native.mockClear();
+  await callLiveAgent({
+    action: "export_document",
+    tabId: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-mdzip",
+    format: "md",
+    filename: "Study.zip",
+    options: { archive: true },
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: true,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-mdzip",
+    format: "mdzip",
+    archive: true,
+    filename: "Study.zip",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: {},
+  });
+
+  prepareMarkdown.mockClear();
+  native.mockClear();
+  await callLiveAgent({
+    action: "export_document",
+    tabId: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-direct-mdzip",
+    format: "mdzip",
+    filename: "Bundle",
+  });
+  expect(prepareMarkdown).toHaveBeenCalledWith(content, "/vault/Study.md", {
+    compatible: true,
+    python: "/opt/venv/bin/python",
+  });
+  expect(native).toHaveBeenCalledWith("agent_export_native", {
+    id: "tab-agent-export",
+    expectedRevision: context.revision,
+    requestId: "job-direct-mdzip",
+    format: "mdzip",
+    archive: true,
+    filename: "Bundle",
+    content: "# Study\n\n![Diagram](<image1.svg>)\n",
+    assets: { "image1.svg": "data:image/svg+xml;base64,PHN2Zy8+" },
+    options: {},
+  });
+});
+
 it("shares read and diagram actions across snapshot and live agent handlers while preserving distinct fallbacks", async () => {
   await mountReader();
 
@@ -560,4 +671,127 @@ it("routes undo and redo through note history even when a reused task checkbox k
   });
   expect(checkbox.checked).toBe(true);
   expect(native).toHaveBeenCalledWith("document_changed", { id: "tasks-tab", content: checked });
+});
+
+it("acknowledges android_flush handoffs before supermdLoad without spurious edit errors and reports document_outline for the new draft", async () => {
+  native.mockImplementation(async (command: string, args?: unknown) => {
+    if (command === "document_sync") return { accepted: true, revision: 0 };
+    if (command === "document_patch") {
+      const payload = args as { id: string; revision: number };
+      if (payload.id === "fail-tab") return { accepted: false, reason: "conflict" };
+      return { accepted: true, revision: payload.revision };
+    }
+    if (command === "document_resync") return { accepted: false, reason: "conflict" };
+    return { accepted: true };
+  });
+
+  const host = await mountReader();
+
+  // 1. Flush arriving before the initial supermdLoad replies immediately instead of hanging 12s.
+  native.mockClear();
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "tab-initial", token: "tok-pre-load" });
+  });
+  expect(native).toHaveBeenCalledWith("document_flushed", {
+    id: "",
+    token: "tok-pre-load",
+    error: "Reader has not loaded a note yet",
+  });
+  expect(host.querySelector(".reader-edit-error")).toBeNull();
+
+  // 2. Load sample note, then request flush for a newly selected native tab before supermdLoad catches up.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-sample",
+      content: "# A clear place to think\n",
+      path: "tab-sample",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  native.mockClear();
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "tab-draft", token: "tok-handoff" });
+  });
+  expect(native).toHaveBeenCalledWith("document_flushed", {
+    id: "tab-sample",
+    token: "tok-handoff",
+    error: "The active note changed before its edit flush",
+  });
+  expect(host.querySelector(".reader-edit-error")).toBeNull();
+
+  // 3. Once supermdLoad delivers the draft, document_outline reports headings for that exact draft ID
+  // and android_flush acknowledges its content.
+  native.mockClear();
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-draft",
+      content: "# Recoverable draft",
+      path: "tab-draft",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  await vi.waitFor(() =>
+    expect(native).toHaveBeenCalledWith("document_outline", {
+      id: "tab-draft",
+      headings: [expect.objectContaining({ title: "Recoverable draft", level: 1 })],
+    }),
+  );
+
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "tab-draft", token: "tok-draft-ok" });
+  });
+  await vi.waitFor(() =>
+    expect(native).toHaveBeenCalledWith("document_flushed", {
+      id: "tab-draft",
+      token: "tok-draft-ok",
+      content: "# Recoverable draft",
+    }),
+  );
+  expect(host.querySelector(".reader-edit-error")).toBeNull();
+
+  // 4. Genuine editProtocol flush failure on the active note still surfaces .reader-edit-error and fails flush.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "fail-tab",
+      content: "# Baseline\n",
+      path: "fail-tab",
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      editProtocol: 1,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  await act(async () => {
+    editorBridge.onChange!("# Unsynced change\n");
+  });
+  native.mockClear();
+  await act(async () => {
+    window.supermdFlush!({ action: "android_flush", target: "fail-tab", token: "tok-fail" });
+  });
+  await vi.waitFor(() =>
+    expect(native).toHaveBeenCalledWith(
+      "document_flushed",
+      expect.objectContaining({ id: "fail-tab", token: "tok-fail", error: expect.any(String) }),
+    ),
+  );
+  expect(host.querySelector(".reader-edit-error")).not.toBeNull();
 });

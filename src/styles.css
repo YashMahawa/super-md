@@ -316,6 +316,9 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .katex-display::-webkit-scrollbar-track { background:transparent; }
 .katex-display::-webkit-scrollbar-thumb { border:2px solid transparent;border-radius:12px;background:transparent;background-clip:padding-box; }
 .katex-display:hover::-webkit-scrollbar-thumb,.katex-display.scroll-indicator-active::-webkit-scrollbar-thumb { background-color:color-mix(in srgb,var(--primary) 60%,transparent); }
+.math-equation-anchor { position: relative; scroll-margin-top: 24px; }
+.equation-ref { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.equation-ref.is-unresolved { color: var(--muted); }
 .android-reading.is-panning { cursor:grabbing;user-select:none; }
 .callout { --callout-accent: var(--primary); display: flow-root; position: relative; margin: 1.55em 0; padding: 12px 20px 13px 22px; border: 1px solid color-mix(in srgb, var(--callout-accent) 36%, var(--outline)); border-radius: 14px; background: color-mix(in srgb, var(--callout-accent) 8%, var(--surface)); }
 .callout::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 4px; border-radius: 0 4px 4px 0; background: var(--callout-accent); }
@@ -725,6 +728,7 @@ button.code-copy:active { border-radius:10px; }
 .svg-figure { margin: 1.4em 0; display: flex; justify-content: center; }
 .svg-figure img.svg-diagram { display: block; width:100%; max-width: 100%; min-width:0; height: auto; box-sizing:border-box; }
 .svg-figure--color img.svg-diagram { padding: 16px; border-radius: 20px; background: #fdfdfc; box-shadow: 0 0 0 1px var(--code-border); }
+.mermaid[data-render-dark="true"] .svg-figure--color img.svg-diagram { background: var(--surface, #19171b); }
 .svg-figure--own-background img.svg-diagram { border-radius: 16px; }
 .media-save-menu{position:fixed;z-index:2147483000;min-width:240px;max-width:calc(100vw - 16px);padding:8px;border:1px solid var(--border,#7776);border-radius:18px;background:var(--surface,#fff);color:var(--text,#20252d);box-shadow:0 14px 42px #0004;font:14px/1.45 'Manrope Variable',sans-serif;filter:none;user-select:none}
 .media-save-title{padding:7px 12px;color:var(--muted,var(--text));font-size:12px;max-width:320px;overflow-wrap:anywhere}
@@ -808,3 +812,6 @@ button.code-copy:active { border-radius:10px; }
  .step-viewer .is-visual-only .step-cards-notes { position:absolute; top:4px; left:4px; z-index:2; max-width:calc(100% - 8px); pointer-events:none; }
  .step-viewer .is-visual-only .step-cards-legacy-note { pointer-events:auto; }
 }
+.reader-link-notice { position:sticky; top:calc(var(--native-chrome-inset,0px) + 12px); z-index:20; display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 14px; padding:10px 14px; border:1px solid var(--outline,var(--code-border)); border-radius:14px; background:var(--surface-high,var(--surface,#fff)); color:var(--text,#20252d); box-shadow:0 4px 18px #0002; font-size:.9em; line-height:1.4; }
+.reader-link-notice button { flex:none; min-height:32px; padding:4px 12px; border:1px solid var(--outline,var(--code-border)); border-radius:999px; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.reader-link-notice button:hover,.reader-link-notice button:focus-visible { background:color-mix(in srgb,var(--primary,#6750a4) 14%,transparent); outline:2px solid transparent; }

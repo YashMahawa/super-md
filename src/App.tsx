@@ -6,7 +6,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { AnimatePresence, motion, MotionConfig, useReducedMotion } from "motion/react";
 import { ArrowsOutIcon, BookOpenIcon, BrowsersIcon, ChartLineIcon, CodeIcon, ColumnsIcon, CrosshairIcon, FilePdfIcon, FloppyDiskIcon, FolderOpenIcon, FunctionIcon, GearSixIcon, MagnifyingGlassIcon, MinusIcon, NoteIcon, SidebarSimpleIcon, PencilSimpleIcon, PlusIcon, SparkleIcon, TextBIcon, TextHTwoIcon, TextItalicIcon, XIcon } from "@phosphor-icons/react";
-import Editor, { editorReadingOffset } from "./components/Editor";
+import Editor from "./components/Editor";
 import BrandMark from "./components/BrandMark";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -26,11 +26,10 @@ import { MaterialButton, MaterialIconButton, MaterialSelect, MaterialSlider, Mat
 import { useDocumentAnalysis } from "./documentAnalysisWorker";
 import type { OutlineEntry } from "./documentAnalysis";
 import { applyAlignedTaskToggle } from "./revisionEdit";
-import { readingOffset, revealReadingOffset } from "./readingPosition";
-import { loadReadingLocation, saveReadingLocation } from "./readingLocations";
 import { cancelHeadingNavigation, navigateToHeading } from "./documentNavigation";
 import { markScrollInput, scrollInputVersion } from "./scrollAnchor";
 import { isTypewriterShortcutEvent, setTypewriterScroll, toggleTypewriterScroll, useTypewriterScroll } from "./typewriterScroll";
+import { applySharedAnchor, captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, hasExternalReadingScroll, isProgrammaticAnchorScroll, primeEditorAnchor, snapshotReadingScroll, type ReadingScrollSnapshot, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
 
 const welcome = `# Super MD
 
@@ -167,8 +166,6 @@ export default function App() {
   const { pinnedAnalysis, exactAnalysis, outline, isReady: previewReady } = useDocumentAnalysis(activeTab.id, content, view);
   const exactReady = view === "editor" || exactAnalysis?.source === content;
   const activeScrollRestoreRef = useRef<(() => void) | null>(null);
-  const modeOffsetRef = useRef<{ tabId: string; offset: number } | null>(null);
-  const tabOffsetsRef = useRef(new Map<string, number>());
   const pendingHeadingRef = useRef<{ tabId: string; view: ViewMode; headingId: string; offset: number; input: number } | null>(null);
   const [focusMode, setFocusMode] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
@@ -230,6 +227,56 @@ export default function App() {
   const gestureInWorkspace = useRef(false);
   const pinchStartDistance = useRef(0);
   const zoomRef = useRef(100);
+  const viewRef = useRef<ViewMode>(view);
+  viewRef.current = view;
+  const contentRef = useRef(content);
+  contentRef.current = content;
+  const tabAnchors = useRef(new Map<string, SharedSourceAnchor>());
+  const pendingTransitionAnchor = useRef<SharedSourceAnchor | null>(null);
+  const splitPaneRef = useRef<SplitAnchorPane | null>(null);
+  const splitScrollTopsRef = useRef<{ editor: number | null; preview: number | null }>({ editor: null, preview: null });
+  const restoringAnchorRef = useRef(false);
+  const restoringAnchorSeq = useRef(0);
+  const previousViewAndTab = useRef<{ id: string; view: ViewMode }>({ id: activeTab.id, view });
+  const snapshotActiveTabAnchor = useCallback(() => {
+    const id = documentsRef.current.activeId;
+    const currentMode = viewRef.current;
+    const readingRoot = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null;
+    if (
+      (currentMode === "reader" || currentMode === "live") &&
+      !readingRoot?.querySelector(".markdown-body, .live-editor")
+    ) {
+      const existing = tabAnchors.current.get(id);
+      if (existing) return existing;
+    }
+    const anchor = captureSharedAnchor({
+      id,
+      mode: currentMode,
+      zoom: zoomRef.current,
+      readingRoot,
+      preferredSplitPane: splitPaneRef.current,
+    });
+    tabAnchors.current.set(id, anchor);
+    while (tabAnchors.current.size > 40) tabAnchors.current.delete(tabAnchors.current.keys().next().value!);
+    return anchor;
+  }, []);
+  const switchView = useCallback((nextMode: ViewMode) => {
+    if (nextMode === viewRef.current) return;
+    pendingTransitionAnchor.current = snapshotActiveTabAnchor();
+    splitPaneRef.current = null;
+    pendingHeadingRef.current = null;
+    if (readingScrollRef.current) cancelHeadingNavigation(readingScrollRef.current);
+    setView(nextMode);
+  }, [snapshotActiveTabAnchor]);
+  const selectTabById = useCallback((nextId: string) => {
+    if (nextId === documentsRef.current.activeId) return;
+    snapshotActiveTabAnchor();
+    pendingTransitionAnchor.current = null;
+    splitPaneRef.current = null;
+    pendingHeadingRef.current = null;
+    if (readingScrollRef.current) cancelHeadingNavigation(readingScrollRef.current);
+    setDocuments((current) => ({ ...current, activeId: nextId }));
+  }, [snapshotActiveTabAnchor]);
   const [autosave, setAutosave] = useState(() => localStorage.getItem("autosave") === "true");
   const typewriterScroll = useTypewriterScroll();
   const [reduceMotion, setReduceMotion] = useState(() => localStorage.getItem("reduceMotion") === "true");
@@ -251,41 +298,6 @@ export default function App() {
   }, [fullscreen]);
   const zoomBy = useCallback((step: number) => setZoom((current) => current + step), [setZoom]);
   const trustImageHost = useCallback((host: string) => setTrustedImageHosts((current) => current.includes(host) ? current : [...current, host]), []);
-  const captureActiveOffset = useCallback((tabId: string, currentView: ViewMode): number => {
-    if (currentView === "editor") return editorReadingOffset(tabId) ?? 0;
-    const scroller = readingScrollRef.current;
-    if (currentView === "split") {
-      if (scroller && scroller.scrollTop > 0) return readingOffset(scroller);
-      return editorReadingOffset(tabId) ?? (scroller ? readingOffset(scroller) : 0);
-    }
-    return scroller ? readingOffset(scroller) : 0;
-  }, []);
-
-  const switchView = useCallback((nextView: ViewMode) => {
-    setView((currentView) => {
-      if (currentView === nextView) return currentView;
-      const tab = documentsRef.current.tabs.find((item) => item.id === documentsRef.current.activeId) ?? documentsRef.current.tabs[0];
-      if (tab) {
-        const offset = captureActiveOffset(tab.id, currentView);
-        modeOffsetRef.current = { tabId: tab.id, offset };
-        tabOffsetsRef.current.set(tab.id, offset);
-      }
-      pendingHeadingRef.current = null;
-      if (readingScrollRef.current) cancelHeadingNavigation(readingScrollRef.current);
-      return nextView;
-    });
-  }, [captureActiveOffset]);
-
-  const selectTab = useCallback((nextId: string) => {
-    setDocuments((current) => {
-      if (current.activeId === nextId) return current;
-      const active = current.tabs.find((item) => item.id === current.activeId);
-      if (active) tabOffsetsRef.current.set(active.id, captureActiveOffset(active.id, view));
-      pendingHeadingRef.current = null;
-      if (readingScrollRef.current) cancelHeadingNavigation(readingScrollRef.current);
-      return { ...current, activeId: nextId };
-    });
-  }, [captureActiveOffset, view]);
 
   const navigateOutlineHeading = useCallback((entry: OutlineEntry) => {
     markScrollInput();
@@ -295,6 +307,7 @@ export default function App() {
       return;
     }
     if (view === "split") {
+      splitPaneRef.current = "preview";
       window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: entry.offset }));
     }
     const scroller = readingScrollRef.current;
@@ -314,10 +327,17 @@ export default function App() {
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
     const query = window.matchMedia("(max-width: 760px)");
-    const onChange = () => { setMobileUi(query.matches); if (query.matches) switchView(view === "split" ? "live" : view); };
+    const onChange = () => {
+      setMobileUi(query.matches);
+      if (query.matches && viewRef.current === "split") {
+        pendingTransitionAnchor.current = snapshotActiveTabAnchor();
+        splitPaneRef.current = null;
+        setView("live");
+      }
+    };
     query.addEventListener("change", onChange);
     return () => query.removeEventListener("change", onChange);
-  }, [switchView, view]);
+  }, [snapshotActiveTabAnchor]);
 
   useEffect(() => {
     if (android) document.documentElement.dataset.platform = "android";
@@ -348,52 +368,6 @@ export default function App() {
   }, [view, activeTab.id, previewReady]);
 
   useLayoutEffect(() => {
-    if (!previewReady) return;
-    if (pendingHeadingRef.current?.tabId === activeTab.id && pendingHeadingRef.current.view === view) {
-      modeOffsetRef.current = null;
-      return;
-    }
-    const startingInput = scrollInputVersion();
-    const saved = path ? loadReadingLocation(path) : null;
-    let targetOffset: number | undefined;
-    if (modeOffsetRef.current?.tabId === activeTab.id) {
-      targetOffset = modeOffsetRef.current.offset;
-      modeOffsetRef.current = null;
-    } else if (tabOffsetsRef.current.has(activeTab.id)) {
-      targetOffset = tabOffsetsRef.current.get(activeTab.id);
-    } else if (saved) {
-      targetOffset = saved.offset;
-    }
-    if (targetOffset === undefined) return;
-    let stopped = false;
-    const stop = () => { stopped = true; };
-    const inputs = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
-    inputs.forEach((name) => window.addEventListener(name, stop, { capture: true, passive: true }));
-    const apply = () => {
-      if (stopped || scrollInputVersion() !== startingInput) return;
-      if (view === "editor" || view === "split") {
-        window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: targetOffset }));
-      }
-      if (view !== "editor") {
-        const host = readingScrollRef.current;
-        if (host) revealReadingOffset(host, targetOffset);
-      }
-    };
-    const frame = requestAnimationFrame(() => { apply(); requestAnimationFrame(apply); });
-    const timers = [120, 320, 700].map((delay) => window.setTimeout(apply, delay));
-    activeScrollRestoreRef.current = apply;
-    const clearActive = window.setTimeout(() => { if (activeScrollRestoreRef.current === apply) activeScrollRestoreRef.current = null; }, 760);
-    return () => {
-      stopped = true;
-      if (activeScrollRestoreRef.current === apply) activeScrollRestoreRef.current = null;
-      window.clearTimeout(clearActive);
-      cancelAnimationFrame(frame);
-      timers.forEach(window.clearTimeout);
-      inputs.forEach((name) => window.removeEventListener(name, stop, { capture: true }));
-    };
-  }, [activeTab.id, path, previewReady, view]);
-
-  useLayoutEffect(() => {
     if (exactReady) activeScrollRestoreRef.current?.();
   }, [exactReady]);
 
@@ -406,28 +380,6 @@ export default function App() {
     const host = readingScrollRef.current;
     if (host) navigateToHeading(host, pending.headingId);
   }, [activeTab.id, content, exactReady, previewReady, view]);
-
-  useEffect(() => {
-    if (!previewReady) return;
-    const root = view === "editor" ? document.querySelector<HTMLElement>(".editor-pane .cm-scroller") : readingScrollRef.current;
-    if (!root) return;
-    let timer = 0;
-    const persist = () => {
-      if (!root.isConnected) return;
-      const offset = captureActiveOffset(activeTab.id, view);
-      tabOffsetsRef.current.set(activeTab.id, offset);
-      if (path) saveReadingLocation(path, { top: root.scrollTop, offset, zoom: zoomRef.current, mode: view });
-    };
-    const onScroll = () => { window.clearTimeout(timer); timer = window.setTimeout(persist, 600); };
-    root.addEventListener("scroll", onScroll, { passive: true });
-    window.addEventListener("pagehide", persist);
-    return () => {
-      window.clearTimeout(timer);
-      persist();
-      root.removeEventListener("scroll", onScroll);
-      window.removeEventListener("pagehide", persist);
-    };
-  }, [activeTab.id, captureActiveOffset, path, previewReady, view]);
 
   useEffect(() => {
     const inWorkspace = (target: EventTarget | null, x?: number, y?: number) =>
@@ -494,7 +446,7 @@ export default function App() {
   };
 
   const flash = (message: string) => { setNotice(message); window.setTimeout(() => setNotice(""), 2800); };
-  const applyDocument = useCallback((doc: DocumentData) => { setDocuments((current) => openTab(current, doc)); recordRecent(doc.path); }, []);
+  const applyDocument = useCallback((doc: DocumentData) => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => openTab(current, doc)); recordRecent(doc.path); }, [snapshotActiveTabAnchor]);
   const chooseFolder = useCallback(async () => {
     try { const root = await invoke<string | null>("open_workspace_folder"); if (root) { setFolderRoot(root); setFolderVisible(true); localStorage.setItem("folder.root", root); } }
     catch (error) { flash(`Could not open folder: ${error}`); }
@@ -515,9 +467,17 @@ export default function App() {
     getCurrentWindow().onCloseRequested((event) => { event.preventDefault(); void closeWindow(); }).then((unlisten) => { if (disposed) unlisten(); else stop = unlisten; });
     return () => { disposed = true; stop?.(); };
   }, [closeWindow]);
-  const newDocument = useCallback(() => setDocuments((current) => addTab(current)), []);
+  const newDocument = useCallback(() => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => addTab(current)); }, [snapshotActiveTabAnchor]);
   const insertMedia = useCallback((text: string, point?: InsertionPoint) => {
-    setDocuments((current) => { const tab = current.tabs.find((t) => t.id === current.activeId)!; const from = Math.max(0, Math.min(point?.from ?? tab.content.length, tab.content.length)); const to = Math.max(from, Math.min(point?.to ?? from, tab.content.length)); return editTab(current, tab.id, tab.content.slice(0, from) + text + tab.content.slice(to)); });
+    const targetId = documentsRef.current.activeId;
+    setDocuments((current) => {
+      if (current.activeId !== targetId) return current;
+      const tab = current.tabs.find((t) => t.id === targetId);
+      if (!tab) return current;
+      const from = Math.max(0, Math.min(point?.from ?? tab.content.length, tab.content.length));
+      const to = Math.max(from, Math.min(point?.to ?? from, tab.content.length));
+      return editTab(current, tab.id, tab.content.slice(0, from) + text + tab.content.slice(to));
+    });
   }, []);
   const open = useCallback(async () => {
     if (openingRef.current) return;
@@ -660,17 +620,27 @@ export default function App() {
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
       if (event.key === "F11") { event.preventDefault(); toggleFullscreen(); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") { event.preventDefault(); save(event.shiftKey); }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "o") { event.preventDefault(); event.shiftKey ? chooseFolder() : open(); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") { event.preventDefault(); setFolderVisible((visible) => !visible); }
+      if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "b") {
+        const target = event.target instanceof Element ? event.target : null;
+        if (!target?.closest(".cm-editor, .live-active-block")) {
+          event.preventDefault();
+          setFolderVisible((visible) => !visible);
+        }
+      }
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
       else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") { event.preventDefault(); newDocument(); }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); event.shiftKey ? closeWindow() : setDocuments((current) => closeTab(current, current.activeId)); }
-      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); setDocuments(restoreClosedTab); }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "w") { event.preventDefault(); if (event.shiftKey) void closeWindow(); else { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, current.activeId)); } }
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") { event.preventDefault(); snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments(restoreClosedTab); }
       if (!event.defaultPrevented && isTypewriterShortcutEvent(event)) { event.preventDefault(); toggleTypewriterScroll(); }
       if ((event.ctrlKey || event.metaKey) && event.key === "Tab") {
         event.preventDefault();
+        snapshotActiveTabAnchor();
+        pendingTransitionAnchor.current = null;
+        splitPaneRef.current = null;
         setDocuments((current) => {
           const index = current.tabs.findIndex((tab) => tab.id === current.activeId);
           const next = (index + (event.shiftKey ? current.tabs.length - 1 : 1)) % current.tabs.length;
@@ -697,7 +667,177 @@ export default function App() {
       window.removeEventListener("keydown", handler);
       window.removeEventListener("supermd-find", openFind);
     };
-  }, [newDocument, open, openNewWindow, save, setZoom, toggleFullscreen, zoomBy, chooseFolder, closeWindow, view]);
+  }, [newDocument, open, openNewWindow, save, setZoom, snapshotActiveTabAnchor, toggleFullscreen, zoomBy, chooseFolder, closeWindow, view]);
+
+  useEffect(() => {
+    let frame = 0;
+    const scheduleSnapshot = () => {
+      if (restoringAnchorRef.current || frame) return;
+      if (previousViewAndTab.current.id !== documentsRef.current.activeId || previousViewAndTab.current.view !== viewRef.current) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        if (!restoringAnchorRef.current && previousViewAndTab.current.id === documentsRef.current.activeId && previousViewAndTab.current.view === viewRef.current) {
+          snapshotActiveTabAnchor();
+        }
+      });
+    };
+    const trackInput = (event: Event) => {
+      if (viewRef.current === "split") {
+        const pane = detectSplitPaneFromTarget(event.target);
+        if (pane) {
+          const scroller = pane === "editor"
+            ? workspaceRef.current?.querySelector(".cm-scroller")
+            : workspaceRef.current?.querySelector(".reading-scroll");
+          clearProgrammaticAnchorScroll(scroller);
+          splitPaneRef.current = pane;
+        }
+      }
+    };
+    const trackScroll = (event: Event) => {
+      if (restoringAnchorRef.current) return;
+      if (event.target instanceof HTMLElement && isProgrammaticAnchorScroll(event.target)) return;
+      if (viewRef.current === "split") {
+        const pane = detectSplitPaneFromTarget(event.target);
+        if (pane && event.target instanceof HTMLElement) {
+          const recorded = splitScrollTopsRef.current[pane];
+          if (recorded === null || Math.abs(event.target.scrollTop - recorded) > 2) {
+            splitScrollTopsRef.current[pane] = event.target.scrollTop;
+            splitPaneRef.current = pane;
+          }
+        }
+      }
+      scheduleSnapshot();
+    };
+    const inputEvents = ["wheel", "pointerdown", "touchstart", "keydown", "focusin"] as const;
+    const syncEvents = ["keyup", "pointerup"] as const;
+    inputEvents.forEach((name) => document.addEventListener(name, trackInput, { capture: true, passive: true }));
+    syncEvents.forEach((name) => document.addEventListener(name, scheduleSnapshot, { capture: true, passive: true }));
+    document.addEventListener("scroll", trackScroll, { capture: true, passive: true });
+    return () => {
+      cancelAnimationFrame(frame);
+      inputEvents.forEach((name) => document.removeEventListener(name, trackInput, true));
+      syncEvents.forEach((name) => document.removeEventListener(name, scheduleSnapshot, true));
+      document.removeEventListener("scroll", trackScroll, true);
+    };
+  }, [snapshotActiveTabAnchor]);
+
+  useLayoutEffect(() => {
+    const previous = previousViewAndTab.current;
+    if (previous.id === activeTab.id && previous.view === view) return;
+    const tabId = activeTab.id;
+    const targetMode = view;
+    const isModeTransition = previous.id === tabId && previous.view !== targetMode;
+    if (targetMode !== "editor" && !previewReady) {
+      if (targetMode === "split") {
+        const candidate = isModeTransition
+          ? (pendingTransitionAnchor.current ?? tabAnchors.current.get(tabId))
+          : tabAnchors.current.get(tabId);
+        if (candidate) {
+          const allowExactTop = !isModeTransition;
+          const sameGeometry = allowExactTop && candidate.mode === targetMode && Math.abs(candidate.zoom - zoomRef.current) < 1;
+          if (sameGeometry && candidate.editorTop !== undefined) {
+            primeEditorAnchor(tabId, { offset: candidate.offset, top: candidate.editorTop });
+          } else {
+            primeEditorAnchor(tabId, { offset: candidate.offset, caretOffset: candidate.caretOffset });
+          }
+        } else {
+          primeEditorAnchor(tabId, null);
+        }
+      }
+      return;
+    }
+    previousViewAndTab.current = { id: activeTab.id, view };
+    if (pendingHeadingRef.current?.tabId === tabId && pendingHeadingRef.current.view === targetMode) {
+      pendingTransitionAnchor.current = null;
+      return;
+    }
+    const startingInput = scrollInputVersion();
+    const initialContent = contentRef.current;
+    const anchor = isModeTransition
+      ? (pendingTransitionAnchor.current ?? tabAnchors.current.get(tabId))
+      : tabAnchors.current.get(tabId);
+    pendingTransitionAnchor.current = null;
+    if (!anchor) {
+      primeEditorAnchor(tabId, null);
+      const scroller = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll");
+      if (scroller) scroller.scrollTop = 0;
+      return;
+    }
+    const allowExactTop = !isModeTransition;
+    if (targetMode === "editor" || targetMode === "split") {
+      const sameGeometry = allowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - zoomRef.current) < 1;
+      if (sameGeometry && anchor.editorTop !== undefined) {
+        primeEditorAnchor(tabId, { offset: anchor.offset, top: anchor.editorTop });
+      } else {
+        primeEditorAnchor(tabId, { offset: anchor.offset, caretOffset: anchor.caretOffset });
+      }
+    } else {
+      primeEditorAnchor(tabId, null);
+    }
+    const shouldStop = () =>
+      documentsRef.current.activeId !== tabId ||
+      viewRef.current !== targetMode ||
+      contentRef.current !== initialContent ||
+      scrollInputVersion() !== startingInput ||
+      Boolean(window.getSelection()?.toString()) ||
+      Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
+    let stopped = false;
+    const stop = () => { stopped = true; };
+    const inputs = ["wheel", "touchstart", "pointerdown", "keydown", "supermd-goto-offset"] as const;
+    inputs.forEach((name) => window.addEventListener(name, stop, { capture: true, passive: true }));
+    let firstPass = true;
+    let lastReading: ReadingScrollSnapshot | null = null;
+    const apply = () => {
+      if (stopped || shouldStop()) return;
+      const readingRoot = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null;
+      if (hasExternalReadingScroll(lastReading, readingRoot)) { stopped = true; return; }
+      const updateSelection = firstPass;
+      firstPass = false;
+      const seq = ++restoringAnchorSeq.current;
+      restoringAnchorRef.current = true;
+      applySharedAnchor({
+        id: tabId,
+        targetMode,
+        targetZoom: zoomRef.current,
+        anchor,
+        readingRoot,
+        allowExactTop,
+        updateSelection,
+      });
+      lastReading = snapshotReadingScroll(readingRoot);
+      if (targetMode === "split") {
+        splitScrollTopsRef.current = {
+          editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
+          preview: workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll")?.scrollTop ?? null,
+        };
+      } else {
+        splitScrollTopsRef.current = { editor: null, preview: null };
+      }
+      requestAnimationFrame(() => { if (restoringAnchorSeq.current === seq) restoringAnchorRef.current = false; });
+    };
+    activeScrollRestoreRef.current = apply;
+    apply();
+    let innerFrame = 0;
+    const outerFrame = requestAnimationFrame(() => {
+      apply();
+      innerFrame = requestAnimationFrame(() => {
+        apply();
+        if (!stopped && !shouldStop()) snapshotActiveTabAnchor();
+      });
+    });
+    const timers = [120, 320, 700].map((delay) => window.setTimeout(apply, delay));
+    const clearActive = window.setTimeout(() => { if (activeScrollRestoreRef.current === apply) activeScrollRestoreRef.current = null; }, 760);
+    return () => {
+      stopped = true;
+      if (activeScrollRestoreRef.current === apply) activeScrollRestoreRef.current = null;
+      window.clearTimeout(clearActive);
+      restoringAnchorRef.current = false;
+      cancelAnimationFrame(outerFrame);
+      cancelAnimationFrame(innerFrame);
+      timers.forEach(window.clearTimeout);
+      inputs.forEach((name) => window.removeEventListener(name, stop, { capture: true }));
+    };
+  }, [activeTab.id, previewReady, snapshotActiveTabAnchor, view]);
 
   useEffect(() => {
     if (view === "editor" || view === "split") setSearching(false);
@@ -781,6 +921,8 @@ export default function App() {
   };
   const format = (prefix: string, suffix?: string, block = false) =>
     window.dispatchEvent(new CustomEvent("supermd-format", { detail: { prefix, suffix, block } }));
+  const formatAction = (action: string) =>
+    window.dispatchEvent(new CustomEvent("supermd-format", { detail: { action } }));
 
   return (
     <MotionConfig reducedMotion={motionEnabled ? "never" : "always"}>
@@ -809,20 +951,20 @@ export default function App() {
       </header>}
       {!fullscreen && <div className="tab-strip" role="tablist" aria-label="Open documents">
         <div className="tab-scroll">{documents.tabs.map((tab) => <div key={tab.id} className={`document-tab ${tab.id === documents.activeId ? "selected" : ""}`} role="presentation">
-          <button role="tab" aria-selected={tab.id === documents.activeId} title={tab.path ?? tab.name} onClick={() => selectTab(tab.id)} onAuxClick={(event) => { if (event.button === 1) setDocuments((current) => closeTab(current, tab.id)); }}><span className={`tab-dot ${isDirty(tab) ? "dirty" : ""}`} /><span className="tab-name">{tabTitle(tab)}</span></button>
-          <button className="tab-close" onClick={() => setDocuments((current) => closeTab(current, tab.id))} title={`Close ${tabTitle(tab)}`} aria-label={`Close ${tabTitle(tab)}`}><XIcon size={14} /></button>
+          <button role="tab" aria-selected={tab.id === documents.activeId} title={tab.path ?? tab.name} onClick={() => selectTabById(tab.id)} onAuxClick={(event) => { if (event.button === 1) { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, tab.id)); } }}><span className={`tab-dot ${isDirty(tab) ? "dirty" : ""}`} /><span className="tab-name">{tabTitle(tab)}</span></button>
+          <button className="tab-close" onClick={() => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments((current) => closeTab(current, tab.id)); }} title={`Close ${tabTitle(tab)}`} aria-label={`Close ${tabTitle(tab)}`}><XIcon size={14} /></button>
         </div>)}</div>
         <button className="tab-add" onClick={newDocument} title="New tab · Ctrl+N" aria-label="New tab"><PlusIcon size={17} /></button>
-        {documents.recentlyClosed.length > 0 && <button className="tab-reopen" onClick={() => setDocuments(restoreClosedTab)} title="Reopen closed tab · Ctrl+Shift+T">Reopen</button>}
+        {documents.recentlyClosed.length > 0 && <button className="tab-reopen" onClick={() => { snapshotActiveTabAnchor(); pendingTransitionAnchor.current = null; splitPaneRef.current = null; setDocuments(restoreClosedTab); }} title="Reopen closed tab · Ctrl+Shift+T">Reopen</button>}
       </div>}
       {!fullscreen && view === "editor" && <div className="formatbar" aria-label="Formatting tools">
         <span className="format-label">Insert</span>
-        <button onClick={() => format("## ", "", true)} title="Heading 2" aria-label="Heading 2"><TextHTwoIcon size={18} /></button>
-        <button onClick={() => format("**") } title="Bold" aria-label="Bold"><TextBIcon size={18} /></button>
-        <button onClick={() => format("_") } title="Italic" aria-label="Italic"><TextItalicIcon size={18} /></button>
+        <button onClick={() => formatAction("heading")} title="Heading 2 · Ctrl+Shift+H" aria-label="Heading 2"><TextHTwoIcon size={18} /></button>
+        <button onClick={() => formatAction("bold")} title="Bold · Ctrl+B" aria-label="Bold"><TextBIcon size={18} /></button>
+        <button onClick={() => formatAction("italic")} title="Italic · Ctrl+I" aria-label="Italic"><TextItalicIcon size={18} /></button>
         <span className="format-divider" />
-        <button onClick={() => format("`") } title="Inline code" aria-label="Inline code"><CodeIcon size={18} /></button>
-        <button onClick={() => format("$", "$") } title="Inline math" aria-label="Inline math"><FunctionIcon size={18} /></button>
+        <button onClick={() => formatAction("inline_code")} title="Inline code · Ctrl+E" aria-label="Inline code"><CodeIcon size={18} /></button>
+        <button onClick={() => formatAction("inline_math")} title="Inline math · Ctrl+Shift+M" aria-label="Inline math"><FunctionIcon size={18} /></button>
         <span className="format-divider" />
         <button className="format-text-button" onClick={() => format("\n:::callout note \"Note\"\nWrite here.\n:::\n", "", true)} title="Insert callout"><NoteIcon size={18} /><span>Callout</span></button>
         <button className="format-text-button" onClick={() => format("\n```smd-chart\n{\n  \"title\": \"Interactive graph\",\n  \"x\": { \"min\": -6.28, \"max\": 6.28 },\n  \"series\": [{ \"expression\": \"a * Math.sin(x)\" }],\n  \"sliders\": [{ \"name\": \"a\", \"min\": 0, \"max\": 3, \"step\": 0.1, \"value\": 1 }]\n}\n```\n", "", true)} title="Insert interactive graph"><ChartLineIcon size={18} /><span>Graph</span></button>
@@ -882,7 +1024,7 @@ export default function App() {
       </motion.aside></motion.div>}</AnimatePresence>
       {showWelcome && <WelcomeSetup theme={normalTheme} onTheme={setNormalTheme} readerFont={readerFont} onReaderFont={setReaderFont} motionEnabled={motionEnabled} onMotion={(enabled) => setReduceMotion(!enabled)} onFinish={(openFile) => { localStorage.setItem("setup.complete", "true"); localStorage.removeItem("setup.started"); setShowWelcome(false); if (openFile) window.setTimeout(() => open(), 100); }} />}
       <ImageViewer />
-      <MediaTools key={activeTab.id} documentId={activeTab.id} content={content} renderedContent={pinnedAnalysis?.source} documentPath={path} onInsert={insertMedia} onNotice={flash} />
+      <MediaTools documentId={activeTab.id} content={content} renderedContent={pinnedAnalysis?.source} documentPath={path} onInsert={insertMedia} onNotice={flash} />
     </div>
     </MotionConfig>
   );

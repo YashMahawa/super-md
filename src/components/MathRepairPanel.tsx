@@ -30,6 +30,10 @@ export default function MathRepairPanel({ content, apply, close }: { content: st
   const applySelected = () => {
     if (currentContent.current !== content || applied.current.content !== content || applied.current.done || !count) return;
     applied.current.done = true;
+    // Clear the native overlay latch synchronously before dispatching the edit
+    // so toolbar semantics (Undo/Redo) are restored as soon as the repaired
+    // formula renders, without waiting for passive effect cleanup.
+    setReaderOverlay("repair", false);
     apply(applyMathRepairs(content,repairs.filter((_,index)=>!excluded.has(index))));
     closeRef.current();
   };

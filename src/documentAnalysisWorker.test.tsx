@@ -5,6 +5,7 @@ import {afterEach,describe,expect,it,vi} from 'vitest';
 import * as documentAnalysis from './documentAnalysis';
 import {
   DocumentAnalysisWorkerClient,
+  WORKER_ANALYSIS_MIN_CHARS,
   useDocumentAnalysis,
   type AnalysisWorkerLike,
 } from './documentAnalysisWorker';
@@ -35,6 +36,10 @@ class ControlledWorker implements AnalysisWorkerLike {
     if(!job)throw new Error('No posted job to flush');
     const compact=documentAnalysis.toCompactAnalysis(this.realAnalyze(job.source));
     this.onmessage?.({data:{id:job.id,analysis:compact}} as MessageEvent<DocumentAnalysisWorkerResponse>);
+  }
+
+  emitRaw(payload:DocumentAnalysisWorkerResponse):void {
+    this.onmessage?.({data:payload} as MessageEvent<DocumentAnalysisWorkerResponse>);
   }
 
   fail(message='worker runtime error'):void {
@@ -319,7 +324,10 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
       root=createRoot(host);
 
       function FallbackHarness({client}:{client:DocumentAnalysisWorkerClient}){
-        const {pinnedAnalysis,outline,isReady}=useDocumentAnalysis('fallback-doc','# Sync Heading\n\nBody text.','reader',{client});
+        const {pinnedAnalysis,outline,isReady}=useDocumentAnalysis('fallback-doc','# Sync Heading\n\nBody text.','reader',{
+          client,
+          minWorkerChars:0,
+        });
         return <div data-ready={String(isReady)} data-heading={outline[0]?.title??''}>{pinnedAnalysis?.source??''}</div>;
       }
 
@@ -363,5 +371,185 @@ describe('DocumentAnalysisWorkerClient & useDocumentAnalysis',()=>{
     }finally{
       if(savedWorker!==undefined)globalThis.Worker=savedWorker;
     }
+  });
+
+  it('uses synchronous analyzeDocument fallback without spawning a worker for small documents (<= 80,000 chars) and offloads above 80,000 chars',async()=>{
+    expect(WORKER_ANALYSIS_MIN_CHARS).toBe(80_000);
+    const realAnalyze=documentAnalysis.analyzeDocument;
+    let workerInstance:ControlledWorker|null=null;
+    const factory=vi.fn(()=>{
+      workerInstance=new ControlledWorker(realAnalyze);
+      return workerInstance;
+    });
+    const client=new DocumentAnalysisWorkerClient(factory,{idleMs:30_000});
+
+    const shortNote='# Quick Note\n\nShort body under the worker threshold.';
+    const boundaryNote=buildDocumentOfSize(WORKER_ANALYSIS_MIN_CHARS);
+    expect(boundaryNote).toHaveLength(WORKER_ANALYSIS_MIN_CHARS);
+    const largeNote=`# Oversized Heading\n\n${buildDocumentOfSize(WORKER_ANALYSIS_MIN_CHARS+512)}`;
+    expect(largeNote.length).toBeGreaterThan(WORKER_ANALYSIS_MIN_CHARS);
+
+    let setSourceExternal!:(next:string)=>void;
+    let stateSnapshot:{exactSource:string|null;pinnedSource:string|null;heading:string;isReady:boolean}={
+      exactSource:null,
+      pinnedSource:null,
+      heading:'',
+      isReady:false,
+    };
+
+    function ThresholdHarness(){
+      const [source,setSource]=useState(shortNote);
+      setSourceExternal=setSource;
+      const {pinnedAnalysis,exactAnalysis,outline,isReady}=useDocumentAnalysis('threshold-doc',source,'reader',{client});
+      stateSnapshot={
+        exactSource:exactAnalysis?.source??null,
+        pinnedSource:pinnedAnalysis?.source??null,
+        heading:outline[0]?.title??'',
+        isReady,
+      };
+      return <div data-ready={String(isReady)} data-heading={outline[0]?.title??''}/>;
+    }
+
+    const host=document.createElement('div');
+    document.body.append(host);
+    root=createRoot(host);
+
+    await act(async()=>{
+      root?.render(<ThresholdHarness/>);
+    });
+    expect(stateSnapshot).toEqual({
+      exactSource:shortNote,
+      pinnedSource:shortNote,
+      heading:'Quick Note',
+      isReady:true,
+    });
+    expect(factory).toHaveBeenCalledTimes(0);
+
+    await act(async()=>{
+      setSourceExternal(boundaryNote);
+    });
+    expect(stateSnapshot.exactSource).toBe(boundaryNote);
+    expect(stateSnapshot.isReady).toBe(true);
+    expect(factory).toHaveBeenCalledTimes(0);
+
+    const uiAnalyzeSpy=vi.spyOn(documentAnalysis,'analyzeDocument');
+    await act(async()=>{
+      setSourceExternal(largeNote);
+    });
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(uiAnalyzeSpy).toHaveBeenCalledTimes(0);
+    expect(stateSnapshot.pinnedSource).toBe(boundaryNote);
+    expect(stateSnapshot.exactSource).toBeNull();
+
+    uiAnalyzeSpy.mockRestore();
+    await act(async()=>{
+      workerInstance!.flushNext();
+    });
+    expect(stateSnapshot.exactSource).toBe(largeNote);
+    expect(stateSnapshot.heading).toBe('Oversized Heading');
+    client.dispose();
+  });
+
+  it('ignores stale worker responses and cancels superseded revisions across rapid async edits and large-to-small transitions',async()=>{
+    const realAnalyze=documentAnalysis.analyzeDocument;
+    const worker=new ControlledWorker(realAnalyze);
+    const client=new DocumentAnalysisWorkerClient(()=>worker,{idleMs:30_000});
+
+    // 1. Client-level stale message guard: out-of-order or duplicate responses with a stale id are ignored.
+    const abortRev1=new AbortController();
+    const p1=client.request('# Client Rev 1\n\nFirst.',abortRev1.signal);
+    const p1Aborted=expect(p1).rejects.toMatchObject({name:'AbortError'});
+    abortRev1.abort();
+    await p1Aborted;
+
+    const p2=client.request('# Client Rev 2\n\nSecond.');
+    // Inject a stale/unknown job id while job 1 is still inFlight on the worker.
+    worker.emitRaw({
+      id:999,
+      analysis:documentAnalysis.toCompactAnalysis(realAnalyze('# Ghost Heading\n\nStale payload.')),
+    });
+    expect(worker.posted).toHaveLength(1);
+
+    // Flush job 1 so job 2 becomes inFlight, then replay a duplicate response for job 1: must be ignored!
+    const job1Id=worker.posted[0].id;
+    worker.flushNext();
+    expect(worker.posted).toHaveLength(2);
+    worker.emitRaw({
+      id:job1Id,
+      analysis:documentAnalysis.toCompactAnalysis(realAnalyze('# Stale Replay\n\nShould not resolve job 2.')),
+    });
+    expect(client.peek('# Stale Replay\n\nShould not resolve job 2.')).toBeNull();
+
+    worker.flushNext();
+    const res2=await p2;
+    expect(res2.analysis.outline[0]?.title).toBe('Client Rev 2');
+
+    // 2. Hook-level stale revision guard across rapid large edits followed by a small synchronous edit.
+    const hookWorker=new ControlledWorker(realAnalyze);
+    const hookClient=new DocumentAnalysisWorkerClient(()=>hookWorker,{idleMs:30_000});
+    const baseBody=buildDocumentOfSize(WORKER_ANALYSIS_MIN_CHARS+1024);
+    const largeRev1=`# Large Rev 1\n\n${baseBody}`;
+    const largeRev2=`# Large Rev 2\n\n${baseBody}\nEdit two.`;
+    const largeRev3=`# Large Rev 3\n\n${baseBody}\nEdit three.`;
+    const largeRev4=`# Large Rev 4\n\n${baseBody}\nEdit four.`;
+    const smallFinal='# Small Final\n\nSettled synchronously without waiting on stale worker jobs.';
+
+    let setSourceExternal!:(next:string)=>void;
+    let latestExact:string|null=null;
+    let latestHeading='';
+
+    function StaleRevisionHarness(){
+      const [source,setSource]=useState(largeRev1);
+      setSourceExternal=setSource;
+      const {exactAnalysis,outline}=useDocumentAnalysis('stale-rev-doc',source,'reader',{client:hookClient});
+      latestExact=exactAnalysis?.source??null;
+      latestHeading=outline[0]?.title??'';
+      return <div data-heading={latestHeading}/>;
+    }
+
+    const host=document.createElement('div');
+    document.body.append(host);
+    root=createRoot(host);
+
+    await act(async()=>{
+      root?.render(<StaleRevisionHarness/>);
+    });
+    await act(async()=>{
+      hookWorker.flushNext();
+    });
+    expect(latestExact).toBe(largeRev1);
+    expect(latestHeading).toBe('Large Rev 1');
+    expect(hookWorker.posted).toHaveLength(1);
+
+    // Rapidly dispatch largeRev2 (inFlight), largeRev3 (queued then aborted), largeRev4 (queued)...
+    await act(async()=>{
+      setSourceExternal(largeRev2);
+    });
+    await act(async()=>{
+      setSourceExternal(largeRev3);
+    });
+    await act(async()=>{
+      setSourceExternal(largeRev4);
+    });
+    expect(hookWorker.posted.map(job=>job.source)).toEqual([largeRev1,largeRev2]);
+
+    // ...then shrink to smallFinal before largeRev2 finishes on the worker!
+    await act(async()=>{
+      setSourceExternal(smallFinal);
+    });
+    // smallFinal settles immediately on the synchronous path and aborts queued largeRev4.
+    expect(latestExact).toBe(smallFinal);
+    expect(latestHeading).toBe('Small Final');
+
+    // Late completion of in-flight largeRev2 must NOT overwrite smallFinal OR pump aborted largeRev4!
+    await act(async()=>{
+      hookWorker.flushNext();
+    });
+    expect(hookWorker.posted.map(job=>job.source)).toEqual([largeRev1,largeRev2]);
+    expect(latestExact).toBe(smallFinal);
+    expect(latestHeading).toBe('Small Final');
+
+    client.dispose();
+    hookClient.dispose();
   });
 });

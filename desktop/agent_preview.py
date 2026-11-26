@@ -2,6 +2,7 @@
 from __future__ import annotations
 import base64, hashlib, json, os, sys, time
 from pathlib import Path
+from core.paths import resource_root
 
 def preview(store, path_value, output_value, *, width=1200, height=900, heading=None, dark=False, snapshot_value=None):
     if not 320 <= width <= 2400 or not 240 <= height <= 2400:
@@ -26,15 +27,17 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
     from PySide6.QtWebChannel import QWebChannel
     from PySide6.QtGui import QFontDatabase
     from documents import MIMES, atomic_write
-    root=Path(sys._MEIPASS)/'resources' if getattr(sys,'frozen',False) else Path(__file__).resolve().parent.parent
+    from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
+    root=resource_root()
     reader=root/'dist'/'qt-reader.html'
     if not reader.is_file():raise ValueError('Build or install the offline reader before previewing notes')
+    register_reader_schemes()
     app=QApplication.instance() or QApplication(['Super MD headless preview'])
     for font in (root/'smd-core'/'fonts').glob('*.ttf'):QFontDatabase.addApplicationFont(str(font))
     view=QWebEngineView();view.resize(width,height);view.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen,True)
-    profile=QWebEngineProfile(view);view.setPage(QWebEnginePage(profile,view))
+    profile=QWebEngineProfile(view);bundle_handler=ReaderBundleSchemeHandler(root/'dist',profile);profile.installUrlSchemeHandler(READER_SCHEME.encode('ascii'),bundle_handler);view.setPage(QWebEnginePage(profile,view))
     settings=view.settings();settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,False)
-    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,True)
+    settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,False)
     settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows,False)
     state={'ready':False,'started':time.monotonic(),'error':None,'stable':0,'heading':False}
     payload={'id':'preview','path':str(source),'content':markdown,'mode':'reader','dark':dark,'font':'Manrope','size':18,'zoom':100,'widthPercent':94,'colors':{'surface':'#17131b' if dark else '#ffffff','primary':'#ffb38b' if dark else '#315d99','text':'#f6f0ee' if dark else '#20252d'},'svgAppearance':'auto','motion':False}
@@ -93,7 +96,7 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
     def poll():
         if time.monotonic()-state['started']>40:timer.stop();fail('Offline reader preview timed out');return
         if state['ready']:view.page().runJavaScript("!!document.querySelector('.markdown-body') && document.fonts.status==='loaded' && [...document.images].every(i=>i.complete) && !document.querySelector('.mermaid-loading,.reader-loading')",inspected)
-    timer=QTimer();timer.setInterval(150);timer.timeout.connect(poll);timer.start();view.load(QUrl.fromLocalFile(str(reader)));view.show()
+    timer=QTimer();timer.setInterval(150);timer.timeout.connect(poll);timer.start();view.load(reader_bundle_url());view.show()
     code=app.exec();view.close();view.deleteLater();app.processEvents()
     if code or state['error']:raise ValueError(state['error'] or 'Preview failed')
     return {'output':str(output),'width':width,'height':height,'renderer':'super-md-offline-reader','sourceUnchanged':True,'revision':hashlib.sha256(raw).hexdigest()}

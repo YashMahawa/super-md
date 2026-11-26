@@ -69,4 +69,106 @@ class ReaderFlushBarrierTest {
         assertFalse(barrier.complete("timeout-token", "note-1", "native", "native", null))
         assertFalse(request.result.await())
     }
+
+    @Test fun flushStatusDistinguishesActiveNoteHandoffFromGenuineFailures() = runBlocking {
+        val barrier = ReaderFlushBarrier()
+
+        val preLoad = barrier.register("pre-load", "note-2")
+        assertFalse(barrier.complete("pre-load", "", null, null, "Reader has not loaded a note yet"))
+        assertFalse(preLoad.result.await())
+        assertEquals(ReaderFlushStatus.WRONG_ACTIVE_NOTE, preLoad.status.await())
+
+        val previousNote = barrier.register("handoff", "note-2")
+        assertFalse(barrier.complete("handoff", "note-1", null, null, "The active note changed before its edit flush"))
+        assertFalse(previousNote.result.await())
+        assertEquals(ReaderFlushStatus.WRONG_ACTIVE_NOTE, previousNote.status.await())
+
+        val malformed = barrier.register("malformed", "note-2")
+        assertFalse(barrier.complete("malformed", "note-1", null, null, "Malformed flush acknowledgement", wellFormed = false))
+        assertFalse(malformed.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, malformed.status.await())
+
+        val sameNoteError = barrier.register("same-note-error", "note-2")
+        assertFalse(barrier.complete("same-note-error", "note-2", null, "native", "Reader has unacknowledged edits for this note"))
+        assertFalse(sameNoteError.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, sameNoteError.status.await())
+
+        val contentMismatch = barrier.register("mismatch", "note-2")
+        assertFalse(barrier.complete("mismatch", "note-2", "reader-text", "native-text", null))
+        assertFalse(contentMismatch.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, contentMismatch.status.await())
+
+        val cancelled = barrier.register("cancelled", "note-2")
+        barrier.cancel(cancelled.token, cancelled)
+        assertFalse(cancelled.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, cancelled.status.await())
+
+        val acknowledged = barrier.register("ok", "note-2")
+        assertTrue(barrier.complete("ok", "note-2", "exact", "exact", null))
+        assertTrue(acknowledged.result.await())
+        assertEquals(ReaderFlushStatus.ACKNOWLEDGED, acknowledged.status.await())
+    }
+
+    @Test fun pendingNativeLoadAcceptsUntouchedDispatchedBaselineOnlyWhenAllowed() = runBlocking {
+        val barrier = ReaderFlushBarrier()
+
+        // Default strict flush (used by awaitReaderSnapshot) still requires WebView to match nativeContent.
+        val strict = barrier.register("strict-token", "note-1", allowPendingNativeLoad = false)
+        assertFalse(
+            barrier.complete(
+                "strict-token",
+                "note-1",
+                content = "dispatched-v1",
+                nativeContent = "native-v2",
+                dispatchedContent = "dispatched-v1",
+                error = null,
+            ),
+        )
+        assertFalse(strict.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, strict.status.await())
+
+        // Barrier flush accepts WebView's untouched last-dispatched baseline before Compose's next supermdLoad.
+        val allowed = barrier.register("barrier-token", "note-1", allowPendingNativeLoad = true)
+        assertTrue(
+            barrier.complete(
+                "barrier-token",
+                "note-1",
+                content = "dispatched-v1",
+                nativeContent = "native-v2",
+                dispatchedContent = "dispatched-v1",
+                error = null,
+            ),
+        )
+        assertTrue(allowed.result.await())
+        assertEquals(ReaderFlushStatus.ACKNOWLEDGED, allowed.status.await())
+
+        // Any unacknowledged reader draft or flush error still fails the barrier.
+        val unackedDraft = barrier.register("draft-token", "note-1", allowPendingNativeLoad = true)
+        assertFalse(
+            barrier.complete(
+                "draft-token",
+                "note-1",
+                content = "unacked-reader-draft",
+                nativeContent = "native-v2",
+                dispatchedContent = "dispatched-v1",
+                error = null,
+            ),
+        )
+        assertFalse(unackedDraft.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, unackedDraft.status.await())
+
+        val flushError = barrier.register("error-token", "note-1", allowPendingNativeLoad = true)
+        assertFalse(
+            barrier.complete(
+                "error-token",
+                "note-1",
+                content = "dispatched-v1",
+                nativeContent = "native-v2",
+                dispatchedContent = "dispatched-v1",
+                error = "Reader flush conflict",
+            ),
+        )
+        assertFalse(flushError.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, flushError.status.await())
+    }
 }

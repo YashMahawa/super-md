@@ -110,3 +110,16 @@ it("keeps Unicode prefixes intact when applying helper offsets", () => {
   click(button("Apply 1 repair"));
   expect(apply).toHaveBeenCalledWith("😀 and notes\n" + String.raw`$\sqrt{x}$`);
 });
+
+it("clears readerOverlay synchronously before dispatching apply so toolbar controls become immediately visible", () => {
+  let overlayDuringApply: string | undefined;
+  const apply = vi.fn(() => {
+    overlayDuringApply = document.documentElement.dataset.readerOverlay;
+  });
+  mount(String.raw`\(x + 1\]`, apply);
+  expect(document.documentElement.dataset.readerOverlay).toBe("true");
+  click(button("Apply 1 repair"));
+  expect(apply).toHaveBeenCalledWith("$x + 1$");
+  expect(overlayDuringApply).toBe("false");
+  expect(document.documentElement.dataset.readerOverlay).toBe("false");
+});
