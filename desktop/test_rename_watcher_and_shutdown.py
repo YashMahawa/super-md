@@ -25,6 +25,7 @@ import file_events
 import folder_ops
 import studio
 from studio import Session, Studio
+from workspace_links import resolve_workspace_link
 
 
 class QuietStudio(Studio):
@@ -798,6 +799,118 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
                 self.assertFalse(self._contains_path(report["expanded"], old_dir))
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
+
+    def test_rename_refreshes_note_stamps_invalidates_workspace_links_and_reuses_open_tab(self):
+        overview = self.workspace / "Overview.md"
+        reading = self.workspace / "Reading.md"
+        coursework = self.workspace / "Coursework"
+        week1 = coursework / "Week 1.md"
+
+        self.studio.openFolder(str(self.workspace))
+        self.studio.toggleDirectory(str(coursework))
+        self.wait_until(lambda: any(f["name"] == "Week 1.md" for f in self.studio.files))
+
+        self.studio.openNote(str(overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
+        overview_tab_id = self.studio.active
+        st_overview = overview.stat()
+        self.studio.note_file_stamps[str(overview)] = (st_overview.st_mtime_ns, st_overview.st_size)
+
+        self.studio.post(
+            "dirty-overview-link",
+            "document_changed",
+            json.dumps({"id": overview_tab_id, "content": "# Overview\n\nUnsaved draft preserved across link reuse"}),
+        )
+
+        self.studio.openNote(str(reading))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], reading))
+        reading_tab_id = self.studio.active
+
+        # Prime workspace_links cache before rename.
+        resolved_before = resolve_workspace_link(
+            "Overview",
+            wikilink=True,
+            note_path=str(reading),
+            workspace_folder=str(self.workspace),
+            cache=self.session.workspace_links,
+        )
+        self.assertTrue(folder_ops.same_path(resolved_before, overview))
+
+        # Rename Overview.md -> Course Overview.md while Reading.md is active.
+        renamed_overview = self.workspace / "Course Overview.md"
+        self.studio.renameNote(overview_tab_id, "Course Overview.md")
+        self.session.writes.flush(timeout=3.0)
+        self.wait_until(
+            lambda: renamed_overview.is_file()
+            and any(f["name"] == "Course Overview.md" for f in self.studio.files)
+        )
+
+        # #105: note_file_stamps evicted old key and recorded refreshed stat for renamed path.
+        self.assertFalse(any(folder_ops.same_path(k, overview) for k in self.studio.note_file_stamps))
+        matched_stamps = [v for k, v in self.studio.note_file_stamps.items() if folder_ops.same_path(k, renamed_overview)]
+        self.assertEqual(len(matched_stamps), 1)
+        st_renamed = renamed_overview.stat()
+        self.assertEqual(matched_stamps[0], (st_renamed.st_mtime_ns, st_renamed.st_size))
+
+        # #64: workspace_links cache invalidated; [[Course Overview]] resolves and reuses existing dirty open tab.
+        replies: list[tuple[str, str, str]] = []
+        self.studio.replied.connect(lambda req_id, payload, err: replies.append((req_id, payload, err)))
+        tab_count_before = len(self.studio.tabs)
+        self.studio.post(
+            "open-renamed-wikilink",
+            "open_workspace_link",
+            json.dumps({
+                "id": reading_tab_id,
+                "target": "Course Overview",
+                "wikilink": True,
+                "fragment": "",
+            }),
+        )
+        self.wait_until(lambda: any(r[0] == "open-renamed-wikilink" for r in replies))
+        _, raw_payload, err = next(r for r in replies if r[0] == "open-renamed-wikilink")
+        self.assertEqual(err, "")
+        parsed = json.loads(raw_payload)
+        self.assertTrue(parsed["opened"])
+        self.assertEqual(parsed["id"], overview_tab_id)
+        self.assertEqual(len(self.studio.tabs), tab_count_before)
+        self.assertEqual(self.studio.active, overview_tab_id)
+        self.assertEqual(self.studio._current()["content"], "# Overview\n\nUnsaved draft preserved across link reuse")
+
+        # Also verify folder rename updates child note_file_stamps and invalidates workspace_links.
+        self.studio.openNote(str(week1))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], week1))
+        week1_tab_id = self.studio.active
+        st_week1 = week1.stat()
+        self.studio.note_file_stamps[str(week1)] = (st_week1.st_mtime_ns, st_week1.st_size)
+        resolved_week1_before = resolve_workspace_link(
+            "Coursework/Week 1",
+            wikilink=True,
+            note_path=str(reading),
+            workspace_folder=str(self.workspace),
+            cache=self.session.workspace_links,
+        )
+        self.assertTrue(folder_ops.same_path(resolved_week1_before, week1))
+
+        seminars = self.workspace / "Seminars"
+        remapped_week1 = seminars / "Week 1.md"
+        self.studio.renameEntry(str(coursework), "Seminars")
+        self.session.writes.flush(timeout=3.0)
+        self.wait_until(
+            lambda: remapped_week1.is_file()
+            and any(f["name"] == "Seminars" for f in self.studio.files)
+        )
+        self.assertFalse(any(folder_ops.same_path(k, week1) for k in self.studio.note_file_stamps))
+        matched_week1_stamps = [v for k, v in self.studio.note_file_stamps.items() if folder_ops.same_path(k, remapped_week1)]
+        self.assertEqual(len(matched_week1_stamps), 1)
+        resolved_week1_after = resolve_workspace_link(
+            "Seminars/Week 1",
+            wikilink=True,
+            note_path=str(reading),
+            workspace_folder=str(self.workspace),
+            cache=self.session.workspace_links,
+        )
+        self.assertTrue(folder_ops.same_path(resolved_week1_after, remapped_week1))
+        self.assertEqual(week1_tab_id, self.studio.active)
 
     def test_final_window_shutdown_writer_drain_persists_renamed_note_for_reopen(self):
         self._run_isolated_shutdown_reopen_scenario(finish_before_stop=False, rename_folder=False)
