@@ -1266,6 +1266,7 @@ class InstanceBrokerAndServiceCliTests(unittest.TestCase):
                 lambda raw, owner=legacy_studio: self._dispatch_headless_live_request(owner, raw)
             )
             legacy_session.agent_bridge.start()
+            legacy_session.writes.flush(timeout=3)
             # Restore authentic pre-#41 on-disk settings.json (no `keepInBackground` key yet while old process runs).
             atomic_json(daemon_appdata / "qt-studio" / "settings.json", legacy_settings_payload)
 
@@ -1957,24 +1958,22 @@ desktop_main._exit_process(rc)""",
                 deferred_broker._ensure_listening()
             self.assertTrue(deferred_broker.server.isListening())
 
-            # _ensure_listening() must never drain listenSocket behind an already-queued macOS
-            # QCFSocketNotifier `_q_onNewConnection` activation (which would block in ::accept()).
-            from PySide6.QtCore import QMetaObject
-            from PySide6.QtNetwork import QLocalSocket
-            cfsock_client = QLocalSocket()
-            cfsock_client.connectToServer(deferred_broker.name)
-            self.assertTrue(cfsock_client.waitForConnected(500))
-            deferred_broker._ensure_listening()
-            QMetaObject.invokeMethod(deferred_broker.server, "_q_onNewConnection")
-            cfsock_client.write(b'{"service":"status"}\n')
-            cfsock_client.flush()
-            cfsock_client.waitForBytesWritten(500)
-            self.qt_app.processEvents()
-            cfsock_reply = bytes(cfsock_client.readAll())
-            while b"\n" not in cfsock_reply and cfsock_client.waitForReadyRead(500):
-                cfsock_reply += bytes(cfsock_client.readAll())
-            cfsock_client.disconnectFromServer()
-            self.assertEqual(json.loads(cfsock_reply.decode("utf-8"))["ok"], True)
+            # _ensure_listening() must never call waitForNewConnection() (which drains a blocking
+            # UNIX listenSocket behind an already-queued macOS QCFSocketNotifier activation and
+            # deadlocks QLocalServerPrivate::_q_onNewConnection in ::accept()).
+            with patch.object(
+                deferred_broker.server,
+                "waitForNewConnection",
+                side_effect=AssertionError("_ensure_listening must never call waitForNewConnection"),
+            ):
+                deferred_broker._ensure_listening()
+                status_res = self._call(
+                    {"kind": "service", "action": "status", "appdata": str(deferred_appdata)},
+                    on_tick=deferred_broker._ensure_listening,
+                    timeout=8.0,
+                )
+            self.assertEqual(status_res["code"], 0, status_res)
+            self.assertEqual(json.loads(status_res["stdout"])["ok"], True)
 
             # Intentional server.close() (empty errorString) must stay closed until stop_accepting/close.
             deferred_broker.server.close()

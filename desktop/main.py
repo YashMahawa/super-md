@@ -124,11 +124,9 @@ def main():
     global _TEARDOWN_COMPLETED
     _TEARDOWN_COMPLETED = False
     broker = None if args.test_state else InstanceBroker(app)
-    pending_open_requests = []
-    if broker:
-        broker.requested.connect(pending_open_requests.append)
     if broker and not broker.claim_or_forward(
         args.note,
+        defer_listen=True,
         open_existing=not (args.background and not args.note),
     ):
         return 0
@@ -237,8 +235,9 @@ def main():
             screen = window.screen() or app.primaryScreen()
             if screen is not None:
                 available = screen.availableGeometry()
-                window.setWidth(min(window.width(), available.width()))
-                window.setHeight(min(window.height(), available.height()))
+                if available.width() > 0 and available.height() > 0:
+                    window.setWidth(min(window.width(), available.width()))
+                    window.setHeight(min(window.height(), available.height()))
         laptop = next((s for s in app.screens() if s.name().startswith(("eDP", "LVDS"))), None)
         if laptop:
             window.setScreen(laptop)
@@ -541,17 +540,10 @@ def main():
                     studio._agent_error = f"Could not enable live agent access ({type(error).__name__})."
                     studio._emit(False)
         if broker:
-            try:
-                broker.requested.disconnect(pending_open_requests.append)
-            except (RuntimeError, TypeError):
-                pass
             app.aboutToQuit.connect(broker.stop_accepting)
             broker.requested.connect(lambda note: open_from_service(note or None))
             broker.set_service_handler(session.background.handle_service_request)
             broker.start_listening()
-            for early_note in pending_open_requests:
-                open_from_service(early_note or None)
-            pending_open_requests.clear()
     except BaseException:
         if broker:
             broker.close()
