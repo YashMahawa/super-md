@@ -25,7 +25,7 @@ import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
 import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, formatEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import { extractSelectedText } from "./copySource";
 import {readingOffset} from "./readingPosition";
-import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
+import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,hasExternalAnchorScroll,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,snapshotAnchorScroll,type AnchorScrollSnapshot,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
 import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
@@ -167,6 +167,7 @@ export function Reader() {
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
   const reference = useRef(state); reference.current = state;
   const consumedHeadingToken = useRef<string | null>(null);
+  const layoutNavigatedHeadingToken = useRef<string | null>(null);
   const suppressedRestoreToken = useRef<string | null>(null);
   const suppressedRestoreKey = useRef<string | null>(null);
   const legacyHeadingSeq = useRef(0);
@@ -279,6 +280,18 @@ export function Reader() {
       if(old?.id===next.id)next.readingLocation=old.readingLocation;
       if(old?.id===next.id&&!next.pendingHeading&&old.pendingHeading)next.pendingHeading=old.pendingHeading;
       const hasNewPendingHeading = Boolean(next.pendingHeading?.token && next.pendingHeading.token !== old?.pendingHeading?.token);
+      let unconsumedOldHeadingOffset: number | null = null;
+      if (old && (old.id !== next.id || old.mode !== next.mode) && !hasNewPendingHeading && old.pendingHeading?.token && old.pendingHeading.token !== consumedHeadingToken.current) {
+        consumedHeadingToken.current = old.pendingHeading.token;
+        unconsumedOldHeadingOffset = resolveHeadingOffset(old.content, old.pendingHeading.heading);
+        if (old.mode !== "editor") {
+          const oldHost = document.querySelector<HTMLElement>(".android-reading");
+          if (oldHost) navigateToHeading(oldHost, old.pendingHeading.heading);
+        }
+        if ((old.mode === "editor" || old.mode === "split") && unconsumedOldHeadingOffset !== null) {
+          revealEditorOffset(old.id, unconsumedOldHeadingOffset, { caretOffset: unconsumedOldHeadingOffset });
+        }
+      }
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen))document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
       if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
@@ -287,6 +300,7 @@ export function Reader() {
           splitPane.current=null;
           primeEditorAnchor(next.id,null);
         }else{
+          savePosition.current();
           const root=document.querySelector<HTMLElement>(".android-reading");
           const captured=captureSharedAnchor({
             id:old.id,
@@ -295,6 +309,9 @@ export function Reader() {
             readingRoot:root,
             preferredSplitPane:splitPane.current,
           });
+          if(unconsumedOldHeadingOffset!==null&&unconsumedOldHeadingOffset>0&&captured.offset===0){
+            captured.offset=unconsumedOldHeadingOffset;
+          }
           modeAnchor.current=captured;
           splitPane.current=null;
           if(next.mode==="editor"||next.mode==="split"){
@@ -314,6 +331,9 @@ export function Reader() {
           readingRoot:document.querySelector<HTMLElement>(".android-reading"),
           preferredSplitPane:splitPane.current,
         });
+        if (unconsumedOldHeadingOffset !== null && unconsumedOldHeadingOffset > 0 && outgoingAnchor.offset === 0) {
+          outgoingAnchor.offset = unconsumedOldHeadingOffset;
+        }
         noteViews.current.set(old.id, {top: outgoingAnchor.readingTop ?? 0, anchor: outgoingAnchor, rendered: exportRenderedViews(old.content)});
         if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
         if (suppressedRestoreKey.current?.startsWith(`${old.id}:`)) suppressedRestoreKey.current = null;
@@ -709,6 +729,7 @@ export function Reader() {
       const host = state.mode !== "editor" ? document.querySelector<HTMLElement>(".android-reading") : null;
       if (host && !host.querySelector('[data-windowed-mounted="false"]')) {
         navigateToHeading(host, state.pendingHeading.heading);
+        layoutNavigatedHeadingToken.current = state.pendingHeading.token;
       }
       return;
     }
@@ -748,30 +769,41 @@ export function Reader() {
       // lazy math and fonts). Re-apply the source anchor until it is stable,
       // and stop as soon as the person scrolls, types or opens search/live edit.
       let stopped=false;const stop=()=>{stopped=true;};
+      let readingSnapshot:AnchorScrollSnapshot|null=null;
+      const onScroll=(event:Event)=>{
+        const target=event.target;
+        if(target instanceof HTMLElement&&target.matches(".android-reading")&&hasExternalAnchorScroll(readingSnapshot)){
+          clearProgrammaticAnchorScroll(target);
+          stopped=true;
+        }
+      };
       const inputs=["wheel","touchstart","keydown","pointerdown","supermd-goto-offset"] as const;
       inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+      window.addEventListener("scroll",onScroll,{capture:true,passive:true});
       let firstPass=true;
       const apply=()=>{
-        if(stopped||shouldStop())return;
+        if(stopped||shouldStop()||hasExternalAnchorScroll(readingSnapshot)){stopped=true;return;}
         const updateSelection=firstPass;
         firstPass=false;
         runGuarded(()=>{
+          const readingRoot=document.querySelector<HTMLElement>(".android-reading");
           applySharedAnchor({
             id:state.id,
             targetMode:state.mode,
             targetZoom:zoomReference.current,
             anchor,
-            readingRoot:document.querySelector<HTMLElement>(".android-reading"),
+            readingRoot,
             allowExactTop:false,
             updateSelection,
           });
+          readingSnapshot=snapshotAnchorScroll(readingRoot);
         });
       };
       apply();
       let innerFrame=0;
       const outerFrame=requestAnimationFrame(()=>{apply();innerFrame=requestAnimationFrame(apply);});
       const timers=[120,320,700].map(delay=>window.setTimeout(apply,delay));
-      return()=>{stopped=true;cancelAnimationFrame(outerFrame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+      return()=>{stopped=true;cancelAnimationFrame(outerFrame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));window.removeEventListener("scroll",onScroll,{capture:true});};
     }
     if (suppressedRestoreKey.current === `${state.id}:${state.mode}`) return;
     suppressedRestoreKey.current = null;
@@ -799,30 +831,42 @@ export function Reader() {
     }
     let stopped=false;
     const stop=()=>{stopped=true;};
+    let readingSnapshot:AnchorScrollSnapshot|null=null;
+    const onScroll=(event:Event)=>{
+      const target=event.target;
+      if(target instanceof HTMLElement&&target.matches(".android-reading")&&hasExternalAnchorScroll(readingSnapshot)){
+        clearProgrammaticAnchorScroll(target);
+        stopped=true;
+      }
+    };
     const inputs=['wheel','touchstart','pointerdown','keydown','supermd-goto-offset'] as const;
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+    window.addEventListener('scroll',onScroll,{capture:true,passive:true});
     let firstPass=true;
     const restore=()=>{
-      if(stopped||shouldStop())return;
+      if(stopped||shouldStop()||hasExternalAnchorScroll(readingSnapshot)){stopped=true;return;}
       const updateSelection=firstPass;
       firstPass=false;
       runGuarded(()=>{
+        const readingRoot=document.querySelector<HTMLElement>(".android-reading");
         applySharedAnchor({
           id:state.id,
           targetMode:state.mode,
           targetZoom:zoomReference.current,
           anchor:resolvedAnchor,
-          readingRoot:document.querySelector<HTMLElement>(".android-reading"),
+          readingRoot,
           allowExactTop:true,
           updateSelection,
         });
+        const requestedReadingTop=resolvedAnchor.mode===state.mode&&Math.abs(resolvedAnchor.zoom-zoomReference.current)<1?resolvedAnchor.readingTop:undefined;
+        readingSnapshot=snapshotAnchorScroll(readingRoot,requestedReadingTop);
       });
     };
     restore();
     let innerFrame=0;
     const frame=requestAnimationFrame(()=>{restore();innerFrame=requestAnimationFrame(restore);});
     const timers=[120,320,700].map(delay=>window.setTimeout(restore,delay));
-    return()=>{stopped=true;cancelAnimationFrame(frame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
+    return()=>{stopped=true;cancelAnimationFrame(frame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));window.removeEventListener('scroll',onScroll,{capture:true});};
   }, [state?.id, state?.mode, state?.pendingHeading?.token]);
   useEffect(() => {
     if (!state?.pendingHeading?.token || state.pendingHeading.token === consumedHeadingToken.current) return;
@@ -853,7 +897,9 @@ export function Reader() {
       });
     }
     const host = state.mode !== "editor" ? document.querySelector<HTMLElement>(".android-reading") : null;
-    if (host) navigateToHeading(host, targetHeading);
+    if (host && layoutNavigatedHeadingToken.current !== state.pendingHeading.token) {
+      navigateToHeading(host, targetHeading);
+    }
     const timers = (state.mode === "editor" || state.mode === "split")
       ? [120, 320].map(delay => window.setTimeout(() => applyEditorJump(false), delay))
       : [];
@@ -874,6 +920,7 @@ export function Reader() {
     if(!roots.length)return;
     let timer=0;
     const save=()=>{
+      if(reference.current?.id!==state.id||reference.current?.mode!==state.mode)return;
       if(!roots.some(node=>node.isConnected))return;
       const snap=captureSharedAnchor({
         id:state.id,

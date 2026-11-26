@@ -6,7 +6,8 @@ import MarkdownPreview from "./components/MarkdownPreview";
 import LiveEditor from "./components/LiveEditor";
 import {readingCaretOffset,readingOffset,revealReadingOffset} from "./readingPosition";
 import {applyDocumentZoom} from "./documentZoom";
-import {applySharedAnchor,captureSharedAnchor,detectSplitPaneFromTarget} from "./sourceAnchor";
+import {applySharedAnchor,captureSharedAnchor,detectSplitPaneFromTarget,hasExternalAnchorScroll,markProgrammaticAnchorScroll,snapshotAnchorScroll} from "./sourceAnchor";
+import {Reader} from "./androidReader";
 
 (globalThis as unknown as {IS_REACT_ACT_ENVIRONMENT?:boolean}).IS_REACT_ACT_ENVIRONMENT=true;
 
@@ -314,5 +315,131 @@ describe("readingPosition on deep nested checklists",()=>{
       allowExactTop:true,
     });
     expect(host.scrollTop).toBe(0);
+  });
+
+  it("detects external viewport scrolls within the programmatic window without mistaking layout adjustments or clamps",()=>{
+    host=document.createElement("div");
+    Object.defineProperty(host,"clientHeight",{value:820,configurable:true});
+    let scrollHeight=11320;
+    Object.defineProperty(host,"scrollHeight",{get:()=>scrollHeight,configurable:true});
+    document.body.appendChild(host);
+
+    markProgrammaticAnchorScroll(host);
+    host.scrollTop=6928;
+    const snap=snapshotAnchorScroll(host);
+    expect(hasExternalAnchorScroll(snap)).toBe(false);
+
+    // Layout-recorded scroll preservation does not count as external scroll.
+    host.scrollTop=6960;
+    (host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=6960;
+    expect(hasExternalAnchorScroll(snap)).toBe(false);
+
+    // Temporary maxScrollTop clamping when layout shrinks does not count as external scroll.
+    delete (host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop;
+    scrollHeight=5820;
+    host.scrollTop=5000;
+    expect(hasExternalAnchorScroll(snap)).toBe(false);
+
+    // Programmatic/native scrollIntoView to Appendix 20 (9913 px) is detected immediately as external scroll.
+    scrollHeight=11320;
+    host.scrollTop=9913;
+    expect(hasExternalAnchorScroll(snap)).toBe(true);
+  });
+
+  it("stops post-transition settle timers after scrollIntoView and preserves outgoing ReadingLocation across tab switch",()=>{
+    vi.useFakeTimers();
+    try {
+      const lecture="# Lecture 2\n\n## Bayes\n\nPosterior.\n\n## Appendix 20\n\nDerivation.\n";
+      const savedPositions:Record<string,unknown>={};
+      (window as unknown as {SuperMD?:unknown}).SuperMD={
+        post(id:string,command:string,raw:string){
+          const args=JSON.parse(raw);
+          if(command==="reading_position")savedPositions[args.id]=args.location;
+          window.supermdReply?.(id,command==="document_sync"?{accepted:true,revision:0}:true,null);
+        },
+      };
+      host=document.createElement("div");
+      document.body.appendChild(host);
+      root=createRoot(host);
+      act(()=>{root!.render(<Reader/>);});
+
+      const baseState={
+        dark:false,
+        fullscreen:false,
+        colors:{},
+        font:"Manrope",
+        size:16,
+        zoom:100,
+        motion:false,
+        editProtocol:1,
+        restorePosition:true,
+      };
+
+      // 1. Load Lecture 2 in Source mode at ## Bayes via pendingHeading, then switch to Live mode.
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-lecture-2",
+          path:"/notes/Lecture 2.md",
+          content:lecture,
+          mode:"editor",
+          pendingHeading:{heading:"Bayes",token:"h-1"},
+        });
+      });
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-lecture-2",
+          path:"/notes/Lecture 2.md",
+          content:lecture,
+          mode:"live",
+        });
+      });
+
+      const reading=host.querySelector<HTMLElement>(".android-reading")!;
+      expect(reading).toBeTruthy();
+      Object.defineProperty(reading,"clientHeight",{value:820,configurable:true});
+      Object.defineProperty(reading,"scrollHeight",{value:11320,configurable:true});
+
+      // Simulate settled #Bayes scroll (6928 px) followed by scrollIntoView to #Appendix 20 (9913 px) before 120ms timer.
+      reading.scrollTop=9913;
+      act(()=>{
+        reading.dispatchEvent(new Event("scroll",{bubbles:true}));
+        vi.advanceTimersByTime(400);
+      });
+      expect(reading.scrollTop).toBe(9913);
+
+      // 2. Switch to Index.md in Live mode and verify Lecture 2's saved ReadingLocation was not overwritten with 0 or 6928.
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-index",
+          path:"/notes/Index.md",
+          content:"# Course Index\n",
+          mode:"live",
+        });
+      });
+      expect((savedPositions["tab-lecture-2"] as {top:number}).top).toBe(9913);
+
+      // 3. Reopen Lecture 2 in Live mode and verify exact 9913 px restoration across settle timers.
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-lecture-2",
+          path:"/notes/Lecture 2.md",
+          content:lecture,
+          mode:"live",
+          readingLocation:savedPositions["tab-lecture-2"] as never,
+        });
+      });
+      const reopenedReading=host.querySelector<HTMLElement>(".android-reading")!;
+      Object.defineProperty(reopenedReading,"clientHeight",{value:820,configurable:true});
+      Object.defineProperty(reopenedReading,"scrollHeight",{value:11320,configurable:true});
+      act(()=>{vi.advanceTimersByTime(750);});
+      expect(reopenedReading.scrollTop).toBe(9913);
+    } finally {
+      delete (window as unknown as {SuperMD?:unknown}).SuperMD;
+      vi.useRealTimers();
+    }
   });
 });
