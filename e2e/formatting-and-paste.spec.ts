@@ -327,3 +327,169 @@ test("URL paste wraps selected prose inline without dialog, pastes raw URL in ba
   });
   await expect(page.getByRole("dialog", { name: "Insert image or link" })).toHaveCount(0);
 });
+
+test("maps selected rendered Live ranges to source, unwraps caret inside bold text without splitting, and keeps protected code/YAML and multi-paragraph selections untouched", async ({ page }) => {
+  const calls: Array<{ command: string; args: any }> = [];
+  await page.exposeFunction("bridgePost", (id: string, command: string, raw: string) => {
+    const args = JSON.parse(raw);
+    calls.push({ command, args });
+    void page.evaluate(({ id }) => window.supermdReply?.(id, true, null), { id });
+  });
+  await page.addInitScript(() => {
+    window.SuperMD = { post: (id, command, args) => (window as any).bridgePost(id, command, args) };
+  });
+  await page.setViewportSize({ width: 1120, height: 780 });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const doc = [
+    "---",
+    "title: Guarded Note",
+    "---",
+    "",
+    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd`.",
+    "",
+    "Second paragraph stays separate.",
+    "",
+    "```python",
+    "protected_value = 42",
+    "```",
+  ].join("\n");
+
+  const latestContent = () => calls.filter((c) => c.command === "document_changed").at(-1)?.args.content ?? doc;
+
+  await page.evaluate((content) => {
+    window.supermdLoad?.({
+      id: "selection-guard-note",
+      content,
+      path: "selection-guard-note",
+      mode: "live",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "sans",
+      size: 16,
+      zoom: 100,
+    });
+  }, doc);
+
+  // 1. Multi-paragraph rendered selection in Live mode is kept separate (no mutation)
+  await page.evaluate(() => {
+    const paras = document.querySelectorAll(".live-document p");
+    const range = document.createRange();
+    range.setStart(paras[0]!.firstChild!, 0);
+    range.setEnd(paras[1]!.firstChild!, 6);
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+  await page.keyboard.press("Control+b");
+  expect(latestContent()).toBe(doc);
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveCount(0);
+
+  // 2. Rendered selection inside protected inline code (`inline_cmd`) is guarded against bold splitting
+  await page.evaluate(() => {
+    const codeEl = document.querySelector(".live-document p code")!;
+    const range = document.createRange();
+    range.setStart(codeEl.firstChild!, 0);
+    range.setEnd(codeEl.firstChild!, 6);
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+  await page.keyboard.press("Control+b");
+  expect(latestContent()).toBe(doc);
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveCount(0);
+
+  // 3. Selected rendered range in Live mode maps across bold + link to exact source offsets, formats, toggles, and undoes cleanly
+  await page.evaluate(() => {
+    const para = document.querySelector(".live-document p")!;
+    const walker = document.createTreeWalker(para, NodeFilter.SHOW_TEXT);
+    let targetNode: Text | null = null;
+    let offset = -1;
+    let n: Node | null;
+    while ((n = walker.nextNode())) {
+      const idx = (n as Text).data.indexOf("selected rendered range");
+      if (idx >= 0) {
+        targetNode = n as Text;
+        offset = idx;
+        break;
+      }
+    }
+    const range = document.createRange();
+    range.setStart(targetNode!, offset);
+    range.setEnd(targetNode!, offset + "selected rendered range".length);
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+  await page.keyboard.press("Control+b");
+  const liveBox = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(liveBox).toBeVisible();
+  await expect(liveBox).toHaveValue(
+    "Observe **Fourier** [guide](https://example.com) and **selected rendered range** with `inline_cmd`.",
+  );
+  await expect.poll(latestContent).toContain("and **selected rendered range** with `inline_cmd`.");
+  await page.screenshot({ path: "/tmp/live-selected-rendered-range.png" });
+
+  // Single-step Undo restores unbolded text and selection
+  await page.keyboard.press("Control+z");
+  await expect(liveBox).toHaveValue(
+    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd`.",
+  );
+  await expect.poll(latestContent).toBe(doc);
+
+  // 4. Caret inside bold text (`**Fou|rier**`) in Live mode: Control+i does NOT split `**Fourier**`; Control+b unwraps cleanly preserving caret
+  await page.evaluate(() => {
+    const area = document.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
+    area.focus();
+    const caret = area.value.indexOf("Fourier") + 3;
+    area.setSelectionRange(caret, caret);
+  });
+  await page.keyboard.press("Control+i");
+  await expect(liveBox).toHaveValue(
+    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd`.",
+  );
+  await page.keyboard.press("Control+b");
+  await expect(liveBox).toHaveValue(
+    "Observe Fourier [guide](https://example.com) and selected rendered range with `inline_cmd`.",
+  );
+  const unwrappedCaret = await page.evaluate(() => {
+    const area = document.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
+    return [area.selectionStart, area.selectionEnd];
+  });
+  expect(unwrappedCaret).toEqual(["Observe Fou".length, "Observe Fou".length]);
+
+  // 5. Source mode: YAML frontmatter and caret inside bold text remain protected from splitting
+  calls.length = 0;
+  await page.evaluate((content) => {
+    window.supermdLoad?.({
+      id: "selection-guard-note",
+      content,
+      path: "selection-guard-note",
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "sans",
+      size: 16,
+      zoom: 100,
+    });
+  }, doc);
+  await page.locator(".cm-content").click();
+  // Place caret inside YAML frontmatter `Guarded` and press Control+b -> unchanged
+  const yamlPos = doc.indexOf("Guarded") + 3;
+  await page.keyboard.press("Control+Home");
+  for (let i = 0; i < yamlPos; i++) await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Control+b");
+  expect(latestContent()).toBe(doc);
+
+  // Move caret inside `**Fou|rier**` in Source mode -> Control+i is a safe no-op, Control+b unwraps `**Fourier**`
+  const boldCaretPos = doc.indexOf("Fourier") + 3;
+  await page.keyboard.press("Control+Home");
+  for (let i = 0; i < boldCaretPos; i++) await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Control+i");
+  expect(latestContent()).toBe(doc);
+  await page.keyboard.press("Control+b");
+  await expect.poll(latestContent).toContain("Observe Fourier [guide](https://example.com)");
+});

@@ -21,6 +21,7 @@ import {
 } from '../markdownFormatting';
 import {editableBlockSpans,indentMarkdownSelection,isFirstLineCursor,isLastLineCursor} from '../liveBlockFlow';
 import {handleLiveEditorKey} from '../liveEditorKeys';
+import {mapLiveRenderedSelectionToSourceRange,translateLiveRenderedRange} from '../liveSelectionRange';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 const CARET_KEYS=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End']);
@@ -194,9 +195,7 @@ function LiveBlockShell({windowed,estimate,text,headings,start,end,blockIndex,ac
 }
 
 function translateRenderedRange(start:number,end:number,editing:EditingSession|null,syncedMarkdown:string):[number,number] {
-  if(!editing||end<=editing.baseSplitEnd)return [start,end];
-  const delta=syncedMarkdown.length-editing.baseMarkdown.length;
-  return [start>=editing.baseSplitEnd?start+delta:start,end+delta];
+  return translateLiveRenderedRange(start,end,editing,syncedMarkdown);
 }
 
 interface LiveEditorState {
@@ -873,17 +872,121 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[rememberSelection,update]);
 
   const applyLiveFormat=useCallback((action:FormatAction):boolean=>{
-    const {editing:current,draftText:currentDraft}=latestRef.current,area=editor.current;
-    if(!current||!area)return false;
+    const {
+      editing:current,
+      draftText:currentDraft,
+      markdown:latestMarkdown,
+      renderedSource:currentRenderedSource,
+      sourceAnalysis:currentSourceAnalysis,
+      onChange:emitChange,
+    }=latestRef.current;
+    const activeDoc=current?syncedMarkdownRef.current:latestMarkdown;
+    const mapped=typeof window!=='undefined'
+      ?mapLiveRenderedSelectionToSourceRange(
+        window.getSelection(),
+        rootRef.current,
+        currentRenderedSource,
+        currentSourceAnalysis,
+        current,
+        activeDoc,
+      )
+      :null;
+    if(mapped){
+      const docRange=mapped.reversed
+        ?{anchor:mapped.to,head:mapped.from}
+        :{anchor:mapped.from,head:mapped.to};
+      const result=toggleMarkdownFormat(activeDoc,[docRange],action,0);
+      if(
+        result.changes.length===0||
+        result.doc===activeDoc||
+        !result.changes.every(ch=>ch.from>=mapped.blockStart&&ch.to<=mapped.blockEnd)
+      ){
+        return false;
+      }
+      const origBlockText=activeDoc.slice(mapped.blockStart,mapped.blockEnd);
+      const origStart=mapped.from-mapped.blockStart;
+      const origEnd=mapped.to-mapped.blockStart;
+      const origDirection:"forward"|"backward"=mapped.reversed?"backward":"forward";
+      const nextBlockEnd=mapped.blockEnd+(result.doc.length-activeDoc.length);
+      const nextBlockText=result.doc.slice(mapped.blockStart,nextBlockEnd);
+      const nextDocRange=result.ranges[0];
+      const localAnchor=Math.max(0,Math.min(nextBlockText.length,nextDocRange.anchor-mapped.blockStart));
+      const localHead=Math.max(0,Math.min(nextBlockText.length,nextDocRange.head-mapped.blockStart));
+      const nextStart=Math.min(localAnchor,localHead);
+      const nextEnd=Math.max(localAnchor,localHead);
+      const nextDirection:"forward"|"backward"|"none"=localAnchor>localHead?"backward":nextStart<nextEnd?"forward":"none";
+
+      window.getSelection()?.removeAllRanges();
+      const session=++sessionCounter.current;
+      resetOutsidePress(session);
+      anchorTop.current=mapped.blockElement.getBoundingClientRect().top;
+      blockHistory.current={
+        undo:[{text:origBlockText,start:origStart,end:origEnd,direction:origDirection}],
+        redo:[],
+        last:0,
+      };
+      lastSelection.current={start:nextStart,end:nextEnd,direction:nextDirection};
+      pendingSelection.current={start:nextStart,end:nextEnd,direction:nextDirection};
+      const protectedBlock=(activeDoc===currentSourceAnalysis.source?currentSourceAnalysis.analysis:analyzeDocument(activeDoc))
+        .tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=mapped.blockStart&&(node.position?.end.offset??Infinity)<=mapped.blockEnd);
+      const nextSession:EditingSession={
+        session,
+        prefix:activeDoc.slice(0,mapped.blockStart),
+        suffix:activeDoc.slice(mapped.blockEnd),
+        baseMarkdown:activeDoc,
+        baseSplitEnd:mapped.blockEnd,
+        protectedBlock,
+      };
+      editSpanRef.current={
+        baseSource:activeDoc,
+        start:mapped.blockStart,
+        oldEnd:mapped.blockEnd,
+        newEnd:nextBlockEnd,
+      };
+      savedSelection.current={
+        from:mapped.blockStart+nextStart,
+        to:mapped.blockStart+nextEnd,
+        markdown:result.doc,
+      };
+      syncedMarkdownRef.current=result.doc;
+      latestRef.current.editing=nextSession;
+      latestRef.current.draftText=nextBlockText;
+      setCaret(nextStart);
+      setDraftText(nextBlockText);
+      setEditing(nextSession);
+      notifyHistoryBoundary();
+      emitChange(result.doc);
+      notifyHistoryBoundary();
+      syncActiveCaretCenter();
+      return true;
+    }
+
+    const area=editor.current;
+    if(!current||!area||current.protectedBlock)return false;
     const start=area.selectionStart,end=area.selectionEnd,reversed=area.selectionDirection==="backward";
-    const range=reversed?{anchor:end,head:start}:{anchor:start,head:end};
-    const result=toggleMarkdownFormat(currentDraft,[range],action,0);
+    const prefixLen=current.prefix.length;
+    const fullDoc=current.prefix+currentDraft+current.suffix;
+    const blockEndInDoc=fullDoc.length-current.suffix.length;
+    const docRange=reversed
+      ?{anchor:prefixLen+end,head:prefixLen+start}
+      :{anchor:prefixLen+start,head:prefixLen+end};
+    const result=toggleMarkdownFormat(fullDoc,[docRange],action,0);
+    if(
+      result.changes.length===0||
+      result.doc===fullDoc||
+      !result.changes.every(ch=>ch.from>=prefixLen&&ch.to<=blockEndInDoc)
+    ){
+      return false;
+    }
+    const nextBlockText=result.doc.slice(prefixLen,result.doc.length-current.suffix.length);
     const nextRange=result.ranges[0];
-    const nextStart=Math.min(nextRange.anchor,nextRange.head);
-    const nextEnd=Math.max(nextRange.anchor,nextRange.head);
-    const nextDirection:"forward"|"backward"|"none"=nextRange.anchor>nextRange.head?"backward":nextStart<nextEnd?"forward":"none";
-    return commitDiscreteBlockEdit(result.doc,nextStart,nextEnd,nextDirection);
-  },[commitDiscreteBlockEdit]);
+    const localAnchor=Math.max(0,Math.min(nextBlockText.length,nextRange.anchor-prefixLen));
+    const localHead=Math.max(0,Math.min(nextBlockText.length,nextRange.head-prefixLen));
+    const nextStart=Math.min(localAnchor,localHead);
+    const nextEnd=Math.max(localAnchor,localHead);
+    const nextDirection:"forward"|"backward"|"none"=localAnchor>localHead?"backward":nextStart<nextEnd?"forward":"none";
+    return commitDiscreteBlockEdit(nextBlockText,nextStart,nextEnd,nextDirection);
+  },[commitDiscreteBlockEdit,resetOutsidePress,syncActiveCaretCenter]);
 
   const replayBlockHistory=useCallback((direction:"undo"|"redo"):boolean=>{
     const {editing:current,draftText:currentDraft}=latestRef.current,area=editor.current;
@@ -906,13 +1009,8 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   },[update]);
 
   useEffect(()=>{
-    if(!editing){
-      if(activeLiveFormatHandler===applyLiveFormat)activeLiveFormatHandler=null;
-      if(activeLiveHistoryHandler===replayBlockHistory)activeLiveHistoryHandler=null;
-      return;
-    }
     activeLiveFormatHandler=applyLiveFormat;
-    activeLiveHistoryHandler=replayBlockHistory;
+    activeLiveHistoryHandler=editing?replayBlockHistory:null;
     const onFormatEvent=(event:Event)=>{
       const detail=(event as CustomEvent<{action?:string;prefix?:string;suffix?:string;block?:boolean}>).detail;
       const action=normalizeFormatAction(detail?.action);
@@ -929,9 +1027,34 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       const wrapped=`${prefix}${currentDraft.slice(from,to)}${suffix}`;
       commitDiscreteBlockEdit(currentDraft.slice(0,from)+wrapped+currentDraft.slice(to),from+prefix.length,from+prefix.length+(to-from));
     };
+    const onRenderedKeyDown=(event:KeyboardEvent)=>{
+      if(event.defaultPrevented||event.isComposing||event.keyCode===229)return;
+      if(document.documentElement.dataset.host==='qt')return;
+      if(document.querySelector('.theme-guide-dialog,.image-viewer,.step-viewer,.media-dialog,.math-repair-panel'))return;
+      const target=event.target instanceof Element?event.target:null;
+      if(target?.closest('input,textarea,select,[contenteditable="true"],.cm-editor,.reading-search'))return;
+      const formatAction=formatActionFromKeyEvent(event);
+      if(!formatAction)return;
+      const {editing:current,markdown:latestMarkdown,renderedSource:currentRenderedSource,sourceAnalysis:currentSourceAnalysis}=latestRef.current;
+      const activeDoc=current?syncedMarkdownRef.current:latestMarkdown;
+      const mapped=mapLiveRenderedSelectionToSourceRange(
+        window.getSelection(),
+        rootRef.current,
+        currentRenderedSource,
+        currentSourceAnalysis,
+        current,
+        activeDoc,
+      );
+      if(!mapped)return;
+      event.preventDefault();
+      event.stopPropagation();
+      applyLiveFormat(formatAction);
+    };
     window.addEventListener('supermd-format',onFormatEvent);
+    document.addEventListener('keydown',onRenderedKeyDown);
     return()=>{
       window.removeEventListener('supermd-format',onFormatEvent);
+      document.removeEventListener('keydown',onRenderedKeyDown);
       if(activeLiveFormatHandler===applyLiveFormat)activeLiveFormatHandler=null;
       if(activeLiveHistoryHandler===replayBlockHistory)activeLiveHistoryHandler=null;
     };

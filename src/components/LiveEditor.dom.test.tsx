@@ -24,7 +24,7 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
 });
 
 import Editor from "./Editor";
-import LiveEditor from "./LiveEditor";
+import LiveEditor, { formatActiveLiveBlock } from "./LiveEditor";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
@@ -1257,6 +1257,138 @@ it("combines accessible Edit block controls with prose URL wrapping, raw paste i
   expect(area.value).toContain('endpoint = "old_host"');
   expect([area.selectionStart, area.selectionEnd]).toEqual([hostStart, hostStart + "old_host".length]);
 
+  act(() => root.unmount());
+  host.remove();
+});
+
+it("formats a selected rendered range in Live mode (including across upstream draft shifts), unwraps a caret inside bold text without splitting, and keeps protected code/multi-paragraph selections separate", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let doc = [
+    "---",
+    "title: Live Selection Fixture",
+    "---",
+    "",
+    "Intro block.",
+    "",
+    "Study **Fourier** [docs](https://example.com) and selected rendered range near `cmd_flag`.",
+    "",
+    "Trailing paragraph stays separate.",
+  ].join("\n");
+  const renderDoc = () =>
+    root.render(
+      <LiveEditor
+        markdown={doc}
+        documentPath={null}
+        dark={false}
+        python=""
+        onChange={(next) => {
+          doc = next;
+          renderDoc();
+        }}
+      />,
+    );
+  await act(async () => { renderDoc(); });
+
+  const selectRenderedText = (container: Element, target: string) => {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    let node: Node | null;
+    while ((node = walker.nextNode())) {
+      const idx = (node as Text).data.indexOf(target);
+      if (idx >= 0) {
+        const range = document.createRange();
+        range.setStart(node, idx);
+        range.setEnd(node, idx + target.length);
+        const sel = window.getSelection()!;
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+      }
+    }
+    throw new Error(`Missing rendered substring: ${target}`);
+  };
+
+  // 1. Open block 0 ("Intro block.") and lengthen it so downstream rendered block DOM offsets are shifted
+  const blocks = host.querySelectorAll<HTMLElement>(".live-block");
+  act(() => blocks[0]!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  const introArea = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  await act(async () => {
+    typeInTextarea(introArea, "Intro block with extra draft prose.");
+  });
+  expect(doc).toContain("Intro block with extra draft prose.");
+
+  // 2. While block 0 is still open, select "selected rendered range" in rendered block 1 and format via Ctrl+B
+  const secondPara = blocks[1]!.querySelector("p")!;
+  selectRenderedText(secondPara, "selected rendered range");
+  const ctrlB = new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true });
+  act(() => { secondPara.dispatchEvent(ctrlB); });
+  expect(ctrlB.defaultPrevented).toBe(true);
+
+  const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  expect(area.value).toBe(
+    "Study **Fourier** [docs](https://example.com) and **selected rendered range** near `cmd_flag`.",
+  );
+  const innerSelStart = area.value.indexOf("selected rendered range");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([
+    innerSelStart,
+    innerSelStart + "selected rendered range".length,
+  ]);
+
+  // Single-step Undo restores unformatted block text and selection
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe(
+    "Study **Fourier** [docs](https://example.com) and selected rendered range near `cmd_flag`.",
+  );
+  expect([area.selectionStart, area.selectionEnd]).toEqual([
+    area.value.indexOf("selected rendered range"),
+    area.value.indexOf("selected rendered range") + "selected rendered range".length,
+  ]);
+
+  // 3. Caret inside bold text (`**Fou|rier**`): Ctrl+I does not split, Ctrl+B unwraps preserving caret
+  const fourierCaret = area.value.indexOf("Fourier") + 3;
+  act(() => {
+    area.setSelectionRange(fourierCaret, fourierCaret);
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "i", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe(
+    "Study **Fourier** [docs](https://example.com) and selected rendered range near `cmd_flag`.",
+  );
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toBe(
+    "Study Fourier [docs](https://example.com) and selected rendered range near `cmd_flag`.",
+  );
+  expect([area.selectionStart, area.selectionEnd]).toEqual(["Study Fou".length, "Study Fou".length]);
+
+  // Close editor and verify rendered guards (inline code & multi-paragraph selection)
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+  const snapshotAfterEscape = doc;
+
+  // Rendered inline code selection is protected from bold splitting
+  const codeSpan = host.querySelector(".live-document p code")!;
+  selectRenderedText(codeSpan, "cmd_flag");
+  expect(formatActiveLiveBlock("bold")).toBe(false);
+  expect(doc).toBe(snapshotAfterEscape);
+
+  // Multi-paragraph rendered selection returns false and leaves document untouched
+  const allParas = host.querySelectorAll(".live-document p");
+  const multiRange = document.createRange();
+  multiRange.setStart(allParas[1]!.firstChild!, 0);
+  multiRange.setEnd(allParas[2]!.firstChild!, 8);
+  const sel = window.getSelection()!;
+  sel.removeAllRanges();
+  sel.addRange(multiRange);
+  expect(formatActiveLiveBlock("bold")).toBe(false);
+  expect(doc).toBe(snapshotAfterEscape);
+
+  sel.removeAllRanges();
   act(() => root.unmount());
   host.remove();
 });
