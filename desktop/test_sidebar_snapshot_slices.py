@@ -1085,6 +1085,21 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         rename_dialog.reject()
         self.wait_until(lambda: not bool(rename_dialog.property("visible")))
 
+        # Switching open folders via studio.openFolder resets stale FolderSidebar selection state automatically.
+        folder_sidebar.setProperty("selectedPath", str(seminars_dir))
+        folder_sidebar.setProperty("selectedName", "Seminars")
+        folder_sidebar.setProperty("selectedDirectory", True)
+        self.studio.openFolder(str(self.workspace / "Coursework"))
+        self.wait_until(lambda: folder_ops.same_path(self._qml_dict("sidebarState")["folder"], self.workspace / "Coursework"))
+        self.assertEqual(folder_sidebar.property("selectedPath"), "")
+        self.assertEqual(folder_sidebar.property("selectedName"), "")
+        self.assertFalse(bool(folder_sidebar.property("selectedDirectory")))
+        self.studio.openFolder(str(self.workspace))
+        self.wait_until(
+            lambda: folder_ops.same_path(self._qml_dict("sidebarState")["folder"], self.workspace)
+            and len(self.studio.files) >= 4
+        )
+
         # On an unsaved tab outside the open folder, rename_entry falls back to tabFallbackRenameDialog.
         self.studio.newNote()
         unsaved_id = self.studio.active

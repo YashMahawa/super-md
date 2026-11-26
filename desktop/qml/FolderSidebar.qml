@@ -8,10 +8,17 @@ ColumnLayout {
     required property var viewState
     property var sidebarState: typeof studio !== "undefined" && studio && studio.sidebarSnapshot !== undefined ? JSON.parse(studio.sidebarSnapshot) : viewState
     property var shortcutLabels: ({})
+    readonly property string currentFolder: sidebarState.folder || ""
     property string selectedPath: ""
     property string selectedName: ""
     property bool selectedDirectory: false
     spacing: 12
+
+    onCurrentFolderChanged: {
+        selectedPath = ""
+        selectedName = ""
+        selectedDirectory = false
+    }
 
     function noteStem(name) {
         const raw = name || ""
