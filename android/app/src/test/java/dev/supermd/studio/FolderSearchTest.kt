@@ -619,7 +619,7 @@ class FolderSearchTest {
                                 DocumentsContract.Document.COLUMN_FLAGS -> row.flags
                                 else -> null
                             }
-                        }.toTypedArray(),
+                        }.toTypedArray<Any?>(),
                     )
                 }
                 return cursor

@@ -674,9 +674,10 @@ def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int =
                     if info.st_size > max_text_bytes:
                         return None
                     raw = head if info.st_size <= len(head) else head + handle.read(max_text_bytes + 1 - len(head))
-                    if len(raw) > max_text_bytes:
+                    if len(raw) > max_text_bytes or (len(raw) > len(head) and b"\x00" in raw[len(head):]):
                         return None
-                    return raw.decode("utf-8-sig", errors="replace")
+                    text = raw.decode("utf-8-sig", errors="replace")
+                    return text.replace("\r\n", "\n").replace("\r", "\n") if "\r" in text else text
     except OSError:
         return None
     path_obj = path if isinstance(path, Path) else Path(raw_path)

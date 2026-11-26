@@ -226,6 +226,7 @@ def _webengine_e2e_probe() -> int:
         window.close()
         del engine
         studio.stop()
+        studio._search_pool.shutdown(wait=False, cancel_futures=True)
         studio.pool.shutdown(wait=False, cancel_futures=True)
         session.writes.shutdown(wait=False)
     os._exit(0)
@@ -246,6 +247,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
 
     def tearDown(self):
         self.studio.stop()
+        self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.studio.pool.shutdown(wait=True)
         self.session.writes.shutdown(wait=True)
         self.temp.cleanup()
@@ -450,25 +452,79 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertEqual({m["name"] for m in no_folder_res["matches"]}, {"Untitled.md", "external.md"})
 
     def test_cancellation_stops_in_flight_scan_immediately(self):
+        import builtins
+
         for i in range(60):
-            (self.root / f"note_{i:03d}.md").write_text(f"Line {i} SearchTarget\n", encoding="utf-8")
+            (self.root / f"note_{i:03d}.md").write_bytes(f"# Heading\r\nLine {i} SearchTarget\r\n".encode("utf-8"))
         cancel_event = threading.Event()
         batches = []
+        active_handles = 0
+        handle_lock = threading.Lock()
+        real_open = builtins.open
+        root_prefix = os.path.normcase(str(self.root))
+
+        def tracked_open(file, *args, **kwargs):
+            nonlocal active_handles
+            path_str = os.fspath(file) if isinstance(file, (str, os.PathLike)) else ""
+            tracked = os.path.normcase(str(path_str)).startswith(root_prefix)
+            handle = real_open(file, *args, **kwargs)
+            if not tracked:
+                return handle
+            with handle_lock:
+                active_handles += 1
+            time.sleep(0.002)
+
+            class _HandleGuard:
+                def __getattr__(self, name):
+                    return getattr(handle, name)
+
+                def __enter__(self):
+                    handle.__enter__()
+                    return self
+
+                def __exit__(self, *exc):
+                    nonlocal active_handles
+                    try:
+                        return handle.__exit__(*exc)
+                    finally:
+                        with handle_lock:
+                            active_handles -= 1
+
+            return _HandleGuard()
 
         def on_batch(batch, _scanned, _trunc, _done):
             batches.append(len(batch))
             cancel_event.set()
 
-        res = stream_text_search(
-            "SearchTarget",
-            [],
-            [],
-            self.root,
-            cancel_event=cancel_event,
-            on_batch=on_batch,
-        )
+        with patch.object(builtins, "open", side_effect=tracked_open):
+            res = stream_text_search(
+                "SearchTarget",
+                [],
+                [],
+                self.root,
+                cancel_event=cancel_event,
+                on_batch=on_batch,
+            )
+            with handle_lock:
+                leaked_on_cancel = active_handles
+
+            trunc = stream_text_search(
+                "SearchTarget",
+                [],
+                [],
+                self.root,
+                max_matches=7,
+            )
+            with handle_lock:
+                leaked_on_truncate = active_handles
+
         self.assertTrue(res["cancelled"])
         self.assertLess(res["scannedFiles"], 60)
+        self.assertEqual(leaked_on_cancel, 0, "No worker file handles may remain open when cancelled search returns")
+        self.assertTrue(trunc["truncated"])
+        self.assertEqual(len(trunc["matches"]), 7)
+        self.assertTrue(all(m["line"] == 2 for m in trunc["matches"]))
+        self.assertEqual(leaked_on_truncate, 0, "No worker file handles may remain open when truncated search returns")
 
     def test_stateless_order_preserving_benchmark_and_disk_freshness(self):
         for d in range(12):

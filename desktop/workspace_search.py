@@ -51,7 +51,7 @@ def walk_folder_notes(
     if folder_root is None:
         return []
     try:
-        if folder_root.is_symlink() or not folder_root.is_dir():
+        if folder_root.is_symlink() or getattr(folder_root, "is_junction", lambda: False)() or not folder_root.is_dir():
             return []
         root_str = str(folder_root.resolve())
     except OSError:
@@ -80,7 +80,7 @@ def walk_folder_notes(
             if ename.startswith("."):
                 continue
             try:
-                if entry.is_symlink():
+                if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
                     continue
                 if entry.is_dir(follow_symlinks=False):
                     sub_rel = f"{rel_prefix}/{ename}" if rel_prefix else ename
@@ -321,7 +321,11 @@ def stream_text_search(
     resolved_root: Path | None = None
     if folder_root is not None:
         try:
-            if not folder_root.is_symlink() and folder_root.is_dir():
+            if (
+                not folder_root.is_symlink()
+                and not getattr(folder_root, "is_junction", lambda: False)()
+                and folder_root.is_dir()
+            ):
                 resolved_root = folder_root.resolve()
         except OSError:
             resolved_root = None
@@ -473,16 +477,12 @@ def stream_text_search(
             stop_scan = False
             while inflight and not stop_scan:
                 if cancel_event is not None and cancel_event.is_set():
-                    for pending_fut in inflight:
-                        pending_fut.cancel()
                     return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
                 fut = inflight.popleft()
                 _submit_window()
                 chunk_results = fut.result()
                 for found in chunk_results:
                     if cancel_event is not None and cancel_event.is_set():
-                        for pending_fut in inflight:
-                            pending_fut.cancel()
                         return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
                     if found is None:
                         continue
@@ -495,8 +495,6 @@ def stream_text_search(
                         if len(pending_batch) >= BATCH_SIZE:
                             flush(done=False)
                             if cancel_event is not None and cancel_event.is_set():
-                                for pending_fut in inflight:
-                                    pending_fut.cancel()
                                 return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
                     if len(found) > remaining or len(all_matches) >= max_matches:
                         truncated = True
@@ -506,6 +504,12 @@ def stream_text_search(
             stop_workers.set()
             for pending_fut in inflight:
                 pending_fut.cancel()
+            for pending_fut in inflight:
+                if not pending_fut.cancelled():
+                    try:
+                        pending_fut.result()
+                    except Exception:
+                        pass
 
     if cancel_event is not None and cancel_event.is_set():
         return {"matches": all_matches, "scannedFiles": scanned_files, "truncated": truncated, "cancelled": True}
