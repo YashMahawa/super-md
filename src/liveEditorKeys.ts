@@ -18,7 +18,6 @@ export interface LiveEditorKeyResult {
 }
 
 interface LineInfo {
-  index: number;
   start: number;
   end: number;
   text: string;
@@ -42,7 +41,6 @@ interface ParsedListLine {
   numberStartOffset: number;
   numberEndOffset: number;
   hasTask: boolean;
-  markerStep: number;
   markerCoreEnd: number;
   fullMarkerEnd: number;
   content: string;
@@ -67,11 +65,10 @@ function columnWidth(raw: string): number {
 function splitLines(text: string): LineInfo[] {
   const lines: LineInfo[] = [];
   let start = 0;
-  let index = 0;
   for (let i = 0; i <= text.length; i++) {
     if (i === text.length || text[i] === '\n') {
       const end = i > start && text[i - 1] === '\r' ? i - 1 : i;
-      lines.push({ index: index++, start, end, text: text.slice(start, end) });
+      lines.push({ start, end, text: text.slice(start, end) });
       start = i + 1;
     }
   }
@@ -203,7 +200,6 @@ function parseListLine(lineText: string): ParsedListLine | null {
     ? markerCoreEnd + (taskMatch[2]?.length ?? 0)
     : markerCoreEnd + spaceAfterMarker.length;
   const content = hasTask ? (taskMatch[3] ?? '') : afterMarker;
-  const markerStep = isOrdered ? markerTokenLength + 1 : 2;
 
   return {
     quote,
@@ -216,7 +212,6 @@ function parseListLine(lineText: string): ParsedListLine | null {
     numberStartOffset: markerOffset,
     numberEndOffset: markerOffset + (isOrdered ? match[2].length : 0),
     hasTask,
-    markerStep,
     markerCoreEnd,
     fullMarkerEnd,
     content,
@@ -361,257 +356,6 @@ function handleEnter(
   return null;
 }
 
-interface TrackedListItem {
-  lineIndex: number;
-  quoteDepth: number;
-  oldIndent: number;
-  newIndent: number;
-  kind: 'unordered' | 'ordered';
-  delimiter: '.' | ')' | '';
-  orderNumber: number;
-  markerStep: number;
-  inSelection: boolean;
-}
-
-function findPrecedingOrderedSiblingAtIndent(
-  lines: LineInfo[],
-  fenced: Uint8Array,
-  tracked: Map<number, TrackedListItem>,
-  lineIndex: number,
-  quoteDepth: number,
-  targetIndent: number,
-  delimiter: '.' | ')' | '',
-): number | null {
-  for (let i = lineIndex - 1; i >= 0; i--) {
-    if (fenced[i]) return null;
-    const prevTrack = tracked.get(i);
-    if (prevTrack) {
-      if (prevTrack.quoteDepth < quoteDepth) return null;
-      if (prevTrack.quoteDepth > quoteDepth) continue;
-      if (prevTrack.newIndent < targetIndent) return null;
-      if (prevTrack.newIndent > targetIndent) continue;
-      if (prevTrack.kind === 'ordered' && prevTrack.delimiter === delimiter) {
-        return prevTrack.orderNumber;
-      }
-      return null;
-    }
-    const quote = scanQuotePrefix(lines[i].text);
-    if (quote.depth < quoteDepth) return null;
-    if (quote.depth > quoteDepth) continue;
-    const afterQuote = lines[i].text.slice(quote.raw.length);
-    if (!/\S/.test(afterQuote)) continue;
-    const parsed = parseListLine(lines[i].text);
-    if (parsed) {
-      if (parsed.indentCols < targetIndent) return null;
-      if (parsed.indentCols > targetIndent) continue;
-      if (parsed.kind === 'ordered' && parsed.delimiter === delimiter) {
-        return parsed.orderNumber;
-      }
-      return null;
-    }
-    const indentRaw = /^[ \t]*/.exec(afterQuote)![0];
-    if (columnWidth(indentRaw) > targetIndent) continue;
-    return null;
-  }
-  return null;
-}
-
-function findPrecedingListItem(
-  lines: LineInfo[],
-  fenced: Uint8Array,
-  tracked: Map<number, TrackedListItem>,
-  lineIndex: number,
-  quoteDepth: number,
-): TrackedListItem | null {
-  for (let i = lineIndex - 1; i >= 0; i--) {
-    if (fenced[i]) return null;
-    const prevTrack = tracked.get(i);
-    if (prevTrack) {
-      if (prevTrack.quoteDepth === quoteDepth) return prevTrack;
-      if (prevTrack.quoteDepth < quoteDepth) return null;
-      continue;
-    }
-    const quote = scanQuotePrefix(lines[i].text);
-    if (quote.depth < quoteDepth) return null;
-    if (quote.depth > quoteDepth) continue;
-    const afterQuote = lines[i].text.slice(quote.raw.length);
-    if (!/\S/.test(afterQuote)) continue;
-    const parsed = parseListLine(lines[i].text);
-    if (parsed) {
-      return {
-        lineIndex: i,
-        quoteDepth: parsed.quote.depth,
-        oldIndent: parsed.indentCols,
-        newIndent: parsed.indentCols,
-        kind: parsed.kind,
-        delimiter: parsed.delimiter,
-        orderNumber: parsed.orderNumber,
-        markerStep: parsed.markerStep,
-        inSelection: false,
-      };
-    }
-    return null;
-  }
-  return null;
-}
-
-function mapOffsetThroughEdits(
-  offset: number,
-  edits: TextEdit[],
-  keepBeforeFirstInsertAt: number | null,
-): number {
-  let delta = 0;
-  for (const edit of edits) {
-    const deleteLen = edit.to - edit.from;
-    const insertLen = edit.insert.length;
-    if (offset < edit.from) break;
-    if (offset === edit.from && deleteLen === 0 && keepBeforeFirstInsertAt === offset) {
-      break;
-    }
-    if (offset >= edit.to) {
-      delta += insertLen - deleteLen;
-    } else {
-      delta += Math.min(insertLen, offset - edit.from) - (offset - edit.from);
-    }
-  }
-  return offset + delta;
-}
-
-function handleTab(
-  text: string,
-  lines: LineInfo[],
-  fenced: Uint8Array,
-  selectionStart: number,
-  selectionEnd: number,
-  outdent: boolean,
-): LiveEditorKeyResult | null {
-  const startLine = lineIndexAt(lines, selectionStart);
-  let endLine = lineIndexAt(lines, selectionEnd);
-  if (selectionEnd > selectionStart && endLine > startLine && selectionEnd === lines[endLine].start) {
-    endLine--;
-  }
-
-  for (let i = startLine; i <= endLine; i++) {
-    if (fenced[i]) return null;
-  }
-
-  const parsedLines = new Map<number, ParsedListLine>();
-  let listCount = 0;
-  for (let i = startLine; i <= endLine; i++) {
-    const lineText = lines[i].text;
-    const quote = scanQuotePrefix(lineText);
-    const afterQuote = lineText.slice(quote.raw.length);
-    if (!/\S/.test(afterQuote)) continue;
-    const parsed = parseListLine(lineText);
-    if (!parsed) return null;
-    parsedLines.set(i, parsed);
-    listCount++;
-  }
-
-  if (listCount === 0) return null;
-
-  const tracked = new Map<number, TrackedListItem>();
-  const edits: TextEdit[] = [];
-
-  for (let i = startLine; i <= endLine; i++) {
-    const parsed = parsedLines.get(i);
-    if (!parsed) continue;
-
-    const prev = findPrecedingListItem(lines, fenced, tracked, i, parsed.quote.depth);
-    let nextIndent = parsed.indentCols;
-
-    if (outdent) {
-      if (parsed.indentCols > 0) {
-        if (parsed.indentCols <= 3 && (!prev || prev.oldIndent === 0)) {
-          nextIndent = 0;
-        } else {
-          const step = prev ? prev.markerStep : 2;
-          nextIndent = Math.max(0, parsed.indentCols - step);
-        }
-      }
-    } else {
-      const step = prev ? prev.markerStep : 2;
-      let maxIndent: number;
-      if (!prev) {
-        maxIndent = 2;
-      } else if (prev.inSelection && prev.newIndent === prev.oldIndent && parsed.indentCols >= prev.oldIndent) {
-        maxIndent = parsed.indentCols;
-      } else {
-        maxIndent = prev.newIndent + step;
-      }
-      if (parsed.indentCols < maxIndent) {
-        nextIndent = Math.min(parsed.indentCols + step, maxIndent);
-      }
-    }
-
-    let nextOrderNumber = parsed.orderNumber;
-    if (parsed.kind === 'ordered' && nextIndent !== parsed.indentCols) {
-      const prevSiblingNumber = findPrecedingOrderedSiblingAtIndent(
-        lines,
-        fenced,
-        tracked,
-        i,
-        parsed.quote.depth,
-        nextIndent,
-        parsed.delimiter,
-      );
-      if (prevSiblingNumber !== null) {
-        nextOrderNumber = prevSiblingNumber + 1;
-      } else if (nextIndent > 0 && prev) {
-        nextOrderNumber = 1;
-      }
-    }
-
-    const nextNumberStr = parsed.kind === 'ordered' ? String(nextOrderNumber) : '';
-    const nextMarkerStep = parsed.kind === 'ordered' ? nextNumberStr.length + 1 + 1 : parsed.markerStep;
-
-    tracked.set(i, {
-      lineIndex: i,
-      quoteDepth: parsed.quote.depth,
-      oldIndent: parsed.indentCols,
-      newIndent: nextIndent,
-      kind: parsed.kind,
-      delimiter: parsed.delimiter,
-      orderNumber: nextOrderNumber,
-      markerStep: nextMarkerStep,
-      inSelection: true,
-    });
-
-    const nextIndentRaw = ' '.repeat(nextIndent);
-    if (parsed.kind === 'ordered' && (nextIndentRaw !== parsed.indentRaw || nextOrderNumber !== parsed.orderNumber)) {
-      const editStart = lines[i].start + parsed.quote.raw.length;
-      edits.push({
-        from: editStart,
-        to: lines[i].start + parsed.numberEndOffset,
-        insert: `${nextIndentRaw}${nextNumberStr}`,
-      });
-    } else if (nextIndentRaw !== parsed.indentRaw) {
-      const editStart = lines[i].start + parsed.quote.raw.length;
-      edits.push({
-        from: editStart,
-        to: editStart + parsed.indentRaw.length,
-        insert: nextIndentRaw,
-      });
-    }
-  }
-
-  if (!edits.length) {
-    return { text, selectionStart, selectionEnd };
-  }
-
-  const nextText = applyEdits(text, edits);
-  const firstSelectedLine = lines[startLine];
-  const firstParsed = parsedLines.get(startLine);
-  const firstIndentStart = firstParsed ? firstSelectedLine.start + firstParsed.quote.raw.length : -1;
-  const keepStart = selectionStart < selectionEnd && selectionStart === firstIndentStart ? selectionStart : null;
-
-  return {
-    text: nextText,
-    selectionStart: mapOffsetThroughEdits(selectionStart, edits, keepStart),
-    selectionEnd: mapOffsetThroughEdits(selectionEnd, edits, null),
-  };
-}
-
 export function handleLiveEditorKey(input: LiveEditorKeyInput): LiveEditorKeyResult | null {
   const {
     text,
@@ -627,16 +371,11 @@ export function handleLiveEditorKey(input: LiveEditorKeyInput): LiveEditorKeyRes
   } = input;
 
   if (isComposing || protectedBlock || ctrlKey || metaKey || altKey) return null;
-  if (key !== 'Enter' && key !== 'Tab') return null;
-  if (key === 'Enter' && (shiftKey || selectionStart !== selectionEnd)) return null;
+  if (key !== 'Enter' || shiftKey || selectionStart !== selectionEnd) return null;
 
-  const from = Math.max(0, Math.min(selectionStart, selectionEnd, text.length));
-  const to = Math.max(from, Math.min(Math.max(selectionStart, selectionEnd), text.length));
+  const pos = Math.max(0, Math.min(selectionStart, text.length));
   const lines = splitLines(text);
   const fenced = computeFencedLines(lines);
 
-  if (key === 'Enter') {
-    return handleEnter(text, lines, fenced, from);
-  }
-  return handleTab(text, lines, fenced, from, to, shiftKey);
+  return handleEnter(text, lines, fenced, pos);
 }
