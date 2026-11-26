@@ -51,6 +51,10 @@ from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import LatestWriteExecutor
 import updates
 import app_integration
+if __package__:
+    from . import studio_runtime
+else:
+    import studio_runtime
 import python_runtime
 import pending_python
 from export_jobs import ExportJobRegistry
@@ -2322,9 +2326,7 @@ class Studio(QObject):
     def windowId(self): return self.window_id
 
     @Property(str,constant=True)
-    def appVersion(self):
-        metadata=ROOT/"desktop/build-info.json" if getattr(sys,"frozen",False) else ROOT/"package.json"
-        return json.loads(metadata.read_text(encoding="utf-8"))["version"]
+    def appVersion(self):return studio_runtime.app_version(self)
 
     @Property(str,notify=changed)
     def updateStatus(self):return self.update_status
@@ -2351,131 +2353,34 @@ class Studio(QObject):
     def storageCleanupStatus(self):return self.storage_cleanup_status
 
     @Slot(str)
-    def clearStorageCategory(self, category):
-        if category not in ("execution-results", "update-state"):
-            self.storage_cleanup_status = "This storage category is protected."
-            self._emit(False)
-            return
-        if self.retired or self.storage_busy or self.storage_cleanup_busy or (category == "update-state" and (self.update_running or self.update_path)):
-            self.storage_cleanup_status = "Cleanup is unavailable while storage or updates are in use."
-            self._emit(False)
-            return
-        self.storage_cleanup_busy = True
-        self.storage_cleanup_status = ""
-        self._emit(False)
-        def done(result,error):
-            self.storage_cleanup_busy = False
-            self.storage_cleanup_status = ("Cleanup failed; app files were not intentionally changed." if error or not result else "Temporary app data cleared. Notes and recovery preserved.")
-            self._emit(False)
-            self.inspectStorage()
-        self._submit(lambda:clear_storage_category(self.data,category),done,False)
+    def clearStorageCategory(self, category):return studio_runtime.clear_storage_category_action(self, category)
 
     @Slot()
-    def openLatestGitHubRelease(self):
-        if not QDesktopServices.openUrl(QUrl(updates.REPO + "/releases/latest")):
-            self.message = "Could not open the latest GitHub release in your browser."
-        self._emit(False)
+    def openLatestGitHubRelease(self):return studio_runtime.open_latest_github_release(self)
 
     @Slot()
-    def inspectStorage(self):
-        if self.retired or self.storage_busy:return
-        cancel_event=threading.Event()
-        self._storage_cancel_event=cancel_event
-        self.storage_busy=True
-        self._storage_report=json.dumps({"status":"scanning","cancelled":False,"truncated":False,"scannedEntries":0,"categories":[]})
-        self._emit(False)
-        def done(report,error):
-            if self._storage_cancel_event is not cancel_event:return
-            self._storage_cancel_event=None
-            self.storage_busy=False
-            if error or not isinstance(report,dict):
-                # Keep exception text out of UI/report: filesystem errors may
-                # contain private local paths.
-                report={"status":"partial","cancelled":cancel_event.is_set(),"truncated":False,"scannedEntries":0,"categories":[],"message":"Some app data could not be inspected."}
-            self._storage_report=json.dumps(report,separators=(",",":"))
-            self._emit(False)
-        self._submit(lambda:inspect_storage(self.data,cancel_event),done,False)
+    def inspectStorage(self):return studio_runtime.inspect_storage_action(self)
 
     @Slot()
-    def cancelStorageInspection(self):
-        if self._storage_cancel_event is not None:self._storage_cancel_event.set()
+    def cancelStorageInspection(self):return studio_runtime.cancel_storage_inspection(self)
 
     @Property(bool,constant=True)
-    def desktopIntegrationAvailable(self):return app_integration.available()
+    def desktopIntegrationAvailable(self):return studio_runtime.desktop_integration_available(self)
 
-    def _restore_update(self):
-        self.update_running=True
-        def done(saved,error):
-            self.update_running=False
-            if saved:
-                self.update_info=saved['release'];self.update_path=saved['path'];self.update_status='Verified update ready in Downloads.'
-            if self.settings.get('checkUpdates'):QTimer.singleShot(6000,lambda:self.checkUpdates(True) if not self.retired else None)
-        self._submit(lambda:updates.load_ready(self.data/'updates',self.appVersion),done,False)
+    def _restore_update(self):return studio_runtime.restore_update(self)
 
     @Slot(bool)
-    def setDesktopIntegration(self,enabled):
-        if not self.desktopIntegrationAvailable or self.update_running:return
-        if not enabled:
-            self.setting('desktopIntegration','false');return
-        self.update_running=True;self.update_status='Adding Super MD to your applications…';self._emit(False)
-        def done(path,error):
-            self.update_running=False
-            if error:self.update_status='Desktop integration failed: '+error;return
-            self.setting('desktopIntegration','true');self.update_status='Added to Applications and Open With. Your file defaults are unchanged.'
-        self._submit(lambda:app_integration.integrate_current(self.appVersion),done,False)
+    def setDesktopIntegration(self,enabled):return studio_runtime.set_desktop_integration(self,enabled)
 
     @Slot()
-    def downloadUpdate(self):
-        if self.update_running or not self.update_info or self.update_path:return
-        self.update_running=True;self.update_status="Downloading and verifying update…";self._emit(False)
-        info=dict(self.update_info)
-        def done(path,error):
-            self.update_running=False
-            if error:self.update_status="Update download failed: "+error;return
-            self.update_path=path;self.update_status="Verified update ready. Save your work, then open the installer."
-        downloads=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home()/'Downloads'))/'Super MD Updates'
-        self._submit(lambda:updates.download(info,downloads,self.data/'updates'),done,False)
+    def downloadUpdate(self):return studio_runtime.download_update(self)
 
     @Slot()
     @Slot(bool)
-    def checkUpdates(self,automatic=False):
-        if self.update_running:return
-        self.update_running=True;self.update_status="Checking published releases…";self._emit(False)
-        def done(info,error):
-            self.update_running=False
-            if error:
-                self.update_status=updates.check_failure(error)
-                if not automatic:self.message=self.update_status
-                return
-            # Offline/repeated checks must not forget a verified ready installer.
-            if info and self.update_info and info['version']==self.update_info['version'] and self.update_path:
-                self.update_status='Verified Super MD '+info['version']+' is already downloaded.';return
-            if not info and self.update_path:return
-            self.update_path=""
-            self.update_info=info
-            if not info:self.update_status="You're on the latest published version.";return
-            self.update_status="Super MD "+info["version"]+" is available."
-            self.message=self.update_status
-            if automatic:
-                try:
-                    from PySide6.QtWidgets import QApplication, QSystemTrayIcon
-                    from PySide6.QtGui import QIcon
-                    if isinstance(QGuiApplication.instance(),QApplication) and QSystemTrayIcon.isSystemTrayAvailable():
-                        self.update_tray=QSystemTrayIcon(QIcon(str(ROOT/"public/brand-mark-fixed.svg")),self)
-                        self.update_tray.setToolTip("Super MD updates");self.update_tray.show();self.update_tray.showMessage("Super MD update",self.update_status)
-                except RuntimeError:pass
-            if self.settings.get("autoUpdate"):self.downloadUpdate()
-        def check():
-            try:
-                linux_kind=updates.linux_install_kind() if sys.platform.startswith("linux") else "appimage"
-                return updates.release_info(updates.bounded_json(updates.API),self.appVersion,linux_kind=linux_kind),None
-            except Exception as failure:return None,failure
-        self._submit(check,lambda result,error:done(*(result or (None,error))),False)
+    def checkUpdates(self,automatic=False):return studio_runtime.check_updates(self,automatic)
 
     @Property(bool,notify=changed)
-    def backgroundEnabled(self):
-        service=getattr(self.session,"background",None)
-        return bool(service and service.enabled and not service.quitting)
+    def backgroundEnabled(self):return studio_runtime.background_enabled(self)
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -2487,82 +2392,24 @@ class Studio(QObject):
     def pythonBusy(self): return self.python_busy
 
     @Property(bool,constant=True)
-    def pythonBundled(self): return python_runtime.bundled_available()
+    def pythonBundled(self): return studio_runtime.python_bundled(self)
 
-    def _python_folders(self):
-        return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
+    def _python_folders(self): return studio_runtime.python_folders(self)
 
-    def _choose_default_python(self, emit: bool = True):
-        if self.retired or self.settings.get("python"):
-            return
-        path = python_runtime.default_python(self.data / "python-env")
-        if path:
-            self.settings["python"] = path
-            self._preferences(notify=emit)
-        if emit:
-            self._emit(False)
+    def _choose_default_python(self, emit: bool = True): return studio_runtime.choose_default_python(self, emit)
 
     @Slot(str)
-    def _python_progress(self, text):
-        self.python_status = text
-        self._emit(False)
+    def _python_progress(self, text): return studio_runtime.python_progress(self, text)
 
     @Slot()
-    def refreshPython(self):
-        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
-        managed = self.data / "python-env"
-        folders = tuple(self._python_folders())
-        self.python_busy = True
-        self.python_status = "Looking for Python installations"
-        self._emit(False)
-        def done(choices,error):
-            self.python_busy = False
-            self.python_choices = choices or []
-            if error: self.python_status = error
-            elif not self.python_choices: self.python_status = "No Python found. Use Set up Python to create one, or install Python 3."
-            elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but numpy and matplotlib are missing. Set up Python installs both in a private environment."
-            else: self.python_status = ""
-            self._emit(False)
-        self._submit(lambda: python_runtime.discover(managed, folders), done, False)
+    def refreshPython(self): return studio_runtime.refresh_python(self)
 
     @Slot(str)
-    def installPythonPackages(self, path):
-        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
-        self.python_busy = True
-        self.python_status = "Preparing to install numpy and matplotlib"
-        self._emit(False)
-        def done(result,error):
-            self.python_busy = False
-            if error:
-                self.python_status = error
-                self._emit(False)
-                return
-            self.settings["python"] = result
-            self._preferences()
-            self.refreshPython()
-        self._submit(lambda: python_runtime.install_packages(path, self.pythonProgress.emit), done, False)
+    def installPythonPackages(self, path): return studio_runtime.install_python_packages(self, path)
 
     @Slot()
     def setupPython(self):
-        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
-        managed = self.data / "python-env"
-        self.python_busy = True
-        self.python_status = "Preparing Python setup"
-        self._emit(False)
-        def done(path,error):
-            self.python_busy = False
-            if error:
-                self.python_status = error
-                self._emit(False)
-                return
-            self.settings["python"] = path
-            self._preferences()
-            self.python_status = "Python with numpy and matplotlib is ready"
-            self._emit()
-            self.python_busy = False
-            self.refreshPython()
-            self.python_status = "Python with numpy and matplotlib is ready"
-        self._submit(lambda: python_runtime.setup_environment(managed, self.pythonProgress.emit), done, False)
+        return studio_runtime.setup_python(self)
 
     @Slot(int, int, bool)
     def rememberWindow(self, width, height, maximized):
@@ -2574,44 +2421,7 @@ class Studio(QObject):
 
     @Slot()
     def installUpdate(self):
-        if not self.update_path or self.update_running:return
-        try:
-            kind=updates.installer_kind(self.update_info)
-        except (TypeError,ValueError,KeyError):
-            self.update_status='Update information is invalid. Check for updates again.'
-            self._emit(False);return
-        if kind=='appimage' and not self.desktopIntegrationAvailable:
-            self.update_status='This installation is package-managed. Install the DEB/RPM from the release page using your package manager.'
-            QDesktopServices.openUrl(QUrl(updates.REPO+'/releases/latest'));self._emit(False);return
-        self.update_running=True;self.update_status='Verifying and preparing installation…';self._emit(False)
-        def prepare():
-            saved=updates.load_ready(self.data/'updates',self.appVersion)
-            if not saved or saved['path']!=self.update_path:raise ValueError('Installer changed or is missing. Download the update again.')
-            prepared_kind=updates.installer_kind(saved['release'])
-            if not self.update_info or saved['release']['version']!=self.update_info.get('version'):
-                raise ValueError('The verified installer no longer matches the selected update. Check for updates again.')
-            if prepared_kind=='appimage':
-                installed=app_integration.install_appimage(self.update_path,saved['release']['version'],self.settings.get('desktopIntegration',False))
-                return installed,prepared_kind
-            return self.update_path,prepared_kind
-        def done(prepared,error):
-            self.update_running=False
-            if error:self.update_status='Update installation failed: '+error;return
-            path,prepared_kind=prepared
-            if prepared_kind=='appimage':
-                self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
-            else:
-                opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-                if isinstance(opened,tuple):opened=opened[0]
-                if not opened:
-                    self.update_status='Could not open the verified installer. It is still available in Downloads.'
-                elif prepared_kind in ('deb','rpm'):
-                    self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
-                elif prepared_kind=='macos':
-                    self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
-                else:
-                    self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
-        self._submit(prepare,done,False)
+        return studio_runtime.install_update(self)
 
     def _can_move(self):
         return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
