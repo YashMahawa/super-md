@@ -273,6 +273,9 @@ class AgentDocumentsTest(unittest.TestCase):
             self.store.search("search-contract.md", "w.+d", regex=True)
         direct = search_source(source, "ward", 2, 0, 16, True, True, False, True)
         self.assertEqual(direct["matches"], second["matches"])
+        braced = "Lead token\n```{.mermaid, fig-width=6}\ntoken --> B\n```\ntrailing token"
+        braced_hits = search_source(braced, "token", 10, 0, 0, False, True, False, True)
+        self.assertEqual([item["matchOffset"] for item in braced_hits["matches"]], [5, 63])
         span = diagram_spans(source)[0]
         self.assertEqual(source[span["start"]:span["end"]], "Ward --> X\n")
 
@@ -832,6 +835,88 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertEqual(
             agent_documents._svg_spans(unclosed_empty_svg),
             [{"start": len(unclosed_empty_svg), "end": len(unclosed_empty_svg), "line_start": 3, "line_end": 3}],
+        )
+
+    def test_shared_fence_scanner_recognizes_braced_python_and_mermaid_with_exact_offsets_and_unclosed_fences(self):
+        import agent_documents
+        from unittest.mock import patch
+
+        source = (
+            "😀 Lead needle\r\n"
+            "```{python, echo=false}\r\n"
+            "# Python comment heading\r\n"
+            "value = '<svg><rect/></svg>'  # needle in code\r\n"
+            "```\r\n"
+            "~~~{.py #cell-2}\r\n"
+            "y = 2\r\n"
+            "~~~\r\n"
+            "````{.mermaid, fig-width=6}\r\n"
+            "```\r\n"
+            "graph TD; A[needle 𝕏] --> B\r\n"
+            "````\r\n"
+            "```{r, echo=FALSE}\r\n"
+            "r_needle <- 1\r\n"
+            "```\r\n"
+            "```{mermaid\r\n"
+            "unclosed_brace_needle\r\n"
+            "```\r\n"
+            "## Section After Braced\r\n"
+            "~~~{mermaid echo=false}\r\n"
+            "# Trailing fenced heading\r\n"
+            "flowchart LR; X[needle] --> Y"
+        )
+        line_count = len(source.splitlines(keepends=True))
+        with patch(
+            "agent_documents._step_fence_boundary",
+            wraps=agent_documents._step_fence_boundary,
+        ) as step_spy:
+            headings, fences = agent_documents._scan_read_only(
+                source, collect_headings=True, collect_fences=True
+            )
+            self.assertEqual(step_spy.call_count, line_count)
+
+        self.assertEqual([h["title"] for h in headings], ["Section After Braced"])
+        self.assertEqual(
+            [(span.language, span.is_diagram, span.is_svg) for span in fences],
+            [
+                ("python", False, False),
+                ("py", False, False),
+                ("mermaid", True, False),
+                ("{r,", False, False),
+                ("{mermaid", False, False),
+                ("mermaid", True, False),
+            ],
+        )
+        self.assertEqual(fences[-1].body_end, len(source))
+
+        diag = diagram_spans(source, include_inline_svg=True)
+        expected_closed_mermaid = "```\r\ngraph TD; A[needle 𝕏] --> B\r\n"
+        expected_unclosed_mermaid = "# Trailing fenced heading\r\nflowchart LR; X[needle] --> Y"
+        self.assertEqual(
+            [source[d["start"]:d["end"]] for d in diag],
+            [expected_closed_mermaid, expected_unclosed_mermaid],
+        )
+
+        filtered = search_source(source, "needle", exclude_diagrams=True)
+        self.assertEqual(
+            [m["matchOffset"] for m in filtered["matches"]],
+            [
+                source.index("needle"),
+                source.index("needle in code"),
+                source.index("r_needle") + 2,
+                source.index("unclosed_brace_needle") + len("unclosed_brace_"),
+            ],
+        )
+
+        unclosed_braced_py = "Inline <svg/> before\r\n```{.python, echo=false}\r\n# Hidden\r\nprint('<svg><circle/></svg>')"
+        _, py_fences = agent_documents._scan_read_only(unclosed_braced_py, collect_fences=True)
+        self.assertEqual(len(py_fences), 1)
+        self.assertEqual(py_fences[0].language, "python")
+        self.assertFalse(py_fences[0].is_diagram)
+        self.assertEqual(_headings(unclosed_braced_py), [])
+        self.assertEqual(
+            diagram_spans(unclosed_braced_py, include_inline_svg=True),
+            [{"start": unclosed_braced_py.index("<svg/>"), "end": unclosed_braced_py.index("<svg/>") + len("<svg/>")}],
         )
 
 

@@ -11,9 +11,10 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QEvent, QObject, QUrl
+from PySide6.QtCore import QEvent, QMetaObject, QObject, QUrl, Q_ARG, Q_RETURN_ARG, qInstallMessageHandler
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
+from PySide6.QtQuick import QQuickItem
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
@@ -59,6 +60,20 @@ def _unlink_path_with_windows_retry(target: Path) -> None:
 MAIN_QML = Path(__file__).parent / "qml" / "Main.qml"
 
 
+def _extract_qml_function(qml: str, signature: str) -> str:
+    start = qml.index(signature)
+    brace = qml.index("{", start)
+    depth = 0
+    for end in range(brace, len(qml)):
+        if qml[end] == "{":
+            depth += 1
+        elif qml[end] == "}":
+            depth -= 1
+            if depth == 0:
+                return textwrap.dedent(qml[start:end + 1]).rstrip()
+    raise AssertionError(f"Could not extract QML function: {signature}")
+
+
 def _production_sidebar_harness_qml() -> bytes:
     qml = MAIN_QML.read_text(encoding="utf-8")
     sidebar_start = qml.index("        Pane {\n            visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay")
@@ -74,6 +89,15 @@ def _production_sidebar_harness_qml() -> bytes:
     popup_end = qml.index("    AppDialog {\n        id: settingsDialog", popup_start)
     popup_block = textwrap.dedent(qml[popup_start:popup_end]).rstrip()
 
+    repeater_start = qml.index("    Repeater {\n        model: JSON.parse(studio.shortcutActions)")
+    repeater_end = qml.index("    FileDialog { id:fontDialog", repeater_start)
+    shortcut_repeater = textwrap.dedent(qml[repeater_start:repeater_end]).rstrip()
+
+    hint_fn = _extract_qml_function(qml, "    function hintWithShortcut(label, key, fallback)")
+    focus_fn = _extract_qml_function(qml, "    function nativeTextEditorFocused()")
+    enabled_fn = _extract_qml_function(qml, "    function shortcutEnabled(action)")
+    activate_fn = _extract_qml_function(qml, "    function activateShortcut(action)")
+
     harness = f"""import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
@@ -87,8 +111,12 @@ ApplicationWindow {{
     color: viewState.colors.surface
     property var viewState: JSON.parse(studio.snapshot)
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
+    property var shortcutBindings: JSON.parse(studio.shortcutBindings)
     property var shortcutLabels: JSON.parse(studio.shortcutLabels)
+    property var reader: null
     property bool sidebar: true
+    property bool settingsOpen: false
+    property bool capturingShortcut: false
     property string sidebarSection: "folder"
     property bool chromeAwake: true
     property int contextMenuCount: 0
@@ -98,11 +126,32 @@ ApplicationWindow {{
     onViewStateChanged: viewStateEvaluations += 1
     onSidebarStateChanged: sidebarStateEvaluations += 1
     function focusReader() {{}}
+    function openFind() {{}}
+    function runDocumentScript() {{}}
+    function runDocumentScriptWithCallback() {{}}
+    function nativeReaderEditAction() {{}}
+    QtObject {{ id: openDialog; function open() {{}} }}
+    QtObject {{ id: windowModes; property bool fullscreen: false; function setFullscreen(v) {{ fullscreen = v }} }}
+{textwrap.indent(hint_fn, "    ")}
+{textwrap.indent(focus_fn, "    ")}
+{textwrap.indent(enabled_fn, "    ")}
+{textwrap.indent(activate_fn, "    ")}
+{textwrap.indent(shortcut_repeater, "    ")}
     Material.theme: viewState.dark ? Material.Dark : Material.Light
     Material.primary: viewState.colors.primary
     Material.accent: viewState.colors.primary
     Material.background: viewState.colors.surface
     Material.foreground: viewState.colors["on-surface"]
+
+    header: Column {{
+        width: parent.width
+        TabStrip {{
+            width: parent.width
+            viewState: window.viewState
+            shortcutLabels: window.shortcutLabels
+        }}
+        Rectangle {{ width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }}
+    }}
 
     RowLayout {{
         anchors.fill: parent
@@ -124,6 +173,10 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Sidebar snapshot slices tests"])
 
     def setUp(self):
+        self.qt_messages: list[str] = []
+        self._prev_msg_handler = qInstallMessageHandler(
+            lambda _mode, _ctx, message: self.qt_messages.append(message)
+        )
         self.session = Session(True)
         self.session.settings.update(theme="dark", accent="blue", motion=False, welcomed=True, autosave=False)
         self.studio = QuietStudio(True, self.session)
@@ -161,6 +214,12 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             window.pool.shutdown(wait=True, cancel_futures=True)
             window._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
+        qInstallMessageHandler(self._prev_msg_handler)
+        qml_errors = [
+            msg for msg in self.qt_messages
+            if "TypeError:" in msg or "ReferenceError:" in msg
+        ]
+        self.assertEqual(qml_errors, [], f"Unexpected QML errors: {qml_errors}")
         shutil.rmtree(self.studio.data, ignore_errors=True)
 
     def items(self, item=None):
@@ -835,6 +894,239 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             and not self.studio._folder_searching
             and [f["name"] for f in self._qml_dict("sidebarState")["files"]] == ["Coursework", "Week 1.md", "Week 3.md"]
         )
+
+    def _assert_active_tab_revealed(self, context: str) -> None:
+        self._polish()
+        strip = self.window.findChild(QQuickItem, "tabStrip")
+        self.assertIsNotNone(strip)
+        pending = [strip]
+        active_item = None
+        while pending:
+            item = pending.pop()
+            if item.objectName() == "noteTab" and bool(item.property("isActive")):
+                active_item = item
+                break
+            pending.extend(item.childItems())
+        self.assertIsNotNone(active_item, f"Active tab item missing ({context})")
+        flickable = strip.property("contentItem")
+        content_x = float(flickable.property("contentX"))
+        viewport_width = float(strip.property("availableWidth") or strip.width())
+        self.assertGreaterEqual(
+            active_item.x() + 0.5,
+            content_x,
+            f"Active tab left edge clipped ({context}): x={active_item.x()}, contentX={content_x}",
+        )
+        self.assertLessEqual(
+            active_item.x() + active_item.width() - 0.5,
+            content_x + viewport_width,
+            f"Active tab right edge clipped ({context}): right={active_item.x() + active_item.width()}, viewportRight={content_x + viewport_width}",
+        )
+
+    def test_folder_sidebar_integrates_merged_tab_reveal_and_keyboard_shortcuts_without_slice_churn(self):
+        self.studio.openFolder(str(self.workspace))
+        self.wait_until(lambda: len(self.studio.files) == 3)
+        overview = self.workspace / "Overview.md"
+        self.studio.openNote(str(overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
+        self.studio.pinRecent(str(overview))
+        self.studio.post(
+            "out-merge-1",
+            "document_outline",
+            json.dumps({"id": self.studio.active, "headings": [{"title": "Overview", "level": 1, "offset": 0}]}),
+        )
+        self.wait_until(lambda: len(self._qml_dict("sidebarState")["outline"]) == 1)
+
+        folder_sidebar = self.named("folderSidebar")
+        files_view = self.named("folderFilesView")
+        recent_notes = self.named("sidebarRecentNotes")
+        outline_list = self.named("sidebarOutlineList")
+        create_dialog = self.named("createFolderItemDialog")
+        create_field = self.named("createFolderItemField")
+        rename_dialog = self.named("renameEntryDialog")
+        rename_field = self.named("renameEntryField")
+        fallback_rename = self.named("tabFallbackRenameDialog")
+
+        def activate(action: str) -> None:
+            self.assertTrue(
+                QMetaObject.invokeMethod(self.window, "activateShortcut", Q_ARG("QVariant", action))
+            )
+
+        def is_enabled(action: str) -> bool:
+            return bool(
+                QMetaObject.invokeMethod(
+                    self.window,
+                    "shortcutEnabled",
+                    Q_RETURN_ARG("QVariant"),
+                    Q_ARG("QVariant", action),
+                )
+            )
+
+        # 1. Shortcut hints and menu shortcutText bindings update live and suppress "Disabled" without sidebarChanged churn.
+        self._settle_watchers()
+        shortcut_sidebar_signals = []
+        self.studio.sidebarChanged.connect(lambda: shortcut_sidebar_signals.append(1))
+        self.assertEqual(self.studio.setShortcut("new_folder_note", "Ctrl+Alt+M"), "")
+        self.assertEqual(self.studio.setShortcut("new_subfolder", ""), "")
+        self.assertEqual(self.studio.setShortcut("new_window", ""), "")
+        QTest.qWait(30)
+        self.assertEqual(len(shortcut_sidebar_signals), 0)
+
+        header_new_btn = self.named("headerNewItemButton")
+        header_sub_btn = self.named("headerNewSubfolderButton")
+        new_win_btn = self.named("newWindowButton")
+        header_md_item = self.named("headerNewMarkdownItem")
+        header_sub_item = self.named("headerNewSubfolderItem")
+        menu_md_item = self.named("menuNewMarkdown")
+        menu_sub_item = self.named("menuNewSubfolder")
+        self.assertIn("M", header_new_btn.findChild(QObject, "actionHint").property("text"))
+        self.assertEqual(header_sub_btn.findChild(QObject, "actionHint").property("text"), "New subfolder")
+        self.assertEqual(new_win_btn.findChild(QObject, "actionHint").property("text"), "New window")
+        self.assertIn("M", header_md_item.property("shortcutText"))
+        self.assertTrue(bool(header_md_item.property("hasShortcutHint")))
+        self.assertEqual(header_sub_item.property("shortcutText"), "Disabled")
+        self.assertFalse(bool(header_sub_item.property("hasShortcutHint")))
+        self.assertEqual(header_sub_item.findChild(QObject, "menuShortcutHint").property("text"), "")
+        self.assertIn("M", menu_md_item.property("shortcutText"))
+        self.assertTrue(bool(menu_md_item.property("hasShortcutHint")))
+        self.assertEqual(menu_sub_item.property("shortcutText"), "Disabled")
+        self.assertFalse(bool(menu_sub_item.property("hasShortcutHint")))
+        self.assertEqual(menu_sub_item.findChild(QObject, "menuShortcutHint").property("text"), "")
+        self.assertEqual(self.studio.resetShortcuts(), "")
+        QTest.qWait(25)
+
+        # 2. Keyboard actions route through FolderSidebar against sidebarState and gate mode shortcuts while modals are open.
+        self.window.setProperty("sidebar", False)
+        self.window.setProperty("sidebarSection", "contents")
+        activate("new_subfolder")
+        self.wait_until(lambda: bool(create_dialog.property("visible")))
+        self.assertTrue(bool(self.window.property("sidebar")))
+        self.assertEqual(self.window.property("sidebarSection"), "folder")
+        self.assertFalse(is_enabled("mode_live"))
+        create_field.setProperty("text", "Seminars")
+        create_dialog.accept()
+        seminars_dir = self.workspace / "Seminars"
+        self.wait_until(
+            lambda: seminars_dir.is_dir()
+            and any(f["name"] == "Seminars" for f in self._qml_dict("sidebarState")["files"])
+        )
+        self.wait_until(lambda: is_enabled("mode_live"))
+
+        # Select Seminars in FolderSidebar so new_folder_note targets Seminars and rename_entry renames the selected entry.
+        folder_sidebar.setProperty("selectedPath", str(seminars_dir))
+        folder_sidebar.setProperty("selectedName", "Seminars")
+        folder_sidebar.setProperty("selectedDirectory", True)
+        activate("new_folder_note")
+        self.wait_until(lambda: bool(create_dialog.property("visible")))
+        self.assertTrue(folder_ops.same_path(create_dialog.property("parentDir"), seminars_dir))
+        create_field.setProperty("text", "1.1 Seminar Intro")
+        create_dialog.accept()
+        seminar_note = seminars_dir / "1.1 Seminar Intro.md"
+        self.wait_until(
+            lambda: seminar_note.is_file()
+            and folder_ops.same_path(self.studio._current()["path"], seminar_note)
+        )
+
+        # With selectedPath still pointing to Seminars, rename_entry opens renameEntryDialog for the selected directory.
+        activate("rename_entry")
+        self.wait_until(lambda: bool(rename_dialog.property("visible")))
+        self.assertTrue(bool(rename_dialog.property("entryIsDirectory")))
+        self.assertTrue(folder_ops.same_path(rename_dialog.property("entryPath"), seminars_dir))
+        rename_dialog.reject()
+        self.wait_until(lambda: not bool(rename_dialog.property("visible")))
+
+        # Clearing selectedPath causes rename_entry to target the active folder-backed tab via renameEntryDialog.
+        folder_sidebar.setProperty("selectedPath", "")
+        activate("rename_entry")
+        self.wait_until(lambda: bool(rename_dialog.property("visible")))
+        self.assertFalse(bool(rename_dialog.property("entryIsDirectory")))
+        self.assertTrue(folder_ops.same_path(rename_dialog.property("entryPath"), seminar_note))
+        rename_dialog.reject()
+        self.wait_until(lambda: not bool(rename_dialog.property("visible")))
+
+        # On an unsaved tab outside the open folder, rename_entry falls back to tabFallbackRenameDialog.
+        self.studio.newNote()
+        unsaved_id = self.studio.active
+        QTest.qWait(25)
+        activate("rename_entry")
+        self.wait_until(lambda: bool(fallback_rename.property("visible")))
+        self.assertEqual(fallback_rename.property("noteId"), unsaved_id)
+        self.assertFalse(is_enabled("mode_editor"))
+        fallback_rename.reject()
+        self.wait_until(lambda: not bool(fallback_rename.property("visible")))
+        self.studio.closeTab(unsaved_id)
+        self.wait_until(lambda: all(t["id"] != unsaved_id for t in self.studio.tabs))
+
+        # 3. Overflowing TabStrip reveals active tab across folder create/open/rename while non-sidebar actions keep delegates alive.
+        for idx in range(6):
+            title = f"2.{idx + 1} Distributed Systems Lecture"
+            self.studio.createFolderNote(str(self.workspace), title, "md")
+            self.wait_until(
+                lambda expected=f"{title}.md": self.studio.busy == 0
+                and self.studio._current()["name"] == expected
+            )
+        QTest.qWait(50)
+        strip = self.window.findChild(QQuickItem, "tabStrip")
+        flickable = strip.property("contentItem")
+        self.assertGreater(float(flickable.property("contentWidth")), strip.width())
+        self._assert_active_tab_revealed("after creating overflowing folder notes")
+
+        # Activate Overview.md via openNote (as FolderSidebar click does) and verify left-side tab reveal.
+        self.studio.openNote(str(overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
+        QTest.qWait(50)
+        self._assert_active_tab_revealed("after activating Overview.md from folder")
+
+        # Populate outline on Overview.md, capture sidebar delegates, and exercise tab reordering + mode switches + zoom.
+        self.studio.post(
+            "out-merge-2",
+            "document_outline",
+            json.dumps({"id": self.studio.active, "headings": [{"title": "Overview", "level": 1, "offset": 0}]}),
+        )
+        self.wait_until(lambda: len(self._qml_dict("sidebarState")["outline"]) == 1)
+        self.window.setProperty("sidebarSection", "contents")
+        self.wait_until(lambda: len(self._list_delegates(outline_list)) == 1)
+        baseline_outline_delegates = self._list_delegates(outline_list)
+        self.window.setProperty("sidebarSection", "folder")
+        self.wait_until(lambda: len(self._list_delegates(files_view)) >= 8)
+        baseline_file_delegates = self._list_delegates(files_view)
+        baseline_recent_delegates = self._list_delegates(recent_notes)
+        self._settle_watchers()
+
+        non_sidebar_signals = []
+        self.studio.sidebarChanged.connect(lambda: non_sidebar_signals.append(1))
+        activate("move_tab_right")
+        QTest.qWait(35)
+        self._assert_active_tab_revealed("after moving active tab right")
+        activate("move_tab_left")
+        QTest.qWait(35)
+        self._assert_active_tab_revealed("after moving active tab left")
+        activate("mode_editor")
+        activate("mode_live")
+        self.studio.setZoom(120)
+        QTest.qWait(35)
+
+        self.assertEqual(len(non_sidebar_signals), 0)
+        self.assertEqual(self._list_delegates(files_view), baseline_file_delegates)
+        self.assertEqual(self._list_delegates(recent_notes), baseline_recent_delegates)
+        self.window.setProperty("sidebarSection", "contents")
+        self.assertEqual(self._list_delegates(outline_list), baseline_outline_delegates)
+        self.window.setProperty("sidebarSection", "folder")
+
+        # Jump to rightmost tab via tab_9 and rename via FolderSidebar so tab widens and stays revealed.
+        activate("tab_9")
+        QTest.qWait(50)
+        self._assert_active_tab_revealed("after jumping to rightmost tab via tab_9")
+        rightmost_path = self.studio._current()["path"]
+        folder_sidebar.openRenameFor(rightmost_path, self.studio._current()["name"], False)
+        self.wait_until(lambda: bool(rename_dialog.property("visible")))
+        rename_field.setProperty("text", "2.6 Comprehensive Byzantine Fault Tolerance Reference")
+        rename_dialog.accept()
+        self.wait_until(
+            lambda: self.studio.busy == 0
+            and self.studio._current()["name"] == "2.6 Comprehensive Byzantine Fault Tolerance Reference.md"
+        )
+        QTest.qWait(60)
+        self._assert_active_tab_revealed("after widening active rightmost tab via FolderSidebar rename")
 
 
 if __name__ == "__main__":
