@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { maskFrontmatter, parseFrontmatter } from "./frontmatter";
+import { frontmatterVisibleValueSpans, maskFrontmatter, parseFrontmatter } from "./frontmatter";
 
 describe("YAML frontmatter parser", () => {
   it("recognizes UTF-8 BOM, trailing spaces, dot closers, empty blocks, CRLF, and EOF closers", () => {
@@ -113,5 +113,119 @@ describe("YAML frontmatter parser", () => {
     expect(masked.indexOf("# Real Heading")).toBe(source.indexOf("# Real Heading"));
     expect(masked.indexOf("![Real](chart.png)")).toBe(source.indexOf("![Real](chart.png)"));
     expect(masked).not.toContain("missing.png");
+  });
+
+  it("maps displayed title, author, and tags to exact canonical UTF-16 value spans in display order", () => {
+    const source = [
+      "\uFEFF---",
+      "date: 2026-03-15 # hidden date and comment",
+      "tags: [quantum, physics] # inline tag comment",
+      "keywords: physics, qft",
+      "author:",
+      "  - name: Richard Feynman",
+      "    affiliation: Caltech",
+      "  - given: Emmy",
+      "    family: Noether",
+      "subtitle: Perturbative Notes",
+      'title: "Path Integrals & Symmetries"',
+      "aliases: [QFT Notes]",
+      "...",
+      "# Body Heading",
+    ].join("\r\n");
+
+    const parsedWithSpans = parseFrontmatter(source, { includeSpans: true });
+    expect(parsedWithSpans).not.toBeNull();
+    expect(parsedWithSpans!.properties).toEqual({
+      title: "Path Integrals & Symmetries",
+      subtitle: "Perturbative Notes",
+      authors: ["Richard Feynman", "Emmy Noether"],
+      date: "2026-03-15",
+      description: undefined,
+      tags: ["quantum", "physics", "qft"],
+      aliases: ["QFT Notes"],
+    });
+    expect(parseFrontmatter(source)?.visibleSpans).toBeUndefined();
+
+    const spans = parsedWithSpans!.visibleSpans!;
+    expect(frontmatterVisibleValueSpans(source)).toEqual(spans);
+    expect(spans.map((s) => ({ field: s.field, fieldOrdinal: s.fieldOrdinal, text: source.slice(s.start, s.end) }))).toEqual([
+      { field: "title", fieldOrdinal: 0, text: "Path Integrals & Symmetries" },
+      { field: "author", fieldOrdinal: 0, text: "Richard Feynman" },
+      { field: "author", fieldOrdinal: 0, text: "Emmy" },
+      { field: "author", fieldOrdinal: 0, text: "Noether" },
+      { field: "tag", fieldOrdinal: 0, text: "quantum" },
+      { field: "tag", fieldOrdinal: 1, text: "physics" },
+      { field: "tag", fieldOrdinal: 2, text: "qft" },
+    ]);
+    expect(frontmatterVisibleValueSpans("# No frontmatter\nBody")).toEqual([]);
+  });
+
+  it("extracts values and canonical spans for quoted, folded, literal, flow, and duplicate metadata while excluding hidden fields and malformed headers", () => {
+    const complex = [
+      "---",
+      "title: Initial Overwritten Title",
+      "title: >-",
+      "  Folded Alpha",
+      "  Study",
+      "subtitle: Hidden Folded Subtitle",
+      "description: |",
+      "  Hidden literal description",
+      "  with Alpha text",
+      "date: '2026-04-01'",
+      "aliases: [HiddenAlias, 'Second Alias']",
+      "custom_secret: AlphaSecret",
+      "author: 'Ada ''Alpha'' Lovelace'",
+      "authors:",
+      "  - \"Ada 'Alpha' Lovelace\"",
+      "  - { given: \"Grace\", family: 'Hopper', role: 'Rear Admiral' }",
+      "tags: [",
+      "  'flow-one',",
+      "  \"flow-two\",",
+      "  flow-one",
+      "]",
+      "keywords: >-",
+      "  flow-two, folded-three,",
+      "  folded-four",
+      "---",
+      "Body text.",
+    ].join("\n");
+
+    const parsed = parseFrontmatter(complex, { includeSpans: true });
+    expect(parsed).not.toBeNull();
+    expect(parsed!.properties).toEqual({
+      title: "Folded Alpha Study",
+      subtitle: "Hidden Folded Subtitle",
+      authors: ["Ada 'Alpha' Lovelace", "Grace Hopper"],
+      date: "2026-04-01",
+      description: "Hidden literal description\nwith Alpha text",
+      tags: ["flow-one", "flow-two", "folded-three", "folded-four"],
+      aliases: ["HiddenAlias", "Second Alias"],
+    });
+    expect(parsed!.visibleSpans!.map((s) => ({
+      field: s.field,
+      fieldOrdinal: s.fieldOrdinal,
+      text: complex.slice(s.start, s.end),
+    }))).toEqual([
+      { field: "title", fieldOrdinal: 0, text: "Folded Alpha" },
+      { field: "title", fieldOrdinal: 0, text: "Study" },
+      { field: "author", fieldOrdinal: 0, text: "Ada ''Alpha'' Lovelace" },
+      { field: "author", fieldOrdinal: 0, text: "Grace" },
+      { field: "author", fieldOrdinal: 0, text: "Hopper" },
+      { field: "tag", fieldOrdinal: 0, text: "flow-one" },
+      { field: "tag", fieldOrdinal: 1, text: "flow-two" },
+      { field: "tag", fieldOrdinal: 2, text: "folded-three" },
+      { field: "tag", fieldOrdinal: 3, text: "folded-four" },
+    ]);
+
+    for (const malformed of [
+      "---\ntitle: \"Unclosed quote\n---\nBody",
+      "---\ntags: [unclosed, flow\n---\nBody",
+      "---\n\ttitle: Leading Tab\n---\nBody",
+      "---\n- list_root_not_mapping\n---\nBody",
+      "---\ntitle: Missing Closer\nBody",
+    ]) {
+      expect(parseFrontmatter(malformed, { includeSpans: true })).toBeNull();
+      expect(frontmatterVisibleValueSpans(malformed)).toEqual([]);
+    }
   });
 });
