@@ -1045,6 +1045,7 @@ class Studio(QObject):
         target_active_id = win_spec["activeId"] if win_spec is not None else self.session.startup_active_id
         if restore_enabled and any(t["id"]==target_active_id for t in self.tabs):self.active=target_active_id
         self._activation_generation = 0
+        self._pending_drop_batches = 0
         self._startup_placeholder_ids = {
             tab["id"] for tab in self.tabs
             if tab["name"] == "Untitled.md" and not tab["path"] and not tab["content"] and not tab["saved"] and not tab["assets"]
@@ -1467,6 +1468,7 @@ class Studio(QObject):
 
     def stop(self):
         if self.retired: return
+        self._pending_drop_batches = 0
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
         self._cancel_subfolder_search()
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
@@ -3046,8 +3048,9 @@ class Studio(QObject):
             self._emit(False)
 
     def _open_dropped_notes(self, note_paths: list[Path], *, notice: str = ""):
-        if not note_paths or self.retired:
+        if not note_paths or self.retired or getattr(self.pool, "_shutdown", False):
             return
+        self._pending_drop_batches += 1
         self._activation_generation += 1
         batch_generation = self._activation_generation
         highest_activated_index = -1
@@ -3090,22 +3093,26 @@ class Studio(QObject):
                 elif tab is not None:
                     opened_paths_by_index[index] = folder_ops.canonical_path_str(path)
                 remaining -= 1
-                if remaining == 0 and not self.retired:
-                    if len(opened_paths_by_index) > 1:
-                        ordered = [opened_paths_by_index[i] for i in sorted(opened_paths_by_index, reverse=True)]
-                        self.recent = (
-                            ordered
-                            + [p for p in self.recent if not any(folder_ops.same_path(p, o) for o in ordered)]
-                        )[:30]
-                        self._preferences()
-                    parts: list[str] = []
-                    if errors:
-                        parts.append("Could not open " + "; ".join(errors))
-                    if notice:
-                        parts.append(notice)
-                    if parts:
-                        self.message = " ".join(parts)
-                    self._emit(False)
+                if remaining == 0:
+                    try:
+                        if not self.retired:
+                            if len(opened_paths_by_index) > 1:
+                                ordered = [opened_paths_by_index[i] for i in sorted(opened_paths_by_index, reverse=True)]
+                                self.recent = (
+                                    ordered
+                                    + [p for p in self.recent if not any(folder_ops.same_path(p, o) for o in ordered)]
+                                )[:30]
+                                self._preferences()
+                            parts: list[str] = []
+                            if errors:
+                                parts.append("Could not open " + "; ".join(errors))
+                            if notice:
+                                parts.append(notice)
+                            if parts:
+                                self.message = " ".join(parts)
+                            self._emit(False)
+                    finally:
+                        self._pending_drop_batches = max(0, self._pending_drop_batches - 1)
             return done
 
         for idx, note_path in enumerate(note_paths):

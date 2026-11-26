@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -23,6 +24,7 @@ from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtTest import QTest
 
 from documents import write_portable
+import studio as studio_module
 from studio import Session
 from test_studio import QuietStudio
 
@@ -244,7 +246,12 @@ class DesktopWorkspaceDropUnitTest(unittest.TestCase):
         )
         self._wait_for(
             lambda: self.studio.folder == str(other_dir.resolve())
-            and any(t["path"] == str(extra_note.resolve()) for t in self.studio.tabs)
+            and any(entry["name"] == "chapter.md" for entry in self.studio.files)
+            and self.studio._pending_drop_batches == 0
+        )
+        self.assertEqual(
+            [t["path"] for t in self.studio.tabs if t["path"]],
+            [str(inside_note.resolve()), str(extra_note.resolve())],
         )
         self.assertEqual(self.studio._current()["path"], str(extra_note.resolve()))
         self.assertIn("skipped 1 unsupported item", self.studio.message.lower())
@@ -271,6 +278,67 @@ class DesktopWorkspaceDropUnitTest(unittest.TestCase):
         self.studio.handleExternalDrop([QUrl.fromLocalFile(str(unopened))], True)
         self.studio.pending_close = ""
         self.assertFalse(any(t["path"] == str(unopened.resolve()) for t in self.studio.tabs))
+
+    def test_mixed_drop_publishes_skipped_notice_after_earlier_read_finishes_last(self) -> None:
+        other_dir = self.studio.data / "ordered-folder"
+        other_dir.mkdir()
+        (other_dir / "chapter.md").write_text("# Chapter", encoding="utf-8")
+        inside_note = self.studio.data / "slow-earlier.md"
+        inside_note.write_text("# Earlier Note", encoding="utf-8")
+        extra_note = self.studio.data / "fast-last.md"
+        extra_note.write_text("# Last Note", encoding="utf-8")
+        pdf_file = self.studio.data / "handout.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4\n")
+
+        real_open_note = studio_module.open_note
+        first_read_started = threading.Event()
+        allow_first_read_to_finish = threading.Event()
+
+        def controlled_open_note(path: Path):
+            resolved = path.resolve()
+            if resolved == inside_note.resolve():
+                first_read_started.set()
+                if not allow_first_read_to_finish.wait(timeout=5.0):
+                    raise TimeoutError("Timed out waiting to release earlier dropped note read")
+            elif resolved == extra_note.resolve():
+                if not first_read_started.wait(timeout=5.0):
+                    raise TimeoutError("Timed out waiting for earlier dropped note read to start")
+            return real_open_note(path)
+
+        with patch.object(studio_module, "open_note", side_effect=controlled_open_note):
+            self.studio.handleExternalDrop(
+                [
+                    QUrl.fromLocalFile(str(other_dir)),
+                    QUrl.fromLocalFile(str(inside_note)),
+                    QUrl.fromLocalFile(str(extra_note)),
+                    QUrl.fromLocalFile(str(pdf_file)),
+                ],
+                True,
+            )
+            try:
+                # Force the exact race: folder and last note have appeared, while earlier read is still in flight.
+                self._wait_for(
+                    lambda: self.studio.folder == str(other_dir.resolve())
+                    and any(t["path"] == str(extra_note.resolve()) for t in self.studio.tabs)
+                )
+                self.assertEqual(self.studio._pending_drop_batches, 1)
+                self.assertEqual(self.studio._current()["path"], str(extra_note.resolve()))
+                self.assertNotIn("skipped 1 unsupported item", self.studio.message.lower())
+            finally:
+                allow_first_read_to_finish.set()
+
+            self._wait_for(
+                lambda: self.studio.folder == str(other_dir.resolve())
+                and any(entry["name"] == "chapter.md" for entry in self.studio.files)
+                and self.studio._pending_drop_batches == 0
+            )
+
+        self.assertEqual(
+            [t["path"] for t in self.studio.tabs if t["path"]],
+            [str(inside_note.resolve()), str(extra_note.resolve())],
+        )
+        self.assertEqual(self.studio._current()["path"], str(extra_note.resolve()))
+        self.assertIn("skipped 1 unsupported item", self.studio.message.lower())
 
 
 class DesktopWorkspaceDropQmlTest(unittest.TestCase):
@@ -357,7 +425,9 @@ ApplicationWindow {{
         self.assertTrue(self._send_drop(file_mime, Qt.DropAction.CopyAction))
 
         deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and len([t for t in self.studio.tabs if t["path"]]) < 2:
+        while time.monotonic() < deadline and (
+            self.studio._pending_drop_batches > 0 or len([t for t in self.studio.tabs if t["path"]]) < 2
+        ):
             self.app.processEvents()
             time.sleep(0.005)
         self.assertEqual(
@@ -496,7 +566,9 @@ def _webengine_drop_probe() -> None:
             app.sendEvent(window, note_drop)
 
             deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline and len([t for t in studio.tabs if t["path"]]) < 2:
+            while time.monotonic() < deadline and (
+                studio._pending_drop_batches > 0 or len([t for t in studio.tabs if t["path"]]) < 2
+            ):
                 app.processEvents()
                 QTest.qWait(15)
             opened = [t["path"] for t in studio.tabs if t["path"]]
@@ -805,7 +877,10 @@ def _real_reader_bundle_probe() -> None:
 
             deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline and (
-                len(studio.tabs) < 3 or len(studio.files) < 2 or studio._current()["path"] != str(portable_spec.resolve())
+                studio._pending_drop_batches > 0
+                or len(studio.tabs) < 3
+                or len(studio.files) < 2
+                or studio._current()["path"] != str(portable_spec.resolve())
             ):
                 app.processEvents()
                 QTest.qWait(25)
