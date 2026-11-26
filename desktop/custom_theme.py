@@ -4,6 +4,7 @@ import copy
 import re
 import subprocess
 from pathlib import Path
+from core.paths import SOURCE_ROOT
 from material_color_utilities import get_contrast_ratio
 MAX_THEME = 2 * 1024 * 1024
 
@@ -30,7 +31,7 @@ _PRESET_ID_RE = re.compile(r"^[a-z0-9-]+$")
 TEMPLATE = {"format":"supermd-theme","version":1,"name":"My theme","accent":"violet","variants":{"light":{"colors":{},"background":{"pattern":"dots","color":"#7255a5","opacity":0.05,"spacing":24,"angle":0}},"dark":{"colors":{},"background":{"pattern":"dots","color":"#d4bbfc","opacity":0.04,"spacing":24,"angle":0}}},"metrics":{"controlRadius":22,"contentRadius":16,"paragraphSpacing":1.2,"codePadding":18,"headingWeight":700,"headingTracking":-0.02,"textTracking":0,"tableBorderWidth":1}}
 
 def bundled_themes_dir(root=None):
-    base = Path(root) if root else Path(__file__).resolve().parent.parent
+    base = Path(root) if root else SOURCE_ROOT
     for candidate in (base / "dist" / "themes", base / "public" / "themes"):
         if candidate.is_dir() and any(candidate.glob("*.supermd-theme.json")):
             return candidate

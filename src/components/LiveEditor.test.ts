@@ -110,8 +110,39 @@ describe("CommonMark block flow helpers", () => {
     const multi = "1. Top\n- A\n  - B";
     const multiIndented = indentMarkdownSelection(multi, 7, multi.length, false);
     expect(multiIndented.value).toBe("1. Top\n   - A\n     - B");
+    expect([multiIndented.selectionStart, multiIndented.selectionEnd]).toEqual([7, multiIndented.value.length]);
+    // Repeat Tab caps at one level deeper than the parent item.
+    const multiCapped = indentMarkdownSelection(
+      multiIndented.value,
+      multiIndented.selectionStart,
+      multiIndented.selectionEnd,
+      false,
+    );
+    expect(multiCapped.value).toBe("1. Top\n   - A\n     - B");
     const multiOutdented = indentMarkdownSelection(multiIndented.value, multiIndented.selectionStart, multiIndented.selectionEnd, true);
     expect(multiOutdented.value).toBe(multi);
+    expect([multiOutdented.selectionStart, multiOutdented.selectionEnd]).toEqual([7, multi.length]);
+
+    // Loose multi-line list selection skips blank lines cleanly, and quoted multi-line selection preserves `> `.
+    const loose = "1. Top\n- [ ] First\n\n  - [x] Nested";
+    const looseIndented = indentMarkdownSelection(loose, 7, loose.length, false);
+    expect(looseIndented.value).toBe("1. Top\n   - [ ] First\n\n     - [x] Nested");
+    expect(
+      indentMarkdownSelection(looseIndented.value, looseIndented.selectionStart, looseIndented.selectionEnd, true).value,
+    ).toBe(loose);
+
+    const quotedMulti = "> 1. Parent\n> - Child A\n>   - Child B";
+    const quotedStart = quotedMulti.indexOf("> - Child A");
+    const quotedMultiIndented = indentMarkdownSelection(quotedMulti, quotedStart, quotedMulti.length, false);
+    expect(quotedMultiIndented.value).toBe("> 1. Parent\n>    - Child A\n>      - Child B");
+    expect(
+      indentMarkdownSelection(
+        quotedMultiIndented.value,
+        quotedMultiIndented.selectionStart,
+        quotedMultiIndented.selectionEnd,
+        true,
+      ).value,
+    ).toBe(quotedMulti);
   });
 
   it("detects first/last line cursors and skips non-rendered definition spans", () => {
