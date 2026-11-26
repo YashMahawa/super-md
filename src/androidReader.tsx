@@ -2,6 +2,7 @@ import { createRoot } from "react-dom/client";
 import {flushSync} from 'react-dom';
 import {createGapSelection,type GapSelection} from './gapSelection';
 import {FrameScrollQueue,zoomFrameStep} from './frameMotion';
+import {applyChainedNativeScroll,NON_VIEWER_OVERLAY_SELECTOR,resolveNativeWheelScrollOrigin} from './nativeWheelScroll';
 import {agentCharLength,agentCodePointOffset,agentOutlinePage,agentRead,agentRevision,agentSearch,agentSectionForExport,agentUtf16Offset,applyAgentPatchesDetailed,countCodePointsRange} from './agentOperations';
 import {suggestMathRepairs,applyMathRepairs} from './mathRepair';
 import {agentDiagrams,diagramMetadata,diagramMedia,visibleSourceRange,type AgentDiagramOptions} from './agentView';
@@ -198,9 +199,10 @@ function Reader() {
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
   useLayoutEffect(() => {
     const nativeScroll=new FrameScrollQueue((scroller,dx,dy)=>{
-      const reading=scroller.matches('.android-reading');
-      if(reading){cancelHeadingNavigation(scroller);rememberWindowedScrollSource(scroller,dy);if(Math.abs(dy)>2)requestChrome('hide');}
-      scroller.scrollBy({left:reading&&reference.current?.centerLock?0:dx,top:dy,behavior:'instant'});
+      applyChainedNativeScroll(scroller,dx,dy,{
+        centerLock:Boolean(reference.current?.centerLock),
+        onReadingScroll:(reading,attemptedDy)=>{cancelHeadingNavigation(reading);rememberWindowedScrollSource(reading,attemptedDy);if(Math.abs(attemptedDy)>2)requestChrome('hide');},
+      });
     });
     window.supermdSavePosition=()=>savePosition.current();
     window.supermdSelectedText=()=>extractSelectedText({source:reference.current?.content,editorSelection:()=>reference.current?editorSelectedText(reference.current.id):null});
@@ -348,14 +350,14 @@ function Reader() {
     window.supermdNativeWheel=(dx,dy,point,held,modifier=false)=>{
       markScrollInput();
       const target=document.elementFromPoint(point.x,point.y),canvas=target?.closest(".interactive-chart svg,.image-viewer-canvas");
-      if(target?.closest('.theme-guide-dialog')){const body=target.closest<HTMLElement>('.theme-guide-body');if(!held&&body)nativeScroll.scroll(body,dx,dy);return;}
-      const slideNotes=target?.closest<HTMLElement>('.step-viewer .step-cards-notes');
-      if(slideNotes){nativeScroll.scroll(slideNotes,dx,dy);return;}
+      if(target?.closest(NON_VIEWER_OVERLAY_SELECTOR)){if(!held){const origin=resolveNativeWheelScrollOrigin(target);if(origin)nativeScroll.scroll(origin,dx,dy);}return;}
       const editor=target?.closest<HTMLTextAreaElement>('textarea');
       if(editor){nativeScroll.scroll(editor,dx,dy);return;}
-      if(held&&(modifier||canvas||(!selectingText.current&&!window.getSelection()?.toString()))){gapSelection.current?.cancelStationary();if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
+      const slideNotes=target?.closest<HTMLElement>('.step-viewer .step-cards-notes');
+      if(slideNotes&&!modifier){const origin=resolveNativeWheelScrollOrigin(target);if(origin)nativeScroll.scroll(origin,dx,dy);return;}
+      if(held&&!target?.closest('input')&&(modifier||canvas||(!selectingText.current&&!window.getSelection()?.toString()))){gapSelection.current?.cancelStationary();if(canvas?.matches("svg"))canvas.dispatchEvent(new WheelEvent("wheel",{bubbles:true,cancelable:true,ctrlKey:true,deltaY:dy,clientX:point.x,clientY:point.y}));else window.supermdZoomBy?.(Math.exp(-dy*.002),point);return;}
       if(canvas){canvas.dispatchEvent(new CustomEvent("supermd-canvas-pan",{detail:{dx,dy},cancelable:true}));return;}
-      const scroller=target?.closest<HTMLElement>(".android-reading,.cm-scroller,.image-viewer-canvas,.math-repair-list,.media-dialog") || document.querySelector<HTMLElement>('.android-reading');
+      const scroller=resolveNativeWheelScrollOrigin(target);
       if(scroller)nativeScroll.scroll(scroller,dx,dy);
     };
     window.supermdFlush = operation => {
