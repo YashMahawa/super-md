@@ -1,0 +1,846 @@
+{
+  "version": 1,
+  "description": "Portable YAML frontmatter fixture corpus shared by TypeScript (src/frontmatter.ts) and Desktop Python (desktop/frontmatter.py) for quoted scalars, flow collections, folded scalars, CRLF, and Unicode separators, plus recorded cross-parser divergences on current main.",
+  "sharedCases": [
+    {
+      "id": "quoted-double-escapes-and-masked-tokens",
+      "category": "quoted-scalars",
+      "description": "Double-quoted scalars decode standard YAML escapes and mask embedded Markdown images, wikilinks, link definitions, and diagram fences while preserving body offsets.",
+      "source": "---\ntitle: \"Quantum \\\"Field\\\" Notes: Part I\\t\\x41\\u00e9\"\ndescription: \"Contains # hash, ---, ![fake](missing.png), ![[wiki-fake.png]], [ref]: fake.png, and ```mermaid\" # trailing comment\n---\n# Lecture 1\n\n![Real](real.png)\n",
+      "recognized": true,
+      "frontmatterRaw": "---\ntitle: \"Quantum \\\"Field\\\" Notes: Part I\\t\\x41\\u00e9\"\ndescription: \"Contains # hash, ---, ![fake](missing.png), ![[wiki-fake.png]], [ref]: fake.png, and ```mermaid\" # trailing comment\n---\n",
+      "body": "# Lecture 1\n\n![Real](real.png)\n",
+      "endOffset": {
+        "utf16": 191,
+        "codePoints": 191
+      },
+      "maskedExcludes": [
+        "missing.png",
+        "wiki-fake.png",
+        "fake.png",
+        "mermaid"
+      ],
+      "bodyProbes": [
+        "# Lecture 1",
+        "![Real](real.png)"
+      ],
+      "bodyImages": [
+        "real.png"
+      ],
+      "unsupportedDiagrams": false,
+      "typescriptEntries": {
+        "title": "Quantum \"Field\" Notes: Part I\tA\u00e9",
+        "description": "Contains # hash, ---, ![fake](missing.png), ![[wiki-fake.png]], [ref]: fake.png, and ```mermaid"
+      },
+      "typescriptProperties": {
+        "title": "Quantum \"Field\" Notes: Part I\tA\u00e9",
+        "authors": [],
+        "description": "Contains # hash, ---, ![fake](missing.png), ![[wiki-fake.png]], [ref]: fake.png, and ```mermaid",
+        "tags": [],
+        "aliases": []
+      }
+    },
+    {
+      "id": "quoted-single-doubled-apostrophes-and-quoted-keys",
+      "category": "quoted-scalars",
+      "description": "Single-quoted scalars preserve literal backslashes, decode doubled '' apostrophes, and support single- and double-quoted mapping keys containing colons.",
+      "source": "---\ntitle: 'Noether''s Theorem: A ''Primer'''\nvault_path: 'C:\\vault\\notes\\'\n\"custom:key\": \"value:1\"\n'it''s-key': 'ok'\n...\nParagraph after single-quoted frontmatter.\n",
+      "recognized": true,
+      "frontmatterRaw": "---\ntitle: 'Noether''s Theorem: A ''Primer'''\nvault_path: 'C:\\vault\\notes\\'\n\"custom:key\": \"value:1\"\n'it''s-key': 'ok'\n...\n",
+      "body": "Paragraph after single-quoted frontmatter.\n",
+      "endOffset": {
+        "utf16": 122,
+        "codePoints": 122
+      },
+      "bodyProbes": [
+        "Paragraph after single-quoted frontmatter."
+      ],
+      "typescriptEntries": {
+        "title": "Noether's Theorem: A 'Primer'",
+        "vault_path": "C:\\vault\\notes\\",
+        "custom:key": "value:1",
+        "it's-key": "ok"
+      }
+    },
+    {
+      "id": "quoted-multiline-continuations-and-blank-lines",
+      "category": "quoted-scalars",
+      "description": "Multiline double-quoted (including backslash-newline continuation) and single-quoted scalars fold across indented lines and blank lines (currently collapsed to a single space in TypeScript) at root and sequence levels.",
+      "source": "---\ntitle: \"Hello \\\n  World\"\nabstract: 'First paragraph\n\n  Second line'\ntags:\n  - \"multi\n    tag\"\n---\n- [ ] Verify multiline quotes\n",
+      "recognized": true,
+      "frontmatterRaw": "---\ntitle: \"Hello \\\n  World\"\nabstract: 'First paragraph\n\n  Second line'\ntags:\n  - \"multi\n    tag\"\n---\n",
+      "body": "- [ ] Verify multiline quotes\n",
+      "endOffset": {
+        "utf16": 102,
+        "codePoints": 102
+      },
+      "bodyProbes": [
+        "- [ ] Verify multiline quotes"
+      ],
+      "typescriptEntries": {
+        "title": "Hello World",
+        "abstract": "First paragraph Second line",
+        "tags": [
+          "multi tag"
+        ]
+      }
+    },
+    {
+      "id": "quoted-reject-underindented-multiline",
+      "category": "quoted-scalars",
+      "description": "Multiline quoted scalars whose continuation line is not indented past the parent key fall back safely to Markdown.",
+      "source": "---\ntitle: \"Line one\nLine two at col 0\"\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntitle: \"Line one\nLine two at col 0\"\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "quoted-reject-invalid-unicode-escape",
+      "category": "quoted-scalars",
+      "description": "Double-quoted scalars with malformed \\uXXXX hex escapes are rejected by both parsers.",
+      "source": "---\ntitle: \"Bad escape \\u123G\"\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntitle: \"Bad escape \\u123G\"\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "quoted-reject-overflow-codepoint-escape",
+      "category": "quoted-scalars",
+      "description": "Double-quoted scalars with \\UXXXXXXXX escapes above U+10FFFF are rejected by both parsers.",
+      "source": "---\ntitle: \"Overflow \\U00110000\"\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntitle: \"Overflow \\U00110000\"\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "quoted-reject-trailing-text-after-quote",
+      "category": "quoted-scalars",
+      "description": "Quoted scalars followed by non-comment trailing tokens on the same line are rejected.",
+      "source": "---\ntitle: \"Closed\" stray\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntitle: \"Closed\" stray\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "quoted-reject-compact-colon-after-quoted-key",
+      "category": "quoted-scalars",
+      "description": "Root quoted keys without whitespace after the colon are rejected outside flow mappings.",
+      "source": "---\n\"title\":CompactValue\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\n\"title\":CompactValue\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "flow-nested-maps-lists-and-compact-colons",
+      "category": "flow-collections",
+      "description": "Nested flow sequences and flow mappings support quoted commas, compact colons, quoted keys, empty collections, and trailing commas.",
+      "source": "---\nauthor: [{name: \"Ada, Countess of Lovelace\", roles: [math, computing]}, {given:Grace,family:Hopper}]\ntags: [compilers, \"flow: [tag]\",]\nmeta: {\"role\":\"editor\"}\nempty_list: []\nempty_map: {}\n---\n# Analytical Engine\n\nBody copy.\n",
+      "recognized": true,
+      "frontmatterRaw": "---\nauthor: [{name: \"Ada, Countess of Lovelace\", roles: [math, computing]}, {given:Grace,family:Hopper}]\ntags: [compilers, \"flow: [tag]\",]\nmeta: {\"role\":\"editor\"}\nempty_list: []\nempty_map: {}\n---\n",
+      "body": "# Analytical Engine\n\nBody copy.\n",
+      "endOffset": {
+        "utf16": 196,
+        "codePoints": 196
+      },
+      "bodyProbes": [
+        "# Analytical Engine",
+        "Body copy."
+      ],
+      "typescriptProperties": {
+        "authors": [
+          "Ada, Countess of Lovelace",
+          "Grace Hopper"
+        ],
+        "tags": [
+          "compilers",
+          "flow: [tag]"
+        ],
+        "aliases": []
+      }
+    },
+    {
+      "id": "flow-multiline-comments-and-masked-markdown",
+      "category": "flow-collections",
+      "description": "Multiline flow collections span blank lines and inline comments while masking quoted Markdown image syntax inside flow items.",
+      "source": "---\ntags: [\n  # leading flow comment\n  \"a, ]\", # inline comment\n\n  'b, [',\n]\nlinks: {\n  fake: \"![fake](flow-missing.png)\",\n}\n...\n![Body](flow-real.png)\n",
+      "recognized": true,
+      "frontmatterRaw": "---\ntags: [\n  # leading flow comment\n  \"a, ]\", # inline comment\n\n  'b, [',\n]\nlinks: {\n  fake: \"![fake](flow-missing.png)\",\n}\n...\n",
+      "body": "![Body](flow-real.png)\n",
+      "endOffset": {
+        "utf16": 129,
+        "codePoints": 129
+      },
+      "maskedExcludes": [
+        "flow-missing.png"
+      ],
+      "bodyProbes": [
+        "![Body](flow-real.png)"
+      ],
+      "bodyImages": [
+        "flow-real.png"
+      ]
+    },
+    {
+      "id": "flow-reject-unclosed-nested-sequence",
+      "category": "flow-collections",
+      "description": "Unbalanced nested flow brackets fall back to ordinary Markdown.",
+      "source": "---\ntags: [alpha, [beta]\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntags: [alpha, [beta]\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "flow-reject-extra-closing-bracket",
+      "category": "flow-collections",
+      "description": "Extra closing brackets in flow collections are rejected.",
+      "source": "---\ntags: [alpha, beta]]\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntags: [alpha, beta]]\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "flow-reject-trailing-tokens-after-collection",
+      "category": "flow-collections",
+      "description": "Non-comment tokens after a closed top-level flow mapping are rejected.",
+      "source": "---\nmeta: {a: 1} trailing\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\nmeta: {a: 1} trailing\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "flow-reject-underindented-sequence-item-collection",
+      "category": "flow-collections",
+      "description": "Multiline flow mappings inside block sequence items require continuation lines indented past the dash.",
+      "source": "---\nauthors:\n  - {\n  name: Underindented\n  }\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\nauthors:\n  - {\n  name: Underindented\n  }\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "folded-clip-indented-delimiters-and-fences",
+      "category": "folded-scalars",
+      "description": "Folded block scalars fold single newlines, keep blank-line and more-indented breaks, ignore indented ---/... lines, and mask embedded fences and images.",
+      "source": "---\nabstract: > # header comment\n  First folded\n  sentence.\n\n    indented code\n  ---\n  ...\n  ![fake](folded-fake.png)\n  ```mermaid\n  graph TD; A-->B;\n  ```\n---\n# Real Section\n\nBody text.\n",
+      "recognized": true,
+      "frontmatterRaw": "---\nabstract: > # header comment\n  First folded\n  sentence.\n\n    indented code\n  ---\n  ...\n  ![fake](folded-fake.png)\n  ```mermaid\n  graph TD; A-->B;\n  ```\n---\n",
+      "body": "# Real Section\n\nBody text.\n",
+      "endOffset": {
+        "utf16": 160,
+        "codePoints": 160
+      },
+      "maskedExcludes": [
+        "folded-fake.png",
+        "mermaid"
+      ],
+      "bodyProbes": [
+        "# Real Section",
+        "Body text."
+      ],
+      "bodyImages": [],
+      "unsupportedDiagrams": false,
+      "typescriptEntries": {
+        "abstract": "First folded sentence.\n\n  indented code\n--- ... ![fake](folded-fake.png) ```mermaid graph TD; A-->B; ```"
+      }
+    },
+    {
+      "id": "folded-chomping-and-explicit-indent-indicators",
+      "category": "folded-scalars",
+      "description": "Folded scalars support strip (>-), keep (>+), explicit indentation indicators (>2-, >-2), and block sequence items.",
+      "source": "---\nstrip_note: >-\n  alpha\n  beta\n\nkeep_note: >+\n  kept\n\nindent_first: >2-\n    leading two\nchomp_first: >-2\n    also two\nnotes:\n  - >-\n    seq one\n    seq two\n---\nBody after chomping variants.\n",
+      "recognized": true,
+      "frontmatterRaw": "---\nstrip_note: >-\n  alpha\n  beta\n\nkeep_note: >+\n  kept\n\nindent_first: >2-\n    leading two\nchomp_first: >-2\n    also two\nnotes:\n  - >-\n    seq one\n    seq two\n---\n",
+      "body": "Body after chomping variants.\n",
+      "endOffset": {
+        "utf16": 163,
+        "codePoints": 163
+      },
+      "bodyProbes": [
+        "Body after chomping variants."
+      ],
+      "typescriptEntries": {
+        "strip_note": "alpha beta",
+        "keep_note": "kept\n",
+        "indent_first": "  leading two",
+        "chomp_first": "  also two",
+        "notes": [
+          "seq one seq two"
+        ]
+      }
+    },
+    {
+      "id": "folded-empty-scalars-before-key-and-closer",
+      "category": "folded-scalars",
+      "description": "Empty folded scalars immediately followed by another root key or the closing delimiter are recognized cleanly.",
+      "source": "---\nempty_mid: >\ntitle: After Empty Folded\nempty_end: >-\n...\nBody line.\n",
+      "recognized": true,
+      "frontmatterRaw": "---\nempty_mid: >\ntitle: After Empty Folded\nempty_end: >-\n...\n",
+      "body": "Body line.\n",
+      "endOffset": {
+        "utf16": 61,
+        "codePoints": 61
+      },
+      "bodyProbes": [
+        "Body line."
+      ],
+      "typescriptEntries": {
+        "empty_mid": "",
+        "title": "After Empty Folded",
+        "empty_end": ""
+      }
+    },
+    {
+      "id": "folded-reject-zero-indent-indicator",
+      "category": "folded-scalars",
+      "description": "Folded block scalar headers reject 0 as an explicit indentation indicator (>0).",
+      "source": "---\nsummary: >0\n  invalid zero indicator\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\nsummary: >0\n  invalid zero indicator\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "folded-reject-leading-tab-indentation",
+      "category": "folded-scalars",
+      "description": "Folded scalar content lines indented with leading tabs are rejected.",
+      "source": "---\nsummary: >\n\ttab-indented folded content\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\nsummary: >\n\ttab-indented folded content\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "folded-reject-spaces-followed-by-tab-indent",
+      "category": "folded-scalars",
+      "description": "Folded scalar content lines with leading spaces followed by a tab before non-whitespace are rejected.",
+      "source": "---\nsummary: >\n  \tmixed-tab folded content\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\nsummary: >\n  \tmixed-tab folded content\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "crlf-bom-whitespace-multiline-and-dot-closer",
+      "category": "crlf",
+      "description": "CRLF documents with UTF-8 BOM, delimiter trailing spaces/tabs, multiline quoted and folded scalars, and dot closers preserve every CR and LF offset when masked.",
+      "source": "\ufeff--- \t \r\ntitle: \"CRLF:\r\n  Multiline\"\r\nabstract: >-\r\n  Folded CRLF\r\n  second line\r\ntags: [crlf, \"![fake](crlf-fake.png)\"]\r\n... \t\r\n\r\n# CRLF Heading\r\n\r\n- [ ] CRLF Task\r\n![Real](crlf-real.png)\r\n",
+      "recognized": true,
+      "frontmatterRaw": "\ufeff--- \t \r\ntitle: \"CRLF:\r\n  Multiline\"\r\nabstract: >-\r\n  Folded CRLF\r\n  second line\r\ntags: [crlf, \"![fake](crlf-fake.png)\"]\r\n... \t\r\n",
+      "body": "\r\n# CRLF Heading\r\n\r\n- [ ] CRLF Task\r\n![Real](crlf-real.png)\r\n",
+      "endOffset": {
+        "utf16": 129,
+        "codePoints": 129
+      },
+      "maskedExcludes": [
+        "crlf-fake.png"
+      ],
+      "bodyProbes": [
+        "# CRLF Heading",
+        "- [ ] CRLF Task",
+        "![Real](crlf-real.png)"
+      ],
+      "bodyImages": [
+        "crlf-real.png"
+      ],
+      "typescriptProperties": {
+        "title": "CRLF: Multiline",
+        "authors": [],
+        "description": "Folded CRLF second line",
+        "tags": [
+          "crlf",
+          "![fake](crlf-fake.png)"
+        ],
+        "aliases": []
+      }
+    },
+    {
+      "id": "crlf-empty-and-mixed-line-endings",
+      "category": "crlf",
+      "description": "Mixed CRLF and LF line endings inside YAML frontmatter and body preserve exact line break positions.",
+      "source": "---\r\ntitle: Mixed Endings\nsummary: >-\r\n  alpha\n  beta\r\n---\r\nBody line 1\r\nBody line 2\n",
+      "recognized": true,
+      "frontmatterRaw": "---\r\ntitle: Mixed Endings\nsummary: >-\r\n  alpha\n  beta\r\n---\r\n",
+      "body": "Body line 1\r\nBody line 2\n",
+      "endOffset": {
+        "utf16": 60,
+        "codePoints": 60
+      },
+      "bodyProbes": [
+        "Body line 1",
+        "Body line 2"
+      ]
+    },
+    {
+      "id": "crlf-eof-closer-without-trailing-newline",
+      "category": "crlf",
+      "description": "CRLF frontmatter closed at end-of-file without a trailing newline yields an empty body and end offset at document length.",
+      "source": "---\r\ntitle: CRLF EOF Closer\r\ntags: [eof]\r\n---",
+      "recognized": true,
+      "frontmatterRaw": "---\r\ntitle: CRLF EOF Closer\r\ntags: [eof]\r\n---",
+      "body": "",
+      "endOffset": {
+        "utf16": 45,
+        "codePoints": 45
+      }
+    },
+    {
+      "id": "crlf-reject-bare-cr-delimiters",
+      "category": "crlf",
+      "description": "Classic Mac bare CR delimiter lines are not recognized as YAML frontmatter.",
+      "source": "---\rtitle: Bare CR\r---\r# Body\r",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\rtitle: Bare CR\r---\r# Body\r",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "crlf-reject-double-cr-opener",
+      "category": "crlf",
+      "description": "Opening --- followed by \\r\\r\\n is rejected because \\r is neither horizontal whitespace nor a valid \\r\\n pair.",
+      "source": "---\r\r\ntitle: Double CR\r\n---\r\n# Body\r\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\r\r\ntitle: Double CR\r\n---\r\n# Body\r\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "unicode-bom-nbsp-values-and-body-separators",
+      "category": "unicode-separators",
+      "description": "Leading UTF-8 BOM and non-breaking spaces (U+00A0, U+202F) inside YAML values preserve exact boundaries and leave U+2028/U+2029 in the Markdown body intact.",
+      "source": "\ufeff---\ntitle: Non\u00a0Breaking\u202fSpace\ntags: [unicode, \"a\u00a0b\"]\n---\n# Heading\nParagraph one\u2028Line two\u2029Paragraph two\n",
+      "recognized": true,
+      "frontmatterRaw": "\ufeff---\ntitle: Non\u00a0Breaking\u202fSpace\ntags: [unicode, \"a\u00a0b\"]\n---\n",
+      "body": "# Heading\nParagraph one\u2028Line two\u2029Paragraph two\n",
+      "endOffset": {
+        "utf16": 58,
+        "codePoints": 58
+      },
+      "bodyProbes": [
+        "# Heading",
+        "Paragraph one\u2028Line two\u2029Paragraph two"
+      ]
+    },
+    {
+      "id": "unicode-astral-surrogate-pairs-boundary-offsets",
+      "category": "unicode-separators",
+      "description": "Supplementary astral characters in frontmatter yield identical raw/body slices while end offsets reflect UTF-16 code units in TypeScript vs Unicode code points in Python.",
+      "source": "\ufeff---\ntitle: \"Rocket \ud83d\ude80 & Bold \ud835\udc00\"\ntags: [\"\ud83e\uddea\"]\n---\n# Astral Body\n\n- [ ] Verify astral offset\n",
+      "recognized": true,
+      "frontmatterRaw": "\ufeff---\ntitle: \"Rocket \ud83d\ude80 & Bold \ud835\udc00\"\ntags: [\"\ud83e\uddea\"]\n---\n",
+      "body": "# Astral Body\n\n- [ ] Verify astral offset\n",
+      "endOffset": {
+        "utf16": 51,
+        "codePoints": 48
+      },
+      "bodyProbes": [
+        "# Astral Body",
+        "- [ ] Verify astral offset"
+      ]
+    },
+    {
+      "id": "unicode-reject-nbsp-on-opening-delimiter",
+      "category": "unicode-separators",
+      "description": "Non-breaking space (U+00A0) on the opening --- line is rejected because only ASCII spaces and tabs are allowed on delimiter lines.",
+      "source": "---\u00a0\ntitle: NBSP Opener\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\u00a0\ntitle: NBSP Opener\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "unicode-reject-nbsp-on-closing-delimiter",
+      "category": "unicode-separators",
+      "description": "Non-breaking space (U+00A0) on the closing ... line is rejected.",
+      "source": "---\ntitle: NBSP Closer\n...\u00a0\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntitle: NBSP Closer\n...\u00a0\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "unicode-reject-line-separator-as-opener-newline",
+      "category": "unicode-separators",
+      "description": "Unicode Line Separator (U+2028) after opening --- does not satisfy the LF/CRLF opener requirement.",
+      "source": "---\u2028title: LS Opener\u2028---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\u2028title: LS Opener\u2028---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    },
+    {
+      "id": "unicode-reject-nbsp-after-plain-colon",
+      "category": "unicode-separators",
+      "description": "Plain mapping keys followed immediately by U+00A0 (without ASCII space or tab after :) are rejected by both parsers.",
+      "source": "---\ntitle:\u00a0NoAsciiSpace\n---\n# Body\n",
+      "recognized": false,
+      "frontmatterRaw": "",
+      "body": "---\ntitle:\u00a0NoAsciiSpace\n---\n# Body\n",
+      "endOffset": {
+        "utf16": 0,
+        "codePoints": 0
+      },
+      "bodyProbes": [
+        "# Body"
+      ]
+    }
+  ],
+  "divergences": [
+    {
+      "id": "divergence-flow-map-entry-missing-colon",
+      "category": "flow-collections",
+      "description": "Flow mapping containing a bare scalar without a key-value colon.",
+      "reason": "src/frontmatter.ts validates each {...} entry via splitKeyValue(..., true) in parseFlowValue, whereas desktop/frontmatter.py consume_flow only checks _flow_state brace balance.",
+      "source": "---\nauthor: {invalid_without_colon}\n---\n# Body\n",
+      "typescript": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\nauthor: {invalid_without_colon}\n---\n# Body\n",
+        "endUtf16": 0
+      },
+      "desktop": {
+        "recognized": true,
+        "frontmatterRaw": "---\nauthor: {invalid_without_colon}\n---\n",
+        "body": "# Body\n",
+        "endCodePoints": 40
+      }
+    },
+    {
+      "id": "divergence-flow-mismatched-nested-delimiters",
+      "category": "flow-collections",
+      "description": "Nested flow collection with improperly interleaved closing brackets ([{a: 1]}).",
+      "reason": "src/frontmatter.ts recursively splits nested flow items in parseFlowValue and catches the unclosed '{', whereas desktop/frontmatter.py _flow_state tracks separate integer counters without a delimiter stack.",
+      "source": "---\ntags: [{a: 1]}\n---\n# Body\n",
+      "typescript": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntags: [{a: 1]}\n---\n# Body\n",
+        "endUtf16": 0
+      },
+      "desktop": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntags: [{a: 1]}\n---\n",
+        "body": "# Body\n",
+        "endCodePoints": 23
+      }
+    },
+    {
+      "id": "divergence-flow-adjacent-quoted-scalars",
+      "category": "flow-collections",
+      "description": "Flow sequence item with two adjacent double-quoted scalars lacking a separating comma.",
+      "reason": "src/frontmatter.ts parseFlowValue requires onlyTrailingComment after each comma-split quoted item, whereas desktop/frontmatter.py _flow_state toggles quote flags without validating item boundaries.",
+      "source": "---\ntags: [\"alpha\" \"beta\"]\n---\n# Body\n",
+      "typescript": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntags: [\"alpha\" \"beta\"]\n---\n# Body\n",
+        "endUtf16": 0
+      },
+      "desktop": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntags: [\"alpha\" \"beta\"]\n---\n",
+        "body": "# Body\n",
+        "endCodePoints": 31
+      }
+    },
+    {
+      "id": "divergence-flow-invalid-unicode-escape-in-quoted-item",
+      "category": "quoted-scalars",
+      "description": "Double-quoted scalar inside a flow sequence containing a non-hex \\uZZZZ escape.",
+      "reason": "src/frontmatter.ts parseFlowValue calls parseDoubleQuoted on quoted flow items, whereas desktop/frontmatter.py consume_flow relies on _flow_state which skips '\\u' without hex validation.",
+      "source": "---\ntags: [\"\\uZZZZ\"]\n---\n# Body\n",
+      "typescript": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntags: [\"\\uZZZZ\"]\n---\n# Body\n",
+        "endUtf16": 0
+      },
+      "desktop": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntags: [\"\\uZZZZ\"]\n---\n",
+        "body": "# Body\n",
+        "endCodePoints": 25
+      }
+    },
+    {
+      "id": "divergence-quoted-key-nbsp-before-colon",
+      "category": "quoted-scalars",
+      "description": "Quoted mapping key followed by U+00A0 non-breaking space before the colon.",
+      "reason": "src/frontmatter.ts splitKeyValue uses String.prototype.trimStart() (which strips U+00A0), whereas desktop/frontmatter.py _split_key_value uses str.lstrip(' \\t').",
+      "source": "---\n\"title\"\u00a0: NBSP Before Colon\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\n\"title\"\u00a0: NBSP Before Colon\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 36
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\n\"title\"\u00a0: NBSP Before Colon\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    },
+    {
+      "id": "divergence-quoted-scalar-nbsp-before-comment",
+      "category": "quoted-scalars",
+      "description": "Double-quoted scalar value followed by U+00A0 non-breaking space before an inline # comment.",
+      "reason": "src/frontmatter.ts onlyTrailingComment uses String.prototype.trimStart() (stripping U+00A0 before '#'), whereas desktop/frontmatter.py _only_trailing_comment uses str.lstrip(' \\t').",
+      "source": "---\ntitle: \"Quoted\"\u00a0# comment after NBSP\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntitle: \"Quoted\"\u00a0# comment after NBSP\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 45
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntitle: \"Quoted\"\u00a0# comment after NBSP\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    },
+    {
+      "id": "divergence-unicode-ls-in-quoted-scalar",
+      "category": "unicode-separators",
+      "description": "Double-quoted scalar containing U+2028 Unicode Line Separator followed by unindented text.",
+      "reason": "src/frontmatter.ts splits YAML lines only on /\\r?\\n/ so U+2028 stays inside the single-line quoted scalar, whereas desktop/frontmatter.py yaml_body.splitlines() splits on U+2028 into an unindented continuation line (indent 0 < min_indent).",
+      "source": "---\ntitle: \"First\u2028Second\"\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntitle: \"First\u2028Second\"\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 30
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntitle: \"First\u2028Second\"\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    },
+    {
+      "id": "divergence-unicode-ps-and-nel-in-plain-scalar",
+      "category": "unicode-separators",
+      "description": "Plain scalar containing U+2029 Paragraph Separator and U+0085 Next Line (NEL).",
+      "reason": "src/frontmatter.ts keeps U+2029 and U+0085 inside the single plain scalar line, whereas desktop/frontmatter.py yaml_body.splitlines() splits them into root-level lines lacking ':'.",
+      "source": "---\ntitle: First\u2029Second\u0085Third\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntitle: First\u2029Second\u0085Third\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 34
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntitle: First\u2029Second\u0085Third\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    },
+    {
+      "id": "divergence-unicode-ls-between-root-entries",
+      "category": "unicode-separators",
+      "description": "Two root mapping entries separated by U+2028 Line Separator instead of LF/CRLF.",
+      "reason": "src/frontmatter.ts keeps both entries on one line and rejects trailing 'author: \"Beta\"' after the first quoted scalar, whereas desktop/frontmatter.py yaml_body.splitlines() splits U+2028 into two valid root key: value lines.",
+      "source": "---\ntitle: \"Alpha\"\u2028author: \"Beta\"\n---\n# Body\n",
+      "typescript": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntitle: \"Alpha\"\u2028author: \"Beta\"\n---\n# Body\n",
+        "endUtf16": 0
+      },
+      "desktop": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntitle: \"Alpha\"\u2028author: \"Beta\"\n---\n",
+        "body": "# Body\n",
+        "endCodePoints": 38
+      }
+    },
+    {
+      "id": "divergence-folded-scalar-with-unicode-ls",
+      "category": "folded-scalars",
+      "description": "Folded block scalar containing U+2028 Line Separator before unindented text.",
+      "reason": "src/frontmatter.ts keeps the line together at indent 2 inside parseBlockScalar, whereas desktop/frontmatter.py yaml_body.splitlines() splits at U+2028, exiting consume_block_scalar at indent 0 and failing root mapping validation.",
+      "source": "---\nsummary: >-\n  folded line\u2028unindented tail\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\nsummary: >-\n  folded line\u2028unindented tail\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 50
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\nsummary: >-\n  folded line\u2028unindented tail\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    },
+    {
+      "id": "divergence-bare-cr-inside-yaml-scalar",
+      "category": "crlf",
+      "description": "YAML scalar containing a bare carriage return (\\r) not followed by \\n.",
+      "reason": "src/frontmatter.ts splits lines on /\\r?\\n/ (leaving bare \\r inside the scalar and preserving \\r in maskFrontmatter), whereas desktop/frontmatter.py yaml_body.splitlines() splits bare \\r into a root line lacking ':'.",
+      "source": "---\ntitle: First\rSecond\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntitle: First\rSecond\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 28
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntitle: First\rSecond\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    },
+    {
+      "id": "divergence-unicode-inner-bom-only-line",
+      "category": "unicode-separators",
+      "description": "Line containing only U+FEFF ZERO WIDTH NO-BREAK SPACE between two YAML mapping entries.",
+      "reason": "JavaScript String.prototype.trim() strips U+FEFF so src/frontmatter.ts treats the line as blank, whereas Python str.strip() preserves U+FEFF and desktop/frontmatter.py rejects it as a non-mapping root line.",
+      "source": "---\ntitle: Alpha\n\ufeff\nauthor: Beta\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntitle: Alpha\n\ufeff\nauthor: Beta\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 36
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntitle: Alpha\n\ufeff\nauthor: Beta\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    },
+    {
+      "id": "divergence-vtab-and-formfeed-in-quoted-scalar",
+      "category": "unicode-separators",
+      "description": "Double-quoted scalar containing ASCII vertical tab (U+000B) and form feed (U+000C).",
+      "reason": "src/frontmatter.ts keeps U+000B and U+000C inside the quoted line, whereas desktop/frontmatter.py yaml_body.splitlines() splits on \\x0b and \\x0c into indent-0 continuation lines.",
+      "source": "---\ntitle: \"Vert\u000bTab\fForm\"\n---\n# Body\n",
+      "typescript": {
+        "recognized": true,
+        "frontmatterRaw": "---\ntitle: \"Vert\u000bTab\fForm\"\n---\n",
+        "body": "# Body\n",
+        "endUtf16": 31
+      },
+      "desktop": {
+        "recognized": false,
+        "frontmatterRaw": "",
+        "body": "---\ntitle: \"Vert\u000bTab\fForm\"\n---\n# Body\n",
+        "endCodePoints": 0
+      }
+    }
+  ]
+}
