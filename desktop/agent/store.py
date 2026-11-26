@@ -19,7 +19,7 @@ try:
         _CachedEnvelope, _EnvelopeCache, _atomic_replace, _create_once,
         _path_lock, _read_raw, _serialize, _symlink_component, _try_stat_key,
     )
-    from .patches import apply_patch_operations_detailed, validate_patch_operations
+    from .patches import apply_patch_operations_detailed
     from .source_ops import (
         AgentDocumentError, MAX_OUTLINE_PAGE, MAX_PAGE_CHARS, RevisionConflict,
         outline_source, read_source, search_source,
@@ -29,7 +29,7 @@ except ImportError:
         _CachedEnvelope, _EnvelopeCache, _atomic_replace, _create_once,
         _path_lock, _read_raw, _serialize, _symlink_component, _try_stat_key,
     )
-    from agent.patches import apply_patch_operations_detailed, validate_patch_operations
+    from agent.patches import apply_patch_operations_detailed
     from agent.source_ops import (
         AgentDocumentError, MAX_OUTLINE_PAGE, MAX_PAGE_CHARS, RevisionConflict,
         outline_source, read_source, search_source,
@@ -307,7 +307,6 @@ class DocumentStore(_EnvelopeCache):
         path = self.resolve(path_value)
         if not expected_revision or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
             raise AgentDocumentError("expected_revision must be the 64-character SHA-256 from inspect/read")
-        validate_patch_operations(operations)
         with _path_lock(path):
             entry = self._load_entry(path)
             actual = entry.revision

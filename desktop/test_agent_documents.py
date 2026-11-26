@@ -920,12 +920,11 @@ class AgentDocumentsTest(unittest.TestCase):
         )
 
     def test_read_source_contract_and_agent_package_facade_identity(self):
-        import agent
         import agent_documents
         from agent import fs_ops, patches, source_ops, store
 
-        self.assertIs(agent.AgentDocumentError, AgentDocumentError)
-        self.assertIs(agent.RevisionConflict, RevisionConflict)
+        self.assertIs(source_ops.AgentDocumentError, AgentDocumentError)
+        self.assertIs(source_ops.RevisionConflict, RevisionConflict)
         self.assertIs(source_ops.read_source, agent_documents.read_source)
         self.assertIs(patches.validate_patch_operations, agent_documents.validate_patch_operations)
         self.assertIs(fs_ops._path_lock, agent_documents._path_lock)
