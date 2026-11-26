@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import {expect,it} from 'vitest';
+import {expect,it,vi} from 'vitest';
 import {adaptSvg,adaptSvgData} from './svgTheme';
+import {presentSvg} from './svgImage';
 import {mediaContrast} from './mediaAppearance';
 const light={surface:'#f0e1d0',primary:'#80502d'},dark={surface:'#211d2d',primary:'#dfb1e0'};
 const parse=(s:string)=>new DOMParser().parseFromString(s,'image/svg+xml');
@@ -109,5 +110,56 @@ it('adapts valid SVG data URIs and rejects invalid, active, external or oversize
     'data:image/svg+xml,'+'a'.repeat(1_400_001),
   ]){
     expect(()=>adaptSvgData(malicious,dark,true),malicious.slice(0,80)).toThrow();
+  }
+});
+
+it('parses and serializes synthetic SVGs once per adaptation or presentation while keeping xmlns, scoped CSS and contrast equivalent',()=>{
+  const parseSpy=vi.spyOn(DOMParser.prototype,'parseFromString');
+  const serializeSpy=vi.spyOn(XMLSerializer.prototype,'serializeToString');
+  try{
+    const scopedWithXmlns='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 200"><style>@keyframes dash{from{stroke-dashoffset:10}to{stroke-dashoffset:0}}.node{fill:#f8fafc;stroke:#374151}.edge{fill:none;stroke:#737373!important;filter:drop-shadow(1px 0 0 #ffffff)}.series{fill:none;stroke:#2563eb}.label{fill:#111827}</style><rect class="node" x="50" y="50" width="100" height="60"/><path class="edge" d="M0 0L50 50"/><path class="series" d="M20 160L260 40"/><text class="label" x="100" y="80">Visible</text></svg>';
+    const scopedWithoutXmlns=scopedWithXmlns.replace(' xmlns="http://www.w3.org/2000/svg"','');
+
+    parseSpy.mockClear();serializeSpy.mockClear();
+    const adaptedWithNs=adaptSvg(scopedWithXmlns,dark,true);
+    expect(parseSpy).toHaveBeenCalledTimes(1);
+    expect(serializeSpy).toHaveBeenCalledTimes(1);
+
+    parseSpy.mockClear();serializeSpy.mockClear();
+    const adaptedWithoutNs=adaptSvg(scopedWithoutXmlns,dark,true);
+    expect(parseSpy).toHaveBeenCalledTimes(1);
+    expect(serializeSpy).toHaveBeenCalledTimes(1);
+    expect(adaptedWithoutNs).toContain('xmlns="http://www.w3.org/2000/svg"');
+    expect(adaptedWithoutNs).toContain(`fill="${dark.surface}"`);
+    expect(adaptedWithoutNs).toContain('filter: none');
+    expect(scopedWithoutXmlns).not.toContain('xmlns=');
+
+    const whiteInk='<?xml version="1.0"?><!-- synthetic white ink --><svg viewBox="0 0 160 80"><path fill="white" d="M0 0L80 0L80 80L0 80Z"/><path fill="none" stroke="white" stroke-width="10" d="M90 10L150 70"/></svg>';
+    parseSpy.mockClear();serializeSpy.mockClear();
+    const adaptedWhite=adaptSvg(whiteInk,dark,true);
+    expect(parseSpy).toHaveBeenCalledTimes(1);
+    expect(serializeSpy).toHaveBeenCalledTimes(1);
+    expect(adaptedWhite).toContain(`fill="${dark.primary}"`);
+    expect(adaptedWhite).toContain(`stroke="${dark.primary}"`);
+
+    const dataUri='data:image/svg+xml;base64,'+btoa(scopedWithXmlns);
+    parseSpy.mockClear();serializeSpy.mockClear();
+    const adaptedUri=adaptSvgData(dataUri,dark,true,true);
+    expect(parseSpy).toHaveBeenCalledTimes(1);
+    expect(serializeSpy).toHaveBeenCalledTimes(1);
+    const monoSvg=decodeURIComponent(adaptedUri.split(',')[1]);
+    expect(monoSvg).not.toBe(adaptedWithNs);
+    expect(parse(monoSvg).querySelector('.series')!.getAttribute('stroke')).toBe(dark.primary);
+    expect(parse(adaptedWithNs).querySelector('.series')!.getAttribute('stroke')).not.toBe(dark.primary);
+
+    parseSpy.mockClear();serializeSpy.mockClear();
+    const mono=presentSvg('<svg viewBox="0 0 10 10"><path d="M0 0h5" stroke="#000"/><circle r="2" fill="white"/></svg>','#e6e0e9');
+    expect(parseSpy).toHaveBeenCalledTimes(1);
+    expect(serializeSpy).toHaveBeenCalledTimes(1);
+    expect(mono.mode).toBe('mono');
+    expect(mono.svg).toContain('xmlns="http://www.w3.org/2000/svg"');
+  }finally{
+    parseSpy.mockRestore();
+    serializeSpy.mockRestore();
   }
 });
