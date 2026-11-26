@@ -1,4 +1,4 @@
-import { Children, createContext, isValidElement, lazy, memo, Suspense, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { Children, createContext, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
 import rehypeKatex from "rehype-katex";
@@ -11,7 +11,9 @@ import InlineDiagram,{parseDiagramSource} from "./InlineDiagram";
 import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
-import { navigateHeading, remarkHeadingIds } from "../documentNavigation";
+import { navigateExternalLink, navigateHeading, navigateWorkspaceLink, remarkHeadingIds, UNSAVED_RELATIVE_NOTE_NOTICE } from "../documentNavigation";
+import { trustEquationHref } from "../equationReferences";
+import { classifyRenderedLink } from "../workspaceLinks";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
@@ -98,7 +100,7 @@ export function remarkCallouts() {
 
 export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-diagram", "smd-steps", "smd-chart"] as const;
 export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
-export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
+export const PREVIEW_REHYPE_PLUGINS: PluggableList = [[rehypeKatex, { trust: trustEquationHref }], [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
 
 function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost, editable = false }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void; editable?: boolean }) {
   const isRemote = /^https?:\/\//i.test(src);
@@ -198,11 +200,13 @@ function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTru
 interface Props extends ReaderAccessibilityPreference {
   markdown: string;
   documentPath: string | null;
+  savedDocumentPath?: string | null;
   python: string;
   dark: boolean;
   trustedImageHosts?: string[];
   onTrustImageHost?: (host: string) => void;
   onChange?: (markdown:string)=>void;
+  onNotice?: (message: string) => void;
   renderBlock?:MarkdownBlockRenderer;
   sourceAnalysis?:SourceDocumentAnalysis;
 }
@@ -212,6 +216,11 @@ interface MarkdownPreviewLiveState {
   tasks: number[];
   onChange?: (markdown: string) => void;
   pythonCells: PythonCellSource[];
+  resolvedNotePath: string | null;
+  savedDocumentPath?: string | null;
+  onNotice?: (message: string) => void;
+  reportLinkNotice: (rawMessage: string) => void;
+  clearLinkNotice: () => void;
 }
 
 interface MarkdownPreviewContextValue {
@@ -228,7 +237,17 @@ const EMPTY_TASKS: number[] = [];
 const EMPTY_PYTHON_CELLS: PythonCellSource[] = [];
 const NOOP = () => {};
 const DEFAULT_LIVE_STATE: RefObject<MarkdownPreviewLiveState> = {
-  current: { markdown: "", tasks: EMPTY_TASKS, onChange: undefined, pythonCells: EMPTY_PYTHON_CELLS },
+  current: {
+    markdown: "",
+    tasks: EMPTY_TASKS,
+    onChange: undefined,
+    pythonCells: EMPTY_PYTHON_CELLS,
+    resolvedNotePath: null,
+    savedDocumentPath: undefined,
+    onNotice: undefined,
+    reportLinkNotice: NOOP,
+    clearLinkNotice: NOOP,
+  },
 };
 const MarkdownPreviewContext = createContext<MarkdownPreviewContextValue>({
   documentPath: null,
@@ -242,22 +261,42 @@ const MarkdownPreviewContext = createContext<MarkdownPreviewContextValue>({
 
 const MarkdownInput: Components['input'] = ({ node: _node, checked, ...props }) => {
   const { editable } = useContext(MarkdownPreviewContext);
-  return <input {...props} checked={props.type === 'checkbox' ? Boolean(checked) : checked} disabled={!editable} onChange={NOOP} />;
+  const isTaskCheckbox = props.type === 'checkbox';
+  return (
+    <input
+      {...props}
+      data-task-checkbox={isTaskCheckbox ? '' : undefined}
+      checked={isTaskCheckbox ? Boolean(checked) : checked}
+      disabled={!editable}
+      onChange={NOOP}
+    />
+  );
 };
 
 const MarkdownListItem: Components['li'] = ({ node, children, ...props }) => {
   const { liveStateRef } = useContext(MarkdownPreviewContext);
+  const rawTaskIndex = node?.properties?.['data-task-index'];
+  const hasTaskIndex = rawTaskIndex !== undefined && rawTaskIndex !== null;
   return (
     <li
       {...props}
       className={Array.isArray(node?.properties.className) ? node.properties.className.join(' ') : undefined}
-      onChange={event => {
+      onChange={hasTaskIndex ? event => {
+        const target = event.target;
+        if (
+          !(target instanceof HTMLInputElement) ||
+          target.type !== 'checkbox' ||
+          !target.hasAttribute('data-task-checkbox') ||
+          target.closest('li') !== event.currentTarget
+        ) {
+          return;
+        }
+        event.stopPropagation();
         const { tasks, onChange, markdown } = liveStateRef.current;
-        const index = Number(node?.properties['data-task-index']);
-        const offset = tasks[index];
-        if (offset === undefined || !onChange || !(event.target instanceof HTMLInputElement)) return;
-        onChange(markdown.slice(0, offset) + (event.target.checked ? 'x' : ' ') + markdown.slice(offset + 1));
-      }}
+        const offset = tasks[Number(rawTaskIndex)];
+        if (offset === undefined || !onChange) return;
+        onChange(markdown.slice(0, offset) + (target.checked ? 'x' : ' ') + markdown.slice(offset + 1));
+      } : undefined}
     >
       {children}
     </li>
@@ -269,24 +308,56 @@ const MarkdownImage: Components['img'] = ({ src, alt }) => {
   return <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} editable={editable} />;
 };
 
-const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }) => (
-  <a
-    {...props}
-    href={href}
-    target={href?.startsWith("#") ? undefined : "_blank"}
-    rel="noreferrer"
-    onClick={event => {
-      if (navigateHeading(event.currentTarget)) {
+const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }) => {
+  const { liveStateRef } = useContext(MarkdownPreviewContext);
+  const rawProps = props as Record<string, unknown>;
+  const wikilinkTarget = typeof rawProps['data-wikilink'] === 'string' ? rawProps['data-wikilink'] : undefined;
+  const wikilinkFragment = typeof rawProps['data-heading-fragment'] === 'string' ? rawProps['data-heading-fragment'] : undefined;
+  const classified = classifyRenderedLink(href, wikilinkTarget, wikilinkFragment);
+  const isExternal = classified.kind === 'external';
+  return (
+    <a
+      {...props}
+      href={href}
+      target={isExternal ? "_blank" : undefined}
+      rel={isExternal ? "noreferrer" : undefined}
+      onClick={event => {
+        if (classified.kind === 'same-note') {
+          if (navigateHeading(event.currentTarget)) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          return;
+        }
+        if (classified.kind === 'workspace') {
+          event.preventDefault();
+          event.stopPropagation();
+          event.currentTarget.dataset.visited = 'true';
+          const { resolvedNotePath, reportLinkNotice, clearLinkNotice } = liveStateRef.current;
+          if (!resolvedNotePath && (typeof window === 'undefined' || !window.SuperMD)) {
+            reportLinkNotice(UNSAVED_RELATIVE_NOTE_NOTICE);
+            return;
+          }
+          clearLinkNotice();
+          navigateWorkspaceLink(classified, resolvedNotePath, liveStateRef.current.reportLinkNotice);
+          return;
+        }
+        if (classified.kind === 'external') {
+          event.currentTarget.dataset.visited = 'true';
+          if (navigateExternalLink(classified.url)) {
+            event.preventDefault();
+            event.stopPropagation();
+          }
+          return;
+        }
         event.preventDefault();
         event.stopPropagation();
-      } else {
-        event.currentTarget.dataset.visited = 'true';
-      }
-    }}
-  >
-    {children}
-  </a>
-);
+      }}
+    >
+      {children}
+    </a>
+  );
+};
 
 const MarkdownPre: Components['pre'] = ({ node, children }) => {
   const { documentPath, python, dark, trustedImageHosts, onTrustImageHost, liveStateRef } = useContext(MarkdownPreviewContext);
@@ -316,7 +387,7 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
         sourceEnd={srcEnd}
         renderImage={(src, alt) => <AssetImage src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
         renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
-        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} />}
+        renderMarkdown={text => <MemoizedMarkdownPreview markdown={text} documentPath={documentPath} savedDocumentPath={liveStateRef.current.savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={liveStateRef.current.onNotice} />}
       />
     </CodeBlockBoundary>
   );
@@ -341,13 +412,22 @@ const MARKDOWN_COMPONENTS: Components = {
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange,renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, onTrustImageHost, onChange, onNotice, renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
+  const [linkNotice, setLinkNotice] = useState("");
+  const resolvedNotePath = savedDocumentPath === undefined ? documentPath : savedDocumentPath;
+  useEffect(() => { setLinkNotice(""); }, [markdown, documentPath, savedDocumentPath]);
+  const reportLinkNotice = useCallback((rawMessage: string) => {
+    const clean = rawMessage.replace(/^Error:\s*/, "").trim() || "Could not open linked note.";
+    setLinkNotice(clean);
+    onNotice?.(clean);
+  }, [onNotice]);
+  const clearLinkNotice = useCallback(() => { setLinkNotice(""); }, []);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const editable=Boolean(onChange);
   const tasks=editable?analysis.tasks:EMPTY_TASKS;
-  const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells});
-  liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells};
+  const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice});
+  liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice};
   const previewContext=useMemo<MarkdownPreviewContextValue>(
     ()=>({documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable,liveStateRef}),
     [documentPath,python,dark,trustedImageHosts,onTrustImageHost,editable],
@@ -359,6 +439,7 @@ function MarkdownPreview({ markdown, documentPath, python, dark, trustedImageHos
   return (
     <MarkdownPreviewContext.Provider value={previewContext}>
       <article className="markdown-body" onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
+        {linkNotice && <div role="status" className="reader-link-notice"><span>{linkNotice}</span><button type="button" aria-label="Dismiss notice" onClick={clearLinkNotice}>Dismiss</button></div>}
         {analysis.frontmatter?.properties && <DocumentProperties properties={analysis.frontmatter.properties} />}
         <CachedMarkdown
           sourceAnalysis={resolvedSourceAnalysis}

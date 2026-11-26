@@ -2,6 +2,9 @@ const SKIP_TYPES = new Set(['code', 'inlineCode', 'math', 'inlineMath', 'html', 
 const CONTAINER_TYPES = new Set(['paragraph', 'heading', 'tableCell', 'emphasis', 'strong', 'delete', 'link', 'linkReference', 'highlight', 'subscript', 'superscript']);
 const ESCAPED_TEXT_TYPE = '__studyEscaped';
 const FULL_PHRASING_SPANS = ['autolink', 'destinationLiteral', 'destinationRaw', 'reference', 'titleQuote', 'titleApostrophe'];
+const CANDIDATE_RE = /==|[~^]/;
+const WS_RE = /\s/;
+const LINE_BREAK_RE = /[\r\n]/;
 const PUNCT_RE = /[\p{P}\p{S}]/u;
 const SPAN_META: Record<DelimKind, { type: string; hName: string }> = {
   '==': { type: 'highlight', hName: 'mark' },
@@ -27,22 +30,18 @@ function isAutolinkLiteral(node: any): boolean {
 
 function hasDisallowedBreak(node: any, rejectSpaces: boolean): boolean {
   if (node.type === 'break') return true;
-  if (typeof node.value === 'string') return rejectSpaces ? /\s/.test(node.value) : /[\r\n]/.test(node.value);
-  return Array.isArray(node.children) && node.children.some((c: any) => hasDisallowedBreak(c, rejectSpaces));
+  if (typeof node.value === 'string') return rejectSpaces ? WS_RE.test(node.value) : LINE_BREAK_RE.test(node.value);
+  if (!Array.isArray(node.children)) return false;
+  for (let i = 0; i < node.children.length; i++) {
+    if (hasDisallowedBreak(node.children[i], rejectSpaces)) return true;
+  }
+  return false;
 }
 
-function spanValid(delim: DelimKind, slice: Piece[]): boolean {
-  const rejectSpaces = delim !== '==';
-  return slice.length > 0 && !slice.some(piece =>
-    piece.kind === 'text'
-      ? (rejectSpaces ? /\s/.test(piece.value) : /[\r\n]/.test(piece.value))
-      : piece.kind === 'node' && hasDisallowedBreak(piece.node, rejectSpaces),
-  );
-}
-
-function piecesToNodes(pieces: Piece[]): any[] {
+function piecesToNodes(pieces: Piece[], start: number, end: number): any[] {
   const out: any[] = [];
-  for (const piece of pieces) {
+  for (let i = start; i < end; i++) {
+    const piece = pieces[i];
     if (piece.kind === 'node') {
       out.push(piece.node);
       continue;
@@ -87,41 +86,56 @@ function normalizeEscapedChildren(children: any[]): void {
   children.length = write;
 }
 
-function firstChar(s: string): string {
-  if (!s) return '';
-  const code = s.charCodeAt(0);
-  return code >= 0xd800 && code <= 0xdbff && s.length > 1 ? s.slice(0, 2) : s[0];
+function codePointAtPos(s: string, idx: number): number {
+  return idx < s.length ? s.codePointAt(idx)! : -1;
 }
 
-function lastChar(s: string): string {
-  if (!s) return '';
-  const code = s.charCodeAt(s.length - 1);
-  return code >= 0xdc00 && code <= 0xdfff && s.length > 1 ? s.slice(-2) : s[s.length - 1];
-}
-
-function siblingBoundary(sibling: any, front: boolean): string {
-  if (!sibling) return '';
-  if (sibling.type === 'break') return '\n';
-  if (sibling.type === 'text' || sibling.type === ESCAPED_TEXT_TYPE) {
-    return front ? firstChar(sibling.value) : lastChar(sibling.value);
+function codePointBefore(s: string, idx: number): number {
+  if (idx <= 0) return -1;
+  const lo = s.charCodeAt(idx - 1);
+  if (lo >= 0xdc00 && lo <= 0xdfff && idx > 1) {
+    const hi = s.charCodeAt(idx - 2);
+    if (hi >= 0xd800 && hi <= 0xdbff) return ((hi - 0xd800) << 10) + (lo - 0xdc00) + 0x10000;
   }
-  return 'x';
+  return lo;
 }
 
-function delimFlanking(ch: string, before: string, after: string): { canOpen: boolean; canClose: boolean } {
-  const beforeWs = !before || /\s/.test(before);
-  const afterWs = !after || /\s/.test(after);
-  if (ch !== '=') return { canOpen: !afterWs, canClose: !beforeWs };
-  const beforePunct = !beforeWs && PUNCT_RE.test(before);
-  const afterPunct = !afterWs && PUNCT_RE.test(after);
-  return {
-    canOpen: !afterWs && (!afterPunct || beforeWs || beforePunct),
-    canClose: !beforeWs && (!beforePunct || afterWs || afterPunct),
-  };
+function siblingBoundary(sibling: any, front: boolean): number {
+  if (!sibling) return -1;
+  if (sibling.type === 'break') return 0x0a;
+  if (sibling.type === 'text' || sibling.type === ESCAPED_TEXT_TYPE) {
+    const s: string = sibling.value;
+    return front ? codePointAtPos(s, 0) : codePointBefore(s, s.length);
+  }
+  return 0x78;
 }
 
-function tokenizeChildren(children: any[]): Piece[] {
+function isBoundaryWs(cp: number): boolean {
+  if (cp < 0) return true;
+  return cp < 128 ? cp === 0x20 || (cp >= 0x09 && cp <= 0x0d) : WS_RE.test(String.fromCodePoint(cp));
+}
+
+function isBoundaryPunct(cp: number): boolean {
+  if (cp < 0) return false;
+  return cp < 128
+    ? (cp >= 0x21 && cp <= 0x2f) || (cp >= 0x3a && cp <= 0x40) || (cp >= 0x5b && cp <= 0x60) || (cp >= 0x7b && cp <= 0x7e)
+    : PUNCT_RE.test(String.fromCodePoint(cp));
+}
+
+function delimFlanking(code: number, before: number, after: number): number {
+  const beforeWs = isBoundaryWs(before);
+  const afterWs = isBoundaryWs(after);
+  if (code !== 61) return (!afterWs ? 1 : 0) | (!beforeWs ? 2 : 0);
+  const beforePunct = !beforeWs && isBoundaryPunct(before);
+  const afterPunct = !afterWs && isBoundaryPunct(after);
+  const canOpen = !afterWs && (!afterPunct || beforeWs || beforePunct);
+  const canClose = !beforeWs && (!beforePunct || afterWs || afterPunct);
+  return (canOpen ? 1 : 0) | (canClose ? 2 : 0);
+}
+
+function tokenizeChildren(children: any[]): Piece[] | null {
   const pieces: Piece[] = [];
+  let sawDelim = false;
   for (let idx = 0; idx < children.length; idx++) {
     const child = children[idx];
     if (child.type === ESCAPED_TEXT_TYPE) {
@@ -133,79 +147,113 @@ function tokenizeChildren(children: any[]): Piece[] {
       continue;
     }
     const s: string = child.value;
-    if (!/[=~^]/.test(s)) {
+    if (!CANDIDATE_RE.test(s)) {
       pieces.push({ kind: 'text', value: s, position: child.position });
       continue;
     }
     const prevBoundary = siblingBoundary(idx > 0 ? children[idx - 1] : null, false);
     const nextBoundary = siblingBoundary(idx + 1 < children.length ? children[idx + 1] : null, true);
 
-    let buf = '', i = 0, split = false;
-    while (i < s.length) {
-      const ch = s[i];
-      if (ch === '=' || ch === '~' || ch === '^') {
-        let run = 1;
-        while (i + run < s.length && s[i + run] === ch) run++;
-        if ((ch === '=' && run === 2) || ((ch === '~' || ch === '^') && run === 1)) {
-          const before = i > 0 ? lastChar(s.slice(0, i)) : prevBoundary;
-          const after = i + run < s.length ? firstChar(s.slice(i + run)) : nextBoundary;
-          const { canOpen, canClose } = delimFlanking(ch, before, after);
-          if (canOpen || canClose) {
-            if (buf) { pieces.push({ kind: 'text', value: buf }); buf = ''; }
+    let segStart = 0;
+    let split = false;
+    const len = s.length;
+    let i = 0;
+    while (i < len) {
+      const code = s.charCodeAt(i);
+      if (code === 61 || code === 126 || code === 94) {
+        let end = i + 1;
+        while (end < len && s.charCodeAt(end) === code) end++;
+        const run = end - i;
+        if ((code === 61 && run === 2) || (code !== 61 && run === 1)) {
+          const before = i > 0 ? codePointBefore(s, i) : prevBoundary;
+          const after = end < len ? codePointAtPos(s, end) : nextBoundary;
+          const flank = delimFlanking(code, before, after);
+          if (flank !== 0) {
+            if (i > segStart) pieces.push({ kind: 'text', value: s.slice(segStart, i) });
             split = true;
-            pieces.push({ kind: 'delim', delim: (ch === '=' ? '==' : ch) as DelimKind, canOpen, canClose });
-            i += run;
-            continue;
+            sawDelim = true;
+            pieces.push({
+              kind: 'delim',
+              delim: code === 61 ? '==' : code === 126 ? '~' : '^',
+              canOpen: (flank & 1) !== 0,
+              canClose: (flank & 2) !== 0,
+            });
+            segStart = end;
           }
         }
-        buf += s.slice(i, i + run);
-        i += run;
+        i = end;
         continue;
       }
-      buf += ch;
       i++;
     }
     if (!split) pieces.push({ kind: 'text', value: s, position: child.position });
-    else if (buf) pieces.push({ kind: 'text', value: buf });
+    else if (segStart < len) pieces.push({ kind: 'text', value: s.slice(segStart) });
   }
-  return pieces;
+  return sawDelim ? pieces : null;
 }
 
 function matchPieces(pieces: Piece[]): any[] | null {
   const working: Piece[] = [];
-  const openers: Array<{ pos: number; delim: DelimKind }> = [];
+  const hlOpeners: number[] = [];
+  const subOpeners: number[] = [];
+  const supOpeners: number[] = [];
   let changed = false;
 
-  for (const piece of pieces) {
+  for (let p = 0; p < pieces.length; p++) {
+    const piece = pieces[p];
     if (piece.kind !== 'delim') {
+      if (hlOpeners.length > 0 || subOpeners.length > 0 || supOpeners.length > 0) {
+        if (piece.kind === 'text') {
+          if (hlOpeners.length > 0 && LINE_BREAK_RE.test(piece.value)) {
+            hlOpeners.length = 0;
+            subOpeners.length = 0;
+            supOpeners.length = 0;
+          } else if ((subOpeners.length > 0 || supOpeners.length > 0) && WS_RE.test(piece.value)) {
+            subOpeners.length = 0;
+            supOpeners.length = 0;
+          }
+        } else if (hlOpeners.length > 0 && hasDisallowedBreak(piece.node, false)) {
+          hlOpeners.length = 0;
+          subOpeners.length = 0;
+          supOpeners.length = 0;
+        } else if ((subOpeners.length > 0 || supOpeners.length > 0) && hasDisallowedBreak(piece.node, true)) {
+          subOpeners.length = 0;
+          supOpeners.length = 0;
+        }
+      }
       working.push(piece);
       continue;
     }
-    let matchedIndex = -1;
-    if (piece.canClose) {
-      for (let k = openers.length - 1; k >= 0; k--) {
-        if (openers[k].delim === piece.delim && spanValid(piece.delim, working.slice(openers[k].pos + 1))) {
-          matchedIndex = k;
-          break;
-        }
-      }
+
+    const stack = piece.delim === '==' ? hlOpeners : piece.delim === '~' ? subOpeners : supOpeners;
+    let matchIdx = -1;
+    if (piece.canClose && stack.length > 0) {
+      const top = stack.length - 1;
+      if (stack[top] + 1 < working.length) matchIdx = top;
+      else if (top > 0) matchIdx = top - 1;
     }
-    if (matchedIndex >= 0) {
-      const opener = openers[matchedIndex];
-      openers.length = matchedIndex;
+
+    if (matchIdx >= 0) {
+      const openerPos = stack[matchIdx];
+      stack.length = matchIdx;
+      while (hlOpeners.length > 0 && hlOpeners[hlOpeners.length - 1] > openerPos) hlOpeners.pop();
+      while (subOpeners.length > 0 && subOpeners[subOpeners.length - 1] > openerPos) subOpeners.pop();
+      while (supOpeners.length > 0 && supOpeners[supOpeners.length - 1] > openerPos) supOpeners.pop();
       const meta = SPAN_META[piece.delim];
-      working[opener.pos] = {
+      const children = piecesToNodes(working, openerPos + 1, working.length);
+      working.length = openerPos + 1;
+      working[openerPos] = {
         kind: 'node',
-        node: { type: meta.type, data: { hName: meta.hName }, children: piecesToNodes(working.splice(opener.pos + 1)) },
+        node: { type: meta.type, data: { hName: meta.hName }, children },
       };
       changed = true;
     } else {
       const pos = working.length;
       working.push(piece);
-      if (piece.canOpen) openers.push({ pos, delim: piece.delim });
+      if (piece.canOpen) stack.push(pos);
     }
   }
-  return changed ? piecesToNodes(working) : null;
+  return changed ? piecesToNodes(working, 0, working.length) : null;
 }
 
 function transformNode(node: any): void {
@@ -214,13 +262,11 @@ function transformNode(node: any): void {
     let hasCandidate = false;
     for (let i = 0; i < node.children.length; i++) {
       const c = node.children[i];
-      if (c.type === 'text' && /[=~^]/.test(c.value)) { hasCandidate = true; break; }
+      if (c.type === 'text' && CANDIDATE_RE.test(c.value)) { hasCandidate = true; break; }
     }
     if (hasCandidate) {
       const pieces = tokenizeChildren(node.children);
-      let hasDelim = false;
-      for (let i = 0; i < pieces.length; i++) if (pieces[i].kind === 'delim') { hasDelim = true; break; }
-      const matched = hasDelim ? matchPieces(pieces) : null;
+      const matched = pieces ? matchPieces(pieces) : null;
       if (matched) node.children = matched;
     }
   }
@@ -338,12 +384,15 @@ function studySyntaxToMarkdown() {
   };
 }
 
+const FROM_MARKDOWN_EXT = studySyntaxFromMarkdown();
+const TO_MARKDOWN_EXT = studySyntaxToMarkdown();
+
 /** Parse and stringify `==highlight==`, `~subscript~`, and `^superscript^` spans
  * outside code and math while preserving explicit backslash/entity escapes. */
 export function remarkStudySyntax(this: any) {
   const data = this.data();
   const fromMarkdownExtensions = data.fromMarkdownExtensions || (data.fromMarkdownExtensions = []);
   const toMarkdownExtensions = data.toMarkdownExtensions || (data.toMarkdownExtensions = []);
-  fromMarkdownExtensions.push(studySyntaxFromMarkdown());
-  toMarkdownExtensions.push(studySyntaxToMarkdown());
+  fromMarkdownExtensions.push(FROM_MARKDOWN_EXT);
+  toMarkdownExtensions.push(TO_MARKDOWN_EXT);
 }

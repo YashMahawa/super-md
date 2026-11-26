@@ -19,7 +19,6 @@ class MockHighlight {
     this.ranges=ranges;
   }
 }
-
 describe("source search",()=>{
   let mountedRoot: Root|null=null;
   let hostContainer: HTMLDivElement|null=null;
@@ -100,20 +99,28 @@ describe("source search",()=>{
     expect(sourceMatches(content,")(?:",{regexp:true,wholeWord:true})).toEqual([]);
 
     const dom=document.createElement("article");
-    dom.innerHTML='<section data-frontmatter-properties class="document-properties"><div>cat item-00</div></section><p>cat category bobcat</p><p>item-12 and item-99</p>';
-    expect(readingMatches(dom,"cat",{wholeWord:true}).map(r=>r.toString())).toEqual(["cat"]);
+    dom.innerHTML='<section data-frontmatter-properties class="document-properties"><h1 data-frontmatter-field="title">Study Note</h1><dl><dt>Author</dt><dd data-frontmatter-field="author">Ada</dd><dt>Date</dt><dd>cat item-00</dd><dt>Tags</dt><dd><span data-frontmatter-field="tag">cat</span><span data-frontmatter-field="tag">dog</span></dd></dl></section><p>cat category bobcat</p><p>item-12 and item-99</p>';
+    expect(readingMatches(dom,"cat",{wholeWord:true}).map(r=>r.toString())).toEqual(["cat","cat"]);
+    expect(readingMatches(dom,"catdog")).toEqual([]);
+    expect(readingMatches(dom,"Author")).toEqual([]);
     expect(readingMatches(dom,"item-(\\d+)",{regexp:true}).map(r=>r.toString())).toEqual(["item-12","item-99"]);
     expect(readingMatches(dom,"[unclosed",{regexp:true})).toEqual([]);
 
     const windowedHost=document.createElement("div");
+    const fmHeader=document.createElement("section");
+    fmHeader.className="document-properties";
+    fmHeader.setAttribute("data-frontmatter-properties","");
+    fmHeader.innerHTML='<h1 data-frontmatter-field="title">cat study</h1><dl><dt>Author</dt><dd data-frontmatter-field="author">Ada</dd><dt>Date</dt><dd>cat-hidden item-00</dd><dt>Tags</dt><dd><span data-frontmatter-field="tag">tagA</span><span data-frontmatter-field="tag">tagB</span></dd></dl>';
     const blockA=document.createElement("section");
     blockA.setAttribute("data-windowed-block","");
-    windowedHost.append(blockA);
+    windowedHost.append(fmHeader,blockA);
     document.body.append(windowedHost);
     const unregister=registerWindowedText(blockA,"cat category item-42");
-    expect(windowedMatches(windowedHost,"cat",{wholeWord:true})).toEqual([{element:blockA,ordinal:0}]);
+    expect(windowedMatches(windowedHost,"cat",{wholeWord:true})).toEqual([{element:fmHeader,ordinal:0},{element:blockA,ordinal:0}]);
+    expect(windowedMatches(windowedHost,"tagAtagB")).toEqual([]);
+    expect(windowedMatches(windowedHost,"Author")).toEqual([]);
     expect(windowedMatches(windowedHost,"item-\\d+",{regexp:true})).toEqual([{element:blockA,ordinal:0}]);
-    expect(windowedMatches(windowedHost,"a*",{regexp:true})).toEqual([{element:blockA,ordinal:0},{element:blockA,ordinal:1}]);
+    expect(windowedMatches(blockA,"a*",{regexp:true})).toEqual([{element:blockA,ordinal:0},{element:blockA,ordinal:1}]);
     expect(windowedMatches(windowedHost,"*invalid",{regexp:true})).toEqual([]);
     unregister();
   });
@@ -150,9 +157,9 @@ describe("source search",()=>{
     expect(literalQuery.literal).toBe(true);
   });
 
-  it("keeps Read mode strictly immutable, maps body matches across YAML frontmatter, opens >12-line code disclosures, and yields Escape to modal overlays",async()=>{
+  it("keeps Read mode strictly immutable, includes displayed metadata in Find, maps body matches across YAML frontmatter, opens >12-line code disclosures, and yields Escape to modal overlays",async()=>{
     const codeLines=Array.from({length:14},(_,i)=>i===12?"const alpha = 42;":`const row_${i} = ${i};`).join("\n");
-    const initial=`---\ntitle: Alpha Study\n---\n\nBody Alpha paragraph.\n\n\`\`\`ts\n${codeLines}\n\`\`\``;
+    const initial=`---\ntitle: Alpha Study\ndescription: Hidden alpha summary\n---\n\nBody Alpha paragraph.\n\n\`\`\`ts\n${codeLines}\n\`\`\``;
     const onClose=vi.fn();
     let setReadMode!:(read:boolean)=>void;
     function ModeHarness(){
@@ -186,14 +193,18 @@ describe("source search",()=>{
     await act(async()=>{setNativeValue(searchInput,"alpha");});
     await flushFrames();
     const output=hostContainer.querySelector(".reading-search output")!;
-    // YAML frontmatter "Alpha Study" is excluded from rendered readingMatches; body + code block have 2 matches.
-    expect(output.textContent).toBe("0 / 2");
+    // Displayed title "Alpha Study" + body + code block have 3 rendered matches; description is excluded.
+    expect(output.textContent).toBe("0 / 3");
 
-    // Step to match 1 (Body Alpha paragraph -> 1 / 2), then switch to Live mode and toggle Replace ON -> maps across frontmatter to 2 / 3!
+    // Step to match 1 (displayed title -> 1 / 3), then match 2 (Body Alpha paragraph -> 2 / 3), then switch to Live mode and toggle Replace ON -> maps across hidden description to 3 / 4!
     const nextBtn=hostContainer.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
     await act(async()=>{nextBtn.click();});
     await flushFrames();
-    expect(output.textContent).toBe("1 / 2");
+    expect(output.textContent).toBe("1 / 3");
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Alpha");
+    await act(async()=>{nextBtn.click();});
+    await flushFrames();
+    expect(output.textContent).toBe("2 / 3");
 
     await act(async()=>{setReadMode(false);});
     await flushFrames();
@@ -201,24 +212,24 @@ describe("source search",()=>{
     expect(replaceToggle).not.toBeNull();
     await act(async()=>{replaceToggle.click();});
     await flushFrames();
-    expect(output.textContent).toBe("2 / 3");
+    expect(output.textContent).toBe("3 / 4");
     expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Alpha");
 
-    // Step to match 3 / 3 inside the >12-line collapsed code-disclosure -> opens details.code-disclosure and highlights "alpha"!
+    // Step to match 4 / 4 inside the >12-line collapsed code-disclosure -> opens details.code-disclosure and highlights "alpha"!
     const codeDisclosure=hostContainer.querySelector<HTMLDetailsElement>("details.code-disclosure")!;
     expect(codeDisclosure.open).toBe(false);
     await act(async()=>{nextBtn.click();});
     await flushFrames();
-    expect(output.textContent).toBe("3 / 3");
+    expect(output.textContent).toBe("4 / 4");
     expect(codeDisclosure.open).toBe(true);
     expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("alpha");
 
-    // Switching back to Read mode while Replace is open closes Replace and maps 3 / 3 back to rendered 2 / 2!
+    // Switching back to Read mode while Replace is open closes Replace and maps 4 / 4 back to rendered 3 / 3!
     await act(async()=>{setReadMode(true);});
     await flushFrames();
     expect(hostContainer.querySelector('button[aria-label="Replace in source"]')).toBeNull();
     expect(hostContainer.querySelector(".search-replace")).toBeNull();
-    expect(output.textContent).toBe("2 / 2");
+    expect(output.textContent).toBe("3 / 3");
 
     // Escape yields when a modal overlay (.image-viewer) is mounted, then closes ReadingSearch once removed.
     const modal=document.createElement("div");
@@ -414,3 +425,136 @@ describe("source search",()=>{
     expect(searchHost.querySelector(".reading-search output")?.textContent).toBe("1 / 1");
   });
 });
+
+describe("DOM-order windowed search and hidden subtree pruning",()=>{
+  it("uses DOM order directly for mounted blocks after out-of-order re-registration and at the 5,000-match cap without compareDocumentPosition",()=>{
+    const host=document.createElement("div");
+    const otherHost=document.createElement("div");
+    const a=document.createElement("section");
+    const b=document.createElement("section");
+    const c=document.createElement("section");
+    const foreign=document.createElement("section");
+    for(const el of [a,b,c,foreign])el.setAttribute("data-windowed-block","");
+    host.append(a,b,c);
+    otherHost.append(foreign);
+
+    const cleanups=[
+      registerWindowedText(a,"token tokens alpha item-1"),
+      registerWindowedText(b,"token beta token item-20"),
+      registerWindowedText(c,"token gamma item-300"),
+      registerWindowedText(foreign,"token outside item-999"),
+    ];
+    // Simulate editing block `a` in Live mode so its registration moves after `b` and `c`.
+    cleanups.push(registerWindowedText(a,"token tokens edited-first item-1"));
+
+    const compareSpy=vi.spyOn(Node.prototype,"compareDocumentPosition");
+    expect(windowedMatches(host,"token",{wholeWord:true})).toEqual([
+      {element:a,ordinal:0},
+      {element:b,ordinal:0},
+      {element:b,ordinal:1},
+      {element:c,ordinal:0},
+    ]);
+    expect(windowedMatches(host,"item-\\d+",{regexp:true})).toEqual([
+      {element:a,ordinal:0},
+      {element:b,ordinal:0},
+      {element:c,ordinal:0},
+    ]);
+    expect(compareSpy).not.toHaveBeenCalled();
+
+    // Verify 5,000-match cap still truncates in true DOM order even when `a` was re-registered last.
+    cleanups.push(registerWindowedText(b,"hit ".repeat(3000)));
+    cleanups.push(registerWindowedText(c,"hit ".repeat(3000)));
+    cleanups.push(registerWindowedText(a,"hit ".repeat(10)));
+    const capped=windowedMatches(host,"hit",{wholeWord:true})!;
+    expect(capped).toHaveLength(5000);
+    expect(capped[0]).toEqual({element:a,ordinal:0});
+    expect(capped[9]).toEqual({element:a,ordinal:9});
+    expect(capped[10]).toEqual({element:b,ordinal:0});
+    expect(capped[3009]).toEqual({element:b,ordinal:2999});
+    expect(capped[3010]).toEqual({element:c,ordinal:0});
+    expect(compareSpy).not.toHaveBeenCalled();
+
+    compareSpy.mockRestore();
+    cleanups.forEach(fn=>fn());
+  });
+
+  it("skips hidden, inert, offstage, unmounted, MathML, and control subtrees while preserving visible KaTeX HTML and closed details disclosures",()=>{
+    const host=document.createElement("article");
+    host.className="markdown-body";
+    host.innerHTML=[
+      '<div data-frontmatter-properties="true"><span>needle-1 frontmatter</span></div>',
+      '<p>needle-1 needles-1 visible</p>',
+      '<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="mord">needle-2</span></span><span class="katex-mathml"><math><semantics><mrow><mi>needle-2</mi></mrow><annotation encoding="application/x-tex">needle-2</annotation></semantics></math></span></span></p>',
+      '<details class="callout"><summary>Summary</summary><p>needle-3 in closed callout</p></details>',
+      '<div class="step-cards-figure is-offstage" aria-hidden="true" inert=""><p>needle-4 offstage</p></div>',
+      '<section data-windowed-block="" data-windowed-mounted="false"><span>needle-5 unmounted</span></section>',
+      '<p hidden>needle-6 hidden-attr</p>',
+      '<p inert>needle-7 inert-attr</p>',
+      '<span aria-hidden="true">needle-8 aria-hidden</span>',
+      '<span style="display: none">needle-9 display-none</span>',
+      '<span style="visibility: hidden">needle-10 visibility-hidden</span>',
+      '<svg><text>needle-11 svg</text></svg>',
+      '<button type="button">needle-12 button</button>',
+      '<iframe>needle-13 iframe</iframe>',
+      '<script>const needle = "needle-14";</script>',
+      '<style>.needle-15 { color: red; }</style>',
+    ].join("");
+
+    const hits=readingMatches(host,"needle-\\d+",{regexp:true,wholeWord:true});
+    expect(hits.map(r=>r.toString())).toEqual(["needle-1","needle-2","needle-3"]);
+    expect(hits[0].startContainer.parentElement?.tagName).toBe("P");
+    expect(hits[1].startContainer.parentElement?.closest(".katex-html")).not.toBeNull();
+    expect(hits[2].startContainer.parentElement?.closest("details.callout")).not.toBeNull();
+
+    // Block boundaries still prevent false cross-paragraph matches.
+    const boundary=document.createElement("div");
+    boundary.innerHTML="<p>foo</p><p>bar</p><li>item <p>nested</p> end</li>";
+    expect(readingMatches(boundary,"foobar")).toEqual([]);
+    expect(readingMatches(boundary,"itemnested")).toEqual([]);
+    expect(readingMatches(boundary,"nestedend")).toEqual([]);
+  });
+
+  it("benchmarks DOM-order windowed search and dense hidden-subtree pruning without compareDocumentPosition",()=>{
+    const windowedHost=document.createElement("div");
+    const cleanups:Array<()=>void>=[];
+    const blocks:HTMLElement[]=[];
+    for(let i=0;i<1000;i++){
+      const section=document.createElement("section");
+      section.setAttribute("data-windowed-block","");
+      section.setAttribute("data-windowed-mounted",i<24?"true":"false");
+      if(i<24){
+        section.innerHTML=`<h2>Chapter ${i}</h2><p>Readable chapter ${i} with Readable prose and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="mord">Readable</span></span><span class="katex-mathml"><math><semantics><mrow><mi>Readable</mi></mrow><annotation>Readable</annotation></semantics></math></span></span></p>`;
+      }else{
+        section.innerHTML='<span aria-hidden="true"></span>';
+      }
+      windowedHost.append(section);
+      blocks.push(section);
+    }
+    // Register in scrambled Live-edit order so legacy registration order differs from DOM tree order.
+    for(let i=blocks.length-1;i>=0;i--){
+      cleanups.push(registerWindowedText(blocks[i],`Chapter ${i}\nReadable chapter ${i} with Readable prose and Readable\n`));
+    }
+
+    const compareSpy=vi.spyOn(Node.prototype,"compareDocumentPosition");
+    const t0=performance.now();
+    const wHits=windowedMatches(windowedHost,"Readable",{wholeWord:true})!;
+    const windowedMs=performance.now()-t0;
+    expect(wHits).toHaveLength(3000);
+    expect(wHits[0]).toEqual({element:blocks[0],ordinal:0});
+    expect(wHits[3]).toEqual({element:blocks[1],ordinal:0});
+    expect(wHits[2999]).toEqual({element:blocks[999],ordinal:2});
+    expect(compareSpy).not.toHaveBeenCalled();
+
+    const t1=performance.now();
+    const domHits=readingMatches(windowedHost,"Readable",{wholeWord:true});
+    const domMs=performance.now()-t1;
+    // 24 mounted blocks * 3 visible "Readable" tokens (duplicate .katex-mathml and 976 unmounted blocks pruned).
+    expect(domHits).toHaveLength(72);
+    expect(windowedMs).toBeGreaterThanOrEqual(0);
+    expect(domMs).toBeGreaterThanOrEqual(0);
+
+    compareSpy.mockRestore();
+    cleanups.forEach(fn=>fn());
+  });
+});
+
