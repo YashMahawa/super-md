@@ -405,12 +405,10 @@ def save_agent_setup_instructions(studio_obj, destination) -> None:
                  "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
                  "## MCP client configuration\n\n```json\n" + studio_obj.agentSetupInstructions + "\n```\n\n"
                  "Live access is off by default. Enable it in Super MD Settings → AI agents before starting the MCP server. "
-                 "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n")
-        if studio_obj.cloudAgentConfigured and studio_obj.cloudConnectorUrl:
-            guide += ("\n## Cloud relay connector\n\n"
-                      "Use this Streamable HTTP MCP endpoint with the intended MCP client. It is a bearer capability; "
-                      "keep this guide private and share it only with that client.\n\n"
-                      "```text\n" + studio_obj.cloudConnectorUrl + "\n```\n")
+                 "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n\n"
+                 "## Cloud relay connector\n\n"
+                 "Cloud relay connector URLs are secret bearer credentials and are not included in saved setup guides. "
+                 "To connect a cloud MCP client, open Super MD Settings → AI agents and use Copy MCP connector URL to get your own connector.\n")
         studio_mod.atomic_write(path, guide.encode("utf-8"))
         studio_obj._agent_error = ""
         studio_obj.message = f"Setup guide saved to {path}"

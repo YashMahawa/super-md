@@ -461,6 +461,153 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                     app.processEvents()
                 self.assertFalse(second_discovery.exists())
 
+    def test_saved_setup_guide_omits_cloud_credentials_for_disabled_and_enabled_cloud_states(self):
+        import shutil
+        import sys
+        from PySide6.QtCore import QEvent, QObject, QUrl
+        from PySide6.QtGui import QGuiApplication
+        from PySide6.QtQml import QQmlComponent, QQmlEngine
+        from PySide6.QtQuickControls2 import QQuickStyle
+        import agent_cloud
+        from agent_live import create_qt_bridge
+        import studio as studio_mod
+        from studio import Session, Studio
+
+        if QGuiApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
+        app = QGuiApplication.instance() or QGuiApplication([])
+
+        class QuietStudio(Studio):
+            def _refresh_theme(self):
+                self.system_dark = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            fallback_root = temp / "source-checkout"
+            shutil.copytree(
+                Path(studio_mod.__file__).resolve().parent.parent / "docs" / "skills" / "super-md",
+                fallback_root / "docs" / "skills" / "super-md",
+            )
+
+            session = Session(isolated=True)
+            session.settings["python"] = sys.executable
+            session.agent_bridge = create_qt_bridge(session, session.data)
+            cloud_state = {"enabled": False}
+
+            class StubCloudClient:
+                @property
+                def enabled(self):
+                    return cloud_state["enabled"]
+
+                @property
+                def status(self):
+                    return "Connected to synthetic relay" if cloud_state["enabled"] else "Disconnected"
+
+                def stop(self):
+                    cloud_state["enabled"] = False
+
+            session.agent_bridge.cloudClient = StubCloudClient()
+            session.agent_bridge.start_cloud = lambda _cfg: cloud_state.__setitem__("enabled", True)
+            session.agent_bridge.stop_cloud = lambda: cloud_state.__setitem__("enabled", False)
+
+            studio_instance = QuietStudio(True, session)
+            engine = QQmlEngine()
+            panel = None
+            try:
+                synthetic_pairing = agent_cloud.new_pairing("https://relay.synthetic.example")
+                synthetic_config = agent_cloud.device_config(synthetic_pairing, "Synthetic Desk")
+                agent_cloud.write_cloud_config(studio_instance._agent_cloud_config_path, synthetic_config)
+                expected_connector_url = agent_cloud.connector_url(synthetic_config)
+
+                self.assertTrue(studio_instance.cloudAgentConfigured)
+                self.assertEqual(studio_instance.cloudConnectorUrl, expected_connector_url)
+                self.assertFalse(studio_instance.cloudAgentEnabled)
+
+                studio_instance.setAgentAccessEnabled(True)
+                self.assertTrue(studio_instance.agentAccessEnabled)
+                local_token = session.agent_bridge.token
+                self.assertTrue(local_token)
+
+                forbidden_values = (
+                    expected_connector_url,
+                    synthetic_config["connectorKey"],
+                    synthetic_config["pairingKey"],
+                    synthetic_config["deviceKey"],
+                    synthetic_config["groupId"],
+                    synthetic_config["deviceId"],
+                    synthetic_config["serverOrigin"],
+                    local_token,
+                )
+
+                for state_name, enable_cloud in (("disabled", False), ("enabled", True)):
+                    studio_instance.setCloudAgentEnabled(enable_cloud)
+                    self.assertEqual(studio_instance.cloudAgentEnabled, enable_cloud)
+                    self.assertTrue(studio_instance.cloudAgentConfigured)
+                    self.assertEqual(studio_instance.cloudConnectorUrl, expected_connector_url)
+
+                    app.clipboard().setText("")
+                    built_guide_path = temp / f"guide-cloud-{state_name}.md"
+                    studio_instance.saveAgentSetupInstructions(str(built_guide_path))
+                    self.assertEqual(studio_instance._agent_error, "")
+                    self.assertEqual(app.clipboard().text(), "")
+
+                    fallback_guide_path = temp / f"guide-cloud-{state_name}-fallback.md"
+                    with patch.object(studio_mod, "ROOT", fallback_root):
+                        studio_instance.saveAgentSetupInstructions(str(fallback_guide_path))
+                    self.assertEqual(studio_instance._agent_error, "")
+                    self.assertEqual(app.clipboard().text(), "")
+
+                    for guide_path in (built_guide_path, fallback_guide_path):
+                        with self.subTest(cloud_state=state_name, guide=guide_path.name):
+                            guide_text = guide_path.read_text(encoding="utf-8")
+                            self._assert_complete_self_contained_guide(self, guide_text)
+                            self.assertIn(studio_instance.agentSetupInstructions, guide_text)
+                            self.assertIn("--transport", guide_text)
+                            self.assertIn("stdio", guide_text)
+                            self.assertIn("Settings → AI agents", guide_text)
+                            self.assertIn("Copy MCP connector URL", guide_text)
+                            for secret in forbidden_values:
+                                self.assertNotIn(secret, guide_text)
+                            for credential_field in ("connectorKey", "pairingKey", "deviceKey"):
+                                self.assertNotIn(credential_field, guide_text)
+
+                studio_instance.copyAgentSetupInstructions()
+                self.assertEqual(app.clipboard().text(), studio_instance.agentSetupInstructions)
+                for secret in forbidden_values:
+                    self.assertNotIn(secret, app.clipboard().text())
+
+                engine.rootContext().setContextProperty("studio", studio_instance)
+                component = QQmlComponent(
+                    engine,
+                    QUrl.fromLocalFile(str(Path(__file__).resolve().parent / "qml" / "AgentAccess.qml")),
+                )
+                self.assertTrue(component.isReady(), component.errorString())
+                panel = component.createWithInitialProperties({
+                    "hostStudio": studio_instance,
+                    "viewState": {"colors": {"muted": "#666666", "primary": "#386a57", "outline": "#cccccc", "surface": "#ffffff", "text": "#111111"}},
+                })
+                self.assertIsNotNone(panel, component.errorString())
+                copy_connector_btn = panel.findChild(QObject, "copyCloudConnectorUrl")
+                self.assertIsNotNone(copy_connector_btn)
+                self.assertTrue(copy_connector_btn.property("enabled"))
+                app.clipboard().setText("")
+                copy_connector_btn.clicked.emit()
+                app.processEvents()
+                self.assertEqual(app.clipboard().text(), expected_connector_url)
+                self.assertIn("secret", studio_instance.cloudAgentStatus.lower())
+            finally:
+                if panel is not None:
+                    panel.deleteLater()
+                engine.deleteLater()
+                studio_instance.stop()
+                studio_instance.pool.shutdown(wait=True, cancel_futures=True)
+                session.agent_bridge.stop()
+                session.writes.shutdown(wait=True)
+                studio_instance.deleteLater()
+                app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app.processEvents()
+                shutil.rmtree(session.data, ignore_errors=True)
+
     def test_studio_agent_setup_module_boundary_honors_studio_patches_and_reexports(self):
         import studio
         import studio_agent_setup
@@ -470,9 +617,11 @@ class AgentSetupInstructionsTests(unittest.TestCase):
             temp = Path(directory)
             guide_dest = temp / "guide.md"
             skill_dest = temp / "skill.zip"
-            setup = json.dumps({"command": "/apps/super-md", "args": ["agent", "mcp"]})
+            setup = json.dumps({"command": "/apps/super-md", "args": ["agent", "mcp", "--transport", "stdio"]})
             proxy = SimpleNamespace(agentAccessEnabled=True, agentSetupInstructions=setup,
-                                    cloudAgentConfigured=False, _agent_error="", message="",
+                                    cloudAgentConfigured=True,
+                                    cloudConnectorUrl="https://relay.example.test/mcp/secret-connector-token",
+                                    _agent_error="", message="",
                                     _emit=lambda *args: None)
             with patch("studio.atomic_write", side_effect=OSError("disk full")):
                 Studio.saveAgentSetupInstructions(proxy, str(guide_dest))
@@ -482,6 +631,15 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                 self.assertFalse(Studio.exportAgentSkill(proxy, str(skill_dest)))
                 self.assertIn("OSError", proxy._agent_error)
                 self.assertFalse(skill_dest.exists())
+
+            proxy._agent_error = ""
+            studio_agent_setup.save_agent_setup_instructions(proxy, str(guide_dest))
+            self.assertEqual(proxy._agent_error, "")
+            guide_text = guide_dest.read_text(encoding="utf-8")
+            self.assertIn(setup, guide_text)
+            self.assertIn("Copy MCP connector URL", guide_text)
+            self.assertNotIn("secret-connector-token", guide_text)
+            self.assertNotIn(proxy.cloudConnectorUrl, guide_text)
 
 
 if __name__ == "__main__":
