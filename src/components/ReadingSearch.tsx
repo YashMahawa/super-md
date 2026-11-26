@@ -8,7 +8,7 @@ import {
   deepestSourceOwner,
   findContainingBlock,
   findReadingHost,
-  mapSourceRangeToDomRange,
+  getSearchDomVersion,
   nextSearchIndex,
   openDisclosuresFor,
   readingMatches,
@@ -26,6 +26,9 @@ import {
 } from "../readingSearchDom";
 export type { SearchMatchConfig, SearchMatchOptions } from "../readingSearchDom";
 export { nextSearchIndex, readingMatches, replaceSourceMatches, resolveSourceBlock, resolveSourceHighlightRange, sourceMatches };
+
+const MANUAL_SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+const SEARCH_SETTLE_WINDOW_MS = 800;
 
 export interface ReadingSearchSeed {
   query: string;
@@ -65,11 +68,116 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const input = useRef<HTMLInputElement>(null);
   const closeRef = useRef(close); closeRef.current = close;
   const prevState = useRef({ query, content, caseSensitive, wholeWord, regexp });
-  const settleFrames = useRef<[number, number]>([0, 0]);
+  const settleCleanup = useRef<(() => void) | null>(null);
   const clearSettleFrames = () => {
-    cancelAnimationFrame(settleFrames.current[0]);
-    cancelAnimationFrame(settleFrames.current[1]);
-    settleFrames.current = [0, 0];
+    settleCleanup.current?.();
+    settleCleanup.current = null;
+  };
+  const scheduleSearchSettle = (anchorHost: Element | null, step: () => boolean) => {
+    clearSettleFrames();
+    const scroller = anchorHost?.matches(".android-reading,.reading-scroll")
+      ? (anchorHost as HTMLElement)
+      : anchorHost?.closest<HTMLElement>(".android-reading,.reading-scroll")
+        ?? document.querySelector<HTMLElement>(".android-reading,.reading-scroll");
+    const eventHost = scroller ?? anchorHost;
+    if (!eventHost) return;
+    let active = true;
+    let frame = 0;
+    let remainingFrames = 4;
+    let layoutMutating = false;
+    let recordedScrollTop = scroller?.scrollTop ?? 0;
+    let recordedScrollHeight = scroller?.scrollHeight ?? 0;
+    const recordScrollerState = () => {
+      if (!scroller) return;
+      recordedScrollTop = scroller.scrollTop;
+      recordedScrollHeight = scroller.scrollHeight;
+    };
+    const inSearchUi = (target: EventTarget | null) =>
+      target instanceof Element && Boolean(target.closest(".reading-search"));
+    const stop = () => {
+      if (!active) return;
+      active = false;
+      cancelAnimationFrame(frame);
+      frame = 0;
+      window.clearTimeout(timer);
+      observer?.disconnect();
+      eventHost.removeEventListener("supermd-window-change", onWindowChange);
+      scroller?.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", onUserGesture, { capture: true });
+      window.removeEventListener("touchstart", onUserGesture, { capture: true });
+      window.removeEventListener("touchmove", onUserGesture, { capture: true });
+      window.removeEventListener("pointerdown", onUserGesture, { capture: true });
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
+      window.removeEventListener("supermd-goto-offset", stop);
+      if (settleCleanup.current === stop) settleCleanup.current = null;
+    };
+    const runPass = () => {
+      frame = 0;
+      if (!active) return;
+      if (!step()) {
+        stop();
+        return;
+      }
+      recordScrollerState();
+      if (remainingFrames > 0) {
+        remainingFrames--;
+        frame = requestAnimationFrame(runPass);
+      }
+    };
+    const schedulePass = () => {
+      if (!active || frame) return;
+      frame = requestAnimationFrame(runPass);
+    };
+    const onUserGesture = (event: Event) => {
+      if (!inSearchUi(event.target)) stop();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!inSearchUi(event.target) && MANUAL_SCROLL_KEYS.has(event.key)) stop();
+    };
+    const onWindowChange = () => {
+      if (!active) return;
+      layoutMutating = true;
+      queueMicrotask(() => {
+        layoutMutating = false;
+        if (active) recordScrollerState();
+      });
+      schedulePass();
+    };
+    const onScroll = () => {
+      if (!active || !scroller || layoutMutating) return;
+      if (scroller.scrollHeight !== recordedScrollHeight) {
+        recordScrollerState();
+        schedulePass();
+        return;
+      }
+      if (Math.abs(scroller.scrollTop - recordedScrollTop) > 2) stop();
+    };
+    const page = scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body")
+      ?? (eventHost instanceof HTMLElement ? eventHost : null);
+    let lastPageHeight = page?.getBoundingClientRect().height ?? 0;
+    const observer = page && typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(entries => {
+          if (!active) return;
+          const nextHeight = entries[0]?.borderBoxSize?.[0]?.blockSize ?? entries[0]?.contentRect.height ?? page.getBoundingClientRect().height;
+          if (Math.abs(nextHeight - lastPageHeight) <= 0.5) return;
+          lastPageHeight = nextHeight;
+          if (scroller && scroller.scrollHeight !== recordedScrollHeight) recordScrollerState();
+          schedulePass();
+        })
+      : undefined;
+    if (page && observer) observer.observe(page);
+    eventHost.addEventListener("supermd-window-change", onWindowChange);
+    scroller?.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("touchstart", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("touchmove", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("pointerdown", onUserGesture, { capture: true, passive: true });
+    window.addEventListener("keydown", onKeyDown, { capture: true, passive: true });
+    window.addEventListener("supermd-goto-offset", stop);
+    const timer = window.setTimeout(stop, SEARCH_SETTLE_WINDOW_MS);
+    settleCleanup.current = stop;
+    remainingFrames--;
+    frame = requestAnimationFrame(runPass);
   };
   const sourceCacheRef = useRef<{
     content: string;
@@ -91,6 +199,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   };
 
   const exitReplacingToRendered = (revealActiveBlock: boolean) => {
+    clearSettleFrames();
     let nextIndex = indexRef.current;
     if (!sourceSession) {
       const activeSourceRanges = regexError ? [] : (sourceRanges.length || !query ? sourceRanges : getSourceRanges());
@@ -119,6 +228,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   }, [canReplace, replacing]);
 
   const revealAndHighlightSource = (targetIndex: number, ranges: SourceRange[], sourceText: string, scroll: boolean) => {
+    if (scroll) clearSettleFrames();
     const range = ranges[targetIndex];
     if (!range) return;
     if (scroll && sourceSession) {
@@ -141,16 +251,50 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const block = findContainingBlock(host, range, sourceText) ?? initialBlock;
     const owner = deepestSourceOwner(block, range, sourceText) ?? block;
     if (scroll) openDisclosuresFor(owner, block, null, range);
-    const domRange = mapSourceRangeToDomRange(block, sourceText, ranges, targetIndex, query, filterOptions);
+    const domRange = resolveSourceHighlightRange(host, sourceText, ranges, targetIndex, query, filterOptions, block);
+    let cachedScrollTarget: Element = (domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner) ?? block;
     if (scroll) {
       openDisclosuresFor(owner, block, domRange, range);
-      const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner;
-      scrollTargetIntoView(scrollEl ?? block, host);
+      scrollTargetIntoView(cachedScrollTarget, host);
     }
     syncSearchHighlights({
       all: wasUnmounted || scroll ? () => readingMatches(host, query, filterOptions) : undefined,
       current: domRange,
     });
+    if (scroll) {
+      let settledHost: Element = host;
+      let settledVersion = getSearchDomVersion(host).version;
+      let settledBlock: HTMLElement = block;
+      scheduleSearchSettle(host, () => {
+        if (!sourceSearchRef.current || indexRef.current !== targetIndex) return false;
+        const liveHost = findReadingHost();
+        if (!liveHost) return false;
+        const nextVersion = getSearchDomVersion(liveHost).version;
+        if (liveHost === settledHost && nextVersion === settledVersion && cachedScrollTarget.isConnected && !settledBlock.closest('[data-windowed-mounted="false"]')) {
+          scrollTargetIntoView(cachedScrollTarget, liveHost);
+          return true;
+        }
+        const currentBlock = findContainingBlock(liveHost, range, sourceText);
+        if (!currentBlock) return false;
+        revealMountedBlock(currentBlock);
+        settledBlock = findContainingBlock(liveHost, range, sourceText) ?? currentBlock;
+        const settledOwner = deepestSourceOwner(settledBlock, range, sourceText) ?? settledBlock;
+        openDisclosuresFor(settledOwner, settledBlock, null, range);
+        const settledDomRange = resolveSourceHighlightRange(liveHost, sourceText, ranges, targetIndex, query, filterOptions, settledBlock);
+        openDisclosuresFor(settledOwner, settledBlock, settledDomRange, range);
+        cachedScrollTarget = (settledDomRange
+          ? (settledDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? settledDomRange.startContainer as Element : settledDomRange.startContainer.parentElement)
+          : settledOwner) ?? settledBlock;
+        settledHost = liveHost;
+        settledVersion = getSearchDomVersion(liveHost).version;
+        scrollTargetIntoView(cachedScrollTarget, liveHost);
+        syncSearchHighlights({
+          all: () => readingMatches(liveHost, query, filterOptions),
+          current: settledDomRange,
+        });
+        return true;
+      });
+    }
   };
 
   const selectWindowedMatch = (next: number, activeWindowed: WindowedMatch[], host: HTMLElement | null) => {
@@ -161,33 +305,45 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     openDisclosuresFor(match.element, match.element);
     let range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
     if (openDisclosuresFor(match.element, match.element, range)) range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-    const scrollEl = range ? (range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement) : match.element;
-    scrollTargetIntoView(scrollEl ?? match.element, host);
+    let cachedScrollTarget: Element = (range ? (range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement) : match.element) ?? match.element;
+    scrollTargetIntoView(cachedScrollTarget, host);
     updateIndex(next);
+    const initialRoot = host ?? match.element;
     syncSearchHighlights({
-      all: () => readingMatches(host ?? match.element, query, filterOptions),
+      all: () => readingMatches(initialRoot, query, filterOptions),
       current: range,
     });
-    settleFrames.current[0] = requestAnimationFrame(() => {
-      settleFrames.current[1] = requestAnimationFrame(() => {
-        settleFrames.current = [0, 0];
-        if (indexRef.current !== next || !match.element.isConnected) return;
-        const liveHost = findReadingHost();
-        const liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-        openDisclosuresFor(match.element, match.element, liveRange);
-        const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
-        scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
-        syncSearchHighlights({
-          all: () => readingMatches(liveHost ?? match.element, query, filterOptions),
-          current: liveRange,
-        });
+    let settledRoot: Element = initialRoot;
+    let settledVersion = getSearchDomVersion(initialRoot).version;
+    scheduleSearchSettle(initialRoot, () => {
+      if (sourceSearchRef.current || indexRef.current !== next || !match.element.isConnected) return false;
+      revealMountedBlock(match.element);
+      const liveHost = findReadingHost();
+      const targetRoot = liveHost ?? match.element;
+      const nextVersion = getSearchDomVersion(targetRoot).version;
+      if (targetRoot === settledRoot && nextVersion === settledVersion && cachedScrollTarget.isConnected && !match.element.closest('[data-windowed-mounted="false"]')) {
+        scrollTargetIntoView(cachedScrollTarget, liveHost);
+        return true;
+      }
+      openDisclosuresFor(match.element, match.element);
+      let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      cachedScrollTarget = (liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element) ?? match.element;
+      settledRoot = targetRoot;
+      settledVersion = getSearchDomVersion(targetRoot).version;
+      scrollTargetIntoView(cachedScrollTarget, liveHost);
+      syncSearchHighlights({
+        all: () => readingMatches(targetRoot, query, filterOptions),
+        current: liveRange,
       });
+      return true;
     });
   };
 
   const selectDomMatch = (next: number, activeMatches: Range[], host: HTMLElement | null) => {
     const range = activeMatches[next];
     if (!range) return;
+    clearSettleFrames();
     const element = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
     openDisclosuresFor(element, element?.closest(".code-container,details") ?? element, range);
     scrollTargetIntoView(element, host);
@@ -197,6 +353,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
 
   const toggleReplacing = (nextReplacing = !activeReplacing) => {
     if (!canReplaceRef.current || nextReplacing === activeReplacing) return;
+    clearSettleFrames();
     if (!nextReplacing) {
       exitReplacingToRendered(true);
       return;
@@ -215,6 +372,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     // Search is a new deliberate navigation, just like pan/zoom. A briefly
     // observing heading jump must not pull the viewport back after this move.
     cancelSettlingHeading();
+    clearSettleFrames();
     pendingAutoSelect.current = false;
     if (regexError) return;
     const current = indexRef.current;
@@ -260,6 +418,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
 
   const handleReplaceAll = () => {
     if (!canReplace || !onChange || !query || regexError || !sourceRanges.length) return;
+    clearSettleFrames();
     const nextContent = replaceSourceMatches(content, query, replacement, filterOptions);
     if (nextContent === content) { updateIndex(-1); return; }
     pendingReplaceIndex.current = -1;
@@ -302,6 +461,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     return () => {
       cancelAnimationFrame(focusFrame);
       clearSettleFrames();
+      syncSearchHighlights({ all: null, current: null });
       setReaderOverlay("search", false);
       document.removeEventListener("keydown", key, true);
       window.removeEventListener("supermd-find-focus", focus);
@@ -374,6 +534,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
               ? () => resolveSourceHighlightRange(host, content, activeRanges, targetIndex, query, filterOptions)
               : indexRef.current < 0 ? null : undefined,
           });
+        } else {
+          syncSearchHighlights({ all: null, current: null });
         }
         return;
       }
@@ -413,7 +575,6 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     return () => {
       cancelAnimationFrame(frame);
       clearSettleFrames();
-      syncSearchHighlights({ all: null, current: null });
       if (sourceSession) editorFindQuery(sourceSession, "", false);
     };
   }, [query, content, caseSensitive, wholeWord, regexp, sourceSearch, sourceSession, canReplace, seed?.nonce]);
@@ -447,13 +608,13 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   }, [windowed, sourceSearch, sourceRanges, content, query, caseSensitive, wholeWord, regexp, regexError]);
 
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
-    <input ref={input} aria-label="Find in note" aria-invalid={!!regexError || undefined} role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => { pendingAutoSelect.current = false; setQuery(event.target.value); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
+    <input ref={input} aria-label="Find in note" aria-invalid={!!regexError || undefined} role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => { clearSettleFrames(); pendingAutoSelect.current = false; setQuery(event.target.value); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
     <output aria-live="polite" className={regexError ? "search-error" : undefined} title={regexError ? regexError : count >= 5000 ? "Showing the first 5,000 matches. Narrow your search to find later results." : undefined}>{regexError ? regexError : count ? `${index < 0 ? 0 : index + 1} / ${count}${count >= 5000 ? "+" : ""}` : query ? "No matches" : ""}</output>
     <button className="search-icon" aria-label="Previous match" disabled={!count} onClick={() => move(-1)} title="Previous match (Shift+Enter / Shift+F3)"><ArrowUpIcon size={20} weight="bold" /></button>
     <button className="search-icon" aria-label="Next match" disabled={!count} onClick={() => move(1)} title="Next match (Enter / F3)"><ArrowDownIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={caseSensitive} onClick={() => { pendingAutoSelect.current = false; setCaseSensitive(!caseSensitive); }} title="Match case" aria-label="Match case"><TextAaIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={wholeWord} onClick={() => { pendingAutoSelect.current = false; setWholeWord(!wholeWord); }} title="Match whole word" aria-label="Match whole word"><TextboxIcon size={20} weight="bold" /></button>
-    <button className="search-icon" aria-pressed={regexp} onClick={() => { pendingAutoSelect.current = false; setRegexp(!regexp); }} title="Regular expression" aria-label="Regular expression"><AsteriskIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={caseSensitive} onClick={() => { clearSettleFrames(); pendingAutoSelect.current = false; setCaseSensitive(!caseSensitive); }} title="Match case" aria-label="Match case"><TextAaIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={wholeWord} onClick={() => { clearSettleFrames(); pendingAutoSelect.current = false; setWholeWord(!wholeWord); }} title="Match whole word" aria-label="Match whole word"><TextboxIcon size={20} weight="bold" /></button>
+    <button className="search-icon" aria-pressed={regexp} onClick={() => { clearSettleFrames(); pendingAutoSelect.current = false; setRegexp(!regexp); }} title="Regular expression" aria-label="Regular expression"><AsteriskIcon size={20} weight="bold" /></button>
     {canReplace && <button className="search-icon" aria-pressed={activeReplacing} onClick={() => toggleReplacing()} title="Replace in source (Ctrl+H)" aria-label="Replace in source"><ArrowsClockwiseIcon size={20} weight="bold" /></button>}
     <button className="search-icon" onClick={close} title="Close search (Esc)" aria-label="Close search"><XIcon size={20} weight="bold" /></button>
     {activeReplacing && onChange && <div className="search-replace"><input aria-label="Replacement text" placeholder="Replace with" value={replacement} onChange={e => setReplacement(e.target.value)} /><button disabled={!query || !!regexError || !count || index < 0} onClick={handleSingleReplace}>Replace</button><button disabled={!query || !!regexError || !count} onClick={handleReplaceAll}>Replace all</button><small>{regexError ? `${regexError}.` : regexp ? "Replaces regex matches in Markdown source ($1, $&, $$ supported)." : "Replaces literal text in Markdown source."}</small></div>}

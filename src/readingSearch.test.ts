@@ -651,10 +651,109 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
       host.dispatchEvent(new Event("supermd-window-change"));
       await new Promise(resolve=>setTimeout(resolve,20));
     });
-    expect(highlights.get("smd-search")?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
-    expect(highlights.get("smd-search-current")?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
+    const firstAllHighlight=highlights.get("smd-search");
+    const firstCurrentHighlight=highlights.get("smd-search-current");
+    expect(firstAllHighlight?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
+    expect(firstCurrentHighlight?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
+
+    // Repeated window-change or style-height extent updates without rendered match changes reuse cached ranges and Highlight instances.
+    s0.style.height="480px";
+    const cachedRef=readingMatches(host,"Alpha");
+    expect(readingMatches(host,"Alpha")).toBe(cachedRef);
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(highlights.get("smd-search")).toBe(firstAllHighlight);
+    expect(highlights.get("smd-search-current")).toBe(firstCurrentHighlight);
+
+    // Visibility mutation (display: none) invalidates cached matches immediately.
+    s0.style.display="none";
+    expect(readingMatches(host,"Alpha")).toEqual([]);
 
     cleanup();
+    act(()=>root.unmount());
+  });
+
+  it("settles windowed Read matches across layout shifts without redundant highlight churn and cancels on manual scroll keys",async()=>{
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+    const scrollTargets:Element[]=[];
+    let scrollHeight=8000,scrollTop=0;
+    Element.prototype.scrollIntoView=function(){
+      scrollTargets.push(this);
+      scrollTop=3200;
+    };
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    Object.defineProperty(host,"scrollHeight",{configurable:true,get:()=>scrollHeight});
+    Object.defineProperty(host,"scrollTop",{configurable:true,get:()=>scrollTop,set:(v:number)=>{scrollTop=v;}});
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.innerHTML="<p>Needle zero</p>";
+    const s1=document.createElement("section");
+    s1.setAttribute("data-windowed-block","");
+    s1.setAttribute("data-windowed-mounted","false");
+    s1.innerHTML='<span aria-hidden="true"></span>';
+    s1.addEventListener("supermd-reveal-window",()=>{
+      s1.setAttribute("data-windowed-mounted","true");
+      s1.innerHTML="<p>Needle distant</p>";
+    });
+    const searchRootEl=document.createElement("div");
+    host.append(s0,s1);
+    document.body.append(searchRootEl,host);
+    const cleanups=[registerWindowedText(s0,"Needle zero"),registerWindowedText(s1,"Needle distant")];
+
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{content:"Needle zero\n\nNeedle distant",close:()=>{}}));
+    });
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,20));});
+    const searchInput=searchRootEl.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")!.set!.call(searchInput,"Needle");
+    await act(async()=>{searchInput.dispatchEvent(new Event("input",{bubbles:true}));});
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,25));});
+
+    const nextBtn=searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    await act(async()=>{nextBtn.click();});
+    await act(async()=>{nextBtn.click();});
+    expect(s1.getAttribute("data-windowed-mounted")).toBe("true");
+    const syncedAll=highlights.get("smd-search");
+    const syncedCurrent=highlights.get("smd-search-current");
+    expect(syncedCurrent?.ranges[0]?.toString()).toBe("Needle");
+
+    // Drain initial settle frames: Highlight objects are reused while rendered DOM has not mutated.
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,40));});
+    expect(highlights.get("smd-search")).toBe(syncedAll);
+    expect(highlights.get("smd-search-current")).toBe(syncedCurrent);
+
+    // Delayed layout shrinkage re-scrolls active match without rebuilding unchanged highlights.
+    scrollTargets.length=0;
+    scrollHeight=7400;
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(scrollTargets).toHaveLength(1);
+    expect(scrollTargets[0].textContent).toContain("Needle distant");
+    expect(highlights.get("smd-search")).toBe(syncedAll);
+
+    // Manual scroll key outside .reading-search cancels settle immediately.
+    scrollTargets.length=0;
+    await act(async()=>{
+      host.dispatchEvent(new KeyboardEvent("keydown",{key:"PageDown",bubbles:true}));
+      scrollHeight=6900;
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(scrollTargets).toHaveLength(0);
+
+    cleanups.forEach(fn=>fn());
     act(()=>root.unmount());
   });
 });
