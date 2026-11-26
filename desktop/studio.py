@@ -4116,7 +4116,7 @@ class Studio(QObject):
         except OSError:
             same_path = str(path) == original_path
         portable = bool(force_portable or path.suffix.lower() == ".smd" or (tab["portable"] and same_path))
-        if id in self.saving: return
+        if id in self.saving or id in self._staging_tabs: return
         self.saving.add(id)
         def finished(outcome, error):
             self.saving.discard(id)
@@ -5016,7 +5016,10 @@ class Studio(QObject):
         if getattr(self, "message", "") == self._RECOVERY_NOTICE:
             self.message = ""
         self.session.drafts[self.window_id] = self._window_recovery_drafts()
-        self._submit_startup_snapshot()
+        if changed and self.active == tab_id:
+            self._recover()
+        else:
+            self._submit_startup_snapshot()
         if changed:
             self._emit(load=(self.active == tab_id))
         return {
@@ -6485,7 +6488,7 @@ class Studio(QObject):
             saving_tab_id = (save_as_tab or captured["id"]) if (command == "export_fmd_native" and save_as) else captured["id"]
             is_portable_tab_save = command == "export_fmd_native" and not agent_export_info and bool(args.get("save") or save_as)
             if is_portable_tab_save:
-                if saving_tab_id in self.saving:
+                if saving_tab_id in self.saving or saving_tab_id in self._staging_tabs:
                     raise ValueError("A save is already in progress for this tab; retry after it finishes")
                 self.saving.add(saving_tab_id)
             python = self.settings["python"]
