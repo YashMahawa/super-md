@@ -111,3 +111,74 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
     pollIntervalMs: 10,
   }), /Timed out waiting/);
 });
+
+it('retries GitHub HTTP 403 rate-limit responses and skips artifact listing until producer completes, while rejecting permission 403s', async () => {
+  let clock = 0;
+  const sleeps = [];
+  const calls = [];
+  let attempt = 0;
+  const fetchImpl = async input => {
+    const pathname = new URL(input).pathname;
+    calls.push(pathname);
+    attempt++;
+    if (attempt === 1) {
+      return {
+        ok: false,
+        status: 403,
+        headers: new Headers({ 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1' }),
+        text: async () => JSON.stringify({ message: 'API rate limit exceeded for installation.' }),
+      };
+    }
+    if (attempt === 2) {
+      return {
+        ok: false,
+        status: 403,
+        headers: new Headers({ 'retry-after': '15' }),
+        text: async () => JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }),
+      };
+    }
+    if (attempt <= 4) {
+      const body = pathname.endsWith('/jobs')
+        ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'queued', conclusion: null }] }
+        : run;
+      return { ok: true, status: 200, headers: new Headers(), json: async () => body };
+    }
+    const body = pathname.endsWith('/jobs')
+      ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'completed', conclusion: 'success' }] }
+      : pathname.endsWith('/artifacts')
+        ? { total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }
+        : run;
+    return { ok: true, status: 200, headers: new Headers(), json: async () => body };
+  };
+  const ready = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl,
+    sleep: async ms => { sleeps.push(ms); clock += ms; },
+    now: () => clock,
+    timeoutMs: 60_000,
+    pollIntervalMs: 5_000,
+  });
+  assert.deepEqual(ready, names);
+  assert.equal(calls.filter(pathname => pathname.endsWith('/artifacts')).length, 1);
+  assert.equal(sleeps[1], 15_000);
+
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: async () => ({
+      ok: false,
+      status: 403,
+      headers: new Headers({ 'x-ratelimit-remaining': '4999' }),
+      text: async () => JSON.stringify({ message: 'Resource not accessible by integration' }),
+    }),
+    sleep: async ms => { clock += ms; },
+    now: () => clock,
+    timeoutMs: 60_000,
+    pollIntervalMs: 5_000,
+  }), /HTTP 403/);
+});
