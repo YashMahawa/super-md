@@ -158,7 +158,17 @@ def build_mcp_server(roots: list[str], live_client=None):
         """Find paginated source matches with optional word, case, regex and diagram filters."""
         tab_id = _lh.live_id(path)
         if tab_id is None:
-            return store.search(path, query, limit=limit, context=context)
+            return store.search(
+                path,
+                query,
+                limit=limit,
+                context=context,
+                offset=offset,
+                case_sensitive=case_sensitive,
+                whole_word=whole_word,
+                regex=regex,
+                exclude_diagrams=exclude_diagrams,
+            )
         flags = (("case_sensitive", case_sensitive), ("whole_word", whole_word), ("regex", regex), ("exclude_diagrams", exclude_diagrams))
         try:
             _v.require_search_params(query, limit, context, offset, max_offset=20_000_000, flags=flags, error_cls=AgentDocumentError)
