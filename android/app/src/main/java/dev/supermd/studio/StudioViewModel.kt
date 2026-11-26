@@ -2399,43 +2399,160 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             else -> closeAfterSaveNoteId = null
         }
     }
+    private class ReloadArchiveFailedException(cause: Throwable) : Exception(cause.message, cause)
     fun reloadFromDisk(id: String = mutable.value.active.id) = viewModelScope.launch {
-        val note = mutable.value.tabs.find { it.id == id } ?: return@launch
-        val rawUri = note.uri ?: return@launch
+        if (mutable.value.tabs.none { it.id == id && it.uri != null }) return@launch
+        if (id == mutable.value.active.id && !performReaderBarrier(id) { }) {
+            flushRecoveryAndAwait()
+            readerBarrierFailed()
+            return@launch
+        }
+        val cleanupDirs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         try {
-            val reloaded = withContext(Dispatchers.IO) {
-                val target = documentAccess.resolve(Uri.parse(rawUri))
-                resolver.openInputStream(target)?.use { stream ->
-                    if (note.portable) {
-                        val opened = media.openFmd(stream)
-                        Note(id = note.id, name = note.name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = note.relative, assetDirectory = opened.directory, assetsDirty = false)
-                    } else {
-                        val text = readLimited(stream, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
-                        Note(id = note.id, name = note.name, uri = target.toString(), content = text, saved = text, relative = note.relative, assetsDirty = false)
+            closedNoteMutex.withLock {
+                var snapshotNote: Note? = null
+                var rawUri: String? = null
+                var reloaded: Note? = null
+                var archivedReference: ClosedNoteReference? = null
+                var previousRefs: List<ClosedNoteReference>? = null
+                var nextRefs: List<ClosedNoteReference>? = null
+                try {
+                    withContext(Dispatchers.IO) {
+                        documentWrites.withLock {
+                            val note = mutable.value.tabs.find { it.id == id } ?: return@withLock
+                            val noteUri = note.uri ?: return@withLock
+                            snapshotNote = note
+                            rawUri = noteUri
+                            val target = documentAccess.resolve(Uri.parse(noteUri))
+                            val loaded = resolver.openInputStream(target)?.use { stream ->
+                                if (note.portable) {
+                                    val opened = media.openFmd(stream)
+                                    cleanupDirs.add(opened.directory)
+                                    Note(id = note.id, name = note.name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = note.relative, assetDirectory = opened.directory, assetsDirty = false)
+                                } else {
+                                    val text = readLimited(stream, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                                    Note(id = note.id, name = note.name, uri = target.toString(), content = text, saved = text, relative = note.relative, assetsDirty = false)
+                                }
+                            } ?: error("Document permission is unavailable; choose it again")
+                            reloaded = loaded
+
+                            if (note.dirty) {
+                                try {
+                                    val archivedAssetDir = if (!note.portable) {
+                                        null
+                                    } else {
+                                        val existingAssets = media.portableAssets(note.assetDirectory)
+                                        val collectedAssets = collectNativePortableAssets(note)
+                                        if (note.assetDirectory != null && portableAssetsMatch(collectedAssets, existingAssets)) {
+                                            note.assetDirectory
+                                        } else {
+                                            val tempBundle = File.createTempFile("reload-archive-", ".smd.gz", getApplication<Application>().cacheDir)
+                                            try {
+                                                tempBundle.outputStream().use { media.writeFmd(it, note.content, collectedAssets) }
+                                                tempBundle.inputStream().use(media::openFmd).directory.also { cleanupDirs.add(it) }
+                                            } finally {
+                                                tempBundle.delete()
+                                            }
+                                        }
+                                    }
+                                    val archivedName = if (note.name.startsWith("Recovered ")) note.name else "Recovered ${note.name}"
+                                    val archivedDraft = Note(
+                                        id = UUID.randomUUID().toString(),
+                                        name = archivedName,
+                                        uri = null,
+                                        content = note.content,
+                                        saved = "",
+                                        relative = note.relative,
+                                        assetDirectory = archivedAssetDir,
+                                        assetsDirty = archivedAssetDir != null || note.assetsDirty,
+                                    )
+                                    val ref = closedNoteStore.save(archivedDraft)
+                                    val prev = closedNoteStore.loadIndexStrict()
+                                    val updated = (listOf(ref) + prev).take(ClosedNoteStore.LIMIT)
+                                    closedNoteStore.saveIndex(updated)
+                                    archivedReference = ref
+                                    previousRefs = prev
+                                    nextRefs = updated
+                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                    throw cancelled
+                                } catch (archiveError: Exception) {
+                                    throw ReloadArchiveFailedException(archiveError)
+                                }
+                            }
+                        }
                     }
-                } ?: error("Document permission is unavailable; choose it again")
-            }
-            autosavePending.remove(id)
-            invalidateNoteAssets(id)
-            readerEcho.remove(id)
-            clearReaderEditProtocol(id)
-            if (reloaded.portable) {
-                recordPortableBaseline(id, reloaded.assetDirectory)
-                if (note.assetDirectory != null && note.assetDirectory != reloaded.assetDirectory) {
-                    withContext(Dispatchers.IO) { File(getApplication<Application>().filesDir, "portable-assets/${note.assetDirectory}").deleteRecursively() }
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (archiveFailed: ReloadArchiveFailedException) {
+                    flushRecoveryAndAwait()
+                    fail("Could not archive draft before reloading: ${archiveFailed.message}")
+                    return@withLock
+                } catch (reloadError: Exception) {
+                    flushRecoveryAndAwait()
+                    val failedUri = rawUri
+                    if (failedUri != null && isDocumentAccessFailure(reloadError)) {
+                        requestDocumentAccess(failedUri, snapshotNote, writing = false, explicit = true)
+                    } else {
+                        fail("Could not reload note: ${reloadError.message}")
+                    }
+                    return@withLock
+                }
+
+                val expectedNote = snapshotNote ?: return@withLock
+                val loadedNote = reloaded ?: return@withLock
+                var rollbackRefs: List<ClosedNoteReference>? = null
+                var changedDuringReload = false
+                documentWrites.withLock {
+                    val latest = mutable.value.tabs.find { it.id == id }
+                    if (
+                        latest == null ||
+                        latest.uri != expectedNote.uri ||
+                        latest.content != expectedNote.content ||
+                        latest.saved != expectedNote.saved ||
+                        latest.assetDirectory != expectedNote.assetDirectory ||
+                        latest.assetsDirty != expectedNote.assetsDirty
+                    ) {
+                        changedDuringReload = true
+                        rollbackRefs = previousRefs
+                    } else {
+                        if (nextRefs != null) {
+                            closedNoteRefs = nextRefs!!
+                        }
+                        archivedReference?.assetDirectory?.let { cleanupDirs.remove(it) }
+                        loadedNote.assetDirectory?.let { cleanupDirs.remove(it) }
+                        if (expectedNote.assetDirectory != null && expectedNote.assetDirectory != loadedNote.assetDirectory) {
+                            cleanupDirs.add(expectedNote.assetDirectory)
+                        }
+                        autosavePending.remove(id)
+                        invalidateNoteAssets(id)
+                        readerEcho.remove(id)
+                        clearReaderEditProtocol(id)
+                        if (loadedNote.portable) {
+                            recordPortableBaseline(id, loadedNote.assetDirectory)
+                        }
+                        change { state ->
+                            state.copy(
+                                tabs = state.tabs.map { if (it.id == id) loadedNote else it },
+                                closedTabs = if (archivedReference != null) {
+                                    (listOf(archivedReference!!.placeholder()) + state.closedTabs).take(ClosedNoteStore.LIMIT)
+                                } else {
+                                    state.closedTabs
+                                },
+                                conflictedTabIds = state.conflictedTabIds - id,
+                                pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
+                                message = "Reloaded from disk",
+                            )
+                        }
+                    }
+                }
+                if (changedDuringReload) {
+                    rollbackRefs?.let { prev -> withContext(Dispatchers.IO) { runCatching { closedNoteStore.saveIndex(prev) } } }
+                    flushRecoveryAndAwait()
+                    mutable.value = mutable.value.copy(message = "The note changed while reloading from disk. It remains open with the latest draft.")
                 }
             }
-            change { state ->
-                state.copy(
-                    tabs = state.tabs.map { if (it.id == id) reloaded else it },
-                    conflictedTabIds = state.conflictedTabIds - id,
-                    pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
-                    message = "Reloaded from disk",
-                )
-            }
-        } catch (error: Exception) {
-            if (isDocumentAccessFailure(error)) requestDocumentAccess(rawUri, note, writing = false, explicit = true)
-            else fail("Could not reload note: ${error.message}")
+        } finally {
+            cleanupPortableDirectories(cleanupDirs)
         }
     }
     fun save(uri: Uri? = null, noteId: String? = null, expectedRevision: String? = null, forceOverwrite: Boolean = false, manualGuard: Boolean = false, onComplete: ((String?) -> Unit)? = null) = viewModelScope.launch {
