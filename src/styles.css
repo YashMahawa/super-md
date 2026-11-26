@@ -239,6 +239,7 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .live-block:has(.code-copy) > .live-block-edit { top: calc(22px / var(--document-scale, 1)); right: calc(78px / var(--document-scale, 1)); }
 .live-block:has(.chart-actions) > .live-block-edit { top: calc(16px / var(--document-scale, 1)); right: calc(96px / var(--document-scale, 1)); }
 .live-block:has(.cell-toolbar) > .live-block-edit { top: calc(10px / var(--document-scale, 1)); right: calc(88px / var(--document-scale, 1)); }
+.live-block:has(.python-stop) > .live-block-edit { right: calc(292px / var(--document-scale, 1)); }
 .live-block:has(.step-cards-enlarge) > .live-block-edit { top: calc(6px / var(--document-scale, 1)); right: calc(44px / var(--document-scale, 1)); }
 .live-block-edit:hover { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
 .live-block-edit:active { transform: scale(calc(.96 / var(--document-scale, 1))); }
@@ -455,6 +456,10 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .cell-toolbar { min-height: 48px; padding: 0 8px 0 16px; display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--code-accent); background: transparent; border-bottom: 1px solid var(--code-border); font: 650 .8rem/1.4 var(--md-ref-typeface-plain,system-ui); }
 .cell-toolbar button { min-height: 36px; padding: 6px 16px; border-radius: 18px; background: var(--primary); color: var(--on-primary); font-weight: 650; transition: border-radius .18s cubic-bezier(.2,0,0,1), transform .12s ease; }
 .cell-toolbar button:active { border-radius: 10px; transform: scale(.97); }
+.cell-toolbar button.python-run:disabled { opacity: .72; cursor: default; }
+.cell-toolbar button.python-stop { background: color-mix(in srgb, var(--error) 16%, var(--surface-high)); color: var(--error); border: 1px solid color-mix(in srgb, var(--error) 42%, var(--code-border)); cursor: pointer; }
+.cell-toolbar button.python-stop:hover:not(:disabled) { background: var(--error); color: var(--surface); border-color: var(--error); }
+.cell-toolbar button.python-stop:disabled { opacity: .65; cursor: default; }
 .cell-output { padding: 14px; border-top: 1px solid var(--code-border); background: color-mix(in srgb, var(--surface) 60%, var(--code-bg)); }
 .cell-output.failed { color: var(--error); }
 .cell-output.stale { opacity: .48; }

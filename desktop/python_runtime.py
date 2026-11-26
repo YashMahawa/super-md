@@ -472,8 +472,9 @@ class PythonCellCancelled(RuntimeError):
 class PythonCellJob:
     """Per-cell cancellation handle; marks cancellation promptly while owned workers wait."""
 
-    def __init__(self, tab_id: str = ""):
+    def __init__(self, tab_id: str = "", job_id: str = ""):
         self.tab_id = tab_id
+        self.job_id = job_id
         self.cancelled = threading.Event()
         self._lock = threading.Lock()
 
@@ -495,15 +496,22 @@ class PythonJobRegistry:
     def __init__(self):
         self._lock = threading.RLock()
         self._jobs: set[PythonCellJob] = set()
+        self._by_id: dict[str, PythonCellJob] = {}
         self._retired = False
 
-    def register(self, tab_id: str = "") -> PythonCellJob:
-        job = PythonCellJob(tab_id)
+    def register(self, tab_id: str = "", job_id: str = "") -> PythonCellJob:
+        if job_id != "" and (not isinstance(job_id, str) or len(job_id) > 128):
+            raise ValueError("Invalid Python cell job id")
+        job = PythonCellJob(tab_id, job_id)
         with self._lock:
+            if job_id and job_id in self._by_id:
+                raise ValueError("Python cell job id is already in use")
             if self._retired:
                 job.cancelled.set()
             else:
                 self._jobs.add(job)
+                if job_id:
+                    self._by_id[job_id] = job
         return job
 
     def discard(self, job: PythonCellJob | None) -> None:
@@ -511,6 +519,23 @@ class PythonJobRegistry:
             return
         with self._lock:
             self._jobs.discard(job)
+            if job.job_id and self._by_id.get(job.job_id) is job:
+                del self._by_id[job.job_id]
+
+    def active_count(self, tab_id: str | None = None) -> int:
+        with self._lock:
+            if tab_id is None:
+                return len(self._jobs)
+            return sum(1 for job in self._jobs if job.tab_id == tab_id)
+
+    def cancel_job(self, job_id: str, *, tab_id: str | None = None) -> bool:
+        if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
+            return False
+        with self._lock:
+            job = self._by_id.get(job_id)
+            if job is None or (tab_id is not None and job.tab_id != tab_id):
+                return False
+        return job.cancel()
 
     def cancel_tab(self, tab_id: str) -> int:
         if not tab_id:

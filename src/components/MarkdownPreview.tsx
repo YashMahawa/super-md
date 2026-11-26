@@ -373,7 +373,11 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
   if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
   if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
-  if (language === "python" || language === "py") return protectedBlock(<PythonCell source={source} python={python} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />);
+  if (language === "python" || language === "py") return (
+    <CodeBlockBoundary key={language} source={source}>
+      <PythonCell source={source} python={python} context={context} sourceStart={srcStart} sourceEnd={srcEnd} highlighted={child.props.children} />
+    </CodeBlockBoundary>
+  );
   const sourceText = liveStateRef.current.markdown;
   const lineBreak = srcStart !== undefined ? sourceText.indexOf("\n", srcStart) : -1;
   const fenced = lineBreak >= 0 && (srcEnd === undefined || lineBreak < srcEnd) && /^[ \t>]*(`{3,}|~{3,})/.test(sourceText.slice(srcStart, lineBreak));
