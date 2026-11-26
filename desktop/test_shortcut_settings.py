@@ -12,6 +12,7 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 from PySide6.QtCore import QEvent, QPointF, QUrl, Qt
 from PySide6.QtGui import QGuiApplication, QKeySequence
 from PySide6.QtQml import QQmlComponent, QQmlEngine
+from PySide6.QtQuick import QQuickWindow  # noqa: F401
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
@@ -53,12 +54,13 @@ def _production_shortcut_enabled():
 class ShortcutSettingsSmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        QQuickStyle.setStyle("Material")
+        if QQuickStyle.name() != "Material":
+            QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["shortcut settings smoke"])
 
     def setUp(self):
         self._discover_patch = patch("python_runtime.discover", return_value=[])
-        self._discover_patch.start()
+        self.discover_mock = self._discover_patch.start()
         self.addCleanup(self._discover_patch.stop)
         self.session = Session(True)
         self.studio = QuietStudio(True, self.session)
@@ -136,6 +138,18 @@ ApplicationWindow {{
         }
         for action in actions:
             self.assertIsNotNone(self.named_item("shortcutRecorder_" + action["id"]))
+        for format_action in ("bold", "italic", "inline_code", "link", "heading", "list", "quote", "inline_math"):
+            self.assertIn(format_action, default_bindings)
+        self.assertIn("Italic", self.studio.setShortcut("bold", "Ctrl+I"))
+        self.assertEqual(self.studio.setShortcut("bold", "Ctrl+Alt+B"), "")
+        self.assertEqual(self.studio.shortcutSequences("bold"), ["Ctrl+Alt+B"])
+        self.assertEqual(self.studio.setShortcut("bold", ""), "")
+        self.assertEqual(self.studio.shortcutSequences("bold"), [])
+        emitted_calls = []
+        self.studio.readerCall.connect(emitted_calls.append)
+        self.studio.command("format_bold")
+        self.assertIn("window.supermdFormat?.('bold')", emitted_calls)
+        self.assertEqual(self.studio.resetShortcuts(), "")
         # Main.qml's Settings dialog is the single modal. Picking its shortcuts
         # category must not add another modal layer over the settings page.
         self.window.setProperty("modalDialogCount", 1)
@@ -222,6 +236,23 @@ ApplicationWindow {{
         QTest.keyClick(self.window, Qt.Key.Key_N, Qt.KeyboardModifier.ControlModifier)
         QTest.qWait(40)
         self.assertTrue(self.window.property("newNoteShortcutTriggered"), "The app action should reactivate when the modal closes")
+
+    def test_python_discovery_defers_until_python_section_is_opened(self):
+        page = self.window.findChild(object, "settingsPage")
+        self.assertIsNotNone(page)
+        self.assertEqual(page.property("section"), "appearance")
+        self.discover_mock.assert_not_called()
+        page.setProperty("section", "python")
+        deadline = 40
+        while not self.discover_mock.called and deadline > 0:
+            QTest.qWait(25)
+            deadline -= 1
+        self.discover_mock.assert_called_once()
+        page.setProperty("section", "reading")
+        QTest.qWait(20)
+        page.setProperty("section", "python")
+        QTest.qWait(40)
+        self.discover_mock.assert_called_once()
 
     def test_appearance_settings_expose_bundled_presets_saved_themes_and_scoped_file_actions(self):
         import custom_theme

@@ -1,15 +1,22 @@
+const DISALLOWED_SVG_URL = /url\(\s*(?:'(?!#|data:)[^']*'|"(?!#|data:)[^"]*"|(?!['"]?(?:#|data:)|\s*\))[^)]+)/i;
+
 /** Render SVG as an image, never as executable inline HTML. */
 export function svgImage(source: string): string {
   const document = new DOMParser().parseFromString(source, "image/svg+xml");
   const root = document.documentElement;
   if (document.querySelector("parsererror") || root.localName !== "svg") throw new Error("This SVG is not valid XML.");
   if (root.querySelector("script,foreignObject,iframe,object,embed")) throw new Error("SVG must be a self-contained image, without scripts or embedded HTML.");
-  for (const node of [root, ...Array.from(root.querySelectorAll("*"))]) for (const attribute of Array.from(node.attributes)) {
-    if (/^on/i.test(attribute.name)) throw new Error("SVG event handlers are not allowed.");
-    if (/^(?:href|xlink:href)$/i.test(attribute.name) && !/^(?:#|data:image\/)/.test(attribute.value)) throw new Error("External SVG resources must be embedded first.");
-    if (/url\(\s*['"]?(?:https?:|\/\/|file:)/i.test(attribute.value)) throw new Error("External SVG resources must be embedded first.");
+  for (const node of [root, ...Array.from(root.querySelectorAll("*"))]) {
+    if (/^(?:animate|set|animatemotion|animatetransform)$/i.test(node.localName) && /^(?:href|xlink:href|on\w+)$/i.test((node.getAttribute("attributeName") || "").trim())) {
+      throw new Error("SVG animations may not target links or event handlers.");
+    }
+    for (const attribute of Array.from(node.attributes)) {
+      if (/^on/i.test(attribute.name)) throw new Error("SVG event handlers are not allowed.");
+      if (/^(?:href|xlink:href)$/i.test(attribute.name) && !/^(?:#|data:image\/(?!svg\+xml))/i.test(attribute.value.trim())) throw new Error("External SVG resources must be embedded first.");
+      if (DISALLOWED_SVG_URL.test(attribute.value)) throw new Error("External SVG resources must be embedded first.");
+    }
   }
-  if (Array.from(root.querySelectorAll("style")).some(style=>/url\(\s*['"]?(?:https?:|\/\/|file:)|@import/i.test(style.textContent || ""))) throw new Error("External SVG styles are not allowed.");
+  if (Array.from(root.querySelectorAll("style")).some(style=>DISALLOWED_SVG_URL.test(style.textContent || "") || /@import/i.test(style.textContent || ""))) throw new Error("External SVG styles are not allowed.");
   root.setAttribute("xmlns", "http://www.w3.org/2000/svg");
   return new XMLSerializer().serializeToString(root);
 }
@@ -39,8 +46,8 @@ export function svgContrastBackdrop(source:string):string {
 }
 
 export function svgDataBackdrop(uri:string):string|undefined {
-  if(!uri.startsWith('data:image/svg+xml')||uri.length>1_400_000)return undefined;
-  try {const comma=uri.indexOf(',');return svgContrastBackdrop(uri.slice(0,comma).includes(';base64')?atob(uri.slice(comma+1)):decodeURIComponent(uri.slice(comma+1)));}catch{return undefined;}
+  if(!/^data:image\/svg\+xml(?:[;,]|$)/i.test(uri)||uri.length>1_400_000)return undefined;
+  try {const comma=uri.indexOf(',');if(comma<0)return undefined;return svgContrastBackdrop(uri.slice(0,comma).includes(';base64')?atob(uri.slice(comma+1)):decodeURIComponent(uri.slice(comma+1)));}catch{return undefined;}
 }
 
 /** Monochrome line art adopts the reading text color so it stays readable in
