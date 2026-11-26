@@ -24,6 +24,11 @@ except ImportError:  # python desktop/mcp_server.py
     from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, validate_patch_operations
 
 
+def _valid_diagram_id(value: Any) -> bool:
+    return (isinstance(value, str) and value.startswith("diagram:")
+            and 9 <= len(value) <= 128 and value.isprintable())
+
+
 class BearerAuth:
     """Small ASGI gate that protects every HTTP route before MCP dispatch."""
 
@@ -446,8 +451,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("Desktop returned invalid close status")
             return bounded_result({**result, "target": path})
         if action in ("export", "export_document"):
-            if path is None or format not in ("pdf", "smd", "md"):
-                raise AgentDocumentError("export requires a source path and format pdf, smd, or md")
+            if path is None or format not in ("pdf", "smd", "md", "mdzip"):
+                raise AgentDocumentError("export requires a source path and format pdf, smd, md, or mdzip")
             tab_id = live_id(path)
             if tab_id is not None:
                 if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
@@ -466,6 +471,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                     raise AgentDocumentError("Live export returned invalid status")
                 return bounded_result({key: value for key, value in result.items()
                                    if key in ("jobId", "status", "filename", "format", "bytes", "sha256", "path")})
+            if format == "mdzip":
+                raise AgentDocumentError("Filesystem export supports pdf, smd, or md; mdzip requires a live tab")
             if output_path is None:
                 raise AgentDocumentError("Filesystem export requires output_path inside an allowed root")
             if format != "pdf" and options:
@@ -525,7 +532,7 @@ def build_mcp_server(roots: list[str], live_client=None):
         if action == "get_diagram":
             if path is None or live_id(path) is None:
                 raise AgentDocumentError("get_diagram requires an open desktop tab target")
-            if not isinstance(diagram_id, str) or not diagram_id or len(diagram_id) > 200:
+            if not _valid_diagram_id(diagram_id):
                 raise AgentDocumentError("diagram_id must come from list_diagrams")
             if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
                 raise AgentDocumentError("get_diagram requires expected_revision from list_diagrams or document_inspect")
@@ -689,7 +696,7 @@ def build_mcp_server(roots: list[str], live_client=None):
         if not 64 <= width <= 1600:
             raise AgentDocumentError("width must be between 64 and 1,600 pixels")
         if diagram_id is not None:
-            if not isinstance(diagram_id, str) or not diagram_id or len(diagram_id) > 200:
+            if not _valid_diagram_id(diagram_id):
                 raise AgentDocumentError("diagram_id must come from list_diagrams")
             if not isinstance(expected_revision, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_revision):
                 raise AgentDocumentError("Diagram image requires expected_revision from list_diagrams")
@@ -1091,6 +1098,8 @@ def build_mcp_server(roots: list[str], live_client=None):
             raise AgentDocumentError("The current reading context exceeds the bounded response size")
         return ([image_block] if image_block is not None else []) + [TextContent(type="text", text=text)]
 
+    server._normalize_reading_context = _normalize_reading_context  # type: ignore[attr-defined]
+    server._viewport_contexts = _viewport_contexts  # type: ignore[attr-defined]
     return server, store
 
 

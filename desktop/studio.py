@@ -4743,7 +4743,7 @@ class Studio(QObject):
         elif action == "window": self.newWindowRequested.emit()
 
     def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
-        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
+        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}[format]
         selected = filename or Path(tab["name"]).stem or "Super MD export"
         if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
             raise ValueError("Export filename must be a basename")
@@ -4785,8 +4785,8 @@ class Studio(QObject):
         if target is None or target["id"] != self.active:
             raise ValueError("Export the currently active live tab")
         fmt = args.get("format")
-        if fmt not in ("pdf", "smd", "md"):
-            raise ValueError("Export format must be PDF, SMD or Markdown")
+        if fmt not in ("pdf", "smd", "md", "mdzip"):
+            raise ValueError("export format must be pdf, smd, md, or mdzip")
         expected = args.get("expectedRevision")
         current = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
         if not isinstance(expected, str) or expected != current:
@@ -4809,6 +4809,11 @@ class Studio(QObject):
             options = {**DEFAULT_PDF, **self.settings.get("pdf", {}), **supplied}
             options["themeAccent"] = supplied.get("themeAccent") or self._colors().get("primary", "#386a57")
             options = validate_pdf_options(options)
+        elif not isinstance(options, dict):
+            raise ValueError("Export options must be an object")
+        archive = bool(args.get("archive")) or bool(options.get("archive")) or fmt == "mdzip"
+        if archive and fmt == "md":
+            fmt = "mdzip"
         output = self._agent_export_path(args.get("filename", ""), fmt, target)
         self.pending_export = str(output)
         job_id = uuid.uuid4().hex
@@ -4823,9 +4828,9 @@ class Studio(QObject):
         self._agent_exports[request_id] = {"path": str(output), "format": fmt, "jobId": job_id}
         self._agent_job_records[job_id] = {"jobId": job_id, "action": "export_document", "status": "running", "filename": output.name,
                                            "format": fmt, "path": str(output), "bytes": 0}
-        command = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native"}[fmt]
+        command = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native", "mdzip": "export_markdown_native"}[fmt]
         forwarded = {"id": tab_id, "content": content, "assets": assets, "options": options,
-                     "expectedRevision": expected, "save": False, "jobId": job_id}
+                     "expectedRevision": expected, "save": False, "jobId": job_id, "archive": archive}
         try:
             self.post(request_id, command, json.dumps(forwarded, ensure_ascii=False, separators=(",", ":")))
             self.replied.emit(request_id, json.dumps({"jobId": job_id, "status": "running",
@@ -4876,7 +4881,7 @@ class Studio(QObject):
             raise ValueError("Export artifact metadata is invalid or incomplete")
         if offset > total:
             raise ValueError("offset must be between 0 and the artifact byte count")
-        if (not isinstance(fingerprint, dict) or fmt not in ("pdf", "smd", "md")
+        if (not isinstance(fingerprint, dict) or fmt not in ("pdf", "smd", "md", "mdzip")
                 or not isinstance(filename, str) or not filename
                 or not isinstance(file_path, str) or not isinstance(expected_hash, str)
                 or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)):
@@ -4914,7 +4919,7 @@ class Studio(QObject):
             if fd >= 0:
                 os.close(fd)
         mime = {"pdf": "application/pdf", "smd": "application/x-supermd",
-                "md": "text/markdown"}[fmt]
+                "md": "text/markdown", "mdzip": "application/zip"}[fmt]
         next_offset = offset + len(body)
         return {"jobId": job_id, "filename": filename, "format": fmt, "mimeType": mime,
                 "bytes": total, "sha256": expected_hash, "offset": offset,
