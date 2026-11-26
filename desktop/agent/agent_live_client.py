@@ -7,7 +7,10 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from agent_live import LiveTabClient, read_discovery
+if __package__ and "." in __package__:
+    from ..agent_live import LiveTabClient, read_discovery
+else:
+    from agent_live import LiveTabClient, read_discovery
 
 
 UNAVAILABLE_REASON = (

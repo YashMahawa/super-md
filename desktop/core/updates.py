@@ -17,8 +17,12 @@ import tempfile
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from documents import atomic_json
-from core.network_tls import client_context
+from .network_tls import client_context
+
+if __package__ and "." in __package__:
+    from ..documents import atomic_json
+else:
+    from documents import atomic_json
 
 REPO = "https://github.com/YashMahawa/super-md"
 API = "https://api.github.com/repos/YashMahawa/super-md/releases/latest"

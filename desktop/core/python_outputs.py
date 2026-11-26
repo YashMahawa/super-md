@@ -4,7 +4,10 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from documents import atomic_json, image_data
+if __package__ and "." in __package__:
+    from ..documents import atomic_json, image_data
+else:
+    from documents import atomic_json, image_data
 
 
 _RESULT_FIELDS = {"stdout", "stderr", "images", "ok"}

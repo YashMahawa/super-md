@@ -10,7 +10,10 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from documents import image_data, MAX_IMAGE, MIMES
+if __package__ and "." in __package__:
+    from ..documents import MAX_IMAGE, MIMES, image_data
+else:
+    from documents import MAX_IMAGE, MIMES, image_data
 
 MAX_ASSETS = 512
 MAX_ASSET_TOTAL = 110_000_000

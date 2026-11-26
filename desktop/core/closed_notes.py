@@ -9,7 +9,10 @@ import re
 import uuid
 from pathlib import Path
 
-from documents import atomic_json
+if __package__ and "." in __package__:
+    from ..documents import atomic_json
+else:
+    from documents import atomic_json
 
 
 class ClosedNoteStore:

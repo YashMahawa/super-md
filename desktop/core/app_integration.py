@@ -11,8 +11,12 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from documents import atomic_write
-from core.updates import version
+from .updates import version
+
+if __package__ and "." in __package__:
+    from ..documents import atomic_write
+else:
+    from documents import atomic_write
 
 OWNER='X-SuperMD-Managed=true'
 
