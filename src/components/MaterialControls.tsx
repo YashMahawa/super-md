@@ -1,5 +1,5 @@
 "use client";
-import { createElement, memo, type ReactNode, type FormEvent, type KeyboardEvent } from "react";
+import { createElement, memo, type ReactNode, type ChangeEvent, type InputEvent, type KeyboardEvent } from "react";
 import { M3Button } from "@banegasn/m3-button";
 import { M3IconButton } from "@banegasn/m3-icon-button";
 import { css } from "lit";
@@ -54,14 +54,14 @@ export const MaterialIconButton = memo(function MaterialIconButton({ children, o
 export const MaterialSelect = memo(function MaterialSelect({ value, label, options, onChange, motion = true, disabled }: { value: string; label: string; options: Array<{ value: string; label: string }>; onChange: (value: string) => void; motion?: boolean; disabled?: boolean }) {
   return createElement("smd-select", {
     value, label, disabled, quick: !motion, menuPositioning: typeof HTMLElement.prototype.showPopover === "function" ? "popover" : "fixed", "motion-off": motion ? undefined : "",
-    onChange: (event: FormEvent<HTMLElement>) => onChange((event.currentTarget as HTMLElement & { value: string }).value),
+    onChange: (event: ChangeEvent<HTMLElement>) => onChange((event.currentTarget as HTMLElement & { value: string }).value),
     onKeyDown: (event: KeyboardEvent<HTMLElement>) => { if (event.key === "Escape" && (event.currentTarget.shadowRoot?.querySelector("md-menu") as HTMLElement & { open?: boolean } | null)?.open) event.stopPropagation(); },
   }, options.map(option => createElement("md-select-option", { key: option.value, value: option.value, selected: value === option.value }, createElement("span", { slot: "headline" }, option.label))));
 });
 export const materialThemes = [{ value: "system", label: "System dynamic" }, { value: "light", label: "Material light" }, { value: "dark", label: "Material dark" }, { value: "black", label: "Pure black" }];
 export const MaterialSlider = memo(function MaterialSlider({ value, min, max, step = 1, label, onChange, motion = true }: { value: number; min: number; max: number; step?: number; label: string; onChange: (value: number) => void; motion?: boolean }) {
-  return createElement("smd-slider", { value, min, max, step, "motion-off": motion ? undefined : "", "aria-label": label, onInput: (event: FormEvent<HTMLElement>) => onChange((event.currentTarget as HTMLElement & { value: number }).value) });
+  return createElement("smd-slider", { value, min, max, step, "motion-off": motion ? undefined : "", "aria-label": label, onInput: (event: InputEvent<HTMLElement>) => onChange((event.currentTarget as HTMLElement & { value: number }).value) });
 });
 export const MaterialSwitch = memo(function MaterialSwitch({ checked, disabled, label, onChange, motion = true }: { checked: boolean; disabled?: boolean; label: string; onChange: (value: boolean) => void; motion?: boolean }) {
-  return createElement("smd-switch", { selected: checked, disabled, "motion-off": motion ? undefined : "", "aria-label": label, onChange: (event: FormEvent<HTMLElement>) => onChange((event.currentTarget as HTMLElement & { selected: boolean }).selected) });
+  return createElement("smd-switch", { selected: checked, disabled, "motion-off": motion ? undefined : "", "aria-label": label, onChange: (event: ChangeEvent<HTMLElement>) => onChange((event.currentTarget as HTMLElement & { selected: boolean }).selected) });
 });
