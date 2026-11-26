@@ -543,15 +543,68 @@ private class EntryPointDocumentProvider(
         selectionArgs: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
-        val file = fileFor(uri)
+        if (uri.pathSegments.lastOrNull() == "children") {
+            val cols = projection?.toList() ?: listOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_MIME_TYPE,
+                DocumentsContract.Document.COLUMN_FLAGS,
+            )
+            val parentId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+            val entries = if (parentId == "vault") {
+                listOf(
+                    "vault/Note.md" to firstFile,
+                    "vault/Second.md" to secondFile,
+                    "vault/Archive.smd" to portableFile,
+                )
+            } else {
+                emptyList()
+            }
+            return MatrixCursor(cols.toTypedArray()).apply {
+                for ((docId, child) in entries) {
+                    addRow(
+                        cols.map { col ->
+                            when (col) {
+                                DocumentsContract.Document.COLUMN_DOCUMENT_ID -> docId
+                                OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> child.name
+                                OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> child.length()
+                                DocumentsContract.Document.COLUMN_MIME_TYPE ->
+                                    if (child.name.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
+                                DocumentsContract.Document.COLUMN_FLAGS -> 0
+                                else -> null
+                            }
+                        }.toTypedArray<Any?>(),
+                    )
+                }
+            }
+        }
+        val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrDefault(uri.lastPathSegment.orEmpty())
         val cols = projection?.toList() ?: listOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
+        if (docId == "vault") {
+            return MatrixCursor(cols.toTypedArray()).apply {
+                addRow(
+                    cols.map { col ->
+                        when (col) {
+                            DocumentsContract.Document.COLUMN_DOCUMENT_ID -> "vault"
+                            OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> "vault"
+                            DocumentsContract.Document.COLUMN_MIME_TYPE -> DocumentsContract.Document.MIME_TYPE_DIR
+                            DocumentsContract.Document.COLUMN_FLAGS -> 0
+                            else -> null
+                        }
+                    }.toTypedArray<Any?>(),
+                )
+            }
+        }
+        val file = fileFor(uri)
         return MatrixCursor(cols.toTypedArray()).apply {
             addRow(
                 cols.map { col ->
                     when (col) {
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID -> docId
                         OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> file.name
                         OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> file.length()
                         DocumentsContract.Document.COLUMN_MIME_TYPE -> if (file.name.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
+                        DocumentsContract.Document.COLUMN_FLAGS -> 0
                         else -> null
                     }
                 }.toTypedArray<Any?>(),
