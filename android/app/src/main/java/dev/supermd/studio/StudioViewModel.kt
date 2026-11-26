@@ -89,7 +89,7 @@ data class PendingSeededFind(
     val targetTabId: String? = null,
     val targetUri: String? = null,
 )
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
@@ -171,6 +171,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val blockedDocumentWrites = mutableSetOf<String>()
     private val promptedDocumentAccess = mutableSetOf<String>()
     private val promptedAssetAccess = mutableSetOf<String>()
+    private val pendingAccessHeadings = java.util.concurrent.ConcurrentHashMap<String, String>()
     internal val readerFolderIndex = ReaderFolderIndex()
     private val readerCapabilities = java.util.concurrent.CopyOnWriteArraySet<ReaderAssetCapabilities>()
     internal fun attachReaderCapabilities(capabilities: ReaderAssetCapabilities) { readerCapabilities += capabilities }
@@ -326,12 +327,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun diskMatchesBaseline(target: Uri, note: Note, baselineAssets: JSONObject? = null): Boolean =
         if (note.portable) {
             val expectedAssets = baselineAssets ?: baselinePortableAssets(note)
-            val disk = resolver.openInputStream(target)?.use(media::openFmd) ?: error("Cannot read the current portable note")
-            try {
-                disk.markdown == note.saved && portableAssetsMatch(expectedAssets, media.portableAssets(disk.directory))
-            } finally {
-                deletePortableDirectoryIfUnreferenced(disk.directory)
-            }
+            resolver.openInputStream(target)?.use { stream ->
+                media.portableEnvelopeMatches(stream, note.saved, expectedAssets)
+            } ?: error("Cannot read the current portable note")
         } else {
             val current = resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") }
                 ?: error("Cannot read the current note")
@@ -2028,89 +2026,162 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         mutable.value = mutable.value.copy(busy = false, message = "PDF export cancelled")
     }
     fun busy(value: Boolean) { mutable.value = mutable.value.copy(busy = value) }
-    private fun retainOpenedNote(note: Note, activate: Boolean) {
+    fun consumePendingHeading(token: String) {
+        if (mutable.value.pendingHeading?.token == token) {
+            mutable.value = mutable.value.copy(pendingHeading = null)
+        }
+    }
+    private fun loadNoteForOpen(uri: Uri, relative: String?): Note {
+        documentAccess.persist(uri)
+        val target = documentAccess.resolve(uri)
+        return loadResolvedNoteForOpen(target, uri, relative, externalIntentFlags = null, externalCaller = ExternalIntentCaller())
+    }
+    private fun loadNoteForOpen(
+        uri: Uri,
+        relative: String?,
+        externalIntentFlags: Int?,
+        externalCaller: ExternalIntentCaller,
+    ): Note {
+        if (externalIntentFlags == null) return loadNoteForOpen(uri, relative)
+        // External Intents must prove their own live caller grant; never manufacture
+        // access from persisted SAF folder trees or untrusted app-private paths.
+        return loadResolvedNoteForOpen(uri, uri, relative, externalIntentFlags, externalCaller)
+    }
+    private fun loadResolvedNoteForOpen(
+        target: Uri,
+        originalUri: Uri,
+        relative: String?,
+        externalIntentFlags: Int?,
+        externalCaller: ExternalIntentCaller,
+    ): Note {
+        val app = getApplication<Application>()
+        val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, originalUri.toString()) } == true }
+        // Reopening an existing draft must still validate its grant,
+        // but must never reload older disk bytes over its edits.
+        if (existing != null) {
+            val verifyStream = if (externalIntentFlags != null) {
+                ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
+            } else {
+                resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+            }
+            verifyStream.use { }
+            return existing.copy(uri = target.toString(), relative = relative ?: existing.relative)
+        }
+        val inputStream = if (externalIntentFlags != null) {
+            ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
+        } else {
+            resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
+        }
+        return inputStream.use { stream ->
+            val name = resolveDisplayName(target)
+                ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
+                ?: "Note.md"
+            val buffered = stream.buffered()
+            buffered.mark(65536)
+            val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
+            val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
+            val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
+            if (portable) {
+                val opened = media.openFmd(buffered)
+                Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
+                    .also { recordPortableBaseline(it.id, opened.directory) }
+            } else {
+                val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
+            }
+        }
+    }
+    private fun retainOpenedNote(note: Note, activate: Boolean, headingFragment: String? = null): String {
         val existing = mutable.value.tabs.find { it.uri != null && note.uri != null && sameDocumentUri(it.uri, note.uri) }
+        val targetId = existing?.id ?: note.id
+        val jump = headingFragment?.takeIf { it.isNotBlank() }?.let { PendingHeadingJump(targetId, it, UUID.randomUUID().toString()) }
         change { state ->
             state.copy(
-                tabs = if (existing != null) state.tabs.map { if(it.id == existing.id) it.copy(uri = note.uri) else it } else state.tabs + note,
-                activeId = if (activate) existing?.id ?: note.id else state.activeId,
+                tabs = if (existing != null) state.tabs.map { if (it.id == existing.id) it.copy(uri = note.uri, relative = note.relative ?: it.relative) else it } else state.tabs + note,
+                activeId = if (activate) targetId else state.activeId,
+                pendingHeading = if (activate) jump else state.pendingHeading,
             )
         }
-        mutable.value.tabs.firstOrNull { it.id == (existing?.id ?: note.id) }?.let(::remember)
+        mutable.value.tabs.firstOrNull { it.id == targetId }?.let(::remember)
+        return targetId
     }
-    fun open(uri: Uri, relative: String? = null): Job =
-        openDocument(uri, relative)
-    internal fun openDocument(
+    private suspend fun openNoteInternal(
         uri: Uri,
         relative: String? = null,
+        headingFragment: String? = null,
+        scheduleDirtyAutosave: Boolean = false,
+        alwaysReportError: Boolean = false,
+        errorPrefix: String = "Could not open note",
         externalIntentFlags: Int? = null,
         externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
-    ): Job {
-        val request = openRequests.begin()
-        return viewModelScope.launch {
+        request: Long = openRequests.begin(),
+    ): JSONObject {
+        val requestedHeading = headingFragment?.trim()?.takeIf { it.isNotEmpty() }
         try {
-            val note = withContext(Dispatchers.IO) {
-                val app = getApplication<Application>()
-                val target = if (externalIntentFlags != null) {
-                    // External Intents must prove their own live caller grant; never manufacture
-                    // access from persisted SAF folder trees or untrusted app-private paths.
-                    uri
-                } else {
-                    documentAccess.persist(uri)
-                    documentAccess.resolve(uri)
-                }
-                val existing = mutable.value.tabs.find { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
-                // Reopening an existing draft must still validate its grant,
-                // but must never reload older disk bytes over its edits.
-                if (existing != null) {
-                    val verifyStream = if (externalIntentFlags != null) {
-                        ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
-                    } else {
-                        resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
-                    }
-                    verifyStream.use { }
-                    return@withContext existing.copy(uri = target.toString())
-                }
-                val inputStream = if (externalIntentFlags != null) {
-                    ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
-                } else {
-                    resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
-                }
-                inputStream.use { stream ->
-                    val name = resolveDisplayName(target)
-                        ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
-                        ?: "Note.md"
-                    val buffered = stream.buffered()
-                    buffered.mark(65536)
-                    val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
-                    val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
-                    val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
-                    if (portable) { val opened = media.openFmd(buffered); Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory).also { recordPortableBaseline(it.id, opened.directory) } }
-                    else { val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF"); Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative) }
-                }
-            }
+            val note = withContext(Dispatchers.IO) { loadNoteForOpen(uri, relative, externalIntentFlags, externalCaller) }
             if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
             if (!openRequests.isCurrent(request)) {
                 // A newer open or a user tab action owns focus, but every file
                 // the user requested still becomes an available tab.
                 retainOpenedNote(note, activate = false)
-                return@launch
+                return JSONObject().put("opened", false)
             }
             val expectedActiveId = mutable.value.active.id
-            var applied = false
+            var openedTabId: String? = null
             val accepted = performReaderBarrier(expectedActiveId) {
-                retainOpenedNote(note, activate = openRequests.isCurrent(request))
-                applied = true
+                if (scheduleDirtyAutosave) {
+                    mutable.value.tabs.firstOrNull { it.id == expectedActiveId }
+                        ?.takeIf { it.dirty && it.uri != null }
+                        ?.let { scheduleAutosave(it.id) }
+                }
+                val activate = openRequests.isCurrent(request)
+                val carriedHeading = requestedHeading ?: note.uri?.let { targetUri ->
+                    pendingAccessHeadings.keys.firstOrNull { key -> sameDocumentUri(key, targetUri) }?.let(pendingAccessHeadings::remove)
+                }
+                openedTabId = retainOpenedNote(
+                    note,
+                    activate = activate,
+                    headingFragment = carriedHeading?.takeIf { activate && it.isNotBlank() },
+                )
             }
-            if (!accepted || !applied) {
+            if (!accepted || openedTabId == null) {
                 if (!openRequests.isCurrent(request)) retainOpenedNote(note, activate = false)
                 else readerBarrierFailed()
+                return JSONObject().put("opened", false)
             }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-        catch (error: Exception) { if (openRequests.isCurrent(request)) {
-            if (isDocumentAccessFailure(error)) requestDocumentAccess(uri.toString(), mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }, writing = false, explicit = true)
-            else fail("Could not open note: ${error.message}")
-        } }
+            return JSONObject().put("opened", true).put("id", openedTabId).put("uri", note.uri ?: uri.toString())
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (error: Exception) {
+            if (!alwaysReportError && !openRequests.isCurrent(request)) return JSONObject().put("opened", false)
+            val msg = if (isDocumentAccessFailure(error)) {
+                if (requestedHeading != null) pendingAccessHeadings[uri.toString()] = requestedHeading
+                requestDocumentAccess(uri.toString(), mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }, writing = false, explicit = true)
+            } else {
+                "$errorPrefix: ${error.message}".also(::fail)
+            }
+            return JSONObject().put("opened", false).put("message", msg)
+        }
+    }
+    fun open(uri: Uri, relative: String? = null, pendingHeading: String? = null): Job =
+        openDocument(uri, relative, pendingHeading = pendingHeading)
+    internal fun openDocument(
+        uri: Uri,
+        relative: String? = null,
+        externalIntentFlags: Int? = null,
+        externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
+        pendingHeading: String? = null,
+    ): Job {
+        val request = openRequests.begin()
+        return viewModelScope.launch {
+            openNoteInternal(
+                uri = uri,
+                relative = relative,
+                headingFragment = pendingHeading,
+                externalIntentFlags = externalIntentFlags,
+                externalCaller = externalCaller,
+                request = request,
+            )
         }
     }
     internal suspend fun saveAgentPortable(id: String, expectedRevision: String) {
@@ -2132,53 +2203,55 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val target = documentAccess.resolve(Uri.parse(latest.uri ?: error("This portable note has no saved destination")), writing = true)
                 val backup = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot read the current portable note")
-                val disk = backup.inputStream().use(media::openFmd)
+                require(
+                    agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true) &&
+                        media.portableEnvelopeMatches(backup.inputStream(), note.saved, assets),
+                ) {
+                    "The portable note changed on disk; reopen it before saving"
+                }
+                staged.outputStream().use { media.writeFmd(it, note.content, assets, assets) }
+                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
+                val stagedBytes = staged.readBytes()
+                val reuseExisting = note.assetDirectory != null && media.hasExactLocalPortableAssets(note.assetDirectory, assets)
+                val nextDirectory = if (reuseExisting) {
+                    note.assetDirectory!!
+                } else {
+                    media.materializePortableDirectory(assets, reuseFromDirectory = note.assetDirectory).also { openedDirectory = it }
+                }
+                val latestBytes = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
+                    ?: error("Cannot recheck the portable note before saving")
+                require(latestBytes.contentEquals(backup)) { "The portable note changed on disk; no changes were saved" }
                 try {
-                    require(portableSaveSnapshotMatches(note, expectedRevision, disk.markdown, assets, media.portableAssets(disk.directory))) {
-                        "The portable note changed on disk; reopen it before saving"
-                    }
-                    staged.outputStream().use { media.writeFmd(it, note.content, assets) }
-                    verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
-                    val stagedBytes = staged.readBytes()
-                    val opened = staged.inputStream().use(media::openFmd)
-                    openedDirectory = opened.directory
-                    val latestBytes = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
-                        ?: error("Cannot recheck the portable note before saving")
-                    require(latestBytes.contentEquals(backup)) { "The portable note changed on disk; no changes were saved" }
-                    try {
-                        resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } }
-                            ?: error("Cannot save the portable note")
-                        withContext(Dispatchers.Main) {
-                            val current = mutable.value.tabs.firstOrNull { it.id == id }
-                            require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
-                                "The note changed while it was saving; the portable file was restored"
-                            }
-                            recordPortableBaseline(id, opened.directory)
-                            change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = opened.directory) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
-                            mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
-                            openedDirectory = null
+                    resolver.openOutputStream(target, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } }
+                        ?: error("Cannot save the portable note")
+                    withContext(Dispatchers.Main) {
+                        val current = mutable.value.tabs.firstOrNull { it.id == id }
+                        require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
+                            "The note changed while it was saving; the portable file was restored"
                         }
-                    } catch (error: Exception) {
-                        runCatching {
-                            val current = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
-                                ?: error("Cannot inspect the portable note after the failed write")
-                            when (portableSaveRecovery(current, backup, stagedBytes)) {
-                                PortableSaveRecovery.ORIGINAL_INTACT -> Unit
-                                PortableSaveRecovery.RESTORE_OUR_WRITE -> {
-                                    resolver.openOutputStream(target, "wt")?.use { it.write(backup); it.flush() }
-                                        ?: error("Cannot restore the previous portable note")
-                                    val restored = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
-                                    require(restored != null && restored.contentEquals(backup)) { "Cannot confirm restoration of the previous portable note" }
-                                }
-                                PortableSaveRecovery.LEAVE_CONCURRENT_BYTES -> error("The portable destination changed after the write; it was left intact to avoid overwriting newer bytes")
-                            }
-                        }.getOrElse { rollbackError ->
-                            throw IllegalStateException("The portable save failed and the destination was not overwritten during recovery. Inspect it or reopen it from disk before editing.", rollbackError)
-                        }
-                        throw error
+                        recordPortableBaseline(id, nextDirectory)
+                        change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = nextDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
+                        mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
+                        openedDirectory = null
                     }
-                } finally {
-                    disk.directory.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
+                } catch (error: Exception) {
+                    runCatching {
+                        val current = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
+                            ?: error("Cannot inspect the portable note after the failed write")
+                        when (portableSaveRecovery(current, backup, stagedBytes)) {
+                            PortableSaveRecovery.ORIGINAL_INTACT -> Unit
+                            PortableSaveRecovery.RESTORE_OUR_WRITE -> {
+                                resolver.openOutputStream(target, "wt")?.use { it.write(backup); it.flush() }
+                                    ?: error("Cannot restore the previous portable note")
+                                val restored = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
+                                require(restored != null && restored.contentEquals(backup)) { "Cannot confirm restoration of the previous portable note" }
+                            }
+                            PortableSaveRecovery.LEAVE_CONCURRENT_BYTES -> error("The portable destination changed after the write; it was left intact to avoid overwriting newer bytes")
+                        }
+                    }.getOrElse { rollbackError ->
+                        throw IllegalStateException("The portable save failed and the destination was not overwritten during recovery. Inspect it or reopen it from disk before editing.", rollbackError)
+                    }
+                    throw error
                 }
             }
         } } finally {
@@ -2269,7 +2342,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         } finally { staged.delete() }
     }
     private fun collectNativePortableAssets(note: Note): JSONObject {
-        val assets = JSONObject(media.portableAssets(note.assetDirectory).toString())
+        val existing = media.portableAssets(note.assetDirectory)
+        val assets = JSONObject()
+        existing.keys().forEach { key -> assets.put(key, existing.getString(key)) }
         val sources = JSONArray(markdownImageSourcesJson(note.content))
         for (i in 0 until sources.length()) {
             val source = sources.getString(i)
@@ -2735,6 +2810,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         newFolderPrefix: String? = null,
         folderTreeRaw: String? = null,
         statusMessage: String? = null,
+        preRenameFolderState: Map<StudioViewModel, Pair<Long, String>> = emptyMap(),
     ) {
         if (remaps.isEmpty() && oldFolderPrefix == null) return
         remapPersistedMetadata(remaps)
@@ -2778,7 +2854,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val vmFolder = vm.mutable.value.folder
             if (vmFolder != null && (folderTreeRaw == null || sameDocumentUri(vmFolder, folderTreeRaw))) {
-                val currentRel = vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+                val preRename = preRenameFolderState[vm]
+                val currentRel = if (preRename != null && vm.listFolderSeq == preRename.first) {
+                    preRename.second
+                } else {
+                    vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+                }
                 val nextListed = if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
                     remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
                 } else {
@@ -2982,6 +3063,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val folderUri = Uri.parse(folderRaw)
         val parentRel = parentRelativePath(cleanRelative)
         val currentName = cleanRelative.substringAfterLast('/')
+        val preRenameFolderState = liveStudioViewModels(this).associateWith { vm ->
+            vm.listFolderSeq to vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+        }
 
         val (actualNewName, actualNewRelative, remaps) = withContext(Dispatchers.IO) {
             documentWrites.withLock {
@@ -3073,6 +3157,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             newFolderPrefix = if (isDirectory) actualNewRelative else null,
             folderTreeRaw = folderRaw,
             statusMessage = "Renamed to $actualNewName",
+            preRenameFolderState = preRenameFolderState,
         )
     }
 
@@ -3236,9 +3321,41 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if (!seed.targetUri.isNullOrBlank() && !note.uri.isNullOrBlank() && sameDocumentUri(note.uri, seed.targetUri)) return true
         return false
     }
-    private fun noteForAsset(document: String): Note = mutable.value.tabs.firstOrNull {
+
+    private data class SafTreeMatch(val folderUri: Uri, val rootId: String, val relativePath: String)
+
+    private fun openNoteForDocument(document: String): Note? = mutable.value.tabs.firstOrNull {
         it.id == document || it.uri?.let { uri -> sameDocumentUri(uri, document) } == true
-    } ?: error("The asset's document is no longer open")
+    }
+
+    private fun noteForAsset(document: String): Note =
+        openNoteForDocument(document) ?: error("The asset's document is no longer open")
+
+    private fun findSafTree(noteUri: Uri, allowEmbeddedTreeFallback: Boolean = false): SafTreeMatch? {
+        val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
+        val persisted = resolver.persistedUriPermissions
+            .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == noteUri.authority }
+            .mapNotNull { permission ->
+                val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
+                val trimmed = root.trimEnd('/')
+                val contained = documentId.startsWith("$trimmed/") || root.endsWith(':') && documentId.startsWith(root) || allowEmbeddedTreeFallback && documentId == root
+                if (contained) root to permission.uri else null
+            }
+            .maxByOrNull { it.first.length }
+        val active = persisted ?: if (allowEmbeddedTreeFallback && DocumentsContract.isTreeUri(noteUri)) {
+            runCatching {
+                val root = DocumentsContract.getTreeDocumentId(noteUri)
+                root to DocumentsContract.buildTreeDocumentUri(noteUri.authority, root)
+            }.getOrNull()
+        } else null
+        val (rootId, folderUri) = active ?: return null
+        val trimmed = rootId.trimEnd('/')
+        val relative = documentId.takeIf { it.startsWith("$trimmed/") }?.removePrefix("$trimmed/")
+            ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
+            ?: relativeInOpenFolder(noteUri, folderUri.toString())
+            ?: if (allowEmbeddedTreeFallback) "" else return null
+        return SafTreeMatch(folderUri, rootId, relative)
+    }
 
     /** Resolves only an already granted tree or an individually user-selected linked file. */
     private fun resolveLinkedAssetUri(note: Note, source: String): Uri {
@@ -3246,18 +3363,189 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         note.relative?.let { readerAssetPathParts(it.substringBeforeLast('/', ""), source) }
         linkedAssetUri(note, source)?.let { return it }
         val noteUri = note.uri?.let(Uri::parse) ?: throw LinkedAssetAccessRequiredException()
-        val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
-        val folderUri = resolver.persistedUriPermissions.filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == noteUri.authority }.mapNotNull { permission ->
-            val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
-            if (documentId.startsWith("$root/") || root.endsWith(':') && documentId.startsWith(root)) root to permission.uri else null
-        }.maxByOrNull { it.first.length }?.second ?: throw LinkedAssetAccessRequiredException()
-        val rootId = DocumentsContract.getTreeDocumentId(folderUri)
-        val relative = documentId.takeIf { it.startsWith("$rootId/") }?.removePrefix("$rootId/")
-            ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
-            ?: throw LinkedAssetAccessRequiredException()
-        val parts = readerAssetPathParts(relative.substringBeforeLast('/', ""), source)
-        return readerFolderIndex.resolve(resolver, note.id, folderUri, rootId, parts).uri
+        val tree = findSafTree(noteUri) ?: throw LinkedAssetAccessRequiredException()
+        val parts = readerAssetPathParts(tree.relativePath.substringBeforeLast('/', ""), source)
+        return readerFolderIndex.resolve(resolver, note.id, tree.folderUri, tree.rootId, parts).uri
     }
+
+    private class PromptWorkspaceNoteAccessException(val targetUri: Uri) : Exception()
+
+    suspend fun openWorkspaceLink(
+        documentPath: String,
+        target: String,
+        fragment: String,
+        wikilink: Boolean,
+    ): JSONObject {
+        val trimmedTarget = target.trim()
+        val trimmedFragment = fragment.trim()
+        require(trimmedTarget.length in 1..4096 && trimmedFragment.length <= 1024) { "Invalid workspace link" }
+        val stateSnapshot = mutable.value
+        val sourceNote = if (documentPath.isNotBlank()) {
+            openNoteForDocument(documentPath) ?: run {
+                val notice = "The note for this link is no longer open."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
+                return JSONObject().put("opened", false).put("message", notice)
+            }
+        } else {
+            stateSnapshot.active
+        }
+        val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
+        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf { DocumentsContract.isTreeUri(it) }
+        val rawNoteUri = sourceNote.uri
+        if (rawNoteUri.isNullOrBlank()) {
+            if (explicitRelative || openFolder == null) {
+                val notice = "Save this note before opening linked notes."
+                mutable.value = mutable.value.copy(busy = false, message = notice)
+                return JSONObject().put("opened", false).put("message", notice)
+            }
+        }
+
+        val resolved = try {
+            withContext(Dispatchers.IO) {
+                val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
+                val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
+                if (sourceUri != null && sourceUri.scheme == "file") {
+                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
+                }
+                val treeMatch = when {
+                    sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
+                    openFolder != null -> SafTreeMatch(openFolder, DocumentsContract.getTreeDocumentId(openFolder), "")
+                    else -> null
+                }
+                if (treeMatch != null) {
+                    val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
+                    val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
+                    var deniedTreeCandidate: Uri? = null
+                    for (parts in candidateLists) {
+                        val relJoined = parts.joinToString("/")
+                        val indexedUri = try {
+                            readerFolderIndex.resolve(resolver, sourceNote.id, treeMatch.folderUri, treeMatch.rootId, parts).uri
+                        } catch (_: LinkedAssetAccessRequiredException) {
+                            null
+                        } catch (_: SecurityException) {
+                            null
+                        } catch (_: UnsupportedOperationException) {
+                            null
+                        } catch (_: java.io.FileNotFoundException) {
+                            null
+                        }
+                        if (indexedUri != null) {
+                            canonicalTreeDocumentKey(indexedUri)?.let(confirmedTreeDocumentKeys::add)
+                            val targetUri = documentAccess.resolve(indexedUri)
+                            return@withContext WorkspaceResolvedNote(targetUri, parts.last(), relJoined)
+                        }
+                        val candidateDocId = if (treeMatch.rootId.endsWith(':')) {
+                            "${treeMatch.rootId}$relJoined"
+                        } else {
+                            "${treeMatch.rootId.trimEnd('/')}/$relJoined"
+                        }
+                        val candidateUri = documentAccess.resolve(
+                            DocumentsContract.buildDocumentUriUsingTree(treeMatch.folderUri, candidateDocId),
+                        )
+                        if (!documentAccess.hasReadGrant(candidateUri)) {
+                            if (deniedTreeCandidate == null) deniedTreeCandidate = candidateUri
+                            continue
+                        }
+                        val readable = try {
+                            resolver.openInputStream(candidateUri)?.use { true } == true
+                        } catch (_: java.io.FileNotFoundException) {
+                            false
+                        } catch (error: Exception) {
+                            if (isDocumentAccessFailure(error) && deniedTreeCandidate == null) {
+                                deniedTreeCandidate = candidateUri
+                            }
+                            false
+                        }
+                        if (readable) {
+                            return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                        }
+                    }
+                    if (deniedTreeCandidate != null) {
+                        throw PromptWorkspaceNoteAccessException(deniedTreeCandidate)
+                    }
+                    throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+                }
+
+                val nonNullSourceUri = sourceUri ?: throw WorkspaceLinkException("Save this note before opening linked notes.")
+                val candidateLists = expandWorkspaceCandidatePaths("", cleaned, wikilink)
+                val documentId = runCatching { DocumentsContract.getDocumentId(nonNullSourceUri) }.getOrDefault("")
+                val sep = maxOf(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'))
+
+                linkedAssetUri(sourceNote, cleaned)?.let { grantedUri ->
+                    val resolvedGranted = documentAccess.resolve(grantedUri)
+                    val grantedReadable = documentAccess.hasReadGrant(resolvedGranted) &&
+                        runCatching { resolver.openInputStream(resolvedGranted)?.use { true } == true }.getOrDefault(false)
+                    if (grantedReadable) {
+                        val firstParts = candidateLists.first()
+                        return@withContext WorkspaceResolvedNote(resolvedGranted, firstParts.last(), firstParts.joinToString("/"))
+                    }
+                }
+
+                var deniedCandidate: Uri? = null
+                for (parts in candidateLists) {
+                    val relJoined = parts.joinToString("/")
+                    val siblingDocId = if (sep >= 0) documentId.substring(0, sep + 1) + relJoined else relJoined
+                    val rawCandidate = if (documentId.isNotEmpty() && nonNullSourceUri.authority != null) {
+                        DocumentsContract.buildDocumentUri(nonNullSourceUri.authority, siblingDocId)
+                    } else {
+                        nonNullSourceUri.buildUpon().path((nonNullSourceUri.path?.substringBeforeLast('/', "") ?: "") + "/" + relJoined).build()
+                    }
+                    val openMatch = mutable.value.tabs.firstOrNull { tab ->
+                        tab.uri?.let { existingUri -> sameDocumentUri(existingUri, rawCandidate.toString()) } == true
+                    }?.uri?.let(Uri::parse)
+                    val candidateUri = documentAccess.resolve(openMatch ?: rawCandidate)
+                    if (!documentAccess.hasReadGrant(candidateUri)) {
+                        if (deniedCandidate == null) deniedCandidate = candidateUri
+                        continue
+                    }
+                    val readable = try {
+                        resolver.openInputStream(candidateUri)?.use { true } == true
+                    } catch (_: java.io.FileNotFoundException) {
+                        false
+                    } catch (error: Exception) {
+                        if (isDocumentAccessFailure(error) && deniedCandidate == null) {
+                            deniedCandidate = candidateUri
+                        }
+                        false
+                    }
+                    if (readable) {
+                        return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                    }
+                }
+                if (deniedCandidate != null) {
+                    throw PromptWorkspaceNoteAccessException(deniedCandidate)
+                }
+                throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (prompt: PromptWorkspaceNoteAccessException) {
+            val targetStr = prompt.targetUri.toString()
+            if (trimmedFragment.isNotEmpty()) pendingAccessHeadings[targetStr] = trimmedFragment
+            val notice = requestDocumentAccess(targetStr, null, writing = false, explicit = true)
+            return JSONObject().put("opened", false).put("message", notice)
+        } catch (security: SecurityException) {
+            val msg = security.message ?: DOCUMENT_ACCESS_MESSAGE
+            mutable.value = mutable.value.copy(busy = false, message = msg)
+            return JSONObject().put("opened", false).put("message", msg)
+        } catch (error: WorkspaceLinkException) {
+            val msg = error.message ?: "Invalid relative note path."
+            mutable.value = mutable.value.copy(busy = false, message = msg)
+            return JSONObject().put("opened", false).put("message", msg)
+        }
+
+        return openNoteInternal(
+            resolved.uri,
+            resolved.relative,
+            headingFragment = trimmedFragment,
+            scheduleDirtyAutosave = true,
+            alwaysReportError = true,
+            errorPrefix = "Could not open linked note",
+        )
+    }
+
+    suspend fun openRelativeNote(documentPath: String, target: String, heading: String? = null): JSONObject =
+        openWorkspaceLink(documentPath, target, heading.orEmpty(), wikilink = false)
 
     suspend fun textAsset(document: String, source: String): JSONObject = withContext(Dispatchers.IO) {
         require(Uri.decode(source).substringBefore('?').substringBefore('#').substringAfterLast('.').lowercase() in setOf("mmd", "mermaid")) { "Choose a Mermaid source file" }
@@ -3384,8 +3672,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 check(target.renameTo(backupAsset)) { "Could not safely stage the current image" }
                 check(temporaryAsset.renameTo(target)) { backupAsset.renameTo(target); error("Could not stage the replacement image") }
                 replaced = true
+                media.invalidateLocalAsset(target)
                 if (!backup.contentEquals(incomingBytes) && target.lastModified() == previousModified && previousModified > 0L) {
                     target.setLastModified(maxOf(System.currentTimeMillis(), previousModified + 1_000L))
+                    media.invalidateLocalAsset(target)
                 }
                 stagedNote.outputStream().use { media.writeLocalPortable(it, note.content, note.assetDirectory) }
                 verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)
@@ -3403,6 +3693,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if (replaced) {
                     target.delete()
                     backupAsset.renameTo(target)
+                    media.invalidateLocalAsset(target)
                 }
                 throw error
             } finally {
@@ -3465,8 +3756,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val newData = media.portableImageData(mime, incomingBytes)
             val uri = Uri.parse(note.uri)
             val backup = resolver.openInputStream(uri)?.use { readLimited(it, 120_000_000) } ?: error("Cannot read the current portable note")
-            val diskNote = backup.inputStream().use(media::openFmd)
-            val diskAssetsDir = diskNote.directory
             val stagedNote = File(getApplication<Application>().cacheDir, "agent-attach-${UUID.randomUUID()}.smd.gz")
             var writeAttempted = false
             var openedDir: String? = null
@@ -3480,14 +3769,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 writeAttempted = false
             }
             try {
-                require(diskNote.markdown == note.saved && sameAssets(currentAssets, media.portableAssets(diskAssetsDir))) {
+                require(media.portableEnvelopeMatches(backup.inputStream(), note.saved, currentAssets)) {
                     "The portable note changed on disk; reopen it before attaching an image"
                 }
                 requireSameSnapshot()
-                val updated = JSONObject(currentAssets.toString()).put(newKey, newData)
-                stagedNote.outputStream().use { media.writeFmd(it, note.content, updated) }
+                val updated = JSONObject()
+                currentAssets.keys().forEach { key -> updated.put(key, currentAssets.getString(key)) }
+                updated.put(newKey, newData)
+                stagedNote.outputStream().use { media.writeFmd(it, note.content, updated, currentAssets) }
                 verifyExportHeader(stagedNote, NativeExportFormat.PORTABLE_SMD)
-                openedDir = stagedNote.inputStream().use(media::openFmd).directory
+                openedDir = media.materializePortableDirectory(
+                    updated,
+                    reuseFromDirectory = directory,
+                    predecodedBytes = mapOf(newKey to (mime to incomingBytes)),
+                )
                 val currentDiskBytes = resolver.openInputStream(uri)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot recheck the current portable note before saving")
                 require(currentDiskBytes.contentEquals(backup)) { "The portable note changed on disk; no changes were saved" }
@@ -3533,7 +3828,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 throw error
             } finally {
                 stagedNote.delete()
-                File(getApplication<Application>().filesDir, "portable-assets/$diskAssetsDir").deleteRecursively()
                 openedDir?.takeIf { it != mutable.value.tabs.find { tab -> tab.id == id }?.assetDirectory }
                     ?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
             }
@@ -3631,13 +3925,24 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
             val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
+            var materializedDirectory: String? = null
             try {
-                staged.outputStream().use { media.writeFmd(it, content, assets) }
-                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
-                // Extract assets independently so a saved draft can immediately resolve
-                // new portable references without carrying binary data in its state.
+                // Reuse existing extracted assets when unchanged; otherwise materialize only changed/new assets
+                // before writing the archive so new assets are Base64-decoded once rather than twice.
                 val rebinding = save || rebindId != null
-                val opened = if (rebinding) staged.inputStream().use(media::openFmd) else null
+                val nextDirectory = if (rebinding) {
+                    val reuseExisting = save && rebindId == null && note.assetDirectory != null &&
+                        media.hasExactLocalPortableAssets(note.assetDirectory, assets)
+                    if (reuseExisting) {
+                        note.assetDirectory!!
+                    } else {
+                        media.materializePortableDirectory(assets, reuseFromDirectory = note.assetDirectory).also {
+                            materializedDirectory = it
+                        }
+                    }
+                } else null
+                staged.outputStream().use { media.writeFmd(it, content, assets, savedPortableAssets[effectiveId]) }
+                verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
                 resolver.openOutputStream(destination, "wt")?.use { output -> staged.inputStream().use { it.copyTo(output) } } ?: error("Cannot write portable file")
                 documentAccess.persist(destination)
                 val savedName = if (rebindId != null) {
@@ -3650,7 +3955,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         portableDestinationIsNew = false
                         portableSaveAsNoteId = null
                         autosavePending.remove(effectiveId)
-                        recordPortableBaseline(effectiveId, opened!!.directory)
+                        recordPortableBaseline(effectiveId, nextDirectory!!)
                         change { s ->
                             s.copy(
                                 tabs = s.tabs.map {
@@ -3661,7 +3966,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                         assetsDirty = false,
                                         uri = destination.toString(),
                                         relative = openRel ?: it.relative,
-                                        assetDirectory = opened.directory,
+                                        assetDirectory = nextDirectory,
                                     ) else it
                                 },
                                 conflictedTabIds = s.conflictedTabIds - effectiveId,
@@ -3670,6 +3975,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                 message = if (rebindId != null) "Saved" else "Portable note saved",
                             )
                         }
+                        materializedDirectory = null
                         mutable.value.tabs.find { it.id == effectiveId }?.let(::remember)
                         if (openRel != null) mutable.value.folder?.let { listFolder(Uri.parse(it), listedRelative) }
                         if (closeAfterSaveNoteId == effectiveId) {
@@ -3682,7 +3988,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported")
                     }
                 }
-            } finally { staged.delete() }
+            } finally {
+                materializedDirectory?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
+                staged.delete()
+            }
         } }
         closeTargetId?.let { close(it) }
     }
