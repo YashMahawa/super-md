@@ -62,7 +62,7 @@ import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
-from workspace_links import WorkspaceLinkError, resolve_workspace_link
+from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 
 ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
@@ -715,6 +715,7 @@ class Session(QObject):
             self.closed_tabs=kept
             try:self.closed_note_store.save_index(kept)
             except OSError:pass
+        self.workspace_links = WorkspaceLinkCache()
 
     def is_quitting(self) -> bool:
         background = getattr(self, "background", None)
@@ -1348,6 +1349,7 @@ class Studio(QObject):
             if self.retired or error:return
             for old,new in result.items():self.session.locationChanged.emit(old,new or "")
             self._reload_changed_content(changed)
+            if self.folder:self.session.workspace_links.invalidate(self.folder)
             if self.folder and (self.folder in changed or set(self.expanded)&changed):self._load_tree()
         self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
 
@@ -3181,12 +3183,28 @@ class Studio(QObject):
                         target_tab["pendingHeading"] = pending_heading
                     else:
                         target_tab.pop("pendingHeading", None)
+                    if batch_insert is None:
+                        canon_existing_path = folder_ops.canonical_path_str(path)
+                        self.recent = [canon_existing_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_existing_path)][:29]
+                        self._preferences(notify=False)
                     was_active = self.active == target_tab["id"]
                     self._select_tab_from_open(target_tab["id"], activation_generation)
-                    if was_active and pending_heading:
-                        self._emit()
+                    if was_active:
+                        self._emit(bool(pending_heading))
+                    for window in list(self.session.windows.values()):
+                        if window is not self and not window.retired:
+                            window._emit(False)
                     self._focus_open_target(activation_generation)
-        found = next((t for t in self.tabs if t["path"] == str(path)), None)
+        def same_open_tab_path(tab_path: str) -> bool:
+            if not tab_path:
+                return False
+            if tab_path == str(path) or folder_ops.same_path(tab_path, path):
+                return True
+            try:
+                return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
+            except OSError:
+                return False
+        found = next((t for t in self.tabs if same_open_tab_path(t["path"])), None)
         if found:
             self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             self._restoring_paths.discard(str(path))
@@ -3203,7 +3221,7 @@ class Studio(QObject):
             content, assets, portable = result
             # A startup read and an explicit open may race for the same path.
             # Keep one tab and let only an explicit, still-current request focus it.
-            existing = next((tab for tab in self.tabs if tab["path"] == str(path)), None)
+            existing = next((tab for tab in self.tabs if same_open_tab_path(tab["path"])), None)
             if existing:
                 activate_existing(existing)
                 if completion_callback: completion_callback(existing, None)
@@ -3357,6 +3375,7 @@ class Studio(QObject):
             except OSError:
                 continue
         self.folder = root_str
+        self.session.workspace_links.invalidate(self.folder)
         self.expanded = valid_expanded
         self.session.window_workspaces[self.window_id] = {
             "folder": self.folder,
@@ -3516,6 +3535,7 @@ class Studio(QObject):
             return
         self._clear_folder_filter()
         self.folder = folder_ops.canonical_path_str(path)
+        self.session.workspace_links.invalidate(self.folder)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
         self._preferences()
@@ -3581,6 +3601,8 @@ class Studio(QObject):
     def closeFolder(self):
         self._tree_generation = getattr(self, "_tree_generation", 0) + 1
         self._clear_folder_filter()
+        if self.folder:
+            self.session.workspace_links.invalidate(self.folder)
         self.folder = ""
         self.files = []
         self.expanded.clear()
@@ -3897,6 +3919,7 @@ class Studio(QObject):
                 except OSError:
                     pass
                 if str(path) != original_path:
+                    self.session.workspace_links.invalidate(path.parent)
                     self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                     self._preferences()
                 if automatic and self._is_dirty(target): self.autosave_timer.start(900)
@@ -5226,6 +5249,7 @@ class Studio(QObject):
                         wikilink=wikilink,
                         note_path=note_path,
                         workspace_folder=folder,
+                        cache=self.session.workspace_links,
                     )
                 def resolve_done(resolved_path, error):
                     if self.retired:
@@ -5531,6 +5555,8 @@ class Studio(QObject):
                             self._agent_open_paths.add(str(Path(save_as).resolve()))
                         except OSError:
                             pass
+                        if path_changed:
+                            self.session.workspace_links.invalidate(Path(save_as).parent)
                         self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
                         self._preferences()
                         self.message = "Saved"
@@ -5636,7 +5662,16 @@ class Studio(QObject):
         try:
             if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
                 canonical = str(local_path(reference))
-                return next((item for item in self.tabs if item["path"] == canonical), None)
+                exact = next((item for item in self.tabs if item["path"] == canonical or (item["path"] and folder_ops.same_path(item["path"], canonical))), None)
+                if exact is not None:
+                    return exact
+                return next(
+                    (
+                        item for item in self.tabs
+                        if item["path"] and not Path(item["path"]).is_symlink() and os.path.samefile(item["path"], canonical)
+                    ),
+                    None,
+                )
         except OSError:
             pass
         return None

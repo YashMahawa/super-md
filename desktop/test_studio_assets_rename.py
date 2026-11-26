@@ -241,10 +241,32 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         self._wait_for(lambda: folder_ops.same_path(self.studio.folder, self.open_root))
         real_atomic_write = documents.atomic_write
         atomic_calls: list[Path] = []
-        with patch("studio.atomic_write", side_effect=lambda p, data: (atomic_calls.append(Path(p)), real_atomic_write(p, data))[1]):
+        invalidations: list[object] = []
+        orig_invalidate = self.session.workspace_links.invalidate
+        with (
+            patch("studio.atomic_write", side_effect=lambda p, data: (atomic_calls.append(Path(p)), real_atomic_write(p, data))[1]),
+            patch.object(self.session.workspace_links, "invalidate", side_effect=lambda root=None: (invalidations.append(root), orig_invalidate(root))[1]),
+        ):
             self.studio.createFolderNote(str(self.open_root), "Patched Note", "md")
             self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "Patched Note.md").is_file())
+            self.studio.createSubfolder(str(self.open_root), "Subfolder")
+            self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "Subfolder").is_dir())
+            self.studio.renameEntry(str(self.open_root / "Subfolder"), "RenamedSub")
+            self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "RenamedSub").is_dir())
+        self.assertEqual(invalidations, [self.studio.folder, self.studio.folder, None])
         self.assertIn((self.open_root / "Patched Note.md").resolve(), [p.resolve() for p in atomic_calls])
+        lightweight = SimpleNamespace(
+            folder=str(self.open_root), tabs=[], recent=[], active="", settings={}, message="", _activation_generation=0,
+            _agent_open_paths=set(), _agent_owned_files=set(), writes=None,
+            session=SimpleNamespace(locations={}, pinned=[], workspace={}, startup_paths=[], startup_active="", startup_entries=[]),
+            _save_positions=lambda: None, _preferences=lambda notify=True: None, _watch_notes=lambda force=False: None,
+            recovery_timer=SimpleNamespace(start=lambda _ms: None), _emit=lambda *a: None, _focus_open_target=lambda _g: None,
+            _note=lambda *a: {"id": "n1"}, _submit=lambda work, done, executor=None: done(work(), None),
+        )
+        studio_assets_rename.sync_path_change(lightweight, str(self.open_root / "a.md"), str(self.open_root / "b.md"), is_dir=False, message="Moved")
+        studio_assets_rename.create_subfolder(lightweight, str(self.open_root), "DoubleSub")
+        studio_assets_rename.create_folder_note(lightweight, str(self.open_root), "DoubleNote", "md")
+        self.assertTrue((self.open_root / "DoubleSub").is_dir() and (self.open_root / "DoubleNote.md").is_file())
         _, saved_assets, is_portable = open_note(smd_path)
         self.assertTrue(is_portable)
         self.assertEqual(set(saved_assets), {"assets/diagram.svg", "assets/pixel.png"})

@@ -32,9 +32,7 @@ def _fail_message(studio_obj: Any, text: str) -> None:
 def suspend_watches_for_prefix(studio_obj: Any, target_path: str, *, is_dir: bool) -> None:
     parent_str = folder_ops.canonical_path_str(Path(target_path).parent)
     def hit(candidate: str) -> bool:
-        return folder_ops.matches_path_prefix(candidate, target_path, is_directory=is_dir) or bool(
-            parent_str and folder_ops.same_path(candidate, parent_str)
-        )
+        return folder_ops.matches_path_prefix(candidate, target_path, is_directory=is_dir) or bool(parent_str and folder_ops.same_path(candidate, parent_str))
     for win in _session_windows(studio_obj):
         if getattr(win, "retired", False):
             continue
@@ -107,6 +105,9 @@ def sync_path_change(studio_obj: Any, old_path: str, new_path: str, *, is_dir: b
             entry["path"] = remap(entry["path"])
     if message:
         studio_obj.message = message
+    workspace_links = getattr(session, "workspace_links", None)
+    if workspace_links is not None:
+        workspace_links.invalidate()
     studio_obj._save_positions()
     studio_obj._preferences(notify=False)
     for win in _session_windows(studio_obj):
@@ -125,12 +126,8 @@ def sync_path_change(studio_obj: Any, old_path: str, new_path: str, *, is_dir: b
             win._start_folder_search()
         win._emit()
 
-def _resolve_new_folder_child(
-    open_folder: str, parent_path: str, raw_name: str, *, is_directory: bool, current_ext: str = "",
-) -> Path:
-    target_dir = folder_ops.resolve_within_open_folder(
-        open_folder, parent_path or open_folder, allow_root=True, must_exist=True
-    )
+def _resolve_new_folder_child(open_folder: str, parent_path: str, raw_name: str, *, is_directory: bool, current_ext: str = "") -> Path:
+    target_dir = folder_ops.resolve_within_open_folder(open_folder, parent_path or open_folder, allow_root=True, must_exist=True)
     if not target_dir.is_dir():
         raise ValueError("Choose an existing target folder.")
     target = target_dir / folder_ops.validate_entry_name(raw_name, is_directory=is_directory, current_ext=current_ext)
@@ -179,6 +176,9 @@ def create_folder_note(studio_obj: Any, parent_path: str, name: str, fmt: str = 
     def finished(created_path, error):
         if error or not created_path:
             return
+        workspace_links = getattr(getattr(studio_obj, "session", None), "workspace_links", None)
+        if workspace_links is not None:
+            workspace_links.invalidate(studio_obj.folder)
         created = Path(created_path)
         _expand_created_in_windows(studio_obj, created_path, created.parent, recover=False)
         existing = next((t for t in studio_obj.tabs if folder_ops.same_path(t["path"], created_path)), None)
@@ -218,6 +218,9 @@ def create_subfolder(studio_obj: Any, parent_path: str, name: str) -> None:
     def finished(created_dir, error):
         if error or not created_dir:
             return
+        workspace_links = getattr(getattr(studio_obj, "session", None), "workspace_links", None)
+        if workspace_links is not None:
+            workspace_links.invalidate(studio_obj.folder)
         created = Path(created_dir)
         _expand_created_in_windows(studio_obj, created_dir, created, recover=True)
         _fail_message(studio_obj, f"Created folder {created.name}")
@@ -256,10 +259,7 @@ def _execute_watched_rename(
         old_str, new_str, was_dir = result
         message = f"Renamed to {Path(new_str).name}"
         sync_fn = getattr(studio_obj, "_sync_path_change", None)
-        if callable(sync_fn):
-            sync_fn(old_str, new_str, is_dir=was_dir, message=message)
-        else:
-            sync_path_change(studio_obj, old_str, new_str, is_dir=was_dir, message=message)
+        return sync_fn(old_str, new_str, is_dir=was_dir, message=message) if callable(sync_fn) else sync_path_change(studio_obj, old_str, new_str, is_dir=was_dir, message=message)
 
     studio_obj._submit(work, finished, executor=studio_obj.writes)
 
@@ -330,10 +330,7 @@ def extra_asset_roots(studio_obj: Any) -> list[Path]:
         roots.append(Path(location))
     return roots
 
-def apply_saved_tab_assets(
-    studio_obj: Any, tab_id: str, path: Path, content_snapshot: str,
-    assets_snapshot: dict, updated: dict, stamp=None,
-) -> None:
+def apply_saved_tab_assets(studio_obj: Any, tab_id: str, path: Path, content_snapshot: str, assets_snapshot: dict, updated: dict, stamp=None) -> None:
     note_file_stamps = getattr(studio_obj, "note_file_stamps", None)
     if stamp and isinstance(note_file_stamps, dict):
         note_file_stamps[str(path)] = stamp
