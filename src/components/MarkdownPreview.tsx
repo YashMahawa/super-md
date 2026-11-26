@@ -12,6 +12,7 @@ import {parseBinaryTreeSource} from "./BinaryTree";
 import PythonCell from "./PythonCell";
 import SvgDiagram from "./SvgDiagram";
 import { navigateExternalLink, navigateHeading, navigateWorkspaceLink, remarkHeadingIds, UNSAVED_RELATIVE_NOTE_NOTICE } from "../documentNavigation";
+import { trustEquationHref } from "../equationReferences";
 import { classifyRenderedLink } from "../workspaceLinks";
 import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
@@ -99,7 +100,7 @@ export function remarkCallouts() {
 
 export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-diagram", "smd-steps", "smd-chart"] as const;
 export const PREVIEW_REMARK_PLUGINS: PluggableList = [remarkCallouts, remarkHeadingIds, remarkTaskPositions, remarkSourcePositions];
-export const PREVIEW_REHYPE_PLUGINS: PluggableList = [rehypeKatex, [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
+export const PREVIEW_REHYPE_PLUGINS: PluggableList = [[rehypeKatex, { trust: trustEquationHref }], [rehypeHighlight, { plainText: [...DIAGRAM_PLAIN_TEXT_LANGUAGES] }]];
 
 function AssetImage({ src = "", alt = "", documentPath, trustedImageHosts, onTrustImageHost, editable = false }: { src?: string; alt?: string; documentPath: string | null; trustedImageHosts: string[]; onTrustImageHost?: (host: string) => void; editable?: boolean }) {
   const isRemote = /^https?:\/\//i.test(src);
@@ -265,22 +266,42 @@ const MarkdownPreviewContext = createContext<MarkdownPreviewContextValue>({
 
 const MarkdownInput: Components['input'] = ({ node: _node, checked, ...props }) => {
   const { editable } = useContext(MarkdownPreviewContext);
-  return <input {...props} checked={props.type === 'checkbox' ? Boolean(checked) : checked} disabled={!editable} onChange={NOOP} />;
+  const isTaskCheckbox = props.type === 'checkbox';
+  return (
+    <input
+      {...props}
+      data-task-checkbox={isTaskCheckbox ? '' : undefined}
+      checked={isTaskCheckbox ? Boolean(checked) : checked}
+      disabled={!editable}
+      onChange={NOOP}
+    />
+  );
 };
 
 const MarkdownListItem: Components['li'] = ({ node, children, ...props }) => {
   const { liveStateRef } = useContext(MarkdownPreviewContext);
+  const rawTaskIndex = node?.properties?.['data-task-index'];
+  const hasTaskIndex = rawTaskIndex !== undefined && rawTaskIndex !== null;
   return (
     <li
       {...props}
       className={Array.isArray(node?.properties.className) ? node.properties.className.join(' ') : undefined}
-      onChange={event => {
+      onChange={hasTaskIndex ? event => {
+        const target = event.target;
+        if (
+          !(target instanceof HTMLInputElement) ||
+          target.type !== 'checkbox' ||
+          !target.hasAttribute('data-task-checkbox') ||
+          target.closest('li') !== event.currentTarget
+        ) {
+          return;
+        }
+        event.stopPropagation();
         const { tasks, onChange, markdown } = liveStateRef.current;
-        const index = Number(node?.properties['data-task-index']);
-        const offset = tasks[index];
-        if (offset === undefined || !onChange || !(event.target instanceof HTMLInputElement)) return;
-        onChange(markdown.slice(0, offset) + (event.target.checked ? 'x' : ' ') + markdown.slice(offset + 1));
-      }}
+        const offset = tasks[Number(rawTaskIndex)];
+        if (offset === undefined || !onChange) return;
+        onChange(markdown.slice(0, offset) + (target.checked ? 'x' : ' ') + markdown.slice(offset + 1));
+      } : undefined}
     >
       {children}
     </li>
