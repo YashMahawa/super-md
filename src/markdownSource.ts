@@ -307,6 +307,50 @@ function unmaskedRegexStage(source:string,ranges:Array<[number,number]>,regex:Re
   return {stage:replaceStage(source,edits),ranges:nextRanges};
 }
 
+function isUnmaskedEscaped(source:string,mask:Uint8Array,at:number):boolean {
+  let slashes=0;
+  for(let j=at-1;j>=0&&!mask[j]&&source[j]==='\\';j--)slashes++;
+  return (slashes&1)===1;
+}
+
+function stripPercentComments(source:string):Stage {
+  if(!source.includes('%%'))return {value:source,originalOffset:offset=>offset};
+  const mask=computeCodeMask(source),edits:Edit[]=[];
+  for(let i=0;i<source.length;){
+    if(mask[i]||source[i]!=='$'||isUnmaskedEscaped(source,mask,i)){i++;continue;}
+    if(source[i+1]==='$'&&!mask[i+1]){
+      if(source[i+2]==='$'){while(i<source.length&&source[i]==='$')i++;continue;}
+      let close=-1;
+      for(let j=i+2;j+1<source.length;j++){
+        if(!mask[j]&&!mask[j+1]&&source[j]==='$'&&source[j+1]==='$'&&source[j+2]!=='$'&&!isUnmaskedEscaped(source,mask,j)){close=j;break;}
+      }
+      if(close>=0){mask.fill(1,i,close+2);i=close+2;}else i+=2;
+      continue;
+    }
+    const next=source[i+1];
+    if(!next||/\s/.test(next)){i++;continue;}
+    let close=-1;
+    for(let j=i+1;j<source.length;j++){
+      if(source[j]==='\n'){
+        let k=j+1;while(k<source.length&&(source[k]===' '||source[k]==='\t'||source[k]==='\r'))k++;
+        if(source[k]==='\n')break;
+      }
+      if(!mask[j]&&source[j]==='$'&&source[j+1]!=='$'&&!isUnmaskedEscaped(source,mask,j)&&!/\s/.test(source[j-1])&&!/\d/.test(source[j+1]||'')){close=j;break;}
+    }
+    if(close>=0){mask.fill(1,i,close+1);i=close+1;}else i++;
+  }
+  const isDelim=(at:number)=>at+1<source.length&&source[at]==='%'&&source[at+1]==='%'&&!mask[at]&&!mask[at+1]&&!isUnmaskedEscaped(source,mask,at);
+  for(let i=0;i+1<source.length;){
+    if(!isDelim(i)){i++;continue;}
+    let close=-1;
+    for(let j=i+2;j+1<source.length;j++){if(isDelim(j)){close=j;break;}}
+    if(close<0)break;
+    edits.push({start:i,end:close+2,text:''});
+    i=close+2;
+  }
+  return edits.length?replaceStage(source,edits):{value:source,originalOffset:offset=>offset};
+}
+
 /** Render-only syntax normalization with a sparse offset map. Source positions
  * always address the original note, including frontmatter and wiki/callout edits. */
 export function normalizeMarkdownSource(markdown:string):Stage {
@@ -315,15 +359,38 @@ export function normalizeMarkdownSource(markdown:string):Stage {
   const fm=parseFrontmatter(value);
   if(fm)add(replaceStage(value,[{start:0,end:fm.end,text:''}]));
   else if(value.startsWith('\uFEFF'))add(replaceStage(value,[{start:0,end:1,text:''}]));
+  add(stripPercentComments(value));
   let ranges=unmaskedRangesFromMask(computeCodeMask(value));
   const addUnmasked=(regex:RegExp,replacement:(...args:any[])=>string)=>{const next=unmaskedRegexStage(value,ranges,regex,replacement);ranges=next.ranges;add(next.stage);};
-  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path,label)=>`![${label??path}](${encodeURI(path)})`);
+  addUnmasked(/!\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,path:string,spec?:string)=>{
+    const sized=spec&&/^(?:(.*)\|)?\s*(0*[1-9]\d*(?:\.\d+)?)\s*(?:x\s*\d+(?:\.\d+)?\s*)?$/i.exec(spec);
+    const alt=sized?(sized[1]?.trim()||path):(spec??path);
+    return `![${alt}](${encodeURI(path)})${sized?`{width=${sized[2]}}`:''}`;
+  });
   addUnmasked(/\[\[(#[^\[\r\n\]]+?)\]\]/g,(_all,target:string)=>{const [id,label]=target.split('|');return `[${label||id.slice(1)}](#${headingSlug(id.slice(1))})`;});
   addUnmasked(/\[\[([^\[\r\n\]|]+)(?:\|([^\r\n\]]+))?\]\]/g,(_all,target,label)=>`[${label??target}](${target.endsWith('.md')?target:`${target}.md`})`);
   add(normalizeCalloutBlocks(value,false));
   return {value,originalOffset(offset){for(let i=stages.length-1;i>=0;i--)offset=stages[i].originalOffset(offset);return offset;}};
 }
 export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown).value;}
+
+export function remarkImageAttributes() {
+  return (tree:any)=>{
+    visit(tree,(parent:any)=>{
+      if(!Array.isArray(parent.children))return;
+      for(let i=0;i<parent.children.length-1;i++){
+        const current=parent.children[i],next=parent.children[i+1];
+        if((current?.type==='image'||current?.type==='imageReference')&&next?.type==='text'&&typeof next.value==='string'){
+          const stripped=next.value.replace(/^\{[^}\r\n]*\b(?:width|zoom)\s*=\s*[^}\r\n]+\}/i,'');
+          if(stripped!==next.value){
+            if(stripped)parent.children[i+1]={...next,value:stripped};
+            else parent.children.splice(i+1,1);
+          }
+        }
+      }
+    });
+  };
+}
 
 export function remarkSourceSyntax(this:any){
   const parser=this.parser;

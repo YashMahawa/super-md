@@ -162,6 +162,7 @@ ApplicationWindow {
         self.assertIsNotNone(win, str(comp.errors()))
         try:
             QTest.qWait(40)
+            win.grabWindow()
             banner = win.findChild(QObject, 'conflictBanner')
             editor = win.findChild(QObject, 'editorPlaceholder')
             self.assertIsNotNone(banner)
@@ -171,6 +172,7 @@ ApplicationWindow {
             self.studio.tabs[0]['conflict'] = True
             self.studio._emit(False)
             QTest.qWait(60)
+            win.grabWindow()
             self.assertTrue(banner.property('visible'))
             self.assertEqual(win.property('modalDialogCount'), 0)
             self.assertLessEqual(banner.mapToScene(QPointF(0, banner.height())).y(), editor.mapToScene(QPointF(0, 0)).y() + 1)
@@ -181,6 +183,11 @@ ApplicationWindow {
             self.assertEqual(save_as_btn.property('text'), 'Save as')
             self.assertEqual(reload_btn.property('text'), 'Reload from disk')
             self.assertEqual(overwrite_btn.property('text'), 'Overwrite')
+            banner_bg = banner.property('background')
+            banner_img = win.grabWindow()
+            banner_scale = banner_img.width() / win.width()
+            banner_pt = banner_bg.mapToScene(QPointF(8, banner_bg.height() / 2))
+            self.assertEqual(banner_img.pixelColor(round(banner_pt.x() * banner_scale), round(banner_pt.y() * banner_scale)).name(), QColor(self.studio.palette['surface-high']).name())
 
             # Open the guarded Save conflict dialog and verify its opaque surface and buttons.
             from PySide6.QtCore import QMetaObject
