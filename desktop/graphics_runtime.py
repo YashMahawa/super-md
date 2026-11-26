@@ -12,6 +12,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from core.paths import DESKTOP_DIR
+
 PROBE_TIMEOUT = 8
 
 
@@ -53,7 +55,7 @@ def painted_document(image) -> bool:
 def command() -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, "--graphics-probe"]
-    return [sys.executable, str(Path(__file__).with_name("main.py")), "--graphics-probe"]
+    return [sys.executable, str(DESKTOP_DIR / "main.py"), "--graphics-probe"]
 
 
 def software_environment(env: dict[str, str]) -> None:
