@@ -12,7 +12,9 @@ internal class OpenRequestGate {
 }
 
 /** Retains pending files in latest-activation order until the reader bridge is ready. */
-internal class OpenIntentDispatcher<T> {
+internal class OpenIntentDispatcher<T>(
+    private val sameTarget: (T, T) -> Boolean = { left, right -> left == right },
+) {
     data class Request<T>(val target: T, val relative: String? = null)
     fun interface Handler<T> { fun open(target: T, relative: String?) }
 
@@ -25,7 +27,7 @@ internal class OpenIntentDispatcher<T> {
             current.open(target, relative)
             return
         }
-        val duplicate = pending.indexOfFirst { it.target == target }
+        val duplicate = pending.indexOfFirst { sameTarget(it.target, target) }
         val request = Request(target, relative)
         if (duplicate >= 0) pending.removeAt(duplicate)
         pending += request
