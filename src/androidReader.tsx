@@ -50,7 +50,7 @@ import {applyCustomStyle,type CustomStyle} from './customTheme';
 import {isTypewriterShortcutEvent,setTypewriterScroll} from './typewriterScroll';
 import {computeAgentDocumentRequest,useReaderAgentRuntime} from './readerAgentRuntime';
 import {parseImportedAnchor,useSharedSourceAnchor,useSharedSourceAnchorRefs,type NoteView,type PendingHeadingNavigation} from './useSharedSourceAnchor';
-import {useReaderGesturesAndZoom} from './useReaderGesturesAndZoom';
+import {useReaderGestureControls,useReaderGesturesAndZoom} from './useReaderGesturesAndZoom';
 export {computeAgentDocumentRequest};
 const DocumentPreview = memo(MarkdownPreview);
 const LiveDocument = memo(LiveEditor);
@@ -125,7 +125,8 @@ export function Reader() {
   const customLayout=useRef<{id:string;mode:string;metrics:string}|null>(null);
   const anchorRefs=useSharedSourceAnchorRefs();
   const {noteViews,savePosition,modeAnchor,splitPane,suppressedRestoreKey}=anchorRefs;
-  const {zoomReference,zoomTarget,settleSelection,anchors,applyZoomStyle,anchored,cancelZoomGlide,clearViewportGestures,zoomBy,setZoom,resetZoom,handleNativeWheel}=useReaderGesturesAndZoom({state,reference,splitPane});
+  const gestureControls=useReaderGestureControls({reference,splitPane});
+  const {zoomReference,zoomTarget,settleSelection,anchors,applyZoomStyle,anchored,cancelZoomGlide,clearViewportGestures,zoomBy,setZoom,resetZoom,handleNativeWheel}=gestureControls;
   const update = useCallback((content: string,changes?:SourceChange[]) => {
     const previous=reference.current!;
     if(content===previous.content)return;
@@ -503,6 +504,7 @@ export function Reader() {
   // ResizeObserver updates the content extent without changing magnification.
   }, [state?.id,state?.mode,state?.dark,state?.fullscreen,state?.font,state?.size,
       state?.widthPercent,state?.lineHeight,state?.motion,state?.imageAppearance,state?.svgAppearance,state?.imageContrast,JSON.stringify(state?.colors),JSON.stringify(state?.customStyle)]);
+  useReaderGesturesAndZoom({state,reference,controls:gestureControls});
   useEffect(()=>{
     if(!state || isBuiltinReaderFont(state.font) || !window.SuperMD || typeof FontFace==="undefined")return;
     const family=state.font;

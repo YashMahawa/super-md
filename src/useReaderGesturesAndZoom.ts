@@ -12,9 +12,9 @@ import { rememberWindowedScrollSource } from "./windowedSearch";
 import { clampPreviewZoom } from "./zoom";
 
 export interface GesturesReaderState { id: string; content: string; mode: AnchorViewMode; fullscreen: boolean; widthPercent?: number; centerLock?: boolean }
-export interface UseReaderGesturesAndZoomOptions { state: GesturesReaderState | null; reference: RefObject<GesturesReaderState | null>; splitPane: RefObject<SplitAnchorPane | null> }
+export interface UseReaderGestureControlsOptions { reference: RefObject<GesturesReaderState | null>; splitPane: RefObject<SplitAnchorPane | null> }
 
-export function useReaderGesturesAndZoom({ state, reference, splitPane }: UseReaderGesturesAndZoomOptions) {
+export function useReaderGestureControls({ reference, splitPane }: UseReaderGestureControlsOptions) {
   const zoomReference = useRef(100), zoomGestureAt = useRef(0), cursor = useRef<Point | undefined>(undefined);
   const zoomFrame = useRef(0), zoomTimer = useRef(0), zoomFocus = useRef<Point | undefined>(undefined), zoomTarget = useRef<number | null>(null);
   const zoomAnchors = useRef<{ focus?: Point; points: Map<HTMLElement, Point | null> }>({ points: new Map() });
@@ -118,11 +118,28 @@ export function useReaderGesturesAndZoom({ state, reference, splitPane }: UseRea
     if (scroller) { noteSplitWheelTarget(scroller); nativeScroll.current!.scroll(scroller, dx, dy); }
   };
 
-  useLayoutEffect(() => () => {
-    nativeScroll.current?.clear();
-    cancelZoomGlide();
-    window.clearTimeout(settleTimer.current);
-  }, []);
+  return {
+    refs: { cursor, zoomFrame, zoomTimer, settleTimer, selectingText, gapSelection, nativeScroll, zoomGestureAt, requestChrome },
+    zoomReference,
+    zoomTarget,
+    settleSelection,
+    anchors,
+    applyZoomStyle,
+    anchored,
+    cancelZoomGlide,
+    clearViewportGestures,
+    zoomBy,
+    setZoom,
+    resetZoom,
+    handleNativeWheel,
+  };
+}
+
+export type ReaderGestureControls = ReturnType<typeof useReaderGestureControls>;
+
+export function useReaderGesturesAndZoom({ state, reference, controls }: { state: GesturesReaderState | null; reference: RefObject<GesturesReaderState | null>; controls: ReaderGestureControls }): void {
+  const { zoomReference, zoomTarget, settleSelection, applyZoomStyle, cancelZoomGlide, zoomBy } = controls;
+  const { cursor, zoomFrame, zoomTimer, settleTimer, selectingText, gapSelection, nativeScroll, zoomGestureAt, requestChrome } = controls.refs;
 
   useEffect(() => {
     const root = document.querySelector<HTMLElement>(".android-reading");
@@ -267,18 +284,9 @@ export function useReaderGesturesAndZoom({ state, reference, splitPane }: UseRea
     };
   }, []);
 
-  return {
-    zoomReference,
-    zoomTarget,
-    settleSelection,
-    anchors,
-    applyZoomStyle,
-    anchored,
-    cancelZoomGlide,
-    clearViewportGestures,
-    zoomBy,
-    setZoom,
-    resetZoom,
-    handleNativeWheel,
-  };
+  useLayoutEffect(() => () => {
+    nativeScroll.current?.clear();
+    cancelZoomGlide();
+    window.clearTimeout(settleTimer.current);
+  }, []);
 }

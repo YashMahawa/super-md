@@ -1,15 +1,20 @@
 // @vitest-environment jsdom
-import { act, useRef } from "react";
+import { act, useLayoutEffect, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { SharedSourceAnchor } from "./sourceAnchor";
 
-const { applySharedAnchorMock, primeEditorAnchorMock } = vi.hoisted(() => ({
+const { applySharedAnchorMock, primeEditorAnchorMock, readingOffsetMock } = vi.hoisted(() => ({
   applySharedAnchorMock: vi.fn(),
   primeEditorAnchorMock: vi.fn(),
+  readingOffsetMock: vi.fn(() => 14),
 }));
 
 vi.mock("./nativeBridge", () => ({ invoke: vi.fn(async () => null) }));
+vi.mock("./readingPosition", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./readingPosition")>();
+  return { ...actual, readingOffset: readingOffsetMock };
+});
 vi.mock("./sourceAnchor", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./sourceAnchor")>();
   return { ...actual, applySharedAnchor: applySharedAnchorMock, primeEditorAnchor: primeEditorAnchorMock };
@@ -22,6 +27,7 @@ import {
   type SharedAnchorReaderState,
   type SharedSourceAnchorRefs,
 } from "./useSharedSourceAnchor";
+import { useReaderGestureControls, useReaderGesturesAndZoom, type GesturesReaderState } from "./useReaderGesturesAndZoom";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
@@ -34,6 +40,8 @@ beforeEach(() => {
   vi.useFakeTimers();
   applySharedAnchorMock.mockReset();
   primeEditorAnchorMock.mockReset();
+  readingOffsetMock.mockReset();
+  readingOffsetMock.mockReturnValue(14);
   frames = new Map();
   frameSeq = 0;
   vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => { frames.set(++frameSeq, cb); return frameSeq; });
@@ -122,4 +130,46 @@ it("unifies modeAnchor (allowExactTop: false) and resolvedAnchor (allowExactTop:
   act(() => flushNextFrame());
   act(() => { vi.advanceTimersByTime(1000); });
   expect(applySharedAnchorMock).toHaveBeenCalledTimes(2);
+
+  // External scroll (e.g. Element.scrollIntoView) in split mode stops later timers and records preview pane.
+  applySharedAnchorMock.mockClear();
+  const reading = host!.querySelector<HTMLElement>(".android-reading")!;
+  Object.defineProperties(reading, {
+    clientWidth: { value: 600, configurable: true },
+    clientHeight: { value: 400, configurable: true },
+    scrollHeight: { value: 2400, configurable: true },
+  });
+  applySharedAnchorMock.mockImplementationOnce(() => { reading.scrollTop = 300; });
+  refs.modeAnchor.current = { offset: 14, mode: "live", zoom: 120, readingTop: 300 };
+  act(() => root!.render(<Harness state={{ id: "note-2", content: "# Second\nText", path: null, mode: "split" }} />));
+  expect(applySharedAnchorMock).toHaveBeenCalledTimes(1);
+  reading.scrollTop = 920;
+  readingOffsetMock.mockReturnValue(88);
+  reading.dispatchEvent(new Event("scroll"));
+  act(() => flushNextFrame());
+  act(() => { vi.advanceTimersByTime(1000); });
+  expect(applySharedAnchorMock).toHaveBeenCalledTimes(1);
+  expect(refs.splitPane.current).toBe("preview");
+});
+
+it("runs useReaderGesturesAndZoom centerLock layout sync after host CSS/fullscreen layout effect", () => {
+  const order: string[] = [];
+  function OrderHarness({ state }: { state: GesturesReaderState | null }) {
+    const reference = useRef<GesturesReaderState | null>(state);
+    reference.current = state;
+    const splitPane = useRef<"editor" | "preview" | null>(null);
+    const controls = useReaderGestureControls({ reference, splitPane });
+    const origApply = controls.applyZoomStyle;
+    controls.applyZoomStyle = (...args) => { order.push(`zoom:${document.documentElement.dataset.fullscreen}`); origApply(...args); };
+    useLayoutEffect(() => {
+      if (!state) return;
+      document.documentElement.dataset.fullscreen = String(state.fullscreen);
+      order.push(`host:${document.documentElement.dataset.fullscreen}`);
+    }, [state?.id, state?.fullscreen]);
+    useReaderGesturesAndZoom({ state, reference, controls });
+    return null;
+  }
+  act(() => root!.render(<OrderHarness state={null} />));
+  act(() => root!.render(<OrderHarness state={{ id: "n1", content: "text", mode: "reader", fullscreen: true, centerLock: false }} />));
+  expect(order).toEqual(["host:true", "zoom:true"]);
 });
