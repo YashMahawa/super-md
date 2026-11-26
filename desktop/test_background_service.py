@@ -1,4 +1,5 @@
-import asyncio, hashlib, json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
+import asyncio, contextlib, hashlib, io, json, os, shutil, subprocess, sys, tempfile, threading, time, unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -629,11 +630,45 @@ class BackgroundTests(unittest.TestCase):
             finally:
                 reopened_gui_session.writes.shutdown(wait=True)
 
+        # 6. On macOS (`darwin`), spawning the background daemon uses `process_group=0` (`setpgid`)
+        #    rather than `start_new_session=True` (`setsid`) so Mach bootstrap namespaces stay intact.
+        appdata_darwin = make_env("Profile Z — Darwin Spawn Session")
+        captured_popen = {}
+
+        class _DoneProc:
+            def poll(self):
+                return 0
+
+        def _capture_darwin_popen(cmd, **kwargs):
+            captured_popen["cmd"] = cmd
+            captured_popen["kwargs"] = kwargs
+            return _DoneProc()
+
+        with patch.object(
+            QStandardPaths,
+            "writableLocation",
+            side_effect=lambda k, p=appdata_darwin: str(p) if k == QStandardPaths.StandardLocation.AppDataLocation else orig_writable(k),
+        ), patch("instance.posix_ipc_exchange", side_effect=[
+            (False, b"", True),
+            (True, b'{"ok":true,"running":true,"agentAccess":true}\n', True),
+        ]), patch.object(background_cli.sys, "platform", "darwin"), patch.object(
+            background_cli.subprocess, "Popen", side_effect=_capture_darwin_popen
+        ), redirect_stdout(io.StringIO()):
+            rc = background_cli.main(["start"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured_popen["kwargs"].get("process_group"), 0)
+        self.assertFalse(captured_popen["kwargs"].get("start_new_session", False))
+
 
 _HEADLESS_DAEMON_BOOTSTRAP = """
-import faulthandler, os, sys, time
+import faulthandler, os, signal, sys, time
 from pathlib import Path
 faulthandler.enable()
+if hasattr(faulthandler, "register") and hasattr(signal, "SIGTRAP"):
+    try:
+        faulthandler.register(signal.SIGTRAP, all_threads=True)
+    except (OSError, RuntimeError, ValueError):
+        pass
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["QT_QUICK_BACKEND"] = "software"
@@ -643,6 +678,14 @@ os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 appdata = os.environ["SUPERMD_TEST_APPDATA"]
 downloads = os.environ["SUPERMD_TEST_DOWNLOADS"]
 desktop_dir = os.environ["SUPERMD_TEST_DESKTOP_DIR"]
+diag_path = Path(appdata) / "daemon-diag.log"
+def _diag(stage):
+    try:
+        with diag_path.open("a", encoding="utf-8") as dfh:
+            dfh.write(f"{time.monotonic():.3f} pid={os.getpid()} {stage}\\n")
+    except OSError:
+        pass
+_diag("boot")
 cache_dir = str(Path(appdata) / "cache")
 xdg_data_dir = str(Path(appdata) / "xdg-data")
 Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -675,8 +718,10 @@ python_runtime.discover = lambda *_a, **_kw: []
 
 from studio import Studio
 Studio._restore_update = lambda self: None
+_diag("patched")
 
 import main as desktop_main
+_diag("imported_main")
 sys.argv = [str(Path(desktop_dir) / "main.py"), "--background", "--agent-access", "--safe-graphics"]
 desktop_main._exit_process(desktop_main.main())
 """

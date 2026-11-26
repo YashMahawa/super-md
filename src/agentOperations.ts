@@ -1,6 +1,7 @@
 /** Bounded, renderer-independent operations used by live agents. Character
  * offsets are Unicode code points, matching the Python CLI (not UTF-16). */
 import {analyzeDocument} from './documentAnalysis';
+import {normalizeFenceInfoLanguage} from './fenceLanguage';
 export type AgentPatch = {type:'replace';old:string;new:string;count?:1|'all';expectedCount?:number} | {type:'lines';start_line:number;end_line:number;text:string} | {type:'insert';line:number;text:string};
 const encoder=new TextEncoder(),utf8Scratch=new Uint8Array(65_536);
 const CHECKPOINT_SHIFT=9,CHECKPOINT_STRIDE=1<<CHECKPOINT_SHIFT,MAX_INDEX_ENTRIES=8,MAX_INDEX_UTF16_UNITS=24_000_000;
@@ -396,7 +397,7 @@ function collectFenceSpans(source:string,includeDiagrams:boolean):SvgSpan[] {
       if(fence){
         const marker=fence[1][0],length=fence[1].length;
         if(!open){
-          const language=body.slice(fence[0].length).trim().split(/\s+/,1)[0]?.toLowerCase()??'';
+          const language=normalizeFenceInfoLanguage(body.slice(fence[0].length));
           const matched=includeDiagrams?['svg','svg+xml','image/svg+xml','mermaid','smd-chart'].includes(language):['svg','svg+xml','image/svg+xml'].includes(language);
           open={marker,length,start:position+lineChars,startUtf16:lineEnd,lineStart:lineNumber+1,matched,probe:''};
         }else if(marker===open.marker&&length>=open.length){

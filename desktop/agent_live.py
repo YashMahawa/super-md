@@ -466,7 +466,15 @@ def _qt_bridge_class():
                     except Exception as error:
                         self._reply(500, {"error": f"desktop request failed ({type(error).__name__})"})
 
-            self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            class _LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+                def server_bind(self):
+                    import socketserver
+                    socketserver.TCPServer.server_bind(self)
+                    host, port = self.server_address[:2]
+                    self.server_name = str(host)
+                    self.server_port = int(port)
+
+            self.server = _LoopbackHTTPServer(("127.0.0.1", 0), Handler)
             self.server.daemon_threads = True
             self.server.timeout = 0.5
             self.server.request_queue_size = 8

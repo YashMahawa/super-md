@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 from pathlib import Path
-from PySide6.QtCore import QDir, QLockFile, QMetaMethod, QObject, QStandardPaths, QTimer, QUrl, Qt, Signal, Slot
+from PySide6.QtCore import QCoreApplication, QDir, QLockFile, QMetaMethod, QObject, QStandardPaths, QTimer, QUrl, Qt, Signal, Slot
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 _PROCESS_EXIT_LOCKS = []
@@ -391,6 +391,10 @@ class _PosixLocalServer(QObject):
                 enqueued = True
             try:
                 self.newConnection.emit()
+                app_inst = QCoreApplication.instance()
+                dispatcher = app_inst.eventDispatcher() if app_inst is not None else None
+                if dispatcher is not None:
+                    dispatcher.wakeUp()
             except RuntimeError:
                 pass
         finally:

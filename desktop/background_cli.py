@@ -178,14 +178,15 @@ def main(argv):
                         break
         if not running and not lock_cleared:
             raise ValueError('Background service did not start; previous instance is still shutting down')
-        proc=None
+        proc=None;daemon_exit_code=None
         if not running:
             flags=(subprocess.CREATE_NEW_PROCESS_GROUP|getattr(subprocess,'CREATE_NO_WINDOW',0)) if os.name=='nt' else 0
+            popen_session={'process_group':0} if sys.platform=='darwin' else {'start_new_session':os.name!='nt'}
             log_path=root/'background-service.log'
             had_legacy_log=log_path.is_file()
             spawn_env=None if had_legacy_log else {**os.environ,'SUPERMD_FRESH_SERVICE_LOG':'1'}
             with log_path.open('ab') as log:
-                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=spawn_env,start_new_session=os.name!='nt',creationflags=flags)
+                proc=subprocess.Popen(_daemon_command(),stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=spawn_env,creationflags=flags,**popen_session)
             deadline=time.monotonic()+30
             while time.monotonic()<deadline:
                 status=request('status',startup_poll=True)
@@ -197,12 +198,15 @@ def main(argv):
                 if proc is not None:
                     exit_code=proc.poll()
                     if type(exit_code) is int:
+                        daemon_exit_code=exit_code
                         status=request('status',startup_poll=True)
                         if status is not None and status.get('ok',False) and status.get('running'):
                             running=True
                         break
                 time.sleep(.2)
-        if not running:raise ValueError('Background service did not start; inspect its local log')
+        if not running:
+            detail=f' (exit code {daemon_exit_code})' if daemon_exit_code is not None else ''
+            raise ValueError(f'Background service did not start{detail}; inspect its local log')
     result={'running':running,'action':args.action}
     if running:result['sessionsDirectory']=sessions_dir
     print(json.dumps({'ok':True,'result':result}));return 0

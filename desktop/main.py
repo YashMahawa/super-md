@@ -149,10 +149,15 @@ def main():
     app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
     bundle_handler = ReaderBundleSchemeHandler(ROOT / "dist", app)
-    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
-    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
-    reader_profile_ready = {"initialized": True}
-    session.ensure_reader_profile = lambda: None
+    reader_profile_ready = {"initialized": False}
+    def ensure_reader_profile():
+        if reader_profile_ready["initialized"]:
+            return
+        profile = QWebEngineProfile.defaultProfile()
+        profile.installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
+        profile.installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
+        reader_profile_ready["initialized"] = True
+    session.ensure_reader_profile = ensure_reader_profile
     def detach_window(source_id, tab_id):
         source = session.windows.get(source_id)
         if not source or not source._can_move(): return
@@ -173,6 +178,10 @@ def main():
     def create_window(note=None, *, show_window=True):
         engine = QQmlApplicationEngine()
         studio = Studio(args.test_state,session)
+        if show_window:
+            ensure_reader_profile()
+        else:
+            studio._defer_reader_activation = True
         if args.smoke:
             studio.settings["welcomed"] = True
             studio.mode = "reader"
@@ -512,6 +521,8 @@ def main():
     def open_from_service(note=None):
         hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
         if hidden is not None:
+            ensure_reader_profile()
+            hidden._defer_reader_activation = False
             remembered = session.settings.get("window") or {}
             if isinstance(remembered, dict) and remembered.get("maximized"):
                 hidden.host_window.showMaximized()
