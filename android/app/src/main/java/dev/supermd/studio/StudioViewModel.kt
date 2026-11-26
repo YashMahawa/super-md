@@ -3687,8 +3687,43 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         closeTargetId?.let { close(it) }
     }
     fun importDropped(uris: List<Uri>, id: String, result: (JSONArray?) -> Unit) = viewModelScope.launch {
-        try { val images = withContext(Dispatchers.IO) { media.importUris(uris) }; markAssetsDirty(id); if (mutable.value.active.id == id) result(images) else { val insertion = (0 until images.length()).joinToString("\n\n") { i -> val image = images.getJSONObject(i); "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)" }; val note = mutable.value.tabs.find { it.id == id }; if (note != null) edit(id, note.content + "\n\n" + insertion + "\n"); result(null) } }
-        catch (error: Exception) { fail("Could not insert image: ${error.message}"); result(null) }
+        if (uris.isEmpty()) {
+            mutable.value = mutable.value.copy(message = MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE)
+            result(null)
+            return@launch
+        }
+        try {
+            val batch = withContext(Dispatchers.IO) { media.importDroppedUris(uris) }
+            val images = batch.images
+            if (images.length() == 0) {
+                mutable.value = mutable.value.copy(message = MediaStorage.UNSUPPORTED_DROP_IMAGE_MESSAGE)
+                result(null)
+                return@launch
+            }
+            markAssetsDirty(id)
+            if (batch.skippedCount > 0) {
+                val skippedMessage = if (batch.skippedCount == 1) {
+                    "Skipped 1 unsupported file; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
+                } else {
+                    "Skipped ${batch.skippedCount} unsupported files; only PNG, JPEG, GIF, WebP, AVIF, and SVG images were imported."
+                }
+                mutable.value = mutable.value.copy(message = skippedMessage)
+            }
+            if (mutable.value.active.id == id) {
+                result(images)
+            } else {
+                val insertion = (0 until images.length()).joinToString("\n\n") { i ->
+                    val image = images.getJSONObject(i)
+                    "![${image.getString("alt").replace("[", "\\[").replace("]", "\\]")}](<${image.getString("source")}>)"
+                }
+                val note = mutable.value.tabs.find { it.id == id }
+                if (note != null) edit(id, note.content + "\n\n" + insertion + "\n")
+                result(null)
+            }
+        } catch (error: Exception) {
+            fail("Could not insert image: ${error.message}")
+            result(null)
+        }
     }
     internal suspend fun export(
         content: String,

@@ -340,7 +340,15 @@ export default function App() {
   }, [closeWindow]);
   const newDocument = useCallback(() => setDocuments((current) => addTab(current)), []);
   const insertMedia = useCallback((text: string, point?: InsertionPoint) => {
-    setDocuments((current) => { const tab = current.tabs.find((t) => t.id === current.activeId)!; const from = Math.max(0, Math.min(point?.from ?? tab.content.length, tab.content.length)); const to = Math.max(from, Math.min(point?.to ?? from, tab.content.length)); return editTab(current, tab.id, tab.content.slice(0, from) + text + tab.content.slice(to)); });
+    const targetId = documentsRef.current.activeId;
+    setDocuments((current) => {
+      if (current.activeId !== targetId) return current;
+      const tab = current.tabs.find((t) => t.id === targetId);
+      if (!tab) return current;
+      const from = Math.max(0, Math.min(point?.from ?? tab.content.length, tab.content.length));
+      const to = Math.max(from, Math.min(point?.to ?? from, tab.content.length));
+      return editTab(current, tab.id, tab.content.slice(0, from) + text + tab.content.slice(to));
+    });
   }, []);
   const open = useCallback(async () => {
     if (openingRef.current) return;
@@ -704,7 +712,7 @@ export default function App() {
       </motion.aside></motion.div>}</AnimatePresence>
       {showWelcome && <WelcomeSetup theme={normalTheme} onTheme={setNormalTheme} readerFont={readerFont} onReaderFont={setReaderFont} motionEnabled={motionEnabled} onMotion={(enabled) => setReduceMotion(!enabled)} onFinish={(openFile) => { localStorage.setItem("setup.complete", "true"); localStorage.removeItem("setup.started"); setShowWelcome(false); if (openFile) window.setTimeout(() => open(), 100); }} />}
       <ImageViewer />
-      <MediaTools key={activeTab.id} documentId={activeTab.id} content={content} documentPath={path} onInsert={insertMedia} onNotice={flash} />
+      <MediaTools documentId={activeTab.id} content={content} documentPath={path} onInsert={insertMedia} onNotice={flash} />
     </div>
     </MotionConfig>
   );
