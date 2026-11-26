@@ -648,3 +648,62 @@ test("double-click editing in Live opens the editor in place without jumping",as
   expect(Math.abs((await editor.boundingBox())!.y-before)).toBeLessThan(3);
   await expect(editor).toHaveValue(/Part 30/);
 });
+test("nested task checkboxes toggle independently and study sliders inside checked tasks leave tasks checked",async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:(id,command,args)=>{
+    if(command==="document_changed"){
+      const list=((window as any).docChanges ??= []);
+      list.push(JSON.parse(args).content);
+    }
+    queueMicrotask(()=>window.supermdReply?.(id,true,null));
+  }};});
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(()=>typeof window.supermdLoad==="function");
+  const chart=JSON.stringify({title:"Harmonic study",series:[{expression:"a * sin(x)"}],sliders:[{name:"a",label:"Amplitude",min:0.5,max:3,step:0.5,value:1}]});
+  const initial=[
+    "# Nested Study Tasks",
+    "",
+    "- [x] Outer study goal",
+    "  - [ ] First nested checkpoint",
+    "    - [x] Deep sub-checkpoint",
+    "  - [x] Tune study slider task",
+    "",
+    "    ```smd-chart",
+    `    ${chart}`,
+    "    ```",
+  ].join("\n");
+  for(const mode of ["reader","live"] as const){
+    await page.evaluate(({content,mode})=>{
+      (window as any).docChanges=[];
+      window.supermdLoad?.({id:`nested-tasks-${mode}`,content,path:null,mode,dark:false,fullscreen:false,colors:{},font:"Manrope",size:18,zoom:100,motion:false});
+    },{content:initial,mode});
+    const checkboxes=page.locator('.markdown-body input[type="checkbox"][data-task-checkbox]');
+    await expect(checkboxes).toHaveCount(4);
+    await expect(checkboxes.nth(0)).toBeChecked();
+    await expect(checkboxes.nth(1)).not.toBeChecked();
+    await expect(checkboxes.nth(2)).toBeChecked();
+    await expect(checkboxes.nth(3)).toBeChecked();
+
+    await checkboxes.nth(1).click();
+    await expect(checkboxes.nth(0)).toBeChecked();
+    await expect(checkboxes.nth(1)).toBeChecked();
+    await expect(checkboxes.nth(2)).toBeChecked();
+    await expect(checkboxes.nth(3)).toBeChecked();
+    expect(await page.evaluate(()=>(window as any).docChanges.length)).toBe(1);
+    expect(await page.evaluate(()=>(window as any).docChanges.at(-1))).toBe(initial.replace("  - [ ] First nested checkpoint","  - [x] First nested checkpoint"));
+
+    await checkboxes.nth(2).click();
+    await expect(checkboxes.nth(0)).toBeChecked();
+    await expect(checkboxes.nth(1)).toBeChecked();
+    await expect(checkboxes.nth(2)).not.toBeChecked();
+    await expect(checkboxes.nth(3)).toBeChecked();
+    expect(await page.evaluate(()=>(window as any).docChanges.length)).toBe(2);
+
+    const beforeSliderChanges=await page.evaluate(()=>(window as any).docChanges.length);
+    const slider=page.locator('.chart-controls input[type="range"]');
+    await slider.fill("2.5");
+    await expect(page.locator(".chart-slider-head output")).toHaveText("2.5");
+    await expect(checkboxes.nth(3)).toBeChecked();
+    await expect(checkboxes.nth(0)).toBeChecked();
+    expect(await page.evaluate(()=>(window as any).docChanges.length)).toBe(beforeSliderChanges);
+  }
+});
