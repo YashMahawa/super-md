@@ -1,7 +1,11 @@
-import unittest
+import ast
+import importlib
 import os
+import sys
 import tempfile
+import unittest
 from pathlib import Path
+from unittest import mock
 
 from package_runtime import (portable_binaries, wayland_dependencies, linux_support_binaries,
                              X11_SUPPORT, qtwebengine_framework_version, qtwebengine_framework_entries,
@@ -66,6 +70,63 @@ class PackageRuntimeTest(unittest.TestCase):
                 helper.chmod(0o644)
                 with self.assertRaisesRegex(RuntimeError, "non-executable"):
                     require_macos_qtwebengine_process(app)
+
+    def test_root_shim_aliases_scripts_subpackage_module_object(self):
+        canonical = importlib.import_module("scripts.package_runtime")
+        alias = importlib.import_module("package_runtime")
+        self.assertIs(alias, canonical)
+        self.assertIs(sys.modules["package_runtime"], sys.modules["scripts.package_runtime"])
+        self.assertEqual(
+            Path(canonical.__file__).resolve(),
+            Path(__file__).resolve().parent / "scripts" / "package_runtime.py",
+        )
+
+        sys.modules.pop("package_runtime", None)
+        try:
+            reimported_alias = importlib.import_module("package_runtime")
+            self.assertIs(reimported_alias, canonical)
+            self.assertIs(sys.modules["package_runtime"], canonical)
+
+            sys.modules.pop("package_runtime", None)
+            reloaded_canonical = importlib.reload(canonical)
+            reloaded_alias = importlib.import_module("package_runtime")
+            self.assertIs(reloaded_alias, reloaded_canonical)
+            self.assertIs(sys.modules["package_runtime"], reloaded_canonical)
+        finally:
+            sys.modules["package_runtime"] = sys.modules["scripts.package_runtime"]
+
+    def test_mock_patch_on_root_alias_updates_scripts_subpackage_callers(self):
+        scripts_runtime = importlib.import_module("scripts.package_runtime")
+        with mock.patch("package_runtime.X11_SUPPORT", ("libxcb-test.so.0",)):
+            self.assertEqual(scripts_runtime.X11_SUPPORT, ("libxcb-test.so.0",))
+            self.assertEqual(
+                scripts_runtime.linux_support_binaries(lambda name: f"/usr/lib/{name}", "linux"),
+                [("/usr/lib/libxcb-test.so.0", ".")],
+            )
+        self.assertIn("libxcb-icccm.so.4", scripts_runtime.X11_SUPPORT)
+
+    def test_pyinstaller_spec_and_hook_import_scripts_package_runtime(self):
+        desktop_dir = Path(__file__).resolve().parent
+        spec_path = desktop_dir / "super-md.spec"
+        spec_source = spec_path.read_text(encoding="utf-8")
+        self.assertIn('pathex=[str(root / "desktop")]', spec_source)
+        spec_imports = [
+            node.module
+            for node in ast.walk(ast.parse(spec_source, filename=str(spec_path)))
+            if isinstance(node, ast.ImportFrom)
+        ]
+        self.assertIn("scripts.package_runtime", spec_imports)
+        self.assertNotIn("package_runtime", spec_imports)
+
+        hook_path = desktop_dir / "pyinstaller_hooks" / "hook-PySide6.QtWebEngineCore.py"
+        hook_source = hook_path.read_text(encoding="utf-8")
+        hook_imports = [
+            node.module
+            for node in ast.walk(ast.parse(hook_source, filename=str(hook_path)))
+            if isinstance(node, ast.ImportFrom)
+        ]
+        self.assertIn("scripts.package_runtime", hook_imports)
+        self.assertNotIn("package_runtime", hook_imports)
 
 
 if __name__ == "__main__":

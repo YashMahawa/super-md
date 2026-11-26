@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 from PyInstaller.depend.bindepend import resolve_library_path
 
 sys.path.insert(0, str(Path(SPECPATH)))
-from package_runtime import linux_support_binaries, portable_binaries
+from scripts.package_runtime import linux_support_binaries, portable_binaries
 
 root = Path(SPECPATH).parent
 engine = root / "smd-core" / "target" / "release" / ("smd-engine.exe" if sys.platform == "win32" else "smd-engine")
