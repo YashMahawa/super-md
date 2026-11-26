@@ -44,6 +44,10 @@ from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
+if __package__:
+    from . import studio_workspace
+else:
+    import studio_workspace
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
@@ -1732,176 +1736,39 @@ class Studio(QObject):
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
     def folderSearchState(self):
-        sync_pending = bool(
-            self._folder_search_open
-            and self._folder_search_query.strip()
-            and self.flush_operation
-            and self.flush_operation.get("action") == "sync_for_search"
-        )
-        return {
-            "open": self._folder_search_open,
-            "query": self._folder_search_query,
-            "caseSensitive": self._folder_search_case_sensitive,
-            "includeDiagrams": self._folder_search_include_diagrams,
-            "matches": self._folder_search_matches,
-            "scanning": self._folder_search_scanning or sync_pending,
-            "scannedFiles": self._folder_search_scanned_files,
-            "truncated": self._folder_search_truncated,
-            "hasFolder": bool(self.folder),
-        }
+        return studio_workspace.folder_search_state(self)
 
     def _search_snapshots(self):
-        tabs_snap = [
-            {
-                "id": t["id"],
-                "name": t["name"],
-                "path": t["path"],
-                "content": t["content"],
-                "dirty": self._is_dirty(t),
-            }
-            for t in self.tabs
-        ]
-        pinned_keys = {canonical_note_key(p) for p in self.session.pinned if p}
-        recent_snap = [
-            {
-                "path": p,
-                "name": Path(p).name,
-                "pinned": canonical_note_key(p) in pinned_keys,
-            }
-            for p in self.recent
-            if p
-        ]
-        folder_path = Path(self.folder) if self.folder else None
-        return tabs_snap, recent_snap, folder_path, self.active
+        return studio_workspace.search_snapshots(self)
 
     def _cancel_folder_search(self, close: bool = False):
-        if self._folder_search_cancel is not None:
-            self._folder_search_cancel.set()
-            self._folder_search_cancel = None
-        self._folder_search_generation += 1
-        self._folder_search_scanning = False
-        if close:
-            self._folder_search_open = False
-            self._folder_search_matches = []
-            self._folder_search_scanned_files = 0
-            self._folder_search_truncated = False
-            self._folder_search_tabs_sig = None
-            if self.flush_operation and self.flush_operation.get("action") == "sync_for_search":
-                self.flush_operation = None
-                self.flush_timer.stop()
+        return studio_workspace.cancel_folder_search(self, close)
 
     @Slot()
     def openFolderSearch(self):
-        if self.retired:
-            return
-        self._folder_search_open = True
-        self._folder_search_tabs_sig = None
-        if self.ready and self.tabs and not self.flush_operation:
-            self._flush("sync_for_search")
-            self.workspaceSearchChanged.emit()
-        else:
-            self.workspaceSearchChanged.emit()
-            if self._folder_search_query.strip():
-                self._start_folder_search()
+        return studio_workspace.open_folder_search(self)
 
     @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
-        if self.retired:
-            return
-        self._folder_search_query = query if isinstance(query, str) else ""
-        self._folder_search_case_sensitive = bool(case_sensitive)
-        self._folder_search_include_diagrams = bool(include_diagrams)
-        if not self._folder_search_open:
-            self._folder_search_open = True
-        self._start_folder_search()
+        return studio_workspace.update_folder_search(self, query, case_sensitive, include_diagrams)
 
     def _start_folder_search(self):
-        if self._folder_search_cancel is not None:
-            self._folder_search_cancel.set()
-            self._folder_search_cancel = None
-        self._folder_search_generation += 1
-        generation = self._folder_search_generation
-        self._folder_search_matches = []
-        self._folder_search_scanned_files = 0
-        self._folder_search_truncated = False
-        query = self._folder_search_query
-        if not query or not query.strip():
-            self._folder_search_scanning = False
-            self._folder_search_tabs_sig = None
-            self.workspaceSearchChanged.emit()
-            return
-        cancel_event = threading.Event()
-        self._folder_search_cancel = cancel_event
-        self._folder_search_scanning = True
-        self._folder_search_tabs_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
-        self.workspaceSearchChanged.emit()
-
-        tabs_snap, recent_snap, folder_path, active_id = self._search_snapshots()
-        case_sensitive = self._folder_search_case_sensitive
-        exclude_diagrams = not self._folder_search_include_diagrams
-
-        def emit_batch(batch: list[dict], scanned: int, truncated: bool, done: bool):
-            if self.retired or cancel_event.is_set():
-                return
-            self.workspaceSearchBatch.emit(generation, batch, scanned, truncated, done)
-
-        def worker():
-            stream_text_search(
-                query,
-                tabs_snap,
-                recent_snap,
-                folder_path,
-                active_id=active_id,
-                case_sensitive=case_sensitive,
-                exclude_diagrams=exclude_diagrams,
-                cancel_event=cancel_event,
-                on_batch=emit_batch,
-            )
-
-        try:
-            self._search_pool.submit(worker)
-        except RuntimeError:
-            self._folder_search_scanning = False
-            self.workspaceSearchChanged.emit()
+        return studio_workspace.start_folder_search(self)
 
     def _on_workspace_search_batch(self, generation: int, batch, scanned: int, truncated: bool, done: bool):
-        if self.retired or not self._folder_search_open or generation != self._folder_search_generation:
-            return
-        if batch:
-            self._folder_search_matches = self._folder_search_matches + list(batch)
-        self._folder_search_scanned_files = scanned
-        self._folder_search_truncated = bool(truncated)
-        if done:
-            self._folder_search_scanning = False
-        self.workspaceSearchChanged.emit()
+        return studio_workspace.on_workspace_search_batch(self, generation, batch, scanned, truncated, done)
 
     @Slot()
     def closeFolderSearch(self):
-        if not self._folder_search_open and not self._folder_search_scanning:
-            return
-        self._cancel_folder_search(close=True)
-        self.workspaceSearchChanged.emit()
+        return studio_workspace.close_folder_search(self)
 
     @Slot()
     def cancelWorkspaceSearch(self):
-        changed = self._folder_search_open or self._folder_search_scanning
-        self._cancel_folder_search(close=True)
-        if changed:
-            self.workspaceSearchChanged.emit()
+        return studio_workspace.cancel_workspace_search(self)
 
     @Slot(str, str, str, bool)
     def openFolderSearchMatch(self, tab_id: str, path: str, query: str, case_sensitive: bool = False):
-        if self.retired:
-            return
-        self._cancel_folder_search(close=True)
-        self.workspaceSearchChanged.emit()
-        target_payload = json.dumps({
-            "tabId": tab_id or "",
-            "path": path or "",
-            "query": query or "",
-            "caseSensitive": bool(case_sensitive),
-        })
-        self._flush("open_search_match", target_payload)
+        return studio_workspace.open_folder_search_match(self, tab_id, path, query, case_sensitive)
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -3550,289 +3417,41 @@ class Studio(QObject):
         self._submit(read_note,finished,False,self.writes)
 
     def _restore_workspace_folder(self, folder_path: str, expanded_paths: list[str] | None = None):
-        if not folder_path:
-            return
-        try:
-            candidate_root = Path(folder_ops.strip_extended_length_prefix(str(folder_path))).expanduser()
-            if folder_ops._is_link_or_junction(candidate_root):
-                return
-            root = Path(folder_ops.strip_extended_length_prefix(str(candidate_root.resolve(strict=True))))
-        except OSError:
-            return
-        if not root.is_dir():
-            return
-        root_str = folder_ops.canonical_path_str(root)
-        valid_expanded = {root_str}
-        for raw in expanded_paths or []:
-            if not raw:
-                continue
-            try:
-                candidate = Path(folder_ops.strip_extended_length_prefix(str(raw))).expanduser()
-                if folder_ops._is_link_or_junction(candidate):
-                    continue
-                resolved = Path(folder_ops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
-                if folder_ops.matches_path_prefix(str(resolved), root_str, is_directory=True) and resolved.is_dir():
-                    valid_expanded.add(folder_ops.canonical_path_str(resolved))
-            except OSError:
-                continue
-        self.folder = root_str
-        self.session.workspace_links.invalidate(self.folder)
-        self.expanded = valid_expanded
-        self.session.window_workspaces[self.window_id] = {
-            "folder": self.folder,
-            "expanded": sorted(self.expanded),
-            "active": self._current()["path"],
-            "activeId": self.active,
-        }
-        self._watch_notes()
-        self._load_tree()
+        return studio_workspace.restore_workspace_folder(self, folder_path, expanded_paths)
 
     def _cancel_subfolder_search(self):
-        self.filter_timer.stop()
-        self._search_generation += 1
-        if self._search_cancel is not None:
-            self._search_cancel.set()
-            self._search_cancel = None
-        self._folder_searching = False
+        return studio_workspace.cancel_subfolder_search(self)
 
     def _clear_folder_filter(self):
-        self._cancel_subfolder_search()
-        self.folder_filter = ""
+        return studio_workspace.clear_folder_filter(self)
 
     @Slot(str)
     def setFolderFilter(self, query):
-        if self.retired:
-            return
-        raw = str(query or "")
-        trimmed = raw.strip()
-        if raw == self.folder_filter and (not trimmed or self._folder_searching or self.filter_timer.isActive()):
-            return
-        self._cancel_subfolder_search()
-        self.folder_filter = raw
-        if not self.folder:
-            self.files = []
-            self._emit(False)
-            return
-        if not trimmed:
-            self._load_tree()
-            self._emit(False)
-            return
-        self._folder_searching = True
-        self._emit(False)
-        self.filter_timer.start(150)
+        return studio_workspace.set_folder_filter(self, query)
 
     def _start_subfolder_search(self):
-        if self.retired:
-            return
-        self.filter_timer.stop()
-        if self._search_cancel is not None:
-            self._search_cancel.set()
-            self._search_cancel = None
-        folder = self.folder
-        needle = self.folder_filter.strip().casefold()
-        if not folder or not needle:
-            self._folder_searching = False
-            if folder:
-                self._load_tree()
-            else:
-                self.files = []
-            self._emit(False)
-            return
-        self._search_generation += 1
-        generation = self._search_generation
-        cancel = threading.Event()
-        self._search_cancel = cancel
-        self._folder_searching = True
-
-        max_scanned = 25000
-        max_matched = 3000
-        max_depth = MAX_FOLDER_DEPTH
-
-        def search():
-            scanned = 0
-            matched_total = 0
-
-            def walk_dir(dir_path: str, depth: int) -> list[dict] | None:
-                nonlocal scanned, matched_total
-                if cancel.is_set():
-                    return None
-                if depth > max_depth or scanned >= max_scanned or matched_total >= max_matched:
-                    return []
-                raw_entries = []
-                try:
-                    with os.scandir(dir_path) as it:
-                        for entry in it:
-                            if cancel.is_set():
-                                return None
-                            scanned += 1
-                            if scanned > max_scanned:
-                                break
-                            name = entry.name
-                            if name.startswith("."):
-                                continue
-                            try:
-                                if entry.is_symlink() or folder_ops._is_link_or_junction(Path(entry.path)):
-                                    continue
-                                is_dir = entry.is_dir(follow_symlinks=False)
-                                is_file = False if is_dir else entry.is_file(follow_symlinks=False)
-                            except OSError:
-                                continue
-                            if is_dir or (is_file and is_searchable_note_name(name)):
-                                raw_entries.append((is_dir, name, folder_ops.canonical_path_str(entry.path)))
-                except OSError:
-                    return []
-                if cancel.is_set():
-                    return None
-                raw_entries.sort(key=lambda item: (not item[0], item[1].lower()))
-                collected: list[dict] = []
-                for is_dir, name, full_path in raw_entries:
-                    if cancel.is_set():
-                        return None
-                    if matched_total >= max_matched:
-                        break
-                    if is_dir:
-                        sub_matches = walk_dir(full_path, depth + 1)
-                        if sub_matches is None:
-                            return None
-                        if sub_matches:
-                            collected.append({
-                                "name": name,
-                                "path": full_path,
-                                "directory": True,
-                                "depth": depth,
-                                "expanded": True,
-                            })
-                            matched_total += 1
-                            remaining = max_matched - matched_total
-                            if remaining > 0:
-                                kept_sub = sub_matches[:remaining]
-                                collected.extend(kept_sub)
-                                matched_total += len(kept_sub)
-                    else:
-                        if needle in name.casefold():
-                            collected.append({
-                                "name": name,
-                                "path": full_path,
-                                "directory": False,
-                                "depth": depth,
-                                "expanded": False,
-                            })
-                            matched_total += 1
-                return collected
-
-            return walk_dir(folder, 0)
-
-        def finished(result, error):
-            if self.retired or cancel.is_set() or generation != self._search_generation or not folder_ops.same_path(folder, self.folder):
-                return
-            self._folder_searching = False
-            if not error and result is not None:
-                self.files = result
-
-        self._submit(search, finished, False, executor=self._search_pool)
+        return studio_workspace.start_subfolder_search(self)
 
     @Slot(str)
     def openFolder(self, value):
-        path = local_path(value)
-        if not path.is_dir():
-            self.message = "Choose an existing local folder."
-            self._emit(False)
-            return
-        self._clear_folder_filter()
-        self.folder = folder_ops.canonical_path_str(path)
-        self.session.workspace_links.invalidate(self.folder)
-        self.settings["welcomed"] = True
-        self.expanded = {self.folder}
-        self._preferences()
-        self._recover()
-        self._emit(False)
-        self._load_tree()
+        return studio_workspace.open_folder(self, value)
 
     def _is_within_open_folder(self, candidate) -> bool:
-        folder = getattr(self, "folder", "")
-        if not folder or not candidate:
-            return False
-        try:
-            return folder_ops.matches_path_prefix(str(candidate), folder, is_directory=True)
-        except (OSError, ValueError):
-            return False
+        return studio_workspace.is_within_open_folder(self, candidate)
 
     def _refresh_open_folder_trees(self, *candidates) -> None:
-        if not candidates:
-            return
-        session = getattr(self, "session", None)
-        windows = tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (self,)
-        for window in windows:
-            if getattr(window, "retired", False) or not hasattr(window, "_load_tree"):
-                continue
-            if any(Studio._is_within_open_folder(window, candidate) for candidate in candidates if candidate):
-                window._load_tree()
+        return studio_workspace.refresh_open_folder_trees(self, *candidates)
 
     def _load_tree(self):
-        self._tree_generation = getattr(self, "_tree_generation", 0) + 1
-        generation = self._tree_generation
-        if not self.folder:
-            self.files = []
-            return
-        if self.folder_filter.strip():
-            self._start_subfolder_search()
-            return
-        folder, expanded = self.folder, set(self.expanded)
-        expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
-        def scan():
-            entries: list[dict[str, object]] = []
-            def visit(path, depth):
-                try:
-                    children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-                except OSError:
-                    return
-                for child in children:
-                    if len(entries) >= 3000:
-                        return
-                    if child.name.startswith(".") or folder_ops._is_link_or_junction(child):
-                        continue
-                    directory = child.is_dir()
-                    if directory or is_searchable_note_name(child.name):
-                        child_str = folder_ops.canonical_path_str(child)
-                        is_expanded = folder_ops.normalize_path_key(child_str) in expanded_keys
-                        entries.append({"name": child.name, "path": child_str, "directory": directory, "depth": depth, "expanded": is_expanded})
-                        if directory and is_expanded:
-                            visit(child, depth + 1)
-            visit(folder, 0)
-            return entries
-        def finished(result, error):
-            if not error and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder) and not self.folder_filter.strip():
-                self.files = result
-        self._submit(scan, finished, False)
+        return studio_workspace.load_tree(self)
 
     @Slot(str)
     def toggleDirectory(self, path):
-        if not self.folder:
-            return
-        canon = folder_ops.canonical_path_str(local_path(path))
-        if not canon:
-            return
-        existing = [item for item in self.expanded if folder_ops.same_path(item, canon)]
-        if existing:
-            for item in existing:
-                self.expanded.discard(item)
-        else:
-            self.expanded.add(canon)
-        self._recover()
-        self._emit(False)
-        self._load_tree()
+        return studio_workspace.toggle_directory(self, path)
 
     @Slot()
     def closeFolder(self):
-        self._tree_generation = getattr(self, "_tree_generation", 0) + 1
-        self._clear_folder_filter()
-        if self.folder:
-            self.session.workspace_links.invalidate(self.folder)
-        self.folder = ""
-        self.files = []
-        self.expanded.clear()
-        self._recover()
-        self._emit(False)
+        return studio_workspace.close_folder(self)
 
     @Slot(str)
     def setMode(self, mode):
