@@ -23,6 +23,8 @@ mitex = "0.2.4"
 typst = "0.15"
 typst-pdf = "0.15"
 typst-kit = { version = "0.15", default-features = false, features = ["embedded-fonts", "datetime"] }
+unicode-normalization = "0.1"
+unicode-properties = "0.1"
 
 [dev-dependencies]
 # Audit the same command inventory already embedded by MiTeX; test-only.
