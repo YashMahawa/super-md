@@ -896,7 +896,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     liveState.tabs.take(100).forEach { note ->
                         val id = canonicalTabId(note)
                         tabs.put(JSONObject().put("id", id).put("tabId", id).put("name", note.name).put("saved", !note.dirty)
-                            .put("active", note.id == liveState.activeId).put("mode", if (note.id == liveState.activeId) liveState.mode else "live")
+                            .put("active", note.id == liveState.activeId).put("mode", liveState.effectiveMode(note))
                             .put("path", note.uri ?: note.id).put("uri", note.uri ?: JSONObject.NULL)
                             .put("revision", activity.agentRevision(note.content)))
                     }
@@ -1259,7 +1259,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             }
         }
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
+        LaunchedEffect(readerReady, state.active.id, state.active.name, state.active.uri, state.active.content, state.active.relative, state.active.assetDirectory, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
             if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active

@@ -73,7 +73,17 @@ internal class ClosedNoteStore(
                     writeString(out, note.id); writeString(out, note.name); writeNullable(out, note.uri)
                     writeString(out, note.content); writeString(out, note.saved)
                     writeNullable(out, note.relative); writeNullable(out, note.assetDirectory)
-                    if (note.assetsDirty) out.writeBoolean(true)
+                    if (note.viewMode != null || note.viewNormalZoom != null || note.viewFullscreenZoom != null) {
+                        out.writeBoolean(note.assetsDirty)
+                        out.writeByte(1)
+                        writeNullable(out, note.viewMode)
+                        out.writeBoolean(note.viewNormalZoom != null)
+                        if (note.viewNormalZoom != null) out.writeFloat(note.viewNormalZoom)
+                        out.writeBoolean(note.viewFullscreenZoom != null)
+                        if (note.viewFullscreenZoom != null) out.writeFloat(note.viewFullscreenZoom)
+                    } else if (note.assetsDirty) {
+                        out.writeBoolean(true)
+                    }
                     out.flush(); raw.fd.sync()
                 }
             }
@@ -91,10 +101,15 @@ internal class ClosedNoteStore(
             val content = readString(input); val saved = readString(input)
             val relative = readNullable(input); val assetDirectory = readNullable(input)
             val assetsDirty = try { input.readBoolean() } catch (_: java.io.EOFException) { false }
+            val hasViewState = try { input.readByte().toInt() == 1 } catch (_: java.io.EOFException) { false }
+            val viewMode = if (hasViewState) readNullable(input)?.takeIf { it in VALID_VIEW_MODES } else null
+            val viewNormalZoom = if (hasViewState && input.readBoolean()) input.readFloat().takeIf { it.isFinite() }?.coerceIn(40f, 300f) else null
+            val viewFullscreenZoom = if (hasViewState && input.readBoolean()) input.readFloat().takeIf { it.isFinite() }?.coerceIn(40f, 300f) else null
             val note = Note(
                 id = id, name = name, uri = uri,
                 content = content, saved = saved,
                 relative = relative, assetDirectory = assetDirectory, assetsDirty = assetsDirty,
+                viewMode = viewMode, viewNormalZoom = viewNormalZoom, viewFullscreenZoom = viewFullscreenZoom,
             )
             require(note.id == reference.id) { "Closed-note snapshot identity mismatch" }
             note

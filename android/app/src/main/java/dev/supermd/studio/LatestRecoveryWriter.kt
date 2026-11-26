@@ -175,10 +175,15 @@ internal class RecoverySnapshotSignature(
     private val mode: String,
     private val normalZoom: Float,
     private val fullscreenZoom: Float,
+    private val defaultMode: String = mode,
+    private val defaultNormalZoom: Float = normalZoom,
+    private val defaultFullscreenZoom: Float = fullscreenZoom,
 ) {
     override fun equals(other: Any?): Boolean = other is RecoverySnapshotSignature &&
         tabs === other.tabs && closedTabs === other.closedTabs && activeId == other.activeId &&
-        mode == other.mode && normalZoom == other.normalZoom && fullscreenZoom == other.fullscreenZoom
+        mode == other.mode && normalZoom == other.normalZoom && fullscreenZoom == other.fullscreenZoom &&
+        defaultMode == other.defaultMode && defaultNormalZoom == other.defaultNormalZoom &&
+        defaultFullscreenZoom == other.defaultFullscreenZoom
 
     override fun hashCode(): Int {
         var result = System.identityHashCode(tabs)
@@ -187,6 +192,9 @@ internal class RecoverySnapshotSignature(
         result = 31 * result + mode.hashCode()
         result = 31 * result + normalZoom.hashCode()
         result = 31 * result + fullscreenZoom.hashCode()
+        result = 31 * result + defaultMode.hashCode()
+        result = 31 * result + defaultNormalZoom.hashCode()
+        result = 31 * result + defaultFullscreenZoom.hashCode()
         return result
     }
 }

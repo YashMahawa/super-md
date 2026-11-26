@@ -21,7 +21,7 @@ CATEGORIES = (
     ("execution-results", "Python execution results", "clearable", ("derived-python",), ()),
     ("python-runtime", "Managed Python runtime", "managed", ("python-env",), ()),
     ("fonts-themes", "Fonts and themes", "preserved", ("fonts", "themes"), ("theme.json", "theme-source.json", "theme-library.json")),
-    ("workspace", "Workspace settings", "preserved", (), ("settings.json", "startup.json", "reading-positions.json")),
+    ("workspace", "Workspace settings", "preserved", (), ("settings.json", "startup.json", "reading-positions.json", "note-views.json")),
     ("update-state", "Update verification state", "clearable", ("updates",), ()),
 )
 

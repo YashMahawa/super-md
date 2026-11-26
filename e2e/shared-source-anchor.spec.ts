@@ -318,4 +318,182 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
       )
       .toBe(true);
   });
+
+  test("native reader preserves per-note mode and zoom across tab switches including unsaved drafts while using configured defaults for new notes", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 820 });
+    await page.addInitScript(() => {
+      type TabRecord = {
+        id: string;
+        path: string | null;
+        content: string;
+        viewMode?: "live" | "reader" | "editor" | "split";
+        viewZoom?: number;
+      };
+      const defaults = { mode: "live" as const, zoom: 110 };
+      const tabs: Record<string, TabRecord> = {};
+      let activeId = "";
+      const zoomEvents: Array<{ id?: string; zoom: number; fullscreen?: boolean }> = [];
+
+      const loadTab = (id: string) => {
+        activeId = id;
+        const tab = tabs[id];
+        window.supermdLoad?.({
+          id: tab.id,
+          path: tab.path ?? tab.id,
+          content: tab.content,
+          mode: tab.viewMode ?? defaults.mode,
+          zoom: tab.viewZoom ?? defaults.zoom,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 17,
+          motion: false,
+        });
+      };
+
+      (window as any).__nativeHarness = {
+        openSaved: (id: string, path: string, content: string) => {
+          tabs[id] = { id, path, content };
+          loadTab(id);
+        },
+        newNote: (id: string, content = "") => {
+          tabs[id] = { id, path: null, content };
+          loadTab(id);
+        },
+        selectTab: (id: string) => loadTab(id),
+        setMode: (mode: "live" | "reader" | "editor" | "split") => {
+          tabs[activeId].viewMode = mode;
+          loadTab(activeId);
+        },
+        setZoom: (zoom: number) => {
+          tabs[activeId].viewZoom = zoom;
+          window.supermdSetZoom?.(zoom, Date.now());
+        },
+        getTab: (id: string) => tabs[id],
+        getZoomEvents: () => zoomEvents,
+      };
+
+      window.SuperMD = {
+        post: (id, command, raw) => {
+          const parsed = raw ? JSON.parse(raw) : {};
+          if (command === "document_changed" && tabs[parsed.id]) {
+            tabs[parsed.id].content = parsed.content;
+          } else if (command === "zoom_changed") {
+            const targetId = parsed.id || activeId;
+            if (tabs[targetId]) {
+              tabs[targetId].viewZoom = Math.round(parsed.zoom);
+            }
+            zoomEvents.push(parsed);
+          }
+          queueMicrotask(() => window.supermdReply?.(id, true, null));
+        },
+      };
+    });
+
+    await page.goto("/android-reader.html");
+    await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+    const noteAContent = buildDeepNestedChecklistNote("Saved Architecture Spec");
+    const draftBContent = buildDeepNestedChecklistNote("Unsaved Scratch Draft");
+    const readScale = () =>
+      page.evaluate(
+        () =>
+          document.querySelector<HTMLElement>(".document-page")?.dataset.scale ||
+          document.querySelector<HTMLElement>(".android-source")?.style.getPropertyValue("--workspace-scale") ||
+          "",
+      );
+
+    // 1. Open saved Note A -> starts with configured defaults (live, 110%), scroll to deep nested leaf, then switch Note A to Split @ 150%.
+    await page.evaluate(
+      ({ content }) => (window as any).__nativeHarness.openSaved("saved-note-a", "/workspace/spec.md", content),
+      { content: noteAContent },
+    );
+    const readingRoot = page.locator(".android-reading");
+    await expect(page.locator(".live-document")).toBeVisible();
+    await expect.poll(readScale).toBe("1.1");
+
+    const primaryLeafInLive = page.locator("li", { hasText: "1.2.2.a.iii Primary Deep Leaf Target" }).last();
+    await primaryLeafInLive.evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await page.evaluate(() => {
+      document.querySelector<HTMLElement>(".android-reading")!.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    await expect.poll(() => readingRoot.evaluate((el) => el.scrollTop)).toBeGreaterThan(1400);
+
+    await page.evaluate(() => (window as any).__nativeHarness.setMode("split"));
+    const cmScroller = page.locator(".cm-scroller");
+    await expect(cmScroller).toBeVisible();
+    await expect(readingRoot).toBeVisible();
+    await expect
+      .poll(() => isVisibleWithinScroller(page.locator(".cm-line", { hasText: "1.2.2.a.iii Primary Deep Leaf Target" }), cmScroller))
+      .toBe(true);
+
+    await page.evaluate(() => (window as any).__nativeHarness.setZoom(150));
+    await expect.poll(readScale).toBe("1.5");
+    await expect
+      .poll(() => page.evaluate(() => document.querySelector<HTMLElement>(".android-source")?.style.getPropertyValue("--workspace-scale")))
+      .toBe("1.5");
+    await expect
+      .poll(() => isVisibleWithinScroller(page.locator(".cm-line", { hasText: "1.2.2.a.iii Primary Deep Leaf Target" }), cmScroller))
+      .toBe(true);
+    await expect
+      .poll(() =>
+        isVisibleWithinScroller(page.locator(".android-reading li", { hasText: "1.2.2.a.iii Primary Deep Leaf Target" }).last(), readingRoot),
+      )
+      .toBe(true);
+
+    // 2. Open unsaved Draft B -> uses configured defaults (live @ 110%), then user sets Editor mode, edits deep leaf, and gesture-zooms to 143%.
+    await page.evaluate(({ content }) => (window as any).__nativeHarness.newNote("unsaved-draft-b", content), {
+      content: draftBContent,
+    });
+    await expect(page.locator(".live-document")).toBeVisible();
+    await expect.poll(readScale).toBe("1.1");
+
+    await page.evaluate(() => (window as any).__nativeHarness.setMode("editor"));
+    await expect(page.locator(".android-reading")).toHaveCount(0);
+    await expect.poll(readScale).toBe("1.1");
+    const secondaryOffset = draftBContent.indexOf("- [ ] 2.3.2.b.iv Secondary Deep Leaf Target");
+    await page.evaluate((offset) => window.dispatchEvent(new CustomEvent("supermd-goto-offset", { detail: offset })), secondaryOffset);
+    const secondaryLine = page.locator(".cm-line", { hasText: "2.3.2.b.iv Secondary Deep Leaf Target" });
+    await expect.poll(() => isVisibleWithinScroller(secondaryLine, cmScroller)).toBe(true);
+    await secondaryLine.click();
+    await page.keyboard.press("End");
+    await page.keyboard.type(" [draft-b-view-state]");
+    await expect
+      .poll(() => page.evaluate(() => (window as any).__nativeHarness.getTab("unsaved-draft-b").content))
+      .toContain("[draft-b-view-state]");
+
+    // Gesture-zoom Draft B (110 * 1.3 = 143) and immediately switch back to Note A (<220ms) to verify outgoing id flush.
+    await page.evaluate(() => {
+      window.supermdZoomBy?.(1.3, { x: 400, y: 300 });
+      (window as any).__nativeHarness.selectTab("saved-note-a");
+    });
+
+    // 3. Note A restores Split mode, 150% zoom, AND its deep nested checklist anchor in both panes.
+    await expect(cmScroller).toBeVisible();
+    await expect(readingRoot).toBeVisible();
+    await expect.poll(readScale).toBe("1.5");
+    await expect
+      .poll(() => isVisibleWithinScroller(page.locator(".cm-line", { hasText: "1.2.2.a.iii Primary Deep Leaf Target" }), cmScroller))
+      .toBe(true);
+    await expect
+      .poll(() =>
+        isVisibleWithinScroller(page.locator(".android-reading li", { hasText: "1.2.2.a.iii Primary Deep Leaf Target" }).last(), readingRoot),
+      )
+      .toBe(true);
+
+    // 4. Switch back to unsaved Draft B -> restores Editor mode, flushed 143% zoom, and edited checklist scroll anchor.
+    await page.evaluate(() => (window as any).__nativeHarness.selectTab("unsaved-draft-b"));
+    await expect(page.locator(".android-reading")).toHaveCount(0);
+    await expect.poll(readScale).toBe("1.43");
+    await expect.poll(() => isVisibleWithinScroller(page.locator(".cm-line", { hasText: "[draft-b-view-state]" }), cmScroller)).toBe(true);
+
+    // 5. Open brand-new Note C -> uses configured defaults (live @ 110%) at scrollTop 0.
+    await page.evaluate(() => (window as any).__nativeHarness.newNote("new-note-c", "# Fresh Note C\n\nStarts with defaults.\n"));
+    await expect(page.locator(".live-document")).toBeVisible();
+    await expect.poll(readScale).toBe("1.1");
+    await expect.poll(() => readingRoot.evaluate((el) => el.scrollTop)).toBeLessThan(10);
+  });
 });

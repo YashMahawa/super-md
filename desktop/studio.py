@@ -532,6 +532,24 @@ def export_destination(value: str, format: str) -> Path:
         raise ValueError(f"The {expected} destination already exists; choose its full filename to confirm replacement")
     return target
 
+VALID_VIEW_MODES = ("live", "reader", "editor", "split")
+
+
+def _sanitize_view_overrides(raw: dict | None) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    overrides = {}
+    mode = raw.get("viewMode")
+    if isinstance(mode, str) and mode in VALID_VIEW_MODES:
+        overrides["viewMode"] = mode
+    for key in ("viewNormalZoom", "viewFullZoom"):
+        val = raw.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val):
+            clamped = max(40, min(300, val))
+            overrides[key] = int(clamped) if isinstance(clamped, int) or clamped == int(clamped) else float(clamped)
+    return overrides
+
+
 def _same_closed_revision(current: dict, captured: dict) -> bool:
     """Compare content-bearing fields after a background close snapshot."""
     return current == captured
@@ -634,6 +652,7 @@ class Session(QObject):
         self._pending_startup_windows = []
         self.quitting = False
         self.locations = {}
+        self.path_views = {}
         self.drafts = {}
         self.windows = {}
         self.custom_theme = None
@@ -692,6 +711,22 @@ class Session(QObject):
             locations=json.loads((self.data/"reading-positions.json").read_text(encoding="utf-8"))
             if isinstance(locations,dict):self.locations=dict(list(locations.items())[-200:])
         except (OSError,ValueError,TypeError):pass
+        try:
+            raw_views=json.loads((self.data/"note-views.json").read_text(encoding="utf-8"))
+            if isinstance(raw_views,dict):
+                for view_key, view_val in list(raw_views.items())[-200:]:
+                    if isinstance(view_key,str) and view_key:
+                        cleaned=_sanitize_view_overrides(view_val)
+                        if cleaned:self.path_views[view_key]=cleaned
+        except (OSError,ValueError,TypeError):pass
+        for entry in [
+            *self.startup_entries,
+            *(e for w in self.startup_windows for e in w.get("tabs",[]) if isinstance(e,dict)),
+        ]:
+            if isinstance(entry,dict) and entry.get("path"):
+                cleaned=_sanitize_view_overrides(entry)
+                if cleaned:
+                    self.path_views[entry["path"]]={**self.path_views.get(entry["path"],{}),**cleaned}
         try:
             recovered = json.loads((self.data/"recovery.json").read_text(encoding="utf-8"))
             for tab in recovered:
@@ -939,7 +974,7 @@ class Studio(QObject):
         self._folder_search_cancel: threading.Event | None = None
         self._folder_search_tabs_sig: list[tuple[str, str, bool]] | None = None
         self._pending_seeded_find: dict | None = None
-        self.mode = self.settings.get("readingMode", "live")
+        self._empty_mode: str | None = None
         self.fullscreen = False
         self.reader_overlay = False
         self.image_overlay = False
@@ -1014,6 +1049,7 @@ class Studio(QObject):
         self.preference_timer.setSingleShot(True)
         self.preference_timer.timeout.connect(self._preferences)
         self.position_timer=QTimer(self);self.position_timer.setSingleShot(True);self.position_timer.timeout.connect(self._save_positions)
+        self.view_timer=QTimer(self);self.view_timer.setSingleShot(True);self.view_timer.timeout.connect(self._save_note_views)
         self.saving = set()
         restore_enabled = self.settings.get("startup", "restore") == "restore"
         if not restore_enabled:
@@ -1030,11 +1066,28 @@ class Studio(QObject):
         else:
             claimed = list(self.session.initial_recovery)
             self.session.initial_recovery = []
+        startup_view_by_id = {}
+        for entry in (win_spec["tabs"] if win_spec is not None else self.session.startup_entries):
+            if isinstance(entry, dict) and entry.get("id"):
+                cleaned = _sanitize_view_overrides(entry)
+                if cleaned:
+                    startup_view_by_id[entry["id"]] = cleaned
         self.tabs = [{**tab,"id":tab.get("id") or uuid.uuid4().hex} for tab in claimed]
         for tab in self.tabs:
             tab.setdefault("saved_assets", dict(tab.get("assets", {})))
             tab.setdefault("assets_dirty", False)
             tab.setdefault("conflict", False)
+            cleaned_view = _sanitize_view_overrides(tab)
+            for view_key in ("viewMode", "viewNormalZoom", "viewFullZoom"):
+                tab.pop(view_key, None)
+            merged_view = {
+                **(self._lookup_saved_view(tab["path"]) if tab.get("path") else {}),
+                **startup_view_by_id.get(tab["id"], {}),
+                **cleaned_view,
+            }
+            tab.update(merged_view)
+            if tab.get("path") and merged_view:
+                self.session.path_views[tab["path"]] = dict(merged_view)
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
         if not self.tabs:
@@ -1121,6 +1174,89 @@ class Studio(QObject):
         self._message = value
         if value: self._message_revision = getattr(self, "_message_revision", 0) + 1
 
+    def _default_mode(self) -> str:
+        mode = self.settings.get("readingMode", "live")
+        return mode if mode in VALID_VIEW_MODES else "live"
+
+    def _default_normal_zoom(self):
+        val = self.settings.get("normalZoom", 100)
+        return max(40, min(300, val)) if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) else 100
+
+    def _default_full_zoom(self):
+        val = self.settings.get("fullZoom", 100)
+        return max(40, min(300, val)) if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val) else 100
+
+    def _tab_mode(self, tab: dict | None) -> str:
+        if isinstance(tab, dict):
+            override = tab.get("viewMode")
+            if isinstance(override, str) and override in VALID_VIEW_MODES:
+                return override
+        return self._default_mode()
+
+    def _tab_normal_zoom(self, tab: dict | None):
+        if isinstance(tab, dict):
+            override = tab.get("viewNormalZoom")
+            if isinstance(override, (int, float)) and not isinstance(override, bool) and math.isfinite(override):
+                return max(40, min(300, override))
+        return self._default_normal_zoom()
+
+    def _tab_full_zoom(self, tab: dict | None):
+        if isinstance(tab, dict):
+            override = tab.get("viewFullZoom")
+            if isinstance(override, (int, float)) and not isinstance(override, bool) and math.isfinite(override):
+                return max(40, min(300, override))
+        return self._default_full_zoom()
+
+    def _tab_zoom(self, tab: dict | None):
+        return self._tab_full_zoom(tab) if self.fullscreen else self._tab_normal_zoom(tab)
+
+    def _lookup_saved_view(self, path_str: str, startup_entry: dict | None = None) -> dict:
+        merged = {}
+        if path_str:
+            direct = self.session.path_views.get(path_str)
+            if direct:
+                merged.update(_sanitize_view_overrides(direct))
+            else:
+                try:
+                    canon = folder_ops.canonical_path_str(path_str)
+                except OSError:
+                    canon = path_str
+                if canon in self.session.path_views:
+                    merged.update(_sanitize_view_overrides(self.session.path_views[canon]))
+        if startup_entry:
+            merged.update(_sanitize_view_overrides(startup_entry))
+        return merged
+
+    def _remember_path_view(self, tab: dict | None):
+        if not isinstance(tab, dict) or not tab.get("path"):
+            return
+        overrides = _sanitize_view_overrides(tab)
+        path_key = tab["path"]
+        self.session.path_views.pop(path_key, None)
+        if overrides:
+            self.session.path_views[path_key] = overrides
+            while len(self.session.path_views) > 200:
+                self.session.path_views.pop(next(iter(self.session.path_views)))
+        self.view_timer.start(500)
+
+    @property
+    def mode(self) -> str:
+        if self.tabs:
+            return self._tab_mode(self._current())
+        empty = getattr(self, "_empty_mode", None)
+        return empty if empty in VALID_VIEW_MODES else self._default_mode()
+
+    @mode.setter
+    def mode(self, value: str):
+        if value not in VALID_VIEW_MODES:
+            return
+        if getattr(self, "tabs", None):
+            tab = self._current()
+            tab["viewMode"] = value
+            self._remember_path_view(tab)
+        else:
+            self._empty_mode = value
+
     @Slot(str)
     def pinRecent(self,path):
         matched_recent = next((item for item in self.recent if folder_ops.same_path(item, path)), None)
@@ -1179,7 +1315,7 @@ class Studio(QObject):
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self._tab_mode(tab), "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self._tab_zoom(tab), "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             pending_heading = tab.pop("pendingHeading", None)
             if pending_heading:
                 payload["pendingHeading"] = pending_heading
@@ -1539,7 +1675,7 @@ class Studio(QObject):
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active if self.tabs else "", "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "folderFilter": self.folder_filter, "folderSearching": self._folder_searching, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
+        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active if self.tabs else "", "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "folderFilter": self.folder_filter, "folderSearching": self._folder_searching, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self._tab_zoom(tab) if self.tabs else (self._default_full_zoom() if self.fullscreen else self._default_normal_zoom()), "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
     def folderSearchState(self):
@@ -2899,9 +3035,15 @@ class Studio(QObject):
         data=json.dumps(self.session.locations).encode()
         self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
 
+    def _save_note_views(self):
+        if self.retired or getattr(self.writes, "_shutdown", False):
+            return
+        data = json.dumps(self.session.path_views).encode()
+        self._submit(lambda: atomic_write(self.data / "note-views.json", data), _noop_done, False, self.writes)
+
     def _recover(self):
         # Clean tabs need only paths, never another copy of their image bytes.
-        window_tabs = [{"path":t["path"],"id":t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t)]
+        window_tabs = [{"path":t["path"],"id":t["id"],**_sanitize_view_overrides(t)} for t in self.tabs if t["path"] or self._is_dirty(t)]
         self.session.workspace[self.window_id] = window_tabs
         self.session.window_workspaces[self.window_id] = {
             "folder": self.folder,
@@ -3225,6 +3367,8 @@ class Studio(QObject):
                 if completion_callback: completion_callback(existing, None)
                 return
             note = self._note(path.name, content, str(path), content, assets, portable)
+            startup_entry = next((e for e in self._startup_entries if e.get("path") == str(path)), None) if restoring else None
+            note.update(self._lookup_saved_view(str(path), startup_entry))
             self._agent_open_paths.add(folder_ops.canonical_path_str(path))
             if restoring:
                 if activation_generation == self._activation_generation:
@@ -3324,6 +3468,13 @@ class Studio(QObject):
             note.setdefault("saved_assets", dict(note.get("assets", {})))
             note.setdefault("assets_dirty", False)
             note.setdefault("conflict", False)
+            reopened_view = _sanitize_view_overrides(note)
+            for view_key in ("viewMode", "viewNormalZoom", "viewFullZoom"):
+                note.pop(view_key, None)
+            if reopened_view:
+                note.update(reopened_view)
+            elif note.get("path"):
+                note.update(self._lookup_saved_view(note["path"]))
             next_refs=[item for item in self.closed_tabs if item is not reference]
             try:self.session.closed_note_store.save_index(next_refs)
             except Exception as failure:
@@ -3331,9 +3482,13 @@ class Studio(QObject):
                 self._emit(False);return
             existing=next((t for t in self.tabs if note.get("path") and t["path"]==note["path"]),None)
             if existing:
+                if reopened_view:
+                    existing.update(reopened_view)
+                    self._remember_path_view(existing)
                 if activation_generation==self._activation_generation:self.active=existing["id"]
             else:
                 self.tabs.append(note)
+                self._remember_path_view(note)
                 if note.get("path"):
                     try:self._agent_open_paths.add(str(Path(note["path"]).resolve()))
                     except OSError:pass
@@ -3605,30 +3760,47 @@ class Studio(QObject):
 
     @Slot(str)
     def setMode(self, mode):
-        if mode in ("live", "reader", "editor", "split"):
+        if mode in VALID_VIEW_MODES:
             if mode!=self.mode:self._flush("mode",mode)
 
-    def _apply_mode(self,mode):
-        self.mode=mode
-        self.settings["readingMode"]=mode
-        self.preference_timer.start(500)
-        self._emit()
+    def _apply_mode(self, mode, tab_id=None):
+        if mode not in VALID_VIEW_MODES:
+            return
+        if self.tabs:
+            target = next((t for t in self.tabs if t["id"] == (tab_id or self.active)), None)
+            if target is None:
+                return
+            target["viewMode"] = mode
+            self._remember_path_view(target)
+            self.recovery_timer.start(800)
+            self._emit(load=(target["id"] == self.active))
+        else:
+            self._empty_mode = mode
+            self._emit()
 
     @Slot(bool)
     def setFullscreen(self, value):
         if value == self.fullscreen:
             return
-        if value:
-            self.settings["fullZoom"] = self.settings["normalZoom"]
+        if value and self.tabs:
+            tab = self._current()
+            entry_zoom = self._tab_normal_zoom(tab)
+            if "viewNormalZoom" in tab or "viewFullZoom" in tab or entry_zoom != self._default_full_zoom():
+                tab["viewFullZoom"] = entry_zoom
+                self._remember_path_view(tab)
+                self.recovery_timer.start(800)
         self.fullscreen = value
         self._emit()
 
     @Slot(float)
     def setZoom(self, value):
         zoom = max(40, min(300, round(value)))
-        self.settings["fullZoom" if self.fullscreen else "normalZoom"] = zoom
+        if self.tabs:
+            tab = self._current()
+            tab["viewFullZoom" if self.fullscreen else "viewNormalZoom"] = zoom
+            self._remember_path_view(tab)
+            self.recovery_timer.start(800)
         self.readerCall.emit(f"window.supermdSetZoom?.({zoom},{int(time.time()*1000)})")
-        self.preference_timer.start(500)
         self._emit(False)
 
     @Slot(str, int)
@@ -3662,6 +3834,7 @@ class Studio(QObject):
             except ValueError as error:
                 self.python_status = str(error); self._emit(False); return
             self.python_status = ""
+        if key == "readingMode" and value not in VALID_VIEW_MODES: return
         if key in ("size","width","widthPercent","lineHeight","normalZoom","fullZoom") and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value)): return
         if key == "pdf" and (not isinstance(value,dict) or set(value) != set(DEFAULT_PDF)): return
         if key == "shortcuts":
@@ -3672,8 +3845,13 @@ class Studio(QObject):
         if key == "width": value = max(0, min(5000, int(value)))
         if key == "widthPercent": value = max(50,min(150,float(value)))
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
+        if key in ("normalZoom", "fullZoom"): value = max(40, min(300, round(value)))
         self.settings[key] = value
         if key == "shortcuts": self._notify_shortcuts()
+        if key in ("normalZoom", "fullZoom") and self.tabs and ((key == "fullZoom") == self.fullscreen):
+            tab = self._current()
+            if ("viewFullZoom" if self.fullscreen else "viewNormalZoom") not in tab:
+                self.readerCall.emit(f"window.supermdSetZoom?.({self._tab_zoom(tab)},{int(time.time()*1000)})")
         self._preferences()
         self._emit()
 
@@ -3751,7 +3929,7 @@ class Studio(QObject):
             self.image_overlay=False
             self._emit(False)
             self.readerReloadRequested.emit()
-        elif operation["action"] == "mode": self._apply_mode(operation["target"])
+        elif operation["action"] == "mode": self._apply_mode(operation["target"], operation.get("tabId"))
         elif operation["action"] == "move_tab":
             request = json.loads(operation["target"])
             target = self.session.windows.get(request["window"])
@@ -3773,6 +3951,8 @@ class Studio(QObject):
     def _flush(self,action,target=""):
         if self.retired or action=="close_window" and self.pending_close:return
         operation = {"action":action,"target":target,"token":uuid.uuid4().hex}
+        if action == "mode" and self.tabs:
+            operation["tabId"] = self.active
         if not self.ready or not self.tabs:
             self._after_flush(operation)
             return
@@ -3912,6 +4092,7 @@ class Studio(QObject):
                     self._agent_open_paths.add(str(Path(path).resolve()))
                 except OSError:
                     pass
+                self._remember_path_view(target)
                 if str(path) != original_path:
                     self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
                     self._preferences()
@@ -3970,6 +4151,10 @@ class Studio(QObject):
             if folder_ops.matches_path_prefix(loc_key, old_path, is_directory=is_dir):
                 value = self.session.locations.pop(loc_key)
                 self.session.locations[folder_ops.remap_path_prefix(loc_key, old_path, new_path, is_directory=is_dir)] = value
+        for view_key in list(self.session.path_views.keys()):
+            if folder_ops.matches_path_prefix(view_key, old_path, is_directory=is_dir):
+                value = self.session.path_views.pop(view_key)
+                self.session.path_views[folder_ops.remap_path_prefix(view_key, old_path, new_path, is_directory=is_dir)] = value
         self.session.pinned = list(dict.fromkeys(
             folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
             for p in self.session.pinned
@@ -4023,6 +4208,7 @@ class Studio(QObject):
         if message:
             self.message = message
         self._save_positions()
+        self._save_note_views()
         self._preferences(notify=False)
         for win in list(self.session.windows.values()):
             if win.retired:
@@ -5690,8 +5876,20 @@ class Studio(QObject):
                 self._submit(work, finished, False)
                 return
             if command == "zoom_changed":
-                self.settings["fullZoom" if args.get("fullscreen", self.fullscreen) else "normalZoom"] = max(40,min(300,args["zoom"]))
-                self.preference_timer.start(500)
+                raw_zoom = args.get("zoom")
+                if isinstance(raw_zoom, bool) or not isinstance(raw_zoom, (int, float)) or not math.isfinite(raw_zoom):
+                    raise ValueError("Invalid zoom")
+                clamped_zoom = max(40, min(300, raw_zoom))
+                zoom = int(clamped_zoom) if isinstance(clamped_zoom, int) or clamped_zoom == int(clamped_zoom) else float(clamped_zoom)
+                explicit_id = args.get("id")
+                if isinstance(explicit_id, str) and explicit_id:
+                    target = next((t for t in self.tabs if t["id"] == explicit_id), None)
+                else:
+                    target = self._current() if self.tabs else None
+                if target is not None:
+                    target["viewFullZoom" if args.get("fullscreen", self.fullscreen) else "viewNormalZoom"] = zoom
+                    self._remember_path_view(target)
+                    self.recovery_timer.start(800)
                 self._emit(False); self.replied.emit(id,"true",""); return
             if command == "open_external_url":
                 url = args.get("url")
@@ -6013,6 +6211,7 @@ class Studio(QObject):
                         conflict=False,
                     )
                     if target["content"] == args["originalContent"]: target["content"] = target["saved"] = args["content"]
+                    self._remember_path_view(target)
                     self.message = "Saved"
                     self._recover()
                     self._emit()
@@ -6041,6 +6240,7 @@ class Studio(QObject):
                             self._agent_open_paths.add(str(Path(save_as).resolve()))
                         except OSError:
                             pass
+                        self._remember_path_view(save_target)
                         self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
                         self._preferences()
                         self.message = "Saved"

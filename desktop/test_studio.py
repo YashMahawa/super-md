@@ -973,7 +973,8 @@ class StudioTest(unittest.TestCase):
         operation=self.studio.flush_operation
         self.assertEqual(operation["action"],"mode")
         self.studio.post("flush-mode","document_flushed",json.dumps({"id":self.studio.active,"content":self.studio._current()["content"],"operation":operation}))
-        self.assertEqual(self.window().mode, "reader")
+        self.assertEqual(self.studio.mode, "reader")
+        self.assertEqual(self.window().mode, "live")
 
     def test_export_names_are_typed_urls_and_never_double_encode_spaces(self):
         meta=self.studio.metaObject()
@@ -1980,3 +1981,196 @@ class StudioTest(unittest.TestCase):
         self.assertFalse(studio._is_dirty(smd_tab))
         self.assertEqual(open_note(copy_smd), ("portable draft ![pic](assets/a.svg)", {"assets/a.svg": svg_a}, True))
         self.assertEqual(open_note(orig_smd), ("external smd", {}, True))
+
+    def test_per_note_mode_and_zoom_across_tab_switches_drafts_and_new_note_defaults(self):
+        studio = self.studio
+        self.session.settings["welcomed"] = True
+        studio.setting("readingMode", json.dumps("live"))
+        studio.setting("normalZoom", json.dumps(110))
+        studio.setting("fullZoom", json.dumps(120))
+
+        note_a_path = studio.data / "note-a.md"
+        note_a_path.write_text("# Note A\n\nSaved study note.\n", encoding="utf-8")
+        studio.openNote(str(note_a_path))
+        self.await_idle()
+        note_a_id = studio.active
+        self.assertEqual(studio.mode, "live")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 110)
+
+        # Explicitly customize Note A mode + normal/fullscreen zoom.
+        studio.setMode("reader")
+        studio.setZoom(165)
+        studio.setFullscreen(True)
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 165)
+        studio.setZoom(215)
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 215)
+        studio.setFullscreen(False)
+        self.assertEqual(studio.mode, "reader")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 165)
+        self.assertEqual(studio.settings["readingMode"], "live")
+        self.assertEqual(studio.settings["normalZoom"], 110)
+        self.assertEqual(studio.settings["fullZoom"], 120)
+
+        # Create an unsaved draft Note B: starts with configured defaults, then takes explicit overrides.
+        studio.newNote()
+        draft_b = studio._current()
+        draft_b_id = draft_b["id"]
+        self.assertEqual(studio.mode, "live")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 110)
+        draft_b["content"] = "# Unsaved Draft B\n\nScratch calculations.\n"
+        studio.setMode("editor")
+        studio.setZoom(140)
+        studio.post("pinch-b", "zoom_changed", json.dumps({"id": draft_b_id, "zoom": 145, "fullscreen": False}))
+        self.assertEqual(studio.mode, "editor")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 145)
+
+        # Verify readerLoad payloads across tab switches (saved Note A <-> unsaved Draft B).
+        loads = []
+        studio.readerLoad.connect(loads.append)
+        studio.ready = True
+
+        studio.selectTab(note_a_id)
+        payload_a = json.loads(loads[-1])
+        self.assertEqual(payload_a["id"], note_a_id)
+        self.assertEqual(payload_a["mode"], "reader")
+        self.assertEqual(payload_a["zoom"], 165)
+        self.assertEqual(json.loads(studio.snapshot)["mode"], "reader")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 165)
+
+        studio.selectTab(draft_b_id)
+        payload_b = json.loads(loads[-1])
+        self.assertEqual(payload_b["id"], draft_b_id)
+        self.assertEqual(payload_b["path"], draft_b_id)
+        self.assertEqual(payload_b["mode"], "editor")
+        self.assertEqual(payload_b["zoom"], 145)
+
+        # Create a brand-new Note C and open an unconfigured saved Note D -> both use configured defaults.
+        studio.newNote()
+        note_c_id = studio.active
+        payload_c = json.loads(loads[-1])
+        self.assertEqual(payload_c["id"], note_c_id)
+        self.assertEqual(payload_c["mode"], "live")
+        self.assertEqual(payload_c["zoom"], 110)
+
+        note_d_path = studio.data / "note-d.md"
+        note_d_path.write_text("# Note D\n\nFresh saved note.\n", encoding="utf-8")
+        studio.openNote(str(note_d_path))
+        self.await_idle()
+        note_d_id = studio.active
+        payload_d = json.loads(loads[-1])
+        self.assertEqual(payload_d["id"], note_d_id)
+        self.assertEqual(payload_d["mode"], "live")
+        self.assertEqual(payload_d["zoom"], 110)
+
+        # Updating configured defaults updates un-overridden tabs and new notes without touching Note A or Draft B.
+        studio.setting("readingMode", json.dumps("split"))
+        studio.setting("normalZoom", json.dumps(125))
+        self.assertEqual(studio.mode, "split")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 125)
+
+        studio.selectTab(note_c_id)
+        self.assertEqual(studio.mode, "split")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 125)
+
+        studio.selectTab(note_a_id)
+        self.assertEqual(studio.mode, "reader")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 165)
+
+        studio.selectTab(draft_b_id)
+        self.assertEqual(studio.mode, "editor")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 145)
+
+    def test_per_note_view_state_persists_across_outgoing_zoom_flush_save_rename_reopen_and_recovery(self):
+        studio = self.studio
+        self.session.settings["welcomed"] = True
+        studio.setting("readingMode", json.dumps("live"))
+        studio.setting("normalZoom", json.dumps(105))
+
+        saved_path = studio.data / "alpha.md"
+        saved_path.write_text("# Alpha\n\nSaved content.\n", encoding="utf-8")
+        studio.openNote(str(saved_path))
+        self.await_idle()
+        alpha_id = studio.active
+        studio.setMode("reader")
+        studio.setZoom(160)
+
+        studio.newNote()
+        draft = studio._current()
+        draft_id = draft["id"]
+        draft["content"] = "# Unsaved Beta\n\nWork in progress.\n"
+        studio.setMode("split")
+        studio.setZoom(140)
+
+        # Late zoom_changed from outgoing tab alpha_id while draft_id is active updates only alpha_id.
+        studio.post("late-zoom", "zoom_changed", json.dumps({"id": alpha_id, "zoom": 185, "fullscreen": False}))
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 140)
+        studio.selectTab(alpha_id)
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 185)
+        self.assertEqual(studio.mode, "reader")
+
+        # Close and reopen Draft Beta -> preserves its explicit mode ("split") and zoom (140).
+        studio.closeTab(draft_id)
+        studio.resolveClose("discard")
+        self._wait_for(lambda: all(tab["id"] != draft_id for tab in studio.tabs))
+        studio.reopenTab()
+        self._wait_for(lambda: studio.active == draft_id)
+        reopened_draft = studio._current()
+        self.assertEqual(reopened_draft["content"], "# Unsaved Beta\n\nWork in progress.\n")
+        self.assertEqual(studio.mode, "split")
+        self.assertEqual(json.loads(studio.snapshot)["zoom"], 140)
+
+        # Create another unsaved draft Gamma so recovery covers both saved notes and unsaved drafts.
+        studio.newNote()
+        gamma = studio._current()
+        gamma["content"] = "# Draft Gamma\n\nUnsaved editor note.\n"
+        studio.setMode("editor")
+        studio.setZoom(150)
+
+        # Save reopened_draft to disk and rename Alpha -> path-keyed note-views.json tracks both.
+        studio.selectTab(reopened_draft["id"])
+        beta_path = studio.data / "beta.md"
+        studio.saveAs(str(beta_path))
+        self._wait_for(lambda: not studio.saving and reopened_draft["path"] == str(beta_path))
+        self.await_idle()
+
+        renamed_alpha = studio.data / "alpha-renamed.md"
+        saved_path.rename(renamed_alpha)
+        studio._sync_path_change(str(saved_path), str(renamed_alpha), is_dir=False)
+        studio._save_note_views()
+        studio._recover()
+        self.flush()
+
+        # Simulate full Session restart from disk (settings.json, startup.json, recovery.json, note-views.json).
+        restored_session = Session(True, data=studio.data)
+        restored_window = QuietStudio(True, restored_session)
+        try:
+            deadline = time.monotonic() + 3
+            while restored_window._restoring_paths and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            by_name = {t["name"]: t for t in restored_window.tabs}
+            self.assertIn("alpha-renamed.md", by_name)
+            self.assertIn("beta.md", by_name)
+            restored_gamma = next(t for t in restored_window.tabs if t["path"] == "")
+
+            restored_window.selectTab(by_name["alpha-renamed.md"]["id"])
+            self.assertEqual(restored_window.mode, "reader")
+            self.assertEqual(json.loads(restored_window.snapshot)["zoom"], 185)
+
+            restored_window.selectTab(by_name["beta.md"]["id"])
+            self.assertEqual(restored_window.mode, "split")
+            self.assertEqual(json.loads(restored_window.snapshot)["zoom"], 140)
+
+            restored_window.selectTab(restored_gamma["id"])
+            self.assertEqual(restored_window.mode, "editor")
+            self.assertEqual(json.loads(restored_window.snapshot)["zoom"], 150)
+
+            # A brand-new note in the restored session still uses configured defaults ("live", 105).
+            restored_window.newNote()
+            self.assertEqual(restored_window.mode, "live")
+            self.assertEqual(json.loads(restored_window.snapshot)["zoom"], 105)
+        finally:
+            restored_window.stop()
+            restored_window.pool.shutdown(wait=True, cancel_futures=True)
+            restored_window._search_pool.shutdown(wait=True, cancel_futures=True)
+            restored_session.writes.shutdown(wait=True)
