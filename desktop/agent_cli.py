@@ -103,8 +103,14 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _emit(value: dict) -> None:
-    emit_json(value, error_cls=AgentDocumentError,
-              message="Response exceeded the 64 KB output limit; request a smaller page")
+    emit_json(value, error_cls=AgentDocumentError, message="Response exceeded the 64 KB output limit; request a smaller page")
+
+
+def _load_attr(module: str, attr: str):
+    try:
+        return getattr(__import__(f"{__package__}.{module}", fromlist=[attr]), attr) if __package__ else getattr(__import__(module, fromlist=[attr]), attr)
+    except ImportError:
+        return getattr(__import__(module, fromlist=[attr]), attr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -115,32 +121,15 @@ def main(argv: list[str] | None = None) -> int:
     # without importing Qt; stdio remains reserved for MCP protocol traffic.
     if argv and argv[0] in ("install-skill", "service"):
         try:
-            if argv[0] == "install-skill":
-                try:
-                    from .install_skill import main as extension_main
-                except ImportError:
-                    from install_skill import main as extension_main
-            else:
-                try:
-                    from .background_cli import main as extension_main
-                except ImportError:
-                    from background_cli import main as extension_main
-            return extension_main(argv[1:])
+            mod = "install_skill" if argv[0] == "install-skill" else "background_cli"
+            return _load_attr(mod, "main")(argv[1:])
         except (ValueError, OSError, ImportError) as error:
             _emit({"ok": False, "error": {"type": type(error).__name__, "message": str(error)[:1000]}})
             return 2
     if argv and argv[0] == "mcp":
-        try:
-            from .mcp_server import main as mcp_main
-        except ImportError:
-            from mcp_server import main as mcp_main
-        return mcp_main(argv[1:])
+        return _load_attr("mcp_server", "main")(argv[1:])
     if argv and argv[0] == "live":
-        try:
-            from .agent_live_cli import main as live_main
-        except ImportError:
-            from agent_live_cli import main as live_main
-        return live_main(argv[1:])
+        return _load_attr("agent_live_cli", "main")(argv[1:])
     parser = _parser()
     try:
         args = parser.parse_args(argv)

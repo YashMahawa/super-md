@@ -1,8 +1,4 @@
-"""Authenticated local/cloud MCP server compatibility facade for Super MD documents.
-
-The MCP SDK is imported lazily when server builders or HTTP transports run, so
-ordinary desktop startup and the standalone CLI do not load MCP, ASGI, or Qt.
-"""
+"""Authenticated local/cloud MCP server compatibility facade for Super MD documents."""
 from __future__ import annotations
 
 import sys
@@ -24,7 +20,6 @@ if __name__ in ("mcp_server", "desktop.mcp_server"):
     sys.modules.setdefault("desktop.mcp_server", sys.modules[__name__])
 
 __all__ = ["BearerAuth", "_token", "build_mcp_server", "main"]
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

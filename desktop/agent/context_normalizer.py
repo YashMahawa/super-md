@@ -14,275 +14,175 @@ def _safe_int(value: Any) -> int | None:
 
 
 def bounded_properties(value: Any) -> dict[str, Any] | None:
-    """Allowlist and bound displayed frontmatter metadata (title, author, authors, tags)."""
     if not isinstance(value, dict):
         return None
     out: dict[str, Any] = {}
-    raw_title = _bounded_text(value.get("title"), 300)
-    if raw_title and raw_title.strip():
+    if (raw_title := _bounded_text(value.get("title"), 300)) and raw_title.strip():
         out["title"] = raw_title.strip()
-    authors = [
-        item.strip()[:200]
-        for item in (value.get("authors") if isinstance(value.get("authors"), list) else [])
-        if isinstance(item, str) and item.strip()
-    ][:20]
-    raw_author = _bounded_text(value.get("author"), 500)
-    clean_author = raw_author.strip() if raw_author else ""
+    raw_authors = value.get("authors") if isinstance(value.get("authors"), list) else []
+    authors = [item.strip()[:200] for item in raw_authors if isinstance(item, str) and item.strip()][:20]
+    clean_author = (_bounded_text(value.get("author"), 500) or "").strip()
     if authors:
-        out["authors"] = authors
-        out["author"] = clean_author or ", ".join(authors)[:500]
+        out["authors"], out["author"] = authors, clean_author or ", ".join(authors)[:500]
     elif clean_author:
-        out["author"] = clean_author
-        out["authors"] = [clean_author[:200]]
-    tags = [
-        item.strip()[:100]
-        for item in (value.get("tags") if isinstance(value.get("tags"), list) else [])
-        if isinstance(item, str) and item.strip()
-    ][:50]
-    if tags:
+        out["author"], out["authors"] = clean_author, [clean_author[:200]]
+    raw_tags = value.get("tags") if isinstance(value.get("tags"), list) else []
+    if tags := [item.strip()[:100] for item in raw_tags if isinstance(item, str) and item.strip()][:50]:
         out["tags"] = tags
     return out or None
 
 
 def normalize_reading_context(context: dict[str, Any]) -> dict[str, Any]:
-    """Repair prefix-relative visibleSource pagination and bound displayed properties."""
     base = dict(context)
     if "properties" in base:
-        bounded_props = bounded_properties(base.get("properties"))
-        if bounded_props is not None:
+        if (bounded_props := bounded_properties(base.get("properties"))) is not None:
             base["properties"] = bounded_props
         else:
             base.pop("properties", None)
-    source_length = _safe_int(base.get("sourceLength"))
-    visible_source = base.get("visibleSource")
+    source_length, visible_source = _safe_int(base.get("sourceLength")), base.get("visibleSource")
     if source_length is None or source_length < 0 or not isinstance(visible_source, dict):
         return base
     start, end = _safe_int(visible_source.get("start")), _safe_int(visible_source.get("end"))
     if start is None or end is None or start < 0 or end < start or end > source_length:
         return base
-    return {
-        **base,
-        "visibleSource": {
-            **visible_source,
-            "total_chars": source_length,
-            "next_offset": end if end < source_length else None,
-            "truncated": end < source_length,
-        },
-    }
+    vs = {**visible_source, "total_chars": source_length, "next_offset": end if end < source_length else None, "truncated": end < source_length}
+    return {**base, "visibleSource": vs}
 
 
 def bounded_diagrams(value: Any) -> list[dict[str, Any]] | None:
-    """Bound visible diagram descriptors and strip inline data/base64 asset references."""
     if not isinstance(value, list):
         return None
     items: list[dict[str, Any]] = []
     for raw in value[:30]:
         if not isinstance(raw, dict):
             continue
-        item: dict[str, Any] = {}
-        for key, limit in (("id", 128), ("kind", 128), ("preview", 160), ("deckTitle", 200), ("stepLabel", 200)):
-            text = _bounded_text(raw.get(key), limit)
-            if text is not None:
-                item[key] = text
-        for key in ("sourceStart", "sourceEnd", "sourceChars"):
-            num = _safe_int(raw.get(key))
-            if num is not None:
-                item[key] = num
-        step_index = _safe_int(raw.get("stepIndex"))
-        if step_index is not None and step_index >= 0:
-            item["stepIndex"] = step_index
-        step_count = _safe_int(raw.get("stepCount"))
-        if step_count is not None and step_count >= 1:
-            item["stepCount"] = step_count
+        item: dict[str, Any] = {k: raw[k][:lim] for k, lim in (("id", 128), ("kind", 128), ("preview", 160), ("deckTitle", 200), ("stepLabel", 200)) if isinstance(raw.get(k), str)}
+        item.update({k: raw[k] for k in ("sourceStart", "sourceEnd", "sourceChars") if _safe_int(raw.get(k)) is not None})
+        item.update({k: raw[k] for k, mn in (("stepIndex", 0), ("stepCount", 1)) if (_safe_int(raw.get(k)) is not None and raw[k] >= mn)})
         if isinstance(raw.get("activeStep"), bool):
             item["activeStep"] = raw["activeStep"]
-        asset_ref = _bounded_text(raw.get("assetReference"), 512)
-        if asset_ref is not None and not asset_ref.lower().startswith("data:") and "base64," not in asset_ref.lower():
-            item["assetReference"] = asset_ref
+        if (ref := _bounded_text(raw.get("assetReference"), 512)) is not None and not ref.lower().startswith("data:") and "base64," not in ref.lower():
+            item["assetReference"] = ref
         items.append(item)
     return items
 
 
 def bounded_active_step(value: Any) -> dict[str, Any] | None:
-    """Bound active walkthrough step metadata when valid."""
     if not isinstance(value, dict):
         return None
-    deck_title = _bounded_text(value.get("deckTitle"), 200)
-    step_index, step_count = _safe_int(value.get("stepIndex")), _safe_int(value.get("stepCount"))
+    deck_title, step_index, step_count = _bounded_text(value.get("deckTitle"), 200), _safe_int(value.get("stepIndex")), _safe_int(value.get("stepCount"))
     if deck_title is None or step_index is None or step_index < 0 or step_count is None or step_count < 1:
         return None
-    result: dict[str, Any] = {
-        "deckTitle": deck_title, "stepIndex": step_index,
-        "stepCount": step_count, "activeStep": value.get("activeStep") is not False,
-    }
-    step_label = _bounded_text(value.get("stepLabel"), 200)
-    if step_label is not None:
-        result["stepLabel"] = step_label
+    res: dict[str, Any] = {"deckTitle": deck_title, "stepIndex": step_index, "stepCount": step_count, "activeStep": value.get("activeStep") is not False}
+    if isinstance(value.get("stepLabel"), str):
+        res["stepLabel"] = value["stepLabel"][:200]
     if isinstance(value.get("expanded"), bool):
-        result["expanded"] = value["expanded"]
-    return result
+        res["expanded"] = value["expanded"]
+    return res
 
 
 def bounded_python_cells(value: Any) -> list[dict[str, Any]] | None:
-    """Bound Python cell execution summaries and figure IDs."""
     if not isinstance(value, list):
         return None
     cells: list[dict[str, Any]] = []
     for raw in value[:8]:
         if not isinstance(raw, dict) or not isinstance(raw.get("ok"), bool):
             continue
-        entry: dict[str, Any] = {"ok": raw["ok"]}
-        for key in ("ordinal", "sourceStart", "sourceEnd"):
-            num = _safe_int(raw.get(key))
-            if num is not None and num >= 0:
-                entry[key] = num
+        entry: dict[str, Any] = {"ok": raw["ok"], **{k: raw[k] for k in ("ordinal", "sourceStart", "sourceEnd") if (_safe_int(raw.get(k)) is not None and raw[k] >= 0)}}
         for stream, trunc_key in (("stdout", "stdoutTruncated"), ("stderr", "stderrTruncated")):
-            text = _bounded_text(raw.get(stream), 500)
-            if text is not None:
-                entry[stream] = text
+            if isinstance(raw.get(stream), str):
+                entry[stream] = raw[stream][:500]
             if raw.get(trunc_key) is True or (isinstance(raw.get(stream), str) and len(raw[stream]) > 500):
                 entry[trunc_key] = True
         if isinstance(raw.get("figureIds"), list):
-            entry["figureIds"] = [
-                fid for fid in raw["figureIds"]
-                if isinstance(fid, str) and fid.startswith("diagram:python:") and len(fid) <= 128
-            ][:16]
+            entry["figureIds"] = [f for f in raw["figureIds"] if isinstance(f, str) and f.startswith("diagram:python:") and len(f) <= 128][:16]
         cells.append(entry)
     return cells or None
 
 
-def viewport_contexts(
-    image: dict[str, Any], tab_id: str, expected_revision: str,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Extract bounded image-capture metadata and optional coherent readingContext."""
+def viewport_contexts(image: dict[str, Any], tab_id: str, expected_revision: str) -> tuple[dict[str, Any], dict[str, Any] | None]:
     nested = image.get("context") if isinstance(image.get("context"), dict) else None
-    metadata = image.get("metadata") if isinstance(image.get("metadata"), dict) else None
-    source = nested if nested is not None else image
-    raw_tab_id = source.get("tabId") if isinstance(source.get("tabId"), str) and source.get("tabId") else (
-        metadata.get("tabId") if metadata and isinstance(metadata.get("tabId"), str) else None
-    )
-    source_revision = source.get("revision")
-    revision_matches = not isinstance(source_revision, str) or source_revision == expected_revision
-    capture_ctx: dict[str, Any] = {
-        "tabId": tab_id, "revision": expected_revision, "contextRevisionMatches": revision_matches,
-    }
+    meta = image.get("metadata") if isinstance(image.get("metadata"), dict) else None
+    src = nested if nested is not None else image
+    raw_tab_id = src.get("tabId") if isinstance(src.get("tabId"), str) and src.get("tabId") else (meta.get("tabId") if meta and isinstance(meta.get("tabId"), str) else None)
+    source_rev = src.get("revision")
+    rev_ok = not isinstance(source_rev, str) or source_rev == expected_revision
+    ctx: dict[str, Any] = {"tabId": tab_id, "revision": expected_revision, "contextRevisionMatches": rev_ok}
     if raw_tab_id and raw_tab_id != tab_id:
-        capture_ctx["nativeTabId"] = raw_tab_id
-    if isinstance(source_revision, str) and source_revision != expected_revision:
-        capture_ctx["contextRevision"] = source_revision
-    mode = _bounded_text(source.get("mode", metadata.get("mode") if metadata else None), 64)
-    if mode is not None:
-        capture_ctx["mode"] = mode
-    zoom = source.get("zoom", metadata.get("zoom") if metadata else None)
-    if isinstance(zoom, (int, float)) and not isinstance(zoom, bool):
-        capture_ctx["zoom"] = zoom
-    raw_reading = source.get("reading", metadata.get("reading") if metadata else None)
-    if isinstance(raw_reading, dict):
-        reading: dict[str, Any] = {
-            key: raw_reading[key] for key in ("offset", "scrollFraction")
-            if isinstance(raw_reading.get(key), (int, float)) and not isinstance(raw_reading.get(key), bool)
-        }
-        for key, limit in (("heading", 300), ("visibleText", 2000)):
-            text = _bounded_text(raw_reading.get(key), limit)
-            if text is not None:
-                reading[key] = text
-        capture_ctx["reading"] = reading
-    raw_selection = source.get("selection", metadata.get("selection") if metadata else None)
-    if isinstance(raw_selection, dict):
-        sel_text = _bounded_text(raw_selection.get("text"), 2000)
-        capture_ctx["selection"] = {} if sel_text is None else {"text": sel_text}
-    raw_viewport = source.get("viewport", metadata.get("viewport") if metadata else None)
-    if isinstance(raw_viewport, dict):
-        capture_ctx["viewport"] = {
-            key: raw_viewport[key]
-            for key in ("x", "y", "width", "height", "viewportWidth", "viewportHeight", "devicePixelRatio")
-            if isinstance(raw_viewport.get(key), (int, float)) and not isinstance(raw_viewport.get(key), bool)
-        }
-    active_step = bounded_active_step(source.get("activeStep", metadata.get("activeStep") if metadata else None))
-    if active_step is not None:
-        capture_ctx["activeStep"] = active_step
-    props = bounded_properties(source.get("properties", metadata.get("properties") if metadata else None))
-    if props is not None and revision_matches:
-        capture_ctx["properties"] = props
-    source_length = _safe_int(source.get("sourceLength"))
-    normalized_src = source.get("visibleSource")
-    if source_length is not None and source_length >= 0 and isinstance(normalized_src, dict):
-        normalized_src = normalize_reading_context(
-            {"sourceLength": source_length, "visibleSource": normalized_src}
-        ).get("visibleSource")
+        ctx["nativeTabId"] = raw_tab_id
+    if isinstance(source_rev, str) and source_rev != expected_revision:
+        ctx["contextRevision"] = source_rev
+    if (mode := _bounded_text(src.get("mode", meta.get("mode") if meta else None), 64)) is not None:
+        ctx["mode"] = mode
+    if isinstance(zoom := src.get("zoom", meta.get("zoom") if meta else None), (int, float)) and not isinstance(zoom, bool):
+        ctx["zoom"] = zoom
+    if isinstance(raw_reading := src.get("reading", meta.get("reading") if meta else None), dict):
+        reading = {k: raw_reading[k] for k in ("offset", "scrollFraction") if isinstance(raw_reading.get(k), (int, float)) and not isinstance(raw_reading.get(k), bool)}
+        reading.update({k: raw_reading[k][:lim] for k, lim in (("heading", 300), ("visibleText", 2000)) if isinstance(raw_reading.get(k), str)})
+        ctx["reading"] = reading
+    if isinstance(raw_sel := src.get("selection", meta.get("selection") if meta else None), dict):
+        sel_text = _bounded_text(raw_sel.get("text"), 2000)
+        ctx["selection"] = {} if sel_text is None else {"text": sel_text}
+    if isinstance(raw_vp := src.get("viewport", meta.get("viewport") if meta else None), dict):
+        vkeys = ("x", "y", "width", "height", "viewportWidth", "viewportHeight", "devicePixelRatio")
+        ctx["viewport"] = {k: raw_vp[k] for k in vkeys if isinstance(raw_vp.get(k), (int, float)) and not isinstance(raw_vp.get(k), bool)}
+    if (active_step := bounded_active_step(src.get("activeStep", meta.get("activeStep") if meta else None))) is not None:
+        ctx["activeStep"] = active_step
+    if (props := bounded_properties(src.get("properties", meta.get("properties") if meta else None))) is not None and rev_ok:
+        ctx["properties"] = props
+    source_length, norm_src = _safe_int(src.get("sourceLength")), src.get("visibleSource")
+    if source_length is not None and source_length >= 0 and isinstance(norm_src, dict):
+        norm_src = normalize_reading_context({"sourceLength": source_length, "visibleSource": norm_src}).get("visibleSource")
     visible_source: dict[str, Any] | None = None
     preview_truncated = False
-    if isinstance(normalized_src, dict) and isinstance(normalized_src.get("text"), str):
-        text_chars = normalized_src["text"]
-        returned_text = text_chars[:12_000]
-        preview_truncated = len(text_chars) > len(returned_text)
-        visible_source = {"text": returned_text}
-        source_range: dict[str, Any] = {}
+    if isinstance(norm_src, dict) and isinstance(norm_src.get("text"), str):
+        text_chars = norm_src["text"]
+        ret_text = text_chars[:12_000]
+        preview_truncated = len(text_chars) > len(ret_text)
+        visible_source, source_range = {"text": ret_text}, {}
         if preview_truncated:
             visible_source["previewTruncated"] = source_range["previewTruncated"] = True
-        start = _safe_int(normalized_src.get("start"))
+        start = _safe_int(norm_src.get("start"))
         for key in ("start", "end", "total_chars", "next_offset", "truncated", "view"):
-            alt = normalized_src.get("totalChars") if key == "total_chars" else (
-                normalized_src.get("nextOffset") if key == "next_offset" else None
-            )
-            field = normalized_src.get(key, alt)
+            alt = norm_src.get("totalChars") if key == "total_chars" else (norm_src.get("nextOffset") if key == "next_offset" else None)
+            field = norm_src.get(key, alt)
             if key in ("end", "next_offset") and preview_truncated:
                 if start is not None:
-                    visible_source[key] = source_range[key] = start + len(returned_text)
+                    visible_source[key] = source_range[key] = start + len(ret_text)
             elif key == "truncated" and preview_truncated:
                 visible_source[key] = source_range[key] = True
-            elif (_safe_int(field) is not None or isinstance(field, bool)
-                    or (key == "next_offset" and field is None)
-                    or (key == "view" and isinstance(field, str))):
+            elif _safe_int(field) is not None or isinstance(field, bool) or (key == "next_offset" and field is None) or (key == "view" and isinstance(field, str)):
                 visible_source[key] = source_range[key] = field
         if source_range:
-            capture_ctx["sourceRange"] = source_range
-    diagrams, python_cells = bounded_diagrams(source.get("diagrams")), bounded_python_cells(source.get("pythonCells"))
-    coherent = (revision_matches and visible_source is not None and not preview_truncated
-                and isinstance(source_revision, str) and source_revision == expected_revision)
-    captured_reading: dict[str, Any] | None = None
-    if coherent and visible_source is not None:
-        captured_reading = {**capture_ctx, "visibleSource": visible_source}
-        if source_length is not None and source_length >= 0:
-            captured_reading["sourceLength"] = source_length
-        if diagrams is not None:
-            captured_reading["diagrams"] = diagrams
-        if python_cells is not None:
-            captured_reading["pythonCells"] = python_cells
-    return capture_ctx, captured_reading
+            ctx["sourceRange"] = source_range
+    diagrams, python_cells = bounded_diagrams(src.get("diagrams")), bounded_python_cells(src.get("pythonCells"))
+    coherent = rev_ok and visible_source is not None and not preview_truncated and isinstance(source_rev, str) and source_rev == expected_revision
+    captured = ({**ctx, "visibleSource": visible_source, **({"sourceLength": source_length} if source_length is not None and source_length >= 0 else {}),
+                 **({"diagrams": diagrams} if diagrams is not None else {}), **({"pythonCells": python_cells} if python_cells is not None else {})}
+                if coherent and visible_source is not None else None)
+    return ctx, captured
 
 
-def normalize_initial_reading_context(
-    raw_context: dict[str, Any], *, resolved_tab: str, target: str,
-) -> dict[str, Any]:
-    """Normalize and bound a raw get_context response for view_current."""
-    normalized = normalize_reading_context(raw_context)
-    if "diagrams" in normalized:
-        bounded_diags = bounded_diagrams(normalized.get("diagrams"))
-        if bounded_diags is not None:
-            normalized["diagrams"] = bounded_diags
+def normalize_initial_reading_context(raw_context: dict[str, Any], *, resolved_tab: str, target: str) -> dict[str, Any]:
+    norm = normalize_reading_context(raw_context)
+    if "diagrams" in norm and (bdiags := bounded_diagrams(norm.get("diagrams"))) is not None:
+        norm["diagrams"] = bdiags
     for key, fn in (("activeStep", bounded_active_step), ("pythonCells", bounded_python_cells)):
-        if key in normalized:
-            bounded_val = fn(normalized.get(key))
-            if bounded_val is not None:
-                normalized[key] = bounded_val
+        if key in norm:
+            if (bval := fn(norm.get(key))) is not None:
+                norm[key] = bval
             else:
-                normalized.pop(key, None)
-    raw_ctx_tab = normalized.get("tabId")
-    reading_context = dict(normalized)
-    if isinstance(raw_ctx_tab, str) and raw_ctx_tab and raw_ctx_tab != resolved_tab:
-        reading_context["nativeTabId"] = raw_ctx_tab
-    reading_context["tabId"] = resolved_tab
-    reading_context["target"] = target
-    return reading_context
+                norm.pop(key, None)
+    out = dict(norm)
+    if isinstance(norm.get("tabId"), str) and norm["tabId"] and norm["tabId"] != resolved_tab:
+        out["nativeTabId"] = norm["tabId"]
+    out["tabId"], out["target"] = resolved_tab, target
+    return out
 
 
-_bounded_properties = bounded_properties
-_normalize_reading_context = normalize_reading_context
-_bounded_diagrams = bounded_diagrams
-_bounded_active_step = bounded_active_step
-_bounded_python_cells = bounded_python_cells
-_viewport_contexts = viewport_contexts
+_bounded_properties, _normalize_reading_context = bounded_properties, normalize_reading_context
+_bounded_diagrams, _bounded_active_step = bounded_diagrams, bounded_active_step
+_bounded_python_cells, _viewport_contexts = bounded_python_cells, viewport_contexts
 
 if __name__ in ("agent.context_normalizer", "desktop.agent.context_normalizer"):
     sys.modules.setdefault("agent.context_normalizer", sys.modules[__name__])

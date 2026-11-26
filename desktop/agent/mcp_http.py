@@ -15,25 +15,18 @@ from .mcp_tools import build_mcp_server
 
 
 class BearerAuth:
-    """Small ASGI gate that protects every HTTP route before MCP dispatch."""
-
     def __init__(self, app, token: str):
-        self.app = app
-        self.expected = token.encode("utf-8")
+        self.app, self.expected = app, token.encode("utf-8")
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        headers = {key.lower(): value for key, value in scope.get("headers", [])}
-        supplied = headers.get(b"authorization", b"")
-        valid = supplied.startswith(b"Bearer ") and hmac.compare_digest(supplied[7:], self.expected)
-        if not valid:
+        supplied = {k.lower(): v for k, v in scope.get("headers", [])}.get(b"authorization", b"")
+        if not (supplied.startswith(b"Bearer ") and hmac.compare_digest(supplied[7:], self.expected)):
             body = b"Unauthorized"
-            await send({"type": "http.response.start", "status": 401,
-                        "headers": [(b"content-type", b"text/plain; charset=utf-8"),
-                                    (b"content-length", str(len(body)).encode()),
-                                    (b"www-authenticate", b"Bearer")]})
+            hdrs = [(b"content-type", b"text/plain; charset=utf-8"), (b"content-length", str(len(body)).encode()), (b"www-authenticate", b"Bearer")]
+            await send({"type": "http.response.start", "status": 401, "headers": hdrs})
             await send({"type": "http.response.body", "body": body})
             return
         await self.app(scope, receive, send)
@@ -78,30 +71,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.transport == "stdio":
             server.run(transport="stdio")
             return 0
-
-        is_loopback = args.host in ("127.0.0.1", "localhost", "::1")
         if not 1 <= args.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         token = _token(args)
         import uvicorn
         from mcp.server.transport_security import TransportSecuritySettings
-
-        kwargs = {"host": args.host, "port": args.port,
-                  "streamable_http_path": "/mcp", "max_request_body_size": 2 * 1024 * 1024}
-        if is_loopback:
+        kwargs = {"host": args.host, "port": args.port, "streamable_http_path": "/mcp", "max_request_body_size": 2 * 1024 * 1024}
+        if args.host in ("127.0.0.1", "localhost", "::1"):
             if args.allow_host or args.allow_origin:
                 raise ValueError("Loopback mode uses the SDK's built-in localhost DNS-rebinding protection; remove allowlists")
-            kwargs["host"] = args.host
+        elif not args.allow_host:
+            raise ValueError("Non-loopback HTTP requires explicit --allow-host entries")
         else:
-            if not args.allow_host:
-                raise ValueError("Non-loopback HTTP requires explicit --allow-host entries")
-            kwargs["transport_security"] = TransportSecuritySettings(
-                allowed_hosts=args.allow_host,
-                allowed_origins=args.allow_origin or [],
-            )
-        app = BearerAuth(server.streamable_http_app(**kwargs), token)
-        uvicorn.run(app, host=args.host, port=args.port, access_log=False,
-                    timeout_keep_alive=10, limit_concurrency=64, log_level="warning")
+            kwargs["transport_security"] = TransportSecuritySettings(allowed_hosts=args.allow_host, allowed_origins=args.allow_origin or [])
+        uvicorn.run(BearerAuth(server.streamable_http_app(**kwargs), token), host=args.host, port=args.port,
+                    access_log=False, timeout_keep_alive=10, limit_concurrency=64, log_level="warning")
         return 0
     except (ValueError, OSError, ImportError) as exc:
         print(f"Super MD MCP server: {exc}", file=sys.stderr)

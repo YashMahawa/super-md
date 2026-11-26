@@ -16,27 +16,17 @@ if _DESKTOP_DIR not in sys.path:
     sys.path.insert(0, _DESKTOP_DIR)
 
 try:
-    from .agent.cli_common import (
-        MAX_CLI_OUTPUT,
-        emit_json,
-        heading_selector,
-        make_json_argument_parser,
-    )
+    from .agent import cli_common as _cc
     from .agent_stdio import configure_stdio
 except ImportError:  # python desktop/agent_live_cli.py
-    from agent.cli_common import (
-        MAX_CLI_OUTPUT,
-        emit_json,
-        heading_selector,
-        make_json_argument_parser,
-    )
+    from agent import cli_common as _cc
     from agent_stdio import configure_stdio
 
 if __name__ in ("agent_live_cli", "desktop.agent_live_cli"):
     sys.modules.setdefault("agent_live_cli", sys.modules[__name__])
     sys.modules.setdefault("desktop.agent_live_cli", sys.modules[__name__])
 
-MAX_OUTPUT = MAX_CLI_OUTPUT
+MAX_OUTPUT = _cc.MAX_CLI_OUTPUT
 MAX_INPUT = 64_000
 MAX_CONTENT = 20_000_000
 MAX_IMAGE = 8 * 1024 * 1024
@@ -51,12 +41,11 @@ class _CLIError(ValueError):
     pass
 
 
-_JSONArgumentParser = make_json_argument_parser(_CLIError)
+_JSONArgumentParser = _cc.make_json_argument_parser(_CLIError)
 
 
 def _emit(value: dict[str, Any]) -> None:
-    emit_json(value, max_bytes=MAX_OUTPUT, error_cls=_CLIError,
-              message="Response exceeded 64 KB; request a smaller page")
+    _cc.emit_json(value, max_bytes=MAX_OUTPUT, error_cls=_CLIError, message="Response exceeded 64 KB; request a smaller page")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -226,7 +215,7 @@ def _native_id(value: str) -> str:
     return value.removeprefix("tab:")
 
 
-_heading_selector = heading_selector
+_heading_selector = _cc.heading_selector
 
 
 def _write_image(path: str, image: dict[str, Any]) -> dict[str, Any]:
