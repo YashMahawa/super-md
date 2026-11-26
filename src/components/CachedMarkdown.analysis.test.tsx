@@ -154,13 +154,24 @@ describe("CachedMarkdown supplied source analysis", () => {
     expect(htmlFromSupplied).toContain('class="callout callout-note"');
     expect(htmlFromSupplied).toContain("<mark>term</mark>");
     expect(htmlFromSupplied).toContain("<kbd>Esc</kbd><br/>line two.");
+    const imageParagraph = treeFromSupplied.children.find(
+      (node: any) => node.type === "element" && node.tagName === "p" && node.children?.some((child: any) => child.tagName === "img"),
+    ) as any;
+    const hastImgSrcs = imageParagraph.children
+      .filter((child: any) => child.type === "element" && child.tagName === "img")
+      .map((child: any) => child.properties?.src);
+    expect(hastImgSrcs).toEqual([
+      "data:image/png;base64,iVBORw0KGgo=",
+      "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4=",
+      "",
+    ]);
     expect(htmlFromSupplied).not.toContain("onclick");
     expect(htmlFromSupplied).not.toContain("javascript:");
     expect(htmlFromSupplied).not.toContain("vbscript:");
     expect(htmlFromSupplied).not.toContain("data:text/html");
     expect(htmlFromSupplied).not.toContain("<script");
     expect(htmlFromSupplied).toContain('src="data:image/png;base64,iVBORw0KGgo="');
-    expect(htmlFromSupplied).toContain('src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4="');
+    expect(htmlFromSupplied).toContain('data-note-image-source="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciLz4="');
     expect(htmlFromSupplied).toContain('href="./notes/chapter-2.md#summary"');
     expect(htmlFromSupplied).toContain('href="#analysis-heading"');
     expect(htmlFromSupplied).toContain('href="mailto:reader@example.org"');
