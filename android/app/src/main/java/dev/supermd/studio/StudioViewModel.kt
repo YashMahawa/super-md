@@ -953,6 +953,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val seededFindMutable = MutableStateFlow<PendingSeededFind?>(null)
     val seededFind = seededFindMutable.asStateFlow()
     private var folderSearchJob: Job? = null
+    private var initialFolderLoadJob: Job? = null
+    private var startupAccessSeedJob: Job? = null
 
     init {
         activeStudioViewModels.add(this)
@@ -967,8 +969,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         observeCustomTheme()
         migrateLegacyClosedNotes()
         val initialFolderJob = mutable.value.folder?.let { listFolder(Uri.parse(it), mutable.value.folderRelative) }
+        initialFolderLoadJob = initialFolderJob
         if (restoredFromSnapshot) {
-            seedRestoredDocumentAccess(initialFolderJob)
+            startupAccessSeedJob = seedRestoredDocumentAccess(initialFolderJob)
         }
         if (workspaceKey == "main") viewModelScope.launch {
             updates.restore()
@@ -979,13 +982,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
 
-    private fun seedRestoredDocumentAccess(initialFolderJob: Job?) {
+    @androidx.annotation.VisibleForTesting
+    internal fun isStartupAccessSeedActive(): Boolean = startupAccessSeedJob?.isActive == true
+
+    private fun seedRestoredDocumentAccess(initialFolderJob: Job?): Job? {
         val candidateUris = mutable.value.tabs
             .mapNotNull { it.uri }
             .filter { raw -> runCatching { Uri.parse(raw).scheme.equals("content", ignoreCase = true) }.getOrDefault(false) }
             .distinct()
-        if (candidateUris.isEmpty()) return
-        viewModelScope.launch {
+        if (candidateUris.isEmpty()) return null
+        return viewModelScope.launch {
             if (
                 initialFolderJob != null &&
                 mutable.value.folder?.let { !isKnownPathDocumentProvider(Uri.parse(it).authority) } == true
@@ -1608,6 +1614,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         refreshJob?.cancel()
         refreshJob = viewModelScope.launch {
             if (!immediate) delay(200)
+            val startupFolderJob = initialFolderLoadJob
+            if (
+                startupFolderJob?.isActive == true &&
+                mutable.value.folder?.let { !isKnownPathDocumentProvider(Uri.parse(it).authority) } == true
+            ) {
+                runCatching { startupFolderJob.join() }
+            }
             val (snapshotGen, checkAll, requestedUris) = synchronized(pendingRefreshLock) {
                 Triple(refreshGeneration, refreshAllGeneration > 0L, pendingRefreshUris.keys.toSet())
             }
@@ -3557,14 +3570,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             .mapNotNull { permission ->
                 val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
                 val trimmed = root.trimEnd('/')
-                val contained = documentId.startsWith("$trimmed/") || root.endsWith(':') && documentId.startsWith(root) || allowEmbeddedTreeFallback && documentId == root
+                val contained = documentId.startsWith("$trimmed/") ||
+                    root.endsWith(':') && documentId.startsWith(root) ||
+                    allowEmbeddedTreeFallback && documentId == root ||
+                    relativeInOpenFolder(noteUri, permission.uri.toString()) != null
                 if (contained && documentAccess.resolveReadableTreeRoot(permission.uri) != null) root to permission.uri else null
             }
             .maxByOrNull { it.first.length }
         val active = persisted ?: if (allowEmbeddedTreeFallback && DocumentsContract.isTreeUri(noteUri)) {
             runCatching {
                 val root = DocumentsContract.getTreeDocumentId(noteUri)
-                root to DocumentsContract.buildTreeDocumentUri(noteUri.authority, root)
+                val builtTree = DocumentsContract.buildTreeDocumentUri(noteUri.authority, root)
+                if (documentAccess.resolveReadableTreeRoot(builtTree) != null) root to builtTree else null
             }.getOrNull()
         } else null
         val (rootId, folderUri) = active ?: return null

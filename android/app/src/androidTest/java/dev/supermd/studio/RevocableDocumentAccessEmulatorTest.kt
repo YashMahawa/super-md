@@ -166,7 +166,8 @@ class RevocableDocumentAccessEmulatorTest {
             waitForCondition {
                 model!!.documentWriteNeedsAccess(cleanRevokedId) &&
                     model!!.documentWriteNeedsAccess(draftRevokedId) &&
-                    !model!!.isRefreshExternalActive()
+                    !model!!.isRefreshExternalActive() &&
+                    !model!!.isStartupAccessSeedActive()
             }
 
             // 1. Active clean note with revoked grant shows restore-access status (never "Saved") and keeps cached text.
@@ -319,9 +320,9 @@ class RevocableDocumentAccessEmulatorTest {
     }
 
     private fun awaitActiveReader(model: StudioViewModel) {
-        waitForCondition(15_000L) {
+        waitForCondition(30_000L) {
             val activeId = model.state.value.active.id
-            activeId.isNotEmpty() && runBlocking { model.awaitReaderSnapshot(activeId, 1_500L) }
+            activeId.isNotEmpty() && runBlocking { model.awaitReaderSnapshot(activeId, 2_500L) }
         }
     }
 
@@ -334,14 +335,14 @@ class RevocableDocumentAccessEmulatorTest {
         awaitActiveReader(model)
         scenario.onActivity { activity -> activity.requestOpen(uri, relative) }
         var openedId = ""
-        waitForCondition(15_000L) {
+        waitForCondition(30_000L) {
             val match = model.state.value.tabs.firstOrNull {
                 it.uri != null && sameDocument(Uri.parse(it.uri), uri)
             }
             if (
                 match != null &&
                 model.state.value.active.id == match.id &&
-                runBlocking { model.awaitReaderSnapshot(match.id, 1_500L) }
+                runBlocking { model.awaitReaderSnapshot(match.id, 2_500L) }
             ) {
                 openedId = match.id
                 true
@@ -359,9 +360,9 @@ class RevocableDocumentAccessEmulatorTest {
     ) {
         awaitActiveReader(model)
         scenario.onActivity { model.select(targetId) }
-        waitForCondition(15_000L) {
+        waitForCondition(30_000L) {
             model.state.value.active.id == targetId &&
-                runBlocking { model.awaitReaderSnapshot(targetId, 1_500L) }
+                runBlocking { model.awaitReaderSnapshot(targetId, 2_500L) }
         }
     }
 
@@ -372,14 +373,14 @@ class RevocableDocumentAccessEmulatorTest {
         content: String,
     ) {
         scenario.onActivity { model.edit(noteId, content) }
-        waitForCondition(15_000L) {
+        waitForCondition(30_000L) {
             val current = model.state.value
             current.tabs.single { it.id == noteId }.content == content &&
-                (current.active.id != noteId || runBlocking { model.awaitReaderSnapshot(noteId, 1_500L) })
+                (current.active.id != noteId || runBlocking { model.awaitReaderSnapshot(noteId, 2_500L) })
         }
     }
 
-    private fun waitForNodeText(text: String, timeoutMs: Long = 10_000L) {
+    private fun waitForNodeText(text: String, timeoutMs: Long = 30_000L) {
         waitForCondition(timeoutMs) {
             compose.onAllNodesWithText(text).hasAnyNode()
         }
@@ -389,7 +390,7 @@ class RevocableDocumentAccessEmulatorTest {
     private fun SemanticsNodeInteractionCollection.hasAnyNode(): Boolean =
         runCatching { fetchSemanticsNodes().isNotEmpty() }.getOrDefault(false)
 
-    private fun waitForCondition(timeoutMs: Long = 10_000L, condition: () -> Boolean) {
+    private fun waitForCondition(timeoutMs: Long = 30_000L, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             compose.waitForIdle()

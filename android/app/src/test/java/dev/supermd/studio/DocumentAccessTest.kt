@@ -795,6 +795,80 @@ class DocumentAccessTest {
         assertNotNull(siblingHeading)
         assertEquals(restoredModel.state.value.active.id, siblingHeading!!.noteId)
         assertEquals("lemma", siblingHeading.heading)
+        restoredModel.consumePendingHeading(siblingHeading.token)
+
+        // 4. If a containing-folder tree grant is later revoked while a restored tab still carries an embedded tree URI,
+        // openWorkspaceLink falls back cleanly from the revoked tree to standalone sibling access / prompt + pendingHeading.
+        val revokedTreeUri = DocumentsContract.buildTreeDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:revoked-vault")
+        val treeHubPlainUri = extProvider.putDoc(
+            "primary:revoked-vault/Hub.md",
+            "# Vault Hub\n\n[Target](Target.md#corollary)\n",
+            parentId = "primary:revoked-vault",
+        )
+        val treeTargetPlainUri = extProvider.putDoc(
+            "primary:revoked-vault/Target.md",
+            "# Target\n\n## Corollary\n",
+            parentId = "primary:revoked-vault",
+        )
+        val embeddedHubUri = DocumentsContract.buildDocumentUriUsingTree(revokedTreeUri, "primary:revoked-vault/Hub.md")
+        enforcingApp.grantPersistable(revokedTreeUri, persistRw)
+        restoredModel.open(embeddedHubUri)
+        await { restoredModel.state.value.active.uri == embeddedHubUri.toString() }
+
+        // Revoke the folder tree grant and grant standalone access to Hub.md + Target.md.
+        enforcingApp.revokeAll(revokedTreeUri)
+        enforcingApp.grantPersistable(treeHubPlainUri, persistRw)
+        enforcingApp.grantPersistable(treeTargetPlainUri, persistRw)
+
+        val fallbackReply = callLink(embeddedHubUri.toString(), "Target.md", "corollary", wikilink = false)
+        assertTrue("Revoked embedded tree must fall back to standalone granted sibling", fallbackReply.getBoolean("opened"))
+        await { restoredModel.state.value.active.uri?.let { sameDocument(Uri.parse(it), treeTargetPlainUri) } == true }
+        val fallbackHeading = restoredModel.state.value.pendingHeading
+        assertNotNull(fallbackHeading)
+        assertEquals(restoredModel.state.value.active.id, fallbackHeading!!.noteId)
+        assertEquals("corollary", fallbackHeading.heading)
+        restoredModel.consumePendingHeading(fallbackHeading.token)
+
+        // 5. Cold-start MainActivity.onResume() refreshExternal(immediate = true) concurrently with an opaque
+        // third-party containing-folder projection must await initialFolderLoadJob and keep covered notes unblocked.
+        val opaqueAuthority = "dev.supermd.test.opaque.coldstart.${System.nanoTime()}"
+        val opaqueProvider = StartupGuardDocumentProvider(root).also { it.attach(app, opaqueAuthority) }
+        ShadowContentResolver.registerProviderInternal(opaqueAuthority, opaqueProvider)
+        opaqueProvider.permissionChecker = extProvider.permissionChecker
+        val opaqueTreeUri = DocumentsContract.buildTreeDocumentUri(opaqueAuthority, "opaque-root")
+        val opaqueNotePlainUri = opaqueProvider.putDoc("opaque-doc-42", "# Opaque Covered\n", parentId = "opaque-root")
+        enforcingApp.grantPersistable(opaqueTreeUri, persistRw)
+        enforcingApp.grantPersistable(opaqueNotePlainUri, persistRw)
+
+        val opaqueKey = "opaque-coldstart-${System.nanoTime()}".also(workspaceKeys::add)
+        val opaqueSetupStore = ViewModelStore().also(viewModels::add)
+        val opaqueSetupModel = StudioViewModel(enforcingApp, opaqueKey).also {
+            it.readerFlushRequester = { true }
+            opaqueSetupStore.put("opaque-setup", it)
+        }
+        // Open plain URI BEFORE setFolder so workspace.json stores the plain document URI, then set opaque folder.
+        opaqueSetupModel.open(opaqueNotePlainUri)
+        await { opaqueSetupModel.state.value.tabs.any { it.uri == opaqueNotePlainUri.toString() } }
+        opaqueSetupModel.setFolder(opaqueTreeUri)
+        await { opaqueSetupModel.state.value.files.any { it.name == "opaque-doc-42.md" } }
+        val opaqueCoveredId = opaqueSetupModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), opaqueNotePlainUri) }.id
+        assertTrue(kotlinx.coroutines.runBlocking { opaqueSetupModel.flushRecoveryAndAwait() })
+        opaqueSetupStore.clear()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // Revoke direct plain grant while keeping opaque folder tree grant valid, then cold-restore + immediate refreshExternal.
+        enforcingApp.revokeAll(opaqueNotePlainUri)
+        val opaqueRestoredStore = ViewModelStore().also(viewModels::add)
+        val opaqueRestoredModel = StudioViewModel(enforcingApp, opaqueKey).also {
+            it.readerFlushRequester = { true }
+            opaqueRestoredStore.put("opaque-restored", it)
+        }
+        opaqueRestoredModel.refreshExternal(immediate = true)
+        await { !opaqueRestoredModel.isRefreshExternalActive() && !opaqueRestoredModel.isStartupAccessSeedActive() }
+        assertFalse(
+            "Cold-start refreshExternal must await opaque folder projection and keep containing-folder note unblocked",
+            opaqueRestoredModel.documentWriteNeedsAccess(opaqueCoveredId),
+        )
     }
 
     private fun newModel(): StudioViewModel {
