@@ -310,19 +310,28 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 return@launch
             }
             require(sameDocument(Uri.parse(request.uri), chosen)) { "Choose the original ${request.name}. To use another destination, save a copy instead." }
-            val resolved = withContext(Dispatchers.IO) {
+            val (resolved, writeRestored) = withContext(Dispatchers.IO) {
                 documentAccess.persist(chosen)
                 val target = documentAccess.resolve(chosen, request.writing)
                 // Verify without truncating or writing any bytes. The existing
                 // draft and its saved baseline remain authoritative.
                 resolver.openFileDescriptor(target, if (request.writing) "rw" else "r")?.use { }
                     ?: error("Android did not grant access to this file")
-                target
+                if (request.writing) {
+                    canonicalTreeDocumentKey(target)?.let(confirmedTreeDocumentKeys::add)
+                    target to true
+                } else {
+                    canonicalTreeDocumentKey(target)?.let(confirmedTreeDocumentKeys::add)
+                    val writeCandidate = documentAccess.resolve(chosen, writing = true)
+                    canonicalTreeDocumentKey(writeCandidate)?.let(confirmedTreeDocumentKeys::add)
+                    val canWrite = documentAccess.hasWriteGrant(writeCandidate) &&
+                        runCatching { resolver.openFileDescriptor(writeCandidate, "rw")?.use { true } == true }.getOrDefault(false)
+                    (if (canWrite) writeCandidate else target) to canWrite
+                }
             }
             val carriedHeading = pendingAccessHeadings.keys
                 .firstOrNull { key -> sameDocumentUri(key, resolved.toString()) || sameDocumentUri(key, request.uri) }
                 ?.let(pendingAccessHeadings::remove)
-            val writeRestored = request.writing || documentAccess.hasWriteGrant(resolved)
             val note = mutable.value.tabs.firstOrNull { it.id == request.noteId }
             require(request.noteId == null || note != null) { "The note was closed; its recovery data was left intact." }
             if (note != null) {
@@ -2253,6 +2262,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun dismissWorkspaceFolderPrompt() {
         mutable.value = mutable.value.copy(folderAccessPrompt = null)
     }
+    private enum class DocumentWriteOpenState {
+        UNCHANGED,
+        RESTORED,
+        BLOCKED,
+    }
     private suspend fun applyWorkspaceFolder(uri: Uri, clearPrompt: Boolean = false) {
         withContext(Dispatchers.IO) { documentAccess.persist(uri) }
         workspaceLinks.invalidate()
@@ -2263,28 +2277,93 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             else it.copy(folder = uri.toString(), folderRelative = "")
         }
         val listJob = listFolder(uri, "")
+        startupAccessSeedJob?.let { seedJob ->
+            if (seedJob.isActive) runCatching { seedJob.join() }
+        }
         if (synchronized(blockedDocumentWrites) { blockedDocumentWrites.isNotEmpty() }) {
             listJob.join()
             val candidates = synchronized(blockedDocumentWrites) { blockedDocumentWrites.toList() }
-            val unblocked = withContext(Dispatchers.IO) {
-                if (!documentAccess.hasWriteGrant(uri)) emptyList()
-                else {
-                    val selectedRoot = runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()
-                    candidates.filter { raw ->
+            val stateBeforeUnblock = mutable.value
+            val listedFileUris = stateBeforeUnblock.files.asSequence().filter { !it.directory }.map { it.uri }.toSet()
+            val relativeHints = buildMap<String, String> {
+                recentMutable.value.forEach { r -> if (!r.relative.isNullOrEmpty()) put(r.uri, r.relative) }
+                stateBeforeUnblock.tabs.forEach { t -> if (t.uri != null && !t.relative.isNullOrEmpty()) put(t.uri, t.relative) }
+            }
+            val (unblockedTargets, confirmedKeys) = withContext(Dispatchers.IO) {
+                val selectedAuthority = uri.authority?.takeIf { it.isNotEmpty() }
+                val selectedRoot = if (DocumentsContract.isTreeUri(uri)) {
+                    runCatching { DocumentsContract.getTreeDocumentId(uri) }.getOrNull()
+                        ?.takeIf { it.isNotEmpty() && '\u0000' !in it }
+                } else {
+                    null
+                }
+                if (selectedAuthority == null || selectedRoot == null || !documentAccess.hasWriteGrant(uri)) {
+                    emptyList<Pair<String, Uri>>() to emptySet()
+                } else {
+                    val knownPathProvider = isKnownPathDocumentProvider(selectedAuthority)
+                    val canonicalSelectedTree = DocumentsContract.buildTreeDocumentUri(selectedAuthority, selectedRoot)
+                    val passLazy = lazy(LazyThreadSafetyMode.NONE) { SafProjectionPass(resolver) }
+                    val matched = candidates.mapNotNull { raw ->
                         val parsedRaw = Uri.parse(raw)
-                        val resolved = documentAccess.resolve(parsedRaw, writing = true)
-                        val inSelectedTree = resolved.toString() != raw ||
-                            (DocumentsContract.isTreeUri(parsedRaw) &&
-                                parsedRaw.authority == uri.authority &&
-                                selectedRoot != null &&
-                                runCatching { DocumentsContract.getTreeDocumentId(parsedRaw) == selectedRoot }.getOrDefault(false))
-                        inSelectedTree &&
-                            documentAccess.hasWriteGrant(resolved) &&
-                            runCatching { resolver.openFileDescriptor(resolved, "rw")?.use { true } == true }.getOrDefault(false)
+                        if (parsedRaw.scheme != "content" || parsedRaw.authority != selectedAuthority) {
+                            return@mapNotNull null
+                        }
+                        val docId = runCatching { DocumentsContract.getDocumentId(parsedRaw) }.getOrNull()
+                            ?.takeIf { it.isNotEmpty() && '\u0000' !in it } ?: return@mapNotNull null
+                        val scopedTarget = DocumentsContract.buildDocumentUriUsingTree(canonicalSelectedTree, docId)
+                        val inSelectedTree = if (knownPathProvider) {
+                            isKnownPathContainedInTree(selectedAuthority, selectedRoot, docId)
+                        } else {
+                            docId == selectedRoot ||
+                                scopedTarget.toString() in listedFileUris ||
+                                confirmThirdPartyTreeMembership(
+                                    pass = passLazy.value,
+                                    treeUri = canonicalSelectedTree,
+                                    rootDocumentId = selectedRoot,
+                                    targetDocumentId = docId,
+                                    relativeHint = relativeHints[raw]
+                                        ?: relativeHints.entries.firstOrNull { (k, _) -> sameDocumentUri(k, raw) }?.value,
+                                )
+                        }
+                        if (!inSelectedTree) return@mapNotNull null
+                        canonicalTreeDocumentKey(scopedTarget)?.let(confirmedTreeDocumentKeys::add)
+                        val writable = documentAccess.hasWriteGrant(scopedTarget) &&
+                            runCatching { resolver.openFileDescriptor(scopedTarget, "rw")?.use { true } == true }.getOrDefault(false)
+                        if (writable) raw to scopedTarget else null
                     }
+                    val discoveredKeys = if (passLazy.isInitialized()) passLazy.value.confirmedTreeKeys else emptySet()
+                    matched to discoveredKeys
                 }
             }
-            unblocked.forEach(::clearDocumentAccessFailure)
+            if (confirmedKeys.isNotEmpty()) {
+                confirmedTreeDocumentKeys.addAll(confirmedKeys)
+            }
+            if (unblockedTargets.isNotEmpty()) {
+                unblockedTargets.forEach { (raw, scopedTarget) ->
+                    clearDocumentAccessFailure(raw)
+                    clearDocumentAccessFailure(scopedTarget.toString())
+                }
+                val dirtyUnblockedIds = mutableListOf<String>()
+                change { current ->
+                    val updatedTabs = current.tabs.map { tab ->
+                        val tabUri = tab.uri ?: return@map tab
+                        if (tab.id in closingNoteIds) return@map tab
+                        val match = unblockedTargets.firstOrNull { (raw, scopedTarget) ->
+                            sameDocumentUri(tabUri, raw) || sameDocumentUri(tabUri, scopedTarget.toString())
+                        } ?: return@map tab
+                        val nextUri = match.second.toString()
+                        val nextRelative = relativeInOpenFolder(match.second, uri.toString()) ?: tab.relative
+                        if (tab.dirty) dirtyUnblockedIds += tab.id
+                        if (tab.uri != nextUri || tab.relative != nextRelative) {
+                            tab.copy(uri = nextUri, relative = nextRelative)
+                        } else {
+                            tab
+                        }
+                    }
+                    if (updatedTabs != current.tabs) current.copy(tabs = updatedTabs) else current
+                }
+                dirtyUnblockedIds.forEach(::scheduleAutosave)
+            }
         }
     }
     fun grantWorkspaceFolderForLink(uri: Uri) = viewModelScope.launch {
@@ -2388,8 +2467,66 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     ): JSONObject {
         val requestedHeading = headingFragment?.trim()?.takeIf { it.isNotEmpty() }
         try {
-            val note = withContext(Dispatchers.IO) { loadNoteForOpen(uri, relative, externalIntentFlags, externalCaller) }
-            if (note.uri?.let { documentAccess.hasWriteGrant(Uri.parse(it)) } == true) clearDocumentAccessFailure(uri.toString())
+            val (note, writeOpenState) = withContext(Dispatchers.IO) {
+                var loaded = loadNoteForOpen(uri, relative, externalIntentFlags, externalCaller)
+                val loadedUriStr = loaded.uri
+                val parsedLoaded = loadedUriStr?.let(Uri::parse)
+                if (externalIntentFlags == null && parsedLoaded != null) {
+                    canonicalTreeDocumentKey(parsedLoaded)?.let(confirmedTreeDocumentKeys::add)
+                }
+                val wasBlocked = writeIsBlocked(uri.toString()) || (loadedUriStr != null && writeIsBlocked(loadedUriStr))
+                if (parsedLoaded == null || !parsedLoaded.scheme.equals("content", ignoreCase = true)) {
+                    loaded to DocumentWriteOpenState.UNCHANGED
+                } else if (wasBlocked) {
+                    val callerAllowsWrite = externalIntentFlags == null ||
+                        (externalIntentFlags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0
+                    val writeTarget = if (externalIntentFlags == null) {
+                        documentAccess.resolve(parsedLoaded, writing = true)
+                    } else {
+                        parsedLoaded
+                    }
+                    if (externalIntentFlags == null) {
+                        canonicalTreeDocumentKey(writeTarget)?.let(confirmedTreeDocumentKeys::add)
+                    }
+                    val writeVerified = callerAllowsWrite &&
+                        documentAccess.hasWriteGrant(writeTarget) &&
+                        runCatching { resolver.openFileDescriptor(writeTarget, "rw")?.use { true } == true }.getOrDefault(false)
+                    if (writeVerified) {
+                        if (writeTarget.toString() != loadedUriStr) {
+                            loaded = loaded.copy(uri = writeTarget.toString())
+                        }
+                        loaded to DocumentWriteOpenState.RESTORED
+                    } else {
+                        loaded to DocumentWriteOpenState.BLOCKED
+                    }
+                } else {
+                    val ownShareAuthority = "${getApplication<Application>().packageName}.share"
+                    val writeTarget = if (externalIntentFlags == null) {
+                        documentAccess.resolve(parsedLoaded, writing = true)
+                    } else {
+                        parsedLoaded
+                    }
+                    if (externalIntentFlags == null) {
+                        canonicalTreeDocumentKey(writeTarget)?.let(confirmedTreeDocumentKeys::add)
+                    }
+                    val readOnlyGrant = parsedLoaded.authority != ownShareAuthority &&
+                        documentAccess.hasReadGrant(parsedLoaded) &&
+                        !documentAccess.hasWriteGrant(writeTarget)
+                    if (readOnlyGrant) {
+                        loaded to DocumentWriteOpenState.BLOCKED
+                    } else {
+                        if (externalIntentFlags == null && documentAccess.hasWriteGrant(writeTarget) && writeTarget.toString() != loadedUriStr) {
+                            loaded = loaded.copy(uri = writeTarget.toString())
+                        }
+                        loaded to DocumentWriteOpenState.UNCHANGED
+                    }
+                }
+            }
+            when (writeOpenState) {
+                DocumentWriteOpenState.RESTORED -> clearDocumentAccessFailure(note.uri ?: uri.toString())
+                DocumentWriteOpenState.BLOCKED -> markDocumentWriteBlocked(note.uri ?: uri.toString())
+                DocumentWriteOpenState.UNCHANGED -> Unit
+            }
             if (!openRequests.isCurrent(request)) {
                 // A newer open or a user tab action owns focus, but every file
                 // the user requested still becomes an available tab.
@@ -2413,6 +2550,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     activate = activate,
                     headingFragment = carriedHeading?.takeIf { activate && it.isNotBlank() },
                 )
+                if (writeOpenState == DocumentWriteOpenState.RESTORED) {
+                    openedTabId?.let { id ->
+                        if (mutable.value.tabs.firstOrNull { it.id == id }?.dirty == true) {
+                            scheduleAutosave(id)
+                        }
+                    }
+                }
             }
             if (!accepted || openedTabId == null) {
                 if (!openRequests.isCurrent(request)) retainOpenedNote(note, activate = false)
@@ -3590,6 +3734,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
 
     private fun findSafTree(noteUri: Uri, allowEmbeddedTreeFallback: Boolean = false): SafTreeMatch? {
         val documentId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrDefault("")
+        val knownPathProvider = isKnownPathDocumentProvider(noteUri.authority)
+        val embeddedTreeRoot = if (DocumentsContract.isTreeUri(noteUri)) {
+            runCatching { DocumentsContract.getTreeDocumentId(noteUri) }.getOrNull()
+        } else {
+            null
+        }
         val persisted = (
             resolver.persistedUriPermissions.map { StoredUriGrant(it.uri, it.isReadPermission, it.isWritePermission) } +
                 TestAuthorityGrants.persistedSnapshot()
@@ -3597,27 +3747,26 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             .filter { it.isReadPermission && DocumentsContract.isTreeUri(it.uri) && it.uri.authority == noteUri.authority }
             .mapNotNull { permission ->
                 val root = runCatching { DocumentsContract.getTreeDocumentId(permission.uri) }.getOrNull() ?: return@mapNotNull null
-                val trimmed = root.trimEnd('/')
-                val contained = documentId.startsWith("$trimmed/") ||
-                    root.endsWith(':') && documentId.startsWith(root) ||
-                    allowEmbeddedTreeFallback && documentId == root ||
+                val contained = (knownPathProvider && isKnownPathContainedInTree(noteUri.authority, root, documentId)) ||
+                    (allowEmbeddedTreeFallback && embeddedTreeRoot == root && (!knownPathProvider || isKnownPathContainedInTree(noteUri.authority, root, documentId))) ||
                     relativeInOpenFolder(noteUri, permission.uri.toString()) != null
                 if (contained && documentAccess.resolveReadableTreeRoot(permission.uri) != null) root to permission.uri else null
             }
             .maxByOrNull { it.first.length }
-        val active = persisted ?: if (allowEmbeddedTreeFallback && DocumentsContract.isTreeUri(noteUri)) {
+        val active = persisted ?: if (allowEmbeddedTreeFallback && embeddedTreeRoot != null) {
             runCatching {
-                val root = DocumentsContract.getTreeDocumentId(noteUri)
-                val builtTree = DocumentsContract.buildTreeDocumentUri(noteUri.authority, root)
-                if (documentAccess.resolveReadableTreeRoot(builtTree) != null) root to builtTree else null
+                val builtTree = DocumentsContract.buildTreeDocumentUri(noteUri.authority, embeddedTreeRoot)
+                val validContainment = !knownPathProvider || isKnownPathContainedInTree(noteUri.authority, embeddedTreeRoot, documentId)
+                if (validContainment && documentAccess.resolveReadableTreeRoot(builtTree) != null) embeddedTreeRoot to builtTree else null
             }.getOrNull()
         } else null
         val (rootId, folderUri) = active ?: return null
         val trimmed = rootId.trimEnd('/')
-        val relative = documentId.takeIf { it.startsWith("$trimmed/") }?.removePrefix("$trimmed/")
-            ?: documentId.takeIf { rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
+        val canExtractSyntactically = knownPathProvider || embeddedTreeRoot == rootId
+        val relative = documentId.takeIf { canExtractSyntactically && it.startsWith("$trimmed/") }?.removePrefix("$trimmed/")
+            ?: documentId.takeIf { canExtractSyntactically && rootId.endsWith(':') && it.startsWith(rootId) }?.removePrefix(rootId)?.trimStart('/')
             ?: relativeInOpenFolder(noteUri, folderUri.toString())
-            ?: if (allowEmbeddedTreeFallback) "" else return null
+            ?: if (allowEmbeddedTreeFallback && embeddedTreeRoot == rootId) "" else return null
         return SafTreeMatch(folderUri, rootId, relative)
     }
 
@@ -3655,8 +3804,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             stateSnapshot.active
         }
         val explicitRelative = isExplicitRelativeWorkspaceTarget(trimmedTarget, wikilink)
-        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.takeIf {
-            DocumentsContract.isTreeUri(it) && documentAccess.hasReadGrant(it)
+        val openFolder = stateSnapshot.folder?.let(Uri::parse)?.let {
+            documentAccess.resolveReadableTreeRoot(it)?.first
         }
         val rawNoteUri = sourceNote.uri
         if (rawNoteUri.isNullOrBlank()) {
@@ -3689,20 +3838,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val treeMatch = when {
                     sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
                         ?: run {
-                            val candidateTrees = buildList {
-                                if (openFolder != null) add(openFolder)
-                                (
-                                    resolver.persistedUriPermissions.map { StoredUriGrant(it.uri, it.isReadPermission, it.isWritePermission) } +
-                                        TestAuthorityGrants.persistedSnapshot()
-                                    )
-                                    .filter {
-                                        it.isReadPermission &&
-                                            DocumentsContract.isTreeUri(it.uri) &&
-                                            it.uri.authority == sourceUri.authority &&
-                                            documentAccess.resolveReadableTreeRoot(it.uri) != null
-                                    }
-                                    .mapTo(this) { it.uri }
-                            }.distinctBy { it.toString() }
+                            val candidateTrees = documentAccess
+                                .readableCandidateTrees(sourceUri.authority, openFolder)
+                                .map { it.first }
                             candidateTrees.firstNotNullOfOrNull { folderUri ->
                                 val rel = runCatching {
                                     workspaceLinks.noteRelativeInTree(folderUri, sourceUri, knownRelative = sourceNote.relative)

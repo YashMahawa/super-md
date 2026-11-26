@@ -871,6 +871,211 @@ class DocumentAccessTest {
         )
     }
 
+    @Test
+    fun sharedFolderGrantAndWorkspaceLinkSelectionKeepWriteAccessStrictlyScoped() {
+        val extProvider = StartupGuardDocumentProvider(root).also {
+            it.attach(app, EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY)
+        }
+        ShadowContentResolver.registerProviderInternal(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, extProvider)
+
+        val opaqueAuthority = "dev.supermd.test.opaque.scoped.${System.nanoTime()}"
+        val opaqueProvider = StartupGuardDocumentProvider(root).also {
+            it.attach(app, opaqueAuthority)
+        }
+        ShadowContentResolver.registerProviderInternal(opaqueAuthority, opaqueProvider)
+
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val persistedUris = mutableMapOf<Uri, Int>()
+        val enforcingApp = StartupEnforcingApplication(app, grantedUris, persistedUris)
+        val checker: (Uri, Int) -> Boolean = { uri, required ->
+            enforcingApp.checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(), required) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        extProvider.permissionChecker = checker
+        opaqueProvider.permissionChecker = checker
+
+        val persistRw = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+
+        val vaultTreeUri = DocumentsContract.buildTreeDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:vault")
+        val specsTreeUri = DocumentsContract.buildTreeDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:vault/Specs")
+        extProvider.putDir("primary:vault/Specs", "Specs", parentId = "primary:vault")
+        val vaultIndexUri = extProvider.putDoc(
+            "primary:vault/Index.md",
+            "# Vault Index\n\n[[Sub Note#deep-section]]\n[[ReadOnlyNew#intro]]\n[[DirectWritable#keep-rw]]\n",
+            parentId = "primary:vault",
+        )
+        val subNoteUri = extProvider.putDoc(
+            "primary:vault/Specs/Sub Note.md",
+            "# Sub Note\n\n## Deep Section\n",
+            parentId = "primary:vault/Specs",
+        )
+        val readOnlyNewUri = extProvider.putDoc(
+            "primary:vault/Specs/ReadOnlyNew.md",
+            "# ReadOnlyNew\n\n## Intro\n",
+            parentId = "primary:vault/Specs",
+        )
+        val directWritableUri = extProvider.putDoc(
+            "primary:vault/Specs/DirectWritable.md",
+            "# DirectWritable\n\n## Keep RW\n",
+            parentId = "primary:vault/Specs",
+        )
+        val outsideUri = extProvider.putDoc(
+            "primary:outside/Outside.md",
+            "# Outside Vault\n",
+            parentId = "primary:outside",
+        )
+
+        val opaqueTreeUri = DocumentsContract.buildTreeDocumentUri(opaqueAuthority, "opaque_root")
+        val opaqueRealUri = opaqueProvider.putDoc("opaque_child_1", "# Opaque Real\n", parentId = "opaque_root")
+        val opaqueUnlistedPrefixedUri = opaqueProvider.putDoc("opaque_root/unlisted_secret", "# Unlisted Secret\n", parentId = null)
+
+        listOf(vaultIndexUri, subNoteUri, directWritableUri, outsideUri, opaqueRealUri, opaqueUnlistedPrefixedUri).forEach {
+            enforcingApp.grantPersistable(it, persistRw)
+        }
+
+        val workspaceKey = "scoped-folder-links-${System.nanoTime()}".also(workspaceKeys::add)
+        val store = ViewModelStore().also(viewModels::add)
+        val model = StudioViewModel(enforcingApp, workspaceKey).also {
+            it.readerFlushRequester = { true }
+            store.put("model", it)
+        }
+        model.reading(autosave = false)
+
+        for (uri in listOf(outsideUri, opaqueRealUri, opaqueUnlistedPrefixedUri, subNoteUri, vaultIndexUri)) {
+            model.open(uri)
+            await { model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), uri) } }
+        }
+
+        val indexId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), vaultIndexUri) }.id
+        val subNoteId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), subNoteUri) }.id
+        val outsideId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), outsideUri) }.id
+        val opaqueRealId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), opaqueRealUri) }.id
+        val opaqueUnlistedId = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), opaqueUnlistedPrefixedUri) }.id
+
+        val subNoteDraft = "# Sub Note\n\n## Deep Section\n\nLocal unsaved draft before revocation.\n"
+        model.edit(subNoteId, subNoteDraft)
+
+        // Revoke write access across the open tabs while keeping directWritableUri read-write.
+        enforcingApp.downgradeToReadOnly(vaultIndexUri)
+        enforcingApp.revokeAll(subNoteUri)
+        enforcingApp.revokeAll(outsideUri)
+        enforcingApp.revokeAll(opaqueRealUri)
+        enforcingApp.revokeAll(opaqueUnlistedPrefixedUri)
+
+        model.refreshExternal(immediate = true)
+        await {
+            !model.isRefreshExternalActive() &&
+                model.documentWriteNeedsAccess(indexId) &&
+                model.documentWriteNeedsAccess(subNoteId) &&
+                model.documentWriteNeedsAccess(outsideId) &&
+                model.documentWriteNeedsAccess(opaqueRealId) &&
+                model.documentWriteNeedsAccess(opaqueUnlistedId)
+        }
+
+        fun callLink(docPath: String, target: String, fragment: String, wikilink: Boolean): org.json.JSONObject {
+            val outcome = java.util.concurrent.atomic.AtomicReference<Result<org.json.JSONObject>?>()
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO).launch {
+                outcome.set(runCatching { model.openWorkspaceLink(docPath, target, fragment, wikilink) })
+            }
+            await { outcome.get() != null }
+            return outcome.get()!!.getOrThrow()
+        }
+
+        // 1. Following a nested wikilink without a folder grant surfaces folderAccessPrompt.
+        model.select(indexId)
+        await { model.state.value.active.id == indexId }
+        val promptReply = callLink(vaultIndexUri.toString(), "Sub Note", "deep-section", wikilink = true)
+        assertFalse(promptReply.getBoolean("opened"))
+        assertTrue(promptReply.optBoolean("promptedFolderAccess"))
+        val folderPrompt = model.state.value.folderAccessPrompt
+        assertNotNull(folderPrompt)
+        assertEquals("Sub Note", folderPrompt!!.target)
+        assertEquals("deep-section", folderPrompt.fragment)
+
+        // 2. Granting a READ-ONLY shared folder via grantWorkspaceFolderForLink opens/focuses Sub Note with its
+        // draft and pendingHeading intact, while keeping every blocked tab write-blocked.
+        enforcingApp.downgradeToReadOnly(vaultTreeUri)
+        model.grantWorkspaceFolderForLink(vaultTreeUri)
+        await {
+            model.state.value.folderAccessPrompt == null &&
+                model.state.value.active.id == subNoteId
+        }
+        assertEquals(subNoteDraft, model.state.value.active.content)
+        val subHeading = model.state.value.pendingHeading
+        assertNotNull(subHeading)
+        assertEquals(subNoteId, subHeading!!.noteId)
+        assertEquals("deep-section", subHeading.heading)
+        model.consumePendingHeading(subHeading.token)
+        assertTrue("Read-only folder grant must keep Sub Note write-blocked", model.documentWriteNeedsAccess(subNoteId))
+        assertTrue("Read-only folder grant must keep Index write-blocked", model.documentWriteNeedsAccess(indexId))
+        assertTrue("Outside note must remain write-blocked", model.documentWriteNeedsAccess(outsideId))
+
+        // Newly opened note through the read-only folder must also be marked write-blocked (never falsely Saved),
+        // while a note that already holds its own direct RW grant must keep RW and stay unblocked.
+        val roNewReply = callLink(vaultIndexUri.toString(), "ReadOnlyNew", "intro", wikilink = true)
+        assertTrue(roNewReply.getBoolean("opened"))
+        await { model.state.value.active.name == "ReadOnlyNew.md" }
+        val roNewId = model.state.value.active.id
+        assertTrue("Note opened via read-only folder link must be write-blocked", model.documentWriteNeedsAccess(roNewId))
+        model.state.value.pendingHeading?.token?.let(model::consumePendingHeading)
+
+        val directRwReply = callLink(vaultIndexUri.toString(), "DirectWritable", "keep-rw", wikilink = true)
+        assertTrue(directRwReply.getBoolean("opened"))
+        await { model.state.value.active.name == "DirectWritable.md" }
+        val directRwTab = model.state.value.active
+        assertFalse("Direct RW standalone grant must not be downgraded by read-only folder link", model.documentWriteNeedsAccess(directRwTab.id))
+        assertEquals(directWritableUri.toString(), directRwTab.uri)
+        model.state.value.pendingHeading?.token?.let(model::consumePendingHeading)
+
+        // 3. Granting RW to subfolder primary:vault/Specs unblocks notes inside Specs (Sub Note + ReadOnlyNew),
+        // while keeping parent primary:vault/Index.md and unrelated primary:outside/Outside.md write-blocked.
+        enforcingApp.revokeAll(vaultTreeUri)
+        enforcingApp.grantPersistable(specsTreeUri, persistRw)
+        model.setFolder(specsTreeUri)
+        await {
+            model.state.value.folder == specsTreeUri.toString() &&
+                !model.documentWriteNeedsAccess(subNoteId) &&
+                !model.documentWriteNeedsAccess(roNewId)
+        }
+        assertEquals(subNoteDraft, model.state.value.tabs.single { it.id == subNoteId }.content)
+        assertTrue("Parent folder note outside subfolder grant must stay write-blocked", model.documentWriteNeedsAccess(indexId))
+        assertTrue("Outside note must stay write-blocked", model.documentWriteNeedsAccess(outsideId))
+
+        // 4. Granting RW to parent primary:vault unblocks Index.md too, while provider-level 'rw' denial or outside paths stay blocked.
+        extProvider.ordinaryFailureByDocId["primary:vault/Index.md"] = {
+            SecurityException("Simulated provider rw denial", android.system.ErrnoException("open", android.system.OsConstants.EACCES))
+        }
+        enforcingApp.grantPersistable(vaultTreeUri, persistRw)
+        model.setFolder(vaultTreeUri)
+        await { model.state.value.folder == vaultTreeUri.toString() }
+        assertTrue("Provider rw denial must prevent premature unblocking", model.documentWriteNeedsAccess(indexId))
+
+        extProvider.ordinaryFailureByDocId.remove("primary:vault/Index.md")
+        model.setFolder(vaultTreeUri)
+        await { !model.documentWriteNeedsAccess(indexId) }
+        assertFalse(model.documentWriteNeedsAccess(subNoteId))
+        assertTrue("Note outside granted vault must still remain write-blocked", model.documentWriteNeedsAccess(outsideId))
+
+        // 5. Opaque third-party folder grant unblocks only confirmed children and never unlisted prefix-matching IDs.
+        enforcingApp.grantPersistable(opaqueTreeUri, persistRw)
+        assertNull(
+            "Opaque unlisted prefix ID must not match workspaceLinks.noteRelativeInTree",
+            model.workspaceLinks.noteRelativeInTree(opaqueTreeUri, opaqueUnlistedPrefixedUri),
+        )
+        model.setFolder(opaqueTreeUri)
+        await {
+            model.state.value.folder == opaqueTreeUri.toString() &&
+                !model.documentWriteNeedsAccess(opaqueRealId)
+        }
+        assertTrue(
+            "Unlisted opaque document with root-prefixed ID must remain write-blocked",
+            model.documentWriteNeedsAccess(opaqueUnlistedId),
+        )
+        assertTrue("ExternalStorage outside note must remain write-blocked", model.documentWriteNeedsAccess(outsideId))
+    }
+
     private fun newModel(): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = "document-access-${System.nanoTime()}".also(workspaceKeys::add)
@@ -1036,6 +1241,7 @@ private class StartupGuardDocumentProvider(private val rootDirectory: File) : Co
         val displayName: String,
         val file: File,
         val parentId: String?,
+        val isDirectory: Boolean = false,
     )
 
     private lateinit var providerAuthority: String
@@ -1063,6 +1269,12 @@ private class StartupGuardDocumentProvider(private val rootDirectory: File) : Co
             writeText(content, Charsets.UTF_8)
         }
         docs[docId] = DocEntry(docId, cleanName, file, parentId)
+        return DocumentsContract.buildDocumentUri(providerAuthority, docId)
+    }
+
+    fun putDir(docId: String, displayName: String, parentId: String? = null): Uri {
+        val dir = File(rootDirectory, docId.replace(':', '_')).apply { mkdirs() }
+        docs[docId] = DocEntry(docId, displayName, dir, parentId, isDirectory = true)
         return DocumentsContract.buildDocumentUri(providerAuthority, docId)
     }
 
@@ -1112,7 +1324,11 @@ private class StartupGuardDocumentProvider(private val rootDirectory: File) : Co
             when (col) {
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID -> entry.docId
                 DocumentsContract.Document.COLUMN_DISPLAY_NAME, OpenableColumns.DISPLAY_NAME -> entry.displayName
-                DocumentsContract.Document.COLUMN_MIME_TYPE -> if (entry.displayName.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
+                DocumentsContract.Document.COLUMN_MIME_TYPE -> when {
+                    entry.isDirectory -> DocumentsContract.Document.MIME_TYPE_DIR
+                    entry.displayName.endsWith(".smd") -> "application/vnd.supermd.smd"
+                    else -> "text/markdown"
+                }
                 OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> entry.file.length()
                 else -> null
             }

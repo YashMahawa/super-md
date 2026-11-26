@@ -9,6 +9,7 @@ import android.provider.DocumentsContract
 import androidx.activity.result.ActivityResultRegistry
 import androidx.activity.result.ActivityResultRegistryOwner
 import androidx.activity.result.contract.ActivityResultContract
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.test.SemanticsNodeInteractionCollection
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasContentDescription
@@ -222,6 +223,8 @@ class RevocableDocumentAccessEmulatorTest {
         RevocableTestDocumentsProvider.grantReadWrite(ordinaryErrorUri)
 
         val launchedIntentRef = AtomicReference<Intent?>(null)
+        val launchedTreeIntentRef = AtomicReference<Intent?>(null)
+        val folderPickerResultRef = AtomicReference<(() -> Uri?)?>(null)
         val interceptorRegistry = object : ActivityResultRegistry() {
             override fun <I, O> onLaunch(
                 requestCode: Int,
@@ -233,6 +236,14 @@ class RevocableDocumentAccessEmulatorTest {
                     launchedIntentRef.set(contract.createIntent(app, input))
                     RevocableTestDocumentsProvider.grantReadWrite(input)
                     dispatchResult(requestCode, Activity.RESULT_OK, Intent().setData(input))
+                } else if (contract is ActivityResultContracts.OpenDocumentTree) {
+                    launchedTreeIntentRef.set(contract.createIntent(app, input as? Uri))
+                    val chosenTree = folderPickerResultRef.get()?.invoke()
+                    if (chosenTree != null) {
+                        dispatchResult(requestCode, Activity.RESULT_OK, Intent().setData(chosenTree))
+                    } else {
+                        dispatchResult(requestCode, Activity.RESULT_CANCELED, null)
+                    }
                 } else {
                     dispatchResult(requestCode, Activity.RESULT_CANCELED, null)
                 }
@@ -323,6 +334,97 @@ class RevocableDocumentAccessEmulatorTest {
                 RevocableTestDocumentsProvider.fileForDocId(app, "ResumeTarget.md").readText(Charsets.UTF_8),
             )
             waitForNodeText("Saved")
+
+            // Pass 3: Shared folder grant via workspace link selection scopes returning write access strictly to notes
+            // inside the granted folder tree (leaving read-only folder grants and outside-folder notes write-blocked).
+            scenario.onActivity { model!!.reading(autosave = false) }
+            val vaultTreeUri = RevocableTestDocumentsProvider.treeUri(app, "vault")
+            val vaultHubUri = RevocableTestDocumentsProvider.putMarkdown(
+                app,
+                "vault/Index.md",
+                "# Vault Index\n\n[[Sub Note#Deep Section]]\n",
+            )
+            val vaultSubUri = RevocableTestDocumentsProvider.putMarkdown(
+                app,
+                "vault/Specs/Sub Note.md",
+                "# Sub Note\n\n## Deep Section\n",
+            )
+            val outsideRevokedUri = RevocableTestDocumentsProvider.putMarkdown(
+                app,
+                "outside/OutsideRevoked.md",
+                "# Outside Vault\n",
+            )
+            RevocableTestDocumentsProvider.grantReadWrite(vaultHubUri)
+            RevocableTestDocumentsProvider.grantReadWrite(vaultSubUri)
+            RevocableTestDocumentsProvider.grantReadWrite(outsideRevokedUri)
+
+            val outsideId = openAndAwait(scenario, model!!, outsideRevokedUri)
+            val vaultSubId = openAndAwait(scenario, model!!, vaultSubUri)
+            val linkedDraft = "# Sub Note\n\n## Deep Section\n\nUnsaved linked draft in vault.\n"
+            editAndAwait(scenario, model!!, vaultSubId, linkedDraft)
+            val vaultHubId = openAndAwait(scenario, model!!, vaultHubUri)
+            waitForNodeText("Saved")
+
+            scenario.moveToState(Lifecycle.State.CREATED)
+            RevocableTestDocumentsProvider.revokeAll(vaultHubUri)
+            RevocableTestDocumentsProvider.grantReadOnly(vaultHubUri)
+            RevocableTestDocumentsProvider.revokeAll(vaultSubUri)
+            RevocableTestDocumentsProvider.revokeAll(outsideRevokedUri)
+            scenario.moveToState(Lifecycle.State.RESUMED)
+
+            waitForCondition {
+                !model!!.isRefreshExternalActive() &&
+                    model!!.documentWriteNeedsAccess(vaultHubId) &&
+                    model!!.documentWriteNeedsAccess(vaultSubId) &&
+                    model!!.documentWriteNeedsAccess(outsideId)
+            }
+            waitForNodeText("Local draft · restore file access")
+
+            // Trigger workspace link prompt from vault/Index.md -> [[Sub Note#Deep Section]] and grant READ-ONLY folder first.
+            folderPickerResultRef.set {
+                RevocableTestDocumentsProvider.grantReadOnly(vaultTreeUri)
+                vaultTreeUri
+            }
+            CoroutineScope(Dispatchers.Main).launch {
+                model!!.openWorkspaceLink(vaultHubUri.toString(), "Sub Note", "Deep Section", wikilink = true)
+            }
+            waitForNodeText("Allow folder access for note links")
+            compose.onNodeWithText("Choose folder").assertIsDisplayed().performClick()
+
+            waitForCondition {
+                launchedTreeIntentRef.get() != null &&
+                    model!!.state.value.folderAccessPrompt == null &&
+                    model!!.state.value.active.id == vaultSubId
+            }
+            awaitReaderSnapshotPumpingCompose(model!!, vaultSubId)
+            assertEquals(Intent.ACTION_OPEN_DOCUMENT_TREE, launchedTreeIntentRef.get()!!.action)
+            assertEquals(linkedDraft, model!!.state.value.tabs.single { it.id == vaultSubId }.content)
+            assertTrue("Read-only folder grant must keep target note write-blocked", model!!.documentWriteNeedsAccess(vaultSubId))
+            assertTrue("Read-only folder grant must keep hub note write-blocked", model!!.documentWriteNeedsAccess(vaultHubId))
+            assertTrue("Outside note must remain write-blocked", model!!.documentWriteNeedsAccess(outsideId))
+            waitForNodeText("Local draft · restore file access")
+
+            // Upgrade vaultTreeUri to read+write and apply shared folder: vault notes unblock and save cleanly,
+            // while outside/OutsideRevoked.md remains write-blocked.
+            RevocableTestDocumentsProvider.grantReadWrite(vaultTreeUri)
+            scenario.onActivity {
+                model!!.reading(autosave = true)
+                model!!.setFolder(vaultTreeUri)
+            }
+            waitForCondition {
+                !model!!.documentWriteNeedsAccess(vaultHubId) &&
+                    !model!!.documentWriteNeedsAccess(vaultSubId) &&
+                    !model!!.state.value.tabs.single { it.id == vaultSubId }.dirty
+            }
+            assertEquals(
+                linkedDraft,
+                RevocableTestDocumentsProvider.fileForDocId(app, "vault/Specs/Sub Note.md").readText(Charsets.UTF_8),
+            )
+            waitForNodeText("Saved")
+
+            assertTrue("Note outside granted folder must stay write-blocked", model!!.documentWriteNeedsAccess(outsideId))
+            selectAndAwait(scenario, model!!, outsideId)
+            waitForNodeText("Local draft · restore file access")
         }
     }
 
