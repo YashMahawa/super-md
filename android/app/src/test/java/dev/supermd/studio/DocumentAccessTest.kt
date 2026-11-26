@@ -18,6 +18,7 @@ import java.nio.file.Files
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -398,6 +399,258 @@ class DocumentAccessTest {
         assertEquals("grant verification does not overwrite or reload the original file", provider.baseline, provider.noteFile.readText())
     }
 
+    @Test
+    fun startupRestoreSeedsBlockedWritesForRevokedAndReadOnlyGrantsWhileRespectingDirectAndContainingFolderGrants() {
+        val extProvider = StartupGuardDocumentProvider(root).also {
+            it.attach(app, EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY)
+        }
+        ShadowContentResolver.registerProviderInternal(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, extProvider)
+
+        val opaqueAuthority = "dev.supermd.test.startup.opaque.${System.nanoTime()}"
+        val opaqueProvider = StartupGuardDocumentProvider(root).also {
+            it.attach(app, opaqueAuthority)
+        }
+        ShadowContentResolver.registerProviderInternal(opaqueAuthority, opaqueProvider)
+
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val persistedUris = mutableMapOf<Uri, Int>()
+        val enforcingApp = StartupEnforcingApplication(app, grantedUris, persistedUris)
+        extProvider.permissionChecker = { uri, required ->
+            enforcingApp.checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(), required) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        opaqueProvider.permissionChecker = extProvider.permissionChecker
+
+        val rwFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        val persistRw = rwFlags or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+
+        val revokedCleanUri = extProvider.putDoc("primary:study/RevokedClean.md", "# Clean cached note\n")
+        val revokedDraftUri = extProvider.putDoc("primary:study/RevokedDraft.md", "# Draft baseline\n")
+        val readOnlyUri = extProvider.putDoc("primary:study/ReadOnly.md", "# Read-only note\n")
+        val directValidUri = extProvider.putDoc("primary:study/DirectValid.md", "# Direct valid note\n")
+        val folderCoveredUri = extProvider.putDoc("primary:vault/Sub/FolderCovered.md", "# Covered by external storage folder\n")
+        val extTreeUri = DocumentsContract.buildTreeDocumentUri(EXTERNAL_STORAGE_DOCUMENTS_AUTHORITY, "primary:vault")
+
+        val opaqueTreeUri = DocumentsContract.buildTreeDocumentUri(opaqueAuthority, "opaque_root")
+        val opaqueCoveredUri = opaqueProvider.putDoc("opaque_doc_1", "# Covered by opaque folder\n", parentId = "opaque_root")
+
+        listOf(
+            revokedCleanUri,
+            revokedDraftUri,
+            readOnlyUri,
+            directValidUri,
+            folderCoveredUri,
+            extTreeUri,
+            opaqueTreeUri,
+            opaqueCoveredUri,
+        ).forEach { uri ->
+            enforcingApp.grantPersistable(uri, persistRw)
+        }
+
+        val workspaceKey = "startup-guard-${System.nanoTime()}".also(workspaceKeys::add)
+        val initialStore = ViewModelStore().also(viewModels::add)
+        val initialModel = StudioViewModel(enforcingApp, workspaceKey).also {
+            it.readerFlushRequester = { true }
+            initialStore.put("initial", it)
+        }
+        initialModel.reading(autosave = false)
+        initialModel.setFolder(opaqueTreeUri)
+        await { initialModel.state.value.files.any { it.name == "opaque_doc_1.md" } }
+
+        for (uri in listOf(revokedCleanUri, revokedDraftUri, readOnlyUri, directValidUri, folderCoveredUri)) {
+            initialModel.open(uri)
+            await { initialModel.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), uri) } }
+        }
+        initialModel.open(opaqueCoveredUri, relative = "opaque_doc_1.md")
+        await { initialModel.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), opaqueCoveredUri) } }
+
+        val cleanId = initialModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), revokedCleanUri) }.id
+        val draftId = initialModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), revokedDraftUri) }.id
+        val readOnlyId = initialModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), readOnlyUri) }.id
+        val directId = initialModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), directValidUri) }.id
+        val folderCoveredId = initialModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), folderCoveredUri) }.id
+        val opaqueCoveredId = initialModel.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), opaqueCoveredUri) }.id
+
+        val draftContent = "# Draft baseline\nUnsaved paragraph before cold restart.\n"
+        initialModel.edit(draftId, draftContent)
+        assertTrue(kotlinx.coroutines.runBlocking { initialModel.flushRecoveryAndAwait() })
+        initialStore.clear()
+        shadowOf(Looper.getMainLooper()).idle()
+
+        // Revoke grants while the app is not running:
+        enforcingApp.revokeAll(revokedCleanUri)
+        enforcingApp.revokeAll(revokedDraftUri)
+        enforcingApp.downgradeToReadOnly(readOnlyUri)
+        enforcingApp.revokeAll(folderCoveredUri) // Covered by persisted extTreeUri (primary:vault)
+        enforcingApp.revokeAll(opaqueCoveredUri) // Covered by persisted opaqueTreeUri (opaque_root)
+
+        val restoredStore = ViewModelStore().also(viewModels::add)
+        val restoredModel = StudioViewModel(enforcingApp, workspaceKey).also {
+            it.readerFlushRequester = { true }
+            restoredStore.put("restored", it)
+        }
+
+        await {
+            restoredModel.documentWriteNeedsAccess(cleanId) &&
+                restoredModel.documentWriteNeedsAccess(draftId) &&
+                restoredModel.documentWriteNeedsAccess(readOnlyId)
+        }
+
+        // Revoked and read-only notes are seeded in blockedDocumentWrites + StudioState without losing cached text or drafts.
+        assertTrue(restoredModel.state.value.writeNeedsAccess(cleanId))
+        assertTrue(restoredModel.state.value.writeNeedsAccess(draftId))
+        assertTrue(restoredModel.state.value.writeNeedsAccess(readOnlyId))
+        assertNull("Startup seeding must not display unsolicited modal dialogs", restoredModel.documentAccessRequests.value)
+
+        val restoredClean = restoredModel.state.value.tabs.single { it.id == cleanId }
+        assertEquals("# Clean cached note\n", restoredClean.content)
+        assertEquals("# Clean cached note\n", restoredClean.saved)
+        assertFalse(restoredClean.dirty)
+
+        val restoredDraft = restoredModel.state.value.tabs.single { it.id == draftId }
+        assertEquals(draftContent, restoredDraft.content)
+        assertEquals("# Draft baseline\n", restoredDraft.saved)
+        assertTrue(restoredDraft.dirty)
+
+        // Direct valid grant and both containing-folder grants (ExternalStorage + confirmed opaque tree) remain unblocked ("Saved").
+        assertFalse(restoredModel.documentWriteNeedsAccess(directId))
+        assertFalse(restoredModel.documentWriteNeedsAccess(folderCoveredId))
+        assertFalse(restoredModel.documentWriteNeedsAccess(opaqueCoveredId))
+
+        // Reusing the existing reauthorization flow unblocks the restored note while preserving its draft.
+        restoredModel.saveManual(noteId = draftId)
+        await { restoredModel.documentAccessRequests.value?.noteId == draftId }
+        val request = restoredModel.documentAccessRequests.value!!
+        assertTrue(request.writing)
+
+        enforcingApp.grantPersistable(revokedDraftUri, persistRw)
+        restoredModel.restoreDocumentAccess(request, revokedDraftUri)
+        await { restoredModel.documentAccessRequests.value == null && !restoredModel.documentWriteNeedsAccess(draftId) }
+        assertFalse(restoredModel.state.value.writeNeedsAccess(draftId))
+        assertEquals(draftContent, restoredModel.state.value.tabs.single { it.id == draftId }.content)
+    }
+
+    @Test
+    fun externalRefreshSeedsBlockedWritesOnPermissionDenialWhileKeepingOrdinaryProviderErrorsDistinct() {
+        val refreshAuthority = "dev.supermd.test.refresh.guard.${System.nanoTime()}"
+        val refreshProvider = StartupGuardDocumentProvider(root).also {
+            it.attach(app, refreshAuthority)
+        }
+        ShadowContentResolver.registerProviderInternal(refreshAuthority, refreshProvider)
+
+        val grantedUris = mutableMapOf<Uri, Int>()
+        val persistedUris = mutableMapOf<Uri, Int>()
+        val enforcingApp = StartupEnforcingApplication(app, grantedUris, persistedUris)
+        refreshProvider.permissionChecker = { uri, required ->
+            enforcingApp.checkUriPermission(uri, android.os.Process.myPid(), android.os.Process.myUid(), required) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+
+        val persistRw = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+
+        val cleanMdUri = refreshProvider.putDoc("Clean.md", "# Clean markdown\n")
+        val dirtyMdUri = refreshProvider.putDoc("Dirty.md", "# Dirty baseline\n")
+        val cleanSmdFile = File(root, "Bundle.smd")
+        val media = MediaStorage(app)
+        val svgData = media.portableImageData(
+            "image/svg+xml",
+            "<svg xmlns='http://www.w3.org/2000/svg'><rect width='4' height='4'/></svg>".toByteArray(),
+        )
+        cleanSmdFile.outputStream().use {
+            media.writeFmd(it, "# Portable baseline\n", org.json.JSONObject().put("assets/box.svg", svgData))
+        }
+        val cleanSmdUri = refreshProvider.registerExistingFile("Bundle.smd", cleanSmdFile)
+
+        listOf(cleanMdUri, dirtyMdUri, cleanSmdUri).forEach { enforcingApp.grantPersistable(it, persistRw) }
+
+        val store = ViewModelStore().also(viewModels::add)
+        val key = "refresh-guard-${System.nanoTime()}".also(workspaceKeys::add)
+        val model = StudioViewModel(enforcingApp, key).also {
+            it.readerFlushRequester = { true }
+            store.put("model", it)
+        }
+        model.reading(autosave = false)
+
+        for (uri in listOf(cleanMdUri, dirtyMdUri, cleanSmdUri)) {
+            model.open(uri)
+            await { model.state.value.tabs.any { it.uri == uri.toString() } }
+        }
+        val cleanMdId = model.state.value.tabs.single { it.uri == cleanMdUri.toString() }.id
+        val dirtyMdId = model.state.value.tabs.single { it.uri == dirtyMdUri.toString() }.id
+        val cleanSmdId = model.state.value.tabs.single { it.uri == cleanSmdUri.toString() }.id
+        val originalSmdDir = model.state.value.tabs.single { it.id == cleanSmdId }.assetDirectory
+        assertNotNull(originalSmdDir)
+
+        val unsavedDraft = "# Dirty baseline\nLocal unsaved draft.\n"
+        model.edit(dirtyMdId, unsavedDraft)
+
+        // 1. Ordinary provider errors (FileNotFoundException, IOException, corrupt archive, IllegalStateException)
+        // must NOT seed blockedDocumentWrites or open documentAccessRequests.
+        val originalSmdBytes = cleanSmdFile.readBytes()
+        cleanSmdFile.writeBytes("corrupt-not-a-valid-smd-archive".toByteArray())
+        refreshProvider.ordinaryFailureByDocId["Clean.md"] = { java.io.FileNotFoundException("Transient missing replica") }
+        refreshProvider.ordinaryFailureByDocId["Dirty.md"] = { IllegalStateException("Provider temporarily busy") }
+
+        var committedCount = 0
+        kotlinx.coroutines.runBlocking {
+            model.refreshExternalTabs(model.state.value.tabs) { committedCount++ }
+        }
+        assertEquals(1, committedCount)
+        assertFalse(model.documentWriteNeedsAccess(cleanMdId))
+        assertFalse(model.documentWriteNeedsAccess(dirtyMdId))
+        assertFalse(model.documentWriteNeedsAccess(cleanSmdId))
+        assertNull(model.documentAccessRequests.value)
+        assertEquals("# Clean markdown\n", model.state.value.tabs.single { it.id == cleanMdId }.content)
+        assertEquals(unsavedDraft, model.state.value.tabs.single { it.id == dirtyMdId }.content)
+        assertEquals("# Portable baseline\n", model.state.value.tabs.single { it.id == cleanSmdId }.content)
+        assertEquals(originalSmdDir, model.state.value.tabs.single { it.id == cleanSmdId }.assetDirectory)
+
+        // Restore valid archive bytes and clear ordinary failures.
+        cleanSmdFile.writeBytes(originalSmdBytes)
+        refreshProvider.ordinaryFailureByDocId.clear()
+
+        // 2. Actual permission denials (revoked SAF grants / EACCES) during external refresh seed blocked writes
+        // while preserving cached text, portable assets, and unsaved drafts.
+        enforcingApp.revokeAll(cleanMdUri)
+        enforcingApp.revokeAll(cleanSmdUri)
+        refreshProvider.ordinaryFailureByDocId["Dirty.md"] = {
+            SecurityException("Permission denial wrapping EACCES", android.system.ErrnoException("open", android.system.OsConstants.EACCES))
+        }
+
+        model.refreshExternal(immediate = true)
+        await {
+            model.documentWriteNeedsAccess(cleanMdId) &&
+                model.documentWriteNeedsAccess(dirtyMdId) &&
+                model.documentWriteNeedsAccess(cleanSmdId)
+        }
+        assertTrue(model.state.value.writeNeedsAccess(cleanMdId))
+        assertTrue(model.state.value.writeNeedsAccess(dirtyMdId))
+        assertTrue(model.state.value.writeNeedsAccess(cleanSmdId))
+        assertNull("Background refresh must not pop an unsolicited modal dialog", model.documentAccessRequests.value)
+
+        assertEquals("# Clean markdown\n", model.state.value.tabs.single { it.id == cleanMdId }.content)
+        assertEquals(unsavedDraft, model.state.value.tabs.single { it.id == dirtyMdId }.content)
+        assertEquals("# Dirty baseline\n", model.state.value.tabs.single { it.id == dirtyMdId }.saved)
+        assertEquals("# Portable baseline\n", model.state.value.tabs.single { it.id == cleanSmdId }.content)
+        assertEquals(originalSmdDir, model.state.value.tabs.single { it.id == cleanSmdId }.assetDirectory)
+
+        // 3. Passive read-only refresh must not clear an active write block; explicit reauthorization via
+        // restoreDocumentAccess verifies read-write access and clears the blocked state cleanly.
+        refreshProvider.ordinaryFailureByDocId.clear()
+        enforcingApp.grantPersistable(cleanMdUri, persistRw)
+        model.refreshExternal(cleanMdUri, immediate = true)
+        await { !model.isRefreshExternalActive() }
+        assertTrue("Passive read-only refresh must not silently clear blocked writes", model.documentWriteNeedsAccess(cleanMdId))
+
+        model.requestWriteAccessIfBlocked(cleanMdId, explicit = true)
+        val recoveryRequest = model.documentAccessRequests.value!!
+        model.restoreDocumentAccess(recoveryRequest, cleanMdUri)
+        await { model.documentAccessRequests.value == null && !model.documentWriteNeedsAccess(cleanMdId) }
+        assertFalse(model.state.value.writeNeedsAccess(cleanMdId))
+    }
+
     private fun newModel(): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = "document-access-${System.nanoTime()}".also(workspaceKeys::add)
@@ -485,5 +738,192 @@ private class FailingDocumentProvider(private val directory: File) : ContentProv
             else -> throw java.io.FileNotFoundException("Unsupported test mode: $mode")
         }
         return ParcelFileDescriptor.open(file, flags)
+    }
+}
+
+private class StartupEnforcingApplication(
+    base: android.app.Application,
+    private val grantedUris: MutableMap<Uri, Int>,
+    private val persistedUris: MutableMap<Uri, Int>,
+) : android.app.Application() {
+    init {
+        attachBaseContext(base)
+    }
+
+    fun grantPersistable(uri: Uri, flags: Int) {
+        val access = flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        grantUriPermission(packageName, uri, flags)
+        persistedUris[uri] = (persistedUris[uri] ?: 0) or access
+        contentResolver.takePersistableUriPermission(uri, access)
+    }
+
+    fun downgradeToReadOnly(uri: Uri) {
+        revokeAll(uri)
+        val readPersist = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        grantUriPermission(packageName, uri, readPersist)
+        persistedUris[uri] = Intent.FLAG_GRANT_READ_URI_PERMISSION
+        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+
+    fun revokeAll(uri: Uri) {
+        val rw = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        runCatching { contentResolver.releasePersistableUriPermission(uri, rw) }
+        runCatching { contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+        runCatching { contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION) }
+        revokeUriPermission(uri, rw or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        grantedUris.remove(uri)
+        persistedUris.remove(uri)
+    }
+
+    override fun grantUriPermission(toPackage: String?, uri: Uri?, modeFlags: Int) {
+        super.grantUriPermission(toPackage, uri, modeFlags)
+        if (uri != null) {
+            val access = modeFlags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            grantedUris[uri] = (grantedUris[uri] ?: 0) or access
+        }
+    }
+
+    override fun revokeUriPermission(uri: Uri?, modeFlags: Int) {
+        super.revokeUriPermission(uri, modeFlags)
+        if (uri != null) {
+            val remaining = (grantedUris[uri] ?: 0) and modeFlags.inv()
+            if (remaining == 0) grantedUris.remove(uri) else grantedUris[uri] = remaining
+        }
+    }
+
+    override fun checkUriPermission(uri: Uri?, pid: Int, uid: Int, modeFlags: Int): Int {
+        if (uri == null) return android.content.pm.PackageManager.PERMISSION_DENIED
+        val combined = buildMap<Uri, Int> {
+            grantedUris.forEach { (k, v) -> put(k, v) }
+            persistedUris.forEach { (k, v) -> put(k, (get(k) ?: 0) or v) }
+        }
+        val held = combined.entries
+            .filter { (granted, _) ->
+                granted == uri || (DocumentsContract.isTreeUri(granted) && uri.toString().startsWith("$granted/"))
+            }
+            .fold(0) { acc, (_, flags) -> acc or flags }
+        return if ((held and modeFlags) == modeFlags) {
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else {
+            android.content.pm.PackageManager.PERMISSION_DENIED
+        }
+    }
+}
+
+private class StartupGuardDocumentProvider(private val rootDirectory: File) : ContentProvider() {
+    private data class DocEntry(
+        val docId: String,
+        val displayName: String,
+        val file: File,
+        val parentId: String?,
+    )
+
+    private lateinit var providerAuthority: String
+    private val docs = linkedMapOf<String, DocEntry>()
+    val ordinaryFailureByDocId = linkedMapOf<String, () -> Throwable>()
+    var permissionChecker: ((Uri, Int) -> Boolean)? = null
+
+    fun attach(context: Context, authority: String) {
+        providerAuthority = authority
+        val info = ProviderInfo().apply {
+            this.authority = authority
+            exported = true
+            grantUriPermissions = true
+        }
+        attachInfo(context, info)
+    }
+
+    fun putDoc(docId: String, content: String, parentId: String? = null): Uri {
+        val cleanName = docId.substringAfterLast(':').substringAfterLast('/').let {
+            if ('.' in it) it else "$it.md"
+        }
+        val safePath = docId.replace(':', '_')
+        val file = File(rootDirectory, safePath).apply {
+            parentFile?.mkdirs()
+            writeText(content, Charsets.UTF_8)
+        }
+        docs[docId] = DocEntry(docId, cleanName, file, parentId)
+        return DocumentsContract.buildDocumentUri(providerAuthority, docId)
+    }
+
+    fun registerExistingFile(docId: String, file: File, parentId: String? = null): Uri {
+        docs[docId] = DocEntry(docId, file.name, file, parentId)
+        return DocumentsContract.buildDocumentUri(providerAuthority, docId)
+    }
+
+    override fun onCreate(): Boolean = true
+
+    override fun query(
+        uri: Uri,
+        projection: Array<out String>?,
+        selection: String?,
+        selectionArgs: Array<out String>?,
+        sortOrder: String?,
+    ): Cursor {
+        permissionChecker?.let { check ->
+            if (!check(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)) {
+                throw SecurityException("Permission denied querying $uri")
+            }
+        }
+        val cols = projection ?: arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            OpenableColumns.SIZE,
+        )
+        if ("/children" in uri.path.orEmpty()) {
+            val segments = uri.pathSegments
+            val idx = segments.lastIndexOf("document")
+            val parentDocId = if (idx >= 0 && idx + 1 < segments.size) Uri.decode(segments[idx + 1]) else DocumentsContract.getTreeDocumentId(uri)
+            return MatrixCursor(cols).apply {
+                docs.values.filter { it.parentId == parentDocId }.forEach { entry ->
+                    addRow(rowFor(cols, entry))
+                }
+            }
+        }
+        val docId = DocumentsContract.getDocumentId(uri)
+        ordinaryFailureByDocId[docId]?.invoke()?.let { throw it }
+        val entry = docs[docId] ?: throw java.io.FileNotFoundException("Missing $docId")
+        return MatrixCursor(cols).apply { addRow(rowFor(cols, entry)) }
+    }
+
+    private fun rowFor(cols: Array<out String>, entry: DocEntry): Array<Any?> =
+        cols.map { col ->
+            when (col) {
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID -> entry.docId
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME, OpenableColumns.DISPLAY_NAME -> entry.displayName
+                DocumentsContract.Document.COLUMN_MIME_TYPE -> if (entry.displayName.endsWith(".smd")) "application/vnd.supermd.smd" else "text/markdown"
+                OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> entry.file.length()
+                else -> null
+            }
+        }.toTypedArray()
+
+    override fun getType(uri: Uri): String {
+        val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+        val name = docs[docId]?.displayName.orEmpty()
+        return if (name.endsWith(".smd", ignoreCase = true)) "application/vnd.supermd.smd" else "text/markdown"
+    }
+
+    override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+
+    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+        val required = if (mode == "r") Intent.FLAG_GRANT_READ_URI_PERMISSION else Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        permissionChecker?.let { check ->
+            if (!check(uri, required)) {
+                throw SecurityException("Permission denied opening $uri (mode=$mode)")
+            }
+        }
+        val docId = DocumentsContract.getDocumentId(uri)
+        ordinaryFailureByDocId[docId]?.invoke()?.let { throw it }
+        val entry = docs[docId] ?: throw java.io.FileNotFoundException("Missing $docId")
+        val flags = when (mode) {
+            "r" -> ParcelFileDescriptor.MODE_READ_ONLY
+            "rw" -> ParcelFileDescriptor.MODE_READ_WRITE
+            "wt", "w" -> ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
+            else -> ParcelFileDescriptor.parseMode(mode)
+        }
+        return ParcelFileDescriptor.open(entry.file, flags)
     }
 }

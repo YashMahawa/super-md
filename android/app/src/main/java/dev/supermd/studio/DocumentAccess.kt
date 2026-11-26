@@ -1,5 +1,6 @@
 package dev.supermd.studio
 
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.app.Activity
@@ -10,6 +11,9 @@ import android.provider.DocumentsContract
 import android.system.ErrnoException
 import android.system.OsConstants
 import androidx.activity.result.contract.ActivityResultContract
+import androidx.annotation.VisibleForTesting
+import kotlinx.coroutines.CancellationException
+import java.util.concurrent.ConcurrentHashMap
 
 data class DocumentAccessRequest(val uri: String, val name: String, val noteId: String?, val writing: Boolean, val detail: String? = null, val assetSource: String? = null)
 
@@ -85,6 +89,130 @@ internal fun canonicalTreeDocumentKey(uri: Uri): String? {
     ).toString()
 }
 
+internal data class StoredUriGrant(
+    val uri: Uri,
+    val isReadPermission: Boolean,
+    val isWritePermission: Boolean,
+)
+
+internal enum class DocumentWriteGuardOutcome {
+    ACCESSIBLE,
+    PERMISSION_DENIED,
+    ORDINARY_PROVIDER_ERROR,
+}
+
+@VisibleForTesting
+internal object TestAuthorityGrants {
+    private data class Entry(
+        val modeFlags: Int,
+        val persistableFlags: Int,
+        val persistedFlags: Int,
+    )
+
+    private val authorities = ConcurrentHashMap.newKeySet<String>()
+    private val grants = ConcurrentHashMap<String, Entry>()
+
+    fun registerAuthority(authority: String) {
+        authorities.add(authority)
+    }
+
+    fun unregisterAuthority(authority: String) {
+        authorities.remove(authority)
+        grants.keys.removeIf { raw -> Uri.parse(raw).authority == authority }
+    }
+
+    fun clear() {
+        authorities.clear()
+        grants.clear()
+    }
+
+    fun isRegistered(authority: String?): Boolean =
+        authority != null && authorities.isNotEmpty() && authority in authorities
+
+    fun grant(uri: Uri, modeFlags: Int, persistable: Boolean = false) {
+        val authority = uri.authority ?: return
+        authorities.add(authority)
+        val accessMask = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        val access = modeFlags and accessMask
+        grants.compute(uri.toString()) { _, previous ->
+            val nextMode = (previous?.modeFlags ?: 0) or access
+            val nextPersistable = (previous?.persistableFlags ?: 0) or (if (persistable) access else 0)
+            Entry(nextMode, nextPersistable, previous?.persistedFlags ?: 0)
+        }
+    }
+
+    fun revoke(
+        uri: Uri,
+        modeFlags: Int = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+    ) {
+        if (!isRegistered(uri.authority)) return
+        val clearMask = (modeFlags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)).inv()
+        grants.computeIfPresent(uri.toString()) { _, previous ->
+            val nextMode = previous.modeFlags and clearMask
+            val nextPersistable = previous.persistableFlags and clearMask
+            val nextPersisted = previous.persistedFlags and clearMask
+            if (nextMode == 0 && nextPersistable == 0 && nextPersisted == 0) null
+            else Entry(nextMode, nextPersistable, nextPersisted)
+        }
+    }
+
+    fun takePersistable(uri: Uri, modeFlags: Int) {
+        val access = modeFlags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        var accepted = false
+        grants.computeIfPresent(uri.toString()) { _, previous ->
+            val offered = previous.modeFlags and previous.persistableFlags
+            if ((offered and access) == access && access != 0) {
+                accepted = true
+                previous.copy(persistedFlags = previous.persistedFlags or access)
+            } else {
+                previous
+            }
+        }
+        if (!accepted) {
+            throw SecurityException("No persistable permission grants found for $uri")
+        }
+    }
+
+    fun releasePersistable(
+        uri: Uri,
+        modeFlags: Int = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+    ) {
+        if (!isRegistered(uri.authority)) return
+        val clearMask = (modeFlags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)).inv()
+        grants.computeIfPresent(uri.toString()) { _, previous ->
+            previous.copy(persistedFlags = previous.persistedFlags and clearMask)
+        }
+    }
+
+    fun check(candidate: Uri, modes: Int): Boolean? {
+        val authority = candidate.authority ?: return null
+        if (!isRegistered(authority)) return null
+        val candidateRaw = candidate.toString()
+        var held = 0
+        for ((raw, entry) in grants.entries) {
+            val grantedUri = Uri.parse(raw)
+            if (grantedUri.authority != authority) continue
+            val covers = grantedUri == candidate ||
+                (DocumentsContract.isTreeUri(grantedUri) && candidateRaw.startsWith("$raw/"))
+            if (covers) {
+                held = held or entry.modeFlags or entry.persistedFlags
+            }
+        }
+        return (held and modes) == modes
+    }
+
+    fun persistedSnapshot(): List<StoredUriGrant> {
+        if (authorities.isEmpty()) return emptyList()
+        return grants.entries.mapNotNull { (raw, entry) ->
+            val uri = Uri.parse(raw)
+            if (!isRegistered(uri.authority)) return@mapNotNull null
+            val read = (entry.persistedFlags and Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0
+            val write = (entry.persistedFlags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION) != 0
+            if (!read && !write) null else StoredUriGrant(uri, read, write)
+        }
+    }
+}
+
 internal sealed interface SafReadAccess {
     data class InGrantedTree(
         val treeUri: Uri,
@@ -119,18 +247,28 @@ internal class DocumentAccess(
         val hasReadAndWrite: Boolean,
     )
 
-    private fun granted(candidate: Uri, modes: Int) =
-        context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), modes) == PackageManager.PERMISSION_GRANTED
+    private fun granted(candidate: Uri, modes: Int): Boolean {
+        TestAuthorityGrants.check(candidate, modes)?.let { return it }
+        return context.checkUriPermission(candidate, Process.myPid(), Process.myUid(), modes) == PackageManager.PERMISSION_GRANTED
+    }
 
-    private fun persistedPermissionsSnapshot() =
-        synchronized(persistPermissionsLock) { context.contentResolver.persistedUriPermissions.toList() }
+    private fun persistedPermissionsSnapshot(): List<StoredUriGrant> =
+        synchronized(persistPermissionsLock) {
+            val osGrants = runCatching {
+                context.contentResolver.persistedUriPermissions.map {
+                    StoredUriGrant(it.uri, it.isReadPermission, it.isWritePermission)
+                }
+            }.getOrDefault(emptyList())
+            val testGrants = TestAuthorityGrants.persistedSnapshot()
+            if (testGrants.isEmpty()) osGrants else osGrants + testGrants
+        }
 
     fun hasWriteGrant(uri: Uri) = uri.scheme == "content" && granted(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
 
     fun hasReadGrant(
         uri: Uri,
-        activeFolderUri: Uri? = null,
-        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = null,
+        activeFolderUri: Uri? = activeFolderUriProvider?.invoke(),
+        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = isConfirmedTreeChildProvider,
     ): Boolean = when (val access = resolveReadAccess(uri, activeFolderUri, isConfirmedTreeChild)) {
         is SafReadAccess.InGrantedTree,
         is SafReadAccess.StandaloneDocument -> true
@@ -139,7 +277,43 @@ internal class DocumentAccess(
     }
     fun persist(uri: Uri) {
         if (uri.scheme == "content") synchronized(persistPermissionsLock) {
-            persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
+            if (TestAuthorityGrants.isRegistered(uri.authority)) {
+                persistDocumentGrants { TestAuthorityGrants.takePersistable(uri, it) }
+            } else {
+                persistDocumentGrants { context.contentResolver.takePersistableUriPermission(uri, it) }
+            }
+        }
+    }
+
+    /**
+     * Evaluate whether a restored `content://` note retains effective write access
+     * (either directly or via a user-granted containing folder tree) without truncating
+     * or writing any bytes, while keeping ordinary provider errors distinct from permission denials.
+     */
+    fun evaluateRestoredWriteAccess(resolver: ContentResolver, uri: Uri): DocumentWriteGuardOutcome {
+        if (!uri.scheme.equals("content", ignoreCase = true)) return DocumentWriteGuardOutcome.ACCESSIBLE
+        return try {
+            val readTarget = resolve(uri, writing = false)
+            val writeTarget = resolve(uri, writing = true)
+            val descriptor = resolver.openFileDescriptor(readTarget, "r")
+                ?: return DocumentWriteGuardOutcome.ORDINARY_PROVIDER_ERROR
+            descriptor.use { }
+            if (hasWriteGrant(writeTarget)) {
+                DocumentWriteGuardOutcome.ACCESSIBLE
+            } else if (
+                uri.authority != "${context.packageName}.share" &&
+                hasReadGrant(readTarget) &&
+                !hasWriteGrant(writeTarget)
+            ) {
+                DocumentWriteGuardOutcome.PERMISSION_DENIED
+            } else {
+                DocumentWriteGuardOutcome.ACCESSIBLE
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: Throwable) {
+            if (isDocumentAccessFailure(error)) DocumentWriteGuardOutcome.PERMISSION_DENIED
+            else DocumentWriteGuardOutcome.ORDINARY_PROVIDER_ERROR
         }
     }
 
