@@ -170,3 +170,182 @@ test("relative links and wikilinks open target notes across Live, Read, and Spli
   await page.locator('.android-reading a:has-text("Task Note")').click();
   await expect(page.locator('[role="status"].reader-link-notice')).toContainText("Save this note before opening linked notes.");
 });
+
+test("pendingHeading coexists with shared source anchor mode transitions and ordinary tab position restore", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.addInitScript(() => {
+    const lectureContent =
+      "# Lecture 2\n\n" +
+      Array.from({ length: 45 }, (_, i) => `## Background ${i + 1}\n\n${"Introductory probability context. ".repeat(12)}\n`).join("\n") +
+      "\n## Bayes\n\nPosterior equals likelihood times prior over evidence.\n\n" +
+      Array.from({ length: 35 }, (_, i) => `## Appendix ${i + 1}\n\n${"Further derivations and exercises. ".repeat(12)}\n`).join("\n");
+    const appendixOffset = lectureContent.indexOf("## Appendix 25");
+    const notes: Record<string, { id: string; path: string; content: string }> = {
+      "/notes/Index.md": {
+        id: "tab-index",
+        path: "/notes/Index.md",
+        content: "# Course Index\n\n- [[Lecture 2#Bayes|Bayes Theorem]]\n",
+      },
+      "/notes/Lecture 2.md": {
+        id: "tab-lecture-2",
+        path: "/notes/Lecture 2.md",
+        content: lectureContent,
+      },
+    };
+    let jumpSeq = 0;
+    const savedLocations: Record<string, any> = {
+      "/notes/Lecture 2.md": { top: 4200, offset: appendixOffset, zoom: 100, mode: "live" },
+    };
+    window.SuperMD = {
+      post(id, command, raw) {
+        const args = JSON.parse(raw);
+        if (command === "document_sync") {
+          window.supermdReply?.(id, { accepted: true, revision: 0 }, null);
+          return;
+        }
+        if (command === "reading_position" && args.location) {
+          const note = Object.values(notes).find(item => item.id === args.id);
+          if (note) savedLocations[note.path] = args.location;
+          window.supermdReply?.(id, true, null);
+          return;
+        }
+        if (command === "open_workspace_link") {
+          const target = notes["/notes/Lecture 2.md"];
+          const mode = (window as any).__currentMode || "live";
+          window.supermdReply?.(id, { opened: true, id: target.id, path: target.path }, null);
+          window.supermdLoad?.({
+            id: target.id,
+            path: target.path,
+            content: target.content,
+            mode,
+            dark: false,
+            fullscreen: false,
+            colors: {},
+            font: "Manrope",
+            size: 16,
+            zoom: 100,
+            motion: false,
+            editProtocol: 1,
+            restorePosition: true,
+            readingLocation: savedLocations[target.path] ?? null,
+            pendingHeading: { heading: args.fragment, token: `heading-${++jumpSeq}` },
+          });
+          return;
+        }
+        window.supermdReply?.(id, true, null);
+      },
+    };
+    (window as any).__openTab = (notePath: string, mode: "live" | "reader" | "split" | "editor", pendingHeading?: string) => {
+      (window as any).__currentMode = mode;
+      const target = notes[notePath];
+      window.supermdLoad?.({
+        id: target.id,
+        path: target.path,
+        content: target.content,
+        mode,
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 16,
+        zoom: 100,
+        motion: false,
+        editProtocol: 1,
+        restorePosition: true,
+        readingLocation: savedLocations[target.path] ?? null,
+        ...(pendingHeading ? { pendingHeading: { heading: pendingHeading, token: `heading-${++jumpSeq}` } } : {}),
+      });
+    };
+  });
+
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  // 1. Open Index in Live mode and follow [[Lecture 2#Bayes|Bayes Theorem]] despite prior Appendix 25 readingLocation.
+  await page.evaluate(() => (window as any).__openTab("/notes/Index.md", "live"));
+  await page.locator('.android-reading a:has-text("Bayes Theorem")').click();
+  await expect.poll(() =>
+    page.locator(".android-reading h2#bayes").evaluate(el => {
+      const scroller = el.closest(".android-reading")!;
+      return Math.abs(el.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 16);
+    }),
+  ).toBeLessThan(12);
+
+  // 2. Ordinary mode transitions after pendingHeading (Live -> Split -> Source -> Live) preserve the #Bayes shared source anchor.
+  await page.evaluate(() => (window as any).__openTab("/notes/Lecture 2.md", "split"));
+  const cmScroller = page.locator(".cm-scroller");
+  const readingRoot = page.locator(".android-reading");
+  await expect(cmScroller).toBeVisible();
+  await expect.poll(() =>
+    page.locator(".cm-line", { hasText: "## Bayes" }).evaluate(el => {
+      const box = el.getBoundingClientRect();
+      const hostBox = el.closest(".cm-scroller")!.getBoundingClientRect();
+      return box.bottom > hostBox.top && box.top < hostBox.bottom;
+    }),
+  ).toBe(true);
+  await expect.poll(() =>
+    page.locator(".android-reading h2#bayes").evaluate(el => {
+      const box = el.getBoundingClientRect();
+      const hostBox = el.closest(".android-reading")!.getBoundingClientRect();
+      return box.bottom > hostBox.top && box.top < hostBox.bottom;
+    }),
+  ).toBe(true);
+
+  await page.evaluate(() => (window as any).__openTab("/notes/Lecture 2.md", "editor"));
+  await expect.poll(() =>
+    page.locator(".cm-line", { hasText: "## Bayes" }).evaluate(el => {
+      const box = el.getBoundingClientRect();
+      const hostBox = el.closest(".cm-scroller")!.getBoundingClientRect();
+      return box.bottom > hostBox.top && box.top < hostBox.bottom;
+    }),
+  ).toBe(true);
+
+  await page.evaluate(() => (window as any).__openTab("/notes/Lecture 2.md", "live"));
+  await expect.poll(() =>
+    page.locator(".android-reading h2#bayes").evaluate(el => {
+      const box = el.getBoundingClientRect();
+      const hostBox = el.closest(".android-reading")!.getBoundingClientRect();
+      return box.bottom > hostBox.top && box.top < hostBox.bottom;
+    }),
+  ).toBe(true);
+
+  // 3. Scroll Lecture 2 down to Appendix 20, switch to Index and back without pendingHeading -> Appendix 20 restores normally.
+  await page.locator(".android-reading h2#appendix-20").evaluate(el => el.scrollIntoView({ block: "start" }));
+  await page.evaluate(() => {
+    document.querySelector<HTMLElement>(".android-reading")!.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  const appendixTop = await readingRoot.evaluate(el => el.scrollTop);
+  expect(appendixTop).toBeGreaterThan(2500);
+
+  await page.evaluate(() => (window as any).__openTab("/notes/Index.md", "live"));
+  await expect(page.locator(".android-reading h1")).toHaveText("Course Index");
+
+  await page.evaluate(() => (window as any).__openTab("/notes/Lecture 2.md", "live"));
+  await expect.poll(async () => Math.abs((await readingRoot.evaluate(el => el.scrollTop)) - appendixTop)).toBeLessThan(12);
+
+  // 4. Direct pendingHeading jump in Split and Source modes aligns both preview and CodeMirror panes to ## Bayes.
+  await page.evaluate(() => (window as any).__openTab("/notes/Index.md", "split"));
+  await page.locator('.android-reading a:has-text("Bayes Theorem")').click();
+  await expect.poll(() =>
+    page.locator(".android-reading h2#bayes").evaluate(el => {
+      const scroller = el.closest(".android-reading")!;
+      return Math.abs(el.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 16);
+    }),
+  ).toBeLessThan(12);
+  await expect.poll(() =>
+    page.locator(".cm-line", { hasText: "## Bayes" }).evaluate(el => {
+      const box = el.getBoundingClientRect();
+      const hostBox = el.closest(".cm-scroller")!.getBoundingClientRect();
+      return box.bottom > hostBox.top && box.top < hostBox.bottom;
+    }),
+  ).toBe(true);
+
+  await page.evaluate(() => (window as any).__openTab("/notes/Lecture 2.md", "editor", "Bayes"));
+  await expect.poll(() =>
+    page.locator(".cm-line", { hasText: "## Bayes" }).evaluate(el => {
+      const box = el.getBoundingClientRect();
+      const hostBox = el.closest(".cm-scroller")!.getBoundingClientRect();
+      return box.bottom > hostBox.top && box.top < hostBox.bottom;
+    }),
+  ).toBe(true);
+});

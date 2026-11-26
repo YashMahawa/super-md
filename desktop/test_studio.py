@@ -1254,7 +1254,9 @@ class StudioTest(unittest.TestCase):
         self.assertEqual(replies[-1][2], "")
         self.assertTrue(json.loads(replies[-1][1])["opened"])
         self.assertEqual(studio._current()["path"], str(lecture_note.resolve()))
-        pending = loads[-1].get("pendingHeading")
+        self.assertEqual(len(loads), 1)
+        self.assertIn("content", loads[0])
+        pending = loads[0].get("pendingHeading")
         self.assertIsInstance(pending, dict)
         self.assertEqual(pending["heading"], "bayes")
         self.assertTrue(bool(pending.get("token")))
@@ -1371,10 +1373,114 @@ class StudioTest(unittest.TestCase):
             self.assertFalse(rejected["opened"])
             self.assertIn("symlink", rejected["message"])
 
+        def _linux_inotify_fds() -> int | None:
+            fd_dir = Path("/proc/self/fd")
+            if not fd_dir.is_dir():
+                return None
+            total = 0
+            for entry in os.listdir(fd_dir):
+                try:
+                    if "inotify" in os.readlink(fd_dir / entry):
+                        total += 1
+                except OSError:
+                    pass
+            return total
+
+        inotify_before = _linux_inotify_fds()
         self.assertTrue(studio.note_watcher.files() or studio.note_watcher.directories())
         studio.stop()
         self.assertEqual(studio.note_watcher.files(), [])
         self.assertEqual(studio.note_watcher.directories(), [])
+        inotify_after = _linux_inotify_fds()
+        if inotify_before is not None and inotify_after is not None:
+            self.assertLessEqual(inotify_after, inotify_before - 3)
+
+    def test_open_relative_note_pending_heading_preserves_manual_tab_switch_and_batch_drop(self):
+        from unittest.mock import patch
+
+        studio = self.studio
+        studio.ready = True
+        loads = []
+        studio.readerLoad.connect(lambda payload: loads.append(json.loads(payload)))
+
+        folder = studio.data / "heading-drop-coexist"
+        folder.mkdir(parents=True, exist_ok=True)
+        index_note = folder / "index.md"
+        keep_note = folder / "keep.md"
+        linked_note = folder / "linked.md"
+        drop_a = folder / "drop-a.md"
+        drop_b = folder / "drop-b.md"
+        index_note.write_text("# Index\n\n[[linked#Target]]\n", encoding="utf-8")
+        keep_note.write_text("# Keep\n", encoding="utf-8")
+        linked_note.write_text("# Linked\n\n## Target\n", encoding="utf-8")
+        drop_a.write_text("# Drop A\n", encoding="utf-8")
+        drop_b.write_text("# Drop B\n", encoding="utf-8")
+
+        studio.openFolder(str(folder))
+        studio.openNote(str(index_note))
+        self._wait_for(lambda: studio._current()["path"] == str(index_note.resolve()))
+        studio.openNote(str(keep_note))
+        self._wait_for(lambda: studio._current()["path"] == str(keep_note.resolve()))
+        keep_id = studio.active
+        index_id = next(t["id"] for t in studio.tabs if t["path"] == str(index_note.resolve()))
+        studio.selectTab(index_id)
+
+        replies = []
+        studio.replied.connect(lambda req_id, value, err: replies.append((req_id, value, err)))
+        pending_reads: list[tuple[object, object]] = []
+
+        def intercept_submit(action, done, *args, **kwargs):
+            # Let background settings writes discard cleanly; capture worker tasks.
+            if done.__name__ == "_noop_done":
+                return
+            pending_reads.append((action, done))
+
+        with patch.object(studio, "_submit", side_effect=intercept_submit):
+            studio.post("rel-coexist", "open_workspace_link", json.dumps({
+                "documentPath": str(index_note.resolve()),
+                "target": "linked.md",
+                "fragment": "target",
+                "wikilink": False,
+            }))
+            self.assertEqual(len(pending_reads), 1)
+            resolve_action, resolve_done = pending_reads.pop()
+            resolve_done(resolve_action(), None)
+            self.assertEqual(len(pending_reads), 1)
+
+            # User manually selects keep_id before the linked note finishes loading.
+            studio.selectTab(keep_id)
+            loads.clear()
+            action, done = pending_reads.pop()
+            done(action(), None)
+
+        self.assertEqual(replies[-1][0], "rel-coexist")
+        self.assertTrue(json.loads(replies[-1][1])["opened"])
+        self.assertEqual(studio.active, keep_id)
+        self.assertEqual(loads, [])
+        linked_tab = next(t for t in studio.tabs if t["path"] == str(linked_note.resolve()))
+        self.assertNotIn("pendingHeading", linked_tab)
+
+        # Selecting linked_tab manually later must restore ordinarily without pendingHeading.
+        studio.selectTab(linked_tab["id"])
+        self.assertEqual(studio.active, linked_tab["id"])
+        self.assertNotIn("pendingHeading", loads[-1])
+
+        # Batch drop still preserves drop order and activates the last dropped note.
+        pending_reads.clear()
+        with patch.object(studio, "_submit", side_effect=intercept_submit):
+            studio.handleExternalDrop(
+                [QUrl.fromLocalFile(str(drop_a)), QUrl.fromLocalFile(str(drop_b))],
+                True,
+            )
+            self.assertEqual(len(pending_reads), 2)
+            # Complete out of order: drop_b (1) then drop_a (0).
+            for idx in (1, 0):
+                action, done = pending_reads[idx]
+                done(action(), None)
+
+        self.assertEqual(studio._current()["path"], str(drop_b.resolve()))
+        tail_paths = [t["path"] for t in studio.tabs[-2:]]
+        self.assertEqual(tail_paths, [str(drop_a.resolve()), str(drop_b.resolve())])
 
     def test_workspace_folder_and_expanded_subfolders_persist_across_restarts_tray_hides_and_multiwindow_shutdown(self):
         import tempfile

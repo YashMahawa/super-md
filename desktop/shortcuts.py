@@ -60,6 +60,10 @@ def _definition_rows(platform: str) -> tuple[tuple[str, str, list[str]], ...]:
         ("new_folder_note", "New note in folder", [f"{primary}+Alt+N"]),
         ("new_subfolder", "New subfolder", [f"{primary}+Alt+Shift+N"]),
         ("rename_entry", "Rename note or folder", ["F2"]),
+        ("mode_live", "Live mode", [f"{primary}+Alt+1"]),
+        ("mode_editor", "Source mode", [f"{primary}+Alt+2"]),
+        ("mode_reader", "Read mode", [f"{primary}+Alt+3"]),
+        ("mode_split", "Split mode", [f"{primary}+Alt+4"]),
     )
 
 

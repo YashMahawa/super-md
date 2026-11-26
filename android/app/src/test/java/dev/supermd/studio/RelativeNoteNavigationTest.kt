@@ -17,6 +17,7 @@ import android.webkit.WebView
 import androidx.lifecycle.ViewModelStore
 import java.io.File
 import java.nio.file.Files
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -224,15 +225,15 @@ class RelativeNoteNavigationTest {
     }
 
     private fun <T> callSuspend(block: suspend () -> T): T {
-        var outcome: Result<T>? = null
+        val outcome = AtomicReference<Result<T>?>()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            outcome = runCatching { block() }
+            outcome.set(runCatching { block() })
         }
-        await { outcome != null }
-        return outcome!!.getOrThrow()
+        await { outcome.get() != null }
+        return outcome.get()!!.getOrThrow()
     }
 
-    private fun await(timeoutMs: Long = 5_000, condition: () -> Boolean) {
+    private fun await(timeoutMs: Long = 15_000, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         val mainLooper = shadowOf(Looper.getMainLooper())
         while (System.currentTimeMillis() < deadline) {

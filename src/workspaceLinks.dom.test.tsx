@@ -134,6 +134,29 @@ describe("Source mode Ctrl/Cmd+Click workspace link navigation", () => {
         wikilink: true,
       },
     });
+    // Same-note [[#...]] wikilink moves selection directly to target heading offset
+    const sameNoteSource = "Jump to [[#Q4 Goals]]\n\n## Q4 Goals\n\nBody.";
+    await act(async () => {
+      root?.render(
+        <Editor
+          sessionId="source-link-same-note"
+          documentPath="/vault/Notes/Today.md"
+          value={sameNoteSource}
+          onChange={vi.fn()}
+          dark={false}
+          focusMode={false}
+        />,
+      );
+    });
+    const sameCm = host.querySelector<HTMLElement>(".cm-content")!;
+    const sameView = EditorView.findFromDOM(sameCm)!;
+    vi.spyOn(sameView, "posAtCoords").mockReturnValueOnce(sameNoteSource.indexOf("#Q4 Goals") + 2);
+    await act(async () => {
+      sameCm.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0, ctrlKey: true, clientX: 60, clientY: 16 }),
+      );
+    });
+    expect(sameView.state.selection.main.head).toBe(sameNoteSource.indexOf("## Q4 Goals"));
   }, 15_000);
 
   it("scrolls to pendingHeading in >80k-char windowed notes and Source mode without saved-scroll override", async () => {
@@ -164,33 +187,52 @@ describe("Source mode Ctrl/Cmd+Click workspace link navigation", () => {
     const filler = `${"Detailed background paragraph for windowed rendering verification. ".repeat(25)}\n\n`;
     const largeNote = `# Large Handbook\n\n${filler.repeat(55)}## Target Deep Section\n\nTarget body.\n\n${filler.repeat(10)}`;
     expect(largeNote.length).toBeGreaterThan(85_000);
+    const expectedOffset = largeNote.indexOf("## Target Deep Section");
 
-    const gotoOffsets: number[] = [];
-    const onGotoOffset = (event: Event) => gotoOffsets.push((event as CustomEvent<number>).detail);
-    window.addEventListener("supermd-goto-offset", onGotoOffset);
-    try {
-      await act(async () => {
-        window.supermdLoad?.({
-          id: "source-note",
-          path: "/vault/Large.md",
-          content: largeNote,
-          mode: "editor",
-          dark: false,
-          fullscreen: false,
-          font: "Manrope",
-          size: 15,
-          zoom: 100,
-          motion: false,
-          restorePosition: true,
-          readingLocation: { top: 1500, offset: 100, zoom: 100, mode: "editor" },
-          pendingHeading: { heading: "Target Deep Section", token: "jump-token-source" },
-          colors: {},
-        });
-        vi.advanceTimersByTime(400);
+    await act(async () => {
+      window.supermdLoad?.({
+        id: "windowed-reader-note",
+        path: "/vault/Large.md",
+        content: largeNote,
+        mode: "reader",
+        dark: false,
+        fullscreen: false,
+        font: "Manrope",
+        size: 15,
+        zoom: 100,
+        motion: false,
+        restorePosition: true,
+        readingLocation: { top: 1500, offset: 100, zoom: 100, mode: "reader" },
+        pendingHeading: { heading: "Target Deep Section", token: "jump-token-reader" },
+        colors: {},
       });
-      expect(gotoOffsets).toContain(largeNote.indexOf("## Target Deep Section"));
-    } finally {
-      window.removeEventListener("supermd-goto-offset", onGotoOffset);
-    }
+      vi.advanceTimersByTime(400);
+    });
+    const renderedHeadings = Array.from(readerRootEl.querySelectorAll("h2")).map((el) => el.textContent?.trim());
+    expect(renderedHeadings).toContain("Target Deep Section");
+
+    await act(async () => {
+      window.supermdLoad?.({
+        id: "source-note",
+        path: "/vault/Large.md",
+        content: largeNote,
+        mode: "editor",
+        dark: false,
+        fullscreen: false,
+        font: "Manrope",
+        size: 15,
+        zoom: 100,
+        motion: false,
+        restorePosition: true,
+        readingLocation: { top: 1500, offset: 100, zoom: 100, mode: "editor" },
+        pendingHeading: { heading: "Target Deep Section", token: "jump-token-source" },
+        colors: {},
+      });
+      vi.advanceTimersByTime(400);
+    });
+    const cmContent = readerRootEl.querySelector<HTMLElement>(".cm-content");
+    expect(cmContent).not.toBeNull();
+    const editorView = EditorView.findFromDOM(cmContent!)!;
+    expect(editorView.state.selection.main.head).toBe(expectedOffset);
   }, 15_000);
 });
