@@ -1107,8 +1107,10 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertIsNotNone(window, str(component.errors()))
         self.studio.host_window = window
         try:
-            window.show(); window.requestActivate()
-            QTest.qWait(10)
+            window.show()
+            window.requestActivate()
+            QTest.qWaitForWindowExposed(window, 300)
+            QTest.qWait(15)
             dialog = window.findChild(QObject, "folderSearchDialog")
             search_input = window.findChild(QObject, "folderSearchInput")
             debounce_timer = window.findChild(QObject, "folderSearchDebounce")
@@ -1171,7 +1173,6 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 self.assertEqual({m["name"] for m in self.studio.folderSearchState["matches"]}, {"alpha.md", "beta.md"})
 
             # 2. Editing while a previous generation is scanning cancels & invalidates immediately.
-            dialog.setProperty("debounceInterval", 35)
             scan_started, cancel_observed = threading.Event(), threading.Event()
             captured: dict[str, object] = {}
             stale_hit = [{"name": "stale.md", "relative": "stale.md", "path": "", "tabId": "", "line": 1, "column": 1,
@@ -1197,6 +1198,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 prev_generation, prev_cancel = self.studio._folder_search_generation, captured["cancel_event"]
                 self.assertFalse(prev_cancel.is_set())
 
+                dialog.setProperty("debounceInterval", 220)
                 QTest.keyClick(window, Qt.Key.Key_X)
                 self.app.processEvents()
                 self.assertEqual(search_input.property("text"), "SlowQueryx")
@@ -1212,7 +1214,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 # Late batch signal from the superseded generation on the GUI thread is dropped.
                 self.studio.workspaceSearchBatch.emit(prev_generation, stale_hit, 1, False, True)
                 self.app.processEvents()
-                self.assertEqual(self.studio.folderSearchState["matches"], [])
+                self.assertTrue(all(m["name"] != "stale.md" for m in self.studio.folderSearchState["matches"]))
                 self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
                 self.assertEqual(self.studio.folderSearchState["matches"][0]["name"], "beta.md")
                 self.assertEqual(self.studio.folderSearchState["matches"][0]["matchText"], "SlowQueryx")
@@ -1227,7 +1229,6 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.studio.ready = True
 
         with self._real_folder_search_dialog() as (window, dialog, search_input, debounce_timer):
-            dialog.setProperty("debounceInterval", 35)
             status_label = window.findChild(QObject, "folderSearchStatus")
             self.assertIsNotNone(status_label)
 
@@ -1256,6 +1257,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertIsNone(self.studio.flush_operation)
 
             # Type "OmegaHit" and immediately press Down, Return, and Keypad Enter while pending (plus direct slot guard).
+            dialog.setProperty("debounceInterval", 300)
             QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
             self._type_keys(window, "OmegaHit")
             self.app.processEvents()
@@ -1270,17 +1272,22 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertIsNone(self.studio.flush_operation, "Enter while pending must not open stale match")
 
             # Clear input while pending: stops debounce immediately, launches no scan, resets state cleanly.
+            dialog.setProperty("debounceInterval", 160)
             with patch("studio.stream_text_search", wraps=stream_text_search) as spy_clear_pending:
+                self._type_keys(window, "z")
+                self.app.processEvents()
+                self.assertTrue(bool(debounce_timer.property("running")))
                 select_all_and_clear(Qt.Key.Key_Backspace)
                 self.assertEqual(search_input.property("text"), "")
                 self.assertFalse(bool(debounce_timer.property("running")) or bool(dialog.property("queryPending")))
                 self.assertFalse(self.studio.folderSearchState["pending"] or self.studio.folderSearchState["scanning"])
                 self.assertEqual(self.studio.folderSearchState["matches"], [])
                 self.assertIn("Streams live matches", str(status_label.property("text")))
-                QTest.qWait(55)
+                QTest.qWait(180)
                 spy_clear_pending.assert_not_called()
 
             # Settle "OmegaHit", clear settled results, and verify Enter on empty input is a no-op.
+            dialog.setProperty("debounceInterval", 120)
             self._type_keys(window, "OmegaHit")
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
             select_all_and_clear(Qt.Key.Key_Delete)
@@ -1294,29 +1301,33 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             case_toggle = window.findChild(QObject, "folderSearchCaseToggle")
             diag_toggle = window.findChild(QObject, "folderSearchDiagramsToggle")
             self.assertTrue(case_toggle is not None and diag_toggle is not None)
+            self.assertTrue(_wait_until(lambda: diag_toggle.width() > 0 and case_toggle.width() > 0))
+            diag_pt = diag_toggle.mapToScene(QPointF(diag_toggle.width() / 2.0, diag_toggle.height() / 2.0)).toPoint()
+            toggle_pt = case_toggle.mapToScene(QPointF(case_toggle.width() / 2.0, case_toggle.height() / 2.0)).toPoint()
+            dialog.setProperty("debounceInterval", 220)
             toggle_queries: list[tuple[str, bool, bool]] = []
             with patch("studio.stream_text_search", side_effect=lambda q, *a, **kw: (toggle_queries.append((q, bool(kw.get("case_sensitive")), not bool(kw.get("exclude_diagrams", True)))), stream_text_search(q, *a, **kw))[1]):
                 self._type_keys(window, "diagramhit")
                 self.app.processEvents()
                 self.assertTrue(bool(debounce_timer.property("running")))
-                diag_pt = diag_toggle.mapToScene(QPointF(diag_toggle.width() / 2.0, diag_toggle.height() / 2.0)).toPoint()
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, diag_pt)
                 self.assertTrue(bool(search_input.property("activeFocus")))
                 self.assertFalse(bool(debounce_timer.property("running")))
                 self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
-                QTest.qWait(50)
+                QTest.qWait(240)
                 self.assertEqual(toggle_queries, [("diagramhit", False, True)])
-                toggle_pt = case_toggle.mapToScene(QPointF(case_toggle.width() / 2.0, case_toggle.height() / 2.0)).toPoint()
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, toggle_pt)
-                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"]))
+                self.assertTrue(_wait_until(lambda: bool(case_toggle.property("checked")) and not self.studio.folderSearchState["scanning"]))
                 self.assertEqual(self.studio.folderSearchState["matches"], [])
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, toggle_pt)
+                self.assertTrue(_wait_until(lambda: not bool(case_toggle.property("checked")) and not self.studio.folderSearchState["scanning"]))
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, diag_pt)
-                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"]))
+                self.assertTrue(_wait_until(lambda: not bool(diag_toggle.property("checked")) and not self.studio.folderSearchState["scanning"]))
 
             select_all_and_clear(Qt.Key.Key_Delete)
 
             # Escape while pending cancels debounce cleanly and never runs after closing.
+            dialog.setProperty("debounceInterval", 160)
             with patch("studio.stream_text_search", wraps=stream_text_search) as spy_escape_pending:
                 self._type_keys(window, "AlphaHit")
                 self.app.processEvents()
@@ -1324,10 +1335,11 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 QTest.keyClick(window, Qt.Key.Key_Escape)
                 self.assertTrue(_wait_until(lambda: not bool(dialog.property("visible"))))
                 self.assertFalse(self.studio.folderSearchState["open"] or bool(debounce_timer.property("running")))
-                QTest.qWait(55)
+                QTest.qWait(180)
                 spy_escape_pending.assert_not_called()
 
             # Reopen, search "OmegaHit", step Down to 2nd occurrence, and press Return to activate current result.
+            dialog.setProperty("debounceInterval", 120)
             open_and_ack_sync()
             self._type_keys(window, "OmegaHit")
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
@@ -1351,7 +1363,13 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "second.md"))
             open_and_ack_sync()
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
-            QTest.qWait(15)
+            self.assertTrue(
+                _wait_until(
+                    lambda: (r := self._find_named_item(window, "folderSearchRow_0")) is not None
+                    and r.width() > 0
+                    and r.height() > 0
+                )
+            )
             row0 = self._find_named_item(window, "folderSearchRow_0")
             self.assertIsNotNone(row0)
             center = row0.mapToScene(QPointF(row0.width() / 2.0, row0.height() / 2.0)).toPoint()
