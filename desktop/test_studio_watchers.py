@@ -1,7 +1,7 @@
-"""Focused unit tests for studio_watchers guards, reconciliation, reload, and SimpleNamespace doubles."""
+"""Focused unit tests for studio_watchers guards, reconciliation, reload, and explicit collaborators."""
 from __future__ import annotations
 
-import os, shutil, sys, tempfile, threading, unittest
+import ast, inspect, os, shutil, sys, tempfile, threading, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,8 +14,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from PySide6.QtGui import QGuiApplication
-import studio, studio_watchers
-from documents import write_portable
+import folder_ops, studio, studio_watchers
+from documents import open_note, write_portable
+from studio import Studio
 
 
 class StudioWatchersUnitTests(unittest.TestCase):
@@ -28,6 +29,22 @@ class StudioWatchersUnitTests(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_explicit_dependencies_and_zero_studio_or_sys_modules_lookups(self):
+        self.assertFalse(hasattr(studio_watchers, "_studio_module"))
+        source = inspect.getsource(studio_watchers)
+        self.assertNotIn("_studio" + "_module", source)
+        self.assertNotIn("sys." + "modules", source)
+        tree = ast.parse(source)
+        imported = {
+            alias.name for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
+        } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+        self.assertFalse({"studio", "desktop.studio", "sys"} & imported)
+        self.assertFalse([
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Try) and any(isinstance(sub, (ast.Import, ast.ImportFrom)) for sub in ast.walk(node))
+        ])
 
     def test_stopped_file_watcher_rebound_and_noop_methods(self):
         sentinel = studio_watchers._STOPPED_WATCHER
@@ -71,7 +88,11 @@ class StudioWatchersUnitTests(unittest.TestCase):
         old_path, new_path = self.temp_dir / "draft.md", self.temp_dir / "renamed.md"
         new_path.write_text("# Saved\n", encoding="utf-8")
         invalidated: list[str | None] = []
-        tab = {"id": "t1", "name": "draft.md", "path": str(old_path), "content": "# Saved\n", "saved": "# Saved\n", "conflict": False}
+        tab = {
+            "id": "t1", "name": "draft.md", "path": str(old_path), "content": "# Saved\n", "saved": "# Saved\n",
+            "assets": {"assets/a.png": "data:image/png;base64,AA=="}, "saved_assets": {"assets/a.png": "data:image/png;base64,AA=="},
+            "assets_dirty": False, "conflict": False,
+        }
         session = SimpleNamespace(
             locations={str(old_path): {"top": 4}}, pinned=[str(old_path)], drafts={},
             workspace={"w1": [{"path": str(old_path)}]}, workspace_links=SimpleNamespace(invalidate=lambda folder=None: invalidated.append(folder)),
@@ -81,7 +102,9 @@ class StudioWatchersUnitTests(unittest.TestCase):
             note_file_stamps={str(old_path): (1, 1)}, session=session, message="",
         )
 
-        studio_watchers.location_changed(double, str(old_path), str(new_path))
+        with patch.object(studio, "folder_ops", wraps=studio.folder_ops) as spy_ops:
+            Studio._location_changed(double, str(old_path), str(new_path))
+        self.assertGreater(spy_ops.same_path.call_count, 0)
         st_new = new_path.stat()
         self.assertEqual((tab["path"], tab["name"]), (str(new_path), "renamed.md"))
         self.assertEqual(double.note_file_stamps, {str(new_path): (st_new.st_mtime_ns, st_new.st_size)})
@@ -89,16 +112,16 @@ class StudioWatchersUnitTests(unittest.TestCase):
         self.assertEqual((session.pinned, double.recent), ([str(new_path)], [str(new_path)]))
         self.assertEqual(session.workspace["w1"][0]["path"], str(new_path))
 
-        tab["content"] = "# Unsaved local work\n"
+        tab["assets"] = {"assets/a.png": "data:image/png;base64,AQ=="}
         new_path.unlink()
         studio_watchers.location_changed(double, str(new_path), "")
         self.assertEqual((double.tabs, double.note_file_stamps, session.locations, session.pinned, double.recent), ([], {}, {}, [], []))
         recovered = session.drafts["deleted-notes"]
         self.assertEqual((len(recovered), recovered[0]["name"], recovered[0]["path"]), (1, "Recovered renamed.md", ""))
-        self.assertEqual(recovered[0]["content"], "# Unsaved local work\n")
+        self.assertEqual(recovered[0]["assets"]["assets/a.png"], "data:image/png;base64,AQ==")
         self.assertEqual(invalidated, [None, None])
 
-    def test_reload_changed_content_clean_reload_asset_revocation_conflict_and_monkeypatches(self):
+    def test_studio_wrappers_forward_collaborators_for_watch_external_refresh_and_reload(self):
         smd = self.temp_dir / "note.smd"
         url_keep, url_v1, url_v2 = "data:image/svg+xml;base64,PHN2Zy8+", "data:image/png;base64,AA==", "data:image/png;base64,AQ=="
         write_portable(smd, "# V1\n", {"assets/keep.svg": url_keep, "assets/pic.png": url_v1})
@@ -108,42 +131,93 @@ class StudioWatchersUnitTests(unittest.TestCase):
             "saved_assets": {"assets/keep.svg": url_keep, "assets/pic.png": url_v1},
             "assets_dirty": False, "portable": True, "conflict": False,
         }
-        revoked, emitted = [], []
+        revoked, emitted, watched_added = [], [], []
+        watcher = SimpleNamespace(
+            files=lambda: [], directories=lambda: [],
+            addPaths=lambda paths: (watched_added.extend(paths), [])[1], removePaths=lambda paths: [],
+        )
         double = SimpleNamespace(
             window_id="win-1", tabs=[tab], active="t1", saving=set(), note_file_stamps={},
-            session=SimpleNamespace(reader_assets=SimpleNamespace(revoke_tab=lambda w, t: revoked.append((w, t)))),
+            folder=self.temp_dir.as_uri(), expanded=set(), recent=[], note_watcher=watcher,
+            external_paths=set(), note_identities={str(smd): (9, 9)},
+            session=SimpleNamespace(
+                reader_assets=SimpleNamespace(revoke_tab=lambda w, t: revoked.append((w, t))),
+                locationChanged=SimpleNamespace(emit=lambda o, n: None),
+            ),
             _emit=lambda *a, **kw: emitted.append((a, kw)),
+            _load_tree=lambda: None,
         )
+        with patch.object(studio, "local_path", wraps=studio.local_path) as spy_lp:
+            Studio._watch_notes(double, force=True)
+            Studio._external_note_changed(double, str(smd))
+        self.assertEqual(spy_lp.call_count, 2)
+        self.assertIn(str(smd), watched_added)
+        self.assertIn(str(self.temp_dir.resolve()), watched_added)
+        self.assertEqual(double.external_paths, {str(smd.resolve())})
+        double.folder = str(self.temp_dir)
+
         write_portable(smd, "# V2\n", {"assets/keep.svg": str(url_keep), "assets/pic.png": url_v2})
-        with patch.object(studio, "open_note", wraps=studio.open_note) as spy_open:
-            studio_watchers.reload_changed_content(double, {str(smd)})
-        self.assertEqual((spy_open.call_count, tab["content"], tab["assets"]["assets/pic.png"]), (1, "# V2\n", url_v2))
+        with patch.object(studio, "open_note", wraps=studio.open_note) as spy_open, patch.object(
+            studio, "_preserve_unchanged_assets", wraps=studio._preserve_unchanged_assets
+        ) as spy_preserve:
+            Studio._reload_changed_content(double, {str(smd)})
+        self.assertEqual((spy_open.call_count, spy_preserve.call_count, tab["content"], tab["assets"]["assets/pic.png"]), (1, 1, "# V2\n", url_v2))
         self.assertIs(tab["assets"]["assets/keep.svg"], url_keep)
         self.assertEqual((revoked, emitted[-1]), ([("win-1", "t1")], ((), {"load": True})))
 
+        rec_calls = []
+        with patch.object(studio, "file_events", SimpleNamespace(reconcile=lambda k, c: (rec_calls.append((k, c)), {})[1])):
+            Studio._refresh_external_notes(double)
+        self.assertEqual(len(rec_calls), 1)
+
         tab["content"] = "# Local dirty edit\n"
         write_portable(smd, "# V3 external\n", {"assets/keep.svg": url_keep, "assets/pic.png": url_v2})
-        studio_watchers.reload_changed_content(double, {str(smd)})
+        Studio._reload_changed_content(double, {str(smd)})
         self.assertEqual((tab["conflict"], tab["content"], emitted[-1]), (True, "# Local dirty edit\n", ((False,), {})))
 
-    def test_external_changed_and_refresh_honor_studio_local_path_file_events_and_submit_patches(self):
+    def test_direct_explicit_collaborator_injection_on_simplenamespace_doubles(self):
         note = self.temp_dir / "sub" / "ext.md"
         note.parent.mkdir(parents=True)
         note.write_text("# Ext\n", encoding="utf-8")
-        emitted_locs, submitted, tree_loads = [], [], []
+        lp_calls, id_calls, rec_calls, open_calls, preserve_calls, tree_loads, emitted_locs = [], [], [], [], [], [], []
+        custom_ops = SimpleNamespace(
+            same_path=folder_ops.same_path,
+            matches_path_prefix=folder_ops.matches_path_prefix,
+        )
+        custom_fe = SimpleNamespace(
+            identity=lambda p: (id_calls.append(p), (7, 7))[1],
+            reconcile=lambda known, changed: (rec_calls.append((dict(known), set(changed))), {str(note): ""})[1],
+        )
+        tab = {
+            "id": "t1", "name": "ext.md", "path": str(note), "content": "# V1\n", "saved": "# V1\n",
+            "assets": {"assets/x.svg": "data:image/svg+xml;base64,PHN2Zy8+"},
+            "saved_assets": {"assets/x.svg": "data:image/svg+xml;base64,PHN2Zy8+"},
+            "assets_dirty": False, "portable": False, "conflict": False,
+        }
         double = SimpleNamespace(
-            folder=str(self.temp_dir), external_paths=set(), note_identities={str(note): (9, 9)}, tabs=[{"path": str(note)}],
+            folder=str(self.temp_dir), expanded={note.parent.as_uri()}, recent=[], tabs=[tab], active="t1",
+            saving=set(), external_paths=set(), note_identities={}, note_file_stamps={},
             session=SimpleNamespace(locationChanged=SimpleNamespace(emit=lambda o, n: emitted_locs.append((o, n)))),
             _reload_changed_content=lambda changed: None,
             _load_tree=lambda: tree_loads.append(True),
-            _submit=lambda action, done, busy=True: (submitted.append(busy), done(action(), None)),
         )
-        with patch.object(studio, "local_path", side_effect=lambda p: Path(p)):
-            studio_watchers.external_note_changed(double, str(note))
+        custom_lp = lambda p: (lp_calls.append(p), studio_watchers._default_local_path(p))[1]
+        studio_watchers.watch_notes(double, force=True, local_path_fn=custom_lp, file_events_mod=custom_fe, folder_ops_mod=custom_ops)
+        self.assertEqual(double.note_identities, {str(note): (7, 7)})
+        studio_watchers.external_note_changed(double, str(note), local_path_fn=custom_lp, folder_ops_mod=custom_ops)
         self.assertEqual(double.external_paths, {str(note)})
-        with patch.object(studio.file_events, "reconcile", return_value={str(note): ""}) as spy_rec:
-            studio_watchers.refresh_external_notes(double)
-        self.assertEqual((spy_rec.call_count, submitted, emitted_locs, tree_loads), (1, [False], [(str(note), "")], [True]))
+        studio_watchers.refresh_external_notes(double, file_events_mod=custom_fe, folder_ops_mod=custom_ops)
+        self.assertEqual((len(rec_calls), emitted_locs, tree_loads), (1, [(str(note), "")], [True]))
+
+        note.write_text("# V2\n", encoding="utf-8")
+        studio_watchers.reload_changed_content(
+            double, {str(note)},
+            open_note_fn=lambda p: (open_calls.append(p), open_note(p))[1],
+            folder_ops_mod=custom_ops,
+            preserve_assets_fn=lambda old, new: (preserve_calls.append((old, new)), dict(new))[1],
+        )
+        self.assertEqual((len(open_calls), len(preserve_calls), tab["content"]), (1, 1, "# V2\n"))
+        self.assertGreaterEqual(len(lp_calls), 2)
 
 
 if __name__ == "__main__":

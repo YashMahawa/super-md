@@ -1576,16 +1576,18 @@ class Studio(QObject):
         return studio_assets_rename.active_watch_suspensions(self.session)
 
     def _is_path_suspended(self, candidate: str, suspensions=None) -> bool:
-        return studio_watchers.is_path_suspended(self, candidate, suspensions=suspensions)
+        return studio_watchers.is_path_suspended(self, candidate, suspensions=suspensions, folder_ops_mod=folder_ops)
 
     def _is_watch_target_suspended(self, candidate: str, suspensions=None) -> bool:
-        return studio_watchers.is_watch_target_suspended(self, candidate, suspensions=suspensions)
+        return studio_watchers.is_watch_target_suspended(self, candidate, suspensions=suspensions, folder_ops_mod=folder_ops)
 
     def _has_session_path_reference(self, candidate: str) -> bool:
-        return studio_watchers.has_session_path_reference(self, candidate)
+        return studio_watchers.has_session_path_reference(self, candidate, folder_ops_mod=folder_ops)
 
     def _watch_notes(self, force=False):
-        return studio_watchers.watch_notes(self, force=force)
+        return studio_watchers.watch_notes(
+            self, force=force, local_path_fn=local_path, file_events_mod=file_events, folder_ops_mod=folder_ops
+        )
 
     def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool, new_path: str = ""):
         studio_assets_rename.suspend_watches_for_prefix(self, target_path, is_dir=is_dir, new_path=new_path)
@@ -1594,16 +1596,19 @@ class Studio(QObject):
         return studio_assets_rename.hold_watches_for_rename(self, target_path, is_dir=is_dir, new_path=new_path)
 
     def _external_note_changed(self, path):
-        return studio_watchers.external_note_changed(self, path)
+        return studio_watchers.external_note_changed(self, path, local_path_fn=local_path, folder_ops_mod=folder_ops)
 
     def _refresh_external_notes(self):
-        return studio_watchers.refresh_external_notes(self)
+        return studio_watchers.refresh_external_notes(self, file_events_mod=file_events, folder_ops_mod=folder_ops)
 
     def _location_changed(self, old, new):
-        return studio_watchers.location_changed(self, old, new)
+        return studio_watchers.location_changed(self, old, new, folder_ops_mod=folder_ops)
 
     def _reload_changed_content(self, changed):
-        return studio_watchers.reload_changed_content(self, changed)
+        return studio_watchers.reload_changed_content(
+            self, changed, open_note_fn=open_note, folder_ops_mod=folder_ops,
+            preserve_assets_fn=_preserve_unchanged_assets,
+        )
 
     def _schedule_theme(self,*_):
         self.theme_debounce.start(150)
