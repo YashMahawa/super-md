@@ -15,7 +15,6 @@ else:
     import studio_assets_rename
     from documents import open_note
 
-
 class _StoppedFileWatcher:
     def files(self) -> list[str]: return []
     def directories(self) -> list[str]: return []
@@ -23,7 +22,6 @@ class _StoppedFileWatcher:
     def addPaths(self, paths) -> list[str]: return list(paths)
     def removePath(self, _path: str) -> bool: return False
     def removePaths(self, paths) -> list[str]: return list(paths)
-
 
 _STOPPED_WATCHER = _StoppedFileWatcher()
 
@@ -185,7 +183,13 @@ def refresh_external_notes(studio_obj: Any, *, file_events_mod: Any = file_event
         folder = getattr(studio_obj, "folder", "")
         if folder and (effective or emitted_location_change) and (wl := getattr(session, "workspace_links", None)) is not None:
             wl.invalidate(folder)
-        if folder and effective and any(folder_ops_mod.same_path(ch, folder) or folder_ops_mod.matches_path_prefix(ch, folder, is_directory=True) for ch in effective):
+        if folder and (
+            any(folder_ops_mod.same_path(ch, folder) or folder_ops_mod.matches_path_prefix(ch, folder, is_directory=True) for ch in effective)
+            or (emitted_location_change and any(
+                folder_ops_mod.matches_path_prefix(p, folder, is_directory=True)
+                for old, new in result.items() if (old or new) and not _any_path_suspended(studio_obj, old, new, current_suspensions, folder_ops_mod=folder_ops_mod) for p in (old, new) if p
+            ))
+        ):
             _call_method(studio_obj, "_load_tree", None)
 
     _call_method(studio_obj, "_submit", _fallback_submit, lambda: file_events_mod.reconcile(known, changed), reconciled, False)

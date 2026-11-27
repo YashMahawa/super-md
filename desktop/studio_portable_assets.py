@@ -209,7 +209,7 @@ def _prepare_portable_asset_mutation(
     open_note_fn: Callable = open_note,
     matches_signature_fn: Callable[[str | None, bytes], bool] = _default_matches_media_signature,
     is_dirty_fn: Callable[[Any, dict], bool] | None = None,
-    apply_saved_assets_fn: Callable = apply_saved_tab_assets,
+    apply_saved_assets_fn: Callable | None = None,
 ):
     dirty_check = is_dirty_fn or _default_is_dirty
     tab_id = args.get("tabId")
@@ -257,17 +257,16 @@ def _prepare_portable_asset_mutation(
         if error is not None:
             return None
         if value.get("changed", True):
-            if apply_saved_assets_fn is apply_saved_tab_assets:
-                if callable(bound := getattr(studio_obj, "_apply_saved_tab_assets", None)) and is_dirty_fn is None:
-                    bound(tab_id, path, content_snapshot, assets_snapshot, value["updated"], value.get("stamp"))
-                else:
-                    apply_saved_tab_assets(
-                        studio_obj, tab_id, path, content_snapshot, assets_snapshot,
-                        value["updated"], value.get("stamp"), is_dirty_fn=is_dirty_fn,
-                    )
-            else:
+            if apply_saved_assets_fn is not None:
                 apply_saved_assets_fn(
                     studio_obj, tab_id, path, content_snapshot, assets_snapshot, value["updated"], value.get("stamp")
+                )
+            elif callable(bound := getattr(studio_obj, "_apply_saved_tab_assets", None)):
+                bound(tab_id, path, content_snapshot, assets_snapshot, value["updated"], value.get("stamp"))
+            else:
+                apply_saved_tab_assets(
+                    studio_obj, tab_id, path, content_snapshot, assets_snapshot,
+                    value["updated"], value.get("stamp"), is_dirty_fn=is_dirty_fn,
                 )
         return value["result"]
 
@@ -282,7 +281,7 @@ def prepare_attach_tab_asset(
     validate_local_asset_fn: Callable | None = None,
     valid_asset_filename_fn: Callable[[str], bool] = is_valid_asset_filename,
     is_dirty_fn: Callable[[Any, dict], bool] | None = None,
-    apply_saved_assets_fn: Callable = apply_saved_tab_assets,
+    apply_saved_assets_fn: Callable | None = None,
     extra_asset_roots_fn: Callable[[Any], list[Path]] | None = None,
 ):
     """Prepare attaching a bounded local or relay-supplied image to a saved portable note."""
@@ -357,24 +356,13 @@ def prepare_attach_tab_asset(
 
 def attach_tab_asset_native(
     studio_obj: Any, args: dict, *,
-    write_portable_fn: Callable = write_portable,
-    open_note_fn: Callable = open_note,
-    matches_signature_fn: Callable[[str | None, bytes], bool] = _default_matches_media_signature,
-    validate_local_asset_fn: Callable | None = None,
-    valid_asset_filename_fn: Callable[[str], bool] = is_valid_asset_filename,
-    is_dirty_fn: Callable[[Any, dict], bool] | None = None,
-    apply_saved_assets_fn: Callable = apply_saved_tab_assets,
-    extra_asset_roots_fn: Callable[[Any], list[Path]] | None = None,
     prepare_fn: Callable | None = None,
     run_sync_fn: Callable = _default_run_prepared_write_sync,
+    **prepare_kwargs: Any,
 ):
     """Attach a bounded local or relay-supplied image to a saved portable note."""
     prepared = prepare_fn(studio_obj, args) if prepare_fn is not None else prepare_attach_tab_asset(
-        studio_obj, args,
-        write_portable_fn=write_portable_fn, open_note_fn=open_note_fn,
-        matches_signature_fn=matches_signature_fn, validate_local_asset_fn=validate_local_asset_fn,
-        valid_asset_filename_fn=valid_asset_filename_fn, is_dirty_fn=is_dirty_fn,
-        apply_saved_assets_fn=apply_saved_assets_fn, extra_asset_roots_fn=extra_asset_roots_fn,
+        studio_obj, args, **prepare_kwargs,
     )
     return run_sync_fn(studio_obj, prepared)
 
@@ -386,7 +374,7 @@ def prepare_replace_tab_asset(
     matches_signature_fn: Callable[[str | None, bytes], bool] = _default_matches_media_signature,
     validate_local_asset_fn: Callable | None = None,
     is_dirty_fn: Callable[[Any, dict], bool] | None = None,
-    apply_saved_assets_fn: Callable = apply_saved_tab_assets,
+    apply_saved_assets_fn: Callable | None = None,
     extra_asset_roots_fn: Callable[[Any], list[Path]] | None = None,
 ):
     def prepare_source(tab_id: str, path: Path, assets_snapshot: dict[str, str], revision: str):
@@ -438,21 +426,11 @@ def prepare_replace_tab_asset(
 
 def replace_tab_asset_native(
     studio_obj: Any, args: dict, *,
-    write_portable_fn: Callable = write_portable,
-    open_note_fn: Callable = open_note,
-    matches_signature_fn: Callable[[str | None, bytes], bool] = _default_matches_media_signature,
-    validate_local_asset_fn: Callable | None = None,
-    is_dirty_fn: Callable[[Any, dict], bool] | None = None,
-    apply_saved_assets_fn: Callable = apply_saved_tab_assets,
-    extra_asset_roots_fn: Callable[[Any], list[Path]] | None = None,
     prepare_fn: Callable | None = None,
     run_sync_fn: Callable = _default_run_prepared_write_sync,
+    **prepare_kwargs: Any,
 ):
     prepared = prepare_fn(studio_obj, args) if prepare_fn is not None else prepare_replace_tab_asset(
-        studio_obj, args,
-        write_portable_fn=write_portable_fn, open_note_fn=open_note_fn,
-        matches_signature_fn=matches_signature_fn, validate_local_asset_fn=validate_local_asset_fn,
-        is_dirty_fn=is_dirty_fn, apply_saved_assets_fn=apply_saved_assets_fn,
-        extra_asset_roots_fn=extra_asset_roots_fn,
+        studio_obj, args, **prepare_kwargs,
     )
     return run_sync_fn(studio_obj, prepared)

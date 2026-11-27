@@ -45,6 +45,11 @@ class StudioWatchersUnitTests(unittest.TestCase):
             node for node in ast.walk(tree)
             if isinstance(node, ast.Try) and any(isinstance(sub, (ast.Import, ast.ImportFrom)) for sub in ast.walk(node))
         ])
+        top_funcs = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        for cmp_node in (n for n in ast.walk(tree) if isinstance(n, ast.Compare)):
+            for op, comp in zip(cmp_node.ops, cmp_node.comparators):
+                if isinstance(op, (ast.Is, ast.IsNot)) and isinstance(comp, ast.Name):
+                    self.assertNotIn(comp.id, top_funcs)
 
     def test_stopped_file_watcher_rebound_and_noop_methods(self):
         sentinel = studio_watchers._STOPPED_WATCHER
@@ -208,6 +213,8 @@ class StudioWatchersUnitTests(unittest.TestCase):
         self.assertEqual(double.external_paths, {str(note)})
         studio_watchers.refresh_external_notes(double, file_events_mod=custom_fe, folder_ops_mod=custom_ops)
         self.assertEqual((len(rec_calls), emitted_locs, tree_loads), (1, [(str(note), "")], [True]))
+        studio_watchers.refresh_external_notes(double, file_events_mod=custom_fe, folder_ops_mod=custom_ops)
+        self.assertEqual((len(rec_calls), emitted_locs, tree_loads), (2, [(str(note), ""), (str(note), "")], [True, True]))
 
         note.write_text("# V2\n", encoding="utf-8")
         studio_watchers.reload_changed_content(
