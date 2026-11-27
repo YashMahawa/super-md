@@ -5,7 +5,8 @@ import {createRoot,type Root} from "react-dom/client";
 import {getSearchQuery} from "@codemirror/search";
 import {EditorView} from "@codemirror/view";
 import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
-import ReadingSearch,{nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceBlock,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
+import ReadingSearch,{foldUnicodeForSearch,isValidSeedOccurrence,nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceBlock,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
+import {findMatchingSourceRangeIndex,insertDomRangeInOrder,rangeStartElement,syncSearchHighlights,translateRenderedIndexToSource,translateSourceIndexToRendered} from "./readingSearchDom";
 import Editor,{editorFindQuery} from "./components/Editor";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -649,6 +650,535 @@ describe("DOM-order windowed search and hidden subtree pruning",()=>{
     qsaSpy.mockRestore();
     extraHosts.forEach(el=>el.remove());
     scroller.remove();
+  });
+});
+
+describe("readingSearchDom ordinal translation and highlight sync",()=>{
+  afterEach(()=>{
+    document.body.replaceChildren();
+    vi.restoreAllMocks();
+  });
+
+  it("translates ordinals bidirectionally across displayed frontmatter and mounted/unmounted windowed blocks while skipping hidden fields and link URLs",()=>{
+    const b0="Read [Guide](https://example.com/hit) and hit alpha.";
+    const b1="Unmounted [Ref](https://example.com/hit) first hit and second hit.";
+    const fm="---\ntitle: hit frontmatter\ndescription: hidden hit summary\n---\n\n";
+    const content=`${fm}${b0}\n\n${b1}`;
+    const start0=fm.length,end0=start0+b0.length;
+    const start1=end0+2,end1=start1+b1.length;
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const fmHeader=document.createElement("section");
+    fmHeader.className="document-properties";
+    fmHeader.setAttribute("data-frontmatter-properties","");
+    fmHeader.innerHTML='<h1 data-frontmatter-field="title">hit frontmatter</h1>';
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.setAttribute("data-source-start",String(start0));
+    s0.setAttribute("data-source-end",String(end0));
+    s0.innerHTML=`<p data-source-start="${start0}" data-source-end="${start0}">Read <a href="https://example.com/hit" data-source-start="${start0+5}" data-source-end="${start0+37}">Guide</a> and hit alpha.</p>`.replace(`data-source-end="${start0}"`,`data-source-end="${end0}"`);
+    const s1=document.createElement("section");
+    s1.setAttribute("data-windowed-block","");
+    s1.setAttribute("data-windowed-mounted","false");
+    s1.setAttribute("data-source-start",String(start1));
+    s1.setAttribute("data-source-end",String(end1));
+    s1.innerHTML='<span aria-hidden="true"></span>';
+    host.append(fmHeader,s0,s1);
+    document.body.append(host);
+
+    const cleanups=[
+      registerWindowedText(s0,"Read Guide and hit alpha."),
+      registerWindowedText(s1,"Unmounted Ref first hit and second hit."),
+    ];
+    const ranges=sourceMatches(content,"hit");
+    // Source indices: 0=displayed title, 1=hidden description, 2=s0 hidden URL, 3=s0 visible, 4=s1 hidden URL, 5=s1 visible #1, 6=s1 visible #2.
+    expect(ranges).toHaveLength(7);
+    const wMatches=windowedMatches(host,"hit")!;
+    expect(wMatches).toHaveLength(4);
+
+    expect(translateSourceIndexToRendered(host,content,ranges,0,"hit",false,wMatches)).toBe(0);
+    expect(translateSourceIndexToRendered(host,content,ranges,1,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,2,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,3,"hit",false,wMatches)).toBe(1);
+    expect(translateSourceIndexToRendered(host,content,ranges,4,"hit",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,5,"hit",false,wMatches)).toBe(2);
+    expect(translateSourceIndexToRendered(host,content,ranges,6,"hit",false,wMatches)).toBe(3);
+
+    expect(translateRenderedIndexToSource(host,content,ranges,0,"hit",false,wMatches)).toBe(0);
+    expect(translateRenderedIndexToSource(host,content,ranges,1,"hit",false,wMatches)).toBe(3);
+    expect(translateRenderedIndexToSource(host,content,ranges,2,"hit",false,wMatches)).toBe(5);
+    expect(translateRenderedIndexToSource(host,content,ranges,3,"hit",false,wMatches)).toBe(6);
+    expect(translateRenderedIndexToSource(host,content,ranges,9,"hit",false,wMatches)).toBe(-1);
+    cleanups.forEach(fn=>fn());
+  });
+
+  it("synchronizes CSS.highlights selectively and refreshes active highlight on supermd-window-change",async()=>{
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","false");
+    s0.setAttribute("data-source-start","0");
+    s0.setAttribute("data-source-end","11");
+    s0.innerHTML='<span aria-hidden="true"></span>';
+    const searchRootEl=document.createElement("div");
+    host.append(s0);
+    document.body.append(searchRootEl,host);
+    const cleanup=registerWindowedText(s0,"Alpha token");
+
+    const dummyNode=document.createTextNode("Alpha");
+    const r=document.createRange();
+    r.setStart(dummyNode,0);
+    r.setEnd(dummyNode,5);
+    syncSearchHighlights({all:()=>[r],current:()=>r});
+    expect(highlights.get("smd-search")?.ranges).toEqual([r]);
+    expect(highlights.get("smd-search-current")?.ranges).toEqual([r]);
+    // Leaving `all` undefined preserves smd-search while clearing smd-search-current.
+    syncSearchHighlights({current:null});
+    expect(highlights.has("smd-search")).toBe(true);
+    expect(highlights.has("smd-search-current")).toBe(false);
+    syncSearchHighlights({all:null,current:null});
+    expect(highlights.size).toBe(0);
+
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{content:"Alpha token",close:()=>{},onChange:()=>{},initialReplace:true,seed:{query:"Alpha",nonce:1}}));
+    });
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,20));});
+    expect(highlights.get("smd-search")?.ranges).toHaveLength(0);
+    expect(highlights.has("smd-search-current")).toBe(false);
+
+    // Simulate virtualized block mounting into viewport and firing supermd-window-change.
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.innerHTML='<p data-source-start="0" data-source-end="11">Alpha token</p>';
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    const firstAllHighlight=highlights.get("smd-search");
+    const firstCurrentHighlight=highlights.get("smd-search-current");
+    expect(firstAllHighlight?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
+    expect(firstCurrentHighlight?.ranges.map(x=>x.toString())).toEqual(["Alpha"]);
+
+    // Repeated window-change or style-height extent updates without rendered match changes reuse cached ranges and Highlight instances.
+    s0.style.height="480px";
+    const cachedRef=readingMatches(host,"Alpha");
+    expect(readingMatches(host,"Alpha")).toBe(cachedRef);
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(highlights.get("smd-search")).toBe(firstAllHighlight);
+    expect(highlights.get("smd-search-current")).toBe(firstCurrentHighlight);
+
+    // Visibility mutation (display: none) invalidates cached matches immediately.
+    s0.style.display="none";
+    expect(readingMatches(host,"Alpha")).toEqual([]);
+
+    cleanup();
+    act(()=>root.unmount());
+  });
+
+  it("settles windowed Read matches across layout shifts without redundant highlight churn and cancels on manual scroll keys",async()=>{
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+    const scrollTargets:Element[]=[];
+    let scrollHeight=8000,scrollTop=0;
+    Element.prototype.scrollIntoView=function(){
+      scrollTargets.push(this);
+      scrollTop=3200;
+    };
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    Object.defineProperty(host,"scrollHeight",{configurable:true,get:()=>scrollHeight});
+    Object.defineProperty(host,"scrollTop",{configurable:true,get:()=>scrollTop,set:(v:number)=>{scrollTop=v;}});
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.innerHTML="<p>Needle zero</p>";
+    const s1=document.createElement("section");
+    s1.setAttribute("data-windowed-block","");
+    s1.setAttribute("data-windowed-mounted","false");
+    s1.innerHTML='<span aria-hidden="true"></span>';
+    s1.addEventListener("supermd-reveal-window",()=>{
+      s1.setAttribute("data-windowed-mounted","true");
+      s1.innerHTML="<p>Needle distant</p>";
+    });
+    const searchRootEl=document.createElement("div");
+    host.append(s0,s1);
+    document.body.append(searchRootEl,host);
+    const cleanups=[registerWindowedText(s0,"Needle zero"),registerWindowedText(s1,"Needle distant")];
+
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{content:"Needle zero\n\nNeedle distant",close:()=>{}}));
+    });
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,20));});
+    const searchInput=searchRootEl.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,"value")!.set!.call(searchInput,"Needle");
+    await act(async()=>{searchInput.dispatchEvent(new Event("input",{bubbles:true}));});
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,25));});
+
+    const nextBtn=searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    await act(async()=>{nextBtn.click();});
+    await act(async()=>{nextBtn.click();});
+    expect(s1.getAttribute("data-windowed-mounted")).toBe("true");
+    const syncedAll=highlights.get("smd-search");
+    const syncedCurrent=highlights.get("smd-search-current");
+    expect(syncedCurrent?.ranges[0]?.toString()).toBe("Needle");
+
+    // Drain initial settle frames: Highlight objects are reused while rendered DOM has not mutated.
+    await act(async()=>{
+      for(let i=0;i<5;i++)await new Promise(resolve=>requestAnimationFrame(()=>resolve(undefined)));
+    });
+    expect(highlights.get("smd-search")).toBe(syncedAll);
+    expect(highlights.get("smd-search-current")).toBe(syncedCurrent);
+
+    // Delayed layout shrinkage re-scrolls active match without rebuilding unchanged highlights.
+    scrollTargets.length=0;
+    scrollHeight=7400;
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(scrollTargets).toHaveLength(1);
+    expect(scrollTargets[0].textContent).toContain("Needle distant");
+    expect(highlights.get("smd-search")).toBe(syncedAll);
+
+    // Manual scroll key outside .reading-search cancels settle immediately.
+    scrollTargets.length=0;
+    await act(async()=>{
+      host.dispatchEvent(new KeyboardEvent("keydown",{key:"PageDown",bubbles:true}));
+      scrollHeight=6900;
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(scrollTargets).toHaveLength(0);
+
+    cleanups.forEach(fn=>fn());
+    act(()=>root.unmount());
+  });
+
+  it("maps displayed frontmatter metadata across BOM, out-of-order, quoted, folded, flow, and duplicate source spans while preserving regex replacement semantics",()=>{
+    const content=[
+      "\uFEFF---",
+      'description: "hidden needle"',
+      "tags: [needle, alpha, needle]",
+      "authors:",
+      "  - >",
+      "    Ada",
+      "    needle",
+      'title: "needle \\"one\\""',
+      "---",
+      "Body needle.",
+    ].join("\n");
+    const bodyStart=content.indexOf("Body needle.");
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const props=document.createElement("header");
+    props.className="document-properties";
+    props.setAttribute("data-frontmatter-properties","");
+    props.innerHTML=[
+      '<h1 data-frontmatter-field="title">needle "one"</h1>',
+      '<span data-frontmatter-field="author">Ada needle</span>',
+      '<span data-frontmatter-field="secret">hidden needle</span>',
+      '<span data-frontmatter-field="tag">needle</span>',
+      '<span data-frontmatter-field="tag">alpha</span>',
+    ].join("");
+    const bodyP=document.createElement("p");
+    bodyP.setAttribute("data-source-start",String(bodyStart));
+    bodyP.setAttribute("data-source-end",String(content.length));
+    bodyP.textContent="Body needle.";
+    host.append(props,bodyP);
+
+    const ranges=sourceMatches(content,"needle");
+    // Source indices: 0=hidden description, 1=first flow tag, 2=duplicate flow tag (deduplicated in DOM), 3=folded author, 4=quoted title, 5=body.
+    expect(ranges).toHaveLength(6);
+
+    // Calling resolveSourceHighlightRange before connecting host must not poison connected calls.
+    const preConnect=resolveSourceHighlightRange(host,content,ranges,4,"needle");
+    document.body.append(host);
+    const postConnect=resolveSourceHighlightRange(host,content,ranges,4,"needle");
+    expect(preConnect?.toString()).toBe("needle");
+    expect(postConnect?.startContainer.isConnected).toBe(true);
+
+    // Rendered DOM order is title (source 4), author (source 3), tag (source 1), body (source 5); hidden secret & deduplicated tag #2 do not map.
+    const domMatches=readingMatches(host,"needle");
+    expect(domMatches).toHaveLength(4);
+    expect(translateRenderedIndexToSource(host,content,ranges,0,"needle",false,null,domMatches)).toBe(4);
+    expect(translateRenderedIndexToSource(host,content,ranges,1,"needle",false,null,domMatches)).toBe(3);
+    expect(translateRenderedIndexToSource(host,content,ranges,2,"needle",false,null,domMatches)).toBe(1);
+    expect(translateRenderedIndexToSource(host,content,ranges,3,"needle",false,null,domMatches)).toBe(5);
+    expect(translateSourceIndexToRendered(host,content,ranges,0,"needle",false,null,domMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,2,"needle",false,null,domMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,4,"needle",false,null,domMatches)).toBe(0);
+    expect(translateSourceIndexToRendered(host,content,ranges,3,"needle",false,null,domMatches)).toBe(1);
+    expect(translateSourceIndexToRendered(host,content,ranges,1,"needle",false,null,domMatches)).toBe(2);
+    expect(translateSourceIndexToRendered(host,content,ranges,5,"needle",false,null,domMatches)).toBe(3);
+
+    // Exact source-span single Replace targets the folded author value without touching hidden description or title.
+    const replacedAuthor=replaceSourceMatches(content,"needle","spark",false,3);
+    expect(replacedAuthor).toContain('description: "hidden needle"');
+    expect(replacedAuthor).toContain("    Ada\n    spark");
+    expect(replacedAuthor).toContain('title: "needle \\"one\\""');
+
+    // Overridden inline style -> hidden invalidates cached DOM matches even if oldValue also contained "display: none".
+    bodyP.setAttribute("style","display: none; display: block");
+    expect(readingMatches(host,"needle")).toHaveLength(4);
+    bodyP.setAttribute("style","display: none");
+    expect(readingMatches(host,"needle")).toHaveLength(3);
+
+    // Named capture groups replace unknown $<missing> with "" (matching String.prototype.replace), while unnamed regexes preserve literal $<missing>.
+    expect(replaceSourceMatches("foo bar","(?<w>foo)","[$<w>:$<missing>]",{regexp:true})).toBe("[foo:] bar");
+    expect(replaceSourceMatches("foo bar","(foo)","[$1:$<missing>]",{regexp:true})).toBe("[foo:$<missing>] bar");
+  });
+
+  it("preserves Unicode case-folding seed validation, ordered DOM range insertion, and manual host scroll cancellation across extracted modules",async()=>{
+    expect(foldUnicodeForSearch("Straße İstanbul ﬁ ﬄ")).toBe("strasse i\u0307stanbul fi ffl");
+    const unicodeDoc="📓 Intro — Straße and İstanbul with ﬁnale.";
+    const strasseStart=unicodeDoc.indexOf("Straße");
+    const istanbulStart=unicodeDoc.indexOf("İstanbul");
+    expect(isValidSeedOccurrence(unicodeDoc,{from:strasseStart,to:strasseStart+6},"strasse",false,"Straße")).toBe(true);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:strasseStart,to:strasseStart+6},"strasse",true,"Straße")).toBe(false);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:istanbulStart,to:istanbulStart+8},"i\u0307stanbul",false,"İstanbul")).toBe(true);
+    // Reject split UTF-16 surrogate pairs on astral code points (`📓` occupies UTF-16 indices 0..2).
+    expect(isValidSeedOccurrence(unicodeDoc,{from:0,to:1},"📓",false)).toBe(false);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:1,to:8},"Intro",false)).toBe(false);
+    // Reject stale matchText or out-of-bounds offsets.
+    expect(isValidSeedOccurrence(unicodeDoc,{from:strasseStart,to:strasseStart+6},"strasse",false,"Strasse")).toBe(false);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:0,to:unicodeDoc.length+2},"strasse",false)).toBe(false);
+
+    // Verify findMatchingSourceRangeIndex and insertDomRangeInOrder helper contracts.
+    const sampleRanges=[{from:2,to:5},{from:10,to:14},{from:10,to:16},{from:22,to:28}];
+    expect(findMatchingSourceRangeIndex(sampleRanges,{from:10,to:16})).toBe(2);
+    expect(findMatchingSourceRangeIndex(sampleRanges,{from:10,to:15})).toBe(-1);
+
+    const container=document.createElement("p");
+    container.textContent="alpha Strasse Straße omega";
+    const textNode=container.firstChild as Text;
+    const mkRange=(s:number,e:number)=>{const r=document.createRange();r.setStart(textNode,s);r.setEnd(textNode,e);return r;};
+    const rAlpha=mkRange(0,5),rStrasse=mkRange(14,20),rOmega=mkRange(21,26);
+    expect(rangeStartElement(rStrasse)).toBe(container);
+    const inserted=insertDomRangeInOrder([rAlpha,rOmega],rStrasse);
+    expect(inserted.index).toBe(1);
+    expect(inserted.ranges.map(r=>r.toString())).toEqual(["alpha","Straße","omega"]);
+    expect(insertDomRangeInOrder(inserted.ranges,mkRange(14,20)).index).toBe(1);
+
+    // Seeded offscreen Unicode-folded match keeps custom highlight across window changes and stops settling on manual host scroll (> 2px).
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+    let scrollHeight=6000,scrollTop=0;
+    const scrollCalls:Element[]=[];
+    Element.prototype.scrollIntoView=function(){
+      scrollCalls.push(this);
+      scrollTop=2400;
+    };
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    Object.defineProperty(host,"scrollHeight",{configurable:true,get:()=>scrollHeight});
+    Object.defineProperty(host,"scrollTop",{configurable:true,get:()=>scrollTop,set:(v:number)=>{scrollTop=v;}});
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","false");
+    s0.setAttribute("data-source-start","0");
+    s0.setAttribute("data-source-end",String(unicodeDoc.length));
+    s0.innerHTML='<span aria-hidden="true"></span>';
+    s0.addEventListener("supermd-reveal-window",()=>{
+      s0.setAttribute("data-windowed-mounted","true");
+      s0.innerHTML=`<p data-source-start="0" data-source-end="${unicodeDoc.length}">${unicodeDoc}</p>`;
+    });
+    const searchRootEl=document.createElement("div");
+    host.append(s0);
+    document.body.append(searchRootEl,host);
+    const cleanup=registerWindowedText(s0,unicodeDoc);
+
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{
+        content:unicodeDoc,
+        close:()=>{},
+        seed:{query:"strasse",caseSensitive:false,sourceStart:strasseStart,sourceEnd:strasseStart+6,matchText:"Straße",nonce:1},
+      }));
+    });
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,40));});
+    expect(s0.getAttribute("data-windowed-mounted")).toBe("true");
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Straße");
+
+    // Window-change preserves customCurrentRangeRef on Unicode-folded occurrence.
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Straße");
+
+    // Manual scroll delta > 2px cancels active settle passes immediately.
+    scrollCalls.length=0;
+    scrollTop=2450;
+    await act(async()=>{
+      host.dispatchEvent(new Event("scroll"));
+      scrollHeight=5400;
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(scrollCalls).toHaveLength(0);
+
+    // Unmounting and remounting the windowed block clears detached custom highlight and re-resolves onto the new text node.
+    const oldNode=highlights.get("smd-search-current")?.ranges[0]?.startContainer;
+    s0.setAttribute("data-windowed-mounted","false");
+    s0.innerHTML='<span aria-hidden="true"></span>';
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(highlights.has("smd-search-current")).toBe(false);
+
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.innerHTML=`<p data-source-start="0" data-source-end="${unicodeDoc.length}">${unicodeDoc}</p>`;
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    const remountedRange=highlights.get("smd-search-current")?.ranges[0];
+    expect(remountedRange?.toString()).toBe("Straße");
+    expect(remountedRange?.startContainer.isConnected).toBe(true);
+    expect(remountedRange?.startContainer).not.toBe(oldNode);
+
+    cleanup();
+    act(()=>root.unmount());
+  });
+
+  it("preserves source fallback across windowed unmount/remount cycles and U+00A0 frontmatter spans while sharing the bounded index",()=>{
+    const fm=[
+      "---",
+      "description: \u00A0\"Hidden Symmetry Summary\"",
+      "\"title\"\u00A0: \u00A0\"Symmetry Kernel\"",
+      "'author'\u00A0: \u00A0[\u00A0{\u00A0\"given\"\u00A0:\u00A0\"Emmy\",\u00A0'family'\u00A0:\u00A0'Symmetry'\u00A0}\u00A0]",
+      "\"tags\"\u00A0: \u00A0[Symmetry,\u00A0\u00A0Noether]",
+      "---",
+      "",
+    ].join("\n");
+    const ch0="## Chapter 0\n\nSymmetry [link](https://example.com/Symmetry-0) and Symmetry alpha.";
+    const ch1="## Chapter 1\n\nSymmetry [ref](https://example.com/Symmetry-1) and Symmetry beta.";
+    const content=`${fm}${ch0}\n\n${ch1}`;
+    const s0=fm.length,e0=s0+ch0.length;
+    const s1=e0+2,e1=s1+ch1.length;
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const props=document.createElement("section");
+    props.className="document-properties";
+    props.setAttribute("data-frontmatter-properties","");
+    props.innerHTML=[
+      '<h1 data-frontmatter-field="title">Symmetry Kernel</h1>',
+      '<dd data-frontmatter-field="author">Emmy Symmetry</dd>',
+      '<span data-frontmatter-field="tag">Symmetry</span>',
+      '<span data-frontmatter-field="tag">Noether</span>',
+    ].join("");
+    const b0=document.createElement("section");
+    b0.setAttribute("data-windowed-block","");
+    b0.setAttribute("data-windowed-mounted","true");
+    b0.setAttribute("data-source-start",String(s0));
+    b0.setAttribute("data-source-end",String(e0));
+    b0.innerHTML=`<h2 data-source-start="${s0}" data-source-end="${s0+12}">Chapter 0</h2><p data-source-start="${s0+14}" data-source-end="${e0}">Symmetry <a data-source-start="${s0+23}" data-source-end="${s0+61}" href="https://example.com/Symmetry-0">link</a> and Symmetry alpha.</p>`;
+    const b1=document.createElement("section");
+    b1.setAttribute("data-windowed-block","");
+    b1.setAttribute("data-windowed-mounted","true");
+    b1.setAttribute("data-source-start",String(s1));
+    b1.setAttribute("data-source-end",String(e1));
+    b1.innerHTML=`<h2 data-source-start="${s1}" data-source-end="${s1+12}">Chapter 1</h2><p data-source-start="${s1+14}" data-source-end="${e1}">Symmetry <a data-source-start="${s1+23}" data-source-end="${s1+60}" href="https://example.com/Symmetry-1">ref</a> and Symmetry beta.</p>`;
+    host.append(props,b0,b1);
+    document.body.append(host);
+
+    const cleanups=[
+      registerWindowedText(b0,"Chapter 0\nSymmetry link and Symmetry alpha."),
+      registerWindowedText(b1,"Chapter 1\nSymmetry ref and Symmetry beta."),
+    ];
+    const ranges=sourceMatches(content,"Symmetry");
+    // Source indices: 0=hidden description, 1=title, 2=author, 3=tag, 4=ch0 visible #1, 5=ch0 hidden URL, 6=ch0 visible #2, 7=ch1 visible #1, 8=ch1 hidden URL, 9=ch1 visible #2.
+    expect(ranges).toHaveLength(10);
+    const wMatches=windowedMatches(host,"Symmetry")!;
+    expect(wMatches).toHaveLength(7);
+
+    // #227 U+00A0 frontmatter spans map accurately alongside mounted body blocks while redacting hidden description (0 -> -1).
+    expect(translateSourceIndexToRendered(host,content,ranges,0,"Symmetry",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,1,"Symmetry",false,wMatches)).toBe(0);
+    expect(translateSourceIndexToRendered(host,content,ranges,2,"Symmetry",false,wMatches)).toBe(1);
+    expect(translateSourceIndexToRendered(host,content,ranges,3,"Symmetry",false,wMatches)).toBe(2);
+    expect(translateRenderedIndexToSource(host,content,ranges,0,"Symmetry",false,wMatches)).toBe(1);
+    expect(translateRenderedIndexToSource(host,content,ranges,1,"Symmetry",false,wMatches)).toBe(2);
+    expect(translateRenderedIndexToSource(host,content,ranges,2,"Symmetry",false,wMatches)).toBe(3);
+
+    const initialCh1Node=resolveSourceHighlightRange(host,content,ranges,9,"Symmetry")?.startContainer;
+    expect(initialCh1Node?.textContent).toContain("Symmetry");
+    expect(resolveSourceBlock(host,{from:e0+1,to:e0+1},content)?.tagName).toBe("A");
+
+    // 1. Unmount b0 and b1 (simulating scroll offscreen): source fallback uses wrapper [data-source-start] bounds, never detached nodes.
+    b0.setAttribute("data-windowed-mounted","false");
+    b0.innerHTML='<span aria-hidden="true"></span>';
+    b1.setAttribute("data-windowed-mounted","false");
+    b1.innerHTML='<span aria-hidden="true"></span>';
+    host.dispatchEvent(new Event("supermd-window-change"));
+
+    expect(resolveSourceBlock(host,ranges[9],content)).toBe(b1);
+    expect(resolveSourceBlock(host,{from:e0+1,to:e0+1},content)).toBe(b0);
+    expect(resolveSourceHighlightRange(host,content,ranges,9,"Symmetry")).toBeNull();
+    expect(translateSourceIndexToRendered(host,content,ranges,8,"Symmetry",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,9,"Symmetry",false,wMatches)).toBe(6);
+    expect(translateRenderedIndexToSource(host,content,ranges,6,"Symmetry",false,wMatches)).toBe(9);
+
+    // 2. Remount b1 in deferred/loading state (mounted="true" before inner text hydrates) and b0 without inner data-source-start attributes:
+    //    source fallback preserves exact ordinal translation in both directions while still skipping hidden link URLs.
+    b0.setAttribute("data-windowed-mounted","true");
+    b0.innerHTML='<h2>Chapter 0</h2><p>Symmetry <a href="https://example.com/Symmetry-0">link</a> and Symmetry alpha.</p>';
+    b1.setAttribute("data-windowed-mounted","true");
+    b1.innerHTML='<div class="image-loading">Loading figure...</div>';
+    host.dispatchEvent(new Event("supermd-window-change"));
+
+    expect(resolveSourceBlock(host,ranges[6],content)).toBe(b0);
+    expect(resolveSourceHighlightRange(host,content,ranges,6,"Symmetry")?.toString()).toBe("Symmetry");
+    expect(translateSourceIndexToRendered(host,content,ranges,5,"Symmetry",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,6,"Symmetry",false,wMatches)).toBe(4);
+    expect(translateRenderedIndexToSource(host,content,ranges,4,"Symmetry",false,wMatches)).toBe(6);
+    // Deferred remounted b1 falls back cleanly to source ordinals without inner text nodes yet.
+    expect(translateSourceIndexToRendered(host,content,ranges,7,"Symmetry",false,wMatches)).toBe(5);
+    expect(translateSourceIndexToRendered(host,content,ranges,8,"Symmetry",false,wMatches)).toBe(-1);
+    expect(translateSourceIndexToRendered(host,content,ranges,9,"Symmetry",false,wMatches)).toBe(6);
+    expect(translateRenderedIndexToSource(host,content,ranges,5,"Symmetry",false,wMatches)).toBe(7);
+    expect(translateRenderedIndexToSource(host,content,ranges,6,"Symmetry",false,wMatches)).toBe(9);
+
+    // 3. Complete b1 hydration with inner [data-source-start] owners: live Range resolves onto fresh connected node.
+    b1.innerHTML=`<h2 data-source-start="${s1}" data-source-end="${s1+12}">Chapter 1</h2><p data-source-start="${s1+14}" data-source-end="${e1}">Symmetry <a data-source-start="${s1+23}" data-source-end="${s1+60}" href="https://example.com/Symmetry-1">ref</a> and Symmetry beta.</p>`;
+    const qsaSpy=vi.spyOn(Element.prototype,"querySelectorAll");
+    const remountedCh1=resolveSourceHighlightRange(host,content,ranges,9,"Symmetry");
+    expect(remountedCh1?.toString()).toBe("Symmetry");
+    expect(remountedCh1?.startContainer.isConnected).toBe(true);
+    expect(remountedCh1?.startContainer).not.toBe(initialCh1Node);
+    const scansAfterHydrate=qsaSpy.mock.calls.filter(([sel])=>String(sel).includes("data-windowed-block")&&String(sel).includes("data-source-start")).length;
+    expect(scansAfterHydrate).toBe(1);
+    // Repeated translations share the rebuilt index with 0 further candidate scans.
+    expect(translateSourceIndexToRendered(host,content,ranges,9,"Symmetry",false,wMatches)).toBe(6);
+    expect(translateRenderedIndexToSource(host,content,ranges,6,"Symmetry",false,wMatches)).toBe(9);
+    expect(qsaSpy.mock.calls.filter(([sel])=>String(sel).includes("data-windowed-block")&&String(sel).includes("data-source-start")).length).toBe(scansAfterHydrate);
+
+    qsaSpy.mockRestore();
+    cleanups.forEach(fn=>fn());
+    host.remove();
   });
 });
 
