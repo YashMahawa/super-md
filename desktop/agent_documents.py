@@ -652,15 +652,17 @@ class DocumentStore:
             raise AgentDocumentError("Asset type must be PNG, JPEG, SVG, GIF, WebP, or AVIF")
         filename = name or asset_path.name
         asset_sha = digest_bytes(raw_asset)
-        if name is None and not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename):
+        if name is None and not documents.is_valid_asset_filename(filename):
             original_ext = Path(filename).suffix
             stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename).stem).strip(".-_") or "asset"
             filename = f"{stem[:120]}-{asset_sha[:8]}{original_ext}"
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+        if not documents.is_valid_asset_filename(filename):
             raise AgentDocumentError("Asset name must be a simple filename (letters, digits, dot, underscore, hyphen)")
         named_ext = Path(filename).suffix.lower().lstrip(".")
         if not named_ext:
             filename += "." + ext
+            if not documents.is_valid_asset_filename(filename):
+                raise AgentDocumentError("Asset name must be a simple filename (letters, digits, dot, underscore, hyphen)")
         elif documents.MIMES.get(named_ext) != mime:
             raise AgentDocumentError("Asset name extension must match the image type")
         asset_key = "assets/" + filename
@@ -826,6 +828,19 @@ def _resolve_asset_id(assets: dict[str, str], asset_id: str) -> str:
 
 _SVG_FENCE_LANGUAGES = frozenset({"svg", "svg+xml", "image/svg+xml"})
 _DIAGRAM_FENCE_LANGUAGES = _SVG_FENCE_LANGUAGES | {"mermaid", "smd-chart"}
+_BRACED_FENCE_HEAD = re.compile(r"^\.?([A-Za-z][A-Za-z0-9_-]*)(?:$|[\s,#])")
+
+
+def normalize_fence_language(raw_info: str) -> str:
+    trimmed = raw_info.strip()
+    if len(trimmed) >= 4 and trimmed.startswith("{") and trimmed.endswith("}"):
+        match = _BRACED_FENCE_HEAD.match(trimmed[1:-1].strip())
+        if match:
+            lower = match.group(1).casefold()
+            if lower in ("python", "py", "mermaid"):
+                return lower
+    parts = trimmed.split(None, 1)
+    return parts[0].casefold() if parts else ""
 
 
 @dataclass(frozen=True)
@@ -838,6 +853,7 @@ class _FencedSpan:
     line_end: int
     is_svg: bool
     is_diagram: bool
+    language: str = ""
 
     def to_svg_dict(self) -> dict:
         return {
@@ -855,6 +871,7 @@ class _OpenFence:
     fence_start: int
     body_start: int
     line_start: int
+    language: str = ""
     svg_tagged: bool = False
     diagram_tagged: bool = False
     probe: list[str] = field(default_factory=list)
@@ -873,6 +890,7 @@ class _OpenFence:
             line_end=max(self.line_start, line_end),
             is_svg=is_svg,
             is_diagram=self.diagram_tagged or is_svg,
+            language=self.language,
         )
 
 
@@ -891,10 +909,7 @@ def _step_fence_boundary(
         return False, opened, None
     marker = match.group(1)
     if opened is None:
-        language = ""
-        if inspect_info:
-            info = body[match.end():].strip().split(None, 1)
-            language = info[0].casefold() if info else ""
+        language = normalize_fence_language(body[match.end():]) if inspect_info else ""
         svg_tagged = language in _SVG_FENCE_LANGUAGES
         return True, _OpenFence(
             char=marker[0],
@@ -902,6 +917,7 @@ def _step_fence_boundary(
             fence_start=offset,
             body_start=offset + line_len,
             line_start=line_number + 1,
+            language=language,
             svg_tagged=svg_tagged,
             diagram_tagged=svg_tagged or language in _DIAGRAM_FENCE_LANGUAGES,
         ), None

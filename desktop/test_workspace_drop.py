@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
 from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPointF, Qt, QUrl, Slot
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent, QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
+from PySide6.QtQuick import QQuickItem  # noqa: F401 - registers QQuickItem* property converter
 from PySide6.QtTest import QTest
 
 from documents import write_portable
@@ -34,6 +35,19 @@ PNG_1X1 = (
     b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc`\x00\x00"
     b"\x00\x02\x00\x01\xe5'\xde\xfc\x00\x00\x00\x00IEND\xaeB`\x82"
 )
+
+
+def _footer_notice_text(window: QObject) -> str:
+    footer = window.property("footer")
+    if isinstance(footer, QObject):
+        direct = footer.property("text")
+        if isinstance(direct, str):
+            return direct
+        for item in footer.findChildren(QObject):
+            text = item.property("text")
+            if isinstance(text, str) and text:
+                return text
+    return ""
 
 
 class _HostStub(QObject):
@@ -235,6 +249,7 @@ class DesktopWorkspaceDropUnitTest(unittest.TestCase):
         other_dir = self.studio.data / "second-folder"
         other_dir.mkdir()
         (other_dir / "chapter.md").write_text("# Chapter", encoding="utf-8")
+        expected_mixed_paths = {str(inside_note.resolve()), str(extra_note.resolve())}
         self.studio.handleExternalDrop(
             [
                 QUrl.fromLocalFile(str(other_dir)),
@@ -245,10 +260,13 @@ class DesktopWorkspaceDropUnitTest(unittest.TestCase):
             True,
         )
         self._wait_for(
-            lambda: self.studio.folder == str(other_dir.resolve())
-            and any(entry["name"] == "chapter.md" for entry in self.studio.files)
-            and self.studio._pending_drop_batches == 0
+            lambda: "skipped 1 unsupported item" in self.studio.message.lower()
+            and expected_mixed_paths.issubset({t["path"] for t in self.studio.tabs if t["path"]})
+            and self.studio.folder == str(other_dir.resolve())
+            and [entry["name"] for entry in self.studio.files] == ["chapter.md"]
         )
+        self.assertEqual(self.studio.folder, str(other_dir.resolve()))
+        self.assertEqual([entry["name"] for entry in self.studio.files], ["chapter.md"])
         self.assertEqual(
             [t["path"] for t in self.studio.tabs if t["path"]],
             [str(inside_note.resolve()), str(extra_note.resolve())],
@@ -321,18 +339,21 @@ class DesktopWorkspaceDropUnitTest(unittest.TestCase):
                     lambda: self.studio.folder == str(other_dir.resolve())
                     and any(t["path"] == str(extra_note.resolve()) for t in self.studio.tabs)
                 )
-                self.assertEqual(self.studio._pending_drop_batches, 1)
+                self.assertFalse(any(t["path"] == str(inside_note.resolve()) for t in self.studio.tabs))
                 self.assertEqual(self.studio._current()["path"], str(extra_note.resolve()))
                 self.assertNotIn("skipped 1 unsupported item", self.studio.message.lower())
             finally:
                 allow_first_read_to_finish.set()
 
             self._wait_for(
-                lambda: self.studio.folder == str(other_dir.resolve())
-                and any(entry["name"] == "chapter.md" for entry in self.studio.files)
-                and self.studio._pending_drop_batches == 0
+                lambda: "skipped 1 unsupported item" in self.studio.message.lower()
+                and any(t["path"] == str(inside_note.resolve()) for t in self.studio.tabs)
+                and self.studio.folder == str(other_dir.resolve())
+                and [entry["name"] for entry in self.studio.files] == ["chapter.md"]
             )
 
+        self.assertEqual(self.studio.folder, str(other_dir.resolve()))
+        self.assertEqual([entry["name"] for entry in self.studio.files], ["chapter.md"])
         self.assertEqual(
             [t["path"] for t in self.studio.tabs if t["path"]],
             [str(inside_note.resolve()), str(extra_note.resolve())],
@@ -373,6 +394,10 @@ ApplicationWindow {{
         id: strip
         width: parent.width
         viewState: win.viewState
+    }}
+    footer: Label {{
+        objectName: "statusNotice"
+        text: win.viewState.busy ? "Preparing document…" : (win.viewState.message || "")
     }}
 }}
 """
@@ -415,18 +440,28 @@ ApplicationWindow {{
         self.assertTrue(self._send_drop(tab_mime, Qt.DropAction.MoveAction))
         self.assertIs(self.studio.tabs[0], trailing)
 
-        # 2. External multi-note drop onto TabStrip opens all dropped notes in order.
+        # 2. External multi-note drop onto TabStrip opens dropped notes in order and surfaces skipped-item notice.
         first = self.studio.data / "strip-1.md"
         second = self.studio.data / "strip-2.md"
+        skipped = self.studio.data / "strip-ignored.pdf"
         first.write_text("# Strip 1", encoding="utf-8")
         second.write_text("# Strip 2", encoding="utf-8")
+        skipped.write_bytes(b"%PDF-1.4\n")
+        expected_strip_paths = {str(first.resolve()), str(second.resolve())}
         file_mime = QMimeData()
-        file_mime.setUrls([QUrl.fromLocalFile(str(first)), QUrl.fromLocalFile(str(second))])
+        file_mime.setUrls(
+            [
+                QUrl.fromLocalFile(str(first)),
+                QUrl.fromLocalFile(str(second)),
+                QUrl.fromLocalFile(str(skipped)),
+            ]
+        )
         self.assertTrue(self._send_drop(file_mime, Qt.DropAction.CopyAction))
 
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and (
-            self.studio._pending_drop_batches > 0 or len([t for t in self.studio.tabs if t["path"]]) < 2
+            not expected_strip_paths.issubset({t["path"] for t in self.studio.tabs if t["path"]})
+            or "skipped 1 unsupported item" not in _footer_notice_text(self.window).lower()
         ):
             self.app.processEvents()
             time.sleep(0.005)
@@ -434,6 +469,8 @@ ApplicationWindow {{
             [t["path"] for t in self.studio.tabs if t["path"]],
             [str(first.resolve()), str(second.resolve())],
         )
+        self.assertEqual(self.studio._current()["path"], str(second.resolve()))
+        self.assertIn("skipped 1 unsupported item", _footer_notice_text(self.window).lower())
 
         # 3. Modal dialog count > 0 blocks external drops on the strip.
         blocked = self.studio.data / "modal-blocked.md"
@@ -547,18 +584,29 @@ def _webengine_drop_probe() -> None:
                     break
             else:
                 raise AssertionError(f"WebEngine reader probe did not become ready (title={reader.property('title')!r})")
+            window.grabWindow()
+            app.processEvents()
 
             reader_scene = reader.mapToScene(QPointF(reader.width() * 0.5, reader.height() * 0.5))
             reader_pt = QPoint(int(round(reader_scene.x())), int(round(reader_scene.y())))
             sidebar_pt = QPoint(110, int(round(reader_scene.y())))
 
-            # 1. Dropping multiple notes over WebEngineView is intercepted natively and opens tabs in order.
+            # 1. Dropping multiple notes (+ unsupported item) over WebEngineView is intercepted natively, opens tabs in order, and shows visible notice.
             note_one = tmp_path / "first-drop.md"
             note_two = tmp_path / "second-drop.smd"
+            skipped_note_drop = tmp_path / "ignored-drop.pdf"
             note_one.write_text("# First Drop", encoding="utf-8")
             write_portable(note_two, "# Second Drop", {})
+            skipped_note_drop.write_bytes(b"%PDF-1.4\n")
+            expected_note_paths = {str(note_one.resolve()), str(note_two.resolve())}
             notes_mime = QMimeData()
-            notes_mime.setUrls([QUrl.fromLocalFile(str(note_one)), QUrl.fromLocalFile(str(note_two))])
+            notes_mime.setUrls(
+                [
+                    QUrl.fromLocalFile(str(note_one)),
+                    QUrl.fromLocalFile(str(note_two)),
+                    QUrl.fromLocalFile(str(skipped_note_drop)),
+                ]
+            )
 
             app.sendEvent(window, QDragEnterEvent(reader_pt, Qt.DropAction.CopyAction, notes_mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
             app.sendEvent(window, QDragMoveEvent(reader_pt, Qt.DropAction.CopyAction, notes_mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
@@ -567,13 +615,18 @@ def _webengine_drop_probe() -> None:
 
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline and (
-                studio._pending_drop_batches > 0 or len([t for t in studio.tabs if t["path"]]) < 2
+                not expected_note_paths.issubset({t["path"] for t in studio.tabs if t["path"]})
+                or "skipped 1 unsupported item" not in _footer_notice_text(window).lower()
             ):
                 app.processEvents()
                 QTest.qWait(15)
             opened = [t["path"] for t in studio.tabs if t["path"]]
             if opened != [str(note_one.resolve()), str(note_two.resolve())]:
                 raise AssertionError(f"Unexpected opened tabs after WebEngine note drop: {opened}")
+            if studio._current()["path"] != str(note_two.resolve()):
+                raise AssertionError(f"Expected active note {note_two}, got {studio._current()['path']}")
+            if "skipped 1 unsupported item" not in _footer_notice_text(window).lower():
+                raise AssertionError(f"Expected visible skipped-item notice in Main.qml footer, got {_footer_notice_text(window)!r}")
             current_url = reader.property("url")
             current_url_str = current_url.toString() if hasattr(current_url, "toString") else str(current_url)
             if current_url_str.split("#")[0] != QUrl.fromLocalFile(str(probe_html)).toString():
@@ -602,6 +655,8 @@ def _webengine_drop_probe() -> None:
 
             # Recompute reader & sidebar points after sidebar became visible.
             QTest.qWait(50)
+            app.processEvents()
+            window.grabWindow()
             app.processEvents()
             reader_scene = reader.mapToScene(QPointF(reader.width() * 0.5, reader.height() * 0.5))
             reader_pt = QPoint(int(round(reader_scene.x())), int(round(reader_scene.y())))
@@ -766,6 +821,7 @@ def _real_reader_bundle_probe() -> None:
         asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
         QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
         session.settings["welcomed"] = True
+        session.settings["autosave"] = False
         session.settings["python"] = sys.executable
         session.settings["newNoteLocation"] = str(tmp_path)
         studio = QuietStudio(True, session)
@@ -807,7 +863,26 @@ def _real_reader_bundle_probe() -> None:
                 QTest.qWait(25)
             if not studio.ready:
                 raise AssertionError("Real React reader bundle did not complete WebChannel ready handshake")
-            QTest.qWait(250)
+            workspace_ready = False
+            ws_deadline = time.monotonic() + 15.0
+            while time.monotonic() < ws_deadline:
+                QMetaObject.invokeMethod(
+                    window,
+                    "runDocumentScript",
+                    Qt.ConnectionType.DirectConnection,
+                    Q_ARG(
+                        "QVariant",
+                        "document.title = (document.querySelector('.cm-editor, .android-reading') && document.body && document.body.innerText.includes('Drop an image')) ? 'ws-ready' : 'ws-wait'",
+                    ),
+                )
+                app.processEvents()
+                QTest.qWait(30)
+                if reader.property("title") == "ws-ready":
+                    workspace_ready = True
+                    break
+            if not workspace_ready:
+                raise AssertionError(f"Real React reader .workspace did not mount in time (title={reader.property('title')!r})")
+            window.grabWindow()
             app.processEvents()
 
             reader_scene = reader.mapToScene(QPointF(reader.width() * 0.5, reader.height() * 0.45))
@@ -865,11 +940,20 @@ def _real_reader_bundle_probe() -> None:
                 {},
             )
 
+            skipped_bundle_pdf = tmp_path / "handout.pdf"
+            skipped_bundle_pdf.write_bytes(b"%PDF-1.4\n")
+            expected_bundle_paths = {
+                str(current_note.resolve()),
+                str(meeting_note.resolve()),
+                str(portable_spec.resolve()),
+            }
+
             batch_mime = QMimeData()
             batch_mime.setUrls([
                 QUrl.fromLocalFile(str(project_folder)),
                 QUrl.fromLocalFile(str(meeting_note)),
                 QUrl.fromLocalFile(str(portable_spec)),
+                QUrl.fromLocalFile(str(skipped_bundle_pdf)),
             ])
             app.sendEvent(window, QDragEnterEvent(reader_pt, os_actions, batch_mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
             app.sendEvent(window, QDragMoveEvent(reader_pt, os_actions, batch_mime, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
@@ -877,10 +961,10 @@ def _real_reader_bundle_probe() -> None:
 
             deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline and (
-                studio._pending_drop_batches > 0
-                or len(studio.tabs) < 3
-                or len(studio.files) < 2
-                or studio._current()["path"] != str(portable_spec.resolve())
+                not expected_bundle_paths.issubset({t["path"] for t in studio.tabs if t["path"]})
+                or studio.folder != str(project_folder.resolve())
+                or [f["name"] for f in studio.files] != ["01-overview.md", "02-calculus.md"]
+                or "skipped 1 unsupported item" not in _footer_notice_text(window).lower()
             ):
                 app.processEvents()
                 QTest.qWait(25)
@@ -891,8 +975,14 @@ def _real_reader_bundle_probe() -> None:
                 str(portable_spec.resolve()),
             ]:
                 raise AssertionError(f"Unexpected tab order after multi-item drop: {[t['path'] for t in studio.tabs]}")
+            if studio._current()["path"] != str(portable_spec.resolve()):
+                raise AssertionError(f"Unexpected active tab after multi-item drop: {studio._current()['path']}")
             if studio.folder != str(project_folder.resolve()):
                 raise AssertionError(f"Unexpected folder after drop: {studio.folder}")
+            if [f["name"] for f in studio.files] != ["01-overview.md", "02-calculus.md"]:
+                raise AssertionError(f"Unexpected folder listing after drop: {studio.files}")
+            if "skipped 1 unsupported item" not in _footer_notice_text(window).lower():
+                raise AssertionError(f"Expected visible skipped-item notice in Main.qml footer, got {_footer_notice_text(window)!r}")
             if "![dropped-diagram](" not in studio.tabs[0]["content"]:
                 raise AssertionError("Previously dropped image in first tab was lost")
 

@@ -21,6 +21,16 @@ Rectangle {
     signal centerLockRequested()
     signal saveRequested()
     signal exportRequested()
+    function shortcutHint(label, key, fallback) {
+        const raw = controls.shortcutLabels && controls.shortcutLabels[key] !== undefined ? controls.shortcutLabels[key] : fallback
+        return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
+    }
+    function exitFullscreenHint() {
+        const dismiss = controls.shortcutLabels && controls.shortcutLabels.dismiss !== undefined ? controls.shortcutLabels.dismiss : "Esc"
+        const full = controls.shortcutLabels && controls.shortcutLabels.fullscreen !== undefined ? controls.shortcutLabels.fullscreen : "F11"
+        const parts = [dismiss, full].filter(function(entry) { return entry && entry !== "Disabled" })
+        return parts.length > 0 ? "Exit fullscreen (" + parts.join(" · ") + ")" : "Exit fullscreen"
+    }
     color: colors["surface-low"]
     opacity: shown ? 1 : 0
     Behavior on opacity { NumberAnimation { duration: controls.motion ? 120 : 0 } }
@@ -37,12 +47,12 @@ Rectangle {
             onClicked: controls.contentsRequested()
         }
         Label { text: controls.noteName; Layout.fillWidth: true; elide: Text.ElideRight; color: controls.colors.text; font.pixelSize: 14; font.weight: Font.Medium }
-        ActionButton { id: save; glyph: "FloppyDisk"; compact: true; enabled: controls.ready; ToolTip.text: "Save note (" + (controls.shortcutLabels.save || "Ctrl+S") + ")"; onClicked: controls.saveRequested() }
+        ActionButton { id: save; glyph: "FloppyDisk"; compact: true; enabled: controls.ready; ToolTip.text: controls.shortcutHint("Save note", "save", "Ctrl+S"); onClicked: controls.saveRequested() }
         ActionButton { id: exportNote; glyph: "Export"; compact: true; enabled: controls.ready; ToolTip.text: "Export note"; onClicked: controls.exportRequested() }
         ActionButton {
             id: exit; objectName: "studyExitButton"
             glyph: "FullscreenExit"; compact: true
-            ToolTip.text: "Exit fullscreen (" + (controls.shortcutLabels.dismiss || "Esc") + " · " + (controls.shortcutLabels.fullscreen || "F11") + ")"
+            ToolTip.text: controls.exitFullscreenHint()
             onClicked: controls.exitRequested()
         }
         ActionButton {
