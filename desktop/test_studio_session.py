@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QGuiApplication
 
 import custom_theme
@@ -16,6 +17,11 @@ import studio_session
 from closed_notes import ClosedNoteStore
 from documents import atomic_json
 from studio import Session, Studio
+
+
+class _QuietStudio(Studio):
+    def _refresh_theme(self):
+        self.system_dark = True
 
 
 class StudioSessionTests(unittest.TestCase):
@@ -30,14 +36,30 @@ class StudioSessionTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def _make_studio(self, session: Session) -> Studio:
-        session.settings.update(python=sys.executable, autosave=False)
-        st = Studio(isolated=True, session=session)
-        deadline = time.monotonic() + 0.25
-        while time.monotonic() < deadline and st._theme_running:
+    def _pump_until(self, predicate, timeout: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             self.app.processEvents()
+            if predicate():
+                return
             time.sleep(0.005)
         self.app.processEvents()
+        self.assertTrue(predicate(), "Timed out waiting for asynchronous Qt state")
+
+    def _drain_posted_events(self) -> None:
+        self.app.sendPostedEvents(None, 0)
+        drained = False
+        def mark_drained():
+            nonlocal drained
+            drained = True
+        QTimer.singleShot(0, mark_drained)
+        self._pump_until(lambda: drained)
+        self.app.sendPostedEvents(None, 0)
+
+    def _make_studio(self, session: Session) -> Studio:
+        session.settings.update(python=sys.executable, autosave=False)
+        st = _QuietStudio(isolated=True, session=session)
+        self._drain_posted_events()
         return st
 
     def _cleanup(self, session: Session, *studios: Studio) -> None:
@@ -46,6 +68,7 @@ class StudioSessionTests(unittest.TestCase):
                 st.stop()
             st.pool.shutdown(wait=True)
         session.writes.shutdown(wait=True)
+        self.app.processEvents()
         shutil.rmtree(session.data, ignore_errors=True)
 
     def test_session_init_patches_corruption_resilience_and_multiwindow_restore(self):
@@ -60,6 +83,7 @@ class StudioSessionTests(unittest.TestCase):
             iso_session.writes.shutdown(wait=True)
 
         app_base = self.root / "appdata"
+        app_base.mkdir()
         with patch("studio.QStandardPaths.writableLocation", return_value=str(app_base)):
             std_session = Session(isolated=False)
         try:
@@ -163,27 +187,33 @@ class StudioSessionTests(unittest.TestCase):
         studio = self._make_studio(session)
         try:
             outcomes: list[tuple] = []
+            busy_entered, busy_release = threading.Event(), threading.Event()
             studio.pending_close = "tab-1"
-            studio._submit(lambda: "ok", lambda val, err: outcomes.append((val, err)), busy=True)
-            self.assertGreaterEqual(studio.busy, 1)
-            deadline = time.monotonic() + 2.0
-            while not outcomes and time.monotonic() < deadline:
-                self.app.processEvents()
-                time.sleep(0.005)
+            studio._submit(
+                lambda: (busy_entered.set(), busy_release.wait(2.0), "ok")[2],
+                lambda val, err: outcomes.append((val, err)),
+                busy=True,
+            )
+            self.assertTrue(busy_entered.wait(2.0))
+            self.assertEqual(studio.busy, 1)
+            busy_release.set()
+            self._pump_until(lambda: bool(outcomes))
             self.assertEqual((outcomes, studio.busy), ([("ok", None)], 0))
 
             completed_signals: list = []
+            quiet_ran = threading.Event()
             studio.completed.connect(completed_signals.append)
-            studio._submit(lambda: "quiet", studio_session.noop_done, busy=False)
-            studio.pool.submit(lambda: None).result(timeout=2)
-            self.app.processEvents()
-            self.assertEqual(completed_signals, [])
+            try:
+                studio._submit(lambda: quiet_ran.set(), studio_session.noop_done, busy=False, executor=session.writes)
+                session.writes.flush(timeout=2.0)
+                self._drain_posted_events()
+                self.assertTrue(quiet_ran.is_set())
+                self.assertEqual(completed_signals, [])
+            finally:
+                studio.completed.disconnect(completed_signals.append)
 
             studio._submit(lambda: (_ for _ in ()).throw(RuntimeError("boom")), studio_module._noop_done, busy=False)
-            deadline = time.monotonic() + 2.0
-            while studio.message != "boom" and time.monotonic() < deadline:
-                self.app.processEvents()
-                time.sleep(0.005)
+            self._pump_until(lambda: studio.message == "boom")
             self.assertEqual((studio.message, studio.pending_close), ("boom", ""))
 
             enqueued_revs: list[int] = []
@@ -197,7 +227,7 @@ class StudioSessionTests(unittest.TestCase):
                     studio_module.atomic_json(session.data / "exact.json", {"ok": True})
                 self.assertTrue(studio._submit_exact_recovery_write(run_exact, lambda res, err: exact_results.append((res, err)), on_enqueued=enqueued_revs.append))
                 session.writes.flush(timeout=2.0)
-                self.app.processEvents()
+                self._pump_until(lambda: bool(exact_results))
             self.assertEqual((intercepted, len(enqueued_revs), exact_results[0][0][0]), (True, 1, "committed"))
 
             gate_entered, gate_release = threading.Event(), threading.Event()
@@ -211,7 +241,8 @@ class StudioSessionTests(unittest.TestCase):
             self.assertEqual(len(studio._pending_write_retirements), 1)
             studio.stop()
             gate_release.set()
-            self.app.processEvents()
+            session.writes.flush(timeout=2.0)
+            self._drain_posted_events()
             self.assertFalse(studio._submit_write(lambda: 1, lambda *_: None, on_retired=lambda: retired_calls.append("post-stop-write")))
             self.assertFalse(studio._submit_exact_recovery_write(lambda: None, lambda *_: None, on_retired=lambda: retired_calls.append("post-stop-exact")))
             studio._submit(lambda: 1, lambda *_: retired_calls.append("retired-submit"))
@@ -234,6 +265,7 @@ class StudioSessionTests(unittest.TestCase):
                 session.locations["/doc.md"] = 42
                 first._save_positions()
                 session.writes.flush(timeout=2.0)
+                self._drain_posted_events()
             self.assertEqual(len(changed_hits), 1)
             self.assertFalse(json.loads((session.data / "settings.json").read_text(encoding="utf-8"))["settings"]["agentAccessEnabled"])
             self.assertTrue({session.data / "settings.json", session.data / "reading-positions.json"}.issubset(written))
@@ -252,17 +284,16 @@ class StudioSessionTests(unittest.TestCase):
             first._recover()
             second._recover()
             session.writes.flush(timeout=2.0)
+            self._drain_posted_events()
             startup_disk = json.loads((session.data / "startup.json").read_text(encoding="utf-8"))
             self.assertEqual({t["id"] for t in startup_disk["tabs"]}, {clean_staged["id"], clean_unreviewed["id"], blank_untitled["id"], second_dirty["id"]})
             recovery_disk = json.loads((session.data / "recovery.json").read_text(encoding="utf-8"))
             self.assertEqual({t["id"] for t in recovery_disk}, {clean_staged["id"], clean_unreviewed["id"], second_dirty["id"]})
 
             first._notify_recovery_write("recovery", OSError("no space"))
-            self.app.processEvents()
-            self.assertIn("Couldn't save draft recovery data", first.message)
+            self._pump_until(lambda: "Couldn't save draft recovery data" in first.message)
             first._notify_recovery_write("recovery", None)
-            self.app.processEvents()
-            self.assertEqual(first.message, "")
+            self._pump_until(lambda: first.message == "")
             first.message = "Unrelated notice"
             first._recovery_write_completed(("startup", None), None)
             self.assertEqual(first.message, "Unrelated notice")
