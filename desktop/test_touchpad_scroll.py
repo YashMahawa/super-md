@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 import uuid
 from pathlib import Path
@@ -254,6 +255,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
     studio = None
     engine = None
     window = None
+    exit_code = 1
     try:
         session = Session(True, data=session_dir)
         session.settings["welcomed"] = True
@@ -314,10 +316,10 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             last_pending = None
             while time.monotonic() < deadline:
                 QMetaObject.invokeMethod(window, "runDocumentScript", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", wrapped))
-                attempt_deadline = min(deadline, time.monotonic() + 0.25)
+                attempt_deadline = min(deadline, time.monotonic() + 0.08)
                 while time.monotonic() < attempt_deadline:
                     app.processEvents()
-                    QTest.qWait(10)
+                    QTest.qWait(5)
                     title = reader.property("title")
                     if not isinstance(title, str) or not title.startswith("{"):
                         continue
@@ -377,6 +379,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
                 f"(()=>{{const rd=document.querySelector('.android-reading'),compactTb=rd?.querySelectorAll('.markdown-body table')?.[0],"
                 f"el=({target_expr});"
                 f"if(!rd||!compactTb||!el){{document.title=JSON.stringify({{ready:false}});return;}}"
+                f"document.body.dispatchEvent(new WheelEvent('wheel',{{bubbles:true,deltaX:0,deltaY:0}}));"
                 f"let r=el.getBoundingClientRect(),rr=rd.getBoundingClientRect();"
                 f"if({json.dumps(scroll_into_view)}||r.top>rr.bottom-90||r.bottom<rr.top+40){{"
                 f"const targetCenter=r.top+Math.min(r.height,rr.height*0.6)/2,rdCenter=rr.top+rr.height/2;"
@@ -488,16 +491,24 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
 
         def verify_presented_frame(mode_label: str, screenshot_name: str | None = None) -> int:
             # Re-arm the three scrolled nested regions right before grabbing so active indicator thumbs are painted in the captured frame.
+            frame_key = f"{mode_label}:{screenshot_name or ''}"
             run_script(
-                "(()=>{const rd=document.querySelector('.android-reading'),tb=rd.querySelectorAll('.markdown-body table')[1],"
-                "pre=rd.querySelector('.code-disclosure pre'),py=rd.querySelector('.python-source');"
-                "rd.scrollTop=0;[tb,pre,py].forEach(el=>el.dispatchEvent(new Event('scroll')));"
-                "document.title=JSON.stringify({ready:tb.classList.contains('scroll-indicator-active')&&"
-                "pre.classList.contains('scroll-indicator-active')&&py.classList.contains('scroll-indicator-active')});})()"
+                f"(()=>{{const rd=document.querySelector('.android-reading'),tb=rd?.querySelectorAll('.markdown-body table')?.[1],"
+                f"pre=rd?.querySelector('.code-disclosure pre'),py=rd?.querySelector('.python-source');"
+                f"if(!rd||!tb||!pre||!py){{document.title=JSON.stringify({{ready:false}});return;}}"
+                f"document.body.dispatchEvent(new WheelEvent('wheel',{{bubbles:true,deltaX:0,deltaY:0}}));"
+                f"rd.scrollTop=0;"
+                f"if(window.__smdShotSettled!=={json.dumps(frame_key)}){{"
+                f"if(window.__smdShotPending!=={json.dumps(frame_key)}){{window.__smdShotPending={json.dumps(frame_key)};"
+                f"requestAnimationFrame(()=>requestAnimationFrame(()=>{{window.__smdShotSettled={json.dumps(frame_key)};}}));}}"
+                f"document.title=JSON.stringify({{ready:false}});return;}}"
+                f"[tb,pre,py].forEach(el=>el.dispatchEvent(new Event('scroll')));"
+                f"document.title=JSON.stringify({{ready:rd.scrollTop<=2&&tb.classList.contains('scroll-indicator-active')&&"
+                f"pre.classList.contains('scroll-indicator-active')&&py.classList.contains('scroll-indicator-active')}});}})()"
             )
-            for _ in range(3):
+            for _ in range(4):
                 app.processEvents()
-                QTest.qWait(15)
+                QTest.qWait(20)
             frame = window.grabWindow()
             if frame.isNull() or frame.width() < 1200 or frame.height() < 1000:
                 raise AssertionError(f"Expected presented QtWebEngine frame in {mode_label}: {frame.width()}x{frame.height()}")
@@ -524,6 +535,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             "st=document.querySelector('.step-cards-notes'),rd=document.querySelector('.android-reading');"
             "if(!py||tables.length<2||!st||!rd||py.scrollHeight<=py.clientHeight||tables[1].scrollWidth<=tables[1].clientWidth)"
             "{document.title=JSON.stringify({ready:false});return;}"
+            "document.body.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaX:0,deltaY:0}));"
             "rd.scrollTop=0;document.title=JSON.stringify({ready:true});})()"
         )
         verify_mode_geometry_and_semantics("reader", 0.55)
@@ -630,10 +642,16 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
         # 4. Study step-cards notes scroll internally first, then chain at boundary, and Ctrl+wheel zooms note without scrolling notes.
         st_geom = run_script(
             "(()=>{const st=document.querySelector('.step-cards-notes'),rd=document.querySelector('.android-reading');"
+            "if(!st||!rd||st.scrollHeight<=st.clientHeight){document.title=JSON.stringify({ready:false});return;}"
+            "document.body.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaX:0,deltaY:0}));"
             "const sr0=st.getBoundingClientRect(),rr=rd.getBoundingClientRect();"
             "rd.scrollTop=Math.max(0,rd.scrollTop+(sr0.top+sr0.height/2-(rr.top+rr.height/2)));"
-            "const sr=st.getBoundingClientRect();"
-            "document.title=JSON.stringify({ready:true,x:sr.left+60,y:sr.top+60,maxTop:st.scrollHeight-st.clientHeight,rdTop:rd.scrollTop});})()"
+            "const sr=st.getBoundingClientRect(),rr2=rd.getBoundingClientRect();"
+            "const minX=Math.max(sr.left,rr2.left,0)+12,maxX=Math.min(sr.right,rr2.right,window.innerWidth)-20;"
+            "const minY=Math.max(sr.top,rr2.top,0)+12,maxY=Math.min(sr.bottom,rr2.bottom,window.innerHeight)-20;"
+            "const x=Math.min(Math.max(sr.left+60,minX),Math.max(minX,maxX));"
+            "const y=Math.min(Math.max(sr.top+60,minY),Math.max(minY,maxY));"
+            "document.title=JSON.stringify({ready:true,x,y,maxTop:st.scrollHeight-st.clientHeight,rdTop:rd.scrollTop});})()"
         )
         send_touchpad(st_geom["x"], st_geom["y"], 0, -55, wait_steps=5)
         st_mid = run_script(
@@ -659,6 +677,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
         run_script(
             "(()=>{const rd=document.querySelector('.android-reading'),page=document.querySelector('.document-page');"
             "if(!rd||!page||Math.abs(Number(page.dataset.scale||1)-1)>0.05){document.title=JSON.stringify({ready:false});return;}"
+            "document.body.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaX:0,deltaY:0}));"
             "rd.scrollTop=0;document.title=JSON.stringify({ready:true});})()"
         )
         for _ in range(4):
@@ -667,20 +686,21 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
         mode_results = {}
         for mode_name in ("live", "split"):
             studio.setMode(mode_name)
-            for _ in range(10):
+            for _ in range(3):
                 app.processEvents()
-                QTest.qWait(25)
+                QTest.qWait(15)
             # Wait until the target mode DOM is mounted and two rAF ticks have settled post-load scroll restoration.
             run_script(
                 f"(()=>{{const rd=document.querySelector('.android-reading'),tables=rd?.querySelectorAll('.markdown-body table'),"
                 f"pre=rd?.querySelector('.code-disclosure pre'),py=rd?.querySelector('.python-source'),needCm={json.dumps(mode_name == 'split')},"
                 f"needLive={json.dumps(mode_name == 'live')};"
-                f"if(!rd||!tables||tables.length<2||!pre||!py||(needCm&&!document.querySelector('.cm-scroller'))||(needLive&&!rd.querySelector('.live-document'))||tables[1].scrollWidth-tables[1].clientWidth<=80||pre.scrollWidth-pre.clientWidth<=80||py.scrollHeight<=py.clientHeight)"
+                f"if(!rd||!tables||tables.length<2||!pre||!py||(needCm&&(!document.querySelector('.cm-scroller')||rd.querySelector('.live-document')))||(needLive&&!rd.querySelector('.live-document'))||tables[1].scrollWidth-tables[1].clientWidth<=80||pre.scrollWidth-pre.clientWidth<=80||py.scrollHeight<=py.clientHeight)"
                 f"{{document.title=JSON.stringify({{ready:false}});return;}}"
                 f"if(window.__smdModeSettled!=={json.dumps(mode_name)}){{"
                 f"if(window.__smdModePending!=={json.dumps(mode_name)}){{window.__smdModePending={json.dumps(mode_name)};"
                 f"requestAnimationFrame(()=>requestAnimationFrame(()=>{{window.__smdModeSettled={json.dumps(mode_name)};}}));}}"
                 f"document.title=JSON.stringify({{ready:false}});return;}}"
+                f"document.body.dispatchEvent(new WheelEvent('wheel',{{bubbles:true,deltaX:0,deltaY:0}}));"
                 f"rd.scrollTop=0;tables[1].scrollLeft=0;pre.scrollLeft=0;py.scrollTop=0;py.scrollLeft=0;"
                 f"[tables[0],tables[1],pre,py].forEach(el=>el.classList.remove('scroll-indicator-active','scroll-indicator-hover'));"
                 f"document.title=JSON.stringify({{ready:true}});}})()"
@@ -782,6 +802,9 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             ),
             flush=True,
         )
+        exit_code = 0
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
     finally:
         if getattr(session, "agent_bridge", None) is not None:
             session.agent_bridge.stop()
@@ -791,7 +814,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             if getattr(studio, "_search_pool", None) is not None:
                 studio._search_pool.shutdown(wait=False, cancel_futures=True)
         if session is not None:
-            session.writes.shutdown(wait=True)
+            session.writes.shutdown(wait=False)
         if sys.platform != "darwin":
             if window is not None:
                 try:
@@ -803,6 +826,14 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             if engine is not None:
                 engine.deleteLater()
             app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            try:
+                QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(bundle_handler)
+            except RuntimeError:
+                pass
+            bundle_handler.deleteLater()
+            if studio is not None:
+                studio.host_window = None
+            app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         else:
             # Mirror desktop/main.py: on macOS offscreen WebEngine, destroying
             # QQuickWebEngineView / WebEngineContext can block on a Mach port.
@@ -811,7 +842,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
         shutil.rmtree(session_dir, ignore_errors=True)
         sys.stdout.flush()
         sys.stderr.flush()
-    os._exit(0)
+        os._exit(exit_code)
 
 
 class TouchpadScrollQtWebEngineTest(unittest.TestCase):
@@ -821,18 +852,25 @@ class TouchpadScrollQtWebEngineTest(unittest.TestCase):
         if not (ROOT.parent / "dist" / "qt-reader.html").is_file():
             raise unittest.SkipTest("dist/qt-reader.html not built")
         env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QUICK_BACKEND="software")
-        completed = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--probe"],
-            cwd=ROOT,
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            capture_output=True,
-            timeout=90,
-        )
-        self.assertEqual(completed.returncode, 0, f"{completed.stdout}{completed.stderr}")
-        result = json.loads(completed.stdout.strip().splitlines()[-1])
+        with tempfile.TemporaryDirectory(prefix="supermd-touchpad-probe-io-") as io_dir:
+            stdout_path = Path(io_dir) / "probe-stdout.log"
+            stderr_path = Path(io_dir) / "probe-stderr.log"
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as stderr_file:
+                completed = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), "--probe"],
+                    cwd=ROOT,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=90,
+                )
+            stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+            stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        self.assertEqual(completed.returncode, 0, f"{stdout_text}{stderr_text}")
+        result = json.loads(stdout_text.strip().splitlines()[-1])
         self.assertTrue(result.get("ok"), result)
         self.assertGreaterEqual(result["tbAfter"]["left"], 90, result)
         self.assertGreaterEqual(result["tbAfter"]["leftOnScroll"], 90, result)
