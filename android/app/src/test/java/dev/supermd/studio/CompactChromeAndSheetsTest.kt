@@ -677,6 +677,7 @@ class CompactChromeAndSheetsTest {
 
         val messages = mutableListOf<String>()
         lateinit var exportPairing: (String, ByteArray) -> Unit
+        lateinit var exportGuide: (String, ByteArray) -> Unit
 
         composeRule.setContent {
             CompositionLocalProvider(LocalActivityResultRegistryOwner provides registryOwner) {
@@ -685,6 +686,14 @@ class CompactChromeAndSheetsTest {
                     missingStreamError = "Android could not write the pairing file",
                     successMessage = "Trusted pairing file saved. Share it only with a device you trust.",
                     failurePrefix = "Could not save pairing file",
+                    contentResolver = context.contentResolver,
+                    onMessage = { messages += it },
+                )
+                exportGuide = rememberByteDocumentExporter(
+                    mimeType = "text/markdown",
+                    missingStreamError = "Android could not write the setup guide",
+                    successMessage = "Setup instructions saved.",
+                    failurePrefix = "Could not save setup guide",
                     contentResolver = context.contentResolver,
                     onMessage = { messages += it },
                 )
@@ -745,5 +754,48 @@ class CompactChromeAndSheetsTest {
             "Could not save pairing file: No content provider: content://dev.supermd.test/unwritable.json",
             messages.last(),
         )
+
+        // Saved setup guide export writes credential-free instructions separately from pairing export
+        val pairingKey = "synthPairingKey_" + "A".repeat(28)
+        val connectorKey = "synthConnectorKey_" + "B".repeat(26)
+        val groupId = AgentAccessState.groupIdFor(pairingKey, connectorKey)
+        val syntheticConfig = AgentAccessConfig(
+            serverOrigin = "https://relay.synthetic.example",
+            pairingKey = pairingKey,
+            connectorKey = connectorKey,
+            groupId = groupId,
+            deviceId = "00000000-0000-4000-8000-000000000001",
+            deviceKey = "synthDeviceKey_" + "C".repeat(29),
+            displayName = "Synthetic Pixel",
+            platform = "android",
+        )
+        val guideUri = Uri.parse("content://dev.supermd.test/setup-guide.md")
+        val writtenGuide = ByteArrayOutputStream()
+        shadowOf(context.contentResolver).registerOutputStream(guideUri, writtenGuide)
+        nextUri = guideUri
+        composeRule.runOnIdle {
+            exportGuide(
+                "SuperMD-Live-Agent-setup.md",
+                AgentSetupGuide.instructions(syntheticConfig, "# Synthetic Skill\n\nAuthoring guidance.").toByteArray(Charsets.UTF_8),
+            )
+        }
+        assertEquals("SuperMD-Live-Agent-setup.md", launchedInputs.last())
+        assertEquals("Setup instructions saved.", messages.last())
+        val savedGuideText = writtenGuide.toString(Charsets.UTF_8.name())
+        assertTrue(savedGuideText.contains("# Synthetic Skill"))
+        assertTrue(savedGuideText.contains("# Connection for this installation"))
+        assertTrue(savedGuideText.contains("Settings → Agent connection"))
+        assertTrue(savedGuideText.contains("Copy private MCP URL"))
+        for (secret in listOf(
+            syntheticConfig.mcpUrl,
+            syntheticConfig.connectorKey,
+            syntheticConfig.pairingKey,
+            syntheticConfig.deviceKey,
+            syntheticConfig.groupId,
+            syntheticConfig.deviceId,
+            syntheticConfig.serverOrigin,
+        )) {
+            assertFalse("Saved guide must omit $secret", savedGuideText.contains(secret))
+        }
     }
 }
