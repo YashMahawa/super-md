@@ -112,7 +112,9 @@ function parseDoubleQuoted(input: string): { value: string; rest: string } | nul
         case "u": {
           const hex = input.slice(i + 1, i + 5);
           if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
-          out += String.fromCodePoint(Number.parseInt(hex, 16));
+          const cp = Number.parseInt(hex, 16);
+          if (cp >= 0xd800 && cp <= 0xdfff) return null;
+          out += String.fromCodePoint(cp);
           i += 4;
           break;
         }
@@ -120,7 +122,7 @@ function parseDoubleQuoted(input: string): { value: string; rest: string } | nul
           const hex = input.slice(i + 1, i + 9);
           if (!/^[0-9a-fA-F]{8}$/.test(hex)) return null;
           const cp = Number.parseInt(hex, 16);
-          if (cp > 0x10ffff) return null;
+          if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return null;
           out += String.fromCodePoint(cp);
           i += 8;
           break;
@@ -827,35 +829,44 @@ function extractAuthorNameAndSpans(
   const direct = scalarToString(value);
   if (direct) return { name: direct, spans: node?.spans ?? EMPTY_SPANS };
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    const nameVal = value.name ?? value.literal;
-    const nameNode = node?.entries ? (node.entries.name ?? node.entries.literal) : undefined;
+    const rawName = lookupCaseInsensitive(value, "name");
+    const useName = rawName !== undefined && rawName !== null;
+    const nameVal = useName ? rawName : lookupCaseInsensitive(value, "literal");
+    const nameNode = node?.entries ? lookupCaseInsensitive(node.entries, useName ? "name" : "literal") : undefined;
     const directName = scalarToString(nameVal);
     if (directName) return { name: directName, spans: nameNode?.spans ?? EMPTY_SPANS };
     if (nameVal && typeof nameVal === "object" && !Array.isArray(nameVal)) {
-      const literal = scalarToString(nameVal.literal);
-      if (literal) return { name: literal, spans: nameNode?.entries?.literal?.spans ?? EMPTY_SPANS };
-      const given = scalarToString(nameVal.given);
-      const family = scalarToString(nameVal.family);
+      const literal = scalarToString(lookupCaseInsensitive(nameVal, "literal"));
+      if (literal) {
+        const literalNode = nameNode?.entries ? lookupCaseInsensitive(nameNode.entries, "literal") : undefined;
+        return { name: literal, spans: literalNode?.spans ?? EMPTY_SPANS };
+      }
+      const given = scalarToString(lookupCaseInsensitive(nameVal, "given"));
+      const family = scalarToString(lookupCaseInsensitive(nameVal, "family"));
       const parts = [given, family].filter(Boolean);
       if (parts.length) {
+        const givenNode = nameNode?.entries ? lookupCaseInsensitive(nameNode.entries, "given") : undefined;
+        const familyNode = nameNode?.entries ? lookupCaseInsensitive(nameNode.entries, "family") : undefined;
         return {
           name: parts.join(" "),
           spans: [
-            ...(given && nameNode?.entries?.given ? nameNode.entries.given.spans : EMPTY_SPANS),
-            ...(family && nameNode?.entries?.family ? nameNode.entries.family.spans : EMPTY_SPANS),
+            ...(given && givenNode ? givenNode.spans : EMPTY_SPANS),
+            ...(family && familyNode ? familyNode.spans : EMPTY_SPANS),
           ],
         };
       }
     }
-    const given = scalarToString(value.given);
-    const family = scalarToString(value.family);
+    const given = scalarToString(lookupCaseInsensitive(value, "given"));
+    const family = scalarToString(lookupCaseInsensitive(value, "family"));
     const parts = [given, family].filter(Boolean);
     if (parts.length) {
+      const givenNode = node?.entries ? lookupCaseInsensitive(node.entries, "given") : undefined;
+      const familyNode = node?.entries ? lookupCaseInsensitive(node.entries, "family") : undefined;
       return {
         name: parts.join(" "),
         spans: [
-          ...(given && node?.entries?.given ? node.entries.given.spans : EMPTY_SPANS),
-          ...(family && node?.entries?.family ? node.entries.family.spans : EMPTY_SPANS),
+          ...(given && givenNode ? givenNode.spans : EMPTY_SPANS),
+          ...(family && familyNode ? familyNode.spans : EMPTY_SPANS),
         ],
       };
     }

@@ -138,10 +138,22 @@ test("2D graph canvas drags and two-finger moves pan without zooming the note",a
       target.dispatchEvent(new TouchEvent("touchend",{bubbles:true,touches:[]}));
     });
     await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
-    expect(Number(await plot.getAttribute("data-center-x"))).not.toBe(prior);
-    const panBefore=Number(await plot.getAttribute("data-center-x"));
-    await svg.evaluate(node=>{const r=node.getBoundingClientRect();window.supermdNativeWheel?.(30,10,{x:r.left+r.width/2,y:r.top+r.height/2},false);});
+    expect(Number(await plot.getAttribute("data-center-x"))).toBeLessThan(prior);
+    const pinchSettledX=await svg.evaluate(async node=>{
+      await new Promise(requestAnimationFrame);
+      return Number(node.closest(".interactive-chart")!.getAttribute("data-center-x"));
+    });
+    expect(Number(await plot.getAttribute("data-center-x"))).toBe(pinchSettledX);
+    const panBefore=pinchSettledX,panBeforeY=Number(await plot.getAttribute("data-center-y"));
+    const wheelHitSvg=await svg.evaluate(node=>{
+      const r=node.getBoundingClientRect(),point={x:r.left+r.width/2,y:r.top+r.height/2};
+      const hit=Boolean(document.elementFromPoint(point.x,point.y)?.closest(".interactive-chart svg"));
+      window.supermdNativeWheel?.(30,10,point,false);
+      return hit;
+    });
+    expect(wheelHitSvg).toBe(true);
     await expect.poll(()=>plot.getAttribute("data-center-x").then(Number)).toBeGreaterThan(panBefore);
+    await expect.poll(()=>plot.getAttribute("data-center-y").then(Number)).toBeLessThan(panBeforeY);
     await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
     await svg.dispatchEvent("wheel",{deltaY:120,deltaMode:1});await expect.poll(()=>plot.getAttribute("data-plot-zoom").then(Number)).toBeCloseTo(2,6);
     // Magnifying the controls belongs to the page, not the plot camera.
@@ -296,6 +308,94 @@ test("moving a Source tab preserves its undo history and caret in another docume
   await destination.locator(".cm-content").click(); await destination.keyboard.press("Control+z");
   await expect(destination.locator(".cm-content")).not.toContainText("preserve this edit");
   await destination.close();
+});
+test("tearing off and reloading reader tabs retains bounded note undo/redo, legacy snapshots, and independent tab caches", async ({ page, context }) => {
+  await page.addInitScript(() => {
+    window.SuperMD = {
+      post: (_id, command, raw) => {
+        if (command === "document_flushed") (window as any).__flushed = JSON.parse(raw);
+      },
+    };
+  });
+  await page.goto("/android-reader.html");
+  await expect.poll(() => page.evaluate(() => typeof window.supermdLoad === "function")).toBe(true);
+  const baseNote = { path: null, mode: "reader" as const, dark: false, fullscreen: false, colors: {}, font: "sans", size: 17, zoom: 100 };
+
+  // Seed independent Tab A via legacy string history and verify Undo/Redo.
+  await page.evaluate(
+    note => window.supermdLoad?.(note),
+    { ...baseNote, id: "tab-legacy-a", content: "# Legacy current\n\n- [x] Done", viewState: { history: { undo: ["# Legacy prior\n\n- [ ] Done"], redo: [], last: 0 }, top: 0 } },
+  );
+  await expect(page.locator(".markdown-body h1")).toHaveText("Legacy current");
+
+  // Switch to Tab B with a 300 KB baseline undo snapshot, then apply two checkbox edits and undo one so both undo & redo are populated.
+  await page.evaluate(
+    note => window.supermdLoad?.(note),
+    { ...baseNote, id: "tab-check-b", content: "# Checklist\n\n- [ ] First\n- [ ] Second", viewState: { history: { undo: [`# Seed\n\n${"b".repeat(300_000)}`], redo: [], last: 0 }, top: 0 } },
+  );
+  await page.locator('.markdown-body input[type="checkbox"]').nth(0).click();
+  await page.evaluate(() => window.dispatchEvent(new Event("supermd-history-boundary")));
+  await page.locator('.markdown-body input[type="checkbox"]').nth(1).click();
+  await page.evaluate(() => window.supermdHistory?.("undo"));
+  await expect(page.locator('.markdown-body input[type="checkbox"]').nth(1)).not.toBeChecked();
+
+  // Switch to Tab C holding a 3.9 MB oversized newest step (combined 3.9M + 0.3M > 4.0M pool):
+  // active-tab charge capping keeps Tab A and Tab B's independent caches intact!
+  await page.evaluate(
+    note => window.supermdLoad?.(note),
+    { ...baseNote, id: "tab-over-c", content: "# Compact C\n\n- [ ] Toggle", viewState: { history: { undo: ["c".repeat(3_900_000)], redo: [], last: 0 }, top: 0 } },
+  );
+
+  await page.evaluate(() => {
+    (window as any).__flushed = undefined;
+    window.supermdFlush?.({ action: "detach_tab", target: "tab-check-b", token: "detach-b" });
+  });
+  await expect.poll(() => page.evaluate(() => Boolean((window as any).__flushed?.viewState?.history))).toBe(true);
+  const flushed = await page.evaluate(() => (window as any).__flushed);
+
+  const detached = await context.newPage();
+  await detached.addInitScript(() => {
+    window.SuperMD = {
+      post: (_id, command, raw) => {
+        if (command === "document_flushed") (window as any).__flushed = JSON.parse(raw);
+      },
+    };
+  });
+  await detached.goto("/android-reader.html");
+  await expect.poll(() => detached.evaluate(() => typeof window.supermdLoad === "function")).toBe(true);
+  await detached.evaluate(
+    note => window.supermdLoad?.(note),
+    { ...baseNote, id: "tab-check-b", content: "# Checklist\n\n- [x] First\n- [ ] Second", viewState: flushed.viewState },
+  );
+  // Both Redo (second checkbox) and Undo (first checkbox) survived tear-off.
+  await detached.evaluate(() => window.supermdHistory?.("redo"));
+  await expect(detached.locator('.markdown-body input[type="checkbox"]').nth(1)).toBeChecked();
+  await detached.evaluate(() => window.supermdHistory?.("undo"));
+  await expect(detached.locator('.markdown-body input[type="checkbox"]').nth(1)).not.toBeChecked();
+
+  // Reload the reader (`reload_reader`) and confirm Undo/Redo survive reload too.
+  await detached.evaluate(() => {
+    (window as any).__flushed = undefined;
+    window.supermdFlush?.({ action: "reload_reader", target: "", token: "reload-b" });
+  });
+  await expect.poll(() => detached.evaluate(() => Boolean((window as any).__flushed?.viewState?.history))).toBe(true);
+  const reloadedFlush = await detached.evaluate(() => (window as any).__flushed);
+  await detached.reload();
+  await expect.poll(() => detached.evaluate(() => typeof window.supermdLoad === "function")).toBe(true);
+  await detached.evaluate(
+    note => window.supermdLoad?.(note),
+    { ...baseNote, id: "tab-check-b", content: reloadedFlush.content, viewState: reloadedFlush.viewState },
+  );
+  await detached.evaluate(() => window.supermdHistory?.("undo"));
+  await expect(detached.locator('.markdown-body input[type="checkbox"]').nth(0)).not.toBeChecked();
+  await detached.evaluate(() => window.supermdHistory?.("redo"));
+  await expect(detached.locator('.markdown-body input[type="checkbox"]').nth(0)).toBeChecked();
+  await detached.close();
+
+  // Original window still retains Tab A's legacy snapshot history.
+  await page.evaluate(note => window.supermdLoad?.(note), { ...baseNote, id: "tab-legacy-a", content: "# Legacy current\n\n- [x] Done" });
+  await page.evaluate(() => window.supermdHistory?.("undo"));
+  await expect(page.locator(".markdown-body h1")).toHaveText("Legacy prior");
 });
 test("desktop reading and Source scroll indicators hide without collapsing their gutter", async ({ page }) => {
   await page.addInitScript(() => { window.SuperMD = { post: () => {} }; });
