@@ -22,7 +22,8 @@ import ReadingSearch from "./components/ReadingSearch";
 import { MaterialButton, MaterialIconButton, MaterialSelect, MaterialSlider, MaterialSwitch, materialThemes } from "./components/MaterialControls";
 import { isTypewriterShortcutEvent, setTypewriterScroll, toggleTypewriterScroll, useTypewriterScroll } from "./typewriterScroll";
 import { scrollInputVersion } from "./scrollAnchor";
-import { applySharedAnchor, captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, hasExternalAnchorScroll, isProgrammaticAnchorScroll, primeEditorAnchor, snapshotAnchorScroll, type AnchorScrollSnapshot, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
+import { captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, isProgrammaticAnchorScroll, primeEditorAnchor, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
+import { settleSharedSourceAnchor } from "./useSharedSourceAnchor";
 
 const welcome = `# Super MD
 
@@ -76,7 +77,7 @@ plt.grid(alpha=.2)
 \`\`\`
 `;
 
-const defaultExport: ExportOptions = { pageSize: "a4", margin: 14, fontSize: 10.5, lineHeight: 1.4, paragraphSpacing: 0.65, fontFamily: "Manrope", pageNumbers: true };
+const defaultExport: ExportOptions = { pageSize: "a4", margin: 14, fontSize: 10.5, lineHeight: 1.5, paragraphSpacing: 0.65, fontFamily: "Manrope", pageNumbers: true };
 const readerFonts = [
   { value: "sans", label: "Noto Sans · clean" },
   { value: "humanist", label: "Manrope · expressive" },
@@ -623,88 +624,41 @@ export default function App() {
       scrollInputVersion() !== startingInput ||
       Boolean(window.getSelection()?.toString()) ||
       Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
-    let stopped = false, applying = false;
-    const stop = () => { stopped = true; };
-    let readingSnapshot: AnchorScrollSnapshot | null = null;
-    const commitExternalScroll = (target: HTMLElement) => {
-      clearProgrammaticAnchorScroll(target);
-      restoringAnchorRef.current = false;
-      stopped = true;
-      if (view === "split") {
-        splitScrollTopsRef.current.preview = target.scrollTop;
-        splitPaneRef.current = "preview";
-      }
-    };
-    const onScroll = (event: Event) => {
-      const target = event.target;
-      if (!applying && target instanceof HTMLElement && target.matches(".reading-scroll") && target === readingSnapshot?.element && hasExternalAnchorScroll(readingSnapshot)) {
-        commitExternalScroll(target);
-      }
-    };
-    const inputs = ["wheel", "touchstart", "pointerdown", "keydown", "supermd-goto-offset"] as const;
-    inputs.forEach((name) => window.addEventListener(name, stop, { capture: true, passive: true }));
-    window.addEventListener("scroll", onScroll, { capture: true, passive: true });
-    let firstPass = true;
-    const apply = () => {
-      if (stopped) return;
-      if (readingSnapshot && hasExternalAnchorScroll(readingSnapshot)) {
-        commitExternalScroll(readingSnapshot.element);
-        return;
-      }
-      if (shouldStop()) {
-        stopped = true;
-        return;
-      }
-      const updateSelection = firstPass;
-      firstPass = false;
-      const seq = ++restoringAnchorSeq.current;
-      restoringAnchorRef.current = true;
-      applying = true;
-      try {
-        const readingRoot = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null;
-        applySharedAnchor({
-          id: tabId,
-          targetMode,
-          targetZoom: zoomRef.current,
-          anchor,
-          readingRoot,
-          allowExactTop,
-          updateSelection,
-        });
-        const requestedReadingTop = allowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - zoomRef.current) < 1 ? anchor.readingTop : undefined;
-        readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
+    return settleSharedSourceAnchor({
+      id: tabId,
+      targetMode,
+      getTargetZoom: () => zoomRef.current,
+      anchor,
+      allowExactTop,
+      readingSelector: ".reading-scroll",
+      getReadingRoot: () => workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null,
+      shouldStop,
+      onExternalScroll: (target) => {
+        restoringAnchorRef.current = false;
         if (targetMode === "split") {
-          splitScrollTopsRef.current = {
-            editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
-            preview: readingSnapshot?.top ?? null,
-          };
-        } else {
-          splitScrollTopsRef.current = { editor: null, preview: null };
+          splitScrollTopsRef.current.preview = target.scrollTop;
+          splitPaneRef.current = "preview";
         }
-      } finally {
-        applying = false;
-      }
-      requestAnimationFrame(() => { if (restoringAnchorSeq.current === seq) restoringAnchorRef.current = false; });
-    };
-    apply();
-    let innerFrame = 0;
-    const outerFrame = requestAnimationFrame(() => {
-      apply();
-      innerFrame = requestAnimationFrame(() => {
-        apply();
-        if (!stopped && !shouldStop()) snapshotActiveTabAnchor();
-      });
+      },
+      runApplyPass: (execute) => {
+        const seq = ++restoringAnchorSeq.current;
+        restoringAnchorRef.current = true;
+        try {
+          const readingSnapshot = execute();
+          splitScrollTopsRef.current = targetMode === "split"
+            ? {
+                editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
+                preview: readingSnapshot?.top ?? null,
+              }
+            : { editor: null, preview: null };
+        } finally {
+          requestAnimationFrame(() => { if (restoringAnchorSeq.current === seq) restoringAnchorRef.current = false; });
+        }
+      },
+      onSecondFrameSettled: snapshotActiveTabAnchor,
+      onCleanup: () => { restoringAnchorRef.current = false; },
+      delays: [120, 320],
     });
-    const timers = [120, 320].map((delay) => window.setTimeout(apply, delay));
-    return () => {
-      stopped = true;
-      restoringAnchorRef.current = false;
-      cancelAnimationFrame(outerFrame);
-      cancelAnimationFrame(innerFrame);
-      timers.forEach(window.clearTimeout);
-      inputs.forEach((name) => window.removeEventListener(name, stop, { capture: true }));
-      window.removeEventListener("scroll", onScroll, { capture: true });
-    };
   }, [activeTab.id, snapshotActiveTabAnchor, view]);
 
   useEffect(() => {
