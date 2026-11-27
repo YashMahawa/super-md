@@ -592,7 +592,7 @@ class Session(QObject):
     locationChanged = Signal(str,str)
     def __init__(self,isolated=False,data=None):
         super().__init__()
-        studio_session.init_session(self, isolated, data)
+        studio_session.init_session(self, isolated, data, defaults=DEFAULTS, default_pdf=DEFAULT_PDF, mkdtemp_fn=tempfile.mkdtemp, writable_location_fn=QStandardPaths.writableLocation, atomic_write_fn=atomic_write)
 
     def is_quitting(self) -> bool:
         return studio_session.session_is_quitting(self)
@@ -601,13 +601,13 @@ class Session(QObject):
         return studio_session.has_pending_startup_windows(self)
 
     def _load_theme_library(self):
-        return studio_session.load_theme_library(self)
+        return studio_session.load_theme_library(self, atomic_json_fn=atomic_json)
 
     def reader_asset_is_current(self, grant):
         return studio_session.reader_asset_is_current(self, grant)
 
     def reader_asset_source_is_current(self, owner_id, tab_id, source, embedded_identity, path):
-        return studio_session.reader_asset_source_is_current(self, owner_id, tab_id, source, embedded_identity, path)
+        return studio_session.reader_asset_source_is_current(self, owner_id, tab_id, source, embedded_identity, path, note_file_path_fn=note_file_path)
 
     def reader_asset_payload(self, grant):
         return studio_session.reader_asset_payload(self, grant)
@@ -2923,7 +2923,7 @@ class Studio(QObject):
         return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
 
     def _submit(self, action, done, busy=True, executor=None):
-        return studio_session.submit(self, action, done, busy, executor)
+        return studio_session.submit(self, action, done, busy, executor, noop_done_fn=_noop_done)
 
     @Slot(object)
     def _complete(self, result):
@@ -2940,22 +2940,22 @@ class Studio(QObject):
         return studio_session.submit_exact_recovery_write(self, action, done, on_retired=on_retired, on_enqueued=on_enqueued)
 
     def _preferences(self,notify=True):
-        studio_session.preferences(self, notify)
+        studio_session.preferences(self, notify, atomic_write_fn=atomic_write, noop_done_fn=_noop_done)
 
     def _save_positions(self):
-        studio_session.save_positions(self)
+        studio_session.save_positions(self, atomic_write_fn=atomic_write, noop_done_fn=_noop_done)
 
     def _submit_startup_snapshot(self):
-        studio_session.submit_startup_snapshot(self)
+        studio_session.submit_startup_snapshot(self, atomic_json_fn=atomic_json)
 
     def _window_recovery_drafts(self, tabs=None):
-        return studio_session.window_recovery_drafts(self, tabs)
+        return studio_session.window_recovery_drafts(self, tabs, snapshot_tab_fn=_snapshot_tab_state)
 
     def _combined_recovery_drafts(self, window_drafts):
         return studio_session.combined_recovery_drafts(self, window_drafts)
 
     def _recover(self):
-        studio_session.recover(self)
+        studio_session.recover(self, atomic_json_fn=atomic_json)
 
     def _notify_recovery_write(self,category,error):
         studio_session.notify_recovery_write(self, category, error)

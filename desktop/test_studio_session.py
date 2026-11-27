@@ -1,7 +1,7 @@
 """Focused unit tests for desktop/studio_session.py and Studio/Session facade wrappers."""
 from __future__ import annotations
 
-import json, os, shutil, sys, tempfile, threading, time, unittest
+import ast, inspect, json, os, shutil, sys, tempfile, threading, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -40,8 +40,7 @@ class StudioSessionTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self.app.processEvents()
-            if predicate():
-                return
+            if predicate(): return
             time.sleep(0.005)
         self.app.processEvents()
         self.assertTrue(predicate(), "Timed out waiting for asynchronous Qt state")
@@ -64,12 +63,26 @@ class StudioSessionTests(unittest.TestCase):
 
     def _cleanup(self, session: Session, *studios: Studio) -> None:
         for st in studios:
-            if not st.retired:
-                st.stop()
+            if not st.retired: st.stop()
             st.pool.shutdown(wait=True)
         session.writes.shutdown(wait=True)
         self.app.processEvents()
         shutil.rmtree(session.data, ignore_errors=True)
+
+    def test_explicit_collaborators_and_zero_studio_module_lookups(self):
+        source = inspect.getsource(studio_session)
+        self.assertFalse(hasattr(studio_session, "_studio_module"))
+        self.assertNotIn("_studio_module", source)
+        self.assertNotIn("sys.modules", source)
+        tree = ast.parse(source)
+        imported = {
+            alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
+        } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+        self.assertFalse({"studio", "desktop.studio", "sys"} & imported)
+        self.assertFalse(any(
+            isinstance(node, ast.Try) and any(isinstance(h.type, ast.Name) and h.type.id == "ImportError" for h in node.handlers)
+            for node in ast.walk(tree)
+        ))
 
     def test_session_init_patches_corruption_resilience_and_multiwindow_restore(self):
         iso_dir = self.root / "isolated-mkdtemp"
@@ -165,6 +178,8 @@ class StudioSessionTests(unittest.TestCase):
             self.assertTrue(preset_session.reader_asset_is_current(emb_grant))
             self.assertEqual(preset_session.reader_asset_payload(emb_grant), embedded_str)
             self.assertTrue(preset_session.reader_asset_is_current(disk_grant))
+            with patch("studio.note_file_path", return_value=self.root / "other.png"):
+                self.assertFalse(preset_session.reader_asset_is_current(disk_grant))
             tab["assets"]["emb.png"] = "data:image/png;base64," + ("B" * 8)
             self.assertFalse(preset_session.reader_asset_is_current(emb_grant))
             self.assertIsNone(preset_session.reader_asset_payload(emb_grant))
@@ -189,11 +204,7 @@ class StudioSessionTests(unittest.TestCase):
             outcomes: list[tuple] = []
             busy_entered, busy_release = threading.Event(), threading.Event()
             studio.pending_close = "tab-1"
-            studio._submit(
-                lambda: (busy_entered.set(), busy_release.wait(2.0), "ok")[2],
-                lambda val, err: outcomes.append((val, err)),
-                busy=True,
-            )
+            studio._submit(lambda: (busy_entered.set(), busy_release.wait(2.0), "ok")[2], lambda val, err: outcomes.append((val, err)), busy=True)
             self.assertTrue(busy_entered.wait(2.0))
             self.assertEqual(studio.busy, 1)
             busy_release.set()
@@ -207,8 +218,7 @@ class StudioSessionTests(unittest.TestCase):
                 studio._submit(lambda: quiet_ran.set(), studio_session.noop_done, busy=False, executor=session.writes)
                 session.writes.flush(timeout=2.0)
                 self._drain_posted_events()
-                self.assertTrue(quiet_ran.is_set())
-                self.assertEqual(completed_signals, [])
+                self.assertEqual((quiet_ran.is_set(), completed_signals), (True, []))
             finally:
                 studio.completed.disconnect(completed_signals.append)
 
@@ -271,20 +281,25 @@ class StudioSessionTests(unittest.TestCase):
             self.assertTrue({session.data / "settings.json", session.data / "reading-positions.json"}.issubset(written))
 
             clean_staged = first._note("Staged.md", "clean", "", "clean", {}, True)
-            clean_staged["agent_staged"] = True
+            clean_staged.update(agent_staged=True, viewState={"scroll": 5})
             clean_unreviewed = first._note("Unrev.md", "clean", "", "clean", {}, True)
             clean_unreviewed["agent_unreviewed"] = True
             blank_untitled = first._note("Untitled.md", "  \n", "", "", {}, True)
             clean_blank = first._note("Untitled.md", "", "", "", {}, True)
-            first.tabs = [clean_staged, clean_unreviewed, blank_untitled, clean_blank]
-            first.active = clean_staged["id"]
+            first.tabs, first.active = [clean_staged, clean_unreviewed, blank_untitled, clean_blank], clean_staged["id"]
+            direct_drafts = studio_session.window_recovery_drafts(first)
+            self.assertEqual(([d["id"] for d in direct_drafts], "viewState" in direct_drafts[0]), ([clean_staged["id"], clean_unreviewed["id"]], False))
             second_dirty = second._note("Second.md", "edited", "", "", {}, True)
             second.tabs, second.active = [second_dirty], second_dirty["id"]
 
-            first._recover()
-            second._recover()
-            session.writes.flush(timeout=2.0)
-            self._drain_posted_events()
+            json_paths: list[Path] = []
+            real_json = studio_module.atomic_json
+            with patch("studio.atomic_json", side_effect=lambda p, d: (json_paths.append(Path(p)), real_json(p, d))[1]):
+                first._recover()
+                second._recover()
+                session.writes.flush(timeout=2.0)
+                self._drain_posted_events()
+            self.assertTrue({session.data / "startup.json", session.data / "recovery.json"}.issubset(json_paths))
             startup_disk = json.loads((session.data / "startup.json").read_text(encoding="utf-8"))
             self.assertEqual({t["id"] for t in startup_disk["tabs"]}, {clean_staged["id"], clean_unreviewed["id"], blank_untitled["id"], second_dirty["id"]})
             recovery_disk = json.loads((session.data / "recovery.json").read_text(encoding="utf-8"))
