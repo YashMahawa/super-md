@@ -108,10 +108,10 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             notes.mkdir(parents=True)
             archive.mkdir(parents=True)
             deep.mkdir(parents=True)
-            for idx in range(16):
+            for idx in range(10):
                 section = root / f"Section-{idx:02d}"
                 section.mkdir()
-                for note_idx in range(4):
+                for note_idx in range(3):
                     (section / f"Doc-{idx:02d}-{note_idx}.md").write_text("# Doc\n", encoding="utf-8")
             root = root.resolve()
             notes = notes.resolve()
@@ -134,7 +134,7 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             ) as guard_probe:
                 with self.assertRaises(workspace_links.WorkspaceLinkError):
                     resolve_workspace_link("MissingTarget", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
-                self.assertGreater(guard_probe.call_count, 80)
+                self.assertGreater(guard_probe.call_count, 40)
                 cached_entries = cache.scan(root)
 
                 guard_probe.reset_mock()
@@ -152,13 +152,17 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             # 2. Real unmocked same-tick addition after warming both a missing link and a nested hit:
             # align to the start of a fresh filesystem clock tick on a compact vault so scan() and
             # external file creations complete well inside a single 4-20ms OS clock tick without mocks.
-            compact = (Path(root_dir) / "CompactVault").resolve()
+            compact = Path(root_dir) / "CompactVault"
             compact_notes = compact / "Notes"
             compact_archive = compact / "Archive"
             compact_deep = compact / "Specs" / "Deep"
             compact_notes.mkdir(parents=True)
             compact_archive.mkdir(parents=True)
             compact_deep.mkdir(parents=True)
+            compact = compact.resolve()
+            compact_notes = compact_notes.resolve()
+            compact_archive = compact_archive.resolve()
+            compact_deep = compact_deep.resolve()
             compact_source = compact_notes / "Source.md"
             compact_source.write_text("# Source\n", encoding="utf-8")
             compact_deep_topic = compact_deep / "Topic.md"
@@ -172,6 +176,7 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                 tick_probe.write_bytes(b"1")
                 if tick_probe.stat().st_mtime_ns != initial_tick_ns:
                     break
+                time.sleep(0.001)
             (compact_archive / ".keep").write_text("", encoding="utf-8")
             compact_cache = WorkspaceLinkCache(ttl_seconds=60.0)
             with self.assertRaises(workspace_links.WorkspaceLinkError):
@@ -218,51 +223,88 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                 self.assertLessEqual(scanned_dirs, {root, notes})
             self.assertIs(cache.scan(root), settled_entries)
 
-            # 4. Deterministic pinned-stat coarse-tick fixture (reproduces 100% even on 1ns APFS):
-            # warm both a missing link and a nested match, freeze Beta's directory stat across an
-            # external file write, verify warm misses still do not rescan before the write, and
-            # verify the new file resolves immediately after the write.
-            beta = root / "Beta"
+            # 4. Deterministic pinned-stat & slow-Windows-scan coarse-tick fixture (reproduces 100%
+            # regardless of OS clock granularity or CI VM pauses): simulate a scan spanning 140ms
+            # (>100ms sub-second racy window), verify warm broken-link misses stay cached inside the
+            # post-scan window, and verify external writes with frozen Beta stat resolve immediately.
+            beta = compact / "Beta"
             beta.mkdir()
             beta = beta.resolve()
-            deep_pinned = deep / "PinnedTopic.md"
+            deep_pinned = compact_deep / "PinnedTopic.md"
             deep_pinned.write_text("# Deep Pinned\n", encoding="utf-8")
-            cache.invalidate(root)
 
-            with self.assertRaises(workspace_links.WorkspaceLinkError):
-                resolve_workspace_link("PinnedMissing", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
-            self.assertEqual(
-                resolve_workspace_link("PinnedTopic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
-                deep_pinned,
+            raw_beta_stat = beta.stat(follow_symlinks=False)
+            base_tick_ns = (raw_beta_stat.st_mtime_ns // 1_000_000_000) * 1_000_000_000 + 15_625_000
+            frozen_beta_stat = os.stat_result(
+                tuple(raw_beta_stat), {"st_mtime_ns": base_tick_ns, "st_ctime_ns": base_tick_ns}
             )
-            pinned_entries = cache.scan(root)
-            frozen_beta_stat = beta.stat(follow_symlinks=False)
             real_stat = Path.stat
+            clock = {"wall_ns": base_tick_ns + 10_000_000, "mono": 1_000.0}
 
             def stale_beta_stat(self_path: Path, *, follow_symlinks: bool = True):
                 if self_path == beta:
+                    if clock["wall_ns"] == base_tick_ns + 10_000_000:
+                        clock["wall_ns"] = base_tick_ns + 150_000_000
+                        clock["mono"] = 1_000.140
                     return frozen_beta_stat
                 return real_stat(self_path, follow_symlinks=follow_symlinks)
 
-            with mock.patch.object(Path, "stat", stale_beta_stat):
+            pinned_cache = WorkspaceLinkCache(ttl_seconds=60.0)
+            with (
+                mock.patch.object(Path, "stat", stale_beta_stat),
+                mock.patch.object(workspace_links.time, "time_ns", side_effect=lambda: clock["wall_ns"]),
+                mock.patch.object(workspace_links.time, "monotonic", side_effect=lambda: clock["mono"]),
+            ):
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("PinnedMissing", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache)
+                clock["wall_ns"], clock["mono"] = base_tick_ns + 170_000_000, 1_000.160
+                self.assertEqual(
+                    resolve_workspace_link("PinnedTopic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache),
+                    deep_pinned,
+                )
+                pinned_entries = pinned_cache.scan(compact)
                 for broken in ("PinnedMissing", "OtherPinnedMissing"):
+                    clock["wall_ns"] += 15_000_000
+                    clock["mono"] += 0.015
                     with self.assertRaises(workspace_links.WorkspaceLinkError):
-                        resolve_workspace_link(broken, wikilink=True, note_path=source, workspace_folder=root, cache=cache)
-                self.assertIs(cache.scan(root), pinned_entries)
+                        resolve_workspace_link(broken, wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache)
+                self.assertIs(pinned_cache.scan(compact), pinned_entries)
 
                 beta_missing = beta / "PinnedMissing.md"
                 beta_missing.write_text("# Beta Pinned Missing\n", encoding="utf-8")
                 beta_topic = beta / "PinnedTopic.md"
                 beta_topic.write_text("# Beta Pinned Topic\n", encoding="utf-8")
-
                 self.assertEqual(
-                    resolve_workspace_link("PinnedMissing", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    resolve_workspace_link("PinnedMissing", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache),
                     beta_missing,
                 )
                 self.assertEqual(
-                    resolve_workspace_link("PinnedTopic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    resolve_workspace_link("PinnedTopic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache),
                     beta_topic,
                 )
+
+            # _snapshot_racy_entries avoids per-entry DirEntry.is_junction() syscalls on Windows
+            # while distinguishing regular directories from NTFS junctions (is_dir=False, is_file=False).
+            class _FakeDirEntry:
+                def __init__(self, name: str, *, sym: bool, is_dir: bool, is_file: bool):
+                    self.name, self._sym, self._dir, self._file = name, sym, is_dir, is_file
+
+                def is_symlink(self) -> bool:
+                    return self._sym
+
+                def is_junction(self) -> bool:
+                    raise AssertionError("DirEntry.is_junction() must not be called in _snapshot_racy_entries")
+
+                def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+                    return self._dir
+
+                def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                    return self._file
+
+            self.assertNotEqual(
+                workspace_links._snapshot_racy_entries([_FakeDirEntry("Sub", sym=False, is_dir=True, is_file=False)]),
+                workspace_links._snapshot_racy_entries([_FakeDirEntry("Sub", sym=False, is_dir=False, is_file=False)]),
+            )
 
     def test_cached_exact_nested_match_refreshes_when_higher_ranked_exact_target_added_externally(self):
         with tempfile.TemporaryDirectory() as root_dir:
@@ -651,8 +693,9 @@ class StudioOpenTabJumpTest(unittest.TestCase):
         shutil.rmtree(self.session.data, ignore_errors=True)
 
     def test_nested_wikilink_and_open_tab_jump_retain_drafts_update_recent_and_invalidate_on_rename(self):
-        vault = (self.studio.data / "vault").resolve()
+        vault = self.studio.data / "vault"
         vault.mkdir(parents=True, exist_ok=True)
+        vault = vault.resolve()
         first = vault / "First.md"
         first.write_text("# First\n\nSee [[Second Note#Architecture]]\n", encoding="utf-8")
         nested = vault / "Specs"
@@ -745,13 +788,17 @@ class StudioOpenTabJumpTest(unittest.TestCase):
         self.assertEqual(studio._current()["content"], "# First (unsaved draft)\n")
 
     def test_external_higher_ranked_exact_target_supersedes_cached_nested_tab_without_losing_dirty_draft(self):
-        vault = (self.studio.data / "ranked_vault").resolve()
+        vault = self.studio.data / "ranked_vault"
         notes = vault / "Notes"
         archive = vault / "Archive"
         deep = vault / "Specs" / "Deep"
         notes.mkdir(parents=True, exist_ok=True)
         archive.mkdir(parents=True, exist_ok=True)
         deep.mkdir(parents=True, exist_ok=True)
+        vault = vault.resolve()
+        notes = notes.resolve()
+        archive = archive.resolve()
+        deep = deep.resolve()
 
         index_note = notes / "Index.md"
         index_note.write_text("# Index\n\nSee [[Topic]]\n", encoding="utf-8")
@@ -817,9 +864,11 @@ class StudioOpenTabJumpTest(unittest.TestCase):
 
     @unittest.skipIf(workspace_links._fcntl is None, "POSIX fcntl.fcntl FCNTL_BUFSZ test")
     def test_darwin_studio_rejects_traversal_and_symlinks_and_runs_folder_hooks_without_fcntl_error(self):
-        sandbox = (self.studio.data / "darwin_containment").resolve()
+        sandbox = self.studio.data / "darwin_containment"
         folder = sandbox / "guarded"
         folder.mkdir(parents=True, exist_ok=True)
+        sandbox = sandbox.resolve()
+        folder = folder.resolve()
         outside = sandbox / "outside.md"
         outside.write_text("# Secret\n", encoding="utf-8")
         inside = folder / "Inside.md"

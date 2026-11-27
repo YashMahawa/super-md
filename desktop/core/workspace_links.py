@@ -230,22 +230,21 @@ def _racy_window_ns(mtime_ns: int, ctime_ns: int) -> int:
     return _SUBSECOND_RACY_WINDOW_NS
 
 
-def _snapshot_racy_entries(entries: Iterable[os.DirEntry[str]]) -> frozenset[tuple[str, bool, bool]]:
-    snapshot: set[tuple[str, bool, bool]] = set()
+def _snapshot_racy_entries(entries: Iterable[os.DirEntry[str]]) -> frozenset[tuple[str, bool, bool, bool]]:
+    snapshot: set[tuple[str, bool, bool, bool]] = set()
     for entry in entries:
         name = entry.name
         if not name or name.startswith("."):
             continue
         try:
             is_sym = entry.is_symlink()
-            is_junction = getattr(entry, "is_junction", None)
-            if callable(is_junction) and is_junction():
-                is_sym = True
             is_dir = not is_sym and entry.is_dir(follow_symlinks=False)
+            is_file = not is_sym and not is_dir and entry.is_file(follow_symlinks=False)
         except OSError:
             is_sym = True
             is_dir = False
-        snapshot.add((name, is_sym, is_dir))
+            is_file = False
+        snapshot.add((name, is_sym, is_dir, is_file))
     return frozenset(snapshot)
 
 
@@ -257,7 +256,7 @@ class _DirStamp:
     size: int
     nlink: int
     file_id: tuple[int, int] | None
-    racy_entries: frozenset[tuple[str, bool, bool]] | None = None
+    racy_entries: frozenset[tuple[str, bool, bool, bool]] | None = None
 
 
 @dataclass
@@ -284,8 +283,10 @@ class WorkspaceLinkCache:
         self._entries: dict[str, _CachedScan] = {}
 
     def _is_fresh(self, cached: _CachedScan, now: float) -> bool:
-        if (now - cached.scanned_at) > self.ttl_seconds:
+        elapsed_seconds = now - cached.scanned_at
+        if elapsed_seconds > self.ttl_seconds:
             return False
+        elapsed_since_scan_ns = elapsed_seconds * 1_000_000_000
         check_wall_ns: int | None = None
         cleaned_stamps: list[_DirStamp] | None = None
         for idx, stamp in enumerate(cached.dir_stamps):
@@ -314,7 +315,8 @@ class WorkspaceLinkCache:
                     return False
                 window_ns = _racy_window_ns(stamp.mtime_ns, stamp.ctime_ns)
                 if (
-                    check_wall_ns - stamp.mtime_ns > window_ns
+                    elapsed_since_scan_ns > window_ns
+                    and check_wall_ns - stamp.mtime_ns > window_ns
                     and check_wall_ns - stamp.ctime_ns > window_ns
                 ):
                     if cleaned_stamps is None:
@@ -392,6 +394,7 @@ class WorkspaceLinkCache:
         dir_stamps: list[_DirStamp] = []
         visited_dirs = 0
         truncated = False
+        scan_started_wall_ns = time.time_ns()
         stack: list[tuple[Path, str, int]] = [(boundary_path, "", 0)]
 
         while stack:
@@ -411,6 +414,8 @@ class WorkspaceLinkCache:
             is_racy = (
                 abs(dir_wall_ns - dir_stat.st_mtime_ns) <= window_ns
                 or abs(dir_wall_ns - dir_stat.st_ctime_ns) <= window_ns
+                or abs(scan_started_wall_ns - dir_stat.st_mtime_ns) <= window_ns
+                or abs(scan_started_wall_ns - dir_stat.st_ctime_ns) <= window_ns
             )
             dir_stamps.append(_DirStamp(
                 path=current_dir,
