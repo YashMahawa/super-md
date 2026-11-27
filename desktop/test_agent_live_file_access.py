@@ -16,7 +16,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QEvent, QStandardPaths
+from PySide6.QtCore import QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import QGuiApplication
 
 from agent_documents import AgentDocumentError, DocumentStore
@@ -1046,6 +1046,237 @@ class AgentLiveFileAccessTests(unittest.TestCase):
 
         self.studio.selectTab(tab_one["id"])
         self.assertIsNone(target_tab.get("pendingHeading"))
+
+    def test_native_picker_outer_whitespace_folder_remains_only_approved_root_across_save_and_restart(self):
+        app_data = self.base / "whitespace-app-data"
+        downloads_dir = self.base / "whitespace-downloads"
+        # Windows Win32 APIs strip trailing spaces on directory creation, whereas leading
+        # spaces are valid on Windows and leading/trailing spaces are valid on POSIX.
+        selected_note_name = "Study notes " if os.name != "nt" else " Study notes"
+        decoy_note_name = "Study notes"
+        selected_ws_name = " Workspace " if os.name != "nt" else " Workspace"
+        decoy_ws_name = "Workspace"
+
+        selected_note_dir = self.base / selected_note_name
+        decoy_note_dir = self.base / decoy_note_name
+        selected_ws_dir = self.base / selected_ws_name
+        decoy_ws_dir = self.base / decoy_ws_name
+        for folder in (app_data, downloads_dir, selected_note_dir, decoy_note_dir, selected_ws_dir, decoy_ws_dir):
+            folder.mkdir()
+
+        self.assertNotEqual(selected_note_dir, decoy_note_dir)
+        self.assertFalse(os.path.samefile(selected_note_dir, decoy_note_dir))
+        self.assertNotEqual(selected_ws_dir, decoy_ws_dir)
+        self.assertFalse(os.path.samefile(selected_ws_dir, decoy_ws_dir))
+
+        selected_note = selected_note_dir / "approved-note.md"
+        selected_svg = selected_note_dir / "approved-fig.svg"
+        decoy_note = decoy_note_dir / "decoy-note.md"
+        decoy_svg = decoy_note_dir / "decoy-fig.svg"
+        selected_ws_smd = selected_ws_dir / "ws-approved.smd"
+        selected_ws_svg = selected_ws_dir / "ws-approved.svg"
+        decoy_ws_note = decoy_ws_dir / "ws-decoy.md"
+        decoy_ws_svg = decoy_ws_dir / "ws-decoy.svg"
+
+        for note_file in (selected_note, decoy_note, decoy_ws_note):
+            note_file.write_text(f"# {note_file.stem}\n", encoding="utf-8")
+        write_portable(
+            selected_ws_smd,
+            "# Approved workspace portable note\n",
+            {"assets/existing.svg": "data:image/svg+xml;base64," + base64.b64encode(SVG_BYTES).decode("ascii")},
+        )
+        selected_svg.write_bytes(SVG_REPLACEMENT_BYTES)
+        selected_ws_svg.write_bytes(SVG_BYTES)
+        decoy_svg.write_bytes(SVG_REPLACEMENT_BYTES)
+        decoy_ws_svg.write_bytes(SVG_REPLACEMENT_BYTES)
+
+        expected_note_dir_str = str(selected_note_dir.resolve(strict=True))
+        expected_ws_dir_str = str(selected_ws_dir.resolve(strict=True))
+        decoy_note_dir_str = str(decoy_note_dir.resolve(strict=True))
+        decoy_ws_dir_str = str(decoy_ws_dir.resolve(strict=True))
+
+        # Native QML FolderDialog passes selectedFolder.toString() into setNoteLocation / openFolder.
+        picker_note_url = QUrl.fromLocalFile(str(selected_note_dir)).toString()
+        picker_ws_url = QUrl.fromLocalFile(str(selected_ws_dir)).toString()
+
+        session1 = Session(isolated=False, data=app_data)
+        session1.settings["python"] = sys.executable
+        studio1 = QuietStudio(False, session1)
+        bridge1 = create_qt_bridge(session1, session1.data)
+        session1.agent_bridge = bridge1
+        try:
+            with patch.object(QStandardPaths, "writableLocation", return_value=str(downloads_dir)):
+                studio1.setAgentAccessEnabled(True)
+                studio1.setNoteLocation(picker_note_url)
+                studio1.openFolder(picker_ws_url)
+
+                # Exact unchanged canonical native paths are stored in memory.
+                self.assertEqual(studio1.settings["newNoteLocation"], expected_note_dir_str)
+                self.assertEqual(os.fsencode(studio1.settings["newNoteLocation"]), os.fsencode(expected_note_dir_str))
+                self.assertEqual(studio1.folder, expected_ws_dir_str)
+                self.assertEqual(os.fsencode(studio1.folder), os.fsencode(expected_ws_dir_str))
+
+                # Blank/whitespace-only picker values are rejected without clobbering roots or approving CWD.
+                for blank in ("", "   "):
+                    studio1.setNoteLocation(blank)
+                    studio1.openFolder(blank)
+                self.assertEqual(studio1.settings["newNoteLocation"], expected_note_dir_str)
+                self.assertEqual(studio1.folder, expected_ws_dir_str)
+
+                # Symlinks (even with outer whitespace in their own name) remain rejected.
+                if os.name == "posix":
+                    symlink_space = self.base / "Symlink notes "
+                    symlink_space.symlink_to(decoy_note_dir, target_is_directory=True)
+                    symlink_picker_url = QUrl.fromLocalFile(str(symlink_space)).toString()
+                    studio1.setNoteLocation(symlink_picker_url)
+                    studio1.openFolder(symlink_picker_url)
+                    self.assertEqual(studio1.settings["newNoteLocation"], expected_note_dir_str)
+                    self.assertEqual(studio1.folder, expected_ws_dir_str)
+
+                # MCP roots and setup config contain only the exact outer-whitespace directories.
+                self.assertEqual(studio1._agent_mcp_roots(), [expected_ws_dir_str, expected_note_dir_str])
+                setup_args = json.loads(studio1.agentSetupInstructions)["args"]
+                self.assertIn(expected_ws_dir_str, setup_args)
+                self.assertIn(expected_note_dir_str, setup_args)
+                self.assertNotIn(decoy_ws_dir_str, setup_args)
+                self.assertNotIn(decoy_note_dir_str, setup_args)
+
+                # Default save and export locations preserve exact outer whitespace.
+                self.assertEqual(Path(studio1.defaultSaveFolder().toLocalFile()), Path(expected_note_dir_str))
+                self.assertEqual(
+                    Path(studio1.defaultExportLocation("pdf").toLocalFile()).parent,
+                    Path(expected_note_dir_str),
+                )
+
+                # Selected folders are approved; stripped-name sibling decoys are rejected.
+                self.assertTrue(studio1._agent_path_allowed(selected_note))
+                self.assertTrue(studio1._agent_path_allowed(selected_ws_smd))
+                self.assertFalse(studio1._agent_path_allowed(decoy_note))
+                self.assertFalse(studio1._agent_path_allowed(decoy_ws_note))
+
+                for blocked_note in (decoy_note, decoy_ws_note):
+                    with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                        studio1._agent_document_action({
+                            "action": "open_document",
+                            "filename": str(blocked_note),
+                            "background": True,
+                        })
+
+                studio1._agent_document_action({
+                    "action": "open_document",
+                    "filename": str(selected_ws_smd),
+                    "background": False,
+                })
+                ws_tab = self._await_tab_path(studio1, selected_ws_smd)
+                studio1.selectTab(ws_tab["id"])
+                rev = self._rev(ws_tab["content"])
+
+                for blocked_svg in (decoy_svg, decoy_ws_svg):
+                    with self.assertRaisesRegex(ValueError, "inside the current note folder or a configured folder"):
+                        studio1._attach_tab_asset_native({
+                            "tabId": ws_tab["id"],
+                            "assetPath": str(blocked_svg),
+                            "expectedRevision": rev,
+                        })
+
+                attached = studio1._attach_tab_asset_native({
+                    "tabId": ws_tab["id"],
+                    "assetPath": str(selected_svg),
+                    "assetName": "from-note-loc.svg",
+                    "expectedRevision": rev,
+                })
+                self.assertEqual(attached["assetName"], "assets/from-note-loc.svg")
+
+                studio1._preferences()
+                studio1._recover()
+        finally:
+            bridge1.stop()
+            studio1.stop()
+            studio1.pool.shutdown(wait=True, cancel_futures=True)
+            session1.writes.shutdown(wait=True)
+            studio1.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+
+        saved_settings_json = json.loads((app_data / "settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved_settings_json["settings"]["newNoteLocation"], expected_note_dir_str)
+        self.assertEqual(
+            os.fsencode(saved_settings_json["settings"]["newNoteLocation"]),
+            os.fsencode(expected_note_dir_str),
+        )
+
+        # Session 2: restart from persisted settings.json + startup.json and verify outer whitespace
+        # is NOT stripped on reload and the stripped-name siblings remain unapproved.
+        session2 = Session(isolated=False, data=app_data)
+        session2.settings["python"] = sys.executable
+        studio2 = QuietStudio(False, session2)
+        try:
+            restored_tab = self._await_tab_path(studio2, selected_ws_smd)
+            self.assertEqual(session2.settings["newNoteLocation"], expected_note_dir_str)
+            self.assertEqual(studio2.settings["newNoteLocation"], expected_note_dir_str)
+            self.assertEqual(studio2.folder, expected_ws_dir_str)
+            self.assertEqual(studio2._agent_mcp_roots(), [expected_ws_dir_str, expected_note_dir_str])
+
+            self.assertTrue(studio2._agent_path_allowed(selected_note))
+            self.assertTrue(studio2._agent_path_allowed(selected_ws_smd))
+            self.assertFalse(studio2._agent_path_allowed(decoy_note))
+            self.assertFalse(studio2._agent_path_allowed(decoy_ws_note))
+
+            opened = studio2._agent_document_action({
+                "action": "open_document",
+                "filename": str(selected_note),
+                "background": True,
+            })
+            self.assertEqual(opened["status"], "opening")
+            self._await_tab_path(studio2, selected_note)
+
+            for blocked_note in (decoy_note, decoy_ws_note):
+                with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                    studio2._agent_document_action({
+                        "action": "open_document",
+                        "filename": str(blocked_note),
+                        "background": True,
+                    })
+
+            studio2.selectTab(restored_tab["id"])
+            rev2 = self._rev(restored_tab["content"])
+            for blocked_svg in (decoy_svg, decoy_ws_svg):
+                with self.assertRaisesRegex(ValueError, "inside the current note folder or a configured folder"):
+                    studio2._replace_tab_asset_native({
+                        "tabId": restored_tab["id"],
+                        "assetName": "assets/existing.svg",
+                        "assetPath": str(blocked_svg),
+                        "expectedRevision": rev2,
+                    })
+            replaced = studio2._replace_tab_asset_native({
+                "tabId": restored_tab["id"],
+                "assetName": "assets/existing.svg",
+                "assetPath": str(selected_svg),
+                "expectedRevision": rev2,
+            })
+            self.assertTrue(replaced["changed"])
+
+            # DocumentStore constructed from MCP roots also honors only the outer-whitespace folders.
+            store = DocumentStore(studio2._agent_mcp_roots())
+            self.assertEqual(store.resolve(str(selected_note)).resolve(), selected_note.resolve())
+            for blocked_note in (decoy_note, decoy_ws_note):
+                with self.assertRaises(AgentDocumentError):
+                    store.resolve(str(blocked_note))
+
+            # Dropping a folder URL with outer whitespace also preserves exact directory identity.
+            studio2.closeFolder()
+            studio2.settings["newNoteLocation"] = ""
+            studio2.handleExternalDrop([picker_note_url], False)
+            self.assertEqual(studio2.folder, expected_note_dir_str)
+            self.assertTrue(studio2._agent_path_allowed(selected_note))
+            self.assertFalse(studio2._agent_path_allowed(decoy_note))
+        finally:
+            studio2.stop()
+            studio2.pool.shutdown(wait=True, cancel_futures=True)
+            session2.writes.shutdown(wait=True)
+            studio2.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
 
 
 if __name__ == "__main__":

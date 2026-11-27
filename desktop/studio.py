@@ -37,7 +37,8 @@ from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPat
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
-    encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    encode_base64_chunked, image_data, is_valid_asset_filename,
+    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
@@ -91,10 +92,10 @@ def _normalize_mcp_roots(roots) -> list[str]:
         resolved = _canonical_approved_directory(candidate)
         if resolved is None:
             continue
-        key = str(resolved)
-        if key not in seen:
+        key = folder_ops.normalize_path_key(resolved)
+        if key and key not in seen:
             seen.add(key)
-            normalized.append(key)
+            normalized.append(str(resolved))
     return normalized
 
 
@@ -231,11 +232,13 @@ def _canonical_approved_directory(
     """Validate an existing local directory without traversing symlinks or junctions."""
     if raw_value is None or not isinstance(raw_value, (str, os.PathLike)):
         return None
-    raw = folder_ops.strip_extended_length_prefix(str(raw_value).strip())
-    if not raw or "\0" in raw or len(raw) > 4096:
+    raw = folder_ops.strip_extended_length_prefix(
+        os.fspath(raw_value) if isinstance(raw_value, os.PathLike) else raw_value
+    )
+    if not raw or not raw.strip() or "\0" in raw or len(raw) > 4096:
         return None
     try:
-        expanded = Path(raw).expanduser()
+        expanded = Path(os.path.expanduser(raw))
         if folder_ops._is_link_or_junction(expanded):
             return None
         supplied = Path(os.path.abspath(expanded))
@@ -250,11 +253,11 @@ def _canonical_approved_directory(
 
 def _is_disallowed_root_setting(raw_value: str) -> bool:
     """Return True if a persisted root setting is malformed, a symlink/junction, or a non-directory file."""
-    cleaned = folder_ops.strip_extended_length_prefix(raw_value.strip())
-    if not cleaned:
+    cleaned = folder_ops.strip_extended_length_prefix(raw_value)
+    if not cleaned or not cleaned.strip():
         return False
     try:
-        expanded = Path(cleaned).expanduser()
+        expanded = Path(os.path.expanduser(cleaned))
         if folder_ops._is_link_or_junction(expanded):
             return True
         supplied = Path(os.path.abspath(expanded))
@@ -268,10 +271,14 @@ def _is_disallowed_root_setting(raw_value: str) -> bool:
     return False
 
 
-def _raw_local_path(value: str) -> Path:
+def _raw_local_path(value: str) -> str:
+    if not isinstance(value, str) or not value or not value.strip():
+        return ""
     url = QUrl(value)
     raw = url.toLocalFile() if url.isLocalFile() else value
-    return Path(folder_ops.strip_extended_length_prefix(str(Path(raw).expanduser())))
+    if not raw or not raw.strip():
+        return ""
+    return folder_ops.strip_extended_length_prefix(os.path.expanduser(raw))
 
 
 def _validate_approved_local_file_path(
@@ -286,10 +293,12 @@ def _validate_approved_local_file_path(
     _system_aliases: tuple[tuple[str, str], ...] | None = None,
 ) -> Path:
     """Shared Desktop path validator for live open_document and portable tab asset operations."""
-    if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
+    if not isinstance(raw_path, str) or not raw_path.strip() or len(raw_path) > 4096 or "\0" in raw_path:
         raise ValueError(unavailable_message)
-    cleaned_raw = folder_ops.strip_extended_length_prefix(raw_path.strip())
-    candidate = Path(cleaned_raw).expanduser()
+    cleaned_raw = folder_ops.strip_extended_length_prefix(raw_path)
+    if not cleaned_raw or not cleaned_raw.strip():
+        raise ValueError(unavailable_message)
+    candidate = Path(os.path.expanduser(cleaned_raw))
     if not candidate.is_absolute() and any(folder_ops.is_hidden_name(part) for part in candidate.parts):
         raise ValueError(outside_message)
 
@@ -302,7 +311,10 @@ def _validate_approved_local_file_path(
     root_aliases: list[tuple[Path, Path]] = []
     for root in root_inputs:
         try:
-            supplied_root = Path(os.path.abspath(Path(folder_ops.strip_extended_length_prefix(str(root))).expanduser()))
+            raw_root = folder_ops.strip_extended_length_prefix(os.fspath(root))
+            if not raw_root or not raw_root.strip():
+                continue
+            supplied_root = Path(os.path.abspath(os.path.expanduser(raw_root)))
             aliased_root = _rewrite_system_path_alias(supplied_root, _system_aliases)
             if _has_link_or_junction_component(aliased_root):
                 continue
@@ -325,11 +337,13 @@ def _validate_approved_local_file_path(
     for item in approved_files:
         if not item:
             continue
-        raw_item = folder_ops.strip_extended_length_prefix(str(item).strip())
-        if not raw_item or "\0" in raw_item:
+        raw_item = folder_ops.strip_extended_length_prefix(
+            os.fspath(item) if isinstance(item, os.PathLike) else str(item)
+        )
+        if not raw_item or not raw_item.strip() or "\0" in raw_item:
             continue
         try:
-            supplied_file = Path(os.path.abspath(Path(raw_item).expanduser()))
+            supplied_file = Path(os.path.abspath(os.path.expanduser(raw_item)))
             aliased_file = _rewrite_system_path_alias(supplied_file, _system_aliases)
             if folder_ops.is_hidden_name(aliased_file.name) or _has_link_or_junction_component(aliased_file):
                 continue
@@ -517,8 +531,8 @@ def _extract_local_drop_paths(values) -> list[Path]:
         elif isinstance(raw, Path):
             local_str = str(raw)
         else:
-            text = str(raw).strip()
-            if not text:
+            text = str(raw)
+            if not text or not text.strip():
                 continue
             url = QUrl(text)
             if url.isLocalFile():
@@ -527,10 +541,10 @@ def _extract_local_drop_paths(values) -> list[Path]:
                 local_str = text
             else:
                 continue
-        if not local_str or "\0" in local_str:
+        if not local_str or not local_str.strip() or "\0" in local_str:
             continue
         try:
-            cleaned = folder_ops.strip_extended_length_prefix(str(Path(local_str).expanduser()))
+            cleaned = folder_ops.strip_extended_length_prefix(os.path.expanduser(local_str))
             candidate = Path(os.path.abspath(cleaned))
         except (OSError, RuntimeError, ValueError):
             continue
@@ -869,11 +883,16 @@ class Session(QObject):
             else bool(migrated_keep_in_background)
         )
         raw_note_location = self.settings.get("newNoteLocation")
-        if (not isinstance(raw_note_location, str) or "\0" in raw_note_location
+        if (not isinstance(raw_note_location, str) or not raw_note_location.strip() or "\0" in raw_note_location
                 or len(raw_note_location) > 4096 or _is_disallowed_root_setting(raw_note_location)):
             self.settings["newNoteLocation"] = ""
         else:
-            self.settings["newNoteLocation"] = raw_note_location.strip()
+            canonical_note_location = _canonical_approved_directory(raw_note_location)
+            self.settings["newNoteLocation"] = (
+                str(canonical_note_location)
+                if canonical_note_location is not None
+                else folder_ops.strip_extended_length_prefix(raw_note_location)
+            )
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
         if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
@@ -1454,7 +1473,7 @@ class Studio(QObject):
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "portable": bool(tab.get("portable", False)), "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             pending_heading = tab.pop("pendingHeading", None)
             if pending_heading:
                 payload["pendingHeading"] = pending_heading
@@ -3890,31 +3909,15 @@ class Studio(QObject):
         self._submit(read_note,finished,False,self.writes)
 
     def _restore_workspace_folder(self, folder_path: str, expanded_paths: list[str] | None = None):
-        if not folder_path:
+        root = _canonical_approved_directory(folder_path)
+        if root is None:
             return
-        try:
-            candidate_root = Path(folder_ops.strip_extended_length_prefix(str(folder_path))).expanduser()
-            if folder_ops._is_link_or_junction(candidate_root):
-                return
-            root = Path(folder_ops.strip_extended_length_prefix(str(candidate_root.resolve(strict=True))))
-        except OSError:
-            return
-        if not root.is_dir():
-            return
-        root_str = folder_ops.canonical_path_str(root)
+        root_str = str(root)
         valid_expanded = {root_str}
         for raw in expanded_paths or []:
-            if not raw:
-                continue
-            try:
-                candidate = Path(folder_ops.strip_extended_length_prefix(str(raw))).expanduser()
-                if folder_ops._is_link_or_junction(candidate):
-                    continue
-                resolved = Path(folder_ops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
-                if folder_ops.matches_path_prefix(str(resolved), root_str, is_directory=True) and resolved.is_dir():
-                    valid_expanded.add(folder_ops.canonical_path_str(resolved))
-            except OSError:
-                continue
+            resolved = _canonical_approved_directory(raw)
+            if resolved is not None and folder_ops.matches_path_prefix(str(resolved), root_str, is_directory=True):
+                valid_expanded.add(str(resolved))
         self.folder = root_str
         self.session.workspace_links.invalidate(self.folder)
         self.expanded = valid_expanded
@@ -4079,7 +4082,7 @@ class Studio(QObject):
             self._emit(False)
             return
         self._clear_folder_filter()
-        self.folder = folder_ops.canonical_path_str(path)
+        self.folder = str(path)
         self.session.workspace_links.invalidate(self.folder)
         self.settings["welcomed"] = True
         self.expanded = {self.folder}
@@ -4955,11 +4958,14 @@ class Studio(QObject):
 
     @staticmethod
     def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
-        cleaned = folder_ops.strip_extended_length_prefix(str(raw_path or "").strip())
-        if not cleaned:
+        raw = os.fspath(raw_path) if isinstance(raw_path, os.PathLike) else str(raw_path or "")
+        cleaned = folder_ops.strip_extended_length_prefix(raw)
+        if not cleaned or not cleaned.strip():
             return None
         try:
             candidate = Path(cleaned).expanduser()
+            if reject_links and folder_ops._is_link_or_junction(candidate):
+                return None
             if reject_links:
                 aliased = _rewrite_system_path_alias(Path(os.path.abspath(candidate)))
                 if _has_link_or_junction_component(aliased):
@@ -4979,20 +4985,18 @@ class Studio(QObject):
         home = cls._existing_save_directory(Path.home())
         if home is not None:
             return home
-        cleaned = folder_ops.strip_extended_length_prefix(str(raw_downloads or "").strip()) or str(Path.home())
+        raw = str(raw_downloads or "")
+        cleaned = folder_ops.strip_extended_length_prefix(raw) if raw.strip() else str(Path.home())
         return Path(cleaned).expanduser()
 
     def _default_output_directory(self) -> Path:
-        raw_note_location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else ""
-        if raw_note_location and not _is_disallowed_root_setting(raw_note_location):
-            cleaned_loc = folder_ops.strip_extended_length_prefix(str(raw_note_location).strip())
-            if cleaned_loc:
-                return Path(cleaned_loc).expanduser()
         raw = (
-            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+            self.settings.get("newNoteLocation")
+            or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
             or str(Path.home())
         )
-        cleaned = folder_ops.strip_extended_length_prefix(str(raw or "").strip()) or str(Path.home())
+        raw_str = str(raw or "")
+        cleaned = folder_ops.strip_extended_length_prefix(raw_str) if raw_str.strip() else str(Path.home())
         return Path(cleaned).expanduser()
 
     def _note_save_directory(self) -> Path:
@@ -5007,8 +5011,8 @@ class Studio(QObject):
     def _save_as_directory(self) -> Path:
         current_path = self._current().get("path") if self.tabs else ""
         if current_path:
-            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path).strip())
-            if cleaned_current:
+            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path))
+            if cleaned_current.strip():
                 parent = self._existing_save_directory(Path(cleaned_current).expanduser().parent)
                 if parent is not None:
                     return parent
@@ -5189,6 +5193,19 @@ class Studio(QObject):
         if action in calls: self.readerCall.emit(calls[action])
         elif action == "window": self.newWindowRequested.emit()
 
+    def _agent_output_directory(self) -> Path:
+        raw_note_location = self.settings.get("newNoteLocation") if isinstance(getattr(self, "settings", None), dict) else ""
+        if isinstance(raw_note_location, str) and raw_note_location.strip() and not _is_disallowed_root_setting(raw_note_location):
+            cleaned_loc = folder_ops.strip_extended_length_prefix(raw_note_location)
+            return Path(os.path.expanduser(cleaned_loc))
+        raw = (
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+            or str(Path.home())
+        )
+        raw_str = str(raw or "")
+        cleaned = folder_ops.strip_extended_length_prefix(raw_str) if raw_str.strip() else str(Path.home())
+        return Path(os.path.expanduser(cleaned))
+
     def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
         extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
         selected = filename or Path(tab["name"]).stem or "Super MD export"
@@ -5198,7 +5215,7 @@ class Studio(QObject):
         stem = "".join(char for char in stem if char.isalnum() or char in " ._()-").strip(" .")[:100]
         if not stem or stem in (".", ".."):
             stem = "Super MD export"
-        directory = Studio._default_output_directory(self)
+        directory = Studio._agent_output_directory(self)
         if not directory.is_dir():
             raise ValueError("The configured export folder is unavailable")
         for index in range(1, 10_001):
@@ -5789,12 +5806,14 @@ class Studio(QObject):
                     raise ValueError("Asset exceeds 25 MB")
 
             filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
-            if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+            if not is_valid_asset_filename(filename):
                 raise ValueError("Asset name must be a simple filename")
             ext = Path(filename).suffix.lower().lstrip(".")
             if not ext:
                 ext = next((item for item, kind in MIMES.items() if kind == mime), "")
                 filename += "." + ext
+                if not is_valid_asset_filename(filename):
+                    raise ValueError("Asset name must be a simple filename")
             if MIMES.get(ext) != mime:
                 raise ValueError("Asset name extension must match the image type")
             if not _matches_media_signature(mime, raw):
@@ -5940,7 +5959,7 @@ class Studio(QObject):
         raise ValueError("Could not find an unused media filename")
 
     def _media_download_directory(self) -> Path:
-        directory = Studio._default_output_directory(self)
+        directory = Studio._agent_output_directory(self)
         if not directory.is_dir():
             raise ValueError("The media download folder is unavailable")
         return directory

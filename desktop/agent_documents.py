@@ -658,15 +658,17 @@ class DocumentStore:
             raise AgentDocumentError("Asset type must be PNG, JPEG, SVG, GIF, WebP, or AVIF")
         filename = name or asset_path.name
         asset_sha = digest_bytes(raw_asset)
-        if name is None and not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename):
+        if name is None and not documents.is_valid_asset_filename(filename):
             original_ext = Path(filename).suffix
             stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename).stem).strip(".-_") or "asset"
             filename = f"{stem[:120]}-{asset_sha[:8]}{original_ext}"
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+        if not documents.is_valid_asset_filename(filename):
             raise AgentDocumentError("Asset name must be a simple filename (letters, digits, dot, underscore, hyphen)")
         named_ext = Path(filename).suffix.lower().lstrip(".")
         if not named_ext:
             filename += "." + ext
+            if not documents.is_valid_asset_filename(filename):
+                raise AgentDocumentError("Asset name must be a simple filename (letters, digits, dot, underscore, hyphen)")
         elif documents.MIMES.get(named_ext) != mime:
             raise AgentDocumentError("Asset name extension must match the image type")
         asset_key = "assets/" + filename
