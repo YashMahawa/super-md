@@ -4,13 +4,21 @@ from __future__ import annotations
 import base64, json, math, urllib.parse, uuid
 from pathlib import Path
 from typing import Any
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QImage
+
+if __package__:
+    from . import pending_python, python_runtime, studio_exports, studio_saves
+    from .documents import MIMES, atomic_json, image_data, open_note, write_portable
+    from .reader_assets import resolve_source
+    from .workspace_links import resolve_workspace_link
+else:
+    import pending_python, python_runtime, studio_exports, studio_saves
+    from documents import MIMES, atomic_json, image_data, open_note, write_portable
+    from reader_assets import resolve_source
+    from workspace_links import resolve_workspace_link
 
 _EXPECTED_EXPORT_SUFFIXES = {"export_pdf_native": (".pdf",), "export_markdown_native": (".md", ".markdown", ".txt", ".zip"), "export_fmd_native": (".smd",)}
-
-def _studio_module():
-    if __package__: from . import studio as mod
-    else: import studio as mod
-    return mod
 
 def _set_agent_banner_unreviewed(studio_obj: Any, request_id: str, tab_id: Any, unreviewed: bool) -> None:
     target = next((t for t in studio_obj.tabs if t["id"] == tab_id), None)
@@ -20,8 +28,12 @@ def _set_agent_banner_unreviewed(studio_obj: Any, request_id: str, tab_id: Any, 
         studio_obj._emit(False)
     studio_obj.replied.emit(request_id, "true", "")
 
-def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, args: dict) -> bool:
-    st = _studio_module()
+def _handle_immediate_command(
+    studio_obj: Any, request_id: str, command: str, args: dict, *,
+    gui_app_cls=QGuiApplication, image_cls=QImage, desktop_services_cls=QDesktopServices, qurl_cls=QUrl,
+    atomic_json_fn=atomic_json, resolve_source_fn=resolve_source, asset_identity_fn=id,
+    resolve_workspace_link_fn=resolve_workspace_link,
+) -> bool:
     if command == "agent_result":
         if (bridge := getattr(studio_obj.session, "agent_bridge", None)) is not None:
             error = args.get("error", "")
@@ -78,14 +90,14 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
         width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
         if not 0 < width <= 4096 or not 0 < height <= 4096 or width * height > 16_000_000:
             raise ValueError("Clipboard image dimensions exceed the limit")
-        image = st.QImage.fromData(data, "PNG")
+        image = image_cls.fromData(data, "PNG")
         if image.isNull(): raise ValueError("Clipboard PNG could not be decoded")
-        st.QGuiApplication.clipboard().setImage(image)
+        gui_app_cls.clipboard().setImage(image)
         studio_obj.replied.emit(request_id, "true", "")
     elif command == "copy_text":
         text = args.get("text")
         if not isinstance(text, str) or len(text) > 2_000_000: raise ValueError("Clipboard text is too large or invalid")
-        st.QGuiApplication.clipboard().setText(text)
+        gui_app_cls.clipboard().setText(text)
         studio_obj.replied.emit(request_id, "true", "")
     elif command == "apply_bundled_theme":
         preset_id = args.get("id")
@@ -150,7 +162,7 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
                 studio_obj.replied.emit(request_id, json.dumps({**result, "draftSaved": not bool(error)}), "")
             def preserve_work():
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                return _studio_module().atomic_json(destination, payload)
+                return atomic_json_fn(destination, payload)
             studio_obj._submit(preserve_work, preserve_done, False)
         else:
             studio_obj.replied.emit(request_id, json.dumps(result), "")
@@ -172,11 +184,11 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
         owner_id, tab_id, embedded = studio_obj.window_id, tab["id"], captured["assets"].get(source)
         cached = studio_obj.session.reader_assets.resolve_cached(owner_id, tab_id, source, embedded) if embedded is not None else None
         def asset_done(resolved, error):
-            mod, current = _studio_module(), next((item for item in studio_obj.tabs if item["id"] == tab_id), None)
+            current = next((item for item in studio_obj.tabs if item["id"] == tab_id), None)
             if error:
                 studio_obj.replied.emit(request_id, "null", error)
             elif current is None or not studio_obj.session.reader_asset_source_is_current(
-                owner_id, tab_id, source, mod._asset_identity(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0, resolved.get("path", "")
+                owner_id, tab_id, source, asset_identity_fn(resolved.get("embedded_data")) if resolved.get("embedded_data") else 0, resolved.get("path", "")
             ):
                 studio_obj.session.reader_assets.evict_source(owner_id, tab_id, source)
                 studio_obj.replied.emit(request_id, "null", "The note or image changed while it was being resolved")
@@ -186,7 +198,7 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
                     studio_obj.replied.emit(request_id, json.dumps({"url": url, "mime": resolved["mime"]}), "")
                 except Exception as failure:
                     studio_obj.replied.emit(request_id, "null", str(failure))
-        studio_obj._submit(lambda: cached if cached is not None else _studio_module().resolve_source(captured, source), asset_done, False)
+        studio_obj._submit(lambda: cached if cached is not None else resolve_source_fn(captured, source), asset_done, False)
     elif command == "zoom_changed":
         studio_obj.settings["fullZoom" if args.get("fullscreen", studio_obj.fullscreen) else "normalZoom"] = max(40, min(300, args["zoom"]))
         studio_obj.preference_timer.start(500)
@@ -196,7 +208,7 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
         url = args.get("url")
         if not isinstance(url, str) or len(url) > 4096: raise ValueError("Invalid external URL")
         if urllib.parse.urlparse(url).scheme.lower() not in ("http", "https", "mailto"): raise ValueError("Unsupported external URL scheme")
-        st.QDesktopServices.openUrl(st.QUrl(url))
+        desktop_services_cls.openUrl(qurl_cls(url))
         studio_obj.replied.emit(request_id, "true", "")
     elif command in ("open_workspace_link", "open_relative_note"):
         raw_target, raw_fragment = args.get("target"), args.get("fragment")
@@ -236,7 +248,7 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
                 else:
                     studio_obj.replied.emit(request_id, json.dumps({"opened": True, "id": opened_tab["id"], "path": opened_tab["path"]}), "")
             studio_obj._open_note(str(resolved_path), explicit=True, activation_generation=link_generation, completion_callback=opened, pending_heading=heading_payload)
-        studio_obj._submit(lambda: _studio_module().resolve_workspace_link(
+        studio_obj._submit(lambda: resolve_workspace_link_fn(
             raw_target, wikilink=wikilink, note_path=note_path, workspace_folder=folder, cache=studio_obj.session.workspace_links
         ), resolve_done, False)
     elif command == "export_failed":
@@ -254,18 +266,20 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
 def _run_worker_command(
     studio_obj: Any, command: str, args: dict, captured: dict, *, context: dict | None, output: str,
     save_as: str, force_portable_overwrite: bool, python: str, python_job: Any, export_job: Any, export_result: Any,
+    image_data_fn=image_data, mimes=MIMES, open_note_fn=open_note, write_portable_fn=write_portable,
+    pending_python_mod=pending_python, python_runtime_mod=python_runtime,
+    studio_exports_mod=studio_exports, studio_saves_mod=studio_saves,
 ) -> Any:
-    st = _studio_module()
     if command == "load_asset": return studio_obj._asset(captured, args["source"])
     if command == "load_text_asset": return {"text": studio_obj._text_asset(captured, args["source"])}
     if command == "load_font": return studio_obj.session.font_store.reader(args["family"])
     if command == "cache_python_output":
         if context and args["result"].get("provenance", {}).get("verified") is False:
             raise ValueError("Legacy output cannot be promoted to verified output")
-        if context and not st.pending_python.matches(args["source"], args["result"], context):
+        if context and not pending_python_mod.matches(args["source"], args["result"], context):
             raise ValueError("Only an unsaved native execution can be retried")
         studio_obj.session.python_outputs.store(args["source"], args["result"], context)
-        if context: st.pending_python.forget(args["source"], context)
+        if context: pending_python_mod.forget(args["source"], context)
         return True
     if command == "load_python_output":
         value = studio_obj.session.python_outputs.load(args["source"], context)
@@ -274,8 +288,8 @@ def _run_worker_command(
     if command == "import_images":
         results = []
         for image in args["images"]:
-            mime, _ = st.image_data(image["data"])
-            extension = next(k for k, v in st.MIMES.items() if v == mime)
+            mime, _ = image_data_fn(image["data"])
+            extension = next(k for k, v in mimes.items() if v == mime)
             name = f"assets/import-{uuid.uuid4().hex}.{extension}"
             captured["assets"][name] = image["data"]
             results.append({"source": name, "alt": Path(image["name"]).stem})
@@ -285,7 +299,7 @@ def _run_worker_command(
         try:
             cwd = str(Path(captured["path"]).parent) if captured.get("path") else None
             result = studio_obj._python(python, args["code"], cwd, job=python_job)
-        except st.python_runtime.PythonCellCancelled:
+        except python_runtime_mod.PythonCellCancelled:
             return {"_cancelled": True}
         finally:
             studio_obj._python_jobs.discard(python_job)
@@ -293,43 +307,44 @@ def _run_worker_command(
         if context:
             try:
                 studio_obj.session.python_outputs.store(args["code"], result, context)
-                st.pending_python.forget(args["code"], context)
+                pending_python_mod.forget(args["code"], context)
                 saved = studio_obj.session.python_outputs.load(args["code"], context)
                 return {**result, "provenance": saved["provenance"]}
             except (OSError, ValueError) as error:
-                st.pending_python.remember(args["code"], result, context)
+                pending_python_mod.remember(args["code"], result, context)
                 return {**result, "provenance": {"verified": False, "unsaved": True, "reason": f"Could not save execution output: {error}"}}
         return result
     if command == "export_markdown_native":
-        return st.studio_exports.execute_export_markdown_native(output, args, captured, export_result)
+        return studio_exports_mod.execute_export_markdown_native(output, args, captured, export_result)
     if command == "export_fmd_native" and not args.get("save") and not save_as:
-        return st.studio_exports.execute_export_smd_native(output, args, export_result)
+        return studio_exports_mod.execute_export_smd_native(output, args, export_result)
     if command == "export_fmd_native":
-        return st.studio_saves.execute_portable_tab_save(
+        return studio_saves_mod.execute_portable_tab_save(
             output, args, captured, force_portable_overwrite=force_portable_overwrite,
-            export_result=export_result, open_note_fn=st.open_note, write_portable_fn=st.write_portable,
+            export_result=export_result, open_note_fn=open_note_fn, write_portable_fn=write_portable_fn,
         )
     if command == "export_pdf_native":
-        return st.studio_exports.execute_export_pdf_native(studio_obj, output, args, export_job, export_result)
+        return studio_exports_mod.execute_export_pdf_native(studio_obj, output, args, export_job, export_result)
     raise ValueError(f"Unsupported command: {command}")
 
 def _finish_worker_command(
     studio_obj: Any, request_id: str, command: str, args: dict, captured: dict, result: Any, error: Any,
-    *, output: str, save_as: str, save_as_tab: str, is_portable_tab_save: bool, saving_tab_id: str, agent_export_info: dict | None,
+    *, output: str, save_as: str, save_as_tab: str, is_portable_tab_save: bool, saving_tab_id: str,
+    agent_export_info: dict | None, preserve_unchanged_assets_fn=studio_saves.preserve_unchanged_assets,
+    studio_exports_mod=studio_exports, studio_saves_mod=studio_saves,
 ) -> None:
-    st = _studio_module()
     if is_portable_tab_save: studio_obj.saving.discard(saving_tab_id)
     if command.startswith("export_") and studio_obj.pending_export == output: studio_obj.pending_export = ""
     if error and studio_obj.pending_save_as == save_as: studio_obj.pending_save_as = studio_obj.pending_save_as_tab = ""
     if error:
-        if agent_export_info: st.studio_exports.fail_agent_export(studio_obj, request_id, agent_export_info, error)
+        if agent_export_info: studio_exports_mod.fail_agent_export(studio_obj, request_id, agent_export_info, error)
         else: studio_obj.replied.emit(request_id, "null", error)
         return
     if command == "run_python" and isinstance(result, dict) and result.get("_cancelled"):
         studio_obj.replied.emit(request_id, "null", "Python cell cancelled")
         return
     if command == "export_fmd_native" and isinstance(result, dict) and result.get("_conflict"):
-        st.studio_saves.handle_portable_save_conflict(studio_obj, request_id, captured)
+        studio_saves_mod.handle_portable_save_conflict(studio_obj, request_id, captured)
         return
     stamp = result.pop("_stamp", None) if isinstance(result, dict) else None
     if stamp and isinstance(result, dict) and result.get("path"):
@@ -342,35 +357,52 @@ def _finish_worker_command(
         studio_obj.autosave_timer.start(900)
         studio_obj._emit(False)
     if command == "export_fmd_native" and ((args.get("save") and target) or save_as):
-        st.studio_saves.finalize_portable_tab_save(
+        studio_saves_mod.finalize_portable_tab_save(
             studio_obj, args, captured, target, save_as=save_as, save_as_tab=save_as_tab,
-            preserve_unchanged_assets_fn=st._preserve_unchanged_assets,
+            preserve_unchanged_assets_fn=preserve_unchanged_assets_fn,
             clear_agent_staging_fn=getattr(studio_obj, "_clear_agent_staging", None),
             is_dirty_fn=getattr(studio_obj, "_is_dirty", None),
             refresh_open_folder_trees_fn=getattr(studio_obj, "_refresh_open_folder_trees", None),
         )
     elif command.startswith("export_"):
-        st.studio_exports.finalize_standalone_export(studio_obj, result["path"])
+        studio_exports_mod.finalize_standalone_export(studio_obj, result["path"])
     if agent_export_info:
-        st.studio_exports.complete_agent_export(studio_obj, request_id, agent_export_info, result)
+        studio_exports_mod.complete_agent_export(studio_obj, request_id, agent_export_info, result)
     if not agent_export_info:
         studio_obj.replied.emit(request_id, json.dumps(result), "")
 
-def post_message(studio_obj: Any, id: str, command: str, raw: str) -> None:
+def post_message(
+    studio_obj: Any, id: str, command: str, raw: str, *,
+    gui_app_cls=QGuiApplication, image_cls=QImage, desktop_services_cls=QDesktopServices, qurl_cls=QUrl,
+    atomic_json_fn=atomic_json, image_data_fn=image_data, mimes=MIMES, open_note_fn=open_note,
+    write_portable_fn=write_portable, preserve_unchanged_assets_fn=studio_saves.preserve_unchanged_assets,
+    resolve_source_fn=resolve_source, asset_identity_fn=id, resolve_workspace_link_fn=resolve_workspace_link,
+    pending_python_mod=pending_python, python_runtime_mod=python_runtime,
+    studio_exports_mod=studio_exports, studio_saves_mod=studio_saves,
+    parse_media_envelope_fn=None, validate_and_write_media_fn=None,
+) -> None:
     if studio_obj.retired: return
     python_job = None
     try:
         if command == "save_media_native":
             if not isinstance(raw, str) or len(raw) > 36_100_000: raise ValueError("Media data is invalid or exceeds 25 MB")
             directory = studio_obj._media_download_directory()
+            parse_fn = parse_media_envelope_fn or getattr(studio_obj, "_parse_media_envelope", None)
+            write_fn = validate_and_write_media_fn or getattr(studio_obj, "_validate_and_write_media", None)
+            if not callable(parse_fn) or not callable(write_fn): raise ValueError("Media save helpers are unavailable")
             def media_work():
-                st = _studio_module()
-                parsed, source_str, body_start, body_end = st.Studio._parse_media_envelope(raw)
-                return st.Studio._validate_and_write_media(parsed, directory, source_str=source_str, body_start=body_start, body_end=body_end)
+                parsed, source_str, body_start, body_end = parse_fn(raw)
+                return write_fn(parsed, directory, source_str=source_str, body_start=body_start, body_end=body_end)
             studio_obj._submit_write(media_work, lambda res, err: studio_obj.replied.emit(id, "null" if err else json.dumps(res), err or ""))
             return
         args = json.loads(raw)
-        if _handle_immediate_command(studio_obj, id, command, args): return
+        if _handle_immediate_command(
+            studio_obj, id, command, args, gui_app_cls=gui_app_cls, image_cls=image_cls,
+            desktop_services_cls=desktop_services_cls, qurl_cls=qurl_cls, atomic_json_fn=atomic_json_fn,
+            resolve_source_fn=resolve_source_fn, asset_identity_fn=asset_identity_fn,
+            resolve_workspace_link_fn=resolve_workspace_link_fn,
+        ):
+            return
         exports = getattr(studio_obj, "_agent_exports", None)
         agent_export_info = exports.get(id) if exports is not None else None
         context = args.get("context")
@@ -406,11 +438,17 @@ def post_message(studio_obj: Any, id: str, command: str, raw: str) -> None:
         export_result = lambda path: studio_obj._agent_export_metadata(Path(path), agent_export_info["format"]) if agent_export_info else {"path": str(path)}
         work = lambda: _run_worker_command(
             studio_obj, command, args, captured, context=context, output=output, save_as=save_as,
-            force_portable_overwrite=force_portable_overwrite, python=python, python_job=python_job, export_job=export_job, export_result=export_result,
+            force_portable_overwrite=force_portable_overwrite, python=python, python_job=python_job,
+            export_job=export_job, export_result=export_result, image_data_fn=image_data_fn, mimes=mimes,
+            open_note_fn=open_note_fn, write_portable_fn=write_portable_fn,
+            pending_python_mod=pending_python_mod, python_runtime_mod=python_runtime_mod,
+            studio_exports_mod=studio_exports_mod, studio_saves_mod=studio_saves_mod,
         )
         finished = lambda result, error: _finish_worker_command(
             studio_obj, id, command, args, captured, result, error, output=output, save_as=save_as,
-            save_as_tab=save_as_tab, is_portable_tab_save=is_portable_tab_save, saving_tab_id=saving_tab_id, agent_export_info=agent_export_info,
+            save_as_tab=save_as_tab, is_portable_tab_save=is_portable_tab_save, saving_tab_id=saving_tab_id,
+            agent_export_info=agent_export_info, preserve_unchanged_assets_fn=preserve_unchanged_assets_fn,
+            studio_exports_mod=studio_exports_mod, studio_saves_mod=studio_saves_mod,
         )
         if is_portable_tab_save and (studio_obj.retired or getattr(studio_obj.writes, "_shutdown", False)):
             studio_obj.saving.discard(saving_tab_id)
@@ -423,5 +461,5 @@ def post_message(studio_obj: Any, id: str, command: str, raw: str) -> None:
     except Exception as error:
         if python_job is not None: studio_obj._python_jobs.discard(python_job)
         if hasattr(studio_obj, "_agent_exports"):
-            _studio_module().studio_exports.cleanup_failed_post_agent_export(studio_obj, id)
+            studio_exports_mod.cleanup_failed_post_agent_export(studio_obj, id)
         studio_obj.replied.emit(id, "null", str(error))

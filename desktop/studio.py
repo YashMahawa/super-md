@@ -6155,7 +6155,17 @@ class Studio(QObject):
         self._post(id, command, raw)
 
     def _post(self, id, command, raw):
-        return studio_reader_ipc.post_message(self, id, command, raw)
+        return studio_reader_ipc.post_message(
+            self, id, command, raw, gui_app_cls=QGuiApplication, image_cls=QImage,
+            desktop_services_cls=QDesktopServices, qurl_cls=QUrl, atomic_json_fn=atomic_json,
+            image_data_fn=image_data, mimes=MIMES, open_note_fn=open_note, write_portable_fn=write_portable,
+            preserve_unchanged_assets_fn=_preserve_unchanged_assets, resolve_source_fn=resolve_source,
+            asset_identity_fn=_asset_identity, resolve_workspace_link_fn=resolve_workspace_link,
+            pending_python_mod=pending_python, python_runtime_mod=python_runtime,
+            studio_exports_mod=studio_exports, studio_saves_mod=studio_saves,
+            parse_media_envelope_fn=Studio._parse_media_envelope,
+            validate_and_write_media_fn=Studio._validate_and_write_media,
+        )
 
     @Slot()
     def readerCrashed(self):

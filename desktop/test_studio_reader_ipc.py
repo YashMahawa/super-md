@@ -1,7 +1,7 @@
 """Unit tests for extracted desktop/studio_reader_ipc.py WebChannel IPC command router."""
 from __future__ import annotations
 
-import base64, json, os, sys, tempfile, time, unittest, zipfile
+import ast, base64, json, os, sys, tempfile, time, unittest, zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -283,6 +283,43 @@ class StudioReaderIpcTests(unittest.TestCase):
         )
         Studio._post(proxy, "p-req", "agent_banner_shown", json.dumps({"id": "p1"}))
         self.assertEqual((proxy.tabs[0]["agent_unreviewed"], proxy_replies), (True, [("p-req", "true", "")]))
+
+        opened_direct: list[str] = []
+        studio_reader_ipc.post_message(
+            proxy, "p-url", "open_external_url", json.dumps({"url": "https://example.org/spec"}),
+            desktop_services_cls=SimpleNamespace(openUrl=lambda u: opened_direct.append(u) or True),
+            qurl_cls=lambda raw_url: f"qurl:{raw_url}",
+        )
+        self.assertEqual((opened_direct, proxy_replies[-1]), (["qurl:https://example.org/spec"], ("p-url", "true", "")))
+
+    def test_module_boundary_has_no_studio_back_imports_or_sentinel_branches(self):
+        source = Path(studio_reader_ipc.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertNotIn("_studio_module", source)
+        self.assertFalse(hasattr(studio_reader_ipc, "_studio_module"))
+        self.assertFalse(hasattr(studio_reader_ipc, "sys"))
+        top_names = {
+            alias.asname or alias.name
+            for node in tree.body
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        } | {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotIn(alias.name, ("studio", "desktop.studio", "importlib", "sys"))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertNotIn(node.module, ("studio", "desktop.studio", "importlib", "sys"))
+                for alias in node.names:
+                    self.assertNotIn(alias.name, ("studio", "importlib"))
+            elif isinstance(node, ast.Attribute):
+                self.assertFalse(isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "modules")
+            elif isinstance(node, ast.ExceptHandler):
+                self.assertFalse(isinstance(node.type, ast.Name) and node.type.id in ("ImportError", "ModuleNotFoundError"))
+            elif isinstance(node, ast.Compare) and any(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops):
+                self.assertFalse(isinstance(node.left, ast.Name) and node.left.id in top_names)
+                for comp in node.comparators:
+                    self.assertTrue(isinstance(comp, ast.Constant) and comp.value in (None, True, False))
 
 
 if __name__ == "__main__":
