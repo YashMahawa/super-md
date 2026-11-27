@@ -396,6 +396,10 @@ class StudioSavesTests(unittest.TestCase):
             Studio._after_flush(close_proxy, {"action": "close_window", "target": ""})
         self.assertEqual(scheduled, [(0, close_proxy.allowClose.emit)])
 
+        with patch.object(self.studio._python_jobs, "cancel_tab") as cancel_tab_mock:
+            self.studio._after_flush({"action": "reload_reader", "target": ""})
+        cancel_tab_mock.assert_called_once_with(self.studio.active)
+
 
 if __name__ == "__main__":
     unittest.main()

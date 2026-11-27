@@ -608,6 +608,98 @@ class AgentSetupInstructionsTests(unittest.TestCase):
                 app.processEvents()
                 shutil.rmtree(session.data, ignore_errors=True)
 
+    def test_set_agent_access_enabled_clears_cli_started_agent_access_flag(self):
+        from unittest.mock import Mock
+
+        bridge = Mock()
+        background = SimpleNamespace(_cli_started_agent_access=True)
+        proxy = SimpleNamespace(
+            session=SimpleNamespace(agent_bridge=bridge, background=background),
+            settings={"agentAccessEnabled": False, "cloudAgentEnabled": True},
+            _agent_error="stale",
+            _preferences=Mock(),
+            _emit=Mock(),
+        )
+        Studio.setAgentAccessEnabled(proxy, True)
+        bridge.start.assert_called_once()
+        self.assertFalse(background._cli_started_agent_access)
+        self.assertTrue(proxy.settings["agentAccessEnabled"])
+        self.assertTrue(proxy.settings["cloudAgentEnabled"])
+        self.assertEqual(proxy._agent_error, "")
+
+        background._cli_started_agent_access = True
+        Studio.setAgentAccessEnabled(proxy, False)
+        bridge.stop.assert_called_once()
+        self.assertFalse(background._cli_started_agent_access)
+        self.assertFalse(proxy.settings["agentAccessEnabled"])
+        self.assertFalse(proxy.settings["cloudAgentEnabled"])
+
+        proxy_no_bg = SimpleNamespace(
+            session=SimpleNamespace(agent_bridge=bridge, background=None),
+            settings={"agentAccessEnabled": False, "cloudAgentEnabled": False},
+            _agent_error="",
+            _preferences=Mock(),
+            _emit=Mock(),
+        )
+        Studio.setAgentAccessEnabled(proxy_no_bg, True)
+        self.assertTrue(proxy_no_bg.settings["agentAccessEnabled"])
+
+    def test_studio_agent_setup_module_boundary_honors_studio_patches_and_reexports(self):
+        from unittest.mock import Mock
+        import studio
+        import studio_agent_setup
+
+        self.assertFalse(hasattr(studio_agent_setup, "_studio_module"))
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            with patch.object(studio, "_normalize_mcp_roots", return_value=["/custom/approved-root"]):
+                delegated_cfg = studio.agent_mcp_setup_config(temp / "sessions")
+            self.assertIn("--root", delegated_cfg["args"])
+            self.assertIn("/custom/approved-root", delegated_cfg["args"])
+
+            guide_dest = temp / "guide.md"
+            skill_dest = temp / "skill.zip"
+            setup = json.dumps({"command": "/apps/super-md", "args": ["agent", "mcp", "--transport", "stdio"]})
+            proxy = SimpleNamespace(agentAccessEnabled=True, agentSetupInstructions=setup,
+                                    cloudAgentConfigured=True,
+                                    cloudConnectorUrl="https://relay.example.test/mcp/secret-connector-token",
+                                    _agent_error="", _agent_cloud_error="", message="",
+                                    _emit=lambda *args: None)
+            with patch("studio.atomic_write", side_effect=OSError("disk full")):
+                Studio.saveAgentSetupInstructions(proxy, str(guide_dest))
+                self.assertIn("OSError", proxy._agent_error)
+                self.assertFalse(guide_dest.exists())
+                proxy._agent_error = ""
+                self.assertFalse(Studio.exportAgentSkill(proxy, str(skill_dest)))
+                self.assertIn("OSError", proxy._agent_error)
+                self.assertFalse(skill_dest.exists())
+
+            fake_clipboard = Mock()
+            fake_gui_app = SimpleNamespace(clipboard=lambda: fake_clipboard)
+            with patch.object(studio, "QGuiApplication", fake_gui_app):
+                Studio.copyAgentSetupInstructions(proxy)
+                fake_clipboard.setText.assert_called_once_with(setup)
+                fake_clipboard.reset_mock()
+                Studio.copyCloudConnectorUrl(proxy)
+                fake_clipboard.setText.assert_called_once_with(proxy.cloudConnectorUrl)
+
+            captured_writes: list[tuple[Path, bytes]] = []
+            proxy._agent_error = ""
+            studio_agent_setup.save_agent_setup_instructions(
+                proxy,
+                "custom-guide",
+                atomic_write_fn=lambda path, raw: (captured_writes.append((path, raw)), path.write_bytes(raw)),
+                local_path_fn=lambda raw: temp / raw,
+            )
+            self.assertEqual(proxy._agent_error, "")
+            self.assertEqual(len(captured_writes), 1)
+            self.assertEqual(captured_writes[0][0], temp / "custom-guide.md")
+            guide_text = (temp / "custom-guide.md").read_text(encoding="utf-8")
+            self.assertIn(setup, guide_text)
+            self.assertIn("Copy MCP connector URL", guide_text)
+            self.assertNotIn("secret-connector-token", guide_text)
+            self.assertNotIn(proxy.cloudConnectorUrl, guide_text)
+
 
 if __name__ == "__main__":
     unittest.main()
