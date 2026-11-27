@@ -1,36 +1,48 @@
 """Focused regression suite for Desktop TabStrip snapshot slicing and delegate stability."""
+from __future__ import annotations
+
 import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import unittest
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
 DESKTOP = Path(__file__).resolve().parent
 if str(DESKTOP) not in sys.path:
     sys.path.insert(0, str(DESKTOP))
 
-from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPointF, Qt, QUrl
-from PySide6.QtGui import QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QGuiApplication
-from PySide6.QtQml import QQmlComponent, QQmlEngine
-from PySide6.QtQuick import QQuickItem
-from PySide6.QtQuickControls2 import QQuickStyle
-from PySide6.QtTest import QTest
-
-import folder_ops
-from studio import Session, Studio
-
 MAIN_QML = DESKTOP / "qml" / "Main.qml"
+_ISOLATED_HARNESS_ENV = "SUPERMD_TAB_STRIP_ISOLATED_HARNESS"
+_IS_ISOLATED_SUBPROCESS = os.environ.get(_ISOLATED_HARNESS_ENV) == "1"
 
+if _IS_ISOLATED_SUBPROCESS:
+    os.environ["QT_QUICK_CONTROLS_STYLE"] = "Material"
+    os.environ.pop("QT_STYLE_OVERRIDE", None)
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-class QuietStudio(Studio):
-    def _choose_default_python(self, emit=True):
-        self.python_status = "No Python interpreter configured."
+    from PySide6.QtCore import QEvent, QMimeData, QObject, QPoint, QPointF, Qt, QUrl
+    from PySide6.QtGui import QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QGuiApplication
+    from PySide6.QtQml import QQmlComponent, QQmlEngine
+    from PySide6.QtQuick import QQuickItem
+    from PySide6.QtQuickControls2 import QQuickStyle
+    from PySide6.QtTest import QTest
+
+    if QGuiApplication.instance() is not None:
+        raise RuntimeError("Isolated TabStrip QML harness requires a fresh process before QGuiApplication startup")
+    QQuickStyle.setStyle("Material")
+
+    import folder_ops
+    from studio import Session, Studio
+
+    class QuietStudio(Studio):
+        def _choose_default_python(self, emit=True):
+            self.python_status = "No Python interpreter configured."
 
 
 def _extract_qml_function(qml: str, signature: str) -> str:
@@ -145,13 +157,73 @@ ApplicationWindow {{
 
 
 class TabStripSnapshotSliceTest(unittest.TestCase):
+    _CASE_NAMES = (
+        "test_unrelated_snapshots_keep_tab_delegates_alive_and_skip_tabs_slice_reparsing",
+        "test_dirty_state_and_active_tab_update_in_actual_tab_strip_without_delegate_churn",
+        "test_reorder_close_reopen_and_detach_in_actual_tab_strip",
+        "test_folder_sidebar_rename_shortcut_uses_tabs_slice_for_in_folder_and_untitled_tabs",
+    )
+    _isolated_suite_outcomes: dict[str, dict[str, object]] | None = None
+    _isolated_suite_output: tuple[int, str, str] = (0, "", "")
+
     @classmethod
     def setUpClass(cls):
+        if not _IS_ISOLATED_SUBPROCESS:
+            cls._isolated_suite_outcomes = None
+            cls._isolated_suite_output = (0, "", "")
+            return
         if QGuiApplication.instance() is None:
             QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["TabStrip snapshot slice tests"])
+        if QQuickStyle.name().lower() != "material":
+            raise AssertionError(f"Expected Qt Quick Material style, got {QQuickStyle.name()!r}")
+
+    @classmethod
+    def _ensure_isolated_suite_ran(cls) -> None:
+        if cls._isolated_suite_outcomes is not None:
+            return
+        env = os.environ.copy()
+        env[_ISOLATED_HARNESS_ENV] = "1"
+        env["QT_QUICK_CONTROLS_STYLE"] = "Material"
+        env.pop("QT_STYLE_OVERRIDE", None)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env.setdefault("QT_QUICK_BACKEND", "software")
+        with tempfile.TemporaryDirectory(prefix="supermd-tabstrip-isolated-") as tmp_dir:
+            report_path = Path(tmp_dir) / "outcomes.json"
+            proc = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--isolated-suite", str(report_path)],
+                cwd=str(DESKTOP.parent),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            cls._isolated_suite_output = (proc.returncode, proc.stdout, proc.stderr)
+            if report_path.is_file():
+                cls._isolated_suite_outcomes = json.loads(report_path.read_text(encoding="utf-8"))
+            else:
+                cls._isolated_suite_outcomes = {}
+
+    def _run_isolated_case(self, case_name: str) -> None:
+        type(self)._ensure_isolated_suite_ran()
+        outcomes = type(self)._isolated_suite_outcomes or {}
+        returncode, stdout, stderr = type(self)._isolated_suite_output
+        outcome = outcomes.get(case_name)
+        if outcome is None or not outcome.get("ok"):
+            details = outcome.get("details", "") if isinstance(outcome, dict) else ""
+            self.fail(
+                f"Isolated Material QML harness failed for {case_name} (exit {returncode}):\n"
+                f"{details}\n--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+            )
+        if returncode != 0 and all(item.get("ok") for item in outcomes.values()):
+            self.fail(
+                f"Isolated Material QML harness exited non-zero ({returncode}) after {case_name}:\n"
+                f"--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}"
+            )
 
     def setUp(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            return
         self.session = Session(True)
         self.session.settings["welcomed"] = True
         self.session.settings["motion"] = False
@@ -207,6 +279,8 @@ class TabStripSnapshotSliceTest(unittest.TestCase):
         st._search_pool.shutdown(wait=True, cancel_futures=True)
 
     def tearDown(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            return
         data_dir = self.studio.data
         try:
             self._destroy_window(self.engine, self.window)
@@ -311,6 +385,11 @@ class TabStripSnapshotSliceTest(unittest.TestCase):
         return delegates
 
     def test_unrelated_snapshots_keep_tab_delegates_alive_and_skip_tabs_slice_reparsing(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            self._run_isolated_case(
+                "test_unrelated_snapshots_keep_tab_delegates_alive_and_skip_tabs_slice_reparsing"
+            )
+            return
         overview = self.workspace / "Overview.md"
         reading = self.workspace / "Reading.md"
         coursework = self.workspace / "Coursework"
@@ -429,6 +508,11 @@ class TabStripSnapshotSliceTest(unittest.TestCase):
         self.assertEqual(len(self._list_delegates(files_view)), 4)
 
     def test_dirty_state_and_active_tab_update_in_actual_tab_strip_without_delegate_churn(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            self._run_isolated_case(
+                "test_dirty_state_and_active_tab_update_in_actual_tab_strip_without_delegate_churn"
+            )
+            return
         overview = self.workspace / "Overview.md"
         reading = self.workspace / "Reading.md"
         portable_path = self.workspace / "Diagram.smd"
@@ -560,6 +644,9 @@ class TabStripSnapshotSliceTest(unittest.TestCase):
             self.assertLessEqual(active_item.x() + active_item.width() - 0.5, content_x + viewport_w)
 
     def test_reorder_close_reopen_and_detach_in_actual_tab_strip(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            self._run_isolated_case("test_reorder_close_reopen_and_detach_in_actual_tab_strip")
+            return
         overview = self.workspace / "Overview.md"
         reading = self.workspace / "Reading.md"
         week1 = self.workspace / "Coursework" / "Week 1.md"
@@ -729,6 +816,11 @@ class TabStripSnapshotSliceTest(unittest.TestCase):
         self.assertTrue(bool(self._note_tabs()[0].property("isActive")))
 
     def test_folder_sidebar_rename_shortcut_uses_tabs_slice_for_in_folder_and_untitled_tabs(self):
+        if not _IS_ISOLATED_SUBPROCESS:
+            self._run_isolated_case(
+                "test_folder_sidebar_rename_shortcut_uses_tabs_slice_for_in_folder_and_untitled_tabs"
+            )
+            return
         overview = self.workspace / "Overview.md"
         self.studio.openFolder(str(self.workspace))
         self.wait_until(lambda: len(self.studio.files) == 3)
@@ -757,5 +849,33 @@ class TabStripSnapshotSliceTest(unittest.TestCase):
         self._polish()
 
 
+def _run_isolated_suite_to_report(report_file: Path) -> int:
+    outcomes: dict[str, dict[str, object]] = {}
+    TabStripSnapshotSliceTest.setUpClass()
+    overall_ok = True
+    try:
+        for name in TabStripSnapshotSliceTest._CASE_NAMES:
+            single_result = unittest.TestResult()
+            TabStripSnapshotSliceTest(name)(single_result)
+            problems = [tb for _case, tb in (*single_result.failures, *single_result.errors)]
+            ok = single_result.wasSuccessful() and single_result.testsRun == 1
+            overall_ok = overall_ok and ok
+            outcomes[name] = {"ok": ok, "details": "\n".join(problems)}
+    finally:
+        TabStripSnapshotSliceTest.tearDownClass()
+    report_file.write_text(json.dumps(outcomes), encoding="utf-8")
+    return 0 if overall_ok else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--isolated-suite":
+        if not _IS_ISOLATED_SUBPROCESS:
+            raise SystemExit(f"--isolated-suite requires {_ISOLATED_HARNESS_ENV}=1")
+        raise SystemExit(_run_isolated_suite_to_report(Path(sys.argv[2])))
+    if len(sys.argv) == 3 and sys.argv[1] == "--isolated-case":
+        if not _IS_ISOLATED_SUBPROCESS:
+            raise SystemExit(f"--isolated-case requires {_ISOLATED_HARNESS_ENV}=1")
+        suite = unittest.TestSuite([TabStripSnapshotSliceTest(sys.argv[2])])
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        raise SystemExit(0 if result.wasSuccessful() else 1)
     unittest.main()
