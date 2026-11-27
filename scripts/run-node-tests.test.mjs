@@ -76,14 +76,8 @@ test('walks nested directories, skips node_modules and hidden directories, and f
   }
 });
 
-test('package.json default test targets shipping smd-core manifest and CI preserves artifact, release, and pixel gates', async () => {
-  const pkg = JSON.parse(await readFile(path.join(repoRoot, 'package.json'), 'utf8'));
-  assert.match(pkg.scripts.test, /\bvitest run\b/);
-  assert.match(pkg.scripts.test, /cargo test --manifest-path smd-core\/Cargo\.toml/);
-  assert.doesNotMatch(pkg.scripts.test, /src-tauri/);
-  assert.equal(pkg.scripts['test:scripts'], 'node scripts/run-node-tests.mjs');
-
-  const ci = await readFile(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
+function assertCiWorkflowGates(rawCi) {
+  const ci = rawCi.replace(/\r\n/g, '\n');
   assert.match(ci, /run:\s*npm run test:scripts/);
   assert.match(ci, /run:\s*npm test\b/);
   // Exact-source artifact, release, and presented-pixel gates remain intact.
@@ -94,4 +88,16 @@ test('package.json default test targets shipping smd-core manifest and CI preser
   assert.match(ci, /check_packaged\.py "\$binary" "\$version" --graphics software/);
   assert.match(ci, /:app:connectedDebugAndroidTest/);
   assert.match(ci, /name:\s*All release tests passed/);
+}
+
+test('package.json default test targets shipping smd-core manifest and CI preserves artifact, release, and pixel gates', async () => {
+  const pkg = JSON.parse(await readFile(path.join(repoRoot, 'package.json'), 'utf8'));
+  assert.match(pkg.scripts.test, /\bvitest run\b/);
+  assert.match(pkg.scripts.test, /cargo test --manifest-path smd-core\/Cargo\.toml/);
+  assert.doesNotMatch(pkg.scripts.test, /src-tauri/);
+  assert.equal(pkg.scripts['test:scripts'], 'node scripts/run-node-tests.mjs');
+
+  const ci = await readFile(path.join(repoRoot, '.github', 'workflows', 'ci.yml'), 'utf8');
+  assertCiWorkflowGates(ci);
+  assertCiWorkflowGates(ci.replace(/\r?\n/g, '\r\n'));
 });
