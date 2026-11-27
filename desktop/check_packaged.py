@@ -87,6 +87,18 @@ def check(executable: Path, version: str, graphics: str) -> None:
         packed = json.loads(gzip.decompress(encoded))
         if packed["format"] != "supermd-smd" or len(packed["assets"]) != 1:
             raise RuntimeError("Portable CLI did not produce a valid note")
+        unpacked = root.resolve() / "Unpacked note"
+        run("unpack", portable, unpacked)
+        unpacked_md = unpacked / "Fresh machine.md"
+        unpacked_svg = unpacked / "assets/image-1.svg"
+        if not unpacked_md.is_file() or not unpacked_svg.is_file():
+            raise RuntimeError("Packaged unpack CLI did not extract Markdown and companion asset")
+        if unpacked_svg.read_bytes() != (root / "figure.svg").read_bytes():
+            raise RuntimeError("Packaged unpack CLI did not preserve companion asset bytes")
+        overwrite = subprocess.run([str(executable), "unpack", str(portable), str(unpacked)],
+                                   env=env, capture_output=True, text=True, timeout=30)
+        if overwrite.returncode == 0:
+            raise RuntimeError("Packaged unpack CLI must refuse to overwrite existing output")
         run("export", portable, pdf)
         legacy = root / "Legacy portable.fmd"
         legacy.write_text(json.dumps({**packed, "format":"supermd-fmd"}), encoding="utf-8")
