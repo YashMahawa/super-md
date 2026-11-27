@@ -370,6 +370,8 @@ test('section export prepares MD, SMD and PDF with only selected text and needed
   await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
   await page.evaluate(value=>window.supermdLoad?.(value),{id:'agent-section-export-e2e',path:'/tmp/section-export.md',content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
   await expect(page.getByRole('heading',{name:'Selected Section',exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Load image'}).click();
+  await expect(page.getByRole('img',{name:'selected photo'})).toBeVisible();
   const before=await agent(page,{action:'get_context',tabId:'agent-section-export-e2e'});
   const reading=page.locator('.android-reading');await reading.evaluate(element=>{element.scrollTop=100;});
   await page.waitForTimeout(50);
