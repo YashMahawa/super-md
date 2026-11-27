@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { normalizeReadingContext, viewportContexts } from "./preview.js";
+import { boundedProperties, normalizeReadingContext, viewportContexts } from "./preview.js";
 import { isValidCompatPortableAssetName, isValidPortableAssetName, validateRpcRequest } from "./protocol.js";
 import {
   CREATE_SAVE_FORMATS, DIAGRAM_ID_RE, EXPORT_FORMATS, IMAGE_FORMATS, IMAGE_QUALITIES, MAX_ASSET_BASE64_CHARS,
@@ -121,4 +121,21 @@ test("preview.ts normalizers match viewCurrent.fixtures in docs/agent-contract.j
       if ("expectedContextRevisionMatches" in fixture) assert.equal(captured.captureContext.contextRevisionMatches, fixture.expectedContextRevisionMatches, String(fixture.name));
     }
   }
+  const propsSpec = contract.viewCurrent.properties;
+  const bounded = boundedProperties({
+    title: "t".repeat(propsSpec.titleMaxChars + 50),
+    author: "a".repeat(propsSpec.authorMaxChars + 50),
+    authors: Array.from({ length: propsSpec.maxAuthors + 5 }, (_, i) => `au${i}_` + "x".repeat(propsSpec.authorItemMaxChars)),
+    tags: Array.from({ length: propsSpec.maxTags + 5 }, (_, i) => `tg${i}_` + "y".repeat(propsSpec.tagItemMaxChars)),
+    subtitle: "hidden",
+    date: "2026-03-15",
+    aliases: ["hidden"],
+  }) ?? {};
+  assert.deepEqual(Object.keys(bounded).sort(), [...propsSpec.allowedKeys].sort());
+  assert.equal((bounded.title as string).length, propsSpec.titleMaxChars);
+  assert.equal((bounded.author as string).length, propsSpec.authorMaxChars);
+  assert.equal((bounded.authors as string[]).length, propsSpec.maxAuthors);
+  assert.equal((bounded.authors as string[])[0]?.length, propsSpec.authorItemMaxChars);
+  assert.equal((bounded.tags as string[]).length, propsSpec.maxTags);
+  assert.equal((bounded.tags as string[])[0]?.length, propsSpec.tagItemMaxChars);
 });

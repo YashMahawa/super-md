@@ -218,7 +218,9 @@ export function registerTools(server: McpServer, group: Group, deps: RelayTransp
       const capture = viewportContexts(image, tab, context.revision);
       captureContext = capture.captureContext;
       if (capture.capturedReadingContext) {
-        finalReadingContext = { ...capture.capturedReadingContext, ...(readingContext.properties && !capture.capturedReadingContext.properties ? { properties: readingContext.properties } : {}) };
+        finalReadingContext = readingContext.properties && !capture.capturedReadingContext.properties
+          ? { ...capture.capturedReadingContext, properties: readingContext.properties }
+          : capture.capturedReadingContext;
         readingContextSource = "viewport_capture";
         readingContextAlignedWithCapture = true;
       } else {
