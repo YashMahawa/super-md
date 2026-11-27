@@ -26,12 +26,15 @@ class ResizeObserverMock {
   disconnect() {}
 }
 Object.assign(globalThis, { ResizeObserver: ResizeObserverMock });
-if (typeof ElementInternals !== "undefined") {
-  ElementInternals.prototype.setFormValue ??= () => {};
-  ElementInternals.prototype.setValidity ??= () => {};
-  ElementInternals.prototype.checkValidity ??= () => true;
-  ElementInternals.prototype.reportValidity ??= () => true;
-}
+const attachInternals = HTMLElement.prototype.attachInternals;
+vi.spyOn(HTMLElement.prototype, "attachInternals").mockImplementation(function (this: HTMLElement) {
+  const internals = attachInternals.call(this);
+  internals.setFormValue ??= () => {};
+  internals.setValidity ??= () => {};
+  internals.checkValidity ??= () => true;
+  internals.reportValidity ??= () => true;
+  return internals;
+});
 
 describe("App note-scoped remote image consent across background saves and tab switches", () => {
   let root: Root | null = null;
