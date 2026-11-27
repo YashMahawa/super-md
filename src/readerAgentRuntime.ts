@@ -14,6 +14,7 @@ import { prepareFmd } from "./documentMedia";
 import { prepareMarkdownExport } from "./markdownExport";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import type { NoteHistory } from "./noteHistory";
+import type { NoteRemoteImageConsentStore } from "./remoteImageConsent";
 import type { AnchorViewMode } from "./sourceAnchor";
 
 declare global {
@@ -75,10 +76,11 @@ export interface UseReaderAgentRuntimeOptions {
   zoomReference: RefObject<number>;
   histories: RefObject<Map<string, NoteHistory>>;
   trustedHostsRef: RefObject<string[]>;
+  noteImageConsent: RefObject<NoteRemoteImageConsentStore>;
   update: (content: string) => void;
 }
 
-export function useReaderAgentRuntime({ reference, edits, zoomReference, histories, trustedHostsRef, update }: UseReaderAgentRuntimeOptions): void {
+export function useReaderAgentRuntime({ reference, edits, zoomReference, histories, trustedHostsRef, noteImageConsent, update }: UseReaderAgentRuntimeOptions): void {
   useLayoutEffect(() => {
     const MAX_AGENT_QUEUE = 16;
     let active = false, disposed = false;
@@ -397,7 +399,8 @@ export function useReaderAgentRuntime({ reference, edits, zoomReference, histori
         const archive = format === "mdzip" || rawArchive === true;
         const hasSection = Object.prototype.hasOwnProperty.call(suppliedOptions, "section"), section = hasSection ? agentSectionForExport(note.content, suppliedOptions.section) : undefined;
         const exportContent = section?.text ?? note.content, { section: _section, archive: _archive, ...exportOptions } = suppliedOptions;
-        const prepared = format === "pdf" ? await preparePdf(exportContent, note.path, note.python || "embedded", { trustedImageHosts: trustedHostsRef.current }) : format === "smd" ? await prepareFmd(exportContent, note.path) : await prepareMarkdownExport(exportContent, note.path, { compatible: archive, python: note.python || "embedded" });
+        const consentPolicy = noteImageConsent.current.policy(note.id, trustedHostsRef.current);
+        const prepared = format === "pdf" ? await preparePdf(exportContent, note.path, note.python || "embedded", consentPolicy) : format === "smd" ? await prepareFmd(exportContent, note.path, consentPolicy) : await prepareMarkdownExport(exportContent, note.path, { compatible: archive, python: note.python || "embedded" });
         if (reference.current?.id !== note.id || reference.current.content !== note.content) throw Error("Revision conflict: the note changed while preparing the export");
         const result = await invoke<Record<string, unknown>>("agent_export_native", { ...prepared, id: note.id, expectedRevision: revision, requestId: request.requestId, format: archive ? "mdzip" : format, ...(archive ? { archive: true } : {}), filename: request.filename, options: exportOptions });
         return section ? { ...result, sectionStart: section.sectionStart, sectionEnd: section.sectionEnd, documentLength: section.documentLength } : result;
