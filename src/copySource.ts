@@ -17,18 +17,18 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   const startElement=elementAt(range.startContainer), endElement=elementAt(range.endContainer);
   if (!startElement?.closest(".markdown-body,.live-document") || !endElement?.closest(".markdown-body,.live-document")) return null;
   if (startElement.closest("textarea,input,.cm-editor") || endElement.closest("textarea,input,.cm-editor")) return null;
-  const startProps=startElement.closest("[data-frontmatter-properties],.document-properties");
+  const startProps=startElement.closest("[data-frontmatter-properties],.document-properties,.live-frontmatter");
   if (startProps) {
     if (startProps.contains(range.endContainer)) return null;
     const afterProps=document.createRange();
     afterProps.setStartAfter(startProps);
     afterProps.setEnd(range.endContainer,range.endOffset);
-    if (!afterProps.toString().trim() && !afterProps.cloneContents().querySelector("img,hr,input,.katex,[data-windowed-mounted='false']")) return null;
+    if (!afterProps.toString().trim() && !afterProps.cloneContents().querySelector("img,hr,input,.katex,[data-math-source],[data-math-inline-source],[data-source-tex],[data-windowed-mounted='false']")) return null;
   }
   if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties,.live-frontmatter")) return null;
   const atomicAt=(node:Node)=>{
     const el=elementAt(node);
-    return el?.closest(".katex-display") || el?.closest(".katex") || el?.closest('[data-windowed-mounted="false"]');
+    return el?.closest("[data-math-source]") || el?.closest("[data-math-inline-source]") || el?.closest("[data-source-tex]") || el?.closest(".katex-display") || el?.closest(".katex") || el?.closest('[data-windowed-mounted="false"]');
   };
   const start=atomicAt(range.startContainer), end=atomicAt(range.endContainer);
   if(start)range.setStartBefore(start);if(end)range.setEndAfter(end);
@@ -72,7 +72,10 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       const from=Number(node.getAttribute('data-source-start')),to=Number(node.getAttribute('data-source-end'));
       if(Number.isFinite(from)&&Number.isFinite(to)&&to>from)return source.slice(from,to)+'\n\n';
     }
-    if(node.matches("button,.image-edit-tools,.katex-mathml,[data-frontmatter-properties],.document-properties,.live-frontmatter"))return "";
+    if(node.matches("button,.image-edit-tools,.katex-mathml,.math-equation-extra-anchor,[data-frontmatter-properties],.document-properties,.live-frontmatter"))return "";
+    if(node.hasAttribute("data-source-tex"))return node.getAttribute("data-source-tex")||"";
+    if(node.hasAttribute("data-math-inline-source"))return `$${node.getAttribute("data-math-inline-source")||""}$`;
+    if(node.hasAttribute("data-math-source"))return `\n$$\n${node.getAttribute("data-math-source")||""}\n$$\n`;
     if(node.matches(".katex-display,.katex")){const tex=node.querySelector('annotation[encoding="application/x-tex"]')?.textContent;if(tex)return node.matches(".katex-display")?`\n$$\n${tex}\n$$\n`:`$${tex}$`;}
     if(node.tagName==="TABLE"){
       const rows=Array.from(node.querySelectorAll("tr")).filter(row=>row.closest("table")===node).map(row=>Array.from(row.children).filter(cell=>/^(TH|TD)$/.test(cell.tagName)).map(cell=>Array.from(cell.childNodes).map(child=>serialize(child,true)).join("").trim().replace(/\n+/g,"<br>"))).filter(row=>row.length>0);
@@ -103,7 +106,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       case "sup":return /\s/.test(content)?`<sup>${content}</sup>`:`^${content}^`;
       case "kbd":return `<kbd>${content}</kbd>`;
       case "u":return `<u>${content}</u>`;
-      case "a":return `[${content}](${node.getAttribute("href")||""})`;
+      case "a":return `[${content}](${node.getAttribute("data-source-href")||node.getAttribute("href")||""})`;
       case "pre":return `\n\`\`\`${node.querySelector("code")?.className.match(/language-([\w-]+)/)?.[1]||""}\n${content.trimEnd()}\n\`\`\`\n`;
       case "p":case "div":case "section":return `${content}\n\n`;
       case "li":return `${node.parentElement?.tagName==='OL'?`${listNumber(node)}.`:'-'} ${content}\n`;

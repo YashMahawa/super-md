@@ -2,6 +2,7 @@
 import {afterEach,expect,it} from "vitest";
 import {renderToStaticMarkup} from "react-dom/server";
 import MarkdownPreview from "./components/MarkdownPreview";
+import LiveEditor from "./components/LiveEditor";
 import {extractSelectedText,hasSelectedText,selectedMarkdown,setSelectedMarkdownDrag} from "./copySource";
 import {readingMatches} from "./components/ReadingSearch";
 afterEach(()=>{
@@ -168,7 +169,7 @@ it("extracts source-aware text across rendered math, offscreen blocks, live text
   delete window.supermdSelectedText;
   vhost.remove();host.remove();
 });
-it("excludes document properties header labels and badges from copied Markdown and reader search",()=>{
+it("excludes document properties header from copied Markdown while indexing only displayed title, author, and tags in reader search",()=>{
   const markdown="---\ntitle: Hidden Header Title\nauthor: Emmy Noether\ndate: 2026-03-15\ntags: [algebra, invariants]\n...\n\n# Opening Section\n\nFirst **important** sentence.";
   const host=document.createElement("div");
   host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false}/>);
@@ -245,8 +246,11 @@ it("excludes document properties header labels and badges from copied Markdown a
   expect(extractSelectedText({source:soloMarkdown})).toContain("Solo Metadata");
   soloHost.remove();
 
-  expect(readingMatches(article,"Hidden Header Title")).toEqual([]);
+  expect(readingMatches(article,"Hidden Header Title").map(r=>r.toString())).toEqual(["Hidden Header Title"]);
+  expect(readingMatches(article,"Emmy Noether").map(r=>r.toString())).toEqual(["Emmy Noether"]);
+  expect(readingMatches(article,"invariants").map(r=>r.toString())).toEqual(["invariants"]);
   expect(readingMatches(article,"Author")).toEqual([]);
+  expect(readingMatches(article,"2026-03-15")).toEqual([]);
   expect(readingMatches(article,"important").map(r=>r.toString())).toEqual(["important"]);
   selection.removeAllRanges();
   host.remove();
@@ -262,4 +266,58 @@ it("serializes highlight, subscript, superscript, kbd, underline, and strikethro
   range.setStart(markText,0);range.setEnd(markText,3);selection.removeAllRanges();selection.addRange(range);
   expect(selectedMarkdown(selection)).toBe("==key==");
   selection.removeAllRanges();host.remove();
+});
+it("integrates Live frontmatter copy fallback and exclusion with #119 metadata spans and #109 tagged equation copy",()=>{
+  const markdown=[
+    "---",
+    "title: Variational Mechanics",
+    "author: Emmy Noether",
+    "date: 2026-03-15",
+    "tags: [symmetries, conservation]",
+    "cssclasses: [wide]",
+    "---",
+    "",
+    "See \\eqref{eq:action} and Equation \\ref{eq:action}:",
+    "",
+    "$$",
+    "S[q] = \\int_{t_1}^{t_2} L(q, \\dot{q})\\,dt \\tag{1}\\label{eq:action}",
+    "$$",
+  ].join("\n");
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<LiveEditor markdown={markdown} documentPath={null} python="" dark={false} onChange={()=>{}}/>);
+  document.body.append(host);
+  const liveRoot=host.querySelector(".live-document") as HTMLElement;
+  const fmShell=host.querySelector(".live-frontmatter")!;
+  expect(fmShell).not.toBeNull();
+
+  // #119 metadata spans match only displayed title, author, and tags inside LiveFrontmatterShell
+  expect(readingMatches(liveRoot,"Variational Mechanics").map(r=>r.toString())).toEqual(["Variational Mechanics"]);
+  expect(readingMatches(liveRoot,"Emmy Noether").map(r=>r.toString())).toEqual(["Emmy Noether"]);
+  expect(readingMatches(liveRoot,"symmetries").map(r=>r.toString())).toEqual(["symmetries"]);
+  expect(readingMatches(liveRoot,"2026-03-15")).toEqual([]);
+  expect(readingMatches(liveRoot,"cssclasses")).toEqual([]);
+  expect(readingMatches(liveRoot,"wide")).toEqual([]);
+
+  const selection=window.getSelection()!;
+  const customVal=Array.from(fmShell.querySelectorAll(".document-property-value")).find(el=>el.textContent==="wide")!;
+  const customRange=document.createRange();
+  customRange.selectNodeContents(customVal);
+  selection.removeAllRanges();
+  selection.addRange(customRange);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toBe("wide");
+
+  // Full Live document copy excludes .live-frontmatter while restoring #109 \eqref, \ref, \tag, and \label LaTeX source
+  const allRange=document.createRange();
+  allRange.selectNodeContents(liveRoot);
+  selection.removeAllRanges();
+  selection.addRange(allRange);
+  const copied=selectedMarkdown(selection,markdown);
+  expect(copied).not.toContain("Variational Mechanics");
+  expect(copied).not.toContain("Emmy Noether");
+  expect(copied).not.toContain("cssclasses");
+  expect(copied).toContain("See \\eqref{eq:action} and Equation \\ref{eq:action}:");
+  expect(copied).toContain("\\tag{1}\\label{eq:action}");
+  selection.removeAllRanges();
+  host.remove();
 });

@@ -44,7 +44,19 @@ Pane {
         onAccepted: studio.clearStorageCategory(page.pendingCleanup)
         contentItem: Label { width: 360; wrapMode: Text.WordWrap; text: page.pendingCleanup === "execution-results" ? "Remove app-generated Python result previews. Saved notes, exported images and recovery data will not be touched. This cannot be undone." : "Remove cached update verification/download state. Installed versions and Downloads outside app storage remain unchanged. This cannot be undone." }
     }
-    Component.onCompleted: studio.refreshPython()
+    property bool completed: false
+    property bool pythonScanned: false
+    readonly property bool pythonSectionVisible: page.section === "python" && (page.ownerPopup ? page.ownerPopup.visible : page.visible)
+    function ensurePythonScanned() {
+        if (!page.completed || page.pythonScanned || !page.pythonSectionVisible) return
+        page.pythonScanned = true
+        studio.refreshPython()
+    }
+    onPythonSectionVisibleChanged: ensurePythonScanned()
+    Component.onCompleted: {
+        page.completed = true
+        ensurePythonScanned()
+    }
     ColumnLayout {
         anchors.fill: parent
         anchors.margins: 28
@@ -231,9 +243,13 @@ Pane {
                 Label { text: "On startup" }
                 ChoiceField { Layout.fillWidth: true; model: ["Restore previous tabs","Open a new blank note"]; currentIndex: viewState.settings.startup === "new" ? 1 : 0; onActivated: page.save("startup", currentIndex === 1 ? "new" : "restore") }
                 Label { text: "Unsaved drafts are recovered in either mode. Welcome is shown only on first use."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Switch { objectName: "keepInBackgroundSwitch"; text: "Keep running in the system tray when windows close"; checked: viewState.settings.keepInBackground === true; onToggled: page.save("keepInBackground", checked) }
+                Label { text: "Off by default. Closing the last window quits Super MD and revokes temporary agent tokens. When on, closing the last window hides it to the system tray and suspends live agent access until reopened."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "New note location"; font.weight: Font.DemiBold }
                 ActionButton { Layout.fillWidth: true; text: viewState.settings.newNoteLocation || "Downloads"; glyph: "FolderOpen"; tonal: true; onClicked: studio.chooseNoteLocation(); ToolTip.text: viewState.settings.newNoteLocation || "Downloads" }
                 Label { text: "New notes stay recoverable until you choose a file. Empty untitled notes are discarded."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
+                Switch { objectName: "writingHideNonNoteFolders"; text: "Hide folders without notes"; checked: viewState.settings.hideNonNoteFolders !== false; onToggled: page.save("hideNonNoteFolders", checked) }
+                Label { text: "Ignores subfolders that contain only files other than .md, .smd or .txt, or no files at all."; Layout.fillWidth: true; wrapMode: Text.WordWrap; color: viewState.colors.muted }
                 Label { text: "Writing assistance"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
                 Switch { text: "Spell check"; checked: viewState.settings.spellCheck; onToggled: page.save("spellCheck", checked) }
                 Switch { text: "Grammar check"; checked: viewState.settings.grammarCheck; onToggled: page.save("grammarCheck", checked) }
@@ -246,6 +262,7 @@ Pane {
                 }
                 ColumnLayout {
                     visible: page.section === "python"
+                    onVisibleChanged: page.ensurePythonScanned()
                     Layout.fillWidth: true
                     spacing: 16
                 Label { text: "Python"; font.pixelSize: 22; font.weight: Font.DemiBold; Layout.topMargin: 12 }
@@ -298,7 +315,7 @@ Pane {
                     Layout.fillWidth: true
                     spacing: 8
                     ActionButton { objectName: "setupPython"; text: "Set up Python"; glyph: "DownloadSimple"; prominent: !page.pythonReady; tonal: page.pythonReady; enabled: !studio.pythonBusy; ToolTip.text: "Creates a private Python environment with numpy and matplotlib"; onClicked: studio.setupPython() }
-                    ActionButton { text: "Scan again"; glyph: "ArrowClockwise"; tonal: true; enabled: !studio.pythonBusy; onClicked: studio.refreshPython() }
+                    ActionButton { objectName: "rescanPython"; text: "Scan again"; glyph: "ArrowClockwise"; tonal: true; enabled: !studio.pythonBusy; onClicked: { page.pythonScanned = true; studio.refreshPython() } }
                 }
                 Label { text: "Custom interpreter path"; Layout.topMargin: 4 }
                 TextField { objectName: "pythonPath"; Layout.fillWidth: true; text: viewState.settings.python === "bundled" ? "" : viewState.settings.python; placeholderText: studio.pythonBundled ? "Using built-in Python" : "/path/to/venv/bin/python"; selectByMouse: true; onEditingFinished: if (text.trim().length && text.trim() !== viewState.settings.python) page.save("python", text.trim()) }

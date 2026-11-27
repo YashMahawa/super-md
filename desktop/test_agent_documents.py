@@ -273,6 +273,9 @@ class AgentDocumentsTest(unittest.TestCase):
             self.store.search("search-contract.md", "w.+d", regex=True)
         direct = search_source(source, "ward", 2, 0, 16, True, True, False, True)
         self.assertEqual(direct["matches"], second["matches"])
+        braced = "Lead token\n```{.mermaid, fig-width=6}\ntoken --> B\n```\ntrailing token"
+        braced_hits = search_source(braced, "token", 10, 0, 0, False, True, False, True)
+        self.assertEqual([item["matchOffset"] for item in braced_hits["matches"]], [5, 63])
         span = diagram_spans(source)[0]
         self.assertEqual(source[span["start"]:span["end"]], "Ward --> X\n")
 
@@ -314,6 +317,11 @@ class AgentDocumentsTest(unittest.TestCase):
         attached = self.store.attach_asset("portable.smd", "图形 with space.svg", expected_revision=revision)
         self.assertRegex(attached["asset"]["name"], r"^assets/[A-Za-z0-9._-]+\.svg$")
         revision = attached["revision"]
+        for bad_name in ("a" * 147 + ".png", "a" * 155 + ".png", "a" * 147, ".", ".."):
+            with self.assertRaisesRegex(AgentDocumentError, "simple filename"):
+                self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name=bad_name)
+        max_attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name="a" * 146 + ".png")
+        revision = max_attached["revision"]
         attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision)
         output = self.root / "extracted.png"
         extracted = self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
@@ -323,6 +331,66 @@ class AgentDocumentsTest(unittest.TestCase):
         with self.assertRaises(RevisionConflict):
             self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
                                      expected_revision=attached["revision"])
+
+    def test_existing_151_to_159_char_bundle_opens_exports_and_resaves_without_losing_asset_or_reference(self):
+        from agent_exports import export_pdf, export_smd, find_engine
+        from markdown_export import write_markdown_export, write_markdown_zip
+        import zipfile
+
+        svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><rect width='32' height='16' fill='#386a57'/></svg>"
+        svg_url = "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
+        compat_key = "assets/" + ("a" * 155) + ".svg"
+        self.assertEqual(len(compat_key.removeprefix("assets/")), 159)
+        markdown = f"# Legacy Bundle\n\n![Diagram](<{compat_key}>)\n"
+        legacy_path = self.root / "legacy.smd"
+        legacy_path.write_bytes(compressed_bundle(markdown, {compat_key: svg_url}))
+
+        # 1. Open and inspect existing bundle with 159-char basename.
+        info = self.store.inspect("legacy.smd")
+        self.assertEqual(info["asset_count"], 1)
+        read_res = self.store.read("legacy.smd", view="source")
+        self.assertEqual(read_res["text"], markdown)
+        asset_res = self.store.read_asset("legacy.smd", compat_key, expected_revision=info["revision"])
+        self.assertEqual(asset_res["data"], svg_bytes)
+
+        # 2. Export existing bundle to portable .smd, Markdown + companion folder, Markdown ZIP, and PDF.
+        export_smd(self.store, "legacy.smd", "exported-copy.smd")
+        exported_md, exported_assets, exported_portable = self.store._load(self.root / "exported-copy.smd")[:3]
+        self.assertTrue(exported_portable)
+        self.assertEqual(exported_md, markdown)
+        self.assertEqual(exported_assets, {compat_key: svg_url})
+
+        md_dir = self.root / "md-export"
+        md_dir.mkdir()
+        write_markdown_export(md_dir / "legacy.md", markdown, {compat_key: svg_url})
+        self.assertEqual((md_dir / "legacy.md").read_text(encoding="utf-8"), markdown)
+        self.assertEqual((md_dir / compat_key).read_bytes(), svg_bytes)
+
+        zip_path = self.root / "legacy-export.zip"
+        write_markdown_zip(zip_path, markdown, {compat_key: svg_url})
+        with zipfile.ZipFile(zip_path) as archive:
+            self.assertEqual(archive.read("legacy-export.md").decode("utf-8"), markdown)
+            self.assertEqual(archive.read(compat_key), svg_bytes)
+
+        try:
+            engine = find_engine()
+        except AgentDocumentError:
+            engine = None
+        if engine is not None:
+            export_pdf(self.store, "legacy.smd", "legacy.pdf", engine=engine)
+            self.assertTrue((self.root / "legacy.pdf").read_bytes().startswith(b"%PDF-"))
+
+        # 3. Edit and re-save existing bundle without losing its 159-char asset or Markdown reference.
+        patched = self.store.patch(
+            "legacy.smd",
+            expected_revision=info["revision"],
+            operations=[{"type": "replace", "old": "# Legacy Bundle", "new": "# Legacy Bundle\n\nRe-saved note body."}],
+        )
+        reopened_text = self.store.read("legacy.smd", view="source")["text"]
+        self.assertIn(f"![Diagram](<{compat_key}>)", reopened_text)
+        self.assertIn("Re-saved note body.", reopened_text)
+        reopened_asset = self.store.read_asset("legacy.smd", compat_key, expected_revision=patched["revision"])
+        self.assertEqual(reopened_asset["data"], svg_bytes)
 
     def test_explicit_asset_read_returns_exact_bytes_only_for_current_revision(self):
         payload = "<svg xmlns='http://www.w3.org/2000/svg'><text>Σ</text></svg>".encode("utf-8")
@@ -648,6 +716,273 @@ class AgentDocumentsTest(unittest.TestCase):
             self.assertLessEqual(small_store._cache_bytes, 8_000)
         self.assertGreaterEqual(len(small_store._cache), 1)
         self.assertLess(len(small_store._cache), 6)
+
+    def test_single_pass_fence_boundary_scan_across_headings_svg_and_diagrams(self):
+        import agent_documents
+        from unittest.mock import patch
+
+        source = (
+            "😀 Intro line\n"
+            "# Section One\n"
+            "```svg\n"
+            "# Fenced SVG heading\n"
+            "<svg><text>needle</text></svg>\n"
+            "```\n"
+            "~~~mermaid\n"
+            "graph TD; A[needle] --> B\n"
+            "~~~\n"
+            "````\n"
+            "\n"
+            "  <SVG viewBox='0 0 8 8'><rect/></SVG>\n"
+            "````\n"
+            "## Section Two\n"
+            "Visible needle after diagrams.\n"
+        )
+        line_count = len(source.splitlines(keepends=True))
+        (self.root / "single-pass.md").write_bytes(source.encode("utf-8"))
+
+        with patch(
+            "agent_documents._step_fence_boundary",
+            wraps=agent_documents._step_fence_boundary,
+        ) as step_spy:
+            spans = diagram_spans(source)
+            self.assertEqual(step_spy.call_count, line_count)
+
+            step_spy.reset_mock()
+            inline_spans = diagram_spans(source, include_inline_svg=True)
+            self.assertEqual(step_spy.call_count, line_count)
+            self.assertEqual(inline_spans, spans)
+
+            step_spy.reset_mock()
+            svg_only = agent_documents._svg_spans(source)
+            self.assertEqual(step_spy.call_count, line_count)
+            self.assertEqual(len(svg_only), 2)
+
+            step_spy.reset_mock()
+            prose_section = self.store.read("single-pass.md", heading="Section One", view="prose")
+            self.assertEqual(step_spy.call_count, line_count)
+            self.assertEqual(len(prose_section["svg_omissions"]), 2)
+            self.assertNotIn("Fenced SVG heading", prose_section["text"])
+
+            # Plain unfenced Markdown skips fence-boundary regex checks altogether.
+            step_spy.reset_mock()
+            plain = "# Plain\nNo fences here 😀\n## Child\nBody\n"
+            self.assertEqual(diagram_spans(plain), [])
+            self.assertEqual(agent_documents._svg_spans(plain), [])
+            self.assertEqual([h["title"] for h in _headings(plain)], ["Plain", "Child"])
+            self.assertEqual(step_spy.call_count, 0)
+
+        self.assertEqual(len(spans), 3)
+        self.assertEqual(
+            [source[item["start"]:item["end"]] for item in spans],
+            [
+                "# Fenced SVG heading\n<svg><text>needle</text></svg>\n",
+                "graph TD; A[needle] --> B\n",
+                "\n  <SVG viewBox='0 0 8 8'><rect/></SVG>\n",
+            ],
+        )
+
+    def test_fence_scans_preserve_crlf_unicode_mixed_markers_and_unclosed_fences(self):
+        import agent_documents
+
+        prefix = ("😀" * 40) + "\r\n"
+        h1 = "# 1. Overview 🧭\r\n"
+        mixed_svg = (
+            "````svg\r\n"
+            "~~~\r\n"
+            "```\r\n"
+            "# Still inside 4-backtick SVG\r\n"
+            "<svg><text>needle 𝕏</text></svg>\r\n"
+            "`````\r\n"
+        )
+        tilde_chart = (
+            "   ~~~~smd-chart\r\n"
+            "```\r\n"
+            "~~~\r\n"
+            "# Still inside 4-tilde chart\r\n"
+            "{\"series\": [\"needle\"]}\r\n"
+            "~~~~\r\n"
+        )
+        indented_non_fence = (
+            "    ```svg\r\n"
+            "    <svg><text>indented code block, not fence</text></svg>\r\n"
+            "    ```\r\n"
+        )
+        inline_svg = "Before <svg viewBox='0 0 4 4'><text>needle</text></svg> middle\r\n"
+        h2 = "## 2. Unclosed Tail\r\n"
+        unclosed_mermaid_open = "~~~mermaid\r\n"
+        unclosed_mermaid_body = "# Ignored trailing heading\r\ngraph LR; X[needle] --> Y"
+        source = (
+            prefix
+            + h1
+            + mixed_svg
+            + tilde_chart
+            + indented_non_fence
+            + inline_svg
+            + "needle outside\r\n"
+            + h2
+            + unclosed_mermaid_open
+            + unclosed_mermaid_body
+        )
+
+        # Public _headings (without internal start) and outline_source (with exclusive sectionEnd).
+        public_headings = _headings(source)
+        self.assertEqual(
+            public_headings,
+            [
+                {"index": 0, "level": 1, "title": "1. Overview 🧭", "line": 2},
+                {"index": 1, "level": 2, "title": "2. Unclosed Tail", "line": 20},
+            ],
+        )
+        outline = outline_source(source)["headings"]
+        expected_h1_start = len(prefix)
+        expected_h2_start = source.index(h2)
+        self.assertEqual(outline[0]["sectionStart"], expected_h1_start)
+        self.assertEqual(outline[0]["sectionEnd"], len(source))
+        self.assertEqual(outline[1]["sectionStart"], expected_h2_start)
+        self.assertEqual(outline[1]["sectionEnd"], len(source))
+
+        # SVG spans keep exclusive code-point end offsets and 1-based inclusive line bounds.
+        svg_spans = agent_documents._svg_spans(source)
+        expected_svg_body = (
+            "~~~\r\n"
+            "```\r\n"
+            "# Still inside 4-backtick SVG\r\n"
+            "<svg><text>needle 𝕏</text></svg>\r\n"
+        )
+        self.assertEqual(
+            svg_spans,
+            [{
+                "start": source.index(expected_svg_body),
+                "end": source.index(expected_svg_body) + len(expected_svg_body),
+                "line_start": 4,
+                "line_end": 7,
+            }],
+        )
+
+        # diagram_spans covers mixed-marker SVG, smd-chart, and unclosed mermaid; inline SVG respects fences.
+        fenced_only = diagram_spans(source)
+        expected_chart_body = (
+            "```\r\n"
+            "~~~\r\n"
+            "# Still inside 4-tilde chart\r\n"
+            "{\"series\": [\"needle\"]}\r\n"
+        )
+        self.assertEqual(
+            [source[s["start"]:s["end"]] for s in fenced_only],
+            [expected_svg_body, expected_chart_body, unclosed_mermaid_body],
+        )
+        self.assertEqual(fenced_only[-1]["end"], len(source))
+
+        # Search excluding diagrams keeps exact non-BMP + CRLF code-point offsets.
+        filtered = search_source(source, "needle", exclude_diagrams=True)
+        self.assertEqual(
+            [m["matchOffset"] for m in filtered["matches"]],
+            [
+                source.index("needle", source.index(inline_svg)),
+                source.index("needle outside"),
+            ],
+        )
+
+        # Unclosed non-diagram code fence still masks inline <svg> inside it, while unclosed SVG fence extends to EOF.
+        unclosed_code = "Prose <svg/> ok\r\n```python\r\n# Hidden\r\nprint('<svg><rect/></svg>')"
+        self.assertEqual(_headings(unclosed_code), [])
+        self.assertEqual(
+            diagram_spans(unclosed_code, include_inline_svg=True),
+            [{"start": unclosed_code.index("<svg/>"), "end": unclosed_code.index("<svg/>") + len("<svg/>")}],
+        )
+        unclosed_svg = "# Fig\r\n```svg\r\n<svg><circle/></svg>"
+        self.assertEqual(
+            agent_documents._svg_spans(unclosed_svg),
+            [{"start": unclosed_svg.index("<svg>"), "end": len(unclosed_svg), "line_start": 3, "line_end": 3}],
+        )
+        unclosed_empty_svg = "# Fig\r\n```svg"
+        self.assertEqual(
+            agent_documents._svg_spans(unclosed_empty_svg),
+            [{"start": len(unclosed_empty_svg), "end": len(unclosed_empty_svg), "line_start": 3, "line_end": 3}],
+        )
+
+    def test_shared_fence_scanner_recognizes_braced_python_and_mermaid_with_exact_offsets_and_unclosed_fences(self):
+        import agent_documents
+        from unittest.mock import patch
+
+        source = (
+            "😀 Lead needle\r\n"
+            "```{python, echo=false}\r\n"
+            "# Python comment heading\r\n"
+            "value = '<svg><rect/></svg>'  # needle in code\r\n"
+            "```\r\n"
+            "~~~{.py #cell-2}\r\n"
+            "y = 2\r\n"
+            "~~~\r\n"
+            "````{.mermaid, fig-width=6}\r\n"
+            "```\r\n"
+            "graph TD; A[needle 𝕏] --> B\r\n"
+            "````\r\n"
+            "```{r, echo=FALSE}\r\n"
+            "r_needle <- 1\r\n"
+            "```\r\n"
+            "```{mermaid\r\n"
+            "unclosed_brace_needle\r\n"
+            "```\r\n"
+            "## Section After Braced\r\n"
+            "~~~{mermaid echo=false}\r\n"
+            "# Trailing fenced heading\r\n"
+            "flowchart LR; X[needle] --> Y"
+        )
+        line_count = len(source.splitlines(keepends=True))
+        with patch(
+            "agent_documents._step_fence_boundary",
+            wraps=agent_documents._step_fence_boundary,
+        ) as step_spy:
+            headings, fences = agent_documents._scan_read_only(
+                source, collect_headings=True, collect_fences=True
+            )
+            self.assertEqual(step_spy.call_count, line_count)
+
+        self.assertEqual([h["title"] for h in headings], ["Section After Braced"])
+        self.assertEqual(
+            [(span.language, span.is_diagram, span.is_svg) for span in fences],
+            [
+                ("python", False, False),
+                ("py", False, False),
+                ("mermaid", True, False),
+                ("{r,", False, False),
+                ("{mermaid", False, False),
+                ("mermaid", True, False),
+            ],
+        )
+        self.assertEqual(fences[-1].body_end, len(source))
+
+        diag = diagram_spans(source, include_inline_svg=True)
+        expected_closed_mermaid = "```\r\ngraph TD; A[needle 𝕏] --> B\r\n"
+        expected_unclosed_mermaid = "# Trailing fenced heading\r\nflowchart LR; X[needle] --> Y"
+        self.assertEqual(
+            [source[d["start"]:d["end"]] for d in diag],
+            [expected_closed_mermaid, expected_unclosed_mermaid],
+        )
+
+        filtered = search_source(source, "needle", exclude_diagrams=True)
+        self.assertEqual(
+            [m["matchOffset"] for m in filtered["matches"]],
+            [
+                source.index("needle"),
+                source.index("needle in code"),
+                source.index("r_needle") + 2,
+                source.index("unclosed_brace_needle") + len("unclosed_brace_"),
+            ],
+        )
+
+        unclosed_braced_py = "Inline <svg/> before\r\n```{.python, echo=false}\r\n# Hidden\r\nprint('<svg><circle/></svg>')"
+        _, py_fences = agent_documents._scan_read_only(unclosed_braced_py, collect_fences=True)
+        self.assertEqual(len(py_fences), 1)
+        self.assertEqual(py_fences[0].language, "python")
+        self.assertFalse(py_fences[0].is_diagram)
+        self.assertEqual(_headings(unclosed_braced_py), [])
+        self.assertEqual(
+            diagram_spans(unclosed_braced_py, include_inline_svg=True),
+            [{"start": unclosed_braced_py.index("<svg/>"), "end": unclosed_braced_py.index("<svg/>") + len("<svg/>")}],
+        )
 
 
 if __name__ == "__main__":

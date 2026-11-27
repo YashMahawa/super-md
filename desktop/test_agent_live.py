@@ -358,6 +358,25 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         by_slug = self._call_with_qt_pump(lambda: self.client.read_tab(
             self.active_id, heading="detail", view="source", window_id=self.window_id))
         self.assertEqual(by_slug["sectionStart"], source.index("### Detail"))
+        svg_section = (
+            "# Overview\nIntro\n\n## 2. Visuals\n```svg\n# Not a heading\n<svg><rect/></svg>\n```\nCaption.\n\n## 3. Next\nLater\n"
+        )
+        self.studio.live_source = svg_section
+        self.studio.tabs[0]["content"] = svg_section
+        import agent_documents
+        with unittest.mock.patch(
+            "agent_documents._step_fence_boundary",
+            wraps=agent_documents._step_fence_boundary,
+        ) as step_spy:
+            prose_heading = self._call_with_qt_pump(lambda: self.client.read_tab(
+                self.active_id, heading="2. Visuals", view="prose", window_id=self.window_id))
+            self.assertEqual(step_spy.call_count, len(svg_section.splitlines(keepends=True)))
+        self.assertIn("[SVG omitted:", prose_heading["markdown"])
+        self.assertIn("Caption.", prose_heading["markdown"])
+        self.assertNotIn("Later", prose_heading["markdown"])
+        self.assertEqual(len(prose_heading["svg_omissions"]), 1)
+        with self.assertRaises(agent_live.LiveBridgeError):
+            self.client.read_tab(self.active_id, heading="", window_id=self.window_id)
         with self.assertRaises(agent_live.LiveBridgeError):
             self._call_with_qt_pump(lambda: self.client.read_tab(
                 self.active_id, heading="missing heading", window_id=self.window_id))
@@ -587,6 +606,40 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.assertFalse(self.bridge.enabled)
         with self.assertRaises(agent_live.LiveBridgeError):
             agent_live.read_discovery(discovery_path)
+
+    def test_hidden_window_tabs_are_marked_inactive_for_local_and_cloud_listing(self):
+        hidden_tabs = [
+            {"id": "hidden-active", "name": "Hidden.md", "path": "", "content": "# Hidden\n",
+             "saved": "# Hidden\n", "portable": False, "assets": {}},
+        ]
+        hidden_studio = _FakeStudio(self.events, "window-hidden-2", hidden_tabs, "hidden-active")
+        hidden_studio.host_window = SimpleNamespace(isVisible=lambda: False)
+        self.studio.host_window = SimpleNamespace(isVisible=lambda: True)
+        self.session.windows[hidden_studio.window_id] = hidden_studio
+
+        observed_requests = []
+
+        def handle_hidden_qml(raw):
+            req = json.loads(raw)
+            observed_requests.append(req)
+            # Even if a renderer tries to report active=True on a hidden window,
+            # QtBridge.complete must clamp active to False.
+            tampered = [{**row, "active": True} for row in req.get("tabs", [])]
+            self.bridge.complete(req["requestId"], {"tabs": tampered}, "", window_id=hidden_studio.window_id)
+
+        hidden_studio.agentRequest.connect(handle_hidden_qml)
+        listed = self._call_with_qt_pump(lambda: self.client.list_tabs())["tabs"]
+        active_rows = [row for row in listed if row.get("active") is True]
+        self.assertEqual([row["id"] for row in active_rows], [self.active_id])
+        hidden_row = next(row for row in listed if row["id"] == "hidden-active")
+        self.assertFalse(hidden_row["active"])
+        self.assertEqual(observed_requests[-1]["activeTabId"], "")
+
+        cloud_tabs = self._call_with_qt_pump(lambda: self.bridge.handle_cloud_request({"action": "list_tabs"}))["tabs"]
+        cloud_active = [row for row in cloud_tabs if row.get("active") is True]
+        self.assertEqual([row["id"] for row in cloud_active], [f"{self.window_id}:{self.active_id}"])
+        cloud_hidden = next(row for row in cloud_tabs if row["id"] == "window-hidden-2:hidden-active")
+        self.assertFalse(cloud_hidden["active"])
 
 
 if __name__ == "__main__":

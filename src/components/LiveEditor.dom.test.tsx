@@ -23,12 +23,14 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
   };
 });
 
-import Editor from "./Editor";
+import Editor, { editorFindRange, editorSelectedText } from "./Editor";
 import LiveEditor from "./LiveEditor";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+Range.prototype.getClientRects ??= () => [] as unknown as DOMRectList;
+Range.prototype.getBoundingClientRect ??= () => new DOMRect(0, 0, 0, 0);
 afterEach(() => {
   invokeMock.mockClear();
   toJsxRuntimeSpy.mockClear();
@@ -1050,6 +1052,130 @@ it("continues and clears list, task, and quote markers on Enter and indents/outd
   delete document.documentElement.dataset.reduceMotion;
 });
 
+it("handles Tab and Shift+Tab through the active LiveEditor path across ordered lists, quotes, and multi-line selections", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let doc = [
+    "1. First step\n2. Second step\n\n   - [x] Nested task",
+    "> 1. Quoted parent\n> - Quoted child A\n>   - Quoted child B",
+    "> [!note]\n> Quoted prose",
+    "10. Ten\n11. Eleven",
+  ].join("\n\n");
+  const renderDoc = () =>
+    root.render(
+      <LiveEditor
+        markdown={doc}
+        documentPath={null}
+        dark={false}
+        python=""
+        onChange={(next) => {
+          doc = next;
+          renderDoc();
+        }}
+      />,
+    );
+  await act(async () => { renderDoc(); });
+
+  // 1. Ordered list single-line Tab, nested cap, Shift+Tab outdent, and loose multi-line selection
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[0]!.querySelector("li")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  let area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const secondCaret = area.value.indexOf("Second") + 3;
+  area.setSelectionRange(secondCaret, secondCaret);
+
+  const ordTab1 = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(ordTab1); });
+  expect(ordTab1.defaultPrevented).toBe(true);
+  expect(area.value).toBe("1. First step\n   2. Second step\n\n   - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([secondCaret + 3, secondCaret + 3]);
+  expect(document.activeElement).toBe(area);
+
+  const ordTabCap = new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(ordTabCap); });
+  expect(ordTabCap.defaultPrevented).toBe(true);
+  expect(area.value).toBe("1. First step\n   2. Second step\n\n   - [x] Nested task");
+  expect(document.activeElement).toBe(area);
+
+  const ordShiftTab = new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true });
+  act(() => { area.dispatchEvent(ordShiftTab); });
+  expect(ordShiftTab.defaultPrevented).toBe(true);
+  expect(area.value).toBe("1. First step\n2. Second step\n\n   - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([secondCaret, secondCaret]);
+
+  // Multi-line selection across ordered sibling + blank line + nested task item
+  const multiFrom = area.value.indexOf("2. Second step");
+  area.setSelectionRange(multiFrom, area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("1. First step\n   2. Second step\n\n      - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([multiFrom, area.value.length]);
+  expect(document.activeElement).toBe(area);
+
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("1. First step\n2. Second step\n\n   - [x] Nested task");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([multiFrom, area.value.length]);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // 2. Quoted list single-line & multi-line Tab/Shift+Tab (preserving `> ` prefix)
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[1]!.querySelector("li")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const quotedChildCaret = area.value.indexOf("Quoted child A");
+  area.setSelectionRange(quotedChildCaret, quotedChildCaret);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n>    - Quoted child A\n>   - Quoted child B");
+  expect(area.selectionStart).toBe(quotedChildCaret + 3);
+  expect(document.activeElement).toBe(area);
+
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n> - Quoted child A\n>   - Quoted child B");
+  expect(area.selectionStart).toBe(quotedChildCaret);
+
+  // Multi-line selection across quoted list items
+  const quotedMultiStart = area.value.indexOf("> - Quoted child A");
+  area.setSelectionRange(quotedMultiStart, area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n>    - Quoted child A\n>      - Quoted child B");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([quotedMultiStart, area.value.length]);
+
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> 1. Quoted parent\n> - Quoted child A\n>   - Quoted child B");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([quotedMultiStart, area.value.length]);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // 3. Plain blockquote / callout prose Tab & Shift+Tab without stripping `> `
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[2]!.querySelector("p")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const proseCaret = area.value.indexOf("Quoted prose");
+  area.setSelectionRange(proseCaret, proseCaret);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> [!note]\n>   Quoted prose");
+  expect(area.selectionStart).toBe(proseCaret + 2);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> [!note]\n> Quoted prose");
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("> [!note]\n> Quoted prose");
+  expect(document.activeElement).toBe(area);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // 4. Double-digit ordered list (`10. Ten\n11. Eleven`) aligns nested item at 4 spaces
+  act(() => host.querySelectorAll<HTMLElement>(".live-block")[3]!.querySelector("li")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })));
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area.focus();
+  const elevenCaret = area.value.indexOf("Eleven");
+  area.setSelectionRange(elevenCaret, elevenCaret);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("10. Ten\n    11. Eleven");
+  expect(area.selectionStart).toBe(elevenCaret + 4);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true, cancelable: true })); });
+  expect(area.value).toBe("10. Ten\n11. Eleven");
+  expect(area.selectionStart).toBe(elevenCaret);
+
+  act(() => root.unmount());
+  host.remove();
+});
+
 it("retains LiveEditor focus across WritingSuggestions replacement, dismissal, personal dictionary save, and single-step undo", async () => {
   vi.useFakeTimers();
   window.localStorage.removeItem("supermd.personal-dictionary.v1");
@@ -1488,6 +1614,213 @@ it("supports ordinary copy fallback from DocumentProperties and raw YAML editing
   }
 
   act(() => root.unmount());
+  host.remove();
+});
+
+it("preserves UTF-8 BOM, CRLF body offsets, and existing source selection when editing and clearing Live YAML frontmatter", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const sessionId = "split-bom-yaml-selection";
+  let current = "\uFEFF---\ntitle: Split Header\nauthor: Emmy Noether\n---\n\n# Split Heading\n\nTarget selection phrase.\n";
+
+  const renderSplit = () =>
+    root.render(
+      <div>
+        <Editor
+          sessionId={sessionId}
+          value={current}
+          dark={false}
+          focusMode={false}
+          onChange={(next) => {
+            current = next;
+            renderSplit();
+          }}
+        />
+        <LiveEditor
+          markdown={current}
+          documentPath="/notes/split-note.md"
+          dark={false}
+          python=""
+          onChange={(next) => {
+            current = next;
+            renderSplit();
+          }}
+        />
+      </div>,
+    );
+
+  await act(async () => { renderSplit(); });
+
+  const phrase = "selection phrase";
+  const initialFrom = current.indexOf(phrase);
+  const initialTo = initialFrom + phrase.length;
+  act(() => {
+    editorFindRange(sessionId, initialFrom, initialTo);
+  });
+  expect(editorSelectedText(sessionId)).toBe(phrase);
+
+  const queryInsertion = (extraDetail: Record<string, unknown> = {}) => {
+    const detail: { point?: { from: number; to: number }; [k: string]: unknown } = { ...extraDetail };
+    window.dispatchEvent(new CustomEvent("supermd-insertion-point", { detail }));
+    return detail.point;
+  };
+  expect(queryInsertion()).toEqual({ from: initialFrom, to: initialTo });
+
+  const fmShell = host.querySelector<HTMLElement>(".live-frontmatter")!;
+  expect(fmShell).not.toBeNull();
+
+  const headingBlockBeforeClear = host.querySelectorAll(".live-block")[0]!;
+  const bodyBlockBeforeClear = host.querySelectorAll(".live-block")[1]!;
+
+  act(() => { fmShell.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  const area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(area.value).toBe("---\ntitle: Split Header\nauthor: Emmy Noether\n---");
+
+  // Clearing YAML in Split mode preserves UTF-8 BOM, downstream .live-block identity, and existing Editor source selection.
+  const yamlSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+  await act(async () => {
+    yamlSetter.call(area, "");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(current).toBe("\uFEFF# Split Heading\n\nTarget selection phrase.\n");
+
+  await act(async () => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector(".live-frontmatter")).toBeNull();
+  expect(host.querySelectorAll(".live-block")[0]).toBe(headingBlockBeforeClear);
+  expect(host.querySelectorAll(".live-block")[1]).toBe(bodyBlockBeforeClear);
+
+  const shiftedFrom = current.indexOf(phrase);
+  const shiftedTo = shiftedFrom + phrase.length;
+  expect(editorSelectedText(sessionId)).toBe(phrase);
+  expect(queryInsertion()).toEqual({ from: shiftedFrom, to: shiftedTo });
+
+  // Standalone LiveEditor preserves UTF-8 BOM, CRLF body line endings, target clamping, and body edit offsets across YAML clear.
+  let liveOnly = "\uFEFF---\r\ntitle: CRLF Header\r\nauthor: Emmy Noether\r\n---\r\n\r\n# CRLF Heading\r\n\r\nCRLF body line.\r\n";
+  const renderLiveOnly = () =>
+    root.render(
+      <LiveEditor
+        markdown={liveOnly}
+        documentPath="/notes/crlf-live.md"
+        dark={false}
+        python=""
+        onChange={(next) => {
+          liveOnly = next;
+          renderLiveOnly();
+        }}
+      />,
+    );
+  await act(async () => { renderLiveOnly(); });
+  const standaloneFm = host.querySelector<HTMLElement>(".live-frontmatter")!;
+  const crlfHeadingBlock = host.querySelectorAll(".live-block")[0]!;
+  const crlfBodyBlock = host.querySelectorAll(".live-block")[1]!;
+  const crlfFmEnd = "\uFEFF---\r\ntitle: CRLF Header\r\nauthor: Emmy Noether\r\n---\r\n".length;
+  expect(queryInsertion({ target: standaloneFm })).toEqual({ from: crlfFmEnd, to: crlfFmEnd });
+
+  act(() => { standaloneFm.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  const standaloneArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(queryInsertion({ target: standaloneArea })).toEqual({ from: crlfFmEnd, to: crlfFmEnd });
+  await act(async () => {
+    yamlSetter.call(standaloneArea, "");
+    standaloneArea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(liveOnly).toBe("\uFEFF# CRLF Heading\r\n\r\nCRLF body line.\r\n");
+  expect(queryInsertion({ target: standaloneFm })).toEqual({ from: 1, to: 1 });
+  expect(queryInsertion()).toEqual({ from: 1, to: 1 });
+
+  await act(async () => {
+    standaloneArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelectorAll(".live-block")[0]).toBe(crlfHeadingBlock);
+  expect(host.querySelectorAll(".live-block")[1]).toBe(crlfBodyBlock);
+
+  await act(async () => {
+    host.querySelector("h1")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const headingEditor = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+  expect(headingEditor.value).toBe("# CRLF Heading");
+  await act(async () => {
+    yamlSetter.call(headingEditor, "# Updated CRLF Heading");
+    headingEditor.dispatchEvent(new Event("input", { bubbles: true }));
+    headingEditor.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(liveOnly).toBe("\uFEFF# Updated CRLF Heading\r\n\r\nCRLF body line.\r\n");
+
+  await act(async () => root.unmount());
+  host.remove();
+});
+
+it("toggles only the clicked nested task checkbox and keeps slider-containing tasks checked in LiveEditor", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+
+  const chartSpec = JSON.stringify({
+    series: [{ expression: "k * x" }],
+    sliders: [{ name: "k", label: "Slope", min: 1, max: 5, step: 1, value: 2 }],
+  });
+
+  let markdown = [
+    "# Study Session",
+    "",
+    "- [x] Review unit",
+    "  - [ ] Complete nested exercise",
+    "  - [x] Verify slider response",
+    "",
+    "    ```smd-chart",
+    `    ${chartSpec}`,
+    "    ```",
+  ].join("\n");
+
+  const renderLive = () =>
+    root.render(
+      <LiveEditor
+        markdown={markdown}
+        documentPath="/notes/live-tasks.md"
+        python=""
+        dark={false}
+        onChange={(next) => {
+          markdown = next;
+          renderLive();
+        }}
+      />,
+    );
+
+  await act(async () => { renderLive(); });
+
+  // Open the heading block and expand its draft so source offsets shift downstream,
+  // then change the study slider inside the checked nested task.
+  await act(async () => {
+    host.querySelector("h1")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  const updatedHeading = "# Study Session — Week 4";
+  await act(async () => { typeInTextarea(area, updatedHeading); });
+
+  const slider = host.querySelector<HTMLInputElement>('.chart-controls input[type="range"]')!;
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(slider, "4");
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    slider.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  expect(host.querySelector(".chart-slider-head output")?.textContent).toBe("4");
+  expect(markdown).toContain(updatedHeading);
+  expect(markdown).toContain("  - [x] Verify slider response");
+
+  // Click the unchecked nested checkbox while the heading draft is still open:
+  // only "Complete nested exercise" flips to [x], keeping "Review unit" [x] and preserving the heading draft.
+  const checkboxes = host.querySelectorAll<HTMLInputElement>('input[type="checkbox"][data-task-checkbox]');
+  expect(checkboxes).toHaveLength(3);
+  await act(async () => {
+    checkboxes[1].click();
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+  expect(markdown).toContain(updatedHeading);
+  expect(markdown).toContain("- [x] Review unit\n  - [x] Complete nested exercise\n  - [x] Verify slider response");
+
+  await act(async () => root.unmount());
   host.remove();
 });
 

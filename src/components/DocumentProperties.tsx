@@ -62,7 +62,7 @@ export default function DocumentProperties({ properties, entries, showFallback =
     <section className="document-properties" data-frontmatter-properties="true" aria-label="Document properties">
       {(title || subtitle) && (
         <div className="document-properties-heading">
-          {title && <div className="document-properties-title">{title}</div>}
+          {title && <div className="document-properties-title" data-frontmatter-field="title">{title}</div>}
           {subtitle && <div className="document-properties-subtitle">{subtitle}</div>}
         </div>
       )}
@@ -71,7 +71,7 @@ export default function DocumentProperties({ properties, entries, showFallback =
           {authors.length > 0 && (
             <div className="document-property">
               <dt className="document-property-label">Author</dt>
-              <dd className="document-property-value">{authors.join(", ")}</dd>
+              <dd className="document-property-value" data-frontmatter-field="author">{authors.join(", ")}</dd>
             </div>
           )}
           {date && (
@@ -91,7 +91,7 @@ export default function DocumentProperties({ properties, entries, showFallback =
               <dt className="document-property-label">Tags</dt>
               <dd className="document-property-badges">
                 {tags.map(tag => (
-                  <span key={tag} className="document-property-badge">{tag}</span>
+                  <span key={tag} className="document-property-badge" data-frontmatter-field="tag">{tag}</span>
                 ))}
               </dd>
             </div>

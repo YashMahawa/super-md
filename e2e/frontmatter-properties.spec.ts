@@ -321,3 +321,91 @@ test("renders properties header, hides YAML variations, isolates live first-bloc
     await expect(page.locator(".markdown-body")).not.toContainText("title:");
   }
 });
+
+test("includes displayed title, author, and tags in Find while excluding labels and non-indexed fields and preserving canonical Replace offsets", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.addInitScript(() => {
+    (window as any).__lastChangedContent = null;
+    window.SuperMD = {
+      post: (id, command, raw) => {
+        if (command === "document_changed") {
+          (window as any).__lastChangedContent = JSON.parse(raw).content;
+        }
+        queueMicrotask(() => window.supermdReply?.(id, true, null));
+      },
+    };
+  });
+
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const outOfOrderNote = [
+    "\uFEFF---",
+    "date: 2026-03-15",
+    "tags: [quantum, symmetries]",
+    "author:",
+    "  - name: Emmy Noether",
+    'title: "Conservation & Symmetries"',
+    "aliases: [QFT Notes]",
+    "---",
+    "",
+    "# Propagator Kernel",
+    "",
+    "Continuous symmetries imply conserved currents in Lagrangian mechanics.",
+  ].join("\n");
+
+  await page.evaluate((content) => {
+    window.supermdLoad?.({
+      id: "fm-find-note",
+      content,
+      path: null,
+      mode: "live",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "Manrope",
+      size: 18,
+      zoom: 100,
+      motion: false,
+    });
+  }, outOfOrderNote);
+
+  await expect(page.getByRole("region", { name: "Document properties" })).toBeVisible();
+  await page.evaluate(() => window.supermdFind?.());
+  const findInput = page.getByRole("searchbox", { name: "Find in note" });
+  const status = page.locator(".reading-search output");
+  await expect(findInput).toBeVisible();
+
+  // Labels (<dt>) and non-indexed frontmatter fields (date, aliases) do not match in Reader/Live Find.
+  for (const excluded of ["Author", "2026-03-15", "QFT Notes"]) {
+    await findInput.fill(excluded);
+    await expect(status).toHaveText("No matches");
+  }
+
+  // Displayed author and tags match cleanly.
+  await findInput.fill("Noether");
+  await expect(status).toHaveText("0 / 1");
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(status).toHaveText("1 / 1");
+
+  // Displayed title + tag + body match in visual order ("Conservation & Symmetries" -> tag "symmetries" -> body "symmetries").
+  await findInput.fill("symmetries");
+  await expect(status).toHaveText("0 / 3");
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(status).toHaveText("1 / 3");
+
+  // Step to match 2 (the "symmetries" tag, which is earlier in raw YAML than title!) and toggle Replace in source:
+  // bidirectional span mapping resolves tag "symmetries" to canonical source match 1 / 3.
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(status).toHaveText("2 / 3");
+  await page.getByRole("button", { name: "Replace in source" }).click();
+  await expect(status).toHaveText("1 / 3");
+
+  // Replace the tag value at its exact canonical source offset while preserving BOM and YAML structure.
+  await page.getByRole("textbox", { name: "Replacement text" }).fill("invariants");
+  await page.getByRole("button", { name: "Replace", exact: true }).click();
+  expect(await page.evaluate(() => (window as any).__lastChangedContent)).toBe(
+    outOfOrderNote.replace("tags: [quantum, symmetries]", "tags: [quantum, invariants]"),
+  );
+  await expect(page.getByRole("region", { name: "Document properties" })).toContainText("invariants");
+});
