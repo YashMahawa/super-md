@@ -1021,3 +1021,59 @@ it("forwards note and host image consent policy to portable in-place save, porta
     );
   }
 });
+
+it("forwards portable flag to prepareFmd when saving or exporting an opaque portable URI", async () => {
+  const compatKey = `assets/${"a".repeat(155)}.svg`;
+  const md = `# Opaque Portable\n\n![Legacy](<${compatKey}>)\n`;
+  prepareFmdMock.mockImplementation(async (markdown: string) => ({
+    content: markdown,
+    assets: { [compatKey]: "data:image/svg+xml;base64,PHN2Zy8+" },
+  }));
+  native.mockResolvedValue({ path: "content://com.example.provider/document/doc-42" });
+
+  await mountReader();
+  await act(async () => {
+    window.supermdLoad!({
+      id: "opaque-portable-tab",
+      content: md,
+      path: "content://com.example.provider/document/doc-42",
+      portable: true,
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: {},
+      zoom: 100,
+    });
+  });
+
+  await act(async () => {
+    await (window.supermdPortable!(true) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).toHaveBeenCalledWith(
+    md,
+    "content://com.example.provider/document/doc-42",
+    expect.objectContaining({ noteId: "opaque-portable-tab", portable: true }),
+  );
+
+  prepareFmdMock.mockClear();
+  let agentError = "";
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      window.supermdAgentRequest!(
+        { requestId: "req-opaque-smd", action: "export_document", format: "smd", filename: "Opaque.smd" },
+        (_result, error) => {
+          agentError = error;
+          resolve();
+        },
+      );
+    });
+  });
+  expect(agentError).toBe("");
+  expect(prepareFmdMock).toHaveBeenCalledWith(
+    md,
+    "content://com.example.provider/document/doc-42",
+    expect.objectContaining({ noteId: "opaque-portable-tab", portable: true }),
+  );
+});

@@ -205,16 +205,33 @@ internal fun StudioPrimaryDialogs(
     workspaceFolderPickerShowing: Boolean,
     onLaunchWorkspaceFolderPicker: (Uri) -> Unit,
 ) {
+    var pendingRenameKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingRenameInput by rememberSaveable { mutableStateOf<String?>(null) }
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
-        val initialStem = remember(state.active.id, state.active.name) {
-            if (noteExtension(state.active.name).isNotEmpty()) noteStem(state.active.name) else state.active.name
+        val activeRenameKey = "${state.active.id}\n${state.active.name}"
+        val initialStem = remember(state.active.id, state.active.name, pendingRenameKey, pendingRenameInput) {
+            if (pendingRenameKey == activeRenameKey && pendingRenameInput != null) {
+                pendingRenameInput!!
+            } else if (noteExtension(state.active.name).isNotEmpty()) {
+                noteStem(state.active.name)
+            } else {
+                state.active.name
+            }
         }
-        var name by rememberSaveable(state.active.id, state.active.name) { mutableStateOf(initialStem) }
+        var name by rememberSaveable(state.active.id, state.active.name, pendingRenameInput) { mutableStateOf(initialStem) }
         var renameError by remember(state.active.id, state.active.name) { mutableStateOf<String?>(null) }
         var renameBusy by remember(state.active.id, state.active.name) { mutableStateOf(false) }
         AlertDialog(
-            onDismissRequest = { if (!renameBusy) onDismissRename() },
+            onDismissRequest = {
+                if (!renameBusy) {
+                    if (pendingRenameKey == activeRenameKey) {
+                        pendingRenameKey = null
+                        pendingRenameInput = null
+                    }
+                    onDismissRename()
+                }
+            },
             title = { Text("Rename note") },
             text = {
                 OutlinedTextField(
@@ -230,17 +247,42 @@ internal fun StudioPrimaryDialogs(
             confirmButton = {
                 TextButton(
                     onClick = {
+                        val targetId = state.active.id
+                        val submittedName = name
                         renameBusy = true
                         renameError = null
-                        model.rename(state.active.id, name, showGlobalError = false) { ok, err ->
+                        model.rename(targetId, submittedName, showGlobalError = false) { ok, err ->
                             renameBusy = false
-                            if (ok) onDismissRename() else renameError = err
+                            if (ok) {
+                                if (pendingRenameKey == activeRenameKey) {
+                                    pendingRenameKey = null
+                                    pendingRenameInput = null
+                                }
+                                onDismissRename()
+                            } else if (err == DOCUMENT_ACCESS_MESSAGE || model.documentAccessRequests.value?.noteId == targetId) {
+                                pendingRenameKey = activeRenameKey
+                                pendingRenameInput = submittedName
+                                onDismissRename()
+                            } else {
+                                renameError = err
+                            }
                         }
                     },
                     enabled = !renameBusy && name.isNotBlank(),
                 ) { Text("Rename") }
             },
-            dismissButton = { TextButton(enabled = !renameBusy, onClick = onDismissRename) { Text("Cancel") } },
+            dismissButton = {
+                TextButton(
+                    enabled = !renameBusy,
+                    onClick = {
+                        if (pendingRenameKey == activeRenameKey) {
+                            pendingRenameKey = null
+                            pendingRenameInput = null
+                        }
+                        onDismissRename()
+                    },
+                ) { Text("Cancel") }
+            },
         )
     }
     if (exporting) ModalBottomSheet(onDismissRequest = onDismissExport, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
