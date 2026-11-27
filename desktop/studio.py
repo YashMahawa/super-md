@@ -94,7 +94,7 @@ def _is_windows() -> bool:
 
 def _rename_path_with_windows_retry(before: Path, after: Path) -> None:
     """Retry brief Windows sharing/access-denied locks (e.g. watcher teardown or indexer)."""
-    studio_assets_rename.rename_path_with_windows_retry(before, after)
+    studio_assets_rename.rename_path_with_windows_retry(before, after, is_windows_fn=_is_windows)
 
 def _normalize_mcp_roots(roots) -> list[str]:
     if not roots:
@@ -603,7 +603,7 @@ class Session(QObject):
         super().__init__()
         self.renameCompleted.connect(self._on_rename_completed)
         self._watch_suspension_lock = threading.Lock()
-        self._watch_suspensions: list[tuple[str, str, bool, Any, str]] = []
+        self._watch_suspensions: list[tuple[str, str, bool, threading.Event, str]] = []
         self._pending_rename_cleanups: dict[str, Any] = {}
         self._rename_state_lock = threading.RLock()
         self._retired_persist_needed = False
@@ -1551,8 +1551,11 @@ class Studio(QObject):
         if watched-targets:self.note_watcher.removePaths(list(watched-targets))
         if targets-watched:self.note_watcher.addPaths(list(targets-watched))
 
-    def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool, new_path: str = "") -> threading.Event:
-        return studio_assets_rename.suspend_watches_for_prefix(self, target_path, is_dir=is_dir, new_path=new_path)
+    def _suspend_watches_for_prefix(self, target_path: str, *, is_dir: bool, new_path: str = ""):
+        studio_assets_rename.suspend_watches_for_prefix(self, target_path, is_dir=is_dir, new_path=new_path)
+
+    def _hold_watches_for_rename(self, target_path: str, *, is_dir: bool, new_path: str = "") -> threading.Event:
+        return studio_assets_rename.hold_watches_for_rename(self, target_path, is_dir=is_dir, new_path=new_path)
 
     def _external_note_changed(self,path):
         if self.retired:return
@@ -1579,7 +1582,7 @@ class Studio(QObject):
         def reconciled(result,error):
             if self.retired or error:return
             current_suspensions = self._active_watch_suspensions()
-            reconciled_any = False
+            emitted_location_change = False
             for old,new in result.items():
                 if self._is_path_suspended(old, current_suspensions) or (
                     new and self._is_path_suspended(new, current_suspensions)
@@ -1587,13 +1590,13 @@ class Studio(QObject):
                     continue
                 if not self._has_session_path_reference(old):
                     continue
-                reconciled_any = True
+                emitted_location_change = True
                 self.session.locationChanged.emit(old,new or "")
             effective_changed = {
                 path for path in changed if not self._is_watch_target_suspended(path, current_suspensions)
             }
             self._reload_changed_content(effective_changed)
-            if self.folder and (effective_changed or reconciled_any):
+            if self.folder and (effective_changed or emitted_location_change):
                 self.session.workspace_links.invalidate(self.folder)
             if self.folder and effective_changed and (
                 any(folder_ops.same_path(self.folder, p) for p in effective_changed)
@@ -1611,6 +1614,8 @@ class Studio(QObject):
             return
         if Path(old).exists() and not (new and old!=new and old.casefold()==new.casefold()):return  # A temporary atomic-replace gap has healed.
         if new and not Path(new).is_file():return
+        for stamp_key in [k for k in list(self.note_file_stamps) if folder_ops.same_path(k, old)]:
+            self.note_file_stamps.pop(stamp_key, None)
         if new:
             location = None
             for loc_key in [k for k in list(self.session.locations) if folder_ops.same_path(k, old)]:
@@ -1619,7 +1624,13 @@ class Studio(QObject):
                     location = popped
             if location:self.session.locations[new]=location
             for tab in self.tabs:
-                if tab["path"] and folder_ops.same_path(tab["path"], old):tab.update(path=new,name=Path(new).name)
+                if tab["path"] and folder_ops.same_path(tab["path"], old):
+                    tab.update(path=new,name=Path(new).name)
+                    try:
+                        st = Path(new).stat()
+                        self.note_file_stamps[new] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
             self.session.pinned=[new if folder_ops.same_path(path, old) else path for path in self.session.pinned]
             self.recent=[new if folder_ops.same_path(path, old) else path for path in self.recent]
             for paths in self.session.workspace.values():
@@ -1639,8 +1650,7 @@ class Studio(QObject):
                     tab.update(path="",name=draft["name"],conflict=False)
                 self._remove_tab(tab["id"])
             self.message="File deleted: "+Path(old).name+". Its tab was closed; unsaved changes remain recoverable."
-        if self.folder:
-            self.session.workspace_links.invalidate(self.folder)
+        self.session.workspace_links.invalidate()
         self._preferences();self._recover();self._emit()
 
     def _reload_changed_content(self,changed):
@@ -4562,7 +4572,9 @@ class Studio(QObject):
 
     @Slot(str, str, str)
     def createFolderNote(self, parent_path, name, fmt="md"):
-        studio_assets_rename.create_folder_note(self, parent_path, name, fmt)
+        studio_assets_rename.create_folder_note(
+            self, parent_path, name, fmt, write_portable_fn=write_portable, atomic_write_fn=atomic_write
+        )
 
     @Slot(str, str)
     def createSubfolder(self, parent_path, name):
@@ -4571,19 +4583,26 @@ class Studio(QObject):
     def _submit_rename(
         self, before: Path, after: Path, final_name: str, *,
         is_dir: bool, message_builder, symlink_error: str, exists_error: str,
+        is_windows_fn=None, rename_fn=None,
     ):
         studio_assets_rename.submit_rename(
             self, before, after, final_name, is_dir=is_dir, message_builder=message_builder,
             symlink_error=symlink_error, exists_error=exists_error,
+            is_windows_fn=_is_windows if is_windows_fn is None else is_windows_fn,
+            rename_fn=_rename_path_with_windows_retry if rename_fn is None else rename_fn,
         )
 
     @Slot(str, str)
     def renameEntry(self, entry_path, name):
-        studio_assets_rename.rename_entry(self, entry_path, name)
+        studio_assets_rename.rename_entry(
+            self, entry_path, name, is_windows_fn=_is_windows, rename_fn=_rename_path_with_windows_retry
+        )
 
     @Slot(str, str)
     def renameNote(self, id, name):
-        studio_assets_rename.rename_note(self, id, name)
+        studio_assets_rename.rename_note(
+            self, id, name, is_windows_fn=_is_windows, rename_fn=_rename_path_with_windows_retry
+        )
 
     @staticmethod
     def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
@@ -5229,14 +5248,37 @@ class Studio(QObject):
     def _apply_saved_tab_assets(self, tab_id: str, path: Path, content_snapshot: str,
                                 assets_snapshot: dict, updated: dict, stamp=None) -> None:
         studio_portable_assets.apply_saved_tab_assets(
-            self, tab_id, path, content_snapshot, assets_snapshot, updated, stamp
+            self, tab_id, path, content_snapshot, assets_snapshot, updated, stamp,
+            is_dirty_fn=Studio._is_dirty,
         )
 
     def _prepare_attach_tab_asset(self, args):
-        return studio_portable_assets.prepare_attach_tab_asset(self, args)
+        return studio_portable_assets.prepare_attach_tab_asset(
+            self, args,
+            write_portable_fn=write_portable,
+            open_note_fn=open_note,
+            matches_signature_fn=_matches_media_signature,
+            validate_local_asset_fn=_validate_local_tab_asset_path,
+            valid_asset_filename_fn=is_valid_asset_filename,
+            is_dirty_fn=Studio._is_dirty,
+            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
+            extra_asset_roots_fn=Studio._extra_asset_roots,
+        )
 
     def _attach_tab_asset_native(self, args):
-        return studio_portable_assets.attach_tab_asset_native(self, args)
+        return studio_portable_assets.attach_tab_asset_native(
+            self, args,
+            write_portable_fn=write_portable,
+            open_note_fn=open_note,
+            matches_signature_fn=_matches_media_signature,
+            validate_local_asset_fn=_validate_local_tab_asset_path,
+            valid_asset_filename_fn=is_valid_asset_filename,
+            is_dirty_fn=Studio._is_dirty,
+            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
+            extra_asset_roots_fn=Studio._extra_asset_roots,
+            prepare_fn=Studio._prepare_attach_tab_asset,
+            run_sync_fn=Studio._run_prepared_write_sync,
+        )
 
     @staticmethod
     def _parse_media_envelope(raw: str):
@@ -5353,10 +5395,30 @@ class Studio(QObject):
         return Studio._validate_and_write_media(args, self._media_download_directory())
 
     def _prepare_replace_tab_asset(self, args):
-        return studio_portable_assets.prepare_replace_tab_asset(self, args)
+        return studio_portable_assets.prepare_replace_tab_asset(
+            self, args,
+            write_portable_fn=write_portable,
+            open_note_fn=open_note,
+            matches_signature_fn=_matches_media_signature,
+            validate_local_asset_fn=_validate_local_tab_asset_path,
+            is_dirty_fn=Studio._is_dirty,
+            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
+            extra_asset_roots_fn=Studio._extra_asset_roots,
+        )
 
     def _replace_tab_asset_native(self, args):
-        return studio_portable_assets.replace_tab_asset_native(self, args)
+        return studio_portable_assets.replace_tab_asset_native(
+            self, args,
+            write_portable_fn=write_portable,
+            open_note_fn=open_note,
+            matches_signature_fn=_matches_media_signature,
+            validate_local_asset_fn=_validate_local_tab_asset_path,
+            is_dirty_fn=Studio._is_dirty,
+            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
+            extra_asset_roots_fn=Studio._extra_asset_roots,
+            prepare_fn=Studio._prepare_replace_tab_asset,
+            run_sync_fn=Studio._run_prepared_write_sync,
+        )
 
     def _agent_viewport_pending(self, request_id, tab_id):
         bridge = getattr(self.session, "agent_bridge", None)

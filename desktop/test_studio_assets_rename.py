@@ -1,6 +1,6 @@
 """Focused unit tests for unified rename pipelines and portable .smd asset-staging helpers."""
 from __future__ import annotations
-import base64, hashlib, os, shutil, sys, tempfile, time, unittest
+import ast, base64, hashlib, inspect, os, shutil, sys, tempfile, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -73,6 +73,18 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
     @staticmethod
     def _rev(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def test_explicit_dependencies_and_zero_studio_or_sys_modules_lookups(self):
+        for module in (studio_assets_rename, studio_portable_assets):
+            self.assertFalse(hasattr(module, "_studio_module"))
+            source = inspect.getsource(module)
+            self.assertNotIn("sys.modules", source)
+            tree = ast.parse(source)
+            imported = {
+                alias.name for node in ast.walk(tree)
+                if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
+            } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+            self.assertFalse({"studio", "desktop.studio", "sys"} & imported)
 
     def test_rename_entry_pipeline_handles_folder_note_samestat_links_and_watcher_restore(self):
         sub = self.open_root / "Drafts"
@@ -232,11 +244,11 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             patch("studio._matches_media_signature", side_effect=lambda mime, raw: (sig_checks.append(mime), real_sig(mime, raw))[1]),
             patch("studio._validate_local_tab_asset_path", side_effect=lambda raw_p, *a, **kw: (validated_paths.append(str(raw_p)), real_validate(raw_p, *a, **kw))[1]),
         ):
-            attached = studio_portable_assets.attach_tab_asset_native(qt_double, {
+            attached = Studio._attach_tab_asset_native(qt_double, {
                 "tabId": "tab-1", "expectedRevision": rev,
                 "mimeType": "image/png", "body": base64.b64encode(PNG_1X1).decode("ascii"), "assetName": "pixel",
             })
-            replaced = studio_portable_assets.replace_tab_asset_native(qt_double, {
+            replaced = Studio._replace_tab_asset_native(qt_double, {
                 "tabId": "tab-1", "expectedRevision": rev, "assetName": asset_sha_id, "assetPath": str(next_svg),
             })
         self.assertEqual(attached["assetName"], "assets/pixel.png")
@@ -244,6 +256,13 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         self.assertEqual(write_calls, [smd_path, smd_path])
         self.assertEqual(sig_checks, ["image/png", "image/svg+xml"])
         self.assertEqual(validated_paths, [str(next_svg)])
+
+        direct_attached = studio_portable_assets.attach_tab_asset_native(proxy, {
+            "tabId": "tab-1", "expectedRevision": rev,
+            "mimeType": "image/png", "body": base64.b64encode(PNG_1X1).decode("ascii"), "assetName": "direct",
+        })
+        self.assertEqual(direct_attached["assetName"], "assets/direct.png")
+        self.assertEqual(len(revoked), 1)
 
         write_portable(smd_path, markdown + "\nExternal modification\n", tab["saved_assets"])
         with self.assertRaisesRegex(ValueError, "The portable note changed on disk; reopen it before attaching an asset"):
@@ -299,17 +318,17 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             return real_rename(p, target)
 
         with patch("studio._is_windows", return_value=True), patch.object(Path, "rename", flaky_win_rename):
-            evt = self.studio._suspend_watches_for_prefix(str(src_retry), is_dir=False, new_path=str(dst_retry))
+            evt = self.studio._hold_watches_for_rename(str(src_retry), is_dir=False, new_path=str(dst_retry))
             self.assertFalse(evt.is_set())
             self.assertEqual(len(self.studio._active_watch_suspensions()), 1)
-            studio_assets_rename.rename_path_with_windows_retry(src_retry, dst_retry)
+            studio._rename_path_with_windows_retry(src_retry, dst_retry)
             self.studio._sync_path_change(str(src_retry), str(dst_retry), is_dir=False, on_rebound=evt.set)
         self.assertTrue(evt.is_set() and dst_retry.is_file() and len(attempts) == 2)
-        self.studio._suspend_watches_for_prefix(str(dst_retry), is_dir=False)
+        self.assertIsNone(self.studio._suspend_watches_for_prefix(str(dst_retry), is_dir=False))
         self.assertEqual(self.studio._active_watch_suspensions(), [])
         _, saved_assets, is_portable = open_note(smd_path)
         self.assertTrue(is_portable)
-        self.assertEqual(set(saved_assets), {"assets/diagram.svg", "assets/pixel.png"})
+        self.assertEqual(set(saved_assets), {"assets/diagram.svg", "assets/pixel.png", "assets/direct.png"})
 
 
 if __name__ == "__main__":
