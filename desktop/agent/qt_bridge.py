@@ -14,14 +14,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-try:
-    from . import cloud_rpc as _cloud
-    from . import live_client as _lc
-    from . import live_native as _native
-except ImportError:
-    from agent import cloud_rpc as _cloud
-    from agent import live_client as _lc
-    from agent import live_native as _native
+from . import cloud_rpc as _cloud
+from . import live_client as _lc
+from . import live_native as _native
+from . import validators as _v
 
 _LIST_TAB_KEYS = ("id", "windowId", "title", "path", "format", "isDirty", "sourceLength", "revision", "active")
 _ACTIVE_VIEW_ACTIONS = ("render_tab", "get_context", "get_diagram_image", "latex_review", "latex_apply", "export_document")
@@ -64,9 +60,9 @@ def _qt_bridge_class():
             self._pending: dict[str, dict[str, Any]] = {}
             self._dispatches: dict[str, tuple[str, str, str]] = {}
             self._enabled = False
-            try:
+            if "." in (__package__ or ""):
                 from ..agent_cloud import CloudRelayClient
-            except ImportError:
+            else:
                 from agent_cloud import CloudRelayClient
             self.cloudClient = CloudRelayClient(self.handle_cloud_request, self.cloudStatusChanged.emit)
             self._dispatch.connect(self._handle_request, Qt.ConnectionType.QueuedConnection)
@@ -283,7 +279,8 @@ def _qt_bridge_class():
                                      "format": "smd" if t.get("portable") or str(t["path"]).lower().endswith(".smd") else "markdown",
                                      "isDirty": t["content"] != t["saved"], "sourceLength": len(t["content"]),
                                      "revision": hashlib.sha256(t["content"].encode("utf-8")).hexdigest(),
-                                     "active": visible and t["id"] == studio.active} for t in studio.tabs]
+                                     "active": visible and t["id"] == studio.active}
+                                    for t in studio.tabs if _v.is_tab_live_authorized(studio, t)]
                         child_id = uuid.uuid4().hex
                         with self._lock:
                             self._dispatches[child_id] = (request_id, studio.window_id, "list")
@@ -329,6 +326,8 @@ def _qt_bridge_class():
                                and any(t["id"] == tab_id for t in w.tabs)), None)
                 if studio is None:
                     raise ValueError("The requested live tab is no longer open")
+                target_tab = next((t for t in studio.tabs if t["id"] == tab_id), None)
+                _v.require_tab_live_authorized(studio, target_tab, action=action)
                 if tab_id != studio.active and action in _ACTIVE_VIEW_ACTIONS:
                     raise ValueError("This action needs the active reader view; activate the target tab explicitly first")
                 if action in _FLUSH_NATIVE_ACTIONS:
@@ -397,6 +396,9 @@ def _qt_bridge_class():
                 try:
                     if studio is None or studio.retired:
                         raise ValueError("The target desktop window was closed")
+                    if payload.get("tabId"):
+                        target_tab = next((tab for tab in studio.tabs if tab["id"] == payload["tabId"]), None)
+                        _v.require_tab_live_authorized(studio, target_tab, action=payload["action"])
                     visible = _is_window_visible(studio)
                     if payload["action"] in ("list_diagrams", "get_diagram"):
                         target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
@@ -425,7 +427,7 @@ def _qt_bridge_class():
                 rows = result.get("tabs") if isinstance(result, dict) else None
                 fallback_by_id = {row.get("id"): row for row in fallback if isinstance(row, dict)}
                 owner_visible = _is_window_visible(self.session.windows.get(expected_window))
-                merged_rows = ([m for row in rows if isinstance(row, dict)
+                merged_rows = ([m for row in rows if isinstance(row, dict) and row.get("id") in fallback_by_id
                                 if (m := {**fallback_by_id.get(row.get("id"), {}),
                                           **{k: row[k] for k in _LIST_TAB_KEYS if k in row},
                                           **({} if owner_visible else {"active": False})}).get("id")]
@@ -444,8 +446,15 @@ def _qt_bridge_class():
                     event.set()
                 return True
 
+            owner_studio = self.session.windows.get(window_id)
+            if not error and owner_studio is not None and payload.get("tabId"):
+                target_tab = next((tab for tab in owner_studio.tabs if tab["id"] == payload["tabId"]), None)
+                try:
+                    _v.require_tab_live_authorized(owner_studio, target_tab, action=payload.get("action", ""))
+                except ValueError as exc:
+                    return self._finish_pending(request_id, None, str(exc)[:1000], expected_window=window_id)
             result, error = _native.finalize_renderer_result(
-                payload, result, error, self.session.windows.get(window_id), window_id)
+                payload, result, error, owner_studio, window_id)
             return self._finish_pending(request_id, result, error, expected_window=window_id)
 
         def has_pending(self, request_id: str, window_id: str, action: str, tab_id: str) -> bool:
@@ -462,3 +471,12 @@ def _qt_bridge_class():
 def create_qt_bridge(session, data_dir: str | os.PathLike[str]):
     """Create the GUI bridge without importing Qt in CLI/MCP-only processes."""
     return _qt_bridge_class()(session, Path(data_dir))
+
+
+_PEER_MODULE = (
+    "agent.qt_bridge"
+    if __name__ == "desktop.agent.qt_bridge"
+    else ("desktop.agent.qt_bridge" if __name__ == "agent.qt_bridge" else None)
+)
+if _PEER_MODULE and _PEER_MODULE in sys.modules:
+    sys.modules[__name__] = sys.modules[_PEER_MODULE]

@@ -1,6 +1,7 @@
 """Qt-free cloud relay RPC translation helpers for live desktop tabs."""
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -117,3 +118,12 @@ def translate_cloud_request(
         return {"devices": [{"deviceId": config["deviceId"], "displayName": config["displayName"],
                              "platform": "desktop", "status": "connected"}]}
     raise ValueError("Unsupported relay action")
+
+
+_PEER_MODULE = (
+    "agent.cloud_rpc"
+    if __name__ == "desktop.agent.cloud_rpc"
+    else ("desktop.agent.cloud_rpc" if __name__ == "agent.cloud_rpc" else None)
+)
+if _PEER_MODULE and _PEER_MODULE in sys.modules:
+    sys.modules[__name__] = sys.modules[_PEER_MODULE]

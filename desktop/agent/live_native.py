@@ -4,16 +4,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib
+import importlib.util
 import json
+import sys
 from collections.abc import Callable
 from typing import Any
 
-try:
-    from . import live_client as _lc
-    from . import validators as _v
-except ImportError:
-    from agent import live_client as _lc
-    from agent import validators as _v
+from . import live_client as _lc
+from . import validators as _v
 
 LIVE_GUI_ACTIONS = frozenset({
     "list_tabs", "read_tab", "search_tab", "outline_tab", "patch_tab", "render_tab", "get_tab_image",
@@ -22,11 +20,46 @@ LIVE_GUI_ACTIONS = frozenset({
     "list_diagrams", "get_diagram", "replace_tab_asset", "asset_action",
 })
 _SUPPORTED_INLINE_MIMES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"})
+_INITIAL_OWNER_ATTRS: dict[tuple[str, str], Any] = {}
 
 
 def _agent_docs():
     parent = __package__.rpartition(".")[0] if __package__ else ""
-    return importlib.import_module(f"{parent}.agent_documents" if parent else "agent_documents")
+    mod_name = f"{parent}.agent_documents" if parent else "agent_documents"
+    if mod_name in sys.modules:
+        return sys.modules[mod_name]
+    return importlib.import_module(mod_name) if importlib.util.find_spec(mod_name) is not None else None
+
+
+def _find_owner_module(owner_submodule: str):
+    for name in (f"agent.{owner_submodule}", f"desktop.agent.{owner_submodule}"):
+        if name in sys.modules:
+            return sys.modules[name]
+    pkg = __package__ or "agent"
+    owner_name = f"{pkg}.{owner_submodule}"
+    return importlib.import_module(owner_name) if importlib.util.find_spec(owner_name) is not None else None
+
+
+def _owner_or_docs_attr(owner_submodule: str, attr: str):
+    """Coordinate extracted ``agent.<owner_submodule>`` owner modules while honoring ``agent_documents`` calls."""
+    owner = _find_owner_module(owner_submodule)
+    owner_val = getattr(owner, attr, None) if owner is not None else None
+    key = (owner_submodule, attr)
+    if owner_val is not None and key not in _INITIAL_OWNER_ATTRS:
+        _INITIAL_OWNER_ATTRS[key] = owner_val
+    initial = _INITIAL_OWNER_ATTRS.get(key)
+    if owner_val is not None and initial is not None and owner_val is not initial:
+        return owner_val
+    for docs_name in ("agent_documents", "desktop.agent_documents"):
+        docs = sys.modules.get(docs_name)
+        if docs is not None and hasattr(docs, attr):
+            docs_val = getattr(docs, attr)
+            if owner_val is None or docs_val is not owner_val:
+                return docs_val
+    if owner_val is not None:
+        return owner_val
+    docs = _agent_docs()
+    return getattr(docs, attr, None) if docs is not None else None
 
 
 def _image_data_fn():
@@ -90,7 +123,9 @@ def validate_live_gui_payload(payload: dict[str, Any]) -> str:
     elif action == "patch_tab":
         _v.require_sha256_revision(payload.get("expectedRevision"), field="expectedRevision")
         operations = payload.get("operations")
-        _agent_docs().validate_patch_operations(operations)
+        validate_ops = _owner_or_docs_attr("patches", "validate_patch_operations")
+        if callable(validate_ops):
+            validate_ops(operations)
         if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > _lc.MAX_PATCH_BYTES:
             raise ValueError("Patch operations exceed the 64 KB limit")
     elif action in ("render_tab", "get_diagram_image"):
@@ -151,7 +186,8 @@ def validate_live_gui_payload(payload: dict[str, Any]) -> str:
 
 def asset_metadata(tab: dict[str, Any], offset: int = 0, limit: int = 50) -> list[dict[str, Any]]:
     try:
-        return _agent_docs()._asset_metadata(tab.get("assets", {}), offset=offset, limit=limit)
+        meta_fn = _owner_or_docs_attr("store", "_asset_metadata")
+        return meta_fn(tab.get("assets", {}), offset=offset, limit=limit) if callable(meta_fn) else []
     except Exception:  # noqa: BLE001
         return []
 
@@ -162,6 +198,7 @@ def asset_action_native(args: dict[str, Any], studio, *,
     tab = next((item for item in studio.tabs if item["id"] == tab_id), None)
     if tab is None:
         raise ValueError("The requested live tab is no longer open")
+    _v.require_tab_live_authorized(studio, tab, action=args.get("action", "asset_action"))
     revision = hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
     if args.get("expectedRevision") != revision:
         raise ValueError("Live tab revision changed; inspect it again before using an asset")
@@ -207,6 +244,7 @@ def verify_native_write_revision(payload: dict[str, Any], studio) -> None:
     target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
     if target is None:
         raise ValueError("The requested live tab is no longer open")
+    _v.require_tab_live_authorized(studio, target, action=payload.get("action", ""))
     source = target["content"]
     current_revision = hashlib.sha256(source.encode("utf-8")).hexdigest()
     expected = payload.get("expectedRevision")
@@ -221,37 +259,40 @@ def verify_native_write_revision(payload: dict[str, Any], studio) -> None:
 def _read_tab_page(source: str, payload: dict[str, Any]) -> dict[str, Any]:
     offset, limit = payload.get("offset", 0), payload.get("limit", _lc.MAX_SOURCE_PAGE)
     heading, view = payload.get("heading"), payload.get("view", "prose")
-    try:
-        docs = _agent_docs()
-    except ImportError:
-        docs = None
-    read_source = getattr(docs, "read_source", None)
+    read_source = _owner_or_docs_attr("source_ops", "read_source")
+    doc_error = _owner_or_docs_attr("source_ops", "AgentDocumentError") or ValueError
     if callable(read_source):
         try:
             return read_source(source, offset=offset, limit=limit, heading=heading, view=view)
-        except docs.AgentDocumentError as exc:
+        except doc_error as exc:
             raise ValueError(str(exc)) from exc
     if offset > len(source):
         raise ValueError("offset must be between 0 and the document character count")
     section_start, section_end, selected_heading, spans = 0, len(source), None, None
     if heading is not None:
-        if docs is None:
+        scan_fn = _owner_or_docs_attr("source_ops", "_read_headings_and_svg_spans")
+        resolve_fn = _owner_or_docs_attr("source_ops", "resolve_heading")
+        if not callable(scan_fn) or not callable(resolve_fn):
             raise ValueError("Heading outlines are unavailable")
         try:
-            headings, precomputed = docs._read_headings_and_svg_spans(source, include_headings=True, include_svg=view == "prose")
-            selected_heading = docs.resolve_heading(headings, heading)
-        except docs.AgentDocumentError as exc:
+            headings, precomputed = scan_fn(source, include_headings=True, include_svg=view == "prose")
+            selected_heading = resolve_fn(headings, heading)
+        except doc_error as exc:
             raise ValueError(str(exc)) from exc
         section_start, section_end = selected_heading["sectionStart"], selected_heading["sectionEnd"]
         if offset > section_end:
             raise ValueError(f"offset must be within the selected section (sectionEnd {section_end})")
         offset, spans = max(section_start, offset), (precomputed if view == "prose" else None)
     end, omitted = min(section_end, offset + limit), []
-    if view == "prose" and docs is not None:
+    if view == "prose":
         try:
-            spans = docs._svg_spans(source) if spans is None else spans
-            end = docs._prose_page_end(offset, limit, section_end, spans)
-            page_text, omitted = docs._elide_svg_page(source, offset, end, spans)
+            svg_fn = _owner_or_docs_attr("source_ops", "_svg_spans")
+            prose_end_fn = _owner_or_docs_attr("source_ops", "_prose_page_end")
+            elide_fn = _owner_or_docs_attr("source_ops", "_elide_svg_page")
+            spans = (svg_fn(source) if callable(svg_fn) else []) if spans is None else spans
+            if callable(prose_end_fn):
+                end = prose_end_fn(offset, limit, section_end, spans)
+            page_text, omitted = elide_fn(source, offset, end, spans) if callable(elide_fn) else (source[offset:end], [])
         except Exception:  # noqa: BLE001
             page_text = source[offset:end]
     else:
@@ -276,11 +317,15 @@ def native_result(payload: dict[str, Any], studio, *,
                   "close_document", "patch_tab", "replace_tab_asset"):
         if action in ("save_document", "close_document", "patch_tab", "replace_tab_asset"):
             verify_native_write_revision(payload, studio)
+        elif payload.get("tabId"):
+            target = next((tab for tab in studio.tabs if tab["id"] == payload["tabId"]), None)
+            _v.require_tab_live_authorized(studio, target, action=action)
         return studio._agent_document_action(payload)
     tab_id = payload["tabId"]
     target = next((tab for tab in studio.tabs if tab["id"] == tab_id), None)
     if target is None:
         raise ValueError("The requested live tab is no longer open")
+    _v.require_tab_live_authorized(studio, target, action=action)
     source = target["content"]
     revision = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if payload.get("expectedRevision") is not None and payload["expectedRevision"] != revision:
@@ -301,12 +346,18 @@ def native_result(payload: dict[str, Any], studio, *,
             result.update(assets=assets, assetsNextOffset=asset_offset + len(assets) if asset_offset + len(assets) < asset_count else None)
         return result
     if action == "search_tab":
-        return {**common, **_agent_docs().search_source(
+        search_fn = _owner_or_docs_attr("source_ops", "search_source")
+        if not callable(search_fn):
+            raise ValueError("Source search is unavailable")
+        return {**common, **search_fn(
             source, payload["query"], limit=payload.get("limit", 10), context=payload.get("context", 100), offset=payload.get("offset", 0),
             case_sensitive=payload.get("caseSensitive", False), whole_word=payload.get("wholeWord", False),
             regex=payload.get("regex", False), exclude_diagrams=payload.get("excludeDiagrams", False))}
     if action == "outline_tab":
-        return {**common, **_agent_docs().outline_source(source, payload.get("offset", 0), payload.get("limit", 80))}
+        outline_fn = _owner_or_docs_attr("source_ops", "outline_source")
+        if not callable(outline_fn):
+            raise ValueError("Heading outlines are unavailable")
+        return {**common, **outline_fn(source, payload.get("offset", 0), payload.get("limit", 80))}
     if action == "get_tab_image":
         if payload["expectedRevision"] != revision:
             raise ValueError("Live tab revision changed; inspect again before extracting the image")
@@ -347,3 +398,12 @@ def finalize_renderer_result(payload: dict[str, Any], result: Any, error: str, s
         elif result.get("revision") != current_rev or (expected and expected != current_rev):
             error = "Live tab changed while its diagrams were being read; inspect again"
     return result, error
+
+
+_PEER_MODULE = (
+    "agent.live_native"
+    if __name__ == "desktop.agent.live_native"
+    else ("desktop.agent.live_native" if __name__ == "agent.live_native" else None)
+)
+if _PEER_MODULE and _PEER_MODULE in sys.modules:
+    sys.modules[__name__] = sys.modules[_PEER_MODULE]

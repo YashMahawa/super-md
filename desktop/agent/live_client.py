@@ -4,41 +4,26 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
-try:
-    from .validators import (
-        require_diagram_id,
-        require_export_params,
-        require_heading_selector,
-        require_identifier,
-        require_image_format,
-        require_int_range,
-        require_nonneg_int,
-        require_optional_sha256_revision,
-        require_repair_indices,
-        require_search_params,
-        require_sha256_revision,
-        require_viewport_width,
-    )
-except ImportError:
-    from agent.validators import (
-        require_diagram_id,
-        require_export_params,
-        require_heading_selector,
-        require_identifier,
-        require_image_format,
-        require_int_range,
-        require_nonneg_int,
-        require_optional_sha256_revision,
-        require_repair_indices,
-        require_search_params,
-        require_sha256_revision,
-        require_viewport_width,
-    )
+from .validators import (
+    require_diagram_id,
+    require_export_params,
+    require_heading_selector,
+    require_identifier,
+    require_image_format,
+    require_int_range,
+    require_nonneg_int,
+    require_optional_sha256_revision,
+    require_repair_indices,
+    require_search_params,
+    require_sha256_revision,
+    require_viewport_width,
+)
 
 MAX_BODY = 2 * 1024 * 1024
 MAX_RESPONSE = 12 * 1024 * 1024
@@ -331,3 +316,12 @@ class LiveTabClient:
         require_image_format(image_format, error_cls=LiveBridgeError)
         return self._call("render_tab", tabId=tab_id, width=width,
                           imageFormat=image_format, **self._window_params(window_id))
+
+
+_PEER_MODULE = (
+    "agent.live_client"
+    if __name__ == "desktop.agent.live_client"
+    else ("desktop.agent.live_client" if __name__ == "agent.live_client" else None)
+)
+if _PEER_MODULE and _PEER_MODULE in sys.modules:
+    sys.modules[__name__] = sys.modules[_PEER_MODULE]
