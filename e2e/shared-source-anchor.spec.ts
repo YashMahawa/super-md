@@ -336,7 +336,10 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
       let activeId = "";
       const zoomEvents: Array<{ id?: string; zoom: number; fullscreen?: boolean }> = [];
 
-      const loadTab = (id: string) => {
+      const loadTab = (
+        id: string,
+        seededFind?: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string },
+      ) => {
         activeId = id;
         const tab = tabs[id];
         window.supermdLoad?.({
@@ -351,6 +354,7 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
           font: "Manrope",
           size: 17,
           motion: false,
+          ...(seededFind ? { seededFind } : {}),
         });
       };
 
@@ -364,6 +368,10 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
           loadTab(id);
         },
         selectTab: (id: string) => loadTab(id),
+        openSearchResult: (
+          id: string,
+          seededFind: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string },
+        ) => loadTab(id, seededFind),
         setMode: (mode: "live" | "reader" | "editor" | "split") => {
           tabs[activeId].viewMode = mode;
           loadTab(activeId);
@@ -495,5 +503,49 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
     await expect(page.locator(".live-document")).toBeVisible();
     await expect.poll(readScale).toBe("1.1");
     await expect.poll(() => readingRoot.evaluate((el) => el.scrollTop)).toBeLessThan(10);
+
+    // 6. Selected folder-search occurrence takes priority over previous viewport anchor ONLY on its owning note (Note A),
+    //    while keeping Note A's Split @ 150% view state and preserving per-note restore on edited Draft B and subsequent tab switches.
+    const selectedQuery = "sign-off records for stage 12";
+    const selectedStart = noteAContent.indexOf(selectedQuery);
+    await page.evaluate(
+      ({ query, sourceStart, sourceEnd }) =>
+        (window as any).__nativeHarness.openSearchResult("saved-note-a", {
+          query,
+          caseSensitive: true,
+          sourceStart,
+          sourceEnd,
+          matchText: query,
+        }),
+      { query: selectedQuery, sourceStart: selectedStart, sourceEnd: selectedStart + selectedQuery.length },
+    );
+    await expect(cmScroller).toBeVisible();
+    await expect(readingRoot).toBeVisible();
+    await expect.poll(readScale).toBe("1.5");
+    await expect(page.locator(".reading-search")).toBeVisible();
+    await expect
+      .poll(() => isVisibleWithinScroller(page.locator(".cm-line", { hasText: "sign-off records for stage 12" }), cmScroller))
+      .toBe(true);
+    await expect
+      .poll(() => isVisibleWithinScroller(page.locator(".android-reading p", { hasText: "sign-off records for stage 12" }), readingRoot))
+      .toBe(true);
+
+    // Switch to edited unsaved Draft B while .reading-search remains open -> Draft B applies its per-note Editor @ 143% restore.
+    await page.evaluate(() => (window as any).__nativeHarness.selectTab("unsaved-draft-b"));
+    await expect(page.locator(".android-reading")).toHaveCount(0);
+    await expect.poll(readScale).toBe("1.43");
+    await expect.poll(() => isVisibleWithinScroller(page.locator(".cm-line", { hasText: "[draft-b-view-state]" }), cmScroller)).toBe(true);
+
+    // Switch back to Note A without seededFind -> Note A applies its per-note Split @ 150% restore at Stage 12 in both panes.
+    await page.evaluate(() => (window as any).__nativeHarness.selectTab("saved-note-a"));
+    await expect(cmScroller).toBeVisible();
+    await expect(readingRoot).toBeVisible();
+    await expect.poll(readScale).toBe("1.5");
+    await expect
+      .poll(() => isVisibleWithinScroller(page.locator(".cm-line", { hasText: "sign-off records for stage 12" }), cmScroller))
+      .toBe(true);
+    await expect
+      .poll(() => isVisibleWithinScroller(page.locator(".android-reading p", { hasText: "sign-off records for stage 12" }), readingRoot))
+      .toBe(true);
   });
 });

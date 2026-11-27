@@ -4,7 +4,7 @@ import type { Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { consumePendingEditorAnchor, registerEditorAnchorAdapter } from "./sourceAnchor";
 
-const { native, editorAnchors, revealedOffsets, mockViewContext, readerTree } = vi.hoisted(() => {
+const { native, editorAnchors, revealedOffsets, mockViewContext, appliedSearchSeeds, readerTree } = vi.hoisted(() => {
   if (typeof document !== "undefined") {
     document.body.innerHTML = '<div id="root"></div>';
   }
@@ -13,6 +13,7 @@ const { native, editorAnchors, revealedOffsets, mockViewContext, readerTree } = 
     editorAnchors: new Map<string, { offset: number; caretOffset?: number; top?: number } | null>(),
     revealedOffsets: [] as Array<{ id: string; offset: number; options?: Record<string, unknown> }>,
     mockViewContext: new Map<string, { scroller: HTMLElement; visibleStart: number; visibleEnd: number }>(),
+    appliedSearchSeeds: [] as Array<{ sourceSession?: string; seed: unknown; content: string }>,
     readerTree: {
       element: null as ReactNode,
       mountRoot: null as ((container: Element | DocumentFragment) => Root) | null,
@@ -93,7 +94,36 @@ vi.mock("./components/MediaTools", () => ({ default: () => null }));
 vi.mock("./components/ImageViewer", () => ({ default: () => null }));
 vi.mock("./components/MathRepairPanel", () => ({ default: () => null }));
 vi.mock("./components/ThemeGuideDialog", () => ({ default: () => null }));
-vi.mock("./components/ReadingSearch", () => ({ default: () => null }));
+vi.mock("./components/ReadingSearch", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./components/ReadingSearch")>();
+  return {
+    ...actual,
+    default: ({
+      content,
+      sourceSession,
+      seed,
+    }: {
+      content: string;
+      sourceSession?: string;
+      seed?: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number } | null;
+    }) => {
+      useEffect(() => {
+        if (!seed) return;
+        appliedSearchSeeds.push({ sourceSession, seed, content });
+        if (
+          typeof seed.sourceStart === "number" &&
+          typeof seed.sourceEnd === "number" &&
+          actual.isValidSeedOccurrence(content, { from: seed.sourceStart, to: seed.sourceEnd }, seed.query, Boolean(seed.caseSensitive), seed.matchText) &&
+          sourceSession
+        ) {
+          editorAnchors.set(sourceSession, { offset: seed.sourceStart, caretOffset: seed.sourceEnd, top: 1420 });
+          revealedOffsets.push({ id: sourceSession, offset: seed.sourceStart, options: { fromSeed: true } });
+        }
+      }, [seed?.nonce, sourceSession, content]);
+      return <div className="reading-search" data-seed-query={seed?.query ?? ""} />;
+    },
+  };
+});
 
 import "./androidReader";
 
@@ -140,6 +170,7 @@ describe("nativeReader per-note mode and zoom across tab switches", () => {
     editorAnchors.clear();
     revealedOffsets.length = 0;
     mockViewContext.clear();
+    appliedSearchSeeds.length = 0;
     document.body.innerHTML = "";
     localStorage.clear();
   });
@@ -325,5 +356,131 @@ describe("nativeReader per-note mode and zoom across tab switches", () => {
     expect(revealedOffsets.some((entry) => entry.id === "saved-note-a" && entry.offset === targetOffset && entry.options?.top === undefined)).toBe(
       true,
     );
+  });
+
+  it("keeps selected folder-search occurrence priority only on its owning note and applies per-note restore otherwise", async () => {
+    await mountReader();
+    const noteAContent =
+      "# Spec A\n\nFirst SharedPin intro.\n\n## Previous Anchor\n\nSaved Note A previous viewport line.\n\n## Deep Match\n\nSelected SharedPin target occurrence.\n";
+    const previousNoteAOffset = noteAContent.indexOf("Saved Note A previous viewport line.");
+    const selectedNoteAStart = noteAContent.lastIndexOf("SharedPin");
+    const selectedNoteAEnd = selectedNoteAStart + "SharedPin".length;
+
+    const draftBContent = "# Draft B\n\nIntro SharedPin.\n\n## Draft Section\n\nEdited unsaved draft B anchor [draft-b-view-state].\n";
+    const draftBAnchorOffset = draftBContent.indexOf("Edited unsaved draft B anchor");
+
+    // 1. Prime Note A in Split @ 150% at its previous viewport anchor, then switch to Draft B in Editor @ 143% at its edited anchor.
+    await act(async () => {
+      window.supermdLoad?.({
+        ...basePayload,
+        id: "saved-note-a",
+        path: "/notes/spec-a.md",
+        content: noteAContent,
+        mode: "split",
+        zoom: 150,
+      });
+    });
+    editorAnchors.set("saved-note-a", { offset: previousNoteAOffset, caretOffset: previousNoteAOffset, top: 520 });
+
+    await act(async () => {
+      window.supermdLoad?.({
+        ...basePayload,
+        id: "unsaved-draft-b",
+        path: "unsaved-draft-b",
+        content: draftBContent,
+        mode: "editor",
+        zoom: 143,
+      });
+    });
+    editorAnchors.set("unsaved-draft-b", { offset: draftBAnchorOffset, caretOffset: draftBAnchorOffset, top: 680 });
+    expect(currentAppliedScale()).toBe("1.43");
+    revealedOffsets.length = 0;
+
+    // 2. Select the 2nd folder-search occurrence on Note A: Note A restores Split @ 150% zoom,
+    //    suppresses its previous viewport anchor (previousNoteAOffset), and lets seededFind jump to selectedNoteAStart.
+    await act(async () => {
+      window.supermdLoad?.({
+        ...basePayload,
+        id: "saved-note-a",
+        path: "/notes/spec-a.md",
+        content: noteAContent,
+        mode: "split",
+        zoom: 150,
+        seededFind: {
+          query: "SharedPin",
+          caseSensitive: true,
+          sourceStart: selectedNoteAStart,
+          sourceEnd: selectedNoteAEnd,
+          matchText: "SharedPin",
+        },
+      });
+    });
+    expect(document.querySelector<HTMLElement>(".document-page")?.dataset.scale).toBe("1.5");
+    expect(document.querySelector<HTMLElement>(".android-source")?.style.getPropertyValue("--workspace-scale")).toBe("1.5");
+    expect(revealedOffsets.some((entry) => entry.id === "saved-note-a" && entry.offset === previousNoteAOffset)).toBe(false);
+    expect(revealedOffsets.some((entry) => entry.id === "saved-note-a" && entry.offset === selectedNoteAStart && entry.options?.fromSeed === true)).toBe(true);
+
+    // 3. Switch to Draft B while .reading-search stays open (no seededFind on Draft B):
+    //    Draft B restores Editor @ 143% zoom and its own draftBAnchorOffset without seed suppression leaking from Note A.
+    revealedOffsets.length = 0;
+    await act(async () => {
+      window.supermdLoad?.({
+        ...basePayload,
+        id: "unsaved-draft-b",
+        path: "unsaved-draft-b",
+        content: draftBContent,
+        mode: "editor",
+        zoom: 143,
+      });
+    });
+    expect(document.querySelector(".android-reading")).toBeNull();
+    expect(currentAppliedScale()).toBe("1.43");
+    expect(revealedOffsets.some((entry) => entry.id === "unsaved-draft-b" && entry.offset === draftBAnchorOffset)).toBe(true);
+
+    // 4. Switch back to Note A without seededFind (and then with a stale seededFind): per-note restore applies selectedNoteAStart @ 150% Split.
+    revealedOffsets.length = 0;
+    await act(async () => {
+      window.supermdLoad?.({
+        ...basePayload,
+        id: "saved-note-a",
+        path: "/notes/spec-a.md",
+        content: noteAContent,
+        mode: "split",
+        zoom: 150,
+      });
+    });
+    expect(currentAppliedScale()).toBe("1.5");
+    expect(revealedOffsets.some((entry) => entry.id === "saved-note-a" && entry.offset === selectedNoteAStart)).toBe(true);
+
+    await act(async () => {
+      window.supermdLoad?.({
+        ...basePayload,
+        id: "unsaved-draft-b",
+        path: "unsaved-draft-b",
+        content: draftBContent,
+        mode: "editor",
+        zoom: 143,
+      });
+    });
+    revealedOffsets.length = 0;
+    await act(async () => {
+      window.supermdLoad?.({
+        ...basePayload,
+        id: "saved-note-a",
+        path: "/notes/spec-a.md",
+        content: noteAContent,
+        mode: "split",
+        zoom: 150,
+        seededFind: {
+          query: "SharedPin",
+          caseSensitive: true,
+          sourceStart: 99999,
+          sourceEnd: 100008,
+          matchText: "SharedPin",
+        },
+      });
+    });
+    expect(currentAppliedScale()).toBe("1.5");
+    expect(revealedOffsets.some((entry) => entry.id === "saved-note-a" && entry.offset === selectedNoteAStart)).toBe(true);
   });
 });

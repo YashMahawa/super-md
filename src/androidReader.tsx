@@ -172,6 +172,7 @@ export function Reader() {
   const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
   const searchSeedNonce = useRef(0);
   const suppressRestoreForSeed = useRef(false);
+  const suppressRestoreSeedNoteId = useRef<string | null>(null);
   const searchingRef = useRef(false); searchingRef.current = searching;
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
@@ -351,6 +352,7 @@ export function Reader() {
         next.pendingHeading=trimmed?{heading:trimmed,token:`legacy:${next.id}:${++legacyHeadingSeq.current}:${trimmed}`}:null;
       }
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen)){nativeScroll.clear();gapSelection.current?.end();}
+      if(old&&(old.id!==next.id||old.mode!==next.mode)){zoomSettleCleanup.current?.();zoomSettleCleanup.current=null;}
       const draft=edits.current!.unacknowledged(next.id);
       if(draft!==undefined&&next.content!==draft&&!contentUnchanged){
         next.content=draft;
@@ -363,12 +365,28 @@ export function Reader() {
         if(draft===undefined&&(old?.id!==next.id||old?.content!==next.content))setEditError('');
       }
       if(old?.id===next.id)next.readingLocation=old.readingLocation;
-      if(old?.id===next.id&&!next.pendingHeading&&old.pendingHeading)next.pendingHeading=old.pendingHeading;
+      const hasActiveSeedNavigation = Boolean(
+        seededFind &&
+          willSeedNavigate(
+            next.content,
+            seededFind.query,
+            seededFind.caseSensitive,
+            seededFind.sourceStart,
+            seededFind.sourceEnd,
+            seededFind.matchText,
+          ),
+      );
+      if (hasActiveSeedNavigation && !next.pendingHeading && old?.id === next.id && old.pendingHeading?.token) {
+        suppressedRestoreToken.current = old.pendingHeading.token;
+        consumedHeadingToken.current = old.pendingHeading.token;
+        document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
+      }
+      if(old?.id===next.id&&!next.pendingHeading&&old.pendingHeading&&!hasActiveSeedNavigation)next.pendingHeading=old.pendingHeading;
       const hasNewPendingHeading = Boolean(next.pendingHeading?.token && next.pendingHeading.token !== old?.pendingHeading?.token);
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen))document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
-      if(old&&(old.id!==next.id||old.mode!==next.mode)){zoomSettleCleanup.current?.();zoomSettleCleanup.current=null;const history=histories.current.get(next.id);if(history)history.last=0;}
+      if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
-        if(hasNewPendingHeading){
+        if(hasNewPendingHeading||hasActiveSeedNavigation){
           modeAnchor.current=null;
           splitPane.current=null;
           primeEditorAnchor(next.id,null);
@@ -390,7 +408,7 @@ export function Reader() {
           }
         }
       }
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.id===next.id&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind(next.content);return;}
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.id===next.id&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){if(hasActiveSeedNavigation){zoomSettleCleanup.current?.();zoomSettleCleanup.current=null;markScrollInput();}applyIncomingFind(next.content);return;}
       if (old && old.id !== next.id) {
         const outgoingPaintedZoom = currentPaintedZoom();
         if (zoomTarget.current !== null) {
@@ -468,22 +486,23 @@ export function Reader() {
           primeEditorAnchor(next.id, null);
         }
       }
-      const hasActiveSeedNavigation = Boolean(
-        seededFind &&
-          willSeedNavigate(
-            loaded.content,
-            seededFind.query,
-            seededFind.caseSensitive,
-            seededFind.sourceStart,
-            seededFind.sourceEnd,
-            seededFind.matchText,
-          ),
-      );
       const load = () => {
-        if (hasActiveSeedNavigation && (!old || old.id !== loaded.id || old.mode !== loaded.mode)) {
-          suppressRestoreForSeed.current = true;
+        if (hasActiveSeedNavigation) {
           modeAnchor.current = null;
           primeEditorAnchor(loaded.id, null);
+          if (!old || old.id !== loaded.id || old.mode !== loaded.mode) {
+            suppressRestoreForSeed.current = true;
+            suppressRestoreSeedNoteId.current = loaded.id;
+          } else {
+            suppressRestoreForSeed.current = false;
+            suppressRestoreSeedNoteId.current = null;
+            zoomSettleCleanup.current?.();
+            zoomSettleCleanup.current = null;
+            markScrollInput();
+          }
+        } else {
+          suppressRestoreForSeed.current = false;
+          suppressRestoreSeedNoteId.current = null;
         }
         if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false });
         reference.current = loaded;
@@ -964,10 +983,14 @@ export function Reader() {
       return()=>{stopped=true;cancelAnimationFrame(outerFrame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
     }
     if (suppressRestoreForSeed.current) {
+      const seedOwnerId = suppressRestoreSeedNoteId.current;
       suppressRestoreForSeed.current = false;
-      suppressedRestoreKey.current = null;
-      primeEditorAnchor(state.id, null);
-      return;
+      suppressRestoreSeedNoteId.current = null;
+      if (!seedOwnerId || seedOwnerId === state.id) {
+        suppressedRestoreKey.current = null;
+        primeEditorAnchor(state.id, null);
+        return;
+      }
     }
     if (suppressedRestoreKey.current === `${state.id}:${state.mode}`) return;
     suppressedRestoreKey.current = null;
