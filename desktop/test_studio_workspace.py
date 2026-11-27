@@ -41,7 +41,7 @@ class StudioWorkspaceTest(unittest.TestCase):
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="supermd-studio-workspace-")
-        self.root = Path(self.temp.name).resolve()
+        self.root = Path(folder_ops.canonical_path_str(self.temp.name))
         self.session = Session(True)
         self.session.settings["python"] = sys.executable
         self.studio = QuietStudio(True, self.session)
@@ -322,18 +322,22 @@ class StudioWorkspaceTest(unittest.TestCase):
         with patch("studio._raw_local_path", side_effect=lambda _raw: str(dir_a)) as spy_raw:
             Studio.openFolder(standalone, "custom://redirected-folder")
             spy_raw.assert_called_once_with("custom://redirected-folder")
-        self.assertEqual(standalone.folder, str(dir_a.resolve()))
+        self.assertEqual(standalone.folder, str(studio_mod._canonical_approved_directory(dir_a)))
         self.assertEqual([e["name"] for e in standalone.files], ["sub", "note_a.md"])
         Studio.closeFolder(standalone)
         self.assertEqual((standalone.folder, standalone.files), ("", []))
 
     def test_canonical_native_folder_paths_preserve_outer_whitespace_and_reject_links(self):
-        ws_dir = self.root / " Workspace "
-        sub_dir = ws_dir / " Sub "
+        # Win32 strips trailing spaces on directory creation; leading spaces work on Windows and leading/trailing on POSIX.
+        ws_name = " Workspace " if os.name != "nt" else " Workspace"
+        sub_name = " Sub " if os.name != "nt" else " Sub"
+        ws_dir = self.root / ws_name
+        sub_dir = ws_dir / sub_name
         decoy_ws = self.root / "Workspace"
         outside = self.root / "outside"
         for d in (sub_dir, decoy_ws, outside / "nested"):
             d.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(os.path.samefile(ws_dir, decoy_ws))
         (ws_dir / "Root.md").write_text("# Root\n", encoding="utf-8")
         (sub_dir / "Nested.md").write_text("# Nested\n", encoding="utf-8")
         (decoy_ws / "Decoy.md").write_text("# Decoy\n", encoding="utf-8")
@@ -349,12 +353,13 @@ class StudioWorkspaceTest(unittest.TestCase):
         except OSError:
             pass
 
-        ws_canon = str(ws_dir.resolve(strict=True))
-        sub_canon = str(sub_dir.resolve(strict=True))
+        ws_canon = str(studio_mod._canonical_approved_directory(ws_dir))
+        sub_canon = str(studio_mod._canonical_approved_directory(sub_dir))
+        decoy_canon = str(studio_mod._canonical_approved_directory(decoy_ws))
         self.studio.openFolder(QUrl.fromLocalFile(str(ws_dir)).toString())
         self.assertEqual(self.studio.folder, ws_canon)
-        self.assertNotEqual(self.studio.folder, str(decoy_ws.resolve(strict=True)))
-        self.assertTrue(_wait_until(lambda: [e["name"] for e in self.studio.files] == [" Sub ", "Root.md"]))
+        self.assertNotEqual(self.studio.folder, decoy_canon)
+        self.assertTrue(_wait_until(lambda: [e["name"] for e in self.studio.files] == [sub_name, "Root.md"]))
 
         for invalid in ("", "   ") + ((str(symlink_root), str(symlink_root / "nested")) if links_ok else ()):
             self.studio.openFolder(invalid)
@@ -392,7 +397,7 @@ class StudioWorkspaceTest(unittest.TestCase):
         self.studio.toggleDirectory(str(sub))
         self.assertTrue(_wait_until(lambda: any(e["name"] == "Lecture.md" for e in self.studio.files)))
         self.studio.openNote(str(note))
-        self.assertTrue(_wait_until(lambda: any(t["path"] == str(note) for t in self.studio.tabs)))
+        self.assertTrue(_wait_until(lambda: any(folder_ops.same_path(t["path"], note) for t in self.studio.tabs)))
 
         resume = self.studio._hold_watches_for_rename(str(sub), is_dir=True, new_path=str(renamed_sub))
         try:
@@ -410,14 +415,14 @@ class StudioWorkspaceTest(unittest.TestCase):
             self.studio.external_paths = {str(sub), str(note), str(vault)}
             self.studio._refresh_external_notes()
             self.app.processEvents()
-            self.assertTrue(any(t["path"] == str(note) for t in self.studio.tabs))
+            self.assertTrue(any(folder_ops.same_path(t["path"], note) for t in self.studio.tabs))
         finally:
             self.studio._sync_path_change(
                 str(sub), str(renamed_sub), is_dir=True, on_rebound=resume.set
             )
 
         rebound_note = str(renamed_sub / "Lecture.md")
-        self.assertTrue(any(t["path"] == rebound_note for t in self.studio.tabs))
+        self.assertTrue(any(folder_ops.same_path(t["path"], rebound_note) for t in self.studio.tabs))
         watched_rebound = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
         self.assertIn(folder_ops.canonical_path_str(vault), watched_rebound)
         self.assertIn(folder_ops.canonical_path_str(renamed_sub), watched_rebound)

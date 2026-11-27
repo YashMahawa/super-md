@@ -1985,9 +1985,23 @@ class Studio(QObject):
             self._reload_changed_content(effective_changed)
             if self.folder and (effective_changed or emitted_location_change):
                 self.session.workspace_links.invalidate(self.folder)
-            if self.folder and effective_changed and any(
-                folder_ops.same_path(ch, self.folder) or folder_ops.matches_path_prefix(ch, self.folder, is_directory=True)
-                for ch in effective_changed
+            if self.folder and (
+                any(
+                    folder_ops.same_path(ch, self.folder)
+                    or folder_ops.matches_path_prefix(ch, self.folder, is_directory=True)
+                    for ch in effective_changed
+                )
+                or (
+                    emitted_location_change
+                    and any(
+                        folder_ops.matches_path_prefix(p, self.folder, is_directory=True)
+                        for old, new in result.items()
+                        for p in (old, new)
+                        if p
+                        and not self._is_path_suspended(old, current_suspensions)
+                        and not (new and self._is_path_suspended(new, current_suspensions))
+                    )
+                )
             ):
                 self._load_tree()
         self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)

@@ -102,10 +102,26 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
         overview = self.workspace / "Overview.md"
         coursework = self.workspace / "Coursework"
         week1 = coursework / "Week 1.md"
+        empty_hidden = self.workspace / "EmptyNotes"
+        empty_hidden.mkdir()
+        media_hidden = self.workspace / "Assets"
+        media_hidden.mkdir()
+        (media_hidden / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        inbox_hidden = self.workspace / "Inbox" / "Clipped"
+        inbox_hidden.mkdir(parents=True)
 
         self.studio.openFolder(str(self.workspace))
         self.studio.toggleDirectory(str(coursework))
         self.wait_until(lambda: any(f["name"] == "Week 1.md" for f in self.studio.files))
+        self.assertTrue(self.studio.settings.get("hideNonNoteFolders", True))
+        self.assertEqual(
+            [f["name"] for f in self.studio.files],
+            ["Coursework", "Week 1.md", "Overview.md", "Reading.md"],
+        )
+        for watched_dir in self.studio.note_watcher.directories():
+            self.assertFalse(folder_ops.same_path(watched_dir, str(empty_hidden)))
+            self.assertFalse(folder_ops.same_path(watched_dir, str(media_hidden)))
+            self.assertFalse(folder_ops.same_path(watched_dir, str(inbox_hidden.parent)))
 
         self.studio.openNote(str(overview))
         self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], overview))
@@ -324,6 +340,37 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
             self.assertTrue(folder_ops.same_path(recovery_by_id[week1_tab_id]["path"], remapped_week1))
             self.assertEqual(recovery_by_id[week1_tab_id]["content"], "# Week 1\n\nUnsaved seminar notes")
             self.assertEqual(self.session.drafts.get("deleted-notes", []), [])
+            self.assertEqual(
+                [f["name"] for f in self.studio.files],
+                ["Seminars", "Week 1.md", "Course Overview.md", "Reading.md"],
+            )
+
+            # 3. Pinned empty subfolder rename & external note addition keep #151 folder visibility intact.
+            completion_queued.clear()
+            self.studio.createSubfolder(str(self.workspace), "EmptyDrafts")
+            self.session.writes.flush(timeout=3.0)
+            self.wait_until(lambda: any(f["name"] == "EmptyDrafts" for f in self.studio.files))
+            empty_drafts = self.workspace / "EmptyDrafts"
+            renamed_empty_drafts = self.workspace / "ArchivedDrafts"
+
+            self.studio.renameEntry(str(empty_drafts), "ArchivedDrafts")
+            self.session.writes.flush(timeout=3.0)
+            self.wait_until(lambda: completion_queued.is_set())
+            self.assertEqual(len(held_completions), 1)
+            orig_on_rename_completed(held_completions.pop())
+            self.session.writes.flush(timeout=3.0)
+            self.wait_until(
+                lambda: renamed_empty_drafts.is_dir()
+                and any(f["name"] == "ArchivedDrafts" for f in self.studio.files)
+                and not any(f["name"] == "EmptyDrafts" for f in self.studio.files)
+            )
+            self.assertFalse(any(f["name"] in ("EmptyNotes", "Assets", "Inbox") for f in self.studio.files))
+
+            (inbox_hidden / "Clip.md").write_text("# Clip\n", encoding="utf-8")
+            self.studio._external_note_changed(str(inbox_hidden))
+            self._settle_watchers()
+            self.wait_until(lambda: any(f["name"] == "Inbox" for f in self.studio.files))
+            self.assertFalse(any(f["name"] in ("EmptyNotes", "Assets") for f in self.studio.files))
         finally:
             try:
                 self.session.renameCompleted.disconnect(defer_rename_completion)
@@ -475,6 +522,10 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
             state_dir.mkdir(parents=True, exist_ok=True)
             workspace_dir.mkdir(parents=True, exist_ok=True)
             workspace_canon = Path(folder_ops.canonical_path_str(workspace_dir))
+            (workspace_canon / "EmptyScratch").mkdir()
+            assets_only = workspace_canon / "Assets"
+            assets_only.mkdir()
+            (assets_only / "diagram.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 
             if rename_folder:
                 old_dir = workspace_canon / "Drafts"
@@ -711,7 +762,7 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
                 def check_restored():
                     global attempts
                     attempts += 1
-                    if st._restoring_paths and attempts < 60:
+                    if (st._restoring_paths or (st.folder and not st.files)) and attempts < 80:
                         QTimer.singleShot(15, check_restored)
                         return
                     st.ready = True
@@ -732,6 +783,9 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
                         ],
                         "activePath": current.get("path", ""),
                         "activeName": current.get("name", ""),
+                        "folder": st.folder,
+                        "files": [f["name"] for f in st.files],
+                        "hideNonNoteFolders": bool(st.settings.get("hideNonNoteFolders", True)),
                         "pinned": list(session.pinned),
                         "recent": list(st.recent),
                         "locations": dict(session.locations),
@@ -794,9 +848,16 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
                 {"top": 6, "offset": 0.42, "zoom": 110, "mode": "live"},
             )
             self.assertEqual(report["lastReaderLoad"]["content"], unsaved_text)
+            self.assertTrue(folder_ops.same_path(report["folder"], workspace_canon))
+            self.assertTrue(report["hideNonNoteFolders"])
+            self.assertNotIn("EmptyScratch", report["files"])
+            self.assertNotIn("Assets", report["files"])
             if new_dir is not None and old_dir is not None:
                 self.assertTrue(self._contains_path(report["expanded"], new_dir))
                 self.assertFalse(self._contains_path(report["expanded"], old_dir))
+                self.assertEqual(report["files"], ["Published", "Draft.md"])
+            else:
+                self.assertEqual(report["files"], ["Renamed.md"])
         finally:
             shutil.rmtree(temp_root, ignore_errors=True)
 
