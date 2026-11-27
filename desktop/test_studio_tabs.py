@@ -95,9 +95,11 @@ class StudioTabsTest(unittest.TestCase):
         self.studio.pinRecent(str(first))
         self.assertEqual(self.studio.pinnedRecent, [])
 
-        self.studio._pending_seeded_find = {"tabId": "", "path": str(first), "query": "First", "caseSensitive": True}
-        self.assertEqual(self.studio._consume_seeded_find(self.studio._current()), {"query": "First", "caseSensitive": True})
+        self.studio._pending_seeded_find = {"tabId": "", "path": str(first), "query": "First", "caseSensitive": True, "sourceStart": 2, "sourceEnd": 7, "matchText": "First"}
+        self.assertEqual(self.studio._consume_seeded_find(self.studio._current()), {"query": "First", "caseSensitive": True, "sourceStart": 2, "sourceEnd": 7, "matchText": "First"})
         self.assertIsNone(self.studio._pending_seeded_find)
+        proxy._pending_seeded_find = {"tabId": note["id"], "path": "", "query": "Hi", "caseSensitive": False, "sourceStart": -1, "sourceEnd": 2}
+        self.assertEqual(Studio._consume_seeded_find(proxy, note), {"query": "Hi", "caseSensitive": False})
 
     def test_open_note_reuse_startup_restore_pending_heading_folder_redirect_and_navigation(self):
         vault = self.root / "vault"

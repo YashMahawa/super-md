@@ -108,7 +108,8 @@ def consume_seeded_find(studio_obj, tab: dict) -> dict | None:
     if not (matches_id or matches_path):
         return None
     studio_obj._pending_seeded_find = None
-    return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+    bounds_fn = getattr(studio_obj, "_seeded_find_bounds", None) or _studio_module().Studio._seeded_find_bounds
+    return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False)), **bounds_fn(pending)}
 
 def can_move(studio_obj) -> bool:
     return not any(
