@@ -2,32 +2,40 @@
 from __future__ import annotations
 import io, json, os, sys, threading, zipfile
 from pathlib import Path
-try:
-    from .core.paths import DESKTOP_DIR
-except ImportError:
-    from core.paths import DESKTOP_DIR
+from PySide6.QtCore import QUrl
+from PySide6.QtGui import QGuiApplication
+
+if __package__:
+    from .core import folder_ops
+    from .core.paths import DESKTOP_DIR, resource_root
+    from .documents import atomic_write
+else:
+    from core import folder_ops
+    from core.paths import DESKTOP_DIR, resource_root
+    from documents import atomic_write
+
+ROOT = resource_root()
+
+
+def local_path(value: str) -> Path:
+    url = QUrl(value)
+    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+    return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
+
 
 def _agent_cloud():
-    try:
+    if __package__:
         from . import agent_cloud
-    except ImportError:
+    else:
         import agent_cloud
     return agent_cloud
 
-def _studio_module():
-    module = sys.modules.get("studio") or sys.modules.get("desktop.studio")
-    if module is not None:
-        return module
-    try:
-        from . import studio as module
-    except ImportError:
-        import studio as module
-    return module
 
 def _agent_bridge(studio_obj):
     return getattr(getattr(studio_obj, "session", None), "agent_bridge", None)
 
-def _normalize_mcp_roots(roots) -> list[str]:
+
+def _default_normalize_mcp_roots(roots) -> list[str]:
     if not roots:
         return []
     normalized, seen = [], set()
@@ -46,8 +54,23 @@ def _normalize_mcp_roots(roots) -> list[str]:
             normalized.append(str(resolved))
     return normalized
 
-def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen=None, platform=None, cli_script=None):
+
+_normalize_mcp_roots = _default_normalize_mcp_roots
+
+
+def agent_mcp_setup_config(
+    discovery_dir,
+    *,
+    roots=None,
+    executable=None,
+    frozen=None,
+    platform=None,
+    cli_script=None,
+    root=ROOT,
+    normalize_roots_fn=_default_normalize_mcp_roots,
+):
     """Return a directly executable, absolute MCP stdio command for this install."""
+    _ = root
     frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
     # Resolving a source venv's Python symlink would bypass that environment
     # and lose its MCP dependencies. Frozen launchers can use canonical paths.
@@ -74,15 +97,17 @@ def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen
                 executable_path = console_python
         script = Path(cli_script or DESKTOP_DIR / "agent_cli.py").expanduser().resolve()
         command, args = str(executable_path), [str(script), "mcp"]
-    for root_path in _normalize_mcp_roots(roots):
+    for root_path in normalize_roots_fn(roots):
         args.extend(["--root", root_path])
     args.extend(["--live-sessions-dir", str(Path(discovery_dir).expanduser().resolve()), "--transport", "stdio"])
     return {"command": command, "args": args}
+
 
 _REQUIRED_SKILL_PACKAGE_FILES = (
     "SKILL.md", "references/study-notes.md", "references/visual-authoring.md",
     "references/agent-connection.md", "assets/study-visual-example.svg",
 )
+
 
 def _bundle_agent_skill_markdown(skill_dir: Path) -> str:
     router = ((skill_dir / "SKILL.md").read_text(encoding="utf-8").rstrip()
@@ -93,6 +118,7 @@ def _bundle_agent_skill_markdown(skill_dir: Path) -> str:
     visual_authoring = (skill_dir / "references" / "visual-authoring.md").read_text(encoding="utf-8").strip()
     connection = (skill_dir / "references" / "agent-connection.md").read_text(encoding="utf-8").strip()
     return f"{router}\n\n{study_notes}\n\n{visual_authoring}\n\n# Agent connection\n\n{connection}\n"
+
 
 def _build_agent_skill_zip_bytes(root_dir: Path) -> bytes:
     dist_zip = root_dir / "dist" / "super-md-skill.zip"
@@ -125,12 +151,14 @@ def _build_agent_skill_zip_bytes(root_dir: Path) -> bytes:
                 archive.writestr(info, file_path.read_bytes())
     return buffer.getvalue()
 
+
 def _stop_cloud_bridge(studio_obj, bridge) -> None:
     bridge.stop_cloud()
     studio_obj.settings["cloudAgentEnabled"] = False
     if getattr(studio_obj, "_cloud_started_local_bridge", False) and not studio_obj.settings.get("agentAccessEnabled", False):
         bridge.stop()
     studio_obj._cloud_started_local_bridge = False
+
 
 def _restore_cloud_connection(studio_obj) -> None:
     if studio_obj.retired or not studio_obj.settings.get("cloudAgentEnabled") or studio_obj._cloud_revocation_pending:
@@ -150,9 +178,11 @@ def _restore_cloud_connection(studio_obj) -> None:
         studio_obj._agent_cloud_error = f"Cloud auto-connect failed: {str(error)[:140]}"
     studio_obj._emit(False)
 
+
 def agent_access_enabled(studio_obj) -> bool:
     bridge = _agent_bridge(studio_obj)
     return bool(bridge and bridge.enabled)
+
 
 def agent_access_status(studio_obj) -> str:
     bridge = _agent_bridge(studio_obj)
@@ -160,7 +190,8 @@ def agent_access_status(studio_obj) -> str:
         return studio_obj._agent_error
     return "On · loopback only (fresh token each launch)" if bridge and bridge.enabled else "Off · no live tabs are exposed"
 
-def agent_mcp_roots(studio_obj) -> list[str]:
+
+def agent_mcp_roots(studio_obj, *, normalize_roots_fn=_default_normalize_mcp_roots) -> list[str]:
     windows = [studio_obj]
     if hasattr(studio_obj, "session") and hasattr(studio_obj.session, "windows"):
         windows.extend(w for w in studio_obj.session.windows.values() if w is not studio_obj and not getattr(w, "retired", False))
@@ -173,14 +204,20 @@ def agent_mcp_roots(studio_obj) -> list[str]:
             tab_path = tab.get("path") if isinstance(tab, dict) else None
             if isinstance(tab_path, str) and tab_path:
                 candidates.append(Path(tab_path).parent)
-    return _normalize_mcp_roots(candidates)
+    return normalize_roots_fn(candidates)
 
-def agent_setup_instructions(studio_obj) -> str:
+
+def agent_setup_instructions(studio_obj, *, root=ROOT, normalize_roots_fn=_default_normalize_mcp_roots) -> str:
     bridge = _agent_bridge(studio_obj)
     if not bridge or not bridge.enabled:
         return "Enable live agent access to prepare the local MCP server configuration."
-    roots = studio_obj._agent_mcp_roots() if hasattr(studio_obj, "_agent_mcp_roots") else agent_mcp_roots(studio_obj)
-    return json.dumps(agent_mcp_setup_config(bridge.discovery_dir, roots=roots), ensure_ascii=False, indent=2)
+    roots = studio_obj._agent_mcp_roots() if hasattr(studio_obj, "_agent_mcp_roots") else agent_mcp_roots(studio_obj, normalize_roots_fn=normalize_roots_fn)
+    return json.dumps(
+        agent_mcp_setup_config(bridge.discovery_dir, roots=roots, root=root, normalize_roots_fn=normalize_roots_fn),
+        ensure_ascii=False,
+        indent=2,
+    )
+
 
 def agent_access_tabs_summary(studio_obj) -> str:
     bridge = _agent_bridge(studio_obj)
@@ -190,12 +227,15 @@ def agent_access_tabs_summary(studio_obj) -> str:
     tabs = sum(len(window.tabs) for window in studios)
     return f"{tabs} open tabs across {len(studios)} windows are available to the local MCP server."
 
+
 def cloud_agent_configured(studio_obj) -> bool: return studio_obj._agent_cloud_config_path.is_file()
 def cloud_agent_revocation_pending(studio_obj) -> bool: return studio_obj._cloud_revocation_pending
+
 
 def cloud_agent_enabled(studio_obj) -> bool:
     bridge = _agent_bridge(studio_obj)
     return bool(bridge and bridge.cloudClient.enabled)
+
 
 def cloud_agent_status(studio_obj) -> str:
     if studio_obj._agent_cloud_error:
@@ -205,6 +245,7 @@ def cloud_agent_status(studio_obj) -> str:
     bridge = _agent_bridge(studio_obj)
     return bridge.cloudClient.status if bridge else "Cloud relay is unavailable."
 
+
 def cloud_relay_origin(studio_obj) -> str:
     if not studio_obj.cloudAgentConfigured:
         return ""
@@ -212,6 +253,7 @@ def cloud_relay_origin(studio_obj) -> str:
         return _agent_cloud().read_cloud_config(studio_obj._agent_cloud_config_path)["serverOrigin"]
     except Exception:
         return ""
+
 
 def cloud_connector_url(studio_obj) -> str:
     if not studio_obj.cloudAgentConfigured:
@@ -222,6 +264,7 @@ def cloud_connector_url(studio_obj) -> str:
     except Exception:
         return ""
 
+
 def best_effort_revoke_cloud_config(config) -> None:
     if not config:
         return
@@ -229,6 +272,7 @@ def best_effort_revoke_cloud_config(config) -> None:
         try: _agent_cloud().revoke(config, timeout=8)
         except Exception: pass
     threading.Thread(target=run, name="supermd-agent-cloud-revoke-old", daemon=True).start()
+
 
 def finish_cloud_revocation(studio_obj, confirmed, device_id) -> None:
     erased = False
@@ -251,6 +295,7 @@ def finish_cloud_revocation(studio_obj, confirmed, device_id) -> None:
     else:
         studio_obj._agent_cloud_error = "Local pairing credentials were erased, but relay revocation could not be confirmed."
     studio_obj._emit(False)
+
 
 def revoke_cloud_agent(studio_obj) -> None:
     if studio_obj._cloud_revocation_pending:
@@ -279,6 +324,7 @@ def revoke_cloud_agent(studio_obj) -> None:
         studio_obj._agent_cloud_error = str(error)[:180]
     studio_obj._emit(False)
 
+
 def _replace_agent_pairing(studio_obj, build_pairing) -> bool:
     try:
         if getattr(studio_obj, "_cloud_revocation_pending", False):
@@ -301,21 +347,24 @@ def _replace_agent_pairing(studio_obj, build_pairing) -> bool:
         studio_obj._emit(False)
         return False
 
+
 def create_agent_pairing(studio_obj, server_origin) -> bool:
     return _replace_agent_pairing(studio_obj, lambda cloud: cloud.new_pairing(server_origin))
 
-def import_agent_pairing(studio_obj, source) -> bool:
+
+def import_agent_pairing(studio_obj, source, *, local_path_fn=local_path) -> bool:
     def load_pairing(cloud):
-        path = _studio_module().local_path(source)
+        path = local_path_fn(source)
         if path.stat().st_size > 16_000:
             raise ValueError("Pairing file is too large")
         return cloud.validate_pairing(json.loads(path.read_text(encoding="utf-8")))
     return _replace_agent_pairing(studio_obj, load_pairing)
 
-def export_agent_pairing(studio_obj, destination) -> bool:
+
+def export_agent_pairing(studio_obj, destination, *, local_path_fn=local_path) -> bool:
     try:
         cloud = _agent_cloud()
-        path = _studio_module().local_path(destination)
+        path = local_path_fn(destination)
         cloud.export_pairing(path, cloud.read_cloud_config(studio_obj._agent_cloud_config_path))
         studio_obj.message = f"Pairing file saved to {path}"
         studio_obj._agent_cloud_error = ""
@@ -325,6 +374,7 @@ def export_agent_pairing(studio_obj, destination) -> bool:
         studio_obj._agent_cloud_error = str(error)[:180]
         studio_obj._emit(False)
         return False
+
 
 def set_cloud_agent_enabled(studio_obj, enabled) -> None:
     bridge = _agent_bridge(studio_obj)
@@ -346,14 +396,16 @@ def set_cloud_agent_enabled(studio_obj, enabled) -> None:
         studio_obj._agent_cloud_error = str(error)[:180]
     studio_obj._emit(False)
 
-def copy_cloud_connector_url(studio_obj) -> None:
+
+def copy_cloud_connector_url(studio_obj, *, gui_app_cls=QGuiApplication) -> None:
     url = studio_obj.cloudConnectorUrl
     if not url:
         studio_obj._agent_cloud_error = "Create or import a pairing before copying the connector URL."
     else:
-        _studio_module().QGuiApplication.clipboard().setText(url)
+        gui_app_cls.clipboard().setText(url)
         studio_obj._agent_cloud_error = "Connector URL copied. Treat it as a secret."
     studio_obj._emit(False)
+
 
 def set_agent_access_enabled(studio_obj, enabled) -> None:
     bridge = _agent_bridge(studio_obj)
@@ -368,6 +420,9 @@ def set_agent_access_enabled(studio_obj, enabled) -> None:
             bridge.stop()
             studio_obj.settings["cloudAgentEnabled"] = False
         studio_obj._agent_error = ""
+        background = getattr(studio_obj.session, "background", None)
+        if background is not None:
+            background._cli_started_agent_access = False
         studio_obj.settings["agentAccessEnabled"] = bool(enabled)
         studio_obj._preferences()
         studio_obj._emit(False)
@@ -376,27 +431,35 @@ def set_agent_access_enabled(studio_obj, enabled) -> None:
         studio_obj.settings["agentAccessEnabled"] = False
         studio_obj._emit(False)
 
-def copy_agent_setup_instructions(studio_obj) -> None:
+
+def copy_agent_setup_instructions(studio_obj, *, gui_app_cls=QGuiApplication) -> None:
     if not studio_obj.agentAccessEnabled:
         studio_obj._agent_error = "Enable live agent access before copying its MCP configuration."
         studio_obj._emit(False)
         return
-    _studio_module().QGuiApplication.clipboard().setText(studio_obj.agentSetupInstructions)
+    gui_app_cls.clipboard().setText(studio_obj.agentSetupInstructions)
     studio_obj._agent_error = ""
     studio_obj.message = "MCP server configuration copied to clipboard"
     studio_obj._emit(False)
 
-def save_agent_setup_instructions(studio_obj, destination) -> None:
+
+def save_agent_setup_instructions(
+    studio_obj,
+    destination,
+    *,
+    root=ROOT,
+    atomic_write_fn=atomic_write,
+    local_path_fn=local_path,
+) -> None:
     if not studio_obj.agentAccessEnabled:
         studio_obj._agent_error = "Enable live agent access before saving its setup guide."
         studio_obj._emit(False)
         return
-    studio_mod = _studio_module()
     try:
-        path = studio_mod.local_path(destination)
+        path = local_path_fn(destination)
         if path.suffix.casefold() != ".md":
             path = path.with_suffix(".md")
-        root_dir = studio_mod.ROOT
+        root_dir = Path(root)
         skill_path = root_dir / "dist" / "super-md-agent-SKILL.md"
         if skill_path.is_file():
             skill = skill_path.read_text(encoding="utf-8").rstrip()
@@ -413,7 +476,7 @@ def save_agent_setup_instructions(studio_obj, destination) -> None:
                  "## Cloud relay connector\n\n"
                  "Cloud relay connector URLs are secret bearer credentials and are not included in saved setup guides. "
                  "To connect a cloud MCP client, open Super MD Settings → AI agents and use Copy MCP connector URL to get your own connector.\n")
-        studio_mod.atomic_write(path, guide.encode("utf-8"))
+        atomic_write_fn(path, guide.encode("utf-8"))
         studio_obj._agent_error = ""
         studio_obj.message = f"Setup guide saved to {path}"
         studio_obj._emit(False)
@@ -421,13 +484,20 @@ def save_agent_setup_instructions(studio_obj, destination) -> None:
         studio_obj._agent_error = f"Could not save setup guide ({type(error).__name__})."
         studio_obj._emit(False)
 
-def export_agent_skill(studio_obj, destination) -> bool:
-    studio_mod = _studio_module()
+
+def export_agent_skill(
+    studio_obj,
+    destination,
+    *,
+    root=ROOT,
+    atomic_write_fn=atomic_write,
+    local_path_fn=local_path,
+) -> bool:
     try:
-        path = studio_mod.local_path(destination)
+        path = local_path_fn(destination)
         if path.suffix.casefold() != ".zip":
             path = path.with_suffix(".zip")
-        studio_mod.atomic_write(path, _build_agent_skill_zip_bytes(studio_mod.ROOT))
+        atomic_write_fn(path, _build_agent_skill_zip_bytes(Path(root)))
         studio_obj._agent_error = ""
         studio_obj.message = f"Skill package saved to {path}"
         studio_obj._emit(False)
