@@ -1,6 +1,7 @@
 """Install the complete bundled authoring skill, with reversible replacement."""
 import argparse, json, os, shutil, sys, uuid
 from pathlib import Path
+from core.paths import resource_root
 
 REQUIRED_SKILL_FILES = (
     "SKILL.md",
@@ -45,7 +46,7 @@ def main(argv):
     selected_agent = (args.agent or "codex").strip().lower() if args.destination is None else None
     destination = default_skill_destination(selected_agent) if args.destination is None else args.destination
 
-    root = Path(sys._MEIPASS) / "resources" if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+    root = resource_root()
     source = root / "dist/super-md-skill"
     if not source.is_dir():
         source = root / "docs/skills/super-md"

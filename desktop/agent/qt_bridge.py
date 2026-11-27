@@ -7,6 +7,7 @@ import http.server
 import json
 import os
 import secrets
+import socketserver
 import sys
 import threading
 import uuid
@@ -29,6 +30,17 @@ _FLUSH_NATIVE_ACTIONS = (
     "activate_document", "close_document", "list_diagrams", "get_diagram",
     "replace_tab_asset", "asset_action", "save_document", "open_document",
 )
+
+
+class _LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = str(self.server_address[0]), int(self.server_address[1])
+
+
+def _is_window_visible(studio) -> bool:
+    host = getattr(studio, "host_window", None) if studio is not None else None
+    return host is None or bool(host.isVisible())
 
 
 def _qt_bridge_class():
@@ -126,7 +138,7 @@ def _qt_bridge_class():
                     except Exception as error:  # noqa: BLE001
                         self._reply(500, {"error": f"desktop request failed ({type(error).__name__})"})
 
-            self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self.server = _LoopbackHTTPServer(("127.0.0.1", 0), Handler)
             self.server.daemon_threads = True
             self.server.timeout, self.server.request_queue_size = 0.5, 8
             self.discovery_path = self.discovery_dir / f"{self.session_id}.json"
@@ -266,18 +278,19 @@ def _qt_bridge_class():
                             return
                         parent.update(expected=len(candidates), aggregate=[], completed=0, fallback={})
                     for studio in candidates:
+                        visible = _is_window_visible(studio)
                         tab_rows = [{"id": t["id"], "windowId": studio.window_id, "title": t["name"], "path": t["path"],
                                      "format": "smd" if t.get("portable") or str(t["path"]).lower().endswith(".smd") else "markdown",
                                      "isDirty": t["content"] != t["saved"], "sourceLength": len(t["content"]),
                                      "revision": hashlib.sha256(t["content"].encode("utf-8")).hexdigest(),
-                                     "active": t["id"] == studio.active} for t in studio.tabs]
+                                     "active": visible and t["id"] == studio.active} for t in studio.tabs]
                         child_id = uuid.uuid4().hex
                         with self._lock:
                             self._dispatches[child_id] = (request_id, studio.window_id, "list")
                             if request_id in self._pending:
                                 self._pending[request_id]["fallback"][studio.window_id] = tab_rows
                         studio.agentRequest.emit(json.dumps({"action": "list_tabs", "requestId": child_id, "tabs": tab_rows,
-                                                             "windowId": studio.window_id, "activeTabId": studio.active},
+                                                             "windowId": studio.window_id, "activeTabId": studio.active if visible else ""},
                                                             ensure_ascii=False, separators=(",", ":")))
                     return
                 if action == "create_document" or (action == "open_document" and not payload.get("tabId")):
@@ -384,15 +397,16 @@ def _qt_bridge_class():
                 try:
                     if studio is None or studio.retired:
                         raise ValueError("The target desktop window was closed")
+                    visible = _is_window_visible(studio)
                     if payload["action"] in ("list_diagrams", "get_diagram"):
                         target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
                         if target is None:
                             raise ValueError("The requested live tab is no longer open")
-                        request = ({**payload, "requestId": parent_id} if payload.get("tabId") == studio.active else {
+                        request = ({**payload, "requestId": parent_id} if visible and payload.get("tabId") == studio.active else {
                             **payload, "requestId": parent_id, "_snapshot": True, "content": target["content"],
                             "path": target.get("path", ""), "python": studio.settings.get("python", "embedded")})
                         return self._emit_to_studio(parent_id, studio, request)
-                    if payload["action"] == "patch_tab" and payload.get("tabId") == studio.active:
+                    if payload["action"] == "patch_tab" and visible and payload.get("tabId") == studio.active:
                         return self._emit_to_studio(parent_id, studio, {**payload, "requestId": parent_id})
                     async_handler = getattr(studio, "_agent_document_action_async", None)
                     if self._is_async_native_action(payload) and callable(async_handler):
@@ -410,9 +424,11 @@ def _qt_bridge_class():
             if dispatch_type == "list":
                 rows = result.get("tabs") if isinstance(result, dict) else None
                 fallback_by_id = {row.get("id"): row for row in fallback if isinstance(row, dict)}
+                owner_visible = _is_window_visible(self.session.windows.get(expected_window))
                 merged_rows = ([m for row in rows if isinstance(row, dict)
                                 if (m := {**fallback_by_id.get(row.get("id"), {}),
-                                          **{k: row[k] for k in _LIST_TAB_KEYS if k in row}}).get("id")]
+                                          **{k: row[k] for k in _LIST_TAB_KEYS if k in row},
+                                          **({} if owner_visible else {"active": False})}).get("id")]
                                if isinstance(rows, list) else list(fallback))
                 event = None
                 with self._lock:
