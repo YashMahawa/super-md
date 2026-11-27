@@ -35,7 +35,28 @@ class CustomThemeTest(unittest.TestCase):
             style=custom_theme.reader(theme,"dark",True,overrides)
             self.assertEqual(style["artwork"]["reader"]["opacity"],.18)
         presets=custom_theme.bundled_themes()
-        self.assertEqual(len(presets),16)
+        catalog=json.loads((Path(__file__).resolve().parent.parent/"public/themes/index.json").read_text(encoding="utf-8"))
+        self.assertEqual(presets,catalog)
+        with tempfile.TemporaryDirectory() as folder:
+            themes_dir=Path(folder)/"public/themes"
+            themes_dir.mkdir(parents=True)
+            (themes_dir/"index.json").write_text(json.dumps([
+                {"id":"rose-paper","name":"Rose paper","filename":"rose-paper.supermd-theme.json"},
+                {"id":"../invalid","name":"Invalid","filename":"../invalid.supermd-theme.json"},
+            ]),encoding="utf-8")
+            (themes_dir/"rose-paper.supermd-theme.json").write_text(json.dumps({**custom_theme.TEMPLATE,"name":"Rose paper"}),encoding="utf-8")
+            (themes_dir/"extra-dawn.supermd-theme.json").write_text(json.dumps({**custom_theme.TEMPLATE,"name":"Extra dawn"}),encoding="utf-8")
+            self.assertEqual(custom_theme.bundled_themes(folder),[
+                {"id":"rose-paper","name":"Rose paper","filename":"rose-paper.supermd-theme.json"},
+                {"id":"extra-dawn","name":"Extra dawn","filename":"extra-dawn.supermd-theme.json"},
+            ])
+        with tempfile.TemporaryDirectory() as folder:
+            fallback_dir=Path(folder)/"public/themes"
+            fallback_dir.mkdir(parents=True)
+            (fallback_dir/"extra-only.supermd-theme.json").write_text(json.dumps({**custom_theme.TEMPLATE,"name":"Extra only"}),encoding="utf-8")
+            self.assertEqual(custom_theme.bundled_themes(folder),[
+                {"id":"extra-only","name":"Extra only","filename":"extra-only.supermd-theme.json"},
+            ])
         engine=Path(__file__).resolve().parent.parent/"smd-core/target/debug/smd-engine"
         if engine.is_file():
             for preset in presets:
