@@ -848,19 +848,98 @@ def _write_json_value(raw, value, seen: set[int]) -> None:
         raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+_ATOMIC_JSON_STAGE_TLS = threading.local()
+
+
+def _stage_target_key(path: Path | str) -> str:
+    try:
+        resolved = os.path.realpath(os.path.abspath(os.fspath(path)))
+    except OSError:
+        resolved = os.path.abspath(os.fspath(path))
+    if os.name == "nt":
+        if resolved.startswith("\\\\?\\UNC\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif resolved.startswith("\\\\?\\"):
+            resolved = resolved[4:]
+    return os.path.normcase(os.path.normpath(resolved))
+
+
+class _StagedAtomicJsonScope:
+    """Defer the final atomic rename of ``target_path`` until the caller commits."""
+
+    def __init__(self, target_path: Path, abort_check=None):
+        self.target = Path(os.path.abspath(os.fspath(target_path)))
+        self.target_key = _stage_target_key(target_path)
+        self.abort_check = abort_check
+        self.intercepted = False
+        self.temporary: str | None = None
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = getattr(_ATOMIC_JSON_STAGE_TLS, "active", None)
+        _ATOMIC_JSON_STAGE_TLS.active = self
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _ATOMIC_JSON_STAGE_TLS.active = self._previous
+        if exc_type is not None:
+            self.discard()
+        return False
+
+    def publish(self, destination: Path | None = None) -> None:
+        temp = self.temporary
+        if temp is None:
+            return
+        self.temporary = None
+        try:
+            _replace_with_windows_sharing_retry(temp, destination or self.target)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
+    def discard(self) -> None:
+        temp = self.temporary
+        self.temporary = None
+        if temp is not None and os.path.exists(temp):
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+def stage_atomic_json(target_path: Path, *, abort_check=None) -> _StagedAtomicJsonScope:
+    return _StagedAtomicJsonScope(target_path, abort_check=abort_check)
+
+
 def atomic_json(path: Path, value) -> None:
     """Write ordered recovery without full-workspace JSON + UTF-8 copies or long GIL holds."""
-    handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    path_obj = Path(path)
+    stage_scope = getattr(_ATOMIC_JSON_STAGE_TLS, "active", None)
+    capture_stage = (
+        stage_scope is not None
+        and not stage_scope.intercepted
+        and _stage_target_key(path_obj) == stage_scope.target_key
+    )
+    if capture_stage:
+        stage_scope.intercepted = True
+        if callable(stage_scope.abort_check) and stage_scope.abort_check():
+            return
+    handle, temporary = tempfile.mkstemp(prefix=f".{path_obj.name}.", suffix=".tmp", dir=path_obj.parent)
+    handed_off = False
     try:
         with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as file:
-            if path.exists() and hasattr(os, "fchmod"):
-                os.fchmod(file.fileno(), stat.S_IMODE(path.stat().st_mode))
+            if path_obj.exists() and hasattr(os, "fchmod"):
+                os.fchmod(file.fileno(), stat.S_IMODE(path_obj.stat().st_mode))
             _write_json_value(file, value, set())
             file.flush()
             os.fsync(file.fileno())
-        _replace_with_windows_sharing_retry(temporary, path)
+        if capture_stage:
+            stage_scope.temporary = temporary
+            handed_off = True
+            return
+        _replace_with_windows_sharing_retry(temporary, path_obj)
     finally:
-        if os.path.exists(temporary):
+        if not handed_off and os.path.exists(temporary):
             os.unlink(temporary)
 
 def materialize_assets(root: Path, assets: dict[str,str]) -> None:
