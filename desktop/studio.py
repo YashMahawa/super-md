@@ -1021,6 +1021,7 @@ class Studio(QObject):
         self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
+        self._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
         self.session = session or Session(isolated)
         weak_self = weakref.ref(self)
@@ -1852,6 +1853,8 @@ class Studio(QObject):
         self._cancel_subfolder_search()
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
         self._search_pool.shutdown(wait=False, cancel_futures=True)
+        if self._python_pool is not None:
+            self._python_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
         self._python_jobs.cancel_all(retire=True)
         self._preview_jobs.cancel_all(retire=True)
@@ -2849,6 +2852,7 @@ class Studio(QObject):
         if target is self or not self._can_move() or not target._can_move(): return False
         note = next((t for t in self.tabs if t["id"] == tab_id), None)
         if not note: return False
+        self._python_jobs.cancel_tab(tab_id)
         old = self.tabs.index(note)
         self.tabs.remove(note)
         self._preview_jobs.cancel_tab(tab_id)
@@ -2998,6 +3002,11 @@ class Studio(QObject):
         colors = self._colors()
         svg = svg.replace("#16181d",colors["text"]).replace("#f4f4f1",colors["surface"])
         return "data:image/svg+xml;base64,"+base64.b64encode(svg.encode()).decode()
+
+    def _get_python_pool(self):
+        if self._python_pool is None and not self.retired:
+            self._python_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="supermd-python")
+        return self._python_pool
 
     def _submit(self, action, done, busy=True, executor=None):
         if self.retired:return
@@ -3973,6 +3982,7 @@ class Studio(QObject):
         elif operation["action"] == "reload_reader":
             # The renderer has acknowledged all edits. Reopen it from native
             # state and the just-captured view snapshot in document_flushed.
+            self._python_jobs.cancel_tab(self.active)
             self.ready=False
             self._last_reader_text=None
             self.reader_overlay=False
@@ -5872,6 +5882,15 @@ class Studio(QObject):
                     raise ValueError("Invalid PDF export job id")
                 self.replied.emit(id, json.dumps({"cancelled": self._export_jobs.cancel(job_id)}), "")
                 return
+            if command == "stop_python":
+                job_id = args.get("jobId")
+                if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
+                    raise ValueError("Invalid Python cell job id")
+                tab_filter = args.get("id")
+                if tab_filter is not None and (not isinstance(tab_filter, str) or not tab_filter or len(tab_filter) > 128):
+                    raise ValueError("Invalid Python cell tab id")
+                self.replied.emit(id, json.dumps({"stopped": self._python_jobs.cancel_job(job_id, tab_id=tab_filter)}), "")
+                return
             tab = self._current()
             if command == "reader_ready": self.ready = True; self._last_reader_text=None; self._emit(); self.replied.emit(id,"true",""); return
             if command == "reader_chrome":
@@ -6157,7 +6176,10 @@ class Studio(QObject):
             elif command == "run_python":
                 if self.retired or captured["id"] in self._closing_tabs:
                     raise ValueError("The note for this operation is no longer open")
-                python_job = self._python_jobs.register(captured["id"])
+                py_job_id = args.get("jobId")
+                if py_job_id is None:
+                    py_job_id = uuid.uuid4().hex
+                python_job = self._python_jobs.register(captured["id"], job_id=py_job_id)
             def export_result(path):
                 if agent_export_info:
                     return self._agent_export_metadata(Path(path), agent_export_info["format"])
@@ -6327,10 +6349,16 @@ class Studio(QObject):
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
                 self.saving.discard(saving_tab_id)
                 return
-            if python_job is not None and (self.retired or getattr(self.pool, "_shutdown", False)):
+            python_executor = self._get_python_pool() if command == "run_python" else None
+            if python_job is not None and (self.retired or python_executor is None or getattr(python_executor, "_shutdown", False)):
                 self._python_jobs.discard(python_job)
                 return
-            self._submit(work,finished,command in ("run_python","export_fmd_native","export_pdf_native","export_markdown_native"),self.writes if command in ("export_fmd_native", "export_markdown_native") else None)
+            self._submit(
+                work,
+                finished,
+                command in ("export_fmd_native", "export_pdf_native", "export_markdown_native"),
+                python_executor if command == "run_python" else (self.writes if command in ("export_fmd_native", "export_markdown_native") else None),
+            )
         except Exception as error:
             if python_job is not None:
                 self._python_jobs.discard(python_job)
