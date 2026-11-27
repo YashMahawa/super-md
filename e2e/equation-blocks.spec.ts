@@ -47,6 +47,16 @@ test("numbered LaTeX equation block without surrounding $$ resolves forward refe
     "",
     "As previewed in \\eqref{eq:parseval} and Equation \\ref{eq:parseval} (inline check $E = \\eqref{eq:parseval}$), see [Next Lecture](./lecture-2.md#fourier) before jumping to the identity.",
     "",
+    "```latex",
+    "\\begin{equation}",
+    "x = 999 \\label{eq:fenced}",
+    "\\end{equation}",
+    "```",
+    "",
+    "    \\begin{equation}",
+    "    y = 888 \\label{eq:indented}",
+    "    \\end{equation}",
+    "",
     fillerParagraphs,
     "",
     "## Parseval Identity",
@@ -55,7 +65,7 @@ test("numbered LaTeX equation block without surrounding $$ resolves forward refe
     "\\sum_{n=-\\infty}^{\\infty} |c_n|^2 = \\frac{1}{2\\pi} \\int_{-\\pi}^{\\pi} |f(x)|^2 \\, dx \\label{eq:parseval}",
     "\\end{equation}",
     "",
-    "Follow-up reference in [[Appendix#Bounds]] and [Summary](summary.md) confirming \\eqref{eq:parseval}.",
+    "Follow-up reference in [[Appendix#Bounds]] and [Summary](summary.md) confirming \\eqref{eq:parseval}, while literals \\eqref{eq:fenced} and \\eqref{eq:indented} stay unresolved.",
   ].join("\n");
 
   await page.evaluate(
@@ -88,10 +98,15 @@ test("numbered LaTeX equation block without surrounding $$ resolves forward refe
   await expect(forwardRef).toHaveText("1");
   await expect(page.locator(".katex a[href='#smd-eq-eq_3a_parseval']")).toHaveText("(1)");
 
-  // 2. Verify rendered equation block has tag (1), no $$ artifacts, and exact canonical source offsets on block and links.
+  // 2. Verify rendered equation block has tag (1), fenced/indented literals stay literal, and canonical source offsets hold.
   const eqAnchor = page.locator("#smd-eq-eq_3a_parseval");
   await expect(eqAnchor).toBeAttached();
   await expect(eqAnchor.locator(".katex-tag, .tag")).toContainText("(1)");
+  await expect(page.locator("#smd-eq-eq_3a_fenced")).toHaveCount(0);
+  await expect(page.locator("#smd-eq-eq_3a_indented")).toHaveCount(0);
+  await expect(page.locator("pre code").nth(0)).toContainText("x = 999 \\label{eq:fenced}");
+  await expect(page.locator("pre code").nth(1)).toContainText("y = 888 \\label{eq:indented}");
+  await expect(page.locator(".equation-ref.is-unresolved")).toHaveText(["(??)", "(??)"]);
 
   const offsetReport = await page.evaluate((src) => {
     const sliceAt = (selector: string, index = 0) => {
@@ -171,7 +186,7 @@ test("numbered LaTeX equation block without surrounding $$ resolves forward refe
       "\\sum_{n=-\\infty}^{\\infty} |c_n|^2 = \\frac{1}{2\\pi} \\int_{-\\pi}^{\\pi} |f(x)|^2 \\, dx \\label{eq:parseval}",
       "\\end{equation}",
       "",
-      "Follow-up reference in [Appendix#Bounds](Appendix.md#bounds) and [Summary](summary.md) confirming \\eqref{eq:parseval}.",
+      "Follow-up reference in [Appendix#Bounds](Appendix.md#bounds) and [Summary](summary.md) confirming \\eqref{eq:parseval}, while literals \\eqref{eq:fenced} and \\eqref{eq:indented} stay unresolved.",
     ].join("\n"),
   );
   expect(copiedSlice).not.toContain("$$");

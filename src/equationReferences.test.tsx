@@ -232,7 +232,7 @@ describe("explicit equation tags and resolved references", () => {
     });
   });
 
-  it("numbers standalone \\begin{equation} blocks without surrounding $$, resolves forward references across LiveEditor blocks, and preserves source offsets on copy and links", async () => {
+  it("numbers standalone \\begin{equation} blocks without surrounding $$, ignores fenced/indented literals, resolves forward references across Reader and LiveEditor, and preserves source offsets on copy and links", async () => {
     const markdown = [
       "# Fourier Series",
       "",
@@ -241,6 +241,16 @@ describe("explicit equation tags and resolved references", () => {
       "\\begin{equation}",
       "e^{i\\pi} + 1 = 0 \\label{eq:euler}",
       "\\end{equation}",
+      "",
+      "```latex",
+      "\\begin{equation}",
+      "x = 999 \\label{eq:fenced}",
+      "\\end{equation}",
+      "```",
+      "",
+      "    \\begin{equation}",
+      "    y = 888 \\label{eq:indented}",
+      "    \\end{equation}",
       "",
       "\\begin{equation*}",
       "f(x) = \\sum_{n=-\\infty}^{\\infty} c_n e^{inx} \\label{eq:unnumbered-star}",
@@ -266,7 +276,7 @@ describe("explicit equation tags and resolved references", () => {
       "",
       "## Closing Links",
       "",
-      "After equations: [Next Note](./next.md#bounds), [[RefNote#Lemma]], [Jump Euler](#eq:euler), custom \\eqref{eq:custom}, unnumbered \\eqref{eq:unnumbered-star} / \\eqref{eq:suppressed} / \\eqref{eq:align-separate}.",
+      "After equations: [Next Note](./next.md#bounds), [[RefNote#Lemma]], [Jump Euler](#eq:euler), custom \\eqref{eq:custom}, unnumbered \\eqref{eq:unnumbered-star} / \\eqref{eq:suppressed} / \\eqref{eq:align-separate}, literals \\eqref{eq:fenced} / \\eqref{eq:indented}.",
     ].join("\n");
 
     // 1. Verify canonical AST block & heading offsets.
@@ -277,10 +287,82 @@ describe("explicit equation tags and resolved references", () => {
       expect(markdown.slice(block.start, block.end)).toBe(block.text);
     }
 
-    // 2. Render in LiveEditor (which renders each block in isolation) to prove equation #2 stays (2), not reset to (1).
+    const verifyRenderedDom = (container: HTMLElement, copyContainerSelector: string) => {
+      expect(container.querySelectorAll(".katex-error")).toHaveLength(0);
+      const tags = Array.from(
+        container.querySelectorAll<HTMLElement>(".katex-display .katex-tag, .katex-display .tag"),
+      )
+        .map((el) => (el.textContent || "").replace(/[\s\u200b]+/g, " ").trim())
+        .filter(Boolean);
+      expect(tags).toEqual(["(1)", "(P.1)", "(2)"]);
+
+      const codeBlocks = Array.from(container.querySelectorAll<HTMLElement>("pre code")).map(
+        (el) => el.textContent || "",
+      );
+      expect(codeBlocks.some((txt) => txt.includes("x = 999 \\label{eq:fenced}"))).toBe(true);
+      expect(codeBlocks.some((txt) => txt.includes("y = 888 \\label{eq:indented}"))).toBe(true);
+
+      const refLinks = Array.from(container.querySelectorAll<HTMLAnchorElement>("a.equation-ref"));
+      expect(refLinks.map((a) => a.textContent)).toEqual(["(1)", "1", "(2)", "(P.1)"]);
+
+      const inMathLinks = Array.from(container.querySelectorAll<HTMLAnchorElement>(".katex a[href^='#smd-eq-']"));
+      expect(inMathLinks.map((a) => (a.textContent || "").trim())).toEqual(["(2)"]);
+
+      const unresolved = Array.from(container.querySelectorAll<HTMLElement>(".equation-ref.is-unresolved")).map(
+        (el) => el.textContent,
+      );
+      expect(unresolved).toEqual(["(??)", "(??)", "(??)", "(??)", "(??)"]);
+
+      for (const el of Array.from(
+        container.querySelectorAll<HTMLElement>("a[data-source-start], .math-equation-anchor[data-source-start]"),
+      )) {
+        const start = Number(el.dataset.sourceStart);
+        const end = Number(el.dataset.sourceEnd);
+        expect(end).toBeGreaterThan(start);
+        const rawSlice = markdown.slice(start, end);
+        if (el.classList.contains("math-equation-anchor")) {
+          expect(rawSlice.startsWith("\\begin{equation") || rawSlice.startsWith("$$")).toBe(true);
+        } else if (el.classList.contains("equation-ref")) {
+          expect(rawSlice).toBe(el.getAttribute("data-source-tex"));
+        } else if (el.textContent === "Next Note") {
+          expect(rawSlice).toBe("[Next Note](./next.md#bounds)");
+        } else if (el.textContent === "RefNote#Lemma") {
+          expect(rawSlice).toBe("[[RefNote#Lemma]]");
+        } else if (el.textContent === "Jump Euler") {
+          expect(rawSlice).toBe("[Jump Euler](#eq:euler)");
+        }
+      }
+
+      const copyRoot = container.querySelector(copyContainerSelector)!;
+      const range = document.createRange();
+      range.selectNodeContents(copyRoot);
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const copied = selectedMarkdown(selection, markdown) || "";
+      expect(copied).toContain("\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}");
+      expect(copied).toContain("x = 999 \\label{eq:fenced}");
+      expect(copied).toContain("y = 888 \\label{eq:indented}");
+      expect(copied).not.toContain("$$\n\\begin{equation}");
+      selection.removeAllRanges();
+    };
+
+    // 2. Render in Reader (MarkdownPreview) and verify numbering, literals, offsets, and copy.
     const host = document.createElement("div");
     document.body.append(host);
     root = createRoot(host);
+    await act(async () => {
+      root?.render(
+        <div className="reading-scroll">
+          <div className="document-page">
+            <MarkdownPreview markdown={markdown} documentPath="/notes/fourier.md" python="" dark={false} />
+          </div>
+        </div>,
+      );
+    });
+    verifyRenderedDom(host, ".markdown-body");
+
+    // 3. Render in LiveEditor (isolated per-block rendering) to prove equation #2 stays (2), not reset to (1).
     await act(async () => {
       root?.render(
         <LiveEditor
@@ -292,59 +374,14 @@ describe("explicit equation tags and resolved references", () => {
         />,
       );
     });
+    verifyRenderedDom(host, ".live-document");
 
-    expect(host.querySelectorAll(".katex-error")).toHaveLength(0);
-    const tags = Array.from(
-      host.querySelectorAll<HTMLElement>(".katex-display .katex-tag, .katex-display .tag"),
-    )
-      .map((el) => (el.textContent || "").replace(/[\s\u200b]+/g, " ").trim())
-      .filter(Boolean);
-    expect(tags).toEqual(["(1)", "(P.1)", "(2)"]);
-
-    const refLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>("a.equation-ref"));
-    expect(refLinks.map((a) => a.textContent)).toEqual(["(1)", "1", "(2)", "(P.1)"]);
-
-    const inMathLinks = Array.from(host.querySelectorAll<HTMLAnchorElement>(".katex a[href^='#smd-eq-']"));
-    expect(inMathLinks.map((a) => (a.textContent || "").trim())).toEqual(["(2)"]);
-
-    const unresolved = Array.from(host.querySelectorAll<HTMLElement>(".equation-ref.is-unresolved")).map(
-      (el) => el.textContent,
-    );
-    expect(unresolved).toEqual(["(??)", "(??)", "(??)"]);
-
-    // 3. Verify every link and bare equation anchor preserves exact canonical source offsets.
-    for (const anchor of Array.from(host.querySelectorAll<HTMLElement>("a[data-source-start]"))) {
-      const start = Number(anchor.dataset.sourceStart);
-      const end = Number(anchor.dataset.sourceEnd);
-      expect(end).toBeGreaterThan(start);
-      const rawSlice = markdown.slice(start, end);
-      if (anchor.classList.contains("equation-ref")) {
-        expect(rawSlice).toBe(anchor.getAttribute("data-source-tex"));
-      } else if (anchor.textContent === "Next Note") {
-        expect(rawSlice).toBe("[Next Note](./next.md#bounds)");
-      } else if (anchor.textContent === "RefNote#Lemma") {
-        expect(rawSlice).toBe("[[RefNote#Lemma]]");
-      } else if (anchor.textContent === "Jump Euler") {
-        expect(rawSlice).toBe("[Jump Euler](#eq:euler)");
-      }
-    }
-
-    // 4. Verify Copy preserves bare \begin{equation}...\end{equation} without adding $$.
-    const liveDoc = host.querySelector(".live-document")!;
-    const range = document.createRange();
-    range.selectNodeContents(liveDoc);
-    const selection = window.getSelection()!;
-    selection.removeAllRanges();
-    selection.addRange(range);
-    const copied = selectedMarkdown(selection, markdown) || "";
-    expect(copied).toContain("\\begin{equation}\ne^{i\\pi} + 1 = 0 \\label{eq:euler}\n\\end{equation}");
-    expect(copied).not.toContain("$$\n\\begin{equation}");
-    selection.removeAllRanges();
-
-    // 5. Verify preparePdf preserves standalone equation blocks cleanly for smd-core.
+    // 4. Verify preparePdf preserves standalone equation blocks and code literals cleanly for smd-core.
     const prepared = await preparePdf(markdown, "/notes/fourier.md");
     expect(prepared.content).toContain("\\eqref{eq:euler}");
     expect(prepared.content).toContain("\\begin{equation}");
     expect(prepared.content).toContain("\\label{eq:parseval}");
+    expect(prepared.content).toContain("x = 999 \\label{eq:fenced}");
+    expect(prepared.content).toContain("y = 888 \\label{eq:indented}");
   });
 });

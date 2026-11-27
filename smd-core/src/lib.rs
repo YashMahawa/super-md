@@ -17,7 +17,7 @@ use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -921,7 +921,6 @@ struct Renderer<'a> {
     headings: HashMap<String, usize>,
     heading_counts: HashMap<String, usize>,
     equations: HashMap<String, equations::EquationTarget>,
-    display_plans: VecDeque<equations::DisplayEquationPlan>,
     emitted_equation_anchors: HashSet<String>,
     link_depth: usize,
 }
@@ -1006,11 +1005,7 @@ impl<'a> Renderer<'a> {
                 Event::InlineMath(ref value) | Event::DisplayMath(ref value) => {
                     let display = matches!(&event, Event::DisplayMath(_));
                     let plan = if display {
-                        self.display_plans.pop_front().unwrap_or_else(|| {
-                            let mut sink_map = HashMap::new();
-                            let mut sink_counter = 0usize;
-                            equations::analyze_display_equation(value, &mut sink_map, &mut sink_counter)
-                        })
+                        equations::render_display_equation(value, &mut self.equations)
                     } else {
                         equations::DisplayEquationPlan { clean_tex: value.to_string(), tag: None, anchor_ids: Vec::new() }
                     };
@@ -1150,8 +1145,8 @@ impl<'a> Renderer<'a> {
                             let (body, accent) = if let Some((kind, title)) = callout {
                                 self.events.next();
                                 while !matches!(self.events.peek(), None | Some(Event::SoftBreak | Event::HardBreak | Event::End(TagEnd::Paragraph))) {
-                                    if matches!(self.events.next(), Some(Event::DisplayMath(_))) {
-                                        let _ = self.display_plans.pop_front();
+                                    if let Some(Event::DisplayMath(v)) = self.events.next() {
+                                        let _ = equations::render_display_equation(&v, &mut self.equations);
                                     }
                                 }
                                 if matches!(self.events.peek(), Some(Event::SoftBreak | Event::HardBreak)) { self.events.next(); }
@@ -1213,7 +1208,7 @@ impl<'a> Renderer<'a> {
                                 Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
                                     let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
                                     let trimmed = decoded.trim();
-                                    if let Some(eq_target) = self.equations.get(trimmed) {
+                                    if let Some(eq_target) = equations::lookup_equation_target(&self.equations, trimmed) {
                                         format!("#link(label({}))[{body}]", string(&eq_target.anchor_id))
                                     } else {
                                         let slug = heading_slug(trimmed);
@@ -1247,14 +1242,12 @@ pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>)
     let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
     let mut equations = HashMap::new();
-    let mut display_plans = VecDeque::new();
-    let mut equation_counter = 0usize;
     for event in &events {
         if let Event::DisplayMath(v) = event {
-            display_plans.push_back(equations::analyze_display_equation(v, &mut equations, &mut equation_counter));
+            equations::analyze_display_equation(v, &mut equations);
         }
     }
-    Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new(), equations, display_plans, emitted_equation_anchors: HashSet::new(), link_depth: 0 }.render(None)
+    Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
@@ -1268,31 +1261,18 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES);
     let mut headings = HashMap::new(); let mut current = None::<String>;
     let mut equations = HashMap::new();
-    let mut display_plans = VecDeque::new();
-    let mut equation_counter = 0usize;
     for event in &events { match event {
         Event::Start(Tag::Heading { .. }) => current = Some(String::new()),
         Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => { if let Some(text) = &mut current { text.push_str(v); } },
         Event::End(TagEnd::Heading(_)) => { if let Some(text) = current.take() { let slug = heading_slug(&text); let count = headings.get(&slug).copied().unwrap_or(0); if count > 0 { headings.insert(format!("{slug}-{count}"), 1); } headings.insert(slug, count + 1); } },
-        Event::DisplayMath(v) => {
-            display_plans.push_back(equations::analyze_display_equation(v, &mut equations, &mut equation_counter));
-        },
+        Event::DisplayMath(v) => { equations::analyze_display_equation(v, &mut equations); },
         _ => {}
     } }
-    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings, heading_counts: HashMap::new(), equations: equations.clone(), display_plans: display_plans.clone(), emitted_equation_anchors: HashSet::new(), link_depth: 0 };
+    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings, heading_counts: HashMap::new(), equations: equations.clone(), emitted_equation_anchors: HashSet::new(), link_depth: 0 };
     // References normally precede definitions, so collect definitions first.
-    let mut definitions = Renderer { events: renderer.events.clone(), assets, footnotes: HashMap::new(), headings: renderer.headings.clone(), heading_counts: HashMap::new(), equations, display_plans, emitted_equation_anchors: HashSet::new(), link_depth: 0 };
+    let mut definitions = Renderer { events: renderer.events.clone(), assets, footnotes: HashMap::new(), headings: renderer.headings.clone(), heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 };
     while let Some(event) = definitions.events.next() {
-        match event {
-            Event::Start(Tag::FootnoteDefinition(name)) => {
-                let value = definitions.render(Some(TagEnd::FootnoteDefinition))?;
-                definitions.footnotes.insert(name.to_string(), value);
-            }
-            Event::DisplayMath(_) => {
-                let _ = definitions.display_plans.pop_front();
-            }
-            _ => {}
-        }
+        if let Event::Start(Tag::FootnoteDefinition(name)) = event { let value = definitions.render(Some(TagEnd::FootnoteDefinition))?; definitions.footnotes.insert(name.to_string(), value); }
     }
     renderer.footnotes = definitions.footnotes;
     let body = renderer.render(None)?;
@@ -1663,7 +1643,6 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
             headings: HashMap::new(),
             heading_counts: HashMap::new(),
             equations: HashMap::new(),
-            display_plans: VecDeque::new(),
             emitted_equation_anchors: HashSet::new(),
             link_depth: 0,
         }.render(None).unwrap();

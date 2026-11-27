@@ -729,10 +729,39 @@ fn strip_unescaped_latex_comments(tex: &str) -> String {
     out
 }
 
-pub(crate) fn analyze_display_equation(
+const AUTO_SCAN_COUNTER_KEY: &str = "\0smd_auto_scan_counter";
+const AUTO_RENDER_COUNTER_KEY: &str = "\0smd_auto_render_counter";
+
+fn next_internal_counter(equations: &mut HashMap<String, EquationTarget>, key: &str) -> usize {
+    let next = equations
+        .get(key)
+        .and_then(|target| target.anchor_id.parse::<usize>().ok())
+        .unwrap_or(0)
+        + 1;
+    equations.insert(
+        key.to_string(),
+        EquationTarget {
+            anchor_id: next.to_string(),
+            tag: None,
+        },
+    );
+    next
+}
+
+pub(crate) fn lookup_equation_target<'a>(
+    equations: &'a HashMap<String, EquationTarget>,
+    label: &str,
+) -> Option<&'a EquationTarget> {
+    if label.contains('\0') {
+        return None;
+    }
+    equations.get(label)
+}
+
+fn plan_display_equation(
     tex: &str,
     equations: &mut HashMap<String, EquationTarget>,
-    equation_counter: &mut usize,
+    register_labels: bool,
 ) -> DisplayEquationPlan {
     let outer_eq = detect_outer_equation_environment(tex);
     let commands = scan_commands(tex, true, false, true);
@@ -771,8 +800,13 @@ pub(crate) fn analyze_display_equation(
         }
     }
     if matches!(outer_eq, Some((false, ..))) && !has_explicit_tag && !has_no_tag {
-        *equation_counter += 1;
-        tag = format_equation_tag(&equation_counter.to_string(), false);
+        let counter_key = if register_labels {
+            AUTO_SCAN_COUNTER_KEY
+        } else {
+            AUTO_RENDER_COUNTER_KEY
+        };
+        let equation_number = next_internal_counter(equations, counter_key);
+        tag = format_equation_tag(&equation_number.to_string(), false);
     }
     strip_spans.sort_by_key(|&(start, end)| (start, end));
     let mut clean_tex = String::with_capacity(tex.len());
@@ -790,15 +824,25 @@ pub(crate) fn analyze_display_equation(
 
     let mut anchor_ids = Vec::new();
     for label in labels {
-        if !equations.contains_key(&label) {
+        if label.contains('\0') {
+            continue;
+        }
+        if register_labels {
+            if !equations.contains_key(&label) {
+                let id = equation_anchor_id(&label);
+                equations.insert(
+                    label,
+                    EquationTarget {
+                        anchor_id: id.clone(),
+                        tag: tag.clone(),
+                    },
+                );
+                if !anchor_ids.contains(&id) {
+                    anchor_ids.push(id);
+                }
+            }
+        } else {
             let id = equation_anchor_id(&label);
-            equations.insert(
-                label,
-                EquationTarget {
-                    anchor_id: id.clone(),
-                    tag: tag.clone(),
-                },
-            );
             if !anchor_ids.contains(&id) {
                 anchor_ids.push(id);
             }
@@ -810,6 +854,20 @@ pub(crate) fn analyze_display_equation(
         tag,
         anchor_ids,
     }
+}
+
+pub(crate) fn analyze_display_equation(
+    tex: &str,
+    equations: &mut HashMap<String, EquationTarget>,
+) -> DisplayEquationPlan {
+    plan_display_equation(tex, equations, true)
+}
+
+pub(crate) fn render_display_equation(
+    tex: &str,
+    equations: &mut HashMap<String, EquationTarget>,
+) -> DisplayEquationPlan {
+    plan_display_equation(tex, equations, false)
 }
 
 pub(crate) fn render_prose_with_equation_refs(
@@ -830,7 +888,7 @@ pub(crate) fn render_prose_with_equation_refs(
         if cmd.start > last {
             out.push_str(&crate::text(&value[last..cmd.start]));
         }
-        if let Some(target) = equations.get(&cmd.arg) {
+        if let Some(target) = lookup_equation_target(equations, &cmd.arg) {
             if let Some(tag) = &target.tag {
                 let rendered = if cmd.kind == CommandKind::Eqref {
                     &tag.eqref_text
@@ -881,7 +939,7 @@ pub(crate) fn prepare_math_refs_for_mitex(
             token.push('X');
         }
         out.push_str(&format!("\\text{{{token}}}"));
-        let typst_expr = if let Some(target) = equations.get(&cmd.arg).filter(|t| t.tag.is_some()) {
+        let typst_expr = if let Some(target) = lookup_equation_target(equations, &cmd.arg).filter(|t| t.tag.is_some()) {
             let tag = target.tag.as_ref().unwrap();
             let rendered = if cmd.kind == CommandKind::Eqref {
                 &tag.eqref_text
@@ -921,4 +979,60 @@ pub(crate) fn apply_mitex_ref_replacements(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_equation_scanner_ignores_fenced_and_indented_literals() {
+        let md = [
+            "\\begin{equation}",
+            "a = 1 \\label{eq:first}",
+            "\\end{equation}",
+            "",
+            "```latex",
+            "\\begin{equation}",
+            "b = 2 \\label{eq:fenced}",
+            "\\end{equation}",
+            "```",
+            "",
+            "    \\begin{equation}",
+            "    c = 3 \\label{eq:indented}",
+            "    \\end{equation}",
+            "",
+            "\\begin{equation}",
+            "d = 4 \\label{eq:second}",
+            "\\end{equation}",
+        ]
+        .join("\n");
+
+        let blocks = standalone_equation_blocks(&md);
+        assert_eq!(blocks.len(), 2);
+        assert!(md[blocks[0].start..blocks[0].end].contains("eq:first"));
+        assert!(md[blocks[1].start..blocks[1].end].contains("eq:second"));
+    }
+
+    #[test]
+    fn analyze_and_render_counters_stay_independent_while_preserving_first_label() {
+        let mut equations = HashMap::new();
+        let scan1 = analyze_display_equation("\\begin{equation}\nx = 1 \\label{eq:dup}\n\\end{equation}", &mut equations);
+        let scan2 = analyze_display_equation("\\begin{equation}\ny = 2 \\label{eq:dup}\n\\end{equation}", &mut equations);
+        assert_eq!(scan1.tag.as_ref().map(|t| t.display_text.as_str()), Some("(1)"));
+        assert_eq!(scan2.tag.as_ref().map(|t| t.display_text.as_str()), Some("(2)"));
+        assert_eq!(
+            lookup_equation_target(&equations, "eq:dup")
+                .and_then(|t| t.tag.as_ref())
+                .map(|t| t.eqref_text.as_str()),
+            Some("(1)")
+        );
+
+        let render1 = render_display_equation("\\begin{equation}\nx = 1 \\label{eq:dup}\n\\end{equation}", &mut equations);
+        let render2 = render_display_equation("\\begin{equation}\ny = 2 \\label{eq:dup}\n\\end{equation}", &mut equations);
+        assert_eq!(render1.tag.as_ref().map(|t| t.display_text.as_str()), Some("(1)"));
+        assert_eq!(render2.tag.as_ref().map(|t| t.display_text.as_str()), Some("(2)"));
+        assert_eq!(render1.anchor_ids, vec!["smd-eq-eq_3a_dup".to_string()]);
+        assert_eq!(render2.anchor_ids, vec!["smd-eq-eq_3a_dup".to_string()]);
+    }
 }
