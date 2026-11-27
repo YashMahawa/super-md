@@ -269,6 +269,98 @@ describe("ReadingSearch DOM behavior", () => {
     host.remove();
   });
 
+  it("maps Find and Replace offsets accurately across U+00A0 frontmatter keys, quoted values, flow maps, and sequence/flow tags", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    let current = [
+      "---",
+      "description: \u00a0\"Hidden Symmetry Description\"",
+      "\"tags\"\u00a0:",
+      "  - \u00a0'symmetry-seq'",
+      "keywords: \u00a0[\u00a0\"symmetry-flow\"\u00a0]",
+      "'author'\u00a0: \u00a0[\u00a0{\u00a0\"given\"\u00a0:\u00a0\"Emmy\",\u00a0'family'\u00a0:\u00a0'Symmetry'\u00a0}\u00a0]",
+      "\"title\"\u00a0: \u00a0\"Symmetry Kernel\"",
+      "---",
+      "",
+      "Body Symmetry note.",
+    ].join("\n");
+    const changes: string[] = [];
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Displayed title omits surrounding quotes and displayed tags render as individual badges (not a raw "[...]" string).
+    expect(host.querySelector('[data-frontmatter-field="title"]')?.textContent).toBe("Symmetry Kernel");
+    expect(host.querySelector('[data-frontmatter-field="author"]')?.textContent).toBe("Emmy Symmetry");
+    expect(Array.from(host.querySelectorAll('[data-frontmatter-field="tag"]')).map((el) => el.textContent)).toEqual([
+      "symmetry-seq",
+      "symmetry-flow",
+    ]);
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Symmetry"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // 5 rendered matches (title, author, seq tag, flow tag, body), excluding hidden description.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 5");
+    const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+
+    // Match 1 / 5 (displayed title "Symmetry Kernel") maps to source match 5 / 6 (after description, seq tag, flow tag, author).
+    act(() => nextButton.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 5");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("5 / 6");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const replaceButtons = () => Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
+    act(() => setInputValue(replaceInput, "Invariant"));
+    act(() => replaceButtons()[0].click());
+    expect(changes.at(-1)).toContain("\"title\"\u00a0: \u00a0\"Invariant Kernel\"");
+
+    // Re-render updated content and verify Replace offset mapping on sequence and flow tags.
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Toggle Replace off, step to flow tag ("symmetry-flow" — rendered match 3 / 4: author, seq tag, flow tag, body) -> source match 3 / 5.
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("4 / 4");
+    act(() => nextButton.click()); // 1 / 4 (author: Emmy Symmetry)
+    act(() => nextButton.click()); // 2 / 4 (seq tag: symmetry-seq)
+    act(() => nextButton.click()); // 3 / 4 (flow tag: symmetry-flow)
+    expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 5");
+    const nextReplaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    act(() => setInputValue(nextReplaceInput, "invariant"));
+    act(() => replaceButtons()[0].click());
+    expect(changes.at(-1)).toContain("keywords: \u00a0[\u00a0\"invariant-flow\"\u00a0]");
+    expect(changes.at(-1)).toContain("  - \u00a0'symmetry-seq'");
+    expect(changes.at(-1)).toContain("description: \u00a0\"Hidden Symmetry Description\"");
+
+    act(() => root.unmount());
+    host.remove();
+  });
+
   it("resolves block-mapped highlight ranges across hidden URLs, inline HTML tags, study syntax, and fenced code", async () => {
     const host = document.createElement("div");
     document.body.append(host);
