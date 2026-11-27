@@ -69,7 +69,7 @@ export async function computeAgentDocumentRequest(request: Record<string, unknow
   throw Error("Unsupported snapshot agent action");
 }
 
-export interface AgentRuntimeNote { id: string; content: string; path: string | null; mode: AnchorViewMode; python?: string; editProtocol?: number }
+export interface AgentRuntimeNote { id: string; content: string; path: string | null; portable?: boolean; mode: AnchorViewMode; python?: string; editProtocol?: number }
 export interface UseReaderAgentRuntimeOptions {
   reference: RefObject<AgentRuntimeNote | null>;
   edits: RefObject<ReaderEdits | null>;
@@ -400,7 +400,7 @@ export function useReaderAgentRuntime({ reference, edits, zoomReference, histori
         const hasSection = Object.prototype.hasOwnProperty.call(suppliedOptions, "section"), section = hasSection ? agentSectionForExport(note.content, suppliedOptions.section) : undefined;
         const exportContent = section?.text ?? note.content, { section: _section, archive: _archive, ...exportOptions } = suppliedOptions;
         const consentPolicy = noteImageConsent.current.policy(note.id, trustedHostsRef.current);
-        const prepared = format === "pdf" ? await preparePdf(exportContent, note.path, note.python || "embedded", consentPolicy) : format === "smd" ? await prepareFmd(exportContent, note.path, consentPolicy) : await prepareMarkdownExport(exportContent, note.path, { compatible: archive, python: note.python || "embedded" });
+        const prepared = format === "pdf" ? await preparePdf(exportContent, note.path, note.python || "embedded", consentPolicy) : format === "smd" ? await prepareFmd(exportContent, note.path, note.portable !== undefined ? { ...consentPolicy, portable: note.portable } : consentPolicy) : await prepareMarkdownExport(exportContent, note.path, { compatible: archive, python: note.python || "embedded" });
         if (reference.current?.id !== note.id || reference.current.content !== note.content) throw Error("Revision conflict: the note changed while preparing the export");
         const result = await invoke<Record<string, unknown>>("agent_export_native", { ...prepared, id: note.id, expectedRevision: revision, requestId: request.requestId, format: archive ? "mdzip" : format, ...(archive ? { archive: true } : {}), filename: request.filename, options: exportOptions });
         return section ? { ...result, sectionStart: section.sectionStart, sectionEnd: section.sectionEnd, documentLength: section.documentLength } : result;
