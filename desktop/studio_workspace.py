@@ -125,18 +125,6 @@ def _invalidate_workspace_links(studio_obj, folder_path: str) -> None:
     if links is not None:
         links.invalidate(folder_path)
 
-def _resolve_non_link_dir(raw_path, fops) -> Path | None:
-    if not raw_path:
-        return None
-    try:
-        candidate = Path(fops.strip_extended_length_prefix(str(raw_path))).expanduser()
-        if fops._is_link_or_junction(candidate):
-            return None
-        resolved = Path(fops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
-        return resolved if resolved.is_dir() else None
-    except OSError:
-        return None
-
 def _list_visible_dir_entries(
     dir_path: str | os.PathLike[str], *, fops, is_searchable,
     cancel_event: threading.Event | None = None, scan_budget: list[int] | None = None,
@@ -313,17 +301,18 @@ def open_folder_search_match(
     studio_obj._flush("open_search_match", json.dumps(payload))
 
 def restore_workspace_folder(studio_obj, folder_path: str, expanded_paths: list[str] | None = None) -> None:
-    fops = _studio_module().folder_ops
-    root = _resolve_non_link_dir(folder_path, fops)
+    st = _studio_module()
+    fops = st.folder_ops
+    root = st._canonical_approved_directory(folder_path)
     if root is None:
         return
-    root_str = fops.canonical_path_str(root)
+    root_str = str(root)
     _clear_pinned_visible_dirs(studio_obj)
     valid_expanded = {root_str}
     for raw in expanded_paths or []:
-        resolved = _resolve_non_link_dir(raw, fops)
+        resolved = st._canonical_approved_directory(raw)
         if resolved is not None and fops.matches_path_prefix(str(resolved), root_str, is_directory=True):
-            valid_expanded.add(fops.canonical_path_str(resolved))
+            valid_expanded.add(str(resolved))
     studio_obj.folder = root_str
     _invalidate_workspace_links(studio_obj, studio_obj.folder)
     studio_obj.expanded = valid_expanded
@@ -437,13 +426,13 @@ def start_subfolder_search(studio_obj) -> None:
 
 def open_folder(studio_obj, value) -> None:
     st = _studio_module()
-    path = st.local_path(value)
-    if not path.is_dir():
+    path = st._canonical_approved_directory(st._raw_local_path(value))
+    if path is None:
         studio_obj.message = "Choose an existing local folder."
         _call_optional(studio_obj, "_emit", False)
         return
     _call_method(studio_obj, "_clear_folder_filter", clear_folder_filter)
-    studio_obj.folder = st.folder_ops.canonical_path_str(path)
+    studio_obj.folder = str(path)
     _invalidate_workspace_links(studio_obj, studio_obj.folder)
     if isinstance(getattr(studio_obj, "settings", None), dict):
         studio_obj.settings["welcomed"] = True
@@ -517,7 +506,8 @@ def load_tree(studio_obj) -> None:
         return entries
 
     def finished(result, error):
-        if (not error and result is not None and generation == getattr(studio_obj, "_tree_generation", 0)
+        if (not getattr(studio_obj, "retired", False) and not error and result is not None
+                and generation == getattr(studio_obj, "_tree_generation", 0)
                 and st.folder_ops.same_path(folder, studio_obj.folder) and not getattr(studio_obj, "folder_filter", "").strip()):
             studio_obj.files = result
             _call_optional(studio_obj, "_watch_notes")
@@ -527,7 +517,11 @@ def toggle_directory(studio_obj, path) -> None:
     if not getattr(studio_obj, "folder", ""):
         return
     st = _studio_module()
-    canon = st.folder_ops.canonical_path_str(st.local_path(path))
+    raw = st._raw_local_path(os.fspath(path) if isinstance(path, os.PathLike) else path)
+    if not raw:
+        return
+    resolved = st._canonical_approved_directory(raw)
+    canon = str(resolved) if resolved is not None else st.folder_ops.canonical_path_str(raw)
     if not canon:
         return
     existing = [item for item in studio_obj.expanded if st.folder_ops.same_path(item, canon)]
@@ -538,6 +532,8 @@ def toggle_directory(studio_obj, path) -> None:
         for item in ([p for p in pinned if st.folder_ops.same_path(p, canon)] if pinned is not None else ()):
             pinned.discard(item)
     else:
+        if resolved is None:
+            return
         studio_obj.expanded.add(canon)
     _call_optional(studio_obj, "_recover")
     _call_optional(studio_obj, "_emit", False)

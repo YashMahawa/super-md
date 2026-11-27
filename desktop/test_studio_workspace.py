@@ -319,13 +319,109 @@ class StudioWorkspaceTest(unittest.TestCase):
             folder="", files=[], expanded=set(), folder_filter="", _folder_searching=False,
             _search_generation=0, _search_cancel=None, filter_timer=None, settings={}, session=SimpleNamespace(),
         )
-        with patch("studio.local_path", side_effect=lambda _raw: dir_a) as spy_local:
+        with patch("studio._raw_local_path", side_effect=lambda _raw: str(dir_a)) as spy_raw:
             Studio.openFolder(standalone, "custom://redirected-folder")
-            spy_local.assert_called_once_with("custom://redirected-folder")
-        self.assertEqual(standalone.folder, folder_ops.canonical_path_str(dir_a))
+            spy_raw.assert_called_once_with("custom://redirected-folder")
+        self.assertEqual(standalone.folder, str(dir_a.resolve()))
         self.assertEqual([e["name"] for e in standalone.files], ["sub", "note_a.md"])
         Studio.closeFolder(standalone)
         self.assertEqual((standalone.folder, standalone.files), ("", []))
+
+    def test_canonical_native_folder_paths_preserve_outer_whitespace_and_reject_links(self):
+        ws_dir = self.root / " Workspace "
+        sub_dir = ws_dir / " Sub "
+        decoy_ws = self.root / "Workspace"
+        outside = self.root / "outside"
+        for d in (sub_dir, decoy_ws, outside / "nested"):
+            d.mkdir(parents=True, exist_ok=True)
+        (ws_dir / "Root.md").write_text("# Root\n", encoding="utf-8")
+        (sub_dir / "Nested.md").write_text("# Nested\n", encoding="utf-8")
+        (decoy_ws / "Decoy.md").write_text("# Decoy\n", encoding="utf-8")
+        (outside / "nested" / "Leak.md").write_text("# Leak\n", encoding="utf-8")
+
+        symlink_root = self.root / "symlink_ws"
+        symlink_sub = ws_dir / "symlink_sub"
+        links_ok = False
+        try:
+            symlink_root.symlink_to(outside, target_is_directory=True)
+            symlink_sub.symlink_to(outside / "nested", target_is_directory=True)
+            links_ok = True
+        except OSError:
+            pass
+
+        ws_canon = str(ws_dir.resolve(strict=True))
+        sub_canon = str(sub_dir.resolve(strict=True))
+        self.studio.openFolder(QUrl.fromLocalFile(str(ws_dir)).toString())
+        self.assertEqual(self.studio.folder, ws_canon)
+        self.assertNotEqual(self.studio.folder, str(decoy_ws.resolve(strict=True)))
+        self.assertTrue(_wait_until(lambda: [e["name"] for e in self.studio.files] == [" Sub ", "Root.md"]))
+
+        for invalid in ("", "   ") + ((str(symlink_root), str(symlink_root / "nested")) if links_ok else ()):
+            self.studio.openFolder(invalid)
+            self.assertEqual(self.studio.folder, ws_canon)
+
+        self.studio.toggleDirectory("")
+        self.studio.toggleDirectory("   ")
+        if links_ok:
+            self.studio.toggleDirectory(str(symlink_sub))
+        self.assertEqual(self.studio.expanded, {ws_canon})
+
+        self.studio.toggleDirectory(QUrl.fromLocalFile(str(sub_dir)).toString())
+        self.assertEqual(self.studio.expanded, {ws_canon, sub_canon})
+        self.assertTrue(_wait_until(lambda: any(e["name"] == "Nested.md" for e in self.studio.files)))
+
+        restored_expanded = [sub_canon, str(decoy_ws)] + ([str(symlink_sub)] if links_ok else [])
+        self.studio.closeFolder()
+        if links_ok:
+            self.studio._restore_workspace_folder(str(symlink_root / "nested"), [])
+            self.assertEqual(self.studio.folder, "")
+        self.studio._restore_workspace_folder(ws_canon, restored_expanded)
+        self.assertEqual(self.studio.folder, ws_canon)
+        self.assertEqual(self.studio.expanded, {ws_canon, sub_canon})
+
+    def test_watcher_suspension_holds_across_tree_loads_and_reconciles_after_release(self):
+        vault = self.root / "vault"
+        sub = vault / "Topics"
+        renamed_sub = vault / "RenamedTopics"
+        sub.mkdir(parents=True)
+        note = sub / "Lecture.md"
+        note.write_text("# Lecture\n", encoding="utf-8")
+
+        self.studio.openFolder(str(vault))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) == 1))
+        self.studio.toggleDirectory(str(sub))
+        self.assertTrue(_wait_until(lambda: any(e["name"] == "Lecture.md" for e in self.studio.files)))
+        self.studio.openNote(str(note))
+        self.assertTrue(_wait_until(lambda: any(t["path"] == str(note) for t in self.studio.tabs)))
+
+        resume = self.studio._hold_watches_for_rename(str(sub), is_dir=True, new_path=str(renamed_sub))
+        try:
+            watched_mid = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
+            for suspended in (vault, sub, note):
+                self.assertNotIn(folder_ops.canonical_path_str(suspended), watched_mid)
+
+            sub.rename(renamed_sub)
+            self.studio._load_tree()
+            self.assertTrue(_wait_until(lambda: any(e["name"] == "RenamedTopics" for e in self.studio.files)))
+            watched_after_tree = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
+            for suspended in (vault, sub, renamed_sub, note, renamed_sub / "Lecture.md"):
+                self.assertNotIn(folder_ops.canonical_path_str(suspended), watched_after_tree)
+
+            self.studio.external_paths = {str(sub), str(note), str(vault)}
+            self.studio._refresh_external_notes()
+            self.app.processEvents()
+            self.assertTrue(any(t["path"] == str(note) for t in self.studio.tabs))
+        finally:
+            self.studio._sync_path_change(
+                str(sub), str(renamed_sub), is_dir=True, on_rebound=resume.set
+            )
+
+        rebound_note = str(renamed_sub / "Lecture.md")
+        self.assertTrue(any(t["path"] == rebound_note for t in self.studio.tabs))
+        watched_rebound = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
+        self.assertIn(folder_ops.canonical_path_str(vault), watched_rebound)
+        self.assertIn(folder_ops.canonical_path_str(renamed_sub), watched_rebound)
+        self.assertIn(folder_ops.canonical_path_str(rebound_note), watched_rebound)
 
 
 if __name__ == "__main__":
