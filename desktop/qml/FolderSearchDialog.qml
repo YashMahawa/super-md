@@ -158,7 +158,7 @@ AppDialog {
                 objectName: "folderSearchStatus"
                 Layout.fillWidth: true
                 elide: Text.ElideRight
-                font.pixelSize: 12
+                font.pixelSize: 13
                 color: dialog.colors.muted
                 text: {
                     const q = (dialog.stateData.query || "").trim()
@@ -212,7 +212,7 @@ AppDialog {
                             text: modelData.relative || modelData.name || "Untitled.md"
                             textFormat: Text.PlainText
                             elide: Text.ElideMiddle
-                            font.pixelSize: 12
+                            font.pixelSize: 13
                             font.weight: Font.DemiBold
                             color: dialog.colors.muted
                         }
@@ -228,14 +228,14 @@ AppDialog {
                                 id: dirtyLabel
                                 anchors.centerIn: parent
                                 text: "Live buffer"
-                                font.pixelSize: 10
+                                font.pixelSize: 12
                                 color: dialog.colors.primary
                             }
                         }
                         Label {
                             text: "Line " + (modelData.line || 1)
                             textFormat: Text.PlainText
-                            font.pixelSize: 12
+                            font.pixelSize: 13
                             color: dialog.colors.muted
                         }
                     }
