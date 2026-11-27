@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { imageMarkdown, imageRanges, importImageFiles, importImageUrl, linkDetails, markdownLabel, safeHostname, type ImportedImage, type LinkDetails } from "../documentMedia";
 import { invoke } from "../nativeBridge";
 import { sourceChanges, type SourceChange } from "../readerEdits";
+import { alignRangeToCurrentSource } from "../revisionEdit";
 import { setReaderOverlay } from "../readerOverlays";
 
 export interface InsertionPoint { from: number; to: number }
@@ -120,18 +121,15 @@ function formatDroppedImages(images: ImportedImage[], point: InsertionPoint | un
   const suffix = replacing ? "" : atStart ? (content.startsWith("\n") ? "\n" : "\n\n") : "\n";
   return prefix + images.map(imageMarkdown).join("\n\n") + suffix;
 }
-function sourceEndAt(element: Element | null): InsertionPoint | undefined {
+function sourceEndAt(element: Element | null, renderedSource: string, currentSource: string): InsertionPoint | undefined {
   if (element?.closest(".live-document")) return undefined;
-  const live = element?.closest<HTMLElement>(".live-block");
-  if (live?.dataset.sourceEnd !== undefined) {
-    const end = Number(live.dataset.sourceEnd);
-    if (Number.isFinite(end)) return { from: end, to: end };
-  }
   const scope = element?.closest(".step-cards-description") ? element.closest(".step-cards")?.parentElement ?? null : element;
   const block = scope?.closest<HTMLElement>(".windowed-md-block[data-source-end],p[data-source-end],li[data-source-end],h1[data-source-end],h2[data-source-end],h3[data-source-end],h4[data-source-end],h5[data-source-end],h6[data-source-end],blockquote[data-source-end],aside[data-source-end],details[data-source-end],table[data-source-end],pre[data-source-end]") || scope?.closest<HTMLElement>("[data-source-end]");
   if (block?.dataset.sourceEnd !== undefined) {
     const end = Number(block.dataset.sourceEnd);
-    if (Number.isFinite(end)) return { from: end, to: end };
+    if (Number.isFinite(end)) {
+      return alignRangeToCurrentSource(renderedSource, currentSource, end, end) ?? undefined;
+    }
   }
   return undefined;
 }
@@ -151,7 +149,7 @@ function insertionPoint(coords?: { x: number; y: number }, target?: Element | nu
   return request.point;
 }
 declare global { interface Window { supermdInsertImages?: (images: ImportedImage[]) => void; supermdMedia?: () => void; supermdCaptureInsertion?: (x?: number, y?: number) => void } }
-export default function MediaTools({ documentId, content, documentPath: _documentPath, onInsert, onNotice }: { documentId: string; content: string; documentPath: string | null; onInsert: (text: string, point?: InsertionPoint) => void; onNotice: (message: string) => void }) {
+export default function MediaTools({ documentId, content, renderedContent, documentPath: _documentPath, onInsert, onNotice }: { documentId: string; content: string; renderedContent?: string; documentPath: string | null; onInsert: (text: string, point?: InsertionPoint) => void; onNotice: (message: string) => void }) {
   const [open, setOpen] = useState(false); const [url, setUrl] = useState(""); const [imageMode, setImageMode] = useState(false);
   const [details, setDetails] = useState<LinkDetails | null>(null); const [thumbnail, setThumbnail] = useState(false);
   const [thumbnailPreview,setThumbnailPreview] = useState("");
@@ -178,8 +176,8 @@ export default function MediaTools({ documentId, content, documentPath: _documen
   const pendingTargetRef = useRef<PendingInsertion | null>(null);
   const modalSessionRef = useRef(0);
   const mounted = useRef(true);
-  const reference = useRef({ onInsert, onNotice, content, documentId });
-  reference.current = { onInsert, onNotice, content, documentId };
+  const reference = useRef({ onInsert, onNotice, content, renderedContent: renderedContent ?? content, documentId });
+  reference.current = { onInsert, onNotice, content, renderedContent: renderedContent ?? content, documentId };
   const openRef = useRef(open); openRef.current = open;
   const busyRef = useRef(busy); busyRef.current = busy;
   const ignoreCapturedDrop = useRef(false);
@@ -262,7 +260,8 @@ export default function MediaTools({ documentId, content, documentPath: _documen
       const hit = hasCoords && typeof document.elementFromPoint === "function" ? document.elementFromPoint(x, y) : null;
       if (hasActiveOverlay(hit)) { ignoreCapturedDrop.current = true; pendingTargetRef.current = null; return; }
       ignoreCapturedDrop.current = false;
-      const point = hasCoords ? (sourceEndAt(hit) ?? insertionPoint({ x, y }, hit)) : insertionPoint();
+      const { content: cur, renderedContent: ren } = reference.current;
+      const point = hasCoords ? (sourceEndAt(hit, ren, cur) ?? insertionPoint({ x, y }, hit)) : insertionPoint();
       pendingTargetRef.current = capturePending(point, false);
     };
     window.supermdInsertImages = (images) => {
@@ -280,13 +279,18 @@ export default function MediaTools({ documentId, content, documentPath: _documen
       const root = block || image.closest(".workspace,.android-document"); if (!root) return;
       const source = image.dataset.noteImageSource;
       const normalize = (url: string) => { try { return decodeURI(url); } catch { return url; } };
-      const candidates = imageRanges(reference.current.content).filter((range) => normalize(range.source) === normalize(source || "") && (!block || range.from >= Number(block.dataset.sourceStart) && range.to <= Number(block.dataset.sourceEnd)));
+      const baseSource = reference.current.renderedContent;
+      const blockStart = block ? Number(block.dataset.renderedStart ?? block.dataset.sourceStart) : -Infinity;
+      const blockEnd = block ? Number(block.dataset.renderedEnd ?? block.dataset.sourceEnd) : Infinity;
+      const candidates = imageRanges(baseSource).filter((range) => normalize(range.source) === normalize(source || "") && (!block || range.from >= blockStart && range.to <= blockEnd));
       const siblings = Array.from(root.querySelectorAll<HTMLElement>("[data-note-image-source]")).filter((node) => !node.closest(".step-cards,.theme-guide-dialog") && normalize(node.dataset.noteImageSource || "") === normalize(source || ""));
-      const range = candidates[siblings.indexOf(image)];
-      if (!range) { reference.current.onNotice("Couldn't locate this image in the source. Use Source mode to edit its reference."); return; }
-      const point = { from: range.from, to: range.to };
+      const baseRange = candidates[siblings.indexOf(image)];
+      if (!baseRange) { reference.current.onNotice("Couldn't locate this image in the source. Use Source mode to edit its reference."); return; }
+      const aligned = alignRangeToCurrentSource(baseSource, reference.current.content, baseRange.from, baseRange.to);
+      if (!aligned) { reference.current.onNotice("The note changed while updating the preview. Wait a moment or edit this image in Source mode."); return; }
+      const point = { from: aligned.from, to: aligned.to };
       if (action === "remove") {
-        const current = reference.current.content; setRemoved({ documentId: reference.current.documentId, from: range.from, text: current.slice(range.from, range.to), expected: current.slice(0, range.from) + current.slice(range.to) });
+        const current = reference.current.content; setRemoved({ documentId: reference.current.documentId, from: point.from, text: current.slice(point.from, point.to), expected: current.slice(0, point.from) + current.slice(point.to) });
         reference.current.onInsert("", point);
       } else { ignoreCapturedDrop.current = false; pendingTargetRef.current = capturePending(point, true); setReplacement(true); setImageMode(true); setUrl(""); setDetails(null); setError(""); openModal(); }
     };
@@ -359,7 +363,7 @@ export default function MediaTools({ documentId, content, documentPath: _documen
       }
       const skipped = allFiles.length - files.length;
       const coords = typeof event.clientX === "number" && typeof event.clientY === "number" && Number.isFinite(event.clientX) && Number.isFinite(event.clientY) ? { x: event.clientX, y: event.clientY } : undefined;
-      const point = sourceEndAt(element) ?? insertionPoint(coords, element);
+      const point = sourceEndAt(element, reference.current.renderedContent, reference.current.content) ?? insertionPoint(coords, element);
       const pending = capturePending(point, false);
       void importImageFiles(files).then((images) => {
         if (!mounted.current || !images.length) return;

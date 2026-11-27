@@ -37,7 +37,7 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
       near=entry.isIntersecting;
       if(entry.isIntersecting)show();
       else release(false);
-    },{root:node.closest('.android-reading'),rootMargin:'900px 0px'},commitWindowedLayout);
+    },{root:node.closest('.android-reading,.reading-scroll'),rootMargin:'900px 0px'},commitWindowedLayout);
     return()=>{window.clearTimeout(focusReleaseTimer);unobserve();unregister();node.removeEventListener('supermd-reveal-window',reveal);node.removeEventListener('focusin',reveal);node.removeEventListener('focusout',focusout);node.removeEventListener('supermd-output-stored',outputStored);};
   },[active,text]);
   useLayoutEffect(()=>{
@@ -55,7 +55,7 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
     const observer=new ResizeObserver(entries=>{const measured=entries[0].borderBoxSize?.[0]?.blockSize??entries[0].contentRect.height;if(measured>0)height.current=measured;});observer.observe(node);
     const headingsInBlock=node.querySelectorAll<HTMLElement>('[data-heading-key]');
     headings.forEach((heading,i)=>{if(headingsInBlock[i])headingsInBlock[i].id=heading.id;});
-    node.closest('.android-reading')?.dispatchEvent(new Event('supermd-window-change'));
+    node.closest('.android-reading,.reading-scroll')?.dispatchEvent(new Event('supermd-window-change'));
     return()=>observer.disconnect();
   },[active,shown,headings]);
   if(!active)return <section {...props} ref={setNodeRef}>{children}</section>;

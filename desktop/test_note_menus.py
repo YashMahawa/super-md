@@ -6,12 +6,15 @@ os.environ.setdefault("QT_QPA_PLATFORM","offscreen")
 from PySide6.QtCore import QObject,QUrl,QPoint,QPointF,Qt,QEvent
 from PySide6.QtGui import QGuiApplication,QColor
 from PySide6.QtQml import QQmlEngine,QQmlComponent
+from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 from test_choice_field import Palette
 
 class NoteMenuTest(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):cls.app=QGuiApplication.instance() or QGuiApplication(["Menu paint tests"])
+    def setUpClass(cls):
+        if QGuiApplication.instance() is None:QQuickStyle.setStyle("Material")
+        cls.app=QGuiApplication.instance() or QGuiApplication(["Menu paint tests"])
     def setUp(self):
         self.engine=QQmlEngine();self.palette=Palette()
         self.engine.rootContext().setContextProperty("studio",self.palette)

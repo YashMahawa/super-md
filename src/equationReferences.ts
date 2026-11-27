@@ -465,7 +465,10 @@ function isMathCodeBlock(node: any): boolean {
 }
 
 export function remarkEquationReferences() {
-  return (tree: unknown) => {
+  return (tree: unknown, file?: { value?: unknown }) => {
+    if (typeof file?.value === "string" && !/\\(?:tag|label|eqref|ref)(?![A-Za-z])/.test(file.value)) {
+      return;
+    }
     const equations = new Map<string, EquationTarget>();
     const nodeLabels = new WeakMap<object, { originalTex: string; katexTex: string; anchorIds: string[] }>();
 

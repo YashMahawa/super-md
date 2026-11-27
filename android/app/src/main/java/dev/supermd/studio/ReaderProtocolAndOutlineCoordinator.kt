@@ -20,6 +20,7 @@ internal class ReaderProtocolAndOutlineCoordinator(
     private val app: Application,
     private val scope: CoroutineScope,
     private val readerEcho: MutableMap<String, String>,
+    private val readerDispatchedContent: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap(),
     private val readerEditProtocol: ReaderEditProtocol,
     private val readState: () -> StudioState,
     private val changeState: ((StudioState) -> StudioState) -> Unit,
@@ -75,17 +76,27 @@ internal class ReaderProtocolAndOutlineCoordinator(
     fun readerStateIsNativeAuthoritative(id: String): Boolean =
         readState().tabs.find { it.id == id }?.let { readerEditProtocol.matchesNative(id, it.content) } == true
 
+    fun readerStateIsNativeOrPendingLoadAuthoritative(id: String): Boolean =
+        readerStateIsNativeAuthoritative(id) ||
+            (readState().tabs.any { it.id == id } &&
+                readerDispatchedContent[id]?.let { dispatched ->
+                    readerEditProtocol.matchesNative(id, dispatched)
+                } == true)
+
     /** An edit that came from the reader itself; only these may skip the echo. */
     fun readerEdit(id: String, content: String, protocolPatch: Boolean = false) {
         if (readState().tabs.none { it.id == id }) return
         if (!protocolPatch) readerEditProtocol.clear(id)
         readerEcho[id] = content
+        readerDispatchedContent[id] = content
         editNote(id, content)
     }
 
     fun readerSync(id: String, epoch: String, revision: Long, content: String): JSONObject {
         val note = readState().tabs.find { it.id == id }
-        return readerProtocolJson(readerEditProtocol.sync(id, epoch, revision, content, note?.content))
+        val ack = readerEditProtocol.sync(id, epoch, revision, content, note?.content)
+        if (ack.accepted) readerDispatchedContent[id] = content
+        return readerProtocolJson(ack)
     }
 
     fun readerPatch(

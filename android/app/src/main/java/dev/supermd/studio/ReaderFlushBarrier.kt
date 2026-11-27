@@ -15,14 +15,16 @@ internal class ReaderFlushBarrier {
     internal data class Request(
         val token: String,
         val noteId: String,
+        val allowPendingNativeLoad: Boolean = false,
         val result: CompletableDeferred<Boolean>,
         val status: CompletableDeferred<ReaderFlushStatus> = CompletableDeferred(),
+        @Volatile var dispatchedAtEnqueue: String? = null,
     )
     private val pending = ConcurrentHashMap<String, Request>()
 
-    fun register(token: String, noteId: String): Request {
+    fun register(token: String, noteId: String, allowPendingNativeLoad: Boolean = false): Request {
         require(token.isNotBlank() && noteId.isNotBlank())
-        val request = Request(token, noteId, CompletableDeferred())
+        val request = Request(token, noteId, allowPendingNativeLoad, CompletableDeferred())
         check(pending.putIfAbsent(token, request) == null) { "Duplicate reader flush token" }
         return request
     }
@@ -35,10 +37,36 @@ internal class ReaderFlushBarrier {
         nativeContent: String?,
         error: String?,
         wellFormed: Boolean = true,
+    ): Boolean = complete(
+        token = token,
+        noteId = noteId,
+        content = content,
+        nativeContent = nativeContent,
+        dispatchedContent = null,
+        error = error,
+        wellFormed = wellFormed,
+    )
+
+    fun complete(
+        token: String,
+        noteId: String,
+        content: String?,
+        nativeContent: String?,
+        dispatchedContent: String?,
+        error: String?,
+        wellFormed: Boolean = true,
     ): Boolean {
         val request = pending.remove(token) ?: return false
-        val accepted = wellFormed && request.noteId == noteId && error == null && content != null &&
-            nativeContent != null && content == nativeContent
+        val matchesContent = nativeContent != null && (
+            content == nativeContent ||
+                (
+                    request.allowPendingNativeLoad && (
+                        (request.dispatchedAtEnqueue != null && content == request.dispatchedAtEnqueue) ||
+                            (dispatchedContent != null && content == dispatchedContent)
+                        )
+                    )
+            )
+        val accepted = wellFormed && request.noteId == noteId && error == null && content != null && matchesContent
         val outcome = when {
             accepted -> ReaderFlushStatus.ACKNOWLEDGED
             wellFormed && noteId != request.noteId -> ReaderFlushStatus.WRONG_ACTIVE_NOTE

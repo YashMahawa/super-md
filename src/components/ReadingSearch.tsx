@@ -31,7 +31,6 @@ export interface ReadingSearchSeed {
   matchText?: string;
   nonce: number;
 }
-
 function extractSeedRange(seed?: ReadingSearchSeed | null): SourceRange | null {
   if (!seed) return null;
   const { sourceStart, sourceEnd } = seed;
@@ -66,7 +65,8 @@ export function isValidSeedOccurrence(content: string, seedRange: SourceRange, q
   return caseSensitive ? slice === query : foldUnicodeForSearch(slice) === foldUnicodeForSearch(query);
 }
 
-export default function ReadingSearch({ content, close, onChange, sourceSession, seed, initialReplace = false }: { content: string; close: () => void; onChange?: (content: string) => void; sourceSession?: string; seed?: ReadingSearchSeed | null; initialReplace?: boolean }) {
+export default function ReadingSearch({ content, renderedRevision, close, onChange, sourceSession, seed, initialReplace = false }: { content: string; renderedRevision?: string | null; close: () => void; onChange?: (content: string) => void; sourceSession?: string; seed?: ReadingSearchSeed | null; initialReplace?: boolean }) {
+  const previewSynced = renderedRevision === undefined || renderedRevision === content;
   const canReplace = Boolean(onChange);
   const canReplaceRef = useRef(canReplace); canReplaceRef.current = canReplace;
   const [query, setQuery] = useState(() => seed ? seed.query.slice(0, 200) : window.getSelection()?.toString().slice(0, 200) || "");
@@ -111,7 +111,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const count = regexError ? 0 : sourceSearch ? sourceRanges.length : windowed?.length ?? matches.length;
   const input = useRef<HTMLInputElement>(null);
   const closeRef = useRef(close); closeRef.current = close;
-  const prevState = useRef({ query, content, caseSensitive, wholeWord, regexp });
+  const prevState = useRef({ query, content, caseSensitive, wholeWord, regexp, seedNonce: seed?.nonce ?? null });
   const settleCleanup = useRef<(() => void) | null>(null);
   const clearSettleFrames = () => { settleCleanup.current?.(); settleCleanup.current = null; };
   const clearPendingSeed = () => {
@@ -501,15 +501,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   useEffect(() => {
     clearSettleFrames();
     const prev = prevState.current;
+    const seedNonce = seed?.nonce ?? null;
+    const seedChanged = prev.seedNonce !== seedNonce;
     const criteriaChanged = prev.query !== query || prev.caseSensitive !== caseSensitive || prev.wholeWord !== wholeWord || prev.regexp !== regexp;
     const contentChanged = prev.content !== content;
-    prevState.current = { query, content, caseSensitive, wholeWord, regexp };
+    prevState.current = { query, content, caseSensitive, wholeWord, regexp, seedNonce };
     // Only evaluate the source-search pipeline when Source/Split editor search or
     // Replace-in-source is active; rendered Read/Live Find skips scanning raw source.
     const nextSourceRanges = regexError || !sourceSearch ? [] : getSourceRanges();
     setSourceRanges(prevRanges => (prevRanges.length === 0 && nextSourceRanges.length === 0 ? prevRanges : nextSourceRanges));
     if (sourceSession) editorFindQuery(sourceSession, regexError ? "" : query, caseSensitive, { wholeWord, regexp });
-    const autoSelect = pendingAutoSelect.current;
+    const autoSelect = pendingAutoSelect.current && (!criteriaChanged || seedChanged);
     let targetIndex = indexRef.current, shouldScrollReplaced = false;
     if (autoSelect && !regexError) {
       pendingReplaceIndex.current = null;
@@ -524,9 +526,16 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       setHiddenSourceHit(false);
       hiddenSourceAnchorRef.current = null;
       targetIndex = pendingReplaceIndex.current;
-      pendingReplaceIndex.current = null;
-      shouldScrollReplaced = targetIndex >= 0;
-      updateIndex(targetIndex);
+      if (indexRef.current !== targetIndex) updateIndex(targetIndex);
+      if (targetIndex < 0) {
+        pendingReplaceIndex.current = null;
+      } else if (sourceSession) {
+        if (previewSynced) pendingReplaceIndex.current = null;
+        shouldScrollReplaced = true;
+      } else if (previewSynced) {
+        pendingReplaceIndex.current = null;
+        shouldScrollReplaced = true;
+      }
     } else if (contentChanged) {
       setHiddenSourceHit(false);
       hiddenSourceAnchorRef.current = null;
@@ -538,6 +547,51 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       updateIndex(targetIndex);
     }
     const frame = requestAnimationFrame(() => {
+      if (regexError) {
+        pendingAutoSelect.current = false;
+        pendingSeedRange.current = null;
+        pendingSeedMatchText.current = undefined;
+        if (sourceSession) editorFindQuery(sourceSession, "", caseSensitive, { wholeWord, regexp });
+        setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
+        setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
+        customCurrentRangeRef.current = null;
+        syncSearchHighlights({ all: null, current: null });
+        return;
+      }
+      if (sourceSession) editorFindQuery(sourceSession, query, caseSensitive, { wholeWord, regexp });
+      if (!previewSynced) {
+        if (pendingAutoSelect.current && sourceSession) {
+          const seedRange = pendingSeedRange.current;
+          const seedMatchText = pendingSeedMatchText.current;
+          const hasValidSeedRange = Boolean(seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText));
+          const hasStaleSeedRange = Boolean(seedRange && !hasValidSeedRange);
+          const activeRanges = nextSourceRanges.length || !query ? nextSourceRanges : getSourceRanges();
+          if (hasValidSeedRange && seedRange) {
+            const seedSourceIndex = findMatchingSourceRangeIndex(activeRanges, seedRange);
+            if (seedSourceIndex >= 0) {
+              updateIndex(seedSourceIndex);
+              editorFindRange(sourceSession, activeRanges[seedSourceIndex].from, activeRanges[seedSourceIndex].to);
+            } else {
+              updateIndex(-1);
+              editorFindRange(sourceSession, seedRange.from, seedRange.to);
+            }
+          } else if (!hasStaleSeedRange && activeRanges.length) {
+            updateIndex(0);
+            editorFindRange(sourceSession, activeRanges[0].from, activeRanges[0].to);
+          } else {
+            updateIndex(-1);
+          }
+          return;
+        }
+        if (shouldScrollReplaced && sourceSession && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
+          editorFindRange(sourceSession, nextSourceRanges[targetIndex].from, nextSourceRanges[targetIndex].to);
+        }
+        return;
+      }
+      const host = findReadingHost();
+      if (pendingAutoSelect.current && renderedRevision !== undefined && !sourceSession && !host) {
+        return;
+      }
       const runAutoSelect = pendingAutoSelect.current;
       const seedRange = runAutoSelect ? pendingSeedRange.current : null;
       const seedMatchText = runAutoSelect ? pendingSeedMatchText.current : undefined;
@@ -546,16 +600,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       pendingAutoSelect.current = false;
       pendingSeedRange.current = null;
       pendingSeedMatchText.current = undefined;
-      if (sourceSession) editorFindQuery(sourceSession, regexError ? "" : query, caseSensitive, { wholeWord, regexp });
       if (!runAutoSelect && shouldScrollReplaced && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
         revealAndHighlightSource(targetIndex, nextSourceRanges, content, true);
-      }
-      const host = findReadingHost();
-      if (regexError) {
-        setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
-        setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
-        syncSearchHighlights({ all: null, current: null });
-        return;
       }
       if (sourceSearchRef.current) {
         const activeRanges = nextSourceRanges.length || !query ? nextSourceRanges : getSourceRanges();
@@ -742,17 +788,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       clearSettleFrames();
       if (sourceSession) editorFindQuery(sourceSession, "", false);
     };
-  }, [query, content, caseSensitive, wholeWord, regexp, sourceSearch, sourceSession, canReplace, seed?.nonce]);
+  }, [query, content, renderedRevision, previewSynced, caseSensitive, wholeWord, regexp, sourceSearch, sourceSession, canReplace, seed?.nonce]);
 
   useEffect(() => {
     syncSearchHighlights({
-      current: regexError ? null : index < 0 ? customCurrentRangeRef.current
+      current: regexError || !previewSynced ? null : index < 0 ? customCurrentRangeRef.current
         : () => resolveActiveHighlightRange(findReadingHost(), index, { sourceSearch, content, sourceRanges, windowed, matches, query, filterOptions }),
     });
-  }, [index, matches, windowed, sourceRanges, sourceSearch, sourceSession, content, query, caseSensitive, wholeWord, regexp, regexError]);
+  }, [index, matches, windowed, sourceRanges, sourceSearch, sourceSession, content, renderedRevision, previewSynced, query, caseSensitive, wholeWord, regexp, regexError]);
 
   useEffect(() => {
-    const host = findReadingHost(); if (!host || (!windowed && !sourceSearch) || !query || regexError) return;
+    const host = findReadingHost(); if (!host || !previewSynced || (!windowed && !sourceSearch) || !query || regexError) return;
     let frame = 0;
     const refresh = () => {
       if (frame) return;
@@ -771,7 +817,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     };
     host.addEventListener("supermd-window-change", refresh);
     return () => { cancelAnimationFrame(frame); host.removeEventListener("supermd-window-change", refresh); };
-  }, [windowed, sourceSearch, sourceRanges, content, query, caseSensitive, wholeWord, regexp, regexError]);
+  }, [windowed, sourceSearch, sourceSession, sourceRanges, content, renderedRevision, previewSynced, query, caseSensitive, wholeWord, regexp, regexError]);
 
   const hiddenStatus = !sourceSearch && hiddenSourceHit && index < 0;
   const statusText = regexError ? regexError
@@ -780,7 +826,6 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const statusTitle = regexError ? regexError
     : hiddenStatus ? "Selected match is in hidden Markdown syntax (such as a link URL, comment, or frontmatter)."
     : count >= 5000 ? "Showing the first 5,000 matches. Narrow your search to find later results." : undefined;
-
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">
     <input ref={input} aria-label="Find in note" aria-invalid={!!regexError || undefined} role="searchbox" type="text" inputMode="search" autoCapitalize="none" autoCorrect="off" spellCheck={false} placeholder="Find in this note" value={query} onChange={event => { clearPendingSeed(); setQuery(event.target.value); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); move(event.shiftKey ? -1 : 1); } }} />
     <output aria-live="polite" className={regexError ? "search-error" : undefined} title={statusTitle}>{statusText}</output>

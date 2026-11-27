@@ -460,7 +460,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         scheduleAutosave(id)
     }
     @Volatile internal var readerFlushRequester: (suspend (String) -> Boolean)? = null
+    @Volatile internal var readerBarrierFlushRequester: (suspend (String) -> Boolean)? = null
     @Volatile internal var readerFlushStatusRequester: (suspend (String) -> ReaderFlushStatus)? = null
+    @Volatile internal var readerBarrierFlushStatusRequester: (suspend (String) -> ReaderFlushStatus)? = null
+    @Volatile internal var readerLoadedNoteId: (() -> String?)? = null
     private val readerActionMutex = Mutex()
     private val openRequests = OpenRequestGate()
     private val openIntentDispatcher = OpenIntentDispatcher<OpenDocumentTarget> { left, right -> left.uri == right.uri }
@@ -507,7 +510,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private suspend fun flushActiveNoteLocked(expectedActiveId: String): Boolean {
         if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) return true
         if (mutable.value.active.id != expectedActiveId) return false
-        val statusRequester = readerFlushStatusRequester
+        val statusRequester = readerBarrierFlushStatusRequester ?: readerFlushStatusRequester
         if (statusRequester != null) {
             val status = try {
                 statusRequester.invoke(expectedActiveId)
@@ -522,19 +525,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     // Compose delivers supermdLoad asynchronously after native switches
                     // activeId. When the live reader confirms a different note is still
                     // mounted (with no unacknowledged draft for expectedActiveId) and
-                    // native remains authoritative for expectedActiveId, there are no
-                    // pending reader edits on expectedActiveId to flush.
+                    // native or its last acknowledged reader load remains authoritative,
+                    // there are no pending reader edits on expectedActiveId to flush.
                     mutable.value.active.id == expectedActiveId &&
-                        readerStateIsNativeAuthoritative(expectedActiveId)
+                        readerStateIsNativeOrPendingLoadAuthoritative(expectedActiveId)
                 ReaderFlushStatus.FAILED -> false
             }
         }
-        // A missing bridge is not an implicit flush acknowledgement. Only
-        // proceed when the native snapshot is already the last acknowledged
-        // reader state (for example, before the reader has ever attached).
+        // A missing bridge—or an active tab that Compose has not yet sent to
+        // WebView via supermdLoad—cannot hold newer unacknowledged edits for
+        // expectedActiveId. Proceed only when native already matches the last
+        // acknowledged reader session; otherwise flush the live reader.
         val accepted = try {
-            readerFlushRequester?.invoke(expectedActiveId)
-                ?: readerStateIsNativeAuthoritative(expectedActiveId)
+            val requester = readerBarrierFlushRequester ?: readerFlushRequester
+            val loadedNoteProvider = readerLoadedNoteId
+            if (requester == null) {
+                readerStateIsNativeAuthoritative(expectedActiveId)
+            } else if (loadedNoteProvider != null && loadedNoteProvider() != expectedActiveId) {
+                readerStateIsNativeOrPendingLoadAuthoritative(expectedActiveId)
+            } else {
+                requester.invoke(expectedActiveId)
+            }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
         } catch (_: Exception) {
@@ -1013,7 +1024,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if(archived.isFailure){fail("Could not preserve a deleted note's edits. Its draft is still open; save it to another file.");return@launch}
                 if(mutable.value!==s){refreshMetadata();return@launch} // Never overwrite edits made during archive I/O.
             }
-            discarded.forEach {readerEcho.remove(it.id)}
+            discarded.forEach { readerEcho.remove(it.id); readerDispatchedContent.remove(it.id) }
             val kept=s.tabs.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
             val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
@@ -1142,6 +1153,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         activeStudioViewModels.remove(this)
         viewModelRetired.set(true)
         readerFlushRequester = null
+        readerBarrierFlushRequester = null
+        readerFlushStatusRequester = null
+        readerBarrierFlushStatusRequester = null
+        readerLoadedNoteId = null
+        clearReaderLoads()
         folderSearchController.cancel()
         invalidateAllNoteAssets()
         recoveryWriter.closeAfterLatest(mutable.value)
@@ -1425,14 +1441,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     // The exact String the reader last sent per note. Echoing it back on every
     // keystroke re-serializes the whole note on both sides and costs battery.
     val readerEcho = java.util.concurrent.ConcurrentHashMap<String, String>()
+    internal val readerDispatchedContent = java.util.concurrent.ConcurrentHashMap<String, String>()
+    internal fun recordReaderLoad(id: String, content: String) { readerDispatchedContent[id] = content }
+    internal fun clearReaderLoads() { readerDispatchedContent.clear() }
     private val readerEditProtocol = ReaderEditProtocol()
     private val readerProtocolAndOutline = ReaderProtocolAndOutlineCoordinator(
         app = getApplication(), scope = viewModelScope,
-        readerEcho = readerEcho, readerEditProtocol = readerEditProtocol,
+        readerEcho = readerEcho, readerDispatchedContent = readerDispatchedContent,
+        readerEditProtocol = readerEditProtocol,
         readState = { mutable.value }, changeState = ::change, editNote = ::edit, fail = ::fail,
     )
     internal fun clearReaderEditProtocol(id: String) = readerProtocolAndOutline.clearReaderEditProtocol(id)
     internal fun readerStateIsNativeAuthoritative(id: String): Boolean = readerProtocolAndOutline.readerStateIsNativeAuthoritative(id)
+    internal fun readerStateIsNativeOrPendingLoadAuthoritative(id: String): Boolean =
+        readerProtocolAndOutline.readerStateIsNativeOrPendingLoadAuthoritative(id)
     fun readerEdit(id: String, content: String, protocolPatch: Boolean = false) = readerProtocolAndOutline.readerEdit(id, content, protocolPatch)
     internal fun readerSync(id: String, epoch: String, revision: Long, content: String): JSONObject =
         readerProtocolAndOutline.readerSync(id, epoch, revision, content)
@@ -1443,7 +1465,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun preserveMalformedReaderResync(id: String?, content: String?) =
         readerProtocolAndOutline.preserveMalformedReaderResync(id, content)
 
-    fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
+    fun edit(id: String, content: String) {
+        if (readerEcho[id] !== content) readerEcho.remove(id)
+        change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }
+        scheduleAutosave(id)
+    }
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
     internal suspend fun commitAgentSnapshotPatch(id: String, expectedRevision: String, patchedContent: String, patchedRevision: String) = documentWrites.withLock {
         require(patchedContent.toByteArray(Charsets.UTF_8).size <= MAX_AGENT_SNAPSHOT_BYTES) { "The patched document exceeds Android's 2 MiB relay snapshot limit" }
@@ -1635,6 +1661,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         )
     private fun discardEmptyTab(id: String) {
         readerEcho.remove(id)
+        readerDispatchedContent.remove(id)
         clearReaderEditProtocol(id)
         autosavePending.remove(id)
         savedPortableAssets.remove(id)
@@ -1773,6 +1800,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 return
             }
             readerEcho.remove(id)
+            readerDispatchedContent.remove(id)
             clearReaderEditProtocol(id)
             autosavePending.remove(id)
             change { state ->

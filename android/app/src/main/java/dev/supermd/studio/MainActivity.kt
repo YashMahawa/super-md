@@ -90,6 +90,7 @@ import kotlinx.coroutines.flow.first
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
@@ -508,7 +509,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     DisposableEffect(Unit){onDispose{chromeTapJob[0]?.cancel()}}
     var web by remember { mutableStateOf<WebView?>(null) }
     var chromeHeight by remember { mutableIntStateOf(0) }
-    val readerNote = remember { arrayOfNulls<String>(1) }
+    val readerNote = remember { AtomicReference<String?>(null) }
     // WebView timer controls are process-wide. Track every reader so a stopped
     // activity cannot pause another window that is still visible.
     val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
@@ -607,6 +608,14 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     var readerReady by remember { mutableStateOf(false) }
     var readerGeneration by remember { mutableIntStateOf(0) }
     DisposableEffect(model, readerReady, readerGeneration, web) {
+        if (!readerReady || web == null) {
+            readerNote.set(null)
+            model.clearReaderLoads()
+        }
+        model.readerLoadedNoteId = {
+            val current = web
+            if (!readerReady || current == null) null else readerNote.get()
+        }
         model.readerFlushRequester = { noteId ->
             val current = web
             if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
@@ -622,9 +631,29 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     ?: ReaderFlushStatus.FAILED
             }
         }
+        model.readerBarrierFlushRequester = { noteId ->
+            val current = web
+            if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
+            else (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)
+                ?.requestFlush(noteId, allowPendingNativeLoad = true) ?: false
+        }
+        model.readerBarrierFlushStatusRequester = { noteId ->
+            val current = web
+            if (!readerReady || current == null) {
+                if (model.readerStateIsNativeAuthoritative(noteId)) ReaderFlushStatus.ACKNOWLEDGED
+                else ReaderFlushStatus.FAILED
+            } else {
+                (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)
+                    ?.requestFlushStatus(noteId, allowPendingNativeLoad = true)
+                    ?: ReaderFlushStatus.FAILED
+            }
+        }
         onDispose {
             model.readerFlushRequester = null
             model.readerFlushStatusRequester = null
+            model.readerBarrierFlushStatusRequester = null
+            model.readerBarrierFlushRequester = null
+            model.readerLoadedNoteId = null
         }
     }
     DisposableEffect(activity, model, readerReady) {
@@ -1015,13 +1044,17 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             }
         }
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
-            if (!readerReady) readerNote[0] = null
-            if (readerReady && state.active.id.isNotEmpty()) {
+        LaunchedEffect(readerReady, web, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
+            val reader = web
+            if (!readerReady || reader == null) {
+                readerNote.set(null)
+                model.clearReaderLoads()
+            }
+            if (readerReady && reader != null && state.active.id.isNotEmpty()) {
                 val note = state.active
                 val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
                 val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("portable", note.portable).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote.get() == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("portable", note.portable).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 if (pendingHeading != null) {
                     payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
                 }
@@ -1041,15 +1074,16 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     }
                     payload.put("seededFind", seededJson)
                 }
-                web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                reader.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
                 if (matchingSeed != null) {
                     model.consumeSeededFind(matchingSeed.nonce)
                 }
-                readerNote[0] = note.id
+                readerNote.set(note.id)
                 readerContent[0] = note.content
+                model.recordReaderLoad(note.id, note.content)
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
-                web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
+                reader.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
         }
         LaunchedEffect(readerReady, state.zoomCommand) {
@@ -1232,8 +1266,10 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                 if (wasCurrent) {
                                     readerReady = false
                                     readerPdfOwnsProgress = false
+                                    readerNote.set(null)
+                                    model.clearReaderLoads()
+                                    model.overlay(false, false)
                                     model.editorFocus(false)
-                                    readerNote[0] = null
                                     readerGeneration++
                                     web = null
                                     scope.launch {
@@ -1301,7 +1337,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
                         if (released != null) {
-                            if (web === released) { web = null; readerReady = false; model.editorFocus(false) }
+                            if (web === released) { web = null; readerReady = false; readerNote.set(null); model.clearReaderLoads(); model.editorFocus(false) }
                             retireAndDestroyReader(released)
                         }
                         frame.removeAllViews()

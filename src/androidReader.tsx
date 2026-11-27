@@ -49,9 +49,9 @@ import {rememberWindowedScrollSource} from './windowedSearch';
 import ReadingSearch, { isValidSeedOccurrence, type ReadingSearchSeed } from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
-import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
-import { readerSourceAnalysis } from "./readerSourceAnalysis";
-import {OutlineWorkerClient} from './outlineWorker';
+import { navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
+import { sharedDocumentAnalysisClient, useDocumentAnalysis } from "./documentAnalysisWorker";
+import { applyAlignedTaskToggle } from "./revisionEdit";
 import {recordHistory,replayHistory,transferHistory,trimHistoryCache,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
@@ -74,11 +74,31 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 import { handoffSharedSourceAnchorOnLoad, parseImportedAnchor, snapshotOutgoingTabOrPathAnchor, useSharedSourceAnchor, type NoteView, type PendingHeadingNavigation } from "./useSharedSourceAnchor";
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; portable?: boolean; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:{action?:string;target?:string;token?:string;allowPendingNativeLoad?:boolean;[key:string]:unknown})=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean;sourceStart?:number;sourceEnd?:number;matchText?:string}|null }
+interface ReaderState { replaceEpoch?:number; centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean;sourceStart?:number;sourceEnd?:number;matchText?:string}|null }
+function sharesDocumentLineage(previous: string, next: string): boolean {
+  if (!previous || !next) return false;
+  if (previous === next) return true;
+  const limit = Math.min(previous.length, next.length);
+  let prefix = 0;
+  while (prefix < limit && previous.charCodeAt(prefix) === next.charCodeAt(prefix)) {
+    prefix += 1;
+  }
+  let suffix = 0;
+  const maxSuffix = limit - prefix;
+  while (
+    suffix < maxSuffix &&
+    previous.charCodeAt(previous.length - 1 - suffix) === next.charCodeAt(next.length - 1 - suffix)
+  ) {
+    suffix += 1;
+  }
+  const shared = prefix + suffix;
+  const maxLength = Math.max(previous.length, next.length);
+  return limit >= 24 && shared >= Math.max(24, Math.ceil(limit * 0.5)) && shared >= Math.ceil(maxLength * 0.25);
+}
 function normalizeSeedBounds(start?: unknown, end?: unknown, matchText?: unknown): { sourceStart?: number; sourceEnd?: number; matchText?: string } {
   if (typeof start === "number" && typeof end === "number" && Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end >= start) {
     return { sourceStart: start, sourceEnd: end, ...(typeof matchText === "string" && matchText ? { matchText } : {}) };
@@ -150,7 +170,18 @@ export async function computeAgentDocumentRequest(request:Record<string,unknown>
 }
 export function Reader() {
   const [state, setState] = useState<ReaderState | null>(null);
-  const readerAnalysis=useMemo(()=>state?readerSourceAnalysis(state.mode,state.content):null,[state?.mode,state?.content]);
+  const analysisKey = state ? `${state.id}:${state.replaceEpoch ?? 0}` : null;
+  const { pinnedAnalysis, exactAnalysis, isReady: previewReady } = useDocumentAnalysis(
+    analysisKey,
+    state?.content ?? "",
+    state?.mode ?? "reader",
+    { enabled: state !== null },
+  );
+  const exactReady = Boolean(state && (state.mode === "editor" || exactAnalysis?.source === state.content));
+  const exactReadyRef = useRef(exactReady);
+  exactReadyRef.current = exactReady;
+  const exactAnalysisRef = useRef(exactAnalysis);
+  exactAnalysisRef.current = exactAnalysis;
   const [repairing, setRepairing] = useState(false);
   const [searching,setSearching] = useState(false);
   const [searchReplace,setSearchReplace] = useState(false);
@@ -183,10 +214,18 @@ export function Reader() {
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
   const reference = useRef(state); reference.current = state;
+  const replaceEpochRef = useRef(0);
+  const publishedOutline = useRef<{ id: string; source: string } | null>(null);
+  const pendingOutlineHeading = useRef<{ noteId: string; mode: ReaderState["mode"]; headingId: string; input: number } | null>(null);
+  const pendingExternalAnchor = useRef<{ id: string; mode: ReaderState["mode"]; content: string; restore: Array<() => void> } | null>(null);
+  const activeScrollRestore = useRef<(() => void) | null>(null);
+  const committedView = useRef<{ id: string; mode: ReaderState["mode"]; content: string; exact: boolean } | null>(null);
+  const measuredView = useRef("");
   const approveImageUrl = useCallback((noteId:string|undefined,url:string)=>{if(noteId&&noteImageConsent.current.approve(noteId,url))setImageConsentVersion(value=>value+1);},[]);
   const recordRemoteImageLoaded = useCallback((noteId:string|undefined,url:string,data:string)=>{if(noteId)noteImageConsent.current.recordLoaded(noteId,url,data);},[]);
   const approvedImageUrls = useMemo(()=>noteImageConsent.current.approvedUrls(state?.id),[state?.id,imageConsentVersion]);
   const consumedHeadingToken = useRef<string | null>(null);
+  const consumedEditorHeadingToken = useRef<string | null>(null);
   const layoutNavigatedHeadingToken = useRef<string | null>(null);
   const suppressedRestoreToken = useRef<string | null>(null);
   const suppressedRestoreKey = useRef<string | null>(null);
@@ -201,7 +240,6 @@ export function Reader() {
     }
     void invoke("typewriter_scroll", { enabled }).catch(() => {});
   }, []);
-  const outlineWorker=useRef<OutlineWorkerClient|null>(null);
   const edits=useRef<ReaderEdits|null>(null);
   if(!edits.current)edits.current=new ReaderEdits((command,args)=>invoke(command,args));
   const [editError,setEditError]=useState('');
@@ -272,6 +310,17 @@ export function Reader() {
       const applyIncomingFind=(targetContent:string)=>{
         if(seededFind&&typeof seededFind.query==='string'){
           if(willSeedNavigate(targetContent,seededFind.query,seededFind.caseSensitive,seededFind.sourceStart,seededFind.sourceEnd,seededFind.matchText)){
+            pendingExternalAnchor.current=null;
+            pendingOutlineHeading.current=null;
+            document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
+            const activeState=reference.current;
+            const activeHeadingToken=(rest as {pendingHeading?:PendingHeadingNavigation|string|null}).pendingHeading?null:activeState?.pendingHeading?.token;
+            if(activeState&&activeHeadingToken){
+              suppressedRestoreKey.current=`${activeState.id}:${activeState.mode}`;
+              suppressedRestoreToken.current=activeHeadingToken;
+              consumedHeadingToken.current=activeHeadingToken;
+              consumedEditorHeadingToken.current=activeHeadingToken;
+            }
             requestAnimationFrame(()=>markScrollInput());
           }
           searchSeedNonce.current+=1;
@@ -300,6 +349,7 @@ export function Reader() {
         // warning. Never hide an error while an unacknowledged draft remains.
         if(draft===undefined&&(old?.id!==next.id||old?.content!==next.content))setEditError('');
       }
+      const wholesaleReplacement=Boolean(old&&old.id===next.id&&!contentUnchanged&&draft===undefined&&old.content!==next.content&&!sharesDocumentLineage(old.content,next.content));
       const hasActiveSeedNavigation = Boolean(
         seededFind &&
           willSeedNavigate(
@@ -311,12 +361,38 @@ export function Reader() {
             seededFind.matchText,
           ),
       );
+      if (old?.id === next.id) {
+        if (wholesaleReplacement) {
+          replaceEpochRef.current += 1;
+          next.replaceEpoch = replaceEpochRef.current;
+          noteViews.current.delete(next.id);
+          if (suppressedRestoreKey.current?.startsWith(`${next.id}:`)) suppressedRestoreKey.current = null;
+          modeAnchor.current = null;
+          splitPane.current = null;
+        } else {
+          next.replaceEpoch = old.replaceEpoch ?? replaceEpochRef.current;
+        }
+      } else {
+        publishedOutline.current = null;
+        next.replaceEpoch = replaceEpochRef.current;
+      }
       const { hasNewPendingHeading, unconsumedOldHeadingOffset } = handoffSharedSourceAnchorOnLoad({
         old,
         next,
         zoom: zoomReference.current,
         hasActiveSeedNavigation,
-        refs: { consumedHeadingToken, suppressedRestoreToken, savePosition, modeAnchor, splitPane },
+        wholesaleReplacement,
+        incomingReadingLocation: incoming.readingLocation,
+        refs: {
+          consumedHeadingToken,
+          suppressedRestoreToken,
+          savePosition,
+          modeAnchor,
+          splitPane,
+          noteViews,
+          consumedEditorHeadingToken,
+          pendingOutlineHeading,
+        },
         onHistoryBoundary: () => { const history = histories.current.get(next.id); if (history) history.last = 0; },
       });
       if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind(next.content);return;}
@@ -382,7 +458,17 @@ export function Reader() {
         applyIncomingFind(loaded.content);
       };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
-      if (old?.id === next.id && old.mode === next.mode && !hasNewPendingHeading && !typewriterChanged && !hasActiveSeedNavigation) anchored(load); else load();
+      if (!wholesaleReplacement && !hasNewPendingHeading && !hasActiveSeedNavigation && old?.id === next.id && old.mode === next.mode && !typewriterChanged) {
+        const restore = anchors();
+        pendingExternalAnchor.current = old.content !== loaded.content && loaded.mode !== "editor"
+          ? { id: loaded.id, mode: loaded.mode, content: loaded.content, restore }
+          : null;
+        load();
+        requestAnimationFrame(() => restore.forEach(callback => callback()));
+      } else {
+        pendingExternalAnchor.current = null;
+        load();
+      }
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
@@ -443,9 +529,11 @@ export function Reader() {
     window.supermdHeading=(id,offset)=>{
       markScrollInput();
       const current=reference.current;
-      if(current?.mode==="editor"||current?.mode==="split"){
+      if(!current)return;
+      if(current.mode==="editor"||current.mode==="split"){
         const resolvedOffset=offset??(resolveHeadingOffset(current.content,id)??undefined);
         if(current.mode==="editor"){
+          pendingOutlineHeading.current=null;
           window.dispatchEvent(new CustomEvent("supermd-goto-offset",{detail:resolvedOffset??0}));
           return;
         }
@@ -454,8 +542,13 @@ export function Reader() {
           revealEditorOffset(current.id,resolvedOffset,{caretOffset:resolvedOffset});
         }
       }
-      const root=document.querySelector(".android-reading");
-      if(root)navigateToHeading(root,id);
+      const root=exactReadyRef.current?document.querySelector(".android-reading"):null;
+      if(root){
+        pendingOutlineHeading.current=null;
+        navigateToHeading(root,id);
+      }else{
+        pendingOutlineHeading.current={noteId:current.id,mode:current.mode,headingId:id,input:scrollInputVersion()};
+      }
     };
     window.supermdBeforeNavigate=async()=>{
       savePosition.current();
@@ -488,41 +581,46 @@ export function Reader() {
       if(canvas){canvas.dispatchEvent(new CustomEvent("supermd-canvas-pan",{detail:{dx,dy},cancelable:true}));return;}
       const scroller=resolveNativeWheelScrollOrigin(target);
       if(scroller){noteSplitWheelTarget(scroller);nativeScroll.scroll(scroller,dx,dy);}
+      else if(reference.current&&reference.current.mode!=='editor'&&Math.abs(dy)>2)requestAnimationFrame(()=>requestChrome('hide'));
     };
     window.supermdFlush = operation => {
       savePosition.current();
       const current = reference.current;
+      const target = typeof operation.target === "string" ? operation.target : "";
+      const token = typeof operation.token === "string" ? operation.token : undefined;
       if(operation.action==='android_flush'){
-        if(edits.current?.unacknowledged(operation.target)!==undefined&&current?.id!==operation.target){
-          void invoke('document_flushed',{id:operation.target,token:operation.token,error:'Reader has unacknowledged edits for this note'}).catch(()=>{});
+        if(edits.current?.unacknowledged(target)!==undefined&&current?.id!==target){
+          void invoke('document_flushed',{id:target,token,error:'Reader has unacknowledged edits for this note'}).catch(()=>{});
           return;
         }
         if(!current){
-          void invoke('document_flushed',{id:'',token:operation.token,error:'Reader has not loaded a note yet'}).catch(()=>{});
+          void invoke('document_flushed',{id:'',token,error:'Reader has not loaded a note yet'}).catch(()=>{});
           return;
         }
-        if(current.id!==operation.target){
-          void invoke('document_flushed',{id:current.id,token:operation.token,error:'The active note changed before its edit flush'}).catch(()=>{});
+        if(current.id!==target){
+          void invoke('document_flushed',{id:current.id,token,error:'The active note changed before its edit flush'}).catch(()=>{});
           return;
         }
         void (async()=>{
-          if(current.editProtocol===1)await edits.current!.flush(current.id);
+          if(current.editProtocol===1&&!(operation.allowPendingNativeLoad===true&&edits.current!.unacknowledged(current.id)===undefined)){
+            await edits.current!.flush(current.id);
+          }
           const latest=reference.current;
-          if(!latest||latest.id!==operation.target){
-            await invoke('document_flushed',{id:latest?.id??'',token:operation.token,error:'The active note changed during its edit flush'});
+          if(!latest||latest.id!==target){
+            await invoke('document_flushed',{id:latest?.id??'',token,error:'The active note changed during its edit flush'});
             return;
           }
-          await invoke('document_flushed',{id:latest.id,token:operation.token,content:latest.content});
+          await invoke('document_flushed',{id:latest.id,token,content:latest.content});
         })().catch(error=>{
           setEditError(String(error));
-          void invoke('document_flushed',{id:current.id,token:operation.token,error:String(error)}).catch(()=>{});
+          void invoke('document_flushed',{id:current.id,token,error:String(error)}).catch(()=>{});
         });
         return;
       }
       if (!current) return;
       let id = current.id;
-      if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
-      else if (operation.action === "detach_tab") id = operation.target;
+      if (operation.action === "move_tab") { try { id = JSON.parse(target).tab; } catch { return; } }
+      else if (operation.action === "detach_tab") id = target;
       const captureView = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader";
       const baseView = captureView ? {editor:exportEditorSession(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
       void (async()=>{
@@ -535,7 +633,7 @@ export function Reader() {
     };
     window.supermdFind = (replaceOrQuery, options) => {
       if(document.querySelector('.theme-guide-dialog'))return;
-      if(typeof replaceOrQuery==='string'&&willSeedNavigate(reference.current?.content??"",replaceOrQuery,options?.caseSensitive,options?.sourceStart,options?.sourceEnd,options?.matchText))markScrollInput();
+      if(typeof replaceOrQuery==='string'&&willSeedNavigate(reference.current?.content??"",replaceOrQuery,options?.caseSensitive,options?.sourceStart,options?.sourceEnd,options?.matchText)){pendingExternalAnchor.current=null;pendingOutlineHeading.current=null;markScrollInput();}
       const requestedReplace=typeof replaceOrQuery==="boolean"?replaceOrQuery:Boolean(options?.replace);
       const openReplace=requestedReplace&&reference.current?.mode!=="reader";
       flushSync(()=>{
@@ -601,33 +699,11 @@ export function Reader() {
     return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; delete window.supermdFindStep; };
   }, []);
   useEffect(()=>{
-    if(!state)return;
-    // Outline is derived state, not durable edits. Coalesce expensive Source
-    // typing work and cancel obsolete document generations before parsing.
-    const {id,content}=state;
-    const controller=new AbortController();
-    const workerBacked=state.mode==='editor'&&content.length>80_000&&typeof Worker!=='undefined';
-    const timer=window.setTimeout(()=>{
-      if(reference.current?.id!==id||reference.current.content!==content)return;
-      void (async()=>{
-        let headings;
-        try{
-          if(readerAnalysis?.source===content)headings=readerAnalysis.analysis.outline;
-          else if(workerBacked){outlineWorker.current??=new OutlineWorkerClient();headings=await outlineWorker.current.request(content,controller.signal);}
-          else headings=documentOutline(content);
-        }catch{
-          if(controller.signal.aborted)return;
-          // Worker creation/analysis can be unavailable in an older WebView;
-          // keep the existing synchronous analysis as the correctness path.
-          headings=readerAnalysis?.source===content?readerAnalysis.analysis.outline:documentOutline(content);
-        }
-        if(controller.signal.aborted||reference.current?.id!==id||reference.current.content!==content)return;
-        void invoke('document_outline',{id,headings}).catch(()=>{});
-      })();
-    },content.length>80_000?180:0);
-    return()=>{window.clearTimeout(timer);controller.abort();if(workerBacked)outlineWorker.current?.cancel();};
-  },[state?.id,state?.content,state?.mode,readerAnalysis]);
-  useEffect(()=>()=>{outlineWorker.current?.dispose();outlineWorker.current=null;},[]);
+    if(!state||!exactAnalysis||exactAnalysis.source!==state.content)return;
+    if(publishedOutline.current?.id===state.id&&publishedOutline.current.source===state.content)return;
+    publishedOutline.current={id:state.id,source:state.content};
+    void invoke('document_outline',{id:state.id,headings:exactAnalysis.analysis.outline}).catch(()=>{});
+  },[state?.id,state?.content,exactAnalysis]);
   useLayoutEffect(() => {
     if (!state) return;
     const nextCustom={id:state.id,mode:state.mode,metrics:JSON.stringify(state.customStyle?.metrics??{})};
@@ -650,24 +726,26 @@ export function Reader() {
     root.style.setProperty('--media-separation',`${Math.max(1,Math.min(2,state.imageContrast??1.25))}px`);
     // A palette-only change must not unset CSS zoom, remeasure a long page or
     // write scrollTop. These operations used to race with momentum scrolling.
-    const nextLayout=JSON.stringify([state.id,state.mode,state.fullscreen,state.font,state.size,state.widthPercent,state.lineHeight,styleKey]);
-    if(layoutKey.current!==nextLayout){layoutKey.current=nextLayout;document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);applyZoomStyle();settleSelection();}
+    document.querySelector<HTMLElement>('.android-source')?.style.setProperty('--workspace-scale',String(zoomReference.current/100));
+    if(!previewReady)layoutKey.current='';
+    const nextLayout=JSON.stringify([analysisKey,state.mode,state.fullscreen,state.font,state.size,state.widthPercent,state.lineHeight,styleKey]);
+    if(previewReady&&layoutKey.current!==nextLayout){layoutKey.current=nextLayout;document.querySelectorAll<HTMLElement>('.android-reading').forEach(invalidateDocumentZoom);applyZoomStyle();settleSelection();}
     if(restoreCustom.length)requestAnimationFrame(()=>restoreCustom.forEach(restore=>restore()));
   // A source edit (especially checking a task) is not a new viewport. Rebuilding
   // zoom geometry here resets settled CSS zoom before the native selection and
   // scroll position have caught up, which jumps on mobile and magnified pages.
   // ResizeObserver updates the content extent without changing magnification.
-  }, [state?.id,state?.mode,state?.dark,state?.fullscreen,state?.font,state?.size,
-      state?.widthPercent,state?.lineHeight,state?.motion,state?.imageAppearance,state?.svgAppearance,state?.imageContrast,JSON.stringify(state?.colors),JSON.stringify(state?.customStyle)]);
-  useEffect(()=>{const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;
+  }, [analysisKey,state?.mode,state?.dark,state?.fullscreen,state?.font,state?.size,
+      state?.widthPercent,state?.lineHeight,state?.motion,state?.imageAppearance,state?.svgAppearance,state?.imageContrast,previewReady,JSON.stringify(state?.colors),JSON.stringify(state?.customStyle)]);
+  useEffect(()=>{if(!previewReady)return;const root=document.querySelector<HTMLElement>(".android-reading");if(!root || typeof ResizeObserver==="undefined")return;let frame=0;const page=root.querySelector<HTMLElement>(".document-page");const observer=new ResizeObserver(()=>{if(!frame)frame=requestAnimationFrame(()=>{frame=0;
     // A scheduled gesture owns its focal point. A resize callback must not
     // consume the pending scale at the default center before that frame runs.
     if(Math.abs(Number(page?.dataset.scale)*100-zoomReference.current)<.01 && !refreshDocumentExtent(root)){invalidateDocumentZoom(root);applyZoomStyle();settleSelection();}
-  });});observer.observe(root);if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[state?.id,state?.mode]);
+  });});observer.observe(root);if(page)observer.observe(page);return()=>{observer.disconnect();cancelAnimationFrame(frame);};},[analysisKey,state?.mode,previewReady]);
   useLayoutEffect(()=>{if(state){applyZoomStyle();settleSelection();}},[state?.centerLock]);
   // A Range must not retain a detached previous note after a tab switch or
   // source replacement, including edits made directly inside this reader.
-  useLayoutEffect(()=>{document.querySelectorAll<HTMLElement>('.android-reading').forEach(root=>rememberWindowedScrollSource(root,0));},[state?.id,state?.content,state?.mode]);
+  useLayoutEffect(()=>{if(!previewReady)return;document.querySelectorAll<HTMLElement>('.android-reading').forEach(root=>rememberWindowedScrollSource(root,0));},[state?.id,state?.content,state?.mode,previewReady]);
   useEffect(()=>{
     const lock=(event:Event)=>{const root=event.target;if(root instanceof HTMLElement&&root.matches('.android-reading'))enforceDocumentCenter(root);};
     document.addEventListener('scroll',lock,{capture:true,passive:true});
@@ -683,17 +761,67 @@ export function Reader() {
     }
   },[state]);
   useLayoutEffect(() => {
-    if (!state) return;
-    const hosts=Array.from(document.querySelectorAll<HTMLElement>(".android-reading"));
-    hosts.forEach(host=>delete host.dataset.measured);
-    let measure=requestAnimationFrame(()=>{measure=requestAnimationFrame(()=>hosts.forEach(host=>{host.dataset.measured="true";}));});
-    return()=>cancelAnimationFrame(measure);
-  }, [state?.id, state?.mode]);
+    if (!state || (state.mode !== "editor" && !previewReady)) {
+      measuredView.current = "";
+      return;
+    }
+    const key = `${analysisKey}:${state.mode}`;
+    if (measuredView.current === key) return;
+    const hosts = Array.from(document.querySelectorAll<HTMLElement>(".android-reading"));
+    if (!hosts.length) {
+      measuredView.current = key;
+      return;
+    }
+    hosts.forEach(host => delete host.dataset.measured);
+    let measure = requestAnimationFrame(() => {
+      measure = requestAnimationFrame(() => {
+        measuredView.current = key;
+        hosts.forEach(host => { host.dataset.measured = "true"; });
+      });
+    });
+    return () => cancelAnimationFrame(measure);
+  }, [analysisKey, state?.mode, previewReady]);
   useSharedSourceAnchor({
     state,
     reference,
     zoomReference,
+    analysisKey,
+    previewReady,
+    exactReady,
+    activeScrollRestore,
+    consumedEditorHeadingToken,
+    pendingOutlineHeading,
     refs: { noteViews, savePosition, modeAnchor, splitPane, restoringSplit, restoringSplitSeq, splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed },
+  });
+  useLayoutEffect(() => {
+    if (!state || !previewReady || !exactReady) return;
+    const pending = pendingExternalAnchor.current;
+    if (!pending) return;
+    if (pending.id !== state.id || pending.mode !== state.mode) {
+      pendingExternalAnchor.current = null;
+      return;
+    }
+    if (pending.content !== state.content) return;
+    pendingExternalAnchor.current = null;
+    pending.restore.forEach(callback => callback());
+    const frame = requestAnimationFrame(() => pending.restore.forEach(callback => callback()));
+    return () => cancelAnimationFrame(frame);
+  }, [state?.id, state?.mode, state?.content, previewReady, exactReady]);
+  useLayoutEffect(() => {
+    if (!state || !previewReady || !exactReady) return;
+    const pending = pendingOutlineHeading.current;
+    if (!pending) return;
+    pendingOutlineHeading.current = null;
+    if (pending.noteId !== state.id || pending.mode !== state.mode || pending.input !== scrollInputVersion()) return;
+    const root = document.querySelector(".android-reading");
+    if (root) navigateToHeading(root, pending.headingId);
+  }, [state?.id, state?.mode, state?.content, previewReady, exactReady]);
+  useLayoutEffect(() => {
+    if (!state) {
+      committedView.current = null;
+      return;
+    }
+    committedView.current = { id: state.id, mode: state.mode, content: state.content, exact: exactReady };
   });
   useLayoutEffect(() => {
     const find=(event:KeyboardEvent)=>{
@@ -813,7 +941,10 @@ export function Reader() {
       const target=event.target as Element,root=target.closest('.android-reading');cancelHeadingNavigation(root);
       const heldPageZoom=(mouseHeld||!!(event.buttons&1))&&!!root&&!selectingText.current&&!window.getSelection()?.toString();
       if ((event.ctrlKey || event.metaKey || heldPageZoom) && !target.closest("textarea,input,[data-independent-zoom]")) { event.preventDefault();gaps.cancelStationary();window.supermdZoomBy?.(Math.exp(-event.deltaY*.002),{x:event.clientX,y:event.clientY}); }
-      else if(root instanceof HTMLElement&&!event.ctrlKey&&!event.metaKey&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom]')){rememberWindowedScrollSource(root,event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?root.clientHeight:1));if(Math.abs(event.deltaY)>2)requestChrome('hide');}
+      else if(!event.ctrlKey&&!event.metaKey&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom],.theme-guide-dialog,.math-repair-panel,.media-dialog,.image-viewer')){
+        if(root instanceof HTMLElement){rememberWindowedScrollSource(root,event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?root.clientHeight:1));if(Math.abs(event.deltaY)>2)requestChrome('hide');}
+        else if(reference.current&&reference.current.mode!=='editor'&&target.closest('.android-document,.reader-loading')&&Math.abs(event.deltaY)>2)requestChrome('hide');
+      }
     };
     const scrollKey=(event:KeyboardEvent)=>{
       const target=event.target as Element;
@@ -847,6 +978,14 @@ export function Reader() {
     const delivery=next.editProtocol===1?edits.current!.change(next.id,content,changes):invoke("document_changed",{id:next.id,content});
     void delivery.then(()=>setEditError(''),error=>setEditError(String(error)));
   }, []);
+  const togglePreviewTask = useCallback((baseSource: string, offset: number, checked: boolean): boolean => {
+    const current = reference.current;
+    if (!current) return false;
+    const aligned = applyAlignedTaskToggle(baseSource, current.content, offset, checked);
+    if (!aligned) return false;
+    update(aligned.content, [aligned.change]);
+    return true;
+  }, [update]);
   useEffect(()=>{
     const MAX_AGENT_QUEUE=16;
     let active=false,disposed=false;
@@ -872,7 +1011,41 @@ export function Reader() {
         const image=await mediaBytes(await diagramMedia(diagram,note.path),imageFormat,typeof request.width==='number'?Math.min(1600,Math.max(64,Math.round(request.width))):1600);return {...base,diagramId:diagram.id,mime_type:image.mimeType,data:image.body,width:image.width,height:image.height};
       }
       if(request.action==='get_context'){
-        const analysis=readerSourceAnalysis(note.mode,note.content)?.analysis??analyzeDocument(note.content);
+        const nextLayoutTurn=()=>new Promise<void>(resolve=>{
+          let settled=false;
+          const finish=()=>{if(settled)return;settled=true;resolve();};
+          const timer=window.setTimeout(finish,20);
+          if(typeof requestAnimationFrame==='function'){
+            requestAnimationFrame(()=>{window.clearTimeout(timer);finish();});
+          }
+        });
+        if(note.mode!=='editor'){
+          if(sharedDocumentAnalysisClient.isAvailable()&&!sharedDocumentAnalysisClient.peek(note.content)){
+            await sharedDocumentAnalysisClient.request(note.content).catch(()=>null);
+          }
+          const deadline=performance.now()+2500;
+          while(performance.now()<deadline){
+            if(reference.current?.id!==note.id||reference.current.content!==note.content){
+              throw Error('The note changed while reading; retry');
+            }
+            const committed=committedView.current;
+            if(committed?.id===note.id&&committed.mode===note.mode&&committed.content===note.content&&committed.exact&&document.querySelector('.android-reading')){
+              break;
+            }
+            await nextLayoutTurn();
+          }
+          await nextLayoutTurn();
+          if(reference.current?.id!==note.id||reference.current.content!==note.content){
+            throw Error('The note changed while reading; retry');
+          }
+        }else if(!document.querySelector('.cm-scroller')){
+          await nextLayoutTurn();
+          if(reference.current?.id!==note.id||reference.current.content!==note.content){
+            throw Error('The note changed while reading; retry');
+          }
+        }
+        const currentExact=exactAnalysisRef.current;
+        const analysis=sharedDocumentAnalysisClient.peek(note.content)?.analysis??(currentExact?.source===note.content?currentExact.analysis:analyzeDocument(note.content));
         const parsedFm=parseFrontmatter(note.content);
         const fmProps=parsedFm?.properties;
         const visibleMetadataProps=(()=>{
@@ -1272,13 +1445,13 @@ export function Reader() {
     </section></div>}
     {editError&&<div role="alert" className="reader-edit-error">{editError}</div>}
     <MediaThemeFilters colors={state.colors} dark={state.dark}/>
-    {searching && <ReadingSearch content={state.content} close={()=>{setSearching(false);setSearchReplace(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed} initialReplace={searchReplace}/>}
+    {searching && <ReadingSearch content={state.content} renderedRevision={state.mode==="editor"?undefined:(pinnedAnalysis?.source??null)} close={()=>{setSearching(false);setSearchReplace(false);setSearchSeed(null);}} onChange={state.mode==="reader"?undefined:update} sourceSession={state.mode==="editor"||state.mode==="split"?state.id:undefined} seed={searchSeed} initialReplace={searchReplace}/>}
     <ImageViewer />
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
-    <MediaTools documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const current = reference.current; if (!current || current.id !== state.id) return; const content = current.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
+    <MediaTools documentId={state.id} content={state.content} renderedContent={pinnedAnalysis?.source} documentPath={state.path} onInsert={(text, point) => { const current = reference.current; if (!current || current.id !== state.id) return; const content = current.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} documentPath={state.path === state.id ? null : state.path} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} onTypewriterChange={changeTypewriter} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} noteId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
-    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview noteId={state.id} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
+    {state.mode === "live" && (pinnedAnalysis ? <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={analysisKey ?? state.id} className="document-page-space"><div className="document-page"><LiveDocument key={analysisKey ?? state.id} sessionId={state.id} noteId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={pinnedAnalysis} /></div></div></section> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your note</div>)}
+    {(state.mode === "reader" || state.mode === "split") && (pinnedAnalysis ? <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={analysisKey ?? state.id} className="document-page-space"><div className="document-page"><DocumentPreview noteId={state.id} markdown={pinnedAnalysis.source} onChange={update} onToggleTask={togglePreviewTask} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={pinnedAnalysis} /></div></div></section> : <div className="reader-loading" role="status"><span className="expressive-loading-shape" aria-hidden="true"/>Opening your note</div>)}
   </div></DocumentAppearance.Provider>;
 }
 const rootElement = document.getElementById("root");

@@ -10,6 +10,7 @@ export const looksLikeSvg = (text: string) => SVG_START.test(text) && SVG_END.te
 export function remarkSvgBlocks(this: unknown) {
   return (tree: any, file: { value?: unknown }) => {
     const source = typeof file?.value === "string" ? file.value : "";
+    if (typeof file?.value === "string" && !/<svg[\s>]/i.test(source)) return tree;
     const slice = (first: any, last: any) => {
       if (!first?.position || !last?.position || !source) return "";
       const start = first.position.start.offset;

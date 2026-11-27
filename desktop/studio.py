@@ -507,6 +507,174 @@ _STOPPED_WATCHER = _StoppedFileWatcher()
 def _matches_media_signature(mime: str, data: bytes) -> bool:
     return studio_paths_media.matches_media_signature(mime, data)
 
+
+def _shiboken_valid(obj) -> bool:
+    return shiboken6 is None or shiboken6.isValid(obj)
+
+
+class _SignalProxy:
+    def __init__(self):
+        self._callbacks = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def disconnect(self, callback):
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
+    def emit(self, *args):
+        for callback in tuple(self._callbacks):
+            callback(*args)
+
+    _emit = emit
+
+
+class _ManagedFileWatcher:
+    """Wraps QFileSystemWatcher so stop() and GC deterministically release OS handles."""
+
+    def __init__(self, parent: QObject | None = None):
+        self._parent_ref = weakref.ref(parent) if parent is not None else None
+        self._watcher: QFileSystemWatcher | None = None
+        self._closed = False
+        self.fileChanged = _SignalProxy()
+        self.directoryChanged = _SignalProxy()
+        self._ensure()
+
+    def _ensure(self) -> QFileSystemWatcher | None:
+        if self._closed:
+            return None
+        if self._watcher is not None and _shiboken_valid(self._watcher):
+            return self._watcher
+        parent = self._parent_ref() if self._parent_ref is not None else None
+        if self._parent_ref is not None and (parent is None or not _shiboken_valid(parent)):
+            return None
+        watcher = QFileSystemWatcher(parent)
+        owner_ref = weakref.ref(self)
+
+        def on_file(path):
+            owner = owner_ref()
+            if owner is not None:
+                owner.fileChanged._emit(path)
+
+        def on_dir(path):
+            owner = owner_ref()
+            if owner is not None:
+                owner.directoryChanged._emit(path)
+
+        watcher.fileChanged.connect(on_file)
+        watcher.directoryChanged.connect(on_dir)
+        self._watcher = watcher
+        return watcher
+
+    def files(self) -> list[str]:
+        if self._watcher is None or not _shiboken_valid(self._watcher):
+            return []
+        return list(self._watcher.files())
+
+    def directories(self) -> list[str]:
+        if self._watcher is None or not _shiboken_valid(self._watcher):
+            return []
+        return list(self._watcher.directories())
+
+    def addPath(self, path: str) -> bool:
+        if not path or self._closed:
+            return False
+        watcher = self._ensure()
+        return bool(watcher.addPath(path)) if watcher is not None else False
+
+    def addPaths(self, paths: list[str]) -> list[str]:
+        valid = [path for path in paths if path]
+        if not valid:
+            return []
+        if self._closed:
+            return list(paths)
+        watcher = self._ensure()
+        return list(watcher.addPaths(valid)) if watcher is not None else valid
+
+    def removePath(self, path: str) -> bool:
+        if self._watcher is None or not _shiboken_valid(self._watcher) or not path:
+            return False
+        return bool(self._watcher.removePath(path))
+
+    def removePaths(self, paths: list[str]) -> list[str]:
+        if self._watcher is None or not _shiboken_valid(self._watcher) or not paths:
+            return list(paths)
+        return list(self._watcher.removePaths(paths))
+
+    def close(self) -> None:
+        self._closed = True
+        watcher, self._watcher = self._watcher, None
+        if watcher is not None and _shiboken_valid(watcher):
+            watched = watcher.files() + watcher.directories()
+            if watched:
+                watcher.removePaths(watched)
+            watcher.setParent(None)
+            if shiboken6 is not None:
+                shiboken6.delete(watcher)
+            else:
+                watcher.deleteLater()
+
+
+def _weak_method(target, method_name: str):
+    ref = weakref.ref(target)
+
+    def _slot(*args, **kwargs):
+        obj = ref()
+        if obj is not None and not getattr(obj, "retired", False):
+            return getattr(obj, method_name)(*args, **kwargs)
+        return None
+
+    return _slot
+
+
+def _weak_call(target, fn):
+    ref = weakref.ref(target)
+
+    def _slot(*args, **kwargs):
+        obj = ref()
+        if obj is not None and not getattr(obj, "retired", False):
+            return fn(obj, *args, **kwargs)
+        return None
+
+    return _slot
+
+
+def _stop_qprocess(proc: QProcess | None) -> None:
+    if proc is None or not _shiboken_valid(proc):
+        return
+    if proc.state() != QProcess.ProcessState.NotRunning:
+        proc.terminate()
+        if not proc.waitForFinished(300) and proc.state() != QProcess.ProcessState.NotRunning:
+            proc.kill()
+            proc.waitForFinished(100)
+
+
+def _release_studio_resources(
+    external_connections: list[tuple[Any, Any]],
+    watchers: tuple[_ManagedFileWatcher, ...],
+    pools: tuple[concurrent.futures.ThreadPoolExecutor, ...],
+    system_preferences: QProcess | None,
+    python_jobs: Any = None,
+    preview_jobs: Any = None,
+) -> None:
+    if python_jobs is not None:
+        python_jobs.cancel_all(retire=True)
+    if preview_jobs is not None:
+        preview_jobs.cancel_all(retire=True)
+    for signal, slot in tuple(external_connections):
+        try:
+            signal.disconnect(slot)
+        except (RuntimeError, TypeError):
+            pass
+    external_connections.clear()
+    for watcher in watchers:
+        watcher.close()
+    for pool in pools:
+        pool.shutdown(wait=False, cancel_futures=True)
+    _stop_qprocess(system_preferences)
+
+
 class Session(QObject):
     """One ordered persistence stream for every native window in the application."""
     changed = Signal()
@@ -526,12 +694,16 @@ class Session(QObject):
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
         self.python_outputs = PythonOutputs(self.data/"derived-python")
-        self.reader_assets = ReaderAssetStore(self.reader_asset_is_current, self.reader_asset_payload)
+        self.reader_assets = ReaderAssetStore(
+            _weak_method(self, "reader_asset_is_current"),
+            _weak_method(self, "reader_asset_payload"),
+        )
         self.closed_note_store = ClosedNoteStore(self.data/"closed-notes")
         try:self.closed_tabs = self.closed_note_store.load_index_strict();self.closed_note_error=""
         except (OSError,ValueError,TypeError) as error:self.closed_tabs=[];self.closed_note_error=str(error)
         self.writes = LatestWriteExecutor(max_workers=1,thread_name_prefix="supermd-save")
-        self.writes.add_drain_finalizer(self._flush_retired_persistence_sync)
+        self.writes.add_drain_finalizer(_weak_method(self, "_flush_retired_persistence_sync"))
+        weakref.finalize(self, self.writes.shutdown, wait=False)
         self.settings = copy.deepcopy(DEFAULTS)
         self.recent = []
         self.pinned = []
@@ -960,21 +1132,11 @@ class Studio(QObject):
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
         self._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
-        self.workspaceSearchBatch.connect(self._on_workspace_search_batch)
+        self._external_connections: list[tuple[Any, Any]] = []
+        self.workspaceSearchBatch.connect(_weak_method(self, "_on_workspace_search_batch"))
         self.session = session or Session(isolated)
-        weak_self = weakref.ref(self)
-        def _on_session_changed():
-            inst = weak_self()
-            if inst is not None and not inst.retired:
-                inst._emit()
-        def _on_location_changed(old, new):
-            inst = weak_self()
-            if inst is not None and not inst.retired:
-                inst._location_changed(old, new)
-        self._session_changed_slot = _on_session_changed
-        self._location_changed_slot = _on_location_changed
-        self.session.changed.connect(self._session_changed_slot)
-        self.session.locationChanged.connect(self._location_changed_slot)
+        self._connect_external(self.session.changed, _weak_call(self, lambda studio, *_: studio._emit()))
+        self._connect_external(self.session.locationChanged, _weak_method(self, "_location_changed"))
         self.writes = self.session.writes
         self.window_id = uuid.uuid4().hex
         self.session.windows[self.window_id] = self
@@ -982,8 +1144,8 @@ class Studio(QObject):
         self._retired = False
         self._write_callback_lock = threading.Lock()
         self._pending_write_retirements: dict[str, Any] = {}
-        self.completed.connect(self._complete)
-        self.backgroundWriteCompleted.connect(self._complete_background_write)
+        self.completed.connect(_weak_method(self, "_complete"))
+        self.backgroundWriteCompleted.connect(_weak_method(self, "_complete_background_write"))
         self.data = self.session.data
         self.settings = self.session.settings
         self._defer_reader_activation = False
@@ -992,13 +1154,13 @@ class Studio(QObject):
         self._agent_cloud_config_path = self.data / "agent-cloud.json"
         self._cloud_started_local_bridge = False
         self._cloud_revocation_pending = False
-        self.cloudRevocationFinished.connect(self._finish_cloud_revocation)
+        self.cloudRevocationFinished.connect(_weak_method(self, "_finish_cloud_revocation"))
         self._agent_viewport_capture = None
         self._preview_jobs = offline_view.PreviewJobRegistry()
         agent_bridge = getattr(self.session, "agent_bridge", None)
         if agent_bridge is not None:
-            agent_bridge.enabledChanged.connect(lambda: self._emit(False))
-            agent_bridge.cloudStatusChanged.connect(self._cloud_status_changed)
+            self._connect_external(agent_bridge.enabledChanged, _weak_call(self, lambda studio, *_: studio._emit(False)))
+            self._connect_external(agent_bridge.cloudStatusChanged, _weak_method(self, "_cloud_status_changed"))
         self.update_status=""
         self.update_info=None
         self.update_path=""
@@ -1011,18 +1173,18 @@ class Studio(QObject):
         self.python_status=""
         self.python_choices=[]
         self.python_busy=False
-        self.pythonProgress.connect(self._python_progress)
+        self.pythonProgress.connect(_weak_method(self, "_python_progress"))
         if not self.settings.get("python"):
             self._choose_default_python(emit=False)
-        if not isolated and len(self.session.windows)==1:QTimer.singleShot(0,self._restore_update)
+        if not isolated and len(self.session.windows)==1:QTimer.singleShot(0, _weak_method(self, "_restore_update"))
         self.tabs: list[dict] = []
         self.closed_tabs = self.session.closed_tabs
         self._closing_tabs: set[str] = set()
         self._staging_tabs: set[str] = set()
         self._max_agent_stage_attempts = 3
-        self.note_watcher = QFileSystemWatcher(self)
-        self.note_watcher.fileChanged.connect(self._external_note_changed)
-        self.note_watcher.directoryChanged.connect(self._external_note_changed)
+        self.note_watcher = _ManagedFileWatcher(self)
+        self.note_watcher.fileChanged.connect(_weak_method(self, "_external_note_changed"))
+        self.note_watcher.directoryChanged.connect(_weak_method(self, "_external_note_changed"))
         self.external_paths = set()
         self.note_watch_paths = None
         self._watch_suspensions = self.session._watch_suspensions
@@ -1032,7 +1194,7 @@ class Studio(QObject):
         self.note_identities = {}
         self.external_timer = QTimer(self)
         self.external_timer.setSingleShot(True)
-        self.external_timer.timeout.connect(self._refresh_external_notes)
+        self.external_timer.timeout.connect(_weak_method(self, "_refresh_external_notes"))
         self.active = ""
         self.folder = ""
         self._files: list[dict] = []
@@ -1046,7 +1208,7 @@ class Studio(QObject):
         self._search_cancel: threading.Event | None = None
         self.filter_timer = QTimer(self)
         self.filter_timer.setSingleShot(True)
-        self.filter_timer.timeout.connect(self._start_subfolder_search)
+        self.filter_timer.timeout.connect(_weak_method(self, "_start_subfolder_search"))
         self._folder_search_open = False
         self._folder_search_query = ""
         self._folder_search_case_sensitive = False
@@ -1085,35 +1247,40 @@ class Studio(QObject):
         self._theme_pending = False
         self.theme_debounce = QTimer(self)
         self.theme_debounce.setSingleShot(True)
-        self.theme_debounce.timeout.connect(self._refresh_theme)
-        def _on_color_scheme_changed(*args):
-            inst = weak_self()
-            if inst is not None and not inst.retired:
-                inst._schedule_theme(*args)
-        self._color_scheme_slot = _on_color_scheme_changed
-        QGuiApplication.styleHints().colorSchemeChanged.connect(self._color_scheme_slot)
-        self.palette_watcher = QFileSystemWatcher(self)
-        self.palette_watcher.fileChanged.connect(self._palette_changed)
-        self.palette_watcher.directoryChanged.connect(self._palette_changed)
+        self.theme_debounce.timeout.connect(_weak_method(self, "_refresh_theme"))
+        self._connect_external(QGuiApplication.styleHints().colorSchemeChanged, _weak_method(self, "_schedule_theme"))
+        self.palette_watcher = _ManagedFileWatcher(self)
+        self.palette_watcher.fileChanged.connect(_weak_method(self, "_palette_changed"))
+        self.palette_watcher.directoryChanged.connect(_weak_method(self, "_palette_changed"))
         self._watch_palette()
-        self.custom_theme_watcher=QFileSystemWatcher(self)
+        self.custom_theme_watcher = _ManagedFileWatcher(self)
         self.custom_theme_timer=QTimer(self)
         self.custom_theme_timer.setSingleShot(True)
         self.custom_theme_timer.setInterval(250)
-        self.custom_theme_timer.timeout.connect(self._custom_theme_event)
+        self.custom_theme_timer.timeout.connect(_weak_method(self, "_custom_theme_event"))
         self.custom_theme_stamp=None
-        self.custom_theme_watcher.fileChanged.connect(lambda *_:self.custom_theme_timer.start())
-        self.custom_theme_watcher.directoryChanged.connect(lambda *_:self.custom_theme_timer.start())
-        QTimer.singleShot(0,self._restore_custom_theme)
+        self.custom_theme_watcher.fileChanged.connect(_weak_call(self, lambda studio, *_: studio.custom_theme_timer.start()))
+        self.custom_theme_watcher.directoryChanged.connect(_weak_call(self, lambda studio, *_: studio.custom_theme_timer.start()))
+        QTimer.singleShot(0, _weak_method(self, "_restore_custom_theme"))
         self.system_preferences = QProcess(self)
-        if sys.platform.startswith("linux") and shutil.which("gsettings"):
-            self.system_preferences.readyReadStandardOutput.connect(self._system_setting_changed)
+        if not isolated and sys.platform.startswith("linux") and shutil.which("gsettings"):
+            self.system_preferences.readyReadStandardOutput.connect(_weak_method(self, "_system_setting_changed"))
             self.system_preferences.start("gsettings",["monitor","org.gnome.desktop.interface"])
+        self._resource_finalizer = weakref.finalize(
+            self,
+            _release_studio_resources,
+            self._external_connections,
+            (self.note_watcher, self.palette_watcher, self.custom_theme_watcher),
+            (self._search_pool, self.pool),
+            self.system_preferences,
+            self._python_jobs,
+            self._preview_jobs,
+        )
         self.theme_timer = QTimer(self)
         # Live notifications handle ordinary changes; this is only a fallback for
         # environments without portal/Qt preference events. No four-second spawning.
         self.theme_timer.setInterval(60000)
-        self.theme_timer.timeout.connect(self._refresh_theme)
+        self.theme_timer.timeout.connect(_weak_method(self, "_refresh_theme"))
         self.theme_timer.start()
         self.pending_close = ""
         self.pending_export = ""
@@ -1123,17 +1290,17 @@ class Studio(QObject):
         self.flush_operation = None
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
-        self.flush_timer.timeout.connect(self._on_flush_timeout)
+        self.flush_timer.timeout.connect(_weak_method(self, "_on_flush_timeout"))
         self.recovery_timer = QTimer(self)
         self.recovery_timer.setSingleShot(True)
-        self.recovery_timer.timeout.connect(self._recover)
+        self.recovery_timer.timeout.connect(_weak_method(self, "_recover"))
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
-        self.autosave_timer.timeout.connect(self._autosave)
+        self.autosave_timer.timeout.connect(_weak_method(self, "_autosave"))
         self.preference_timer = QTimer(self)
         self.preference_timer.setSingleShot(True)
-        self.preference_timer.timeout.connect(self._preferences)
-        self.position_timer=QTimer(self);self.position_timer.setSingleShot(True);self.position_timer.timeout.connect(self._save_positions)
+        self.preference_timer.timeout.connect(_weak_method(self, "_preferences"))
+        self.position_timer=QTimer(self);self.position_timer.setSingleShot(True);self.position_timer.timeout.connect(_weak_method(self, "_save_positions"))
         self.saving = set()
         restore_enabled = self.settings.get("startup", "restore") == "restore"
         if not restore_enabled:
@@ -1215,7 +1382,7 @@ class Studio(QObject):
             self._startup_order = restore_paths
             self._restoring_paths = set(self._startup_order)
             restore_generation = self._activation_generation
-            QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
+            QTimer.singleShot(0, _weak_call(self, lambda studio: [studio._open_note(path, explicit=False, activation_generation=restore_generation) for path in studio._startup_order]))
         if restore_enabled and restore_folder:
             self._restore_workspace_folder(restore_folder, restore_expanded)
         self._emitted_sidebar_key = self._sidebar_slice_key()
@@ -1225,7 +1392,11 @@ class Studio(QObject):
         # Only the first real desktop window may restore the user's opted-in
         # cloud connection. The cloud client handles network retry/backoff.
         if not isolated and len(self.session.windows) == 1 and self.settings.get("cloudAgentEnabled"):
-            QTimer.singleShot(0, self._restore_cloud_connection)
+            QTimer.singleShot(0, _weak_method(self, "_restore_cloud_connection"))
+
+    def _connect_external(self, signal, slot) -> None:
+        signal.connect(slot)
+        self._external_connections.append((signal, slot))
 
     def _restore_cloud_connection(self):
         studio_agent_setup._restore_cloud_connection(self)
@@ -1800,6 +1971,7 @@ class Studio(QObject):
     def stop(self):
         if self.retired: return
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
+        self.filter_timer.stop()
         self._cancel_subfolder_search()
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
         self._search_pool.shutdown(wait=False, cancel_futures=True)
@@ -1828,30 +2000,8 @@ class Studio(QObject):
         self.autosave_timer.stop()
         self.flush_timer.stop()
         self.external_timer.stop()
-        self.filter_timer.stop()
-        for attr in ("note_watcher", "palette_watcher", "custom_theme_watcher"):
-            watcher = getattr(self, attr, None)
-            if watcher is None or watcher is _STOPPED_WATCHER:
-                continue
-            watched = watcher.files() + watcher.directories()
-            if watched:
-                watcher.removePaths(watched)
-            setattr(self, attr, _STOPPED_WATCHER)
-            if shiboken6 is not None and shiboken6.isValid(watcher):
-                watcher.setParent(None)
-                shiboken6.delete(watcher)
-            else:
-                watcher.deleteLater()
-        for signal, slot in (
-            (QGuiApplication.styleHints().colorSchemeChanged, getattr(self, "_color_scheme_slot", None)),
-            (self.session.changed, getattr(self, "_session_changed_slot", None)),
-            (self.session.locationChanged, getattr(self, "_location_changed_slot", None)),
-        ):
-            if slot is not None:
-                try:
-                    signal.disconnect(slot)
-                except (RuntimeError, TypeError):
-                    pass
+        for watcher in (self.note_watcher, self.palette_watcher, self.custom_theme_watcher):
+            watcher.close()
         self._recover()
         self.session.reader_assets.revoke_owner(self.window_id)
         self._retired = True
@@ -1875,9 +2025,7 @@ class Studio(QObject):
                 self.session.workspace.pop(self.window_id,None)
                 self.session.window_workspaces.pop(self.window_id,None)
             next(iter(self.session.windows.values()))._recover()
-        if self.system_preferences.state() != QProcess.ProcessState.NotRunning:
-            self.system_preferences.terminate()
-            self.system_preferences.waitForFinished(300)
+        self._resource_finalizer()
 
     def _folder_slice_key(self, files):
         return (
@@ -2692,14 +2840,17 @@ class Studio(QObject):
             self.busy += 1
             self._emit(False)
         future = target.submit(action)
+        studio_ref = weakref.ref(self)
         def completed(f):
-            if self.retired or f.cancelled():return
+            studio = studio_ref()
+            if studio is None or studio.retired or f.cancelled():return
             try:
                 value,error=f.result(),None
             except Exception as reason:
                 value,error=None,str(reason)
-            if self.retired or (done is _noop_done and not busy and error is None):return
-            try:self.completed.emit((done,value,error,busy))
+            studio = studio_ref()
+            if studio is None or studio.retired or not shiboken6.isValid(studio) or (done is _noop_done and not busy and error is None):return
+            try:studio.completed.emit((done,value,error,busy))
             except RuntimeError:pass  # The QObject may have been retired meanwhile.
         future.add_done_callback(completed)
 
@@ -2718,14 +2869,17 @@ class Studio(QObject):
     def _submit_write(self, action, done, *, on_retired=None):
         token = uuid.uuid4().hex
         invoked = False
+        studio_ref = weakref.ref(self)
+        write_lock = self._write_callback_lock
+        pending_retirements = self._pending_write_retirements
 
         def notify_retired():
             nonlocal invoked
-            with self._write_callback_lock:
+            with write_lock:
                 if invoked:
                     return
                 invoked = True
-                self._pending_write_retirements.pop(token, None)
+                pending_retirements.pop(token, None)
             if on_retired is not None:
                 on_retired()
 
@@ -2734,8 +2888,8 @@ class Studio(QObject):
             return False
 
         if on_retired is not None:
-            with self._write_callback_lock:
-                self._pending_write_retirements[token] = notify_retired
+            with write_lock:
+                pending_retirements[token] = notify_retired
 
         try:
             future = self.writes.submit(action)
@@ -2751,11 +2905,12 @@ class Studio(QObject):
                 value, error = f.result(), None
             except Exception as reason:
                 value, error = None, str(reason)
-            if self.retired:
+            studio = studio_ref()
+            if studio is None or studio.retired or not shiboken6.isValid(studio):
                 notify_retired()
                 return
             try:
-                self.backgroundWriteCompleted.emit((token, done, notify_retired, value, error))
+                studio.backgroundWriteCompleted.emit((token, done, notify_retired, value, error))
             except RuntimeError:
                 notify_retired()
 
@@ -2775,14 +2930,17 @@ class Studio(QObject):
     def _submit_exact_recovery_write(self, action, done, *, on_retired=None, on_enqueued=None):
         token = uuid.uuid4().hex
         invoked = False
+        studio_ref = weakref.ref(self)
+        write_lock = self._write_callback_lock
+        pending_retirements = self._pending_write_retirements
 
         def notify_retired():
             nonlocal invoked
-            with self._write_callback_lock:
+            with write_lock:
                 if invoked:
                     return
                 invoked = True
-                self._pending_write_retirements.pop(token, None)
+                pending_retirements.pop(token, None)
             if on_retired is not None:
                 on_retired()
 
@@ -2791,15 +2949,16 @@ class Studio(QObject):
             return False
 
         if on_retired is not None:
-            with self._write_callback_lock:
-                self._pending_write_retirements[token] = notify_retired
+            with write_lock:
+                pending_retirements[token] = notify_retired
 
         def exact_completed(status, rev, error):
-            if self.retired:
+            studio = studio_ref()
+            if studio is None or studio.retired or not shiboken6.isValid(studio):
                 notify_retired()
                 return
             try:
-                self.backgroundWriteCompleted.emit((token, done, notify_retired, (status, rev, error), None))
+                studio.backgroundWriteCompleted.emit((token, done, notify_retired, (status, rev, error), None))
             except RuntimeError:
                 notify_retired()
 
@@ -2814,16 +2973,18 @@ class Studio(QObject):
 
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
+        settings_path = self.data / "settings.json"
         persisted_settings = dict(self.settings)
         if getattr(getattr(self.session, "background", None), "_cli_started_agent_access", False):
             persisted_settings["agentAccessEnabled"] = False
         data = json.dumps({"settings": persisted_settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
-        self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
+        self._submit(lambda: atomic_write(settings_path, data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 
     def _save_positions(self):
+        positions_path = self.data / "reading-positions.json"
         data=json.dumps(self.session.locations).encode()
-        self._submit(lambda:atomic_write(self.data/"reading-positions.json",data),_noop_done,False,self.writes)
+        self._submit(lambda:atomic_write(positions_path,data),_noop_done,False,self.writes)
 
     def _build_startup_snapshot_locked(self):
         # Clean tabs need only paths, never another copy of their image bytes.
@@ -2864,7 +3025,13 @@ class Studio(QObject):
     def _submit_startup_snapshot(self):
         with self.session._rename_state_lock:
             workspace = self._build_startup_snapshot_locked()
-        self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
+        startup_path = self.data / "startup.json"
+        studio_ref = weakref.ref(self)
+        self.session.writes.submit_latest(
+            "startup",
+            lambda: atomic_json(startup_path, workspace),
+            lambda error: (studio := studio_ref()) is not None and studio._notify_recovery_write("startup", error),
+        )
 
     def _window_recovery_drafts(self, tabs=None):
         source_tabs = self.tabs if tabs is None else tabs
@@ -2896,11 +3063,24 @@ class Studio(QObject):
             window_drafts = self._window_recovery_drafts()
             self.session.drafts[self.window_id] = window_drafts
             drafts = self._combined_recovery_drafts(window_drafts)
-        self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
-        self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
+        startup_path = self.data / "startup.json"
+        recovery_path = self.data / "recovery.json"
+        studio_ref = weakref.ref(self)
+        self.session.writes.submit_latest(
+            "startup",
+            lambda: atomic_json(startup_path, workspace),
+            lambda error: (studio := studio_ref()) is not None and studio._notify_recovery_write("startup", error),
+        )
+        self.session.writes.submit_latest(
+            "recovery",
+            lambda: atomic_json(recovery_path, drafts),
+            lambda error: (studio := studio_ref()) is not None and studio._notify_recovery_write("recovery", error),
+        )
 
     def _notify_recovery_write(self,category,error):
-        try:self.completed.emit((self._recovery_write_completed,(category,error),None,False))
+        if self.retired or not shiboken6.isValid(self):
+            return
+        try:self.completed.emit((_weak_method(self, "_recovery_write_completed"),(category,error),None,False))
         except RuntimeError:pass
 
     def _recovery_write_completed(self,result,_error):

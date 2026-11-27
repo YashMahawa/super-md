@@ -1,5 +1,5 @@
-import {describe,it,expect} from 'vitest';
-import {analyzeDocument} from './documentAnalysis';
+import {describe,it,expect,vi} from 'vitest';
+import {analyzeDocument,hydrateDocumentAnalysis,toCompactAnalysis} from './documentAnalysis';
 import {hasCallouts,maskCode,normalizeCallouts,normalizeMarkdownSource} from './markdownSource';
 
 describe('shared source analysis',()=>{
@@ -186,6 +186,41 @@ describe('shared source analysis',()=>{
     expect(hasCallouts('```markdown\n:::callout note Fenced\n:::\n```')).toBe(false);
     expect(hasCallouts('> ```markdown\n> :::callout note QuotedFenced\n> :::\n> ```')).toBe(false);
     expect(hasCallouts('---\ntitle: x\n---\n```md\n:::callout note Fenced\n:::\n```\n:::callout tip Real\nOk\n:::')).toBe(true);
+  });
+  it('hydrates compact worker analysis lazily without eager block text duplication',()=>{
+    const source='---\ntitle: Study\ntags:\n  - math\n---\n# Heading\n\n- [ ] Task item\n\n```python\nprint(42)\n```\n\nParagraph text.\n';
+    const full=analyzeDocument(source);
+    const compact=toCompactAnalysis(full);
+    for(const range of compact.blockRanges){
+      expect('text' in range).toBe(false);
+    }
+    for(const range of compact.bodyBlockRanges){
+      expect('text' in range).toBe(false);
+    }
+    const sliceSpy=vi.spyOn(String.prototype,'slice');
+    sliceSpy.mockClear();
+    const hydrated=hydrateDocumentAnalysis(source,compact);
+    const callsOnHydrate=sliceSpy.mock.calls.length;
+    const firstRead=hydrated.analysis.blocks[0].text;
+    const callsAfterFirstRead=sliceSpy.mock.calls.length;
+    const secondRead=hydrated.analysis.blocks[0].text;
+    const callsAfterSecondRead=sliceSpy.mock.calls.length;
+    sliceSpy.mockRestore();
+
+    expect(callsOnHydrate).toBe(0);
+    expect(callsAfterFirstRead).toBe(1);
+    expect(callsAfterSecondRead).toBe(1);
+    expect(firstRead).toBe(full.blocks[0].text);
+    expect(secondRead).toBe(full.blocks[0].text);
+    expect(hydrated.source).toBe(source);
+    expect(hydrated.analysis.frontmatter).toEqual(full.frontmatter);
+    expect(hydrated.analysis.outline).toEqual(full.outline);
+    expect(hydrated.analysis.tasks).toEqual(full.tasks);
+    expect(hydrated.analysis.pythonCells).toEqual(full.pythonCells);
+    expect(hydrated.analysis.tree).toEqual(full.tree);
+    expect(hydrated.analysis.blocks).toHaveLength(full.blocks.length);
+    expect(hydrated.analysis.blocks.map(block=>block.text).join('')).toBe(source);
+    expect(hydrated.analysis.bodyBlocks.map(block=>block.text)).toEqual(full.bodyBlocks.map(block=>block.text));
   });
   it('normalizes spaced, aliased, portable, and section wikilinks while preserving sparse UTF-16 source offsets',()=>{
     expect(normalizeCallouts('[[Task Note]]')).toBe('[Task Note](Task%20Note.md)');
@@ -428,5 +463,33 @@ describe('shared source analysis',()=>{
     expect(normalized.value).not.toContain('strip_ledger_0');
     expect(normalized.value).not.toContain('strip_ledger_2399');
     expect(normalized.originalOffset(normalized.value.indexOf('# Tail Heading'))).toBe(largeDoc.indexOf('# Tail Heading'));
+  });
+  it('preserves exact AST, position, and GFM semantics across the >4 KB plain-paragraph fast path',()=>{
+    const smallMulti='Second draft\n'+'P'.repeat(120);
+    const largeMulti='Second draft\n'+'P'.repeat(6000);
+    const smallAnalysis=analyzeDocument(smallMulti);
+    const largeAnalysis=analyzeDocument(largeMulti);
+    expect(largeAnalysis.tree.type).toBe('root');
+    expect(largeAnalysis.tree.children).toHaveLength(1);
+    expect(largeAnalysis.tree.position).toEqual({
+      start:{line:1,column:1,offset:0},
+      end:{line:2,column:6001,offset:largeMulti.length},
+    });
+    expect((largeAnalysis.tree.children[0] as any).type).toBe(smallAnalysis.tree.children[0]?.type);
+    expect(largeAnalysis.blocks.map(b=>({start:b.start,end:b.end,text:b.text}))).toEqual([
+      {start:0,end:largeMulti.length,text:largeMulti},
+    ]);
+    expect(largeAnalysis.bodyBlocks.map(b=>({start:b.start,end:b.end,text:b.text}))).toEqual([
+      {start:0,end:largeMulti.length,text:largeMulti},
+    ]);
+
+    // Ensure HTML entities, www. autolinks, and leading continuation spaces still use remark parsing
+    const withEntity='Plain prefix '+'a'.repeat(5000)+' &amp; tail';
+    const entityNode=(analyzeDocument(withEntity).tree.children[0] as any).children[0];
+    expect(entityNode.value).toContain(' & tail');
+
+    const withWww='Visit www.example.com '+'a'.repeat(5000);
+    const wwwChildren=(analyzeDocument(withWww).tree.children[0] as any).children;
+    expect(wwwChildren.some((c:any)=>c.type==='link')).toBe(true);
   });
 });

@@ -1980,3 +1980,58 @@ class StudioTest(unittest.TestCase):
         self.assertFalse(studio._is_dirty(smd_tab))
         self.assertEqual(open_note(copy_smd), ("portable draft ![pic](assets/a.svg)", {"assets/a.svg": svg_a}, True))
         self.assertEqual(open_note(orig_smd), ("external smd", {}, True))
+
+    def test_stopped_and_unreferenced_studios_release_watchers_and_collect_cleanly(self):
+        import gc
+        import weakref
+
+        def inotify_fd_count():
+            if not Path("/proc/self/fd").is_dir():
+                return 0
+            count = 0
+            for entry in os.listdir("/proc/self/fd"):
+                try:
+                    if "inotify" in os.readlink(f"/proc/self/fd/{entry}"):
+                        count += 1
+                except OSError:
+                    pass
+            return count
+
+        gc.collect()
+        baseline_fds = inotify_fd_count()
+
+        watched_note = self.studio.data / "watched-lifecycle.md"
+        watched_note.write_text("# Watched\n", encoding="utf-8")
+
+        transient = Studio(True)
+        transient.openNote(str(watched_note))
+        deadline = time.monotonic() + 3
+        while transient.busy and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.assertTrue(transient.note_watcher.files() or transient.note_watcher.directories())
+        if Path("/proc/self/fd").is_dir():
+            self.assertGreater(inotify_fd_count(), baseline_fds)
+
+        transient_ref = weakref.ref(transient)
+        transient.stop()
+        self.assertEqual(transient.note_watcher.files(), [])
+        self.assertEqual(transient.note_watcher.directories(), [])
+        if Path("/proc/self/fd").is_dir():
+            self.assertEqual(inotify_fd_count(), baseline_fds)
+        del transient
+        gc.collect()
+        self.assertIsNone(transient_ref())
+
+        unstopped = Studio(True)
+        unstopped.openNote(str(watched_note))
+        deadline = time.monotonic() + 3
+        while unstopped.busy and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        unstopped_ref = weakref.ref(unstopped)
+        del unstopped
+        gc.collect()
+        self.assertIsNone(unstopped_ref())
+        if Path("/proc/self/fd").is_dir():
+            self.assertEqual(inotify_fd_count(), baseline_fds)

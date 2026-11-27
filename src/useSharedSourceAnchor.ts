@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useRef, type RefObject } from "react";
 import type { PortableEditorSession } from "./components/Editor";
 import { cancelHeadingNavigation, navigateToHeading, resolveHeadingOffset } from "./documentNavigation";
 import { invoke } from "./nativeBridge";
@@ -58,21 +58,47 @@ export function handoffSharedSourceAnchorOnLoad(options: {
   next: SharedAnchorReaderState;
   zoom: number;
   hasActiveSeedNavigation?: boolean;
-  refs: Pick<SharedSourceAnchorRefs, "consumedHeadingToken" | "suppressedRestoreToken" | "savePosition" | "modeAnchor" | "splitPane">;
+  wholesaleReplacement?: boolean;
+  incomingReadingLocation?: ReadingLocation | null;
+  refs: Pick<SharedSourceAnchorRefs, "consumedHeadingToken" | "suppressedRestoreToken" | "savePosition" | "modeAnchor" | "splitPane"> & {
+    noteViews?: RefObject<Map<string, NoteView>>;
+    consumedEditorHeadingToken?: RefObject<string | null>;
+    pendingOutlineHeading?: RefObject<{ noteId: string; mode: AnchorViewMode; headingId: string; input: number } | null>;
+  };
   onHistoryBoundary?: () => void;
 }): { hasNewPendingHeading: boolean; unconsumedOldHeadingOffset: number | null } {
-  const { old, next, zoom, hasActiveSeedNavigation = false, refs: { consumedHeadingToken, suppressedRestoreToken, savePosition, modeAnchor, splitPane }, onHistoryBoundary } = options;
-  if (old?.id === next.id) next.readingLocation = old.readingLocation;
+  const {
+    old,
+    next,
+    zoom,
+    hasActiveSeedNavigation = false,
+    wholesaleReplacement = false,
+    incomingReadingLocation,
+    refs: {
+      consumedHeadingToken,
+      suppressedRestoreToken,
+      savePosition,
+      modeAnchor,
+      splitPane,
+      noteViews,
+      consumedEditorHeadingToken,
+      pendingOutlineHeading,
+    },
+    onHistoryBoundary,
+  } = options;
+  if (old?.id === next.id) next.readingLocation = wholesaleReplacement ? incomingReadingLocation : old.readingLocation;
   if (hasActiveSeedNavigation && !next.pendingHeading && old?.id === next.id && old.pendingHeading?.token) {
     suppressedRestoreToken.current = old.pendingHeading.token;
     consumedHeadingToken.current = old.pendingHeading.token;
+    if (consumedEditorHeadingToken) consumedEditorHeadingToken.current = old.pendingHeading.token;
     document.querySelectorAll(".android-reading").forEach(cancelHeadingNavigation);
   }
-  if (old?.id === next.id && !next.pendingHeading && old.pendingHeading && !hasActiveSeedNavigation) next.pendingHeading = old.pendingHeading;
+  if (old?.id === next.id && !next.pendingHeading && old.pendingHeading && !wholesaleReplacement && !hasActiveSeedNavigation) next.pendingHeading = old.pendingHeading;
   const hasNewPendingHeading = Boolean(next.pendingHeading?.token && next.pendingHeading.token !== old?.pendingHeading?.token);
   let unconsumedOldHeadingOffset: number | null = null;
-  if (old && (old.id !== next.id || (old.mode !== next.mode && !hasActiveSeedNavigation)) && !hasNewPendingHeading && old.pendingHeading?.token && old.pendingHeading.token !== consumedHeadingToken.current) {
+  if (!wholesaleReplacement && old && (old.id !== next.id || (old.mode !== next.mode && !hasActiveSeedNavigation)) && !hasNewPendingHeading && old.pendingHeading?.token && old.pendingHeading.token !== consumedHeadingToken.current) {
     consumedHeadingToken.current = old.pendingHeading.token;
+    if (consumedEditorHeadingToken) consumedEditorHeadingToken.current = old.pendingHeading.token;
     unconsumedOldHeadingOffset = resolveHeadingOffset(old.content, old.pendingHeading.heading);
     if (old.mode !== "editor") {
       const oldHost = document.querySelector<HTMLElement>(".android-reading");
@@ -82,17 +108,19 @@ export function handoffSharedSourceAnchorOnLoad(options: {
       revealEditorOffset(old.id, unconsumedOldHeadingOffset, { caretOffset: unconsumedOldHeadingOffset });
     }
   }
-  if (old && (old.id !== next.id || old.mode !== next.mode || old.fullscreen !== next.fullscreen)) {
+  if (old && (old.id !== next.id || wholesaleReplacement || old.mode !== next.mode || old.fullscreen !== next.fullscreen)) {
+    if (pendingOutlineHeading) pendingOutlineHeading.current = null;
     document.querySelectorAll(".android-reading").forEach(cancelHeadingNavigation);
   }
-  if (old && (old.id !== next.id || old.mode !== next.mode)) onHistoryBoundary?.();
+  if (old && (old.id !== next.id || wholesaleReplacement || old.mode !== next.mode)) onHistoryBoundary?.();
   if (old && old.id === next.id && old.mode !== next.mode) {
-    if (hasNewPendingHeading) {
+    if (wholesaleReplacement || hasNewPendingHeading) {
       modeAnchor.current = null; splitPane.current = null; primeEditorAnchor(next.id, null);
     } else {
       savePosition.current();
       const readingRoot = document.querySelector<HTMLElement>(".android-reading");
-      const captured = captureSharedAnchor({ id: old.id, mode: old.mode, zoom, readingRoot, preferredSplitPane: splitPane.current });
+      const captured = (!readingRoot && (old.mode === "reader" || old.mode === "live") && (modeAnchor.current ?? noteViews?.current.get(old.id)?.anchor))
+        || captureSharedAnchor({ id: old.id, mode: old.mode, zoom, readingRoot, preferredSplitPane: splitPane.current });
       if (unconsumedOldHeadingOffset !== null && unconsumedOldHeadingOffset > 0 && captured.offset === 0) captured.offset = unconsumedOldHeadingOffset;
       modeAnchor.current = captured;
       splitPane.current = null;
@@ -147,6 +175,7 @@ export interface SettleSharedSourceAnchorOptions {
   readingSelector: string;
   getReadingRoot: () => HTMLElement | null;
   shouldStop: () => boolean;
+  activeApplyRef?: RefObject<(() => void) | null>;
   onExternalScroll?: (target: HTMLElement) => void;
   runApplyPass?: (execute: () => AnchorScrollSnapshot | null) => void;
   onSecondFrameSettled?: () => void;
@@ -159,7 +188,7 @@ export interface SettleSharedSourceAnchorOptions {
 // when the person scrolls, types or opens search/live edit.
 export function settleSharedSourceAnchor({
   id, targetMode, getTargetZoom, anchor, allowExactTop, readingSelector, getReadingRoot,
-  shouldStop, onExternalScroll, runApplyPass, onSecondFrameSettled, onCleanup, delays = ANCHOR_SETTLE_DELAYS,
+  shouldStop, activeApplyRef, onExternalScroll, runApplyPass, onSecondFrameSettled, onCleanup, delays = ANCHOR_SETTLE_DELAYS,
 }: SettleSharedSourceAnchorOptions): () => void {
   let stopped = false, applying = false;
   const stop = () => { stopped = true; };
@@ -197,6 +226,7 @@ export function settleSharedSourceAnchor({
       else execute();
     } finally { applying = false; }
   };
+  if (activeApplyRef) activeApplyRef.current = apply;
   apply();
   let innerFrame = 0;
   const outerFrame = requestAnimationFrame(() => {
@@ -207,8 +237,14 @@ export function settleSharedSourceAnchor({
     });
   });
   const timers = delays.map(delay => window.setTimeout(apply, delay));
+  const maxDelay = delays.length ? Math.max(...delays) : 0;
+  const clearActive = activeApplyRef
+    ? window.setTimeout(() => { if (activeApplyRef.current === apply) activeApplyRef.current = null; }, maxDelay + 60)
+    : 0;
   return () => {
     stopped = true;
+    if (activeApplyRef && activeApplyRef.current === apply) activeApplyRef.current = null;
+    if (clearActive) window.clearTimeout(clearActive);
     onCleanup?.();
     cancelAnimationFrame(outerFrame); cancelAnimationFrame(innerFrame); timers.forEach(window.clearTimeout);
     ANCHOR_SETTLE_INPUTS.forEach(name => window.removeEventListener(name, stop, { capture: true }));
@@ -221,13 +257,35 @@ export interface UseSharedSourceAnchorOptions {
   reference: RefObject<SharedAnchorReaderState | null>;
   zoomReference: RefObject<number>;
   refs: SharedSourceAnchorRefs;
+  analysisKey?: string | null;
+  previewReady?: boolean;
+  exactReady?: boolean;
+  activeScrollRestore?: RefObject<(() => void) | null>;
+  consumedEditorHeadingToken?: RefObject<string | null>;
+  pendingOutlineHeading?: RefObject<{ noteId: string; mode: AnchorViewMode; headingId: string; input: number } | null>;
 }
 
-export function useSharedSourceAnchor({ state, reference, zoomReference, refs }: UseSharedSourceAnchorOptions): void {
+export function useSharedSourceAnchor({
+  state,
+  reference,
+  zoomReference,
+  refs,
+  analysisKey,
+  previewReady = true,
+  exactReady = true,
+  activeScrollRestore,
+  consumedEditorHeadingToken,
+  pendingOutlineHeading,
+}: UseSharedSourceAnchorOptions): void {
   const {
     noteViews, savePosition, modeAnchor, splitPane, restoringSplit, restoringSplitSeq,
     splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed,
   } = refs;
+  const internalActiveRestore = useRef<(() => void) | null>(null);
+  const internalConsumedEditorToken = useRef<string | null>(null);
+  const effectiveActiveRestore = activeScrollRestore ?? internalActiveRestore;
+  const effectiveConsumedEditorToken = consumedEditorHeadingToken ?? internalConsumedEditorToken;
+  const effectiveAnalysisKey = analysisKey !== undefined ? analysisKey : (state?.id ?? null);
 
   useEffect(() => {
     const trackInput = (event: Event) => {
@@ -259,7 +317,6 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
   useLayoutEffect(() => {
     if (!state) return;
     if (state.pendingHeading?.token && state.pendingHeading.token !== suppressedRestoreToken.current) {
-      suppressedRestoreToken.current = state.pendingHeading.token;
       suppressedRestoreKey.current = `${state.id}:${state.mode}`;
       noteViews.current.delete(state.id);
       modeAnchor.current = null;
@@ -270,12 +327,30 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
           primeEditorAnchor(state.id, { offset: headingOffset, caretOffset: headingOffset });
         } else primeEditorAnchor(state.id, null);
       } else primeEditorAnchor(state.id, null);
+      if (!previewReady) return;
+      suppressedRestoreToken.current = state.pendingHeading.token;
       markScrollInput();
       const host = state.mode !== "editor" ? document.querySelector<HTMLElement>(".android-reading") : null;
-      if (host && !host.querySelector('[data-windowed-mounted="false"]')) {
+      if (host && exactReady && !host.querySelector('[data-windowed-mounted="false"]')) {
         navigateToHeading(host, state.pendingHeading.heading);
         layoutNavigatedHeadingToken.current = state.pendingHeading.token;
       }
+      return;
+    }
+    if (state.mode !== "editor" && !previewReady) {
+      if (state.mode === "split") {
+        const candidate = modeAnchor.current ?? noteViews.current.get(state.id)?.anchor;
+        if (candidate) {
+          const allowExactTop = modeAnchor.current === null;
+          const sameGeometry = allowExactTop && candidate.mode === state.mode && Math.abs(candidate.zoom - zoomReference.current) < 1;
+          if (sameGeometry && candidate.editorTop !== undefined) primeEditorAnchor(state.id, { offset: candidate.offset, top: candidate.editorTop });
+          else primeEditorAnchor(state.id, { offset: candidate.offset, caretOffset: candidate.caretOffset });
+        } else primeEditorAnchor(state.id, null);
+      }
+      return;
+    }
+    if (pendingOutlineHeading?.current?.noteId === state.id && pendingOutlineHeading.current.mode === state.mode) {
+      modeAnchor.current = null;
       return;
     }
     const startingInput = scrollInputVersion(), initialContent = state.content;
@@ -319,6 +394,7 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
         readingSelector: ".android-reading",
         getReadingRoot: () => document.querySelector<HTMLElement>(".android-reading"),
         shouldStop,
+        activeApplyRef: effectiveActiveRestore,
         onExternalScroll: (target) => {
           if (reference.current?.mode === "split") {
             restoringSplit.current = false;
@@ -361,39 +437,61 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
       else primeEditorAnchor(state.id, { offset: resolvedAnchor.offset, caretOffset: resolvedAnchor.caretOffset });
     } else primeEditorAnchor(state.id, null);
     return settleAnchor(resolvedAnchor, true);
-  }, [state?.id, state?.mode, state?.pendingHeading?.token]);
+  }, [effectiveAnalysisKey, state?.mode, previewReady, state?.pendingHeading?.token]);
+
+  useLayoutEffect(() => {
+    if (exactReady) effectiveActiveRestore.current?.();
+  }, [exactReady]);
 
   useEffect(() => {
-    if (!state?.pendingHeading?.token || state.pendingHeading.token === consumedHeadingToken.current) return;
-    consumedHeadingToken.current = state.pendingHeading.token;
-    const startingInput = scrollInputVersion(), targetHeading = state.pendingHeading.heading;
-    const offset = state.mode === "editor" || state.mode === "split" ? resolveHeadingOffset(state.content, targetHeading) : null;
+    const token = state?.pendingHeading?.token;
+    if (!state || !token) return;
+    const targetHeading = state.pendingHeading!.heading;
+    const needsEditorJump = (state.mode === "editor" || state.mode === "split")
+      && token !== consumedHeadingToken.current
+      && token !== effectiveConsumedEditorToken.current;
+    const needsReadingJump = state.mode !== "editor" && previewReady && token !== consumedHeadingToken.current;
+    if (state.mode === "editor" && token !== consumedHeadingToken.current) {
+      consumedHeadingToken.current = token;
+    }
+    if (!needsEditorJump && !needsReadingJump) return;
+    if (needsEditorJump) effectiveConsumedEditorToken.current = token;
+    if (needsReadingJump && exactReady) consumedHeadingToken.current = token;
+    const startingInput = scrollInputVersion();
+    const offset = needsEditorJump ? resolveHeadingOffset(state.content, targetHeading) : null;
     let stopped = false;
     const stop = () => { stopped = true; };
-    ANCHOR_SETTLE_INPUTS.forEach(name => window.addEventListener(name, stop, { capture: true, passive: true }));
+    if (needsEditorJump) {
+      ANCHOR_SETTLE_INPUTS.forEach(name => window.addEventListener(name, stop, { capture: true, passive: true }));
+    }
     const applyEditorJump = (focusEditor: boolean) => {
       if (stopped || scrollInputVersion() !== startingInput || offset === null) return;
       if (state.mode === "split") { splitPane.current = "preview"; revealEditorOffset(state.id, offset, { caretOffset: offset }); }
       else revealEditorOffset(state.id, offset, { caretOffset: offset, focus: focusEditor });
     };
     let innerFrame = 0, outerFrame = 0;
-    if (state.mode === "editor" || state.mode === "split") {
+    if (needsEditorJump) {
       applyEditorJump(state.mode === "editor");
       outerFrame = requestAnimationFrame(() => { applyEditorJump(false); innerFrame = requestAnimationFrame(() => applyEditorJump(false)); });
     }
-    const host = state.mode !== "editor" ? document.querySelector<HTMLElement>(".android-reading") : null;
-    if (host && layoutNavigatedHeadingToken.current !== state.pendingHeading.token) navigateToHeading(host, targetHeading);
-    const timers = (state.mode === "editor" || state.mode === "split") ? [120, 320].map(delay => window.setTimeout(() => applyEditorJump(false), delay)) : [];
-    const cleanupTimer = window.setTimeout(() => ANCHOR_SETTLE_INPUTS.forEach(name => window.removeEventListener(name, stop, { capture: true })), 400);
+    if (needsReadingJump) {
+      const host = document.querySelector<HTMLElement>(".android-reading");
+      if (host && layoutNavigatedHeadingToken.current !== token) navigateToHeading(host, targetHeading);
+    }
+    const timers = needsEditorJump ? [120, 320].map(delay => window.setTimeout(() => applyEditorJump(false), delay)) : [];
+    const cleanupTimer = needsEditorJump
+      ? window.setTimeout(() => ANCHOR_SETTLE_INPUTS.forEach(name => window.removeEventListener(name, stop, { capture: true })), 400)
+      : 0;
     return () => {
       stopped = true; cancelAnimationFrame(outerFrame); cancelAnimationFrame(innerFrame);
-      timers.forEach(window.clearTimeout); window.clearTimeout(cleanupTimer);
-      ANCHOR_SETTLE_INPUTS.forEach(name => window.removeEventListener(name, stop, { capture: true }));
+      timers.forEach(window.clearTimeout);
+      if (cleanupTimer) window.clearTimeout(cleanupTimer);
+      if (needsEditorJump) ANCHOR_SETTLE_INPUTS.forEach(name => window.removeEventListener(name, stop, { capture: true }));
     };
-  }, [state?.id, state?.mode, state?.pendingHeading?.token]);
+  }, [state?.id, state?.mode, state?.pendingHeading?.token, previewReady, exactReady]);
 
   useEffect(() => {
-    if (!state || state.restorePosition === false) return;
+    if (!state || (state.mode !== "editor" && !previewReady) || state.restorePosition === false) return;
     const path = state.path === state.id ? null : state.path; if (!path) return;
     const roots = Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller"));
     if (!roots.length) return;
@@ -417,5 +515,5 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
       window.removeEventListener("pagehide", save); document.removeEventListener("visibilitychange", save);
       savePosition.current = () => {};
     };
-  }, [state?.id, state?.mode, state?.path, state?.restorePosition]);
+  }, [state?.id, state?.mode, state?.path, state?.restorePosition, previewReady]);
 }

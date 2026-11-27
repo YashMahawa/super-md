@@ -45,7 +45,10 @@ const MarkdownParagraph:Components['p']=({node,children,...props})=>{
   return <p {...props} className={[props.className,standalone?'media-paragraph':''].filter(Boolean).join(' ')||undefined}>{children}</p>;
 };
 function remarkTaskPositions() {
-  return (tree:unknown)=>{let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});};
+  return (tree:unknown,file?:{value?:unknown})=>{
+    if(typeof file?.value==='string'&&!/\[[ xX]\]/.test(file.value))return;
+    let index=0;visit(tree as never,'listItem',(node:any)=>{if(typeof node.checked==='boolean')node.data={...node.data,hProperties:{...node.data?.hProperties,'data-task-index':index++}};});
+  };
 }
 function remarkSourcePositions(){return (tree:unknown)=>visit(tree as never,(node:any)=>{
   if(!node.position||!node.children)return;
@@ -60,7 +63,9 @@ function textOf(value: ReactNode): string {
 }
 
 export function remarkCallouts() {
-  return (tree: unknown) => visit(tree as never, "blockquote", (node: any) => {
+  return (tree: unknown, file?: { value?: unknown }) => {
+    if (typeof file?.value === "string" && !file.value.includes("[!") && !/:::callout\s/i.test(file.value)) return;
+    return visit(tree as never, "blockquote", (node: any) => {
     const paragraph = node.children?.[0];
     const first = paragraph?.children?.[0];
     if (first?.type !== "text") return;
@@ -99,7 +104,8 @@ export function remarkCallouts() {
       children: title
     });
     node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:fold === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type, ...(fold ? {"data-callout-fold": fold} : {}), ...(!hasCustomTitle ? {"data-callout-default-title": "true"} : {}) } };
-  });
+    });
+  };
 }
 
 export const DIAGRAM_PLAIN_TEXT_LANGUAGES = ["svg", "mermaid", "smd-tree", "smd-diagram", "smd-steps", "smd-chart"] as const;
@@ -226,6 +232,7 @@ interface Props extends ReaderAccessibilityPreference {
   onApproveImageUrl?: (noteId: string | undefined, url: string) => void;
   onRemoteImageLoaded?: (noteId: string | undefined, url: string, data: string) => void;
   onChange?: (markdown:string)=>void;
+  onToggleTask?: (baseSource:string,offset:number,checked:boolean)=>boolean;
   onNotice?: (message: string) => void;
   renderBlock?:MarkdownBlockRenderer;
   sourceAnalysis?:SourceDocumentAnalysis;
@@ -235,6 +242,7 @@ interface MarkdownPreviewLiveState {
   markdown: string;
   tasks: number[];
   onChange?: (markdown: string) => void;
+  onToggleTask?: (baseSource: string, offset: number, checked: boolean) => boolean;
   pythonCells: PythonCellSource[];
   resolvedNotePath: string | null;
   savedDocumentPath?: string | null;
@@ -265,6 +273,7 @@ const DEFAULT_LIVE_STATE: RefObject<MarkdownPreviewLiveState> = {
     markdown: "",
     tasks: EMPTY_TASKS,
     onChange: undefined,
+    onToggleTask: undefined,
     pythonCells: EMPTY_PYTHON_CELLS,
     resolvedNotePath: null,
     savedDocumentPath: undefined,
@@ -320,10 +329,15 @@ const MarkdownListItem: Components['li'] = ({ node, children, ...props }) => {
           return;
         }
         event.stopPropagation();
-        const { tasks, onChange, markdown } = liveStateRef.current;
+        const { tasks, onChange, onToggleTask, markdown } = liveStateRef.current;
         const offset = tasks[Number(rawTaskIndex)];
-        if (offset === undefined || !onChange) return;
-        onChange(markdown.slice(0, offset) + (target.checked ? 'x' : ' ') + markdown.slice(offset + 1));
+        if (offset === undefined || (!onChange && !onToggleTask)) return;
+        const checked = target.checked;
+        if (onToggleTask) {
+          if (!onToggleTask(markdown, offset, checked)) target.checked = !checked;
+          return;
+        }
+        onChange?.(markdown.slice(0, offset) + (checked ? 'x' : ' ') + markdown.slice(offset + 1));
       } : undefined}
     >
       {children}
@@ -440,7 +454,7 @@ const MARKDOWN_COMPONENTS: Components = {
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, onChange, onNotice, renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, onChange, onToggleTask, onNotice, renderBlock, fullDocumentAccessibility = false, sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
   const [linkNotice, setLinkNotice] = useState("");
   const resolvedNotePath = savedDocumentPath === undefined ? documentPath : savedDocumentPath;
@@ -452,10 +466,10 @@ function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, py
   }, [onNotice]);
   const clearLinkNotice = useCallback(() => { setLinkNotice(""); }, []);
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
-  const editable=Boolean(onChange);
+  const editable=Boolean(onChange||onToggleTask);
   const tasks=editable?analysis.tasks:EMPTY_TASKS;
-  const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice});
-  liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice};
+  const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,onToggleTask,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice});
+  liveStateRef.current={markdown,tasks,onChange,onToggleTask,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice};
   const previewContext=useMemo<MarkdownPreviewContextValue>(
     ()=>({noteId,documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable,liveStateRef}),
     [noteId,documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable],

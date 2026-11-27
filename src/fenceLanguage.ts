@@ -30,7 +30,8 @@ export function normalizeFenceInfoLanguage(rawInfo: string): string {
 }
 
 export function remarkBracedFences() {
-  return (tree: any) => {
+  return (tree: any, file?: { value?: unknown }) => {
+    if (typeof file?.value === "string" && !file.value.includes("{")) return tree;
     visit(tree, "code", (node: any) => {
       const normalized = parseBracedFenceLanguage(node.lang, node.meta);
       if (normalized) {

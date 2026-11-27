@@ -48,22 +48,38 @@ internal class ReaderBridge(
     }
 
     /** Waits for the live reader to flush its acknowledged edit queue for this exact note. */
-    suspend fun requestFlush(noteId: String, timeoutMillis: Long = 12_000): Boolean =
-        requestFlushStatus(noteId, timeoutMillis) == ReaderFlushStatus.ACKNOWLEDGED
+    suspend fun requestFlush(
+        noteId: String,
+        timeoutMillis: Long = 12_000,
+        allowPendingNativeLoad: Boolean = false,
+    ): Boolean = requestFlushStatus(noteId, timeoutMillis, allowPendingNativeLoad) == ReaderFlushStatus.ACKNOWLEDGED
 
     /** Waits for the live reader's flush outcome, distinguishing active-note handoff lag from errors. */
-    suspend fun requestFlushStatus(noteId: String, timeoutMillis: Long = 12_000): ReaderFlushStatus {
+    suspend fun requestFlushStatus(
+        noteId: String,
+        timeoutMillis: Long = 12_000,
+        allowPendingNativeLoad: Boolean = false,
+    ): ReaderFlushStatus {
         if (retired.get() || noteId.isBlank()) return ReaderFlushStatus.FAILED
-        val request = flushBarrier.register(UUID.randomUUID().toString(), noteId)
+        val request = flushBarrier.register(UUID.randomUUID().toString(), noteId, allowPendingNativeLoad)
         try {
             if (retired.get()) {
                 flushBarrier.cancel(request.token, request)
                 return ReaderFlushStatus.FAILED
             }
-            val script = "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}})"
+            val script = if (allowPendingNativeLoad) {
+                "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)},allowPendingNativeLoad:true})"
+            } else {
+                "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}})"
+            }
             if (!web.post {
                     if (retired.get()) flushBarrier.complete(request.token, "", null, null, "Reader retired", wellFormed = false)
-                    else web.evaluateJavascript(script, null)
+                    else {
+                        if (allowPendingNativeLoad) {
+                            request.dispatchedAtEnqueue = model.readerDispatchedContent[noteId]
+                        }
+                        web.evaluateJavascript(script, null)
+                    }
                 }) {
                 flushBarrier.cancel(request.token, request)
                 return ReaderFlushStatus.FAILED
@@ -346,12 +362,14 @@ internal class ReaderBridge(
             else -> content != null && hasOnlyKeys(args, "id", "token", "content")
         }
         val current = id?.let { target -> model.state.value.tabs.firstOrNull { it.id == target } }
+        val activeMatch = current?.takeIf { model.state.value.active.id == it.id }
         val accepted = flushBarrier.complete(
             token,
             id ?: "",
             content,
-            current?.takeIf { model.state.value.active.id == it.id }?.content,
-            if (wellFormed) error else "Malformed flush acknowledgement",
+            activeMatch?.content,
+            dispatchedContent = activeMatch?.let { model.readerDispatchedContent[it.id] },
+            error = if (wellFormed) error else "Malformed flush acknowledgement",
             wellFormed = wellFormed,
         )
         return if (accepted) JSONObject().put("accepted", true)

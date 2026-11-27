@@ -6,6 +6,7 @@ import copy
 import json
 from pathlib import Path
 import uuid
+import weakref
 
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QDesktopServices, QGuiApplication
@@ -183,15 +184,23 @@ def refresh_theme(studio_obj, *, detect_dark_fn: Callable | None = None, read_pa
     studio_obj._theme_running = True
     scheme = QGuiApplication.styleHints().colorScheme().name
 
+    try:
+        studio_ref = weakref.ref(studio_obj)
+    except TypeError:
+        studio_ref = lambda: studio_obj
+
     def finished(result, error):
-        studio_obj._theme_running = False
-        if not error and result != getattr(studio_obj, "_theme_result", None):
-            studio_obj._theme_result = result
-            studio_obj.system_dark, (studio_obj.system_mode, studio_obj.system_colors) = result
-            _emit(studio_obj)
-        if getattr(studio_obj, "_theme_pending", False):
-            studio_obj._theme_pending = False
-            _call(studio_obj, "_schedule_theme", schedule_theme)
+        studio = studio_ref()
+        if studio is None or getattr(studio, "retired", False):
+            return
+        studio._theme_running = False
+        if not error and result != getattr(studio, "_theme_result", None):
+            studio._theme_result = result
+            studio.system_dark, (studio.system_mode, studio.system_colors) = result
+            _emit(studio)
+        if getattr(studio, "_theme_pending", False):
+            studio._theme_pending = False
+            _call(studio, "_schedule_theme", schedule_theme)
 
     _submit(studio_obj, lambda: (detect_dark(scheme), read_palette()), finished, False)
 

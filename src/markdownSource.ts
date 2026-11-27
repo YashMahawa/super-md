@@ -462,7 +462,8 @@ export function normalizeMarkdownSource(markdown:string, options:NormalizeMarkdo
 export function normalizeCallouts(markdown:string):string{return normalizeMarkdownSource(markdown,{encodeLinkDestinations:true}).value;}
 
 export function remarkImageAttributes() {
-  return (tree:any)=>{
+  return (tree:any,file?:{value?:unknown})=>{
+    if(typeof file?.value==='string'&&!file.value.includes('!['))return;
     visit(tree,(parent:any)=>{
       if(!Array.isArray(parent.children))return;
       for(let i=0;i<parent.children.length-1;i++){
