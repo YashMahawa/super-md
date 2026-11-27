@@ -717,6 +717,39 @@ fn explicit_equation_tags_and_resolved_references_render_in_headless_pdf() {
 }
 
 #[test]
+fn stacked_inline_fractions_leave_clearance_between_lines() {
+    let markdown = "$\\dfrac{111}{222}$  \n$\\dfrac{333}{444}$";
+    // Exercise a saved compact preset so the regression cannot pass simply
+    // because fresh installations use a more generous default.
+    let options = PdfOptions { line_height: 1.4, ..PdfOptions::default() };
+    let pdf = export(markdown, &options, &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 1);
+    let path = std::env::temp_dir().join(format!("supermd-inline-math-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-bbox").arg(&path).arg("-").output();
+    let _ = std::fs::remove_file(&path);
+    if require_poppler() {
+        assert!(output.as_ref().is_ok_and(|out| out.status.success()), "PDF bounding boxes are required on Linux CI");
+    }
+    if let Ok(output) = output {
+        if !output.status.success() { return; }
+        let xml = std::str::from_utf8(&output.stdout).unwrap();
+        let html = &xml[xml.find("<html").expect("missing PDF bounding box document")..];
+        let document = roxmltree::Document::parse(html).unwrap();
+        let vertical_edge = |text, attribute| {
+            document.descendants()
+                .find(|node| node.has_tag_name("word") && node.text() == Some(text))
+                .and_then(|node| node.attribute(attribute))
+                .unwrap_or_else(|| panic!("missing {attribute} for {text}"))
+                .parse::<f64>().unwrap()
+        };
+        let gap = vertical_edge("333", "yMin") - vertical_edge("222", "yMax");
+        assert!(gap >= 2., "consecutive inline fractions must have clearance, got {gap:.2}pt");
+    }
+}
+
+#[test]
 fn repeated_and_forward_footnotes_keep_stable_first_reference_numbering_without_duplicating_entries() {
     let md = [
         "[^early]: EARLY_FOOTNOTE_BODY",
@@ -891,3 +924,80 @@ fn footnote_equation_and_heading_targets_follow_emitted_first_reference_definiti
     }
 }
 
+#[test]
+fn nested_footnote_chains_bound_depth_without_stack_overflow_and_preserve_numbering() {
+    let mut valid_chain = Vec::new();
+    for idx in (1..=8).rev() {
+        if idx < 8 {
+            valid_chain.push(format!("[^chain{idx}]: CHAIN_NOTE_{idx:02} citing[^chain{}].", idx + 1));
+        } else {
+            valid_chain.push("[^chain8]: CHAIN_NOTE_08_LEAF cycling[^chain1] and literal[^missing].".to_string());
+        }
+    }
+    valid_chain.push(String::new());
+    valid_chain.push("Lead CHAIN_START[^chain1], repeat CHAIN_MID_REPEAT[^CHAIN4], repeat CHAIN_LEAF_REPEAT[^chain8], and AFTER_CHAIN[^after].".to_string());
+    valid_chain.push(String::new());
+    valid_chain.push("[^after]: AFTER_CHAIN_BODY".to_string());
+    let valid_md = valid_chain.join("\n");
+
+    let valid_src = source(&valid_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert_eq!(valid_src.matches("]<smd.footnote.").count(), 9, "Expected 9 distinct footnotes: {valid_src}");
+    let valid_pdf = export(&valid_md, &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(valid_pdf.starts_with(b"%PDF-"));
+    if let Ok(out) = {
+        let path = std::env::temp_dir().join(format!("supermd-footnote-chain-valid-{}.pdf", std::process::id()));
+        std::fs::write(&path, &valid_pdf).unwrap();
+        let res = std::process::Command::new("pdftotext").arg(&path).arg("-").output();
+        let _ = std::fs::remove_file(&path);
+        res
+    } {
+        if require_poppler() {
+            assert!(out.status.success(), "pdftotext must succeed on Linux CI");
+        }
+        if out.status.success() {
+            let flat = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(flat.contains("CHAIN_START1, repeat CHAIN_MID_REPEAT4, repeat CHAIN_LEAF_REPEAT8, and AFTER_CHAIN9."), "Expected stable chain numbering: {flat}");
+            assert!(flat.contains("CHAIN_NOTE_08_LEAF cycling1 and literal[^missing]."), "Cycle and undefined reference at max depth must still render: {flat}");
+        }
+    }
+
+    let mut sequential = vec![
+        (1..=48).map(|idx| format!("SEQ_{idx:02}[^seq{idx}]")).collect::<Vec<_>>().join(" "),
+        String::new(),
+    ];
+    for idx in (1..=48).rev() {
+        sequential.push(format!("[^seq{idx}]: SEQ_BODY_{idx:02}"));
+    }
+    let sequential_pdf = export(&sequential.join("\n"), &PdfOptions::default(), &HashMap::new()).unwrap();
+    assert!(sequential_pdf.starts_with(b"%PDF-"));
+
+    std::thread::Builder::new()
+        .name("pdf-footnote-long-chain".into())
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let chain_len = 2048usize;
+            let mut deep_md = String::from("Lead[^deep0].\n\n");
+            for idx in 0..chain_len {
+                if idx + 1 < chain_len {
+                    deep_md.push_str(&format!("[^deep{idx}]: Step {idx}[^deep{}].\n", idx + 1));
+                } else {
+                    deep_md.push_str(&format!("[^deep{idx}]: Leaf {idx}.\n"));
+                }
+            }
+            let src_err = source(&deep_md, &PdfOptions::default(), &HashMap::new())
+                .expect_err("long nested footnote chain must fail gracefully in source()");
+            assert!(
+                src_err.to_string().contains("Footnote nesting exceeds maximum depth"),
+                "unexpected source() error: {src_err}"
+            );
+            let export_err = export(&deep_md, &PdfOptions::default(), &HashMap::new())
+                .expect_err("long nested footnote chain must fail gracefully in export()");
+            assert!(
+                export_err.to_string().contains("Footnote nesting exceeds maximum depth"),
+                "unexpected export() error: {export_err}"
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

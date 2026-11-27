@@ -34,7 +34,7 @@ pub struct PdfOptions {
 }
 impl Default for PdfOptions {
     fn default() -> Self {
-        Self { page_size: "a4".into(), margin: 14., font_size: 10.5, line_height: 1.4, paragraph_spacing: 0.65, font_family: "Manrope".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
+        Self { page_size: "a4".into(), margin: 14., font_size: 10.5, line_height: 1.5, paragraph_spacing: 0.65, font_family: "Manrope".into(), page_numbers: true, themed: false, theme_accent: "#386a57".into() }
     }
 }
 impl PdfOptions {
@@ -913,12 +913,14 @@ fn normalize_table_math(input: &str) -> String {
     result
 }
 
+const MAX_FOOTNOTE_NESTING_DEPTH: usize = 8;
+
 struct Renderer<'a> {
     events: std::iter::Peekable<std::vec::IntoIter<Event<'a>>>,
     assets: &'a HashMap<String, Vec<u8>>,
     footnote_defs: HashMap<String, Vec<Event<'a>>>,
     emitted_footnotes: HashMap<String, String>,
-    in_footnote: bool,
+    footnote_depth: usize,
     headings: HashMap<String, usize>,
     heading_counts: HashMap<String, usize>,
     equations: HashMap<String, equations::EquationTarget>,
@@ -959,38 +961,43 @@ fn collect_emitted_targets<'a>(
     visited_footnotes: &mut HashSet<String>,
     headings: &mut HashMap<String, usize>,
     equations: &mut HashMap<String, equations::EquationTarget>,
-) {
-    let mut i = 0usize;
-    while i < events.len() {
-        match &events[i] {
+) -> Result<()> {
+    let mut stack: Vec<(&[Event<'a>], usize)> = vec![(events, 0)];
+    while let Some((cur_events, idx)) = stack.last_mut() {
+        if *idx >= cur_events.len() {
+            stack.pop();
+            continue;
+        }
+        let i = *idx;
+        match &cur_events[i] {
             Event::Start(Tag::FootnoteDefinition(_)) => {
-                i += 1;
+                let mut next = i + 1;
                 let mut depth = 1usize;
-                while i < events.len() && depth > 0 {
-                    match &events[i] {
+                while next < cur_events.len() && depth > 0 {
+                    match &cur_events[next] {
                         Event::Start(Tag::FootnoteDefinition(_)) => depth += 1,
                         Event::End(TagEnd::FootnoteDefinition) => depth -= 1,
                         _ => {}
                     }
-                    i += 1;
+                    next += 1;
                 }
-                continue;
+                *idx = next;
             }
             Event::Start(Tag::Image { .. }) => {
-                i += 1;
+                let mut next = i + 1;
                 let mut depth = 1usize;
-                while i < events.len() && depth > 0 {
-                    match &events[i] {
+                while next < cur_events.len() && depth > 0 {
+                    match &cur_events[next] {
                         Event::Start(Tag::Image { .. }) => depth += 1,
                         Event::End(TagEnd::Image) => depth -= 1,
                         _ => {}
                     }
-                    i += 1;
+                    next += 1;
                 }
-                continue;
+                *idx = next;
             }
             Event::Start(Tag::Heading { .. }) => {
-                let plain: String = events[i + 1..]
+                let plain: String = cur_events[i + 1..]
                     .iter()
                     .take_while(|e| !matches!(e, Event::End(TagEnd::Heading(_))))
                     .filter_map(|e| match e {
@@ -1004,22 +1011,32 @@ fn collect_emitted_targets<'a>(
                     headings.insert(format!("{slug}-{count}"), 1);
                 }
                 headings.insert(slug, count + 1);
+                *idx = i + 1;
             }
             Event::DisplayMath(v) => {
                 equations::analyze_display_equation(v, equations);
+                *idx = i + 1;
             }
             Event::FootnoteReference(name) => {
+                *idx = i + 1;
                 let key = normalize_footnote_id(name);
-                if visited_footnotes.insert(key.clone()) {
+                if !visited_footnotes.contains(&key) {
                     if let Some(def_events) = footnote_defs.get(&key) {
-                        collect_emitted_targets(def_events, footnote_defs, visited_footnotes, headings, equations);
+                        let footnote_depth = stack.len() - 1;
+                        if footnote_depth >= MAX_FOOTNOTE_NESTING_DEPTH {
+                            bail!("Footnote nesting exceeds maximum depth of {MAX_FOOTNOTE_NESTING_DEPTH}");
+                        }
+                        visited_footnotes.insert(key);
+                        stack.push((def_events.as_slice(), 0));
                     }
                 }
             }
-            _ => {}
+            _ => {
+                *idx = i + 1;
+            }
         }
-        i += 1;
     }
+    Ok(())
 }
 fn heading_slug(value: &str) -> String {
     let value = value.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_').collect::<String>();
@@ -1145,14 +1162,17 @@ impl<'a> Renderer<'a> {
                     if let Some(existing_label) = self.emitted_footnotes.get(&key) {
                         out.push_str(&format!("#footnote(<{existing_label}>)"));
                     } else if let Some(def_events) = self.footnote_defs.get(&key).cloned() {
+                        if self.footnote_depth >= MAX_FOOTNOTE_NESTING_DEPTH {
+                            bail!("Footnote nesting exceeds maximum depth of {MAX_FOOTNOTE_NESTING_DEPTH}");
+                        }
                         let label_id = format!("smd.footnote.{}", self.emitted_footnotes.len() + 1);
                         self.emitted_footnotes.insert(key, label_id.clone());
                         let saved_events = std::mem::replace(&mut self.events, def_events.into_iter().peekable());
-                        let saved_in_footnote = std::mem::replace(&mut self.in_footnote, true);
                         let saved_link_depth = std::mem::replace(&mut self.link_depth, 0);
+                        self.footnote_depth += 1;
                         let rendered = self.render(None);
+                        self.footnote_depth -= 1;
                         self.events = saved_events;
-                        self.in_footnote = saved_in_footnote;
                         self.link_depth = saved_link_depth;
                         let body = rendered?;
                         out.push_str(&format!("#footnote[{}]<{label_id}>", body.trim()));
@@ -1325,7 +1345,7 @@ impl<'a> Renderer<'a> {
                             }
                             let body = body_res?;
                             match tag {
-                                Tag::Paragraph => { if !self.in_footnote && body.starts_with("#strong[") && body.ends_with(']') { out.push_str(&format!("#block(sticky: true, below: .35em)[{body}]\n\n")); } else { out.push_str(&format!("{body}\n\n")); } },
+                                Tag::Paragraph => { if self.footnote_depth == 0 && body.starts_with("#strong[") && body.ends_with(']') { out.push_str(&format!("#block(sticky: true, below: .35em)[{body}]\n\n")); } else { out.push_str(&format!("{body}\n\n")); } },
                                 Tag::Heading { level, .. } => out.push_str(&format!("\n#heading(level: {})[{body}] <smd-{}>\n\n", level as u8, heading.unwrap())),
                                 Tag::Emphasis => out.push_str(&format!("#emph[{body}]")),
                                 Tag::Strong => out.push_str(&format!("#strong[{body}]")),
@@ -1376,7 +1396,7 @@ pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>)
             equations::analyze_display_equation(v, &mut equations);
         }
     }
-    Renderer { events: events.into_iter().peekable(), assets, footnote_defs: HashMap::new(), emitted_footnotes: HashMap::new(), in_footnote: false, headings: HashMap::new(), heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 }.render(None)
+    Renderer { events: events.into_iter().peekable(), assets, footnote_defs: HashMap::new(), emitted_footnotes: HashMap::new(), footnote_depth: 0, headings: HashMap::new(), heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
@@ -1391,8 +1411,8 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     let footnote_defs = collect_footnote_definitions(&events);
     let mut headings = HashMap::new();
     let mut equations = HashMap::new();
-    collect_emitted_targets(&events, &footnote_defs, &mut HashSet::new(), &mut headings, &mut equations);
-    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnote_defs, emitted_footnotes: HashMap::new(), in_footnote: false, headings, heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 };
+    collect_emitted_targets(&events, &footnote_defs, &mut HashSet::new(), &mut headings, &mut equations)?;
+    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnote_defs, emitted_footnotes: HashMap::new(), footnote_depth: 0, headings, heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 };
     let body = renderer.render(None)?;
     let template: &str = if options.page_numbers { include_str!("document.typ") } else { &typesetter::UNNUMBERED_DOCUMENT_TEMPLATE };
     let paper=match options.page_size.as_str() {"letter"=>"us-letter","legal"=>"us-legal","tabloid"=>"us-tabloid","executive"=>"us-executive",other=>other};
@@ -1759,7 +1779,7 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
             assets: &HashMap::new(),
             footnote_defs: HashMap::new(),
             emitted_footnotes: HashMap::new(),
-            in_footnote: false,
+            footnote_depth: 0,
             headings: HashMap::new(),
             heading_counts: HashMap::new(),
             equations: HashMap::new(),
@@ -1767,6 +1787,56 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
             link_depth: 0,
         }.render(None).unwrap();
         assert_eq!(raw_crlf_out.trim(), "#smd-code(\"let a = 1;\\r\\nlet b = 2;\", lang: \"rust\")");
+
+        std::thread::Builder::new()
+            .name("footnote-depth-bound".into())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let chain_len = 2048usize;
+                let mut md = String::from("Lead[^chain0].\n\n");
+                for idx in 0..chain_len {
+                    if idx + 1 < chain_len {
+                        md.push_str(&format!("[^chain{idx}]: Step {idx}[^chain{}].\n", idx + 1));
+                    } else {
+                        md.push_str(&format!("[^chain{idx}]: Leaf {idx}.\n"));
+                    }
+                }
+                let events = study::enrich_events(&md, Options::ENABLE_FOOTNOTES);
+                let footnote_defs = collect_footnote_definitions(&events);
+                let prepass_err = collect_emitted_targets(
+                    &events,
+                    &footnote_defs,
+                    &mut HashSet::new(),
+                    &mut HashMap::new(),
+                    &mut HashMap::new(),
+                )
+                .expect_err("collect_emitted_targets must bound deep distinct footnote chains");
+                assert!(
+                    prepass_err.to_string().contains("Footnote nesting exceeds maximum depth"),
+                    "unexpected collect_emitted_targets error: {prepass_err}"
+                );
+                let render_err = Renderer {
+                    events: events.into_iter().peekable(),
+                    assets: &HashMap::new(),
+                    footnote_defs,
+                    emitted_footnotes: HashMap::new(),
+                    footnote_depth: 0,
+                    headings: HashMap::new(),
+                    heading_counts: HashMap::new(),
+                    equations: HashMap::new(),
+                    emitted_equation_anchors: HashSet::new(),
+                    link_depth: 0,
+                }
+                .render(None)
+                .expect_err("Renderer::render must bound deep distinct footnote chains");
+                assert!(
+                    render_err.to_string().contains("Footnote nesting exceeds maximum depth"),
+                    "unexpected Renderer::render error: {render_err}"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
 
         let bbox_word_attr = |md: &str, needle: &str, attr: &str| -> Option<f64> {
             let path = std::env::temp_dir().join(format!("supermd-code-y-{}-{needle}-{attr}.pdf", std::process::id()));

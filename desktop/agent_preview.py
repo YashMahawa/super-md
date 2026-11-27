@@ -97,6 +97,12 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
         if time.monotonic()-state['started']>40:timer.stop();fail('Offline reader preview timed out');return
         if state['ready']:view.page().runJavaScript("!!document.querySelector('.markdown-body') && document.fonts.status==='loaded' && [...document.images].every(i=>i.complete) && !document.querySelector('.mermaid-loading,.reader-loading')",inspected)
     timer=QTimer();timer.setInterval(150);timer.timeout.connect(poll);timer.start();view.load(reader_bundle_url());view.show()
-    code=app.exec();view.close();view.deleteLater();app.processEvents()
+    code=app.exec()
+    page=view.page()
+    view.close()
+    if page is not None:page.deleteLater()
+    profile.deleteLater()
+    view.deleteLater()
+    app.processEvents()
     if code or state['error']:raise ValueError(state['error'] or 'Preview failed')
     return {'output':str(output),'width':width,'height':height,'renderer':'super-md-offline-reader','sourceUnchanged':True,'revision':hashlib.sha256(raw).hexdigest()}
