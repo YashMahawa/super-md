@@ -25,7 +25,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.FiniteAnimationSpec
 import androidx.compose.animation.core.snap
@@ -38,7 +37,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.MenuBook
@@ -56,7 +54,6 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -75,7 +72,6 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
@@ -84,7 +80,6 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.window.layout.FoldingFeature
 import androidx.window.layout.WindowInfoTracker
 import kotlinx.coroutines.launch
@@ -439,6 +434,8 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     }
 }
 
+internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")
+
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
     val scope = rememberCoroutineScope()
     val drawer = rememberDrawerState(DrawerValue.Closed)
@@ -464,6 +461,8 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     var findRequest by remember { mutableIntStateOf(0) }
     var findReplace by remember { mutableStateOf(false) }
     var renaming by rememberSaveable {mutableStateOf(false)}
+    var pendingRenameKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingRenameInput by rememberSaveable { mutableStateOf<String?>(null) }
     var contentsShown by remember {mutableStateOf(false)}
     var readingChromeVisible by remember {mutableStateOf(true)}
     LaunchedEffect(state.busy) { if (!state.busy) readerPdfOwnsProgress = false }
@@ -957,7 +956,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 "open" -> if (request.optJSONObject("options")?.optBoolean("background", false) == true) {
                     reply(null, "Background file picking is unavailable on Android; open the file in Super MD first")
                     true
-                } else { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); reply(JSONObject().put("accepted", true).put("message", "Choose a file in Android's document picker"), null); true }
+                } else { open.launch(noteOpenMimeTypes()); reply(JSONObject().put("accepted", true).put("message", "Choose a file in Android's document picker"), null); true }
                 "save" -> false
                 else -> false
             }
@@ -1107,7 +1106,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     state = state,
                     recent = recent,
                     folderRelative = state.folderRelative,
-                    onOpenNote = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } },
+                    onOpenNote = { open.launch(noteOpenMimeTypes()); scope.launch { drawer.close() } },
                     onOpenFolder = { folder.launch(state.folder?.let(android.net.Uri::parse)) },
                     onCloseFolder = model::closeFolder,
                     onFolderRoot = { model.navigateFolderUp() },
@@ -1347,14 +1346,29 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     )
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
-        val initialStem = remember(state.active.id, state.active.name) {
-            if (noteExtension(state.active.name).isNotEmpty()) noteStem(state.active.name) else state.active.name
+        val activeRenameKey = "${state.active.id}\n${state.active.name}"
+        val initialStem = remember(state.active.id, state.active.name, pendingRenameKey, pendingRenameInput) {
+            if (pendingRenameKey == activeRenameKey && pendingRenameInput != null) {
+                pendingRenameInput!!
+            } else if (noteExtension(state.active.name).isNotEmpty()) {
+                noteStem(state.active.name)
+            } else {
+                state.active.name
+            }
         }
-        var name by rememberSaveable(state.active.id, state.active.name) { mutableStateOf(initialStem) }
+        var name by rememberSaveable(state.active.id, state.active.name, pendingRenameInput) { mutableStateOf(initialStem) }
         var renameError by remember(state.active.id, state.active.name) { mutableStateOf<String?>(null) }
         var renameBusy by remember(state.active.id, state.active.name) { mutableStateOf(false) }
         AlertDialog(
-            onDismissRequest = { if (!renameBusy) renaming = false },
+            onDismissRequest = {
+                if (!renameBusy) {
+                    if (pendingRenameKey == activeRenameKey) {
+                        pendingRenameKey = null
+                        pendingRenameInput = null
+                    }
+                    renaming = false
+                }
+            },
             title = { Text("Rename note") },
             text = {
                 OutlinedTextField(
@@ -1370,17 +1384,42 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             confirmButton = {
                 TextButton(
                     onClick = {
+                        val targetId = state.active.id
+                        val submittedName = name
                         renameBusy = true
                         renameError = null
-                        model.rename(state.active.id, name, showGlobalError = false) { ok, err ->
+                        model.rename(targetId, submittedName, showGlobalError = false) { ok, err ->
                             renameBusy = false
-                            if (ok) renaming = false else renameError = err
+                            if (ok) {
+                                if (pendingRenameKey == activeRenameKey) {
+                                    pendingRenameKey = null
+                                    pendingRenameInput = null
+                                }
+                                renaming = false
+                            } else if (err == DOCUMENT_ACCESS_MESSAGE || model.documentAccessRequests.value?.noteId == targetId) {
+                                pendingRenameKey = activeRenameKey
+                                pendingRenameInput = submittedName
+                                renaming = false
+                            } else {
+                                renameError = err
+                            }
                         }
                     },
                     enabled = !renameBusy && name.isNotBlank(),
                 ) { Text("Rename") }
             },
-            dismissButton = { TextButton(enabled = !renameBusy, onClick = { renaming = false }) { Text("Cancel") } },
+            dismissButton = {
+                TextButton(
+                    enabled = !renameBusy,
+                    onClick = {
+                        if (pendingRenameKey == activeRenameKey) {
+                            pendingRenameKey = null
+                            pendingRenameInput = null
+                        }
+                        renaming = false
+                    },
+                ) { Text("Cancel") }
+            },
         )
     }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
@@ -1477,7 +1516,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
         )
     }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
-    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
+    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(noteOpenMimeTypes()) }
 }
 
 internal fun buildHighlightedSnippet(
@@ -1766,8 +1805,7 @@ internal fun buildHighlightedSnippet(
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
             IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
             if (fullscreen || (wide && actualMode != "reader")) {
-                StudyIcon(if (fullscreen) "Exit fullscreen" else "Fullscreen study", if (fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen, action = onToggleFullscreen)
-                StudyIcon(if (centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre", if (centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open, action = onToggleCenterLock)
+                FullscreenAndCenterLockActions(fullscreen = fullscreen, centerLock = centerLock, onToggleFullscreen = onToggleFullscreen, onToggleCenterLock = onToggleCenterLock)
             }
             Box {
                 IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
@@ -1826,8 +1864,7 @@ internal fun buildHighlightedSnippet(
         }
         Spacer(Modifier.width(4.dp))
         if (actualMode == "reader") {
-            StudyIcon("Fullscreen study", R.drawable.symbol_fullscreen, action = onEnterFullscreen)
-            StudyIcon(if (centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre", if (centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open, action = onToggleCenterLock)
+            FullscreenAndCenterLockActions(fullscreen = false, centerLock = centerLock, onToggleFullscreen = onEnterFullscreen, onToggleCenterLock = onToggleCenterLock)
         } else {
             IconButton(onClick = onUndo, enabled = readerReady, modifier = Modifier.size(48.dp)) { Icon(Icons.AutoMirrored.Rounded.Undo, "Undo (Ctrl+Z)") }
             IconButton(onClick = onRedo, enabled = readerReady, modifier = Modifier.size(48.dp)) { Icon(Icons.AutoMirrored.Rounded.Redo, "Redo (Ctrl+Y)") }
@@ -1941,6 +1978,11 @@ internal fun buildHighlightedSnippet(
             }
         }
     }
+}
+
+@Composable internal fun FullscreenAndCenterLockActions(fullscreen: Boolean, centerLock: Boolean, onToggleFullscreen: () -> Unit, onToggleCenterLock: () -> Unit) {
+    StudyIcon(if (fullscreen) "Exit fullscreen" else "Fullscreen study", if (fullscreen) R.drawable.symbol_fullscreen_exit else R.drawable.symbol_fullscreen, action = onToggleFullscreen)
+    StudyIcon(if (centerLock) "Centre locked · unlock horizontal movement" else "Lock document to centre", if (centerLock) R.drawable.symbol_lock else R.drawable.symbol_lock_open, action = onToggleCenterLock)
 }
 
 @Composable private fun StudyIcon(label:String, resource:Int, enabled:Boolean=true, action:()->Unit) {
@@ -2159,14 +2201,27 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
     }
 }
 
+@Composable internal fun rememberByteDocumentExporter(
+    mimeType: String, missingStreamError: String, successMessage: String, failurePrefix: String,
+    contentResolver: android.content.ContentResolver = LocalContext.current.contentResolver, onMessage: (String) -> Unit,
+): (suggestedName: String, bytes: ByteArray) -> Unit {
+    var pendingBytes by remember { mutableStateOf<ByteArray?>(null) }
+    val currentResolver by rememberUpdatedState(contentResolver)
+    val currentOnMessage by rememberUpdatedState(onMessage)
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument(mimeType)) { uri ->
+        val bytes = pendingBytes; pendingBytes = null
+        if (uri != null && bytes != null) runCatching {
+            currentResolver.openOutputStream(uri, "w")?.use { it.write(bytes); it.flush() } ?: error(missingStreamError)
+        }.onSuccess { currentOnMessage(successMessage) }.onFailure { currentOnMessage("$failurePrefix: ${it.message}") }
+    }
+    return { suggestedName, bytes -> pendingBytes = bytes; launcher.launch(suggestedName) }
+}
+
 @Composable private fun AgentAccessSettings(activity: MainActivity) {
     val scope = rememberCoroutineScope()
     val saved = activity.agentAccessState.currentConfig()
     var origin by remember { mutableStateOf(saved?.serverOrigin.orEmpty()) }
     var message by remember { mutableStateOf("") }
-    var pendingPairingFile by remember { mutableStateOf<String?>(null) }
-    var pendingGuide by remember { mutableStateOf<String?>(null) }
-    var pendingSkillArchive by remember { mutableStateOf<ByteArray?>(null) }
     var enabled by remember { mutableStateOf(activity.agentAccessState.enabled) }
     fun revokeThen(action: () -> Unit) {
         message = "Disconnecting and revoking previous device registrations…"
@@ -2181,18 +2236,10 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
             .onSuccess { config -> enabled = false; origin = config.serverOrigin; activity.refreshAgentRelay(); message = "This Android device joined the workspace. Switch Live Agent Access on when you want it connected. Keep the pairing file private." }
             .onFailure { message = "Could not join workspace: ${it.message}" }
     }
-    val pairingExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
-        val raw = pendingPairingFile
-        pendingPairingFile = null
-        if (uri != null && raw != null) runCatching {
-            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(raw.toByteArray(Charsets.UTF_8)); it.flush() }
-                ?: error("Android could not write the pairing file")
-        }.onSuccess { message = "Trusted pairing file saved. Share it only with a device you trust." }
-            .onFailure { message = "Could not save pairing file: ${it.message}" }
-    }
+    val pairingExport = rememberByteDocumentExporter("application/json", "Android could not write the pairing file", "Trusted pairing file saved. Share it only with a device you trust.", "Could not save pairing file", activity.contentResolver) { message = it }
     fun createWorkspace() {
         runCatching { activity.agentAccessState.createPairingFile(origin) }
-            .onSuccess { pendingPairingFile = it; origin = activity.agentAccessState.currentConfig()?.serverOrigin.orEmpty(); activity.refreshAgentRelay(); pairingExport.launch("SuperMD-pairing.json") }
+            .onSuccess { origin = activity.agentAccessState.currentConfig()?.serverOrigin.orEmpty(); activity.refreshAgentRelay(); pairingExport("SuperMD-pairing.json", it.toByteArray(Charsets.UTF_8)) }
             .onFailure { message = "Could not create workspace: ${it.message}" }
     }
     val pairingImport = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -2211,24 +2258,8 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
                 .onFailure { message = "Could not read pairing file: ${it.message}" }
         }
     }
-    val guideExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/markdown")) { uri ->
-        val guide = pendingGuide
-        pendingGuide = null
-        if (uri != null && guide != null) runCatching {
-            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(guide.toByteArray(Charsets.UTF_8)); it.flush() }
-                ?: error("Android could not write the setup guide")
-        }.onSuccess { message = "Setup instructions saved." }
-            .onFailure { message = "Could not save setup guide: ${it.message}" }
-    }
-    val skillExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
-        val archive = pendingSkillArchive
-        pendingSkillArchive = null
-        if (uri != null && archive != null) runCatching {
-            activity.contentResolver.openOutputStream(uri, "w")?.use { it.write(archive); it.flush() }
-                ?: error("Android could not write the skill package")
-        }.onSuccess { message = "Skill package saved." }
-            .onFailure { message = "Could not save skill package: ${it.message}" }
-    }
+    val guideExport = rememberByteDocumentExporter("text/markdown", "Android could not write the setup guide", "Setup instructions saved.", "Could not save setup guide", activity.contentResolver) { message = it }
+    val skillExport = rememberByteDocumentExporter("application/zip", "Android could not write the skill package", "Skill package saved.", "Could not save skill package", activity.contentResolver) { message = it }
     val config = activity.agentConfigForThisWindow() ?: activity.agentAccessState.currentConfig()
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text("Enter your own Super MD relay server or import a trusted pairing file. Connect an AI client to currently open tabs on this device. Access is off by default; the relay does not store notes.", style = MaterialTheme.typography.bodyMedium)
@@ -2253,11 +2284,11 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
             OutlinedButton(enabled = config != null, onClick = {
                 val file = activity.agentAccessState.currentPairingFile()
                 if (file == null) message = "Create or join a workspace first"
-                else { pendingPairingFile = file; pairingExport.launch("SuperMD-pairing.json") }
+                else pairingExport("SuperMD-pairing.json", file.toByteArray(Charsets.UTF_8))
             }) { Text("Export trusted pairing file…") }
             OutlinedButton(onClick = {
                 runCatching { activity.assets.open("web/super-md-skill.zip").use { it.readBytes() } }
-                    .onSuccess { bytes -> pendingSkillArchive = bytes; skillExport.launch("super-md-skill.zip") }
+                    .onSuccess { bytes -> skillExport("super-md-skill.zip", bytes) }
                     .onFailure { message = "Could not load skill package: ${it.message}" }
             }) { Text("Export skill package (.zip)…") }
         }
@@ -2270,8 +2301,7 @@ private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
                 }) { Text("Copy private MCP URL") }
                 TextButton(onClick = {
                     val skill = runCatching { activity.assets.open("web/super-md-agent-SKILL.md").bufferedReader().use { it.readText() } }.getOrNull()
-                    pendingGuide = AgentSetupGuide.instructions(config, skill)
-                    guideExport.launch("SuperMD-Live-Agent-setup.md")
+                    guideExport("SuperMD-Live-Agent-setup.md", AgentSetupGuide.instructions(config, skill).toByteArray(Charsets.UTF_8))
                 }) { Text("Save setup instructions…") }
             }
         }
