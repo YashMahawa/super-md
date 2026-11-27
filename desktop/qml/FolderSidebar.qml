@@ -6,6 +6,12 @@ ColumnLayout {
     id: root
     objectName: "folderSidebar"
     required property var viewState
+    property var tabs: typeof studio !== "undefined" && studio && studio.tabsSnapshot !== undefined
+        ? JSON.parse(studio.tabsSnapshot)
+        : (viewState && viewState.tabs ? viewState.tabs : [])
+    property string activeTabId: typeof studio !== "undefined" && studio && studio.activeTabId !== undefined
+        ? String(studio.activeTabId)
+        : (sidebarState && sidebarState.active ? String(sidebarState.active) : (viewState && viewState.active ? String(viewState.active) : ""))
     property var sidebarState: typeof studio !== "undefined" && studio && studio.sidebarSnapshot !== undefined ? JSON.parse(studio.sidebarSnapshot) : viewState
     property var shortcutLabels: ({})
     readonly property string currentFolder: sidebarState.folder || ""
@@ -135,8 +141,8 @@ ColumnLayout {
             openRenameFor(selectedEntry.path, selectedEntry.name, Boolean(selectedEntry.directory))
             return
         }
-        const activeId = sidebarState.active || viewState.active
-        const activeTab = (viewState.tabs || []).find(t => t.id === activeId)
+        const activeId = sidebarState.active || root.activeTabId || viewState.active
+        const activeTab = (root.tabs || []).find(t => t.id === activeId)
         if (activeTab && activeTab.path && root.isInsideOpenFolder(activeTab.path)) {
             openRenameFor(activeTab.path, activeTab.name, false)
             return
