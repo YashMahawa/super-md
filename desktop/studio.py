@@ -37,7 +37,8 @@ from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPat
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
-    encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    encode_base64_chunked, image_data, is_valid_asset_filename,
+    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
@@ -1239,7 +1240,7 @@ class Studio(QObject):
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "portable": bool(tab.get("portable", False)), "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             pending_heading = tab.pop("pendingHeading", None)
             if pending_heading:
                 payload["pendingHeading"] = pending_heading
@@ -5425,12 +5426,14 @@ class Studio(QObject):
                     raise ValueError("Asset exceeds 25 MB")
 
             filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
-            if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+            if not is_valid_asset_filename(filename):
                 raise ValueError("Asset name must be a simple filename")
             ext = Path(filename).suffix.lower().lstrip(".")
             if not ext:
                 ext = next((item for item, kind in MIMES.items() if kind == mime), "")
                 filename += "." + ext
+                if not is_valid_asset_filename(filename):
+                    raise ValueError("Asset name must be a simple filename")
             if MIMES.get(ext) != mime:
                 raise ValueError("Asset name extension must match the image type")
             if not _matches_media_signature(mime, raw):

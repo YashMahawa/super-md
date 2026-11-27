@@ -41,6 +41,19 @@ export type RpcRequest = {
   view?: "source" | "prose";
 };
 
+function validPortableAssetBasename(value: string, maxLength: number): boolean {
+  const filename = value.startsWith("assets/") ? value.slice(7) : value;
+  return filename.length >= 1 && filename.length <= maxLength && filename !== "." && filename !== ".." && /^[A-Za-z0-9._-]+$/.test(filename);
+}
+
+export function isValidPortableAssetName(value: string): boolean {
+  return validPortableAssetBasename(value, 150);
+}
+
+export function isValidCompatPortableAssetName(value: string): boolean {
+  return validPortableAssetBasename(value, 159);
+}
+
 export function validateRpcRequest(value: unknown): RpcRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid RPC request");
   const r = value as Record<string, unknown>;
@@ -70,7 +83,7 @@ export function validateRpcRequest(value: unknown): RpcRequest {
   if (r.mimeType !== undefined && (typeof r.mimeType !== "string" || r.mimeType.length > 128)) throw new Error("Invalid media type");
   if (r.body !== undefined && (typeof r.body !== "string" || Buffer.byteLength(r.body) > 1_400_000)) throw new Error("Media body is too large");
   if (r.mimeType !== undefined && !["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"].includes(String(r.mimeType).toLowerCase())) throw new Error("Unsupported image type");
-  if (r.assetName !== undefined && (typeof r.assetName !== "string" || Buffer.byteLength(r.assetName) > 256 || !( /^[a-f0-9]{64}$/.test(r.assetName) || /^(?:assets\/)?[A-Za-z0-9._-]{1,150}$/.test(r.assetName) && ![".",".."].includes(r.assetName.split("/").at(-1)!)))) throw new Error("Invalid asset name");
+  if (r.assetName !== undefined && (typeof r.assetName !== "string" || Buffer.byteLength(r.assetName) > 256 || !(/^[a-f0-9]{64}$/.test(r.assetName) || isValidCompatPortableAssetName(r.assetName)))) throw new Error("Invalid asset name");
   if (r.assetPath !== undefined && (typeof r.assetPath !== "string" || Buffer.byteLength(r.assetPath) > 4096 || r.assetPath.includes("\0"))) throw new Error("Invalid asset path");
   if (r.view !== undefined && r.view !== "source" && r.view !== "prose") throw new Error("Invalid document view");
   if (r.imageFormat !== undefined && (!(["render_tab", "get_diagram_image"] as string[]).includes(r.action as string) || (r.imageFormat !== "png" && r.imageFormat !== "jpeg"))) throw new Error("imageFormat is only valid as png or jpeg on viewport or diagram image captures");
@@ -99,7 +112,7 @@ export function validateRpcRequest(value: unknown): RpcRequest {
       const bytes = Buffer.from(r.body, "base64");
       if (bytes.length < 1 || bytes.length > 1_048_576) throw new Error("Media body must be at most 1 MiB");
     }
-    if (r.assetAction === "attach" && (!/^(?:assets\/)?[A-Za-z0-9._-]{1,150}$/.test(String(r.assetName)) || [".", ".."].includes(String(r.assetName).split("/").at(-1)!))) throw new Error("Invalid new asset name");
+    if (r.assetAction === "attach" && (typeof r.assetName !== "string" || !isValidPortableAssetName(r.assetName))) throw new Error("Invalid new asset name");
   }
   if (r.action === "document_action" && ["export", "outline", "latexfix", "latex_review", "latex_apply", "activate", "close", "save", "snapshot", "get_context"].includes(String(r.documentAction)) && typeof r.tabId !== "string") throw new Error("tabId is required for this document action");
   if (r.action === "document_action" && ["job_status", "export_chunk"].includes(String(r.documentAction)) && typeof r.jobId !== "string") throw new Error("This action requires jobId");
