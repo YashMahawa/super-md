@@ -118,60 +118,61 @@ function expandRegexReplacement(replacement: string, match: RegExpExecArray, sou
   });
 }
 
-function markdownBracketEnd(raw: string, openIndex = 0): number {
-  if (raw[openIndex] !== "[") return raw.length;
+function skipInlineCodeSpan(raw: string, openIndex: number): number {
+  let ticks = 1;
+  while (raw[openIndex + ticks] === "`") ticks++;
+  for (let pos = openIndex + ticks; pos < raw.length; ) {
+    const hit = raw.indexOf("`", pos);
+    if (hit < 0) break;
+    let run = 1;
+    while (raw[hit + run] === "`") run++;
+    if (run === ticks) return hit + run - 1;
+    pos = hit + run;
+  }
+  return openIndex + ticks - 1;
+}
+
+function scanBalancedInlineDelimiter(raw: string, openIndex: number, openChar: string, closeChar: string, allowCodeSpans: boolean): number {
+  if (raw[openIndex] !== openChar) return raw.length;
   for (let i = openIndex, depth = 0; i < raw.length; i++) {
     const ch = raw[i];
     if (ch === "\\") { i++; continue; }
-    if (ch === "`") {
-      let ticks = 1;
-      while (raw[i + ticks] === "`") ticks++;
-      const close = raw.indexOf("`".repeat(ticks), i + ticks);
-      if (close >= 0) { i = close + ticks - 1; continue; }
-    }
-    if (ch === "[") depth++;
-    else if (ch === "]" && --depth === 0) return i;
+    if (allowCodeSpans && ch === "`") { i = skipInlineCodeSpan(raw, i); continue; }
+    if (ch === openChar) depth++;
+    else if (ch === closeChar && --depth === 0) return i;
   }
   return raw.length;
 }
 
-function markdownLinkTailEnd(raw: string, afterBracket: number): number {
-  if (raw[afterBracket] === "(") {
-    for (let i = afterBracket, depth = 0; i < raw.length; i++) {
-      const ch = raw[i];
-      if (ch === "\\") { i++; continue; }
-      if (ch === "(") depth++;
-      else if (ch === ")" && --depth === 0) return i + 1;
-    }
-    return raw.length;
-  }
-  if (raw[afterBracket] === "[") { const end = markdownBracketEnd(raw, afterBracket); return end < raw.length ? end + 1 : raw.length; }
+export const markdownBracketEnd = (raw: string, openIndex = 0): number => scanBalancedInlineDelimiter(raw, openIndex, "[", "]", true);
+
+export function markdownLinkTailEnd(raw: string, afterBracket: number): number {
+  if (raw[afterBracket] === "(") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "(", ")", false); return close < raw.length ? close + 1 : raw.length; }
+  if (raw[afterBracket] === "[") { const close = markdownBracketEnd(raw, afterBracket); return close < raw.length ? close + 1 : raw.length; }
   return afterBracket;
 }
 
-function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
+export function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
   const hidden: SourceRange[] = [];
   for (let i = 0; i < raw.length; i++) {
     const ch = raw[i];
     if (ch === "\\") { i++; continue; }
-    if (ch === "`") {
-      let ticks = 1;
-      while (raw[i + ticks] === "`") ticks++;
-      const close = raw.indexOf("`".repeat(ticks), i + ticks);
-      if (close >= 0) { i = close + ticks - 1; continue; }
-    }
+    if (ch === "`") { i = skipInlineCodeSpan(raw, i); continue; }
     if (ch === "<") {
       INLINE_HTML_HIDDEN_TOKEN.lastIndex = i;
       const htmlMatch = INLINE_HTML_HIDDEN_TOKEN.exec(raw);
       if (htmlMatch && htmlMatch.index === i) { const end = i + htmlMatch[0].length; hidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
     }
     if (ch === "!" && raw[i + 1] === "[") {
-      const close = markdownBracketEnd(raw, i + 1);
-      if (close < raw.length) { const end = markdownLinkTailEnd(raw, close + 1); hidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
+      const close = markdownBracketEnd(raw, i + 1), end = close < raw.length ? markdownLinkTailEnd(raw, close + 1) : 0;
+      if (end > close + 1) { hidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
     }
     if (ch === "[") {
       const close = markdownBracketEnd(raw, i), end = close < raw.length ? markdownLinkTailEnd(raw, close + 1) : 0;
-      if (end > close + 1) { hidden.push({ from: offset + close, to: offset + end }); i = Math.max(i, end - 1); }
+      if (end > close + 1) {
+        hidden.push({ from: offset + i, to: offset + i + 1 }, ...hiddenSpansInSlice(raw.slice(i + 1, close), offset + i + 1), { from: offset + close, to: offset + end });
+        i = Math.max(i, end - 1);
+      }
     }
   }
   return hidden;
