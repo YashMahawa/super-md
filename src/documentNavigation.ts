@@ -3,14 +3,39 @@ import {analyzeDocument,type OutlineEntry} from './documentAnalysis';
 import {headingSlug} from './headingSlug';
 export {headingSlug} from './headingSlug';
 export type {OutlineEntry} from './documentAnalysis';
-import {revealWindowed} from "./windowedSearch";
+import {revealWindowed,rememberWindowedScrollSource} from "./windowedSearch";
 import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './documentZoom';
 import {invoke} from './nativeBridge';
 import {isLocalHref,parseRelativeNoteLink,safeDecodeURIComponent,type ClassifiedRenderedLink} from './workspaceLinks';
 export {isLocalHref,parseRelativeNoteLink};
 export const UNSAVED_RELATIVE_NOTE_NOTICE = "Save this note before opening linked notes.";
+const NON_SCROLL_KEY_TARGET =
+  'input,textarea,select,button,summary,dialog[open],[contenteditable="true"],[role="button"],[role="slider"],[role="spinbutton"],[role="combobox"],[role="listbox"],[role="menuitem"],[role="dialog"],.image-viewer,.media-dialog,.media-save-menu,.reading-search,.math-repair-panel,.step-viewer,.theme-guide-dialog';
+const OVERLAY_OPEN_SELECTOR =
+  'dialog[open],[role="dialog"],.image-viewer,.media-dialog,.media-save-menu,.reading-search,.math-repair-panel,.step-viewer,.theme-guide-dialog,.reader-export-backdrop,.scrim';
 const jumps=new WeakMap<Element,{stop:()=>void}>();
-/** A user's zoom/pan wins over the settling frames of a preceding link jump. */
+
+export function readingKeyboardScrollDelta(event:KeyboardEvent,root:HTMLElement):number|null {
+  if(event.defaultPrevented||event.ctrlKey||event.metaKey||event.altKey)return null;
+  const key=event.key,isSpace=key===' '||key==='Spacebar';
+  if(event.shiftKey&&!isSpace)return null;
+  const target=event.target instanceof Element?event.target:null;
+  if((target instanceof HTMLElement&&target.isContentEditable)||target?.closest(NON_SCROLL_KEY_TARGET))return null;
+  const doc=root.ownerDocument;
+  const inRoot=target?root.contains(target):false;
+  const atDocumentLevel=!target||target===doc.body||target===doc.documentElement;
+  if(!inRoot&&(!atDocumentLevel||doc.querySelector(OVERLAY_OPEN_SELECTOR)))return null;
+  const page=root.clientHeight*.875;
+  if(key==='ArrowUp')return -40;
+  if(key==='ArrowDown')return 40;
+  if(key==='PageUp')return -page;
+  if(key==='PageDown')return page;
+  if(isSpace)return event.shiftKey?-page:page;
+  if(key==='Home'||key==='End')return 0;
+  return null;
+}
+
+/** A user's zoom/pan or keyboard scroll wins over the settling frames of a preceding link jump. */
 export function cancelHeadingNavigation(root:Element|null):void {
   if(!root)return;
   jumps.get(root)?.stop();jumps.delete(root);delete (root as HTMLElement).dataset.navigating;
@@ -105,8 +130,37 @@ export function navigateToHeading(root:Element,rawTarget:string):boolean {
   if (!heading) return true; // Broken local links must not escape into a browser.
   cancelHeadingNavigation(root);
   let observer:ResizeObserver|undefined,timer=0,frame=0;
-  const token={stop:()=>{observer?.disconnect();window.clearTimeout(timer);cancelAnimationFrame(frame);}};jumps.set(root,token);
-  const host=root as HTMLElement;host.dataset.navigating='true';
+  const host=root as HTMLElement,doc=host.ownerDocument;
+  const onKeyDown=(event:KeyboardEvent)=>{
+    const delta=readingKeyboardScrollDelta(event,host);
+    if(delta===null)return;
+    cancelHeadingNavigation(root);
+    rememberWindowedScrollSource(host,delta);
+  };
+  const onPointerDown=(event:PointerEvent)=>{
+    if(event.pointerType==='mouse'&&event.button!==0)return;
+    if(event.target instanceof Node&&host.contains(event.target))cancelHeadingNavigation(root);
+  };
+  const onTouchOrWheel=(event:Event)=>{
+    if(event.target instanceof Node&&host.contains(event.target))cancelHeadingNavigation(root);
+  };
+  const token={
+    stop:()=>{
+      observer?.disconnect();
+      window.clearTimeout(timer);
+      cancelAnimationFrame(frame);
+      doc.removeEventListener('keydown',onKeyDown);
+      doc.removeEventListener('pointerdown',onPointerDown,true);
+      doc.removeEventListener('touchstart',onTouchOrWheel,true);
+      doc.removeEventListener('wheel',onTouchOrWheel,true);
+    },
+  };
+  jumps.set(root,token);
+  host.dataset.navigating='true';
+  doc.addEventListener('keydown',onKeyDown);
+  doc.addEventListener('pointerdown',onPointerDown,{capture:true,passive:true});
+  doc.addEventListener('touchstart',onTouchOrWheel,{capture:true,passive:true});
+  doc.addEventListener('wheel',onTouchOrWheel,{capture:true,passive:true});
   revealWindowed(heading);
   // Native scrollIntoView can clamp against the old magnified spacer, or move
   // a WebView ancestor rather than its reading pane. Lazy blocks also change

@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { observeSharedIntersection } from "./sharedIntersectionObserver";
+import {
+  DEFAULT_OBSERVER_WORK_BUDGET_MS,
+  getObserverWorkBudgetMs,
+  observeSharedIntersection,
+  setObserverWorkBudgetMs,
+  type IntersectionStepFlush,
+} from "./sharedIntersectionObserver";
 
 class FakeIntersectionObserver {
   static instances: FakeIntersectionObserver[] = [];
@@ -18,7 +24,26 @@ class FakeIntersectionObserver {
   }
 }
 
-afterEach(() => { vi.unstubAllGlobals(); FakeIntersectionObserver.instances = []; });
+afterEach(() => {
+  setObserverWorkBudgetMs(DEFAULT_OBSERVER_WORK_BUDGET_MS);
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  FakeIntersectionObserver.instances = [];
+});
+
+function makeRect(top: number, height: number): DOMRect {
+  return {
+    top,
+    bottom: top + height,
+    left: 0,
+    right: 800,
+    width: 800,
+    height,
+    x: 0,
+    y: top,
+    toJSON() {},
+  } as DOMRect;
+}
 
 describe("shared intersection observers", () => {
   it("commits a delivery once and isolates transactional subscribers from ordinary observers",()=>{
@@ -67,5 +92,179 @@ describe("shared intersection observers", () => {
     expect(FakeIntersectionObserver.instances).toHaveLength(3);
     stopOther();
     stopOtherOptions();
+  });
+
+  it("enforces a measured observer work budget per frame and drains margin mounts closest-to-viewport first", () => {
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+
+    let clock = 100;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    setObserverWorkBudgetMs(5);
+    expect(getObserverWorkBudgetMs()).toBe(5);
+
+    const root = document.createElement("main");
+    vi.spyOn(root, "getBoundingClientRect").mockReturnValue(makeRect(0, 800));
+
+    const visibleA = document.createElement("section");
+    const visibleB = document.createElement("section");
+    const marginFar = document.createElement("section");
+    const marginNear = document.createElement("section");
+    const marginMid = document.createElement("section");
+    vi.spyOn(visibleA, "getBoundingClientRect").mockReturnValue(makeRect(40, 120));
+    vi.spyOn(visibleB, "getBoundingClientRect").mockReturnValue(makeRect(200, 120));
+    vi.spyOn(marginFar, "getBoundingClientRect").mockReturnValue(makeRect(1400, 120)); // distance 600px
+    vi.spyOn(marginNear, "getBoundingClientRect").mockReturnValue(makeRect(900, 120)); // distance 100px
+    vi.spyOn(marginMid, "getBoundingClientRect").mockReturnValue(makeRect(-320, 120)); // distance 200px
+
+    const order: string[] = [];
+    const commits: string[][] = [];
+    const commit = vi.fn((_host: Element | Document | null, update: (flush?: IntersectionStepFlush) => void) => {
+      const slice: string[] = [];
+      update((work) => {
+        slice.push("flush");
+        work();
+      });
+      commits.push(slice);
+    });
+
+    const register = (el: Element, label: string) =>
+      observeSharedIntersection(
+        el,
+        () => {
+          order.push(label);
+          clock += 3;
+          return true;
+        },
+        { root, rootMargin: "900px 0px" },
+        commit,
+      );
+
+    const stops = [
+      register(visibleA, "visibleA"),
+      register(visibleB, "visibleB"),
+      register(marginFar, "marginFar"),
+      register(marginNear, "marginNear"),
+      register(marginMid, "marginMid"),
+    ];
+
+    const observer = FakeIntersectionObserver.instances[0];
+    const viewportBounds = makeRect(0, 800);
+    observer.callback(
+      [visibleA, visibleB, marginFar, marginNear, marginMid].map((target) => ({
+        target,
+        isIntersecting: true,
+        intersectionRatio: 1,
+        time: clock,
+        boundingClientRect: target.getBoundingClientRect(),
+        intersectionRect: target.getBoundingClientRect(),
+        rootBounds: viewportBounds,
+      })),
+      observer as unknown as IntersectionObserver,
+    );
+
+    // Visible blocks run first until the 5 ms budget is reached (2 * 3 ms = 6 ms >= 5 ms).
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["visibleA", "visibleB"]);
+    expect(commits[0]).toEqual(["flush", "flush"]);
+    expect(frames).toHaveLength(1);
+
+    // Next animation frame drains margin mounts ordered by viewport proximity (100px -> 200px), stopping at budget.
+    clock += 20;
+    frames.shift()!(clock);
+    expect(commit).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(["visibleA", "visibleB", "marginNear", "marginMid"]);
+    expect(frames).toHaveLength(1);
+
+    // Final animation frame finishes the remaining farthest margin mount (600px).
+    clock += 20;
+    frames.shift()!(clock);
+    expect(commit).toHaveBeenCalledTimes(3);
+    expect(order).toEqual(["visibleA", "visibleB", "marginNear", "marginMid", "marginFar"]);
+    expect(frames).toHaveLength(0);
+
+    stops.forEach((stop) => stop());
+  });
+
+  it("drops scrolled-past deferred margin mounts and skips commit for already-unmounted releases", () => {
+    vi.stubGlobal("IntersectionObserver", FakeIntersectionObserver);
+    const frames: FrameRequestCallback[] = [];
+    const cancelRaf = vi.fn();
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      frames.push(cb);
+      return frames.length;
+    });
+    vi.stubGlobal("cancelAnimationFrame", cancelRaf);
+
+    let clock = 50;
+    vi.spyOn(performance, "now").mockImplementation(() => clock);
+    setObserverWorkBudgetMs(2);
+
+    const root = document.createElement("main");
+    vi.spyOn(root, "getBoundingClientRect").mockReturnValue(makeRect(0, 800));
+
+    const visible = document.createElement("section");
+    const scrolledPast = document.createElement("section");
+    const unsubscribed = document.createElement("section");
+    const unmountedOffscreen = document.createElement("section");
+    unmountedOffscreen.dataset.windowedMounted = "false";
+
+    let scrolledPastTop = 950;
+    vi.spyOn(visible, "getBoundingClientRect").mockReturnValue(makeRect(50, 120));
+    vi.spyOn(scrolledPast, "getBoundingClientRect").mockImplementation(() => makeRect(scrolledPastTop, 120));
+    vi.spyOn(unsubscribed, "getBoundingClientRect").mockReturnValue(makeRect(1100, 120));
+
+    const mounted: string[] = [];
+    let offscreenReleaseCalls = 0;
+    const commit = vi.fn((_host: Element | Document | null, update: (flush?: IntersectionStepFlush) => void) => {
+      update((work) => work());
+    });
+
+    const stopVisible = observeSharedIntersection(visible, () => { mounted.push("visible"); clock += 3; return true; }, { root, rootMargin: "900px 0px" }, commit);
+    const stopScrolledPast = observeSharedIntersection(scrolledPast, () => { mounted.push("scrolledPast"); return true; }, { root, rootMargin: "900px 0px" }, commit);
+    const stopUnsubscribed = observeSharedIntersection(unsubscribed, () => { mounted.push("unsubscribed"); return true; }, { root, rootMargin: "900px 0px" }, commit);
+    const stopOffscreen = observeSharedIntersection(unmountedOffscreen, () => { offscreenReleaseCalls += 1; return false; }, { root, rootMargin: "900px 0px" }, commit);
+
+    const observer = FakeIntersectionObserver.instances[0];
+    // Purely already-unmounted offscreen delivery runs subscriber without invoking commit().
+    observer.callback(
+      [{ target: unmountedOffscreen, isIntersecting: false, intersectionRatio: 0, time: clock, boundingClientRect: makeRect(5000, 120), intersectionRect: makeRect(0, 0), rootBounds: makeRect(0, 800) }],
+      observer as unknown as IntersectionObserver,
+    );
+    expect(offscreenReleaseCalls).toBe(1);
+    expect(commit).not.toHaveBeenCalled();
+
+    // Queue visible + two margin mounts; visible consumes budget, deferring both margin mounts.
+    observer.callback(
+      [visible, scrolledPast, unsubscribed].map((target) => ({
+        target,
+        isIntersecting: true,
+        intersectionRatio: 1,
+        time: clock,
+        boundingClientRect: target.getBoundingClientRect(),
+        intersectionRect: target.getBoundingClientRect(),
+        rootBounds: makeRect(0, 800),
+      })),
+      observer as unknown as IntersectionObserver,
+    );
+    expect(mounted).toEqual(["visible"]);
+    expect(frames).toHaveLength(1);
+
+    // Before the next frame, one target unsubscribes and the other scrolls outside rootMargin (900px).
+    stopUnsubscribed();
+    scrolledPastTop = 2400; // 2400 > 800 + 900
+    clock += 20;
+    frames.shift()!(clock);
+    expect(mounted).toEqual(["visible"]);
+    expect(commit).toHaveBeenCalledTimes(1);
+
+    stopVisible();
+    stopScrolledPast();
+    stopOffscreen();
   });
 });

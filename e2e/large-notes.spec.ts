@@ -123,3 +123,32 @@ test('changing tabs or reading modes retires the previous heading alignment',asy
     await expect(page.locator('.android-document')).toHaveClass(new RegExp('mode-'+next.mode));
   }
 });
+
+test('keyboard scrolling immediately cancels heading-lock settling on large windowed notes',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});await page.goto('/android-reader.html');
+  await page.evaluate(content=>window.supermdLoad?.({id:'keyboard-heading-cancel',content,path:null,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:18,zoom:100}),note);
+  await expect(page.locator('[data-windowed-mounted="true"]')).not.toHaveCount(0);
+
+  await page.evaluate(()=>window.supermdHeading?.('chapter-500'));
+  const heading=page.getByRole('heading',{name:'Chapter 500',exact:true});
+  await expect(heading).toBeVisible();
+  await expect(page.locator('.android-reading')).toHaveAttribute('data-navigating','true');
+  const jumpedTop=await page.locator('.android-reading').evaluate(el=>el.scrollTop);
+
+  // Press PageDown while the 5-second heading-lock settle window is still active.
+  await page.keyboard.press('PageDown');
+  await expect(page.locator('.android-reading')).not.toHaveAttribute('data-navigating','true');
+  await expect.poll(()=>page.locator('.android-reading').evaluate(el=>el.scrollTop)).toBeGreaterThan(jumpedTop+300);
+  const afterKeyTop=await page.locator('.android-reading').evaluate(el=>el.scrollTop);
+
+  // Trigger a .document-page ResizeObserver callback to confirm the cancelled heading lock never snaps back.
+  await page.evaluate(async()=>{
+    const pageNode=document.querySelector<HTMLElement>('.document-page');
+    if(pageNode)pageNode.style.paddingBottom='64px';
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+  });
+  const settledTop=await page.locator('.android-reading').evaluate(el=>el.scrollTop);
+  expect(settledTop).toBeGreaterThanOrEqual(afterKeyTop-4);
+  await expect(heading).not.toBeInViewport();
+  expect(await page.locator('.katex').count()).toBeLessThan(80);
+});
