@@ -462,11 +462,10 @@ class WebEngineContextMenuTest(unittest.TestCase):
         if str(ROOT) not in sys.path:
             sys.path.insert(0, str(ROOT))
         import run_tests
-        self.assertEqual(run_tests.suite_watchdog_seconds("darwin", "arm64"), 420)
-        self.assertLess(run_tests.suite_watchdog_seconds("darwin", "arm64"), 480)
+        for platform_name, machine in (("darwin", "arm64"), ("linux", "x86_64"), ("win32", "AMD64")):
+            self.assertEqual(run_tests.suite_watchdog_seconds(platform_name, machine), 420)
+            self.assertLess(run_tests.suite_watchdog_seconds(platform_name, machine), 480)
         self.assertEqual(run_tests.suite_watchdog_seconds("darwin", "x86_64"), 720)
-        self.assertEqual(run_tests.suite_watchdog_seconds("linux", "x86_64"), 240)
-        self.assertEqual(run_tests.suite_watchdog_seconds("win32", "AMD64"), 240)
 
     def test_real_webengine_right_click_menu_in_isolated_process(self):
         env = os.environ.copy()
