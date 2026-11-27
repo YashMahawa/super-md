@@ -5,18 +5,21 @@ import sys
 import unittest
 from pathlib import Path
 
+
 def suite_watchdog_seconds(platform_name: str = sys.platform, machine: str | None = None) -> int:
     """Return the faulthandler watchdog timeout in seconds.
 
-    macOS CI steps allow 8 minutes (480s) on arm64 (`macos-latest`) because the
-    60+ Qt Quick / WebEngine test files take ~4 minutes in software/offscreen
-    mode. Keep arm64 at 420s so faulthandler still dumps Python tracebacks
-    before the GitHub Actions step timeout if a Qt driver genuinely stalls.
+    CI steps allow 8 minutes (480s) because the 90+ Qt Quick, WebEngine, and
+    subprocess test files exceed 4 minutes in software/offscreen mode across
+    Linux, Windows, and Apple Silicon macOS. Keep CI platforms at 420s (and
+    Intel macOS release builds at 720s within their 15-minute step budget) so
+    faulthandler still dumps Python tracebacks before the GitHub Actions step
+    timeout if a Qt driver genuinely stalls.
     """
     resolved_machine = platform.machine() if machine is None else machine
-    if platform_name == "darwin":
-        return 720 if resolved_machine == "x86_64" else 420
-    return 240
+    if platform_name == "darwin" and resolved_machine == "x86_64":
+        return 720
+    return 420
 
 
 if __name__ == "__main__":
