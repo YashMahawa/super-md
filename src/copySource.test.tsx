@@ -3,12 +3,15 @@ import {afterEach,expect,it} from "vitest";
 import {renderToStaticMarkup} from "react-dom/server";
 import MarkdownPreview from "./components/MarkdownPreview";
 import {extractSelectedText,hasSelectedText,selectedMarkdown,setSelectedMarkdownDrag} from "./copySource";
+import {analyzeDocument} from "./documentAnalysis";
+import {clearNoteDisclosures,setNoteDisclosure} from "./disclosureState";
 import {readingMatches} from "./components/ReadingSearch";
 afterEach(()=>{
   window.getSelection()?.removeAllRanges();
   Reflect.deleteProperty(document,"caretPositionFromPoint");
   Reflect.deleteProperty(document,"caretRangeFromPoint");
   document.body.replaceChildren();
+  clearNoteDisclosures();
 });
 it('retains ordered-list start values, item overrides and partial-list selection',()=>{
   const host=document.createElement('article');host.className='markdown-body';host.innerHTML='<ol start="4"><li>Fourth</li><li value="9">Ninth</li><li>Tenth</li></ol>';document.body.append(host);
@@ -426,4 +429,55 @@ it("filters closed callouts in unmounted windowed blocks while keeping open call
     "```",
   ].join("\n"));
   selection.removeAllRanges();host.remove();
+});
+
+it("respects per-note disclosure overrides in unmounted windowed blocks without leaking across notes",()=>{
+  const b1="> [!answer] Offscreen answer\n> Deliberately revealed $x=9$.";
+  const b2="> [!question] Outer prompt\n> Read first.\n>\n> > [!answer] Nested answer\n> > Deliberately revealed nested $y=4$.";
+  const b3="> [!tip]+ Offscreen folded tip\n> Folded away by reader.";
+  const doc=`${b1}\n\n${b2}\n\n${b3}`;
+  const s1=0,e1=b1.length;
+  const s2=e1+2,e2=s2+b2.length;
+  const s3=e2+2,e3=s3+b3.length;
+  const [ansDesc,nestedAnsDesc,tipDesc]=analyzeDocument(doc).disclosures;
+
+  // In note-open: open both answers and fold the + tip closed
+  setNoteDisclosure("note-open",ansDesc.key,true,ansDesc.defaultOpen);
+  setNoteDisclosure("note-open",nestedAnsDesc.key,true,nestedAnsDesc.defaultOpen);
+  setNoteDisclosure("note-open",tipDesc.key,false,tipDesc.defaultOpen);
+
+  const makeOffscreenHost=(noteId:string)=>{
+    const el=document.createElement("article");
+    el.className="markdown-body";
+    el.setAttribute("data-note-id",noteId);
+    el.innerHTML=[
+      `<section data-windowed-mounted="false" data-source-start="${s1}" data-source-end="${e1}"></section>`,
+      `<section data-windowed-mounted="false" data-source-start="${s2}" data-source-end="${e2}"></section>`,
+      `<section data-windowed-mounted="false" data-source-start="${s3}" data-source-end="${e3}"></section>`,
+    ].join("");
+    document.body.append(el);
+    return el;
+  };
+
+  const hostOpen=makeOffscreenHost("note-open");
+  const range=document.createRange(),selection=window.getSelection()!;
+  range.selectNodeContents(hostOpen);selection.removeAllRanges();selection.addRange(range);
+  const openCopy=selectedMarkdown(selection,doc)!;
+  expect(openCopy).toContain("Deliberately revealed $x=9$.");
+  expect(openCopy).toContain("Deliberately revealed nested $y=4$.");
+  expect(openCopy).not.toContain("Folded away by reader.");
+
+  // Another note with identical Markdown still hides closed answers and keeps owner default + tip open
+  const hostOther=makeOffscreenHost("note-untouched");
+  range.selectNodeContents(hostOther);selection.removeAllRanges();selection.addRange(range);
+  const otherCopy=selectedMarkdown(selection,doc)!;
+  expect(otherCopy).not.toContain("Deliberately revealed");
+  expect(otherCopy).toContain("Folded away by reader.");
+
+  // Re-closing the answer in note-open excludes its body again
+  setNoteDisclosure("note-open",ansDesc.key,false,ansDesc.defaultOpen);
+  range.selectNodeContents(hostOpen);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,doc)).not.toContain("Deliberately revealed $x=9$.");
+
+  selection.removeAllRanges();hostOpen.remove();hostOther.remove();
 });

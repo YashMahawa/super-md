@@ -24,6 +24,7 @@ import { isTypewriterShortcutEvent, setTypewriterScroll, toggleTypewriterScroll,
 import { scrollInputVersion } from "./scrollAnchor";
 import { captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, isProgrammaticAnchorScroll, primeEditorAnchor, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
 import { settleSharedSourceAnchor } from "./useSharedSourceAnchor";
+import { clearNoteDisclosures, retainNoteDisclosures, syncMountedNoteDisclosures } from "./disclosureState";
 
 const welcome = `# Super MD
 
@@ -205,6 +206,7 @@ export default function App() {
   const previousViewAndTab = useRef<{ id: string; view: ViewMode }>({ id: activeTab.id, view });
   const snapshotActiveTabAnchor = useCallback(() => {
     const id = documentsRef.current.activeId;
+    syncMountedNoteDisclosures(id);
     const currentMode = viewRef.current;
     const anchor = captureSharedAnchor({
       id,
@@ -242,7 +244,11 @@ export default function App() {
   const [imageConsentVersion, setImageConsentVersion] = useState(0);
   useEffect(() => {
     noteImageConsentRef.current.retainOnly(documents.tabs.map((tab) => tab.id));
-  }, [documents.tabs]);
+    retainNoteDisclosures([...documents.tabs.map((tab) => tab.id), ...documents.recentlyClosed.map((tab) => tab.id)]);
+  }, [documents.tabs, documents.recentlyClosed]);
+  useEffect(() => () => {
+    clearNoteDisclosures([...documentsRef.current.tabs.map((tab) => tab.id), ...documentsRef.current.recentlyClosed.map((tab) => tab.id)]);
+  }, []);
   const approveImageUrl = useCallback((noteId: string | undefined, url: string) => {
     if (!noteId || !documentsRef.current.tabs.some((tab) => tab.id === noteId)) return;
     if (noteImageConsentRef.current.approve(noteId, url)) setImageConsentVersion((value) => value + 1);

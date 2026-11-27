@@ -1,4 +1,6 @@
 import { caretRangeAtPoint } from "./caretPoint";
+import { analyzeDocument } from "./documentAnalysis";
+import { getNoteDisclosure, hasNoteDisclosureOverrides, isCollapsibleCallout, syncMountedNoteDisclosures } from "./disclosureState";
 
 declare global {
   interface Window {
@@ -78,7 +80,28 @@ function isBlockInterrupt(rest: string): boolean {
   );
 }
 
-function stripClosedOffscreenCallouts(slice: string): string {
+function resolveOffscreenCalloutStates(
+  source: string,
+  from: number,
+  to: number,
+  noteId: string | undefined,
+): boolean[] | undefined {
+  if (!noteId) return undefined;
+  syncMountedNoteDisclosures(noteId);
+  if (!hasNoteDisclosureOverrides(noteId)) return undefined;
+  const states: boolean[] = [];
+  let closedEndOffset = -1;
+  for (const entry of analyzeDocument(source).disclosures) {
+    if (entry.kind !== "callout" || entry.offset < from || entry.offset >= to) continue;
+    if (entry.offset < closedEndOffset) continue;
+    const open = getNoteDisclosure(noteId, entry.key, entry.defaultOpen);
+    states.push(open);
+    if (!open && entry.endOffset > closedEndOffset) closedEndOffset = entry.endOffset;
+  }
+  return states.length > 0 ? states : undefined;
+}
+
+function stripClosedOffscreenCallouts(slice: string, openStates?: readonly boolean[]): string {
   if (!/\[![\w-]+\]|:::callout\s/i.test(slice)) return slice;
   let normalized = slice;
   if (/:::callout\s/i.test(normalized)) {
@@ -126,6 +149,7 @@ function stripClosedOffscreenCallouts(slice: string): string {
   let closedDepth: number | null = null;
   let inClosedParagraph = false;
   let openQuoteDepth = 0;
+  let stateIndex = 0;
 
   for (const rawLine of normalized.split("\n")) {
     const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
@@ -168,7 +192,11 @@ function stripClosedOffscreenCallouts(slice: string): string {
         const type = match[1].toLowerCase();
         const fold = match[2] || "";
         const title = match[3]?.trim() || "";
-        const isClosed = fold === "-" || (fold !== "+" && (type === "answer" || type === "solution"));
+        const collapsible = isCollapsibleCallout(type, fold);
+        const defaultClosed = fold === "-" || (fold !== "+" && (type === "answer" || type === "solution"));
+        const isClosed = collapsible && openStates && stateIndex < openStates.length
+          ? !openStates[stateIndex++]
+          : defaultClosed;
         if (isClosed) {
           out.push(`${"> ".repeat(quoteDepth)}[!${type}]${fold}${title ? ` ${title}` : ""}`);
           closedDepth = quoteDepth;
@@ -190,7 +218,9 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   if (!selection?.rangeCount || selection.isCollapsed) return null;
   const range=selection.getRangeAt(0).cloneRange();
   const startElement=elementAt(range.startContainer), endElement=elementAt(range.endContainer);
-  if (!startElement?.closest(".markdown-body,.live-document") || !endElement?.closest(".markdown-body,.live-document")) return null;
+  const startRoot=startElement?.closest(".markdown-body,.live-document");
+  if (!startElement || !startRoot || !endElement?.closest(".markdown-body,.live-document")) return null;
+  const ownerNoteId=(startElement.closest(".markdown-body[data-note-id]")??startRoot.querySelector(".markdown-body[data-note-id]"))?.getAttribute("data-note-id")||undefined;
   if (startElement.closest("textarea,input,.cm-editor") || endElement.closest("textarea,input,.cm-editor")) return null;
   if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties,.code-disclosure > summary,.cell-toolbar")) return "";
   const hiddenStart=outermostClosedDisclosureHidingPoint(range.startContainer,range.startOffset,"start");
@@ -250,7 +280,8 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     if(source!==undefined&&node.matches('[data-windowed-mounted="false"]')) {
       const from=Number(node.getAttribute('data-source-start')),to=Number(node.getAttribute('data-source-end'));
       if(Number.isFinite(from)&&Number.isFinite(to)&&to>from){
-        const stripped=stripClosedOffscreenCallouts(source.slice(from,to));
+        const noteId=node.closest<HTMLElement>(".markdown-body[data-note-id]")?.getAttribute("data-note-id")||ownerNoteId;
+        const stripped=stripClosedOffscreenCallouts(source.slice(from,to),resolveOffscreenCalloutStates(source,from,to,noteId));
         return stripped?`${stripped}\n\n`:"";
       }
     }
