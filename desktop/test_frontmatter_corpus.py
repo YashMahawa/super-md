@@ -5,40 +5,30 @@ import base64
 import hashlib
 import json
 import struct
+import sys
 import tempfile
 import unittest
 import zipfile
 import zlib
 from pathlib import Path
 
-try:
-    from . import documents
-    from .agent_documents import DocumentStore, _scan_read_only
-    from .agent_exports import (
-        AgentDocumentError,
-        _clean_markdown_images,
-        _contains_unsupported_diagrams,
-        _image_destinations,
-        _resolve_image_assets,
-        export_smd,
-        find_engine,
-    )
-    from .frontmatter import frontmatter_end, mask_frontmatter, strip_frontmatter
-    from .markdown_export import write_markdown_export, write_markdown_zip
-except ImportError:
-    import documents
-    from agent_documents import DocumentStore, _scan_read_only
-    from agent_exports import (
-        AgentDocumentError,
-        _clean_markdown_images,
-        _contains_unsupported_diagrams,
-        _image_destinations,
-        _resolve_image_assets,
-        export_smd,
-        find_engine,
-    )
-    from frontmatter import frontmatter_end, mask_frontmatter, strip_frontmatter
-    from markdown_export import write_markdown_export, write_markdown_zip
+DESKTOP_DIR = Path(__file__).resolve().parent
+if str(DESKTOP_DIR) not in sys.path:
+    sys.path.insert(0, str(DESKTOP_DIR))
+
+import documents
+from agent_documents import DocumentStore, _scan_read_only
+from agent_exports import (
+    AgentDocumentError,
+    _clean_markdown_images,
+    _contains_unsupported_diagrams,
+    _image_destinations,
+    _resolve_image_assets,
+    export_smd,
+    find_engine,
+)
+from frontmatter import frontmatter_end, mask_frontmatter, strip_frontmatter
+from markdown_export import write_markdown_export, write_markdown_zip
 
 REQUIRED_CATEGORIES = (
     "quoted-scalars",
@@ -48,7 +38,7 @@ REQUIRED_CATEGORIES = (
     "unicode-separators",
 )
 
-FIXTURES_DIR = Path(__file__).resolve().parent.parent / "test-fixtures"
+FIXTURES_DIR = DESKTOP_DIR.parent / "test-fixtures"
 CORPUS_PATH = FIXTURES_DIR / "frontmatter-corpus.json"
 CONFORMANCE_PATH = FIXTURES_DIR / "frontmatter-conformance.json"
 

@@ -3,7 +3,13 @@ import corpus from "../test-fixtures/frontmatter-corpus.json";
 import { compatibleMarkdown } from "./compatibleMarkdown";
 import { analyzeDocument } from "./documentAnalysis";
 import { imageRanges } from "./documentMedia";
-import { maskFrontmatter, parseFrontmatter, type DocumentMetadata, type YamlValue } from "./frontmatter";
+import {
+  frontmatterVisibleValueSpans,
+  maskFrontmatter,
+  parseFrontmatter,
+  type DocumentMetadata,
+  type YamlValue,
+} from "./frontmatter";
 import { prepareMarkdownExport } from "./markdownExport";
 import { normalizeMarkdownSource } from "./markdownSource";
 
@@ -95,6 +101,27 @@ function assertMaskInvariants(source: string, masked: string, endUtf16: number, 
   expect(masked.slice(endUtf16)).toBe(expectedBody);
 }
 
+function assertVisibleSpanInvariants(
+  source: string,
+  parsed: NonNullable<ReturnType<typeof parseFrontmatter>>,
+): ReturnType<typeof frontmatterVisibleValueSpans> {
+  const withSpans = parseFrontmatter(source, { includeSpans: true });
+  expect(withSpans).not.toBeNull();
+  expect(withSpans!.raw).toBe(parsed.raw);
+  expect(withSpans!.end).toBe(parsed.end);
+  expect(withSpans!.entries).toEqual(parsed.entries);
+  expect(withSpans!.properties).toEqual(parsed.properties);
+  const spans = frontmatterVisibleValueSpans(source);
+  expect(spans).toEqual(withSpans!.visibleSpans);
+  for (const span of spans) {
+    expect(span.start).toBeGreaterThanOrEqual(0);
+    expect(span.end).toBeGreaterThan(span.start);
+    expect(span.end).toBeLessThanOrEqual(parsed.end);
+    expect(source.slice(span.start, span.end).length).toBeGreaterThan(0);
+  }
+  return spans;
+}
+
 describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
   const sharedCases = corpus.sharedCases as SharedCorpusCase[];
   const divergences = corpus.divergences as DivergenceCorpusCase[];
@@ -157,6 +184,8 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
 
       if (!item.recognized) {
         expect(parsed).toBeNull();
+        expect(parseFrontmatter(item.source, { includeSpans: true })).toBeNull();
+        expect(frontmatterVisibleValueSpans(item.source)).toEqual([]);
         expect(masked).toBe(item.source);
         expect(item.endOffset.utf16).toBe(0);
         expect(item.body).toBe(item.source);
@@ -168,6 +197,7 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
         expect(item.source.slice(parsed!.end)).toBe(item.body);
         expect(parsed!.raw + item.body).toBe(item.source);
         assertMaskInvariants(item.source, masked, parsed!.end, item.body);
+        assertVisibleSpanInvariants(item.source, parsed!);
 
         for (const forbidden of item.maskedExcludes ?? []) {
           expect(masked).not.toContain(forbidden);
@@ -245,6 +275,8 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
 
       if (!entry.typescript.recognized) {
         expect(parsed).toBeNull();
+        expect(parseFrontmatter(entry.source, { includeSpans: true })).toBeNull();
+        expect(frontmatterVisibleValueSpans(entry.source)).toEqual([]);
         expect(masked).toBe(entry.source);
       } else {
         expect(parsed).not.toBeNull();
@@ -252,6 +284,11 @@ describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
         expect(parsed!.end).toBe(entry.typescript.endUtf16);
         expect(entry.source.slice(parsed!.end)).toBe(entry.typescript.body);
         assertMaskInvariants(entry.source, masked, parsed!.end, entry.typescript.body);
+        const spans = assertVisibleSpanInvariants(entry.source, parsed!);
+        if (entry.id === "divergence-quoted-key-nbsp-before-colon") {
+          expect(spans).toHaveLength(1);
+          expect(entry.source.slice(spans[0].start, spans[0].end)).toBe("NBSP Before Colon");
+        }
       }
 
       const companion = await prepareMarkdownExport(entry.source, "/workspace/note.md");
