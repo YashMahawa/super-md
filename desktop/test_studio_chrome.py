@@ -183,6 +183,9 @@ class StudioChromeTest(unittest.TestCase):
             self.studio.setting(key, raw)
             self.assertEqual(self.studio.settings[key], expected)
 
+        self.studio.setting("keepInBackground", "true")
+        self.studio.setting("keepInBackground", '"not-a-bool"')
+        self.assertIs(self.studio.settings["keepInBackground"], True)
         before_window = dict(self.studio.settings["window"])
         self.studio.setting("window", json.dumps({"width": 900, "height": 700, "maximized": True}))
         self.assertEqual(self.studio.settings["window"], before_window)

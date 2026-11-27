@@ -11,7 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QStandardPaths
 
 _PREFERRED_FONTS = ["Manrope", "Roboto", "Noto Sans", "Noto Serif", "JetBrains Mono", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]
-_BOOL_SETTINGS = frozenset({"restorePosition", "centerLock", "motion", "welcomed", "autosave", "checkUpdates", "autoUpdate", "spellCheck", "grammarCheck", "latexAutofix", "typewriterScroll", "desktopIntegration", "fullDocumentAccessibility"})
+_BOOL_SETTINGS = frozenset({"restorePosition", "centerLock", "motion", "welcomed", "autosave", "checkUpdates", "autoUpdate", "spellCheck", "grammarCheck", "latexAutofix", "typewriterScroll", "desktopIntegration", "fullDocumentAccessibility", "keepInBackground"})
 _FINITE_SETTINGS = frozenset({"size", "width", "widthPercent", "lineHeight", "normalZoom", "fullZoom"})
 _PATTERN_DEFAULTS = (("patternKind", ""), ("patternOpacity", -1), ("patternSize", 0), ("patternSpacing", 0))
 

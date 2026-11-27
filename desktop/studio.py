@@ -76,7 +76,7 @@ DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
-DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
+DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackground=False)
 
 def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
     """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
@@ -638,6 +638,7 @@ class Session(QObject):
         self.startup_windows = []
         self._pending_startup_windows = []
         self.quitting = False
+        self.update_installed = False
         self.locations = {}
         self.drafts = {}
         self.windows = {}
@@ -651,8 +652,14 @@ class Session(QObject):
         self.theme_restored = False
         self._load_theme_library()
         self.initial_recovery = []
+        settings_path = self.data / "settings.json"
+        stored_settings = None
+        can_persist_migration = not settings_path.exists()
         try:
-            stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(stored, dict) and isinstance(stored.get("settings"), dict):
+                stored_settings = stored["settings"]
+                can_persist_migration = True
             self.settings.update({k:v for k,v in stored["settings"].items() if k in DEFAULTS})
             if not stored["settings"].get("widthMigrated") and stored["settings"].get("widthPercent") == 80:
                 self.settings["widthPercent"] = 90  # 80% was the old default, not a choice.
@@ -660,12 +667,42 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
+        had_explicit_keep_in_background = isinstance(stored_settings, dict) and "keepInBackground" in stored_settings
+        fresh_service_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
+        migrated_keep_in_background = not had_explicit_keep_in_background and (
+            (isinstance(stored_settings, dict) and any(
+                stored_settings.get(key) is True
+                for key in ("agentAccessEnabled", "cloudAgentEnabled", "background", "backgroundEnabled")
+            ))
+            or (self.data / "agent-sessions").is_dir()
+            or (self.data / "agent-cloud.json").is_file()
+            or (
+                not fresh_service_log
+                and (
+                    (self.data / "background-service.log").is_file()
+                    or (self.data.name == "qt-studio" and (self.data.parent / "background-service.log").is_file())
+                )
+            )
+        )
         # Local MCP access and cloud relay reconnection are explicit, persisted
         # opt-ins; each desktop launch mints a fresh temporary loopback token.
         self.settings["agentAccessEnabled"] = self.settings.get("agentAccessEnabled") is True
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
+        self.settings["keepInBackground"] = (
+            stored_settings.get("keepInBackground") is True
+            if had_explicit_keep_in_background
+            else bool(migrated_keep_in_background)
+        )
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
+        if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
+            try:
+                atomic_write(
+                    settings_path,
+                    json.dumps({"settings": self.settings, "recent": self.recent, "pinned": self.pinned}, ensure_ascii=False).encode("utf-8"),
+                )
+            except OSError:
+                pass
         try:
             workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
             self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
@@ -883,6 +920,7 @@ class Studio(QObject):
         self.backgroundWriteCompleted.connect(self._complete_background_write)
         self.data = self.session.data
         self.settings = self.session.settings
+        self._defer_reader_activation = False
         self._agent_error = ""
         self._agent_cloud_error = ""
         self._agent_cloud_config_path = self.data / "agent-cloud.json"
@@ -2154,6 +2192,9 @@ class Studio(QObject):
                 bridge.stop()
                 self.settings["cloudAgentEnabled"] = False
                 self._agent_error = ""
+            background = getattr(self.session, "background", None)
+            if background is not None:
+                background._cli_started_agent_access = False
             self.settings["agentAccessEnabled"] = bool(enabled)
             self._preferences()
             self._emit(False)
@@ -2392,8 +2433,23 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def backgroundEnabled(self):
+        if getattr(self.session, "update_installed", False):
+            return False
         service=getattr(self.session,"background",None)
         return bool(service and service.enabled and not service.quitting)
+
+    @Slot(result=bool)
+    def hasOtherOpenWindows(self):
+        return any(
+            other is not self
+            and not other.retired
+            and (getattr(other, "host_window", None) is None or other.host_window.isVisible())
+            for other in self.session.windows.values()
+        )
+
+    @Property(bool,notify=changed)
+    def deferReaderActivation(self):
+        return bool(getattr(self, "_defer_reader_activation", False))
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -2512,18 +2568,22 @@ class Studio(QObject):
             if error:self.update_status='Update installation failed: '+error;return
             path,prepared_kind=prepared
             if prepared_kind=='appimage':
+                self.session.update_installed=True;self.session.changed.emit()
                 self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
             else:
                 opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
                 if isinstance(opened,tuple):opened=opened[0]
                 if not opened:
                     self.update_status='Could not open the verified installer. It is still available in Downloads.'
-                elif prepared_kind in ('deb','rpm'):
-                    self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
-                elif prepared_kind=='macos':
-                    self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
                 else:
-                    self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+                    self.session.update_installed=True;self.session.changed.emit()
+                    if prepared_kind in ('deb','rpm'):
+                        self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
+                    elif prepared_kind=='macos':
+                        self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
+                    else:
+                        self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+            self._emit(False)
         self._submit(prepare,done,False)
 
     def _can_move(self):
@@ -2760,7 +2820,10 @@ class Studio(QObject):
 
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
-        data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
+        persisted_settings = dict(self.settings)
+        if getattr(getattr(self.session, "background", None), "_cli_started_agent_access", False):
+            persisted_settings["agentAccessEnabled"] = False
+        data = json.dumps({"settings": persisted_settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
         self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 
@@ -3039,6 +3102,7 @@ class Studio(QObject):
         value,
         *,
         explicit,
+        background=False,
         activation_generation=None,
         completion_callback=None,
         batch_insert=None,
@@ -3053,14 +3117,14 @@ class Studio(QObject):
             self.openFolder(str(path))
             if completion_callback: completion_callback(None, "A folder cannot be opened as a document")
             return
-        if explicit and activation_generation is None:
+        if explicit and not background and activation_generation is None:
             self._activation_generation += 1
             activation_generation = self._activation_generation
         elif activation_generation is None:
             activation_generation = self._activation_generation
-        restoring = not explicit and str(path) in self._restoring_paths
+        restoring = not explicit and not background and str(path) in self._restoring_paths
         def activate_existing(target_tab):
-            if explicit and activation_generation == self._activation_generation:
+            if explicit and not background and activation_generation == self._activation_generation:
                 if should_activate_fn is None or should_activate_fn(target_tab):
                     if pending_heading:
                         target_tab["pendingHeading"] = pending_heading
@@ -3123,10 +3187,15 @@ class Studio(QObject):
                 keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
             if should_activate_fn is not None:
-                should_activate = bool(explicit and activation_generation == self._activation_generation and should_activate_fn(note))
+                should_activate = bool(
+                    not background
+                    and explicit
+                    and activation_generation == self._activation_generation
+                    and should_activate_fn(note)
+                )
             else:
-                should_activate = (explicit and activation_generation == self._activation_generation)
-            if restoring and activation_generation == self._activation_generation:
+                should_activate = (not background and explicit and activation_generation == self._activation_generation)
+            if restoring and not background and activation_generation == self._activation_generation:
                 target_active = self._startup_active or self.session.startup_active
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
             if should_activate:
@@ -3138,12 +3207,12 @@ class Studio(QObject):
             self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
             self._preferences(notify=False)
             self.recovery_timer.start(800)
-            emit_load = should_activate if (should_activate_fn is not None or explicit) else True
+            emit_load = False if background else (should_activate if (should_activate_fn is not None or explicit) else True)
             for window in list(self.session.windows.values()):
                 if window is self:
                     window._emit(emit_load)
                 else:
-                    window._emit()
+                    window._emit(False if background else True)
             if explicit and should_activate:
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(note, None)
@@ -3624,6 +3693,17 @@ class Studio(QObject):
             self.flush_operation = None
             self.workspaceSearchChanged.emit()
             return
+        bg = getattr(self.session, "background", None)
+        if (
+            self.flush_operation
+            and self.flush_operation["action"] == "close_window"
+            and bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        ):
+            self.resolveFlush("recover_close")
+            return
         self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window"))
 
     def _flush(self,action,target=""):
@@ -3632,13 +3712,29 @@ class Studio(QObject):
         if not self.ready or not self.tabs:
             self._after_flush(operation)
             return
-        if self.flush_operation and (self.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"): return
+        bg = getattr(self.session, "background", None)
+        hidden_cli_close = (
+            action == "close_window"
+            and bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        )
+        if self.flush_operation and not hidden_cli_close and (self.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"): return
         self.flush_operation = operation
-        self.flush_timer.start(5000)
+        self.flush_timer.start(250 if hidden_cli_close else 5000)
         self.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
 
     @Slot()
     def saveSafely(self): self._flush("save")
+
+    @Slot()
+    def ensureReaderProfile(self):
+        if getattr(self, "_defer_reader_activation", False):
+            self._defer_reader_activation = False
+        callback = getattr(self.session, "ensure_reader_profile", None)
+        if callable(callback):
+            callback()
 
     @Slot()
     def saveAsSafely(self): self._flush("save_as")
@@ -3659,7 +3755,10 @@ class Studio(QObject):
         operation,self.flush_operation = self.flush_operation,None
         self.flush_timer.stop()
         if not operation: return
-        if choice == "retry": self._flush(operation["action"],operation["target"])
+        if choice == "cancel" and operation["action"] == "close_window":
+            service = getattr(self.session, "background", None)
+            if service is not None: service.cancel_quit()
+        elif choice == "retry": self._flush(operation["action"],operation["target"])
         elif choice == "recover_close" and operation["action"] == "close_window":
             # Explicit emergency action: preserve the latest received drafts, not
             # a silent discard or a claim we can recover an unresponsive renderer.
@@ -3681,7 +3780,11 @@ class Studio(QObject):
     @Slot(str)
     def resolveConflict(self, choice):
         if choice == "cancel":
+            was_window = self.pending_close == "window"
             self.pending_close = ""
+            if was_window:
+                service = getattr(self.session, "background", None)
+                if service is not None: service.cancel_quit()
             return
         if choice == "save_as":
             self.saveAsSafely()
@@ -4277,6 +4380,14 @@ class Studio(QObject):
 
     @Slot(result=bool)
     def requestWindowClose(self):
+        bg = getattr(self.session, "background", None)
+        if (
+            bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        ):
+            return True
         dirty = next((t for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])), None)
         if dirty:
             self.pending_close = "window"
@@ -4287,7 +4398,13 @@ class Studio(QObject):
 
     @Slot(str)
     def resolveClose(self, choice):
-        if choice == "cancel": self.pending_close = ""; return
+        if choice == "cancel":
+            was_window = self.pending_close == "window"
+            self.pending_close = ""
+            if was_window:
+                service = getattr(self.session, "background", None)
+                if service is not None: service.cancel_quit()
+            return
         if choice == "save": self.save(); return
         if choice == "discard":
             # For a single-tab close, "discard" confirms closing the dirty
@@ -4673,7 +4790,7 @@ class Studio(QObject):
                 else:
                     metadata = self._agent_tab_result(result)
                     record.update(status="completed", **metadata)
-            self._open_note(resolved, explicit=not background, completion_callback=opened)
+            self._open_note(resolved, explicit=not background, background=background, completion_callback=opened)
             return {"status": "opening", "jobId": job_id, "path": resolved, "windowId": self.window_id,
                     "active": not background, "format": fmt}
         raise ValueError("Unsupported native document action")
