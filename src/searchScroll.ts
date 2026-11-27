@@ -350,3 +350,131 @@ export function scrollSearchMatchIntoView(options: {
   }
   scrollRectIntoSearchScroller(scroller, initialRect, readRect, mode);
 }
+
+const MANUAL_SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
+const SEARCH_SETTLE_WINDOW_MS = 1600;
+const SEARCH_SETTLE_MAX_MS = 3200;
+
+export interface SearchSettleHandle {
+  stop: () => void;
+  recordScrollerState: () => void;
+}
+
+export function startSearchSettle(
+  anchorHost: Element | null,
+  step: (verifyOnly?: boolean) => boolean | "realigned",
+  onStop?: () => void,
+): SearchSettleHandle | null {
+  const scroller = anchorHost?.matches(".android-reading,.reading-scroll")
+    ? (anchorHost as HTMLElement)
+    : anchorHost?.closest<HTMLElement>(".android-reading,.reading-scroll") ??
+      document.querySelector<HTMLElement>(".android-reading,.reading-scroll");
+  const eventHost = scroller ?? anchorHost;
+  if (!eventHost) return null;
+  let active = true, frame = 0, timer = 0, remainingFrames = 4, verifyFrames = 2, adjustGuard = 8;
+  let dirtyLayout = false, layoutMutating = false, mutatingQueued = false;
+  const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+  const startedAt = nowMs();
+  let recordedScrollTop = scroller?.scrollTop ?? 0, recordedScrollHeight = scroller?.scrollHeight ?? 0;
+  const recordScrollerState = () => {
+    if (scroller) { recordedScrollTop = scroller.scrollTop; recordedScrollHeight = scroller.scrollHeight; }
+  };
+  const inSearchUi = (target: EventTarget | null) => target instanceof Element && Boolean(target.closest(".reading-search"));
+  const stop = () => {
+    if (!active) return;
+    active = false; cancelAnimationFrame(frame); frame = 0;
+    window.clearTimeout(timer); observer?.disconnect();
+    eventHost.removeEventListener("supermd-window-change", onWindowChange);
+    scroller?.removeEventListener("scroll", onScroll);
+    window.removeEventListener("wheel", onUserGesture, { capture: true });
+    window.removeEventListener("touchstart", onUserGesture, { capture: true });
+    window.removeEventListener("touchmove", onUserGesture, { capture: true });
+    window.removeEventListener("pointerdown", onUserGesture, { capture: true });
+    window.removeEventListener("keydown", onKeyDown, { capture: true });
+    window.removeEventListener("supermd-goto-offset", stop);
+    onStop?.();
+  };
+  const armStopTimer = () => {
+    if (!active) return;
+    window.clearTimeout(timer);
+    const remainingCap = Math.max(0, SEARCH_SETTLE_MAX_MS - (nowMs() - startedAt));
+    if (remainingCap <= 0) { stop(); return; }
+    timer = window.setTimeout(stop, Math.min(SEARCH_SETTLE_WINDOW_MS, remainingCap));
+  };
+  const runPass = () => {
+    frame = 0;
+    if (!active) return;
+    const verifyOnly = remainingFrames <= 0 && !dirtyLayout;
+    dirtyLayout = false;
+    const prevScrollTop = scroller?.scrollTop ?? 0, prevScrollHeight = scroller?.scrollHeight ?? 0;
+    const result = step(verifyOnly);
+    if (!result) { stop(); return; }
+    recordScrollerState();
+    const heightChanged = Boolean(scroller && scroller.scrollHeight !== prevScrollHeight);
+    if (heightChanged) adjustGuard = 8;
+    const adjusted = Boolean(heightChanged || result === "realigned" || (scroller && Math.abs(scroller.scrollTop - prevScrollTop) > 0.5));
+    if (remainingFrames > 0) {
+      remainingFrames--;
+      if (adjusted) verifyFrames = 2;
+      frame = requestAnimationFrame(runPass);
+    } else if (adjusted && adjustGuard > 0) {
+      adjustGuard--; verifyFrames = 2; frame = requestAnimationFrame(runPass);
+    } else if (verifyFrames > 0) {
+      verifyFrames--;
+      if (verifyFrames > 0) frame = requestAnimationFrame(runPass);
+    }
+  };
+  const schedulePass = (fromLayoutChange = false) => {
+    if (!active) return;
+    if (fromLayoutChange) { dirtyLayout = true; verifyFrames = 2; adjustGuard = 8; }
+    if (!frame) frame = requestAnimationFrame(runPass);
+  };
+  const onUserGesture = (event: Event) => { if (!inSearchUi(event.target)) stop(); };
+  const onKeyDown = (event: KeyboardEvent) => { if (!inSearchUi(event.target) && MANUAL_SCROLL_KEYS.has(event.key)) stop(); };
+  const onWindowChange = () => {
+    if (!active) return;
+    layoutMutating = true;
+    if (!mutatingQueued) {
+      mutatingQueued = true;
+      queueMicrotask(() => { mutatingQueued = false; layoutMutating = false; if (active) recordScrollerState(); });
+    }
+    armStopTimer();
+    schedulePass(true);
+  };
+  const onScroll = () => {
+    if (!active || !scroller || layoutMutating) return;
+    if (scroller.scrollHeight !== recordedScrollHeight) { recordScrollerState(); armStopTimer(); schedulePass(true); return; }
+    if (Math.abs(scroller.scrollTop - recordedScrollTop) > 2) stop();
+  };
+  const page = scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body") ?? (eventHost instanceof HTMLElement ? eventHost : null);
+  const pageSpace = scroller?.querySelector<HTMLElement>(".document-page-space") ?? null;
+  const readPageHeight = (entry?: ResizeObserverEntry) =>
+    (entry && entry.target === page ? entry.borderBoxSize?.[0]?.blockSize ?? entry.contentRect.height : undefined) ?? page?.offsetHeight ?? page?.getBoundingClientRect().height ?? 0;
+  let lastPageHeight = readPageHeight();
+  const observer = (page || pageSpace) && typeof ResizeObserver !== "undefined"
+    ? new ResizeObserver((entries) => {
+        if (!active) return;
+        const nextHeight = readPageHeight(entries.find((e) => e.target === page));
+        const scrollerHeightChanged = Boolean(scroller && scroller.scrollHeight !== recordedScrollHeight);
+        if (Math.abs(nextHeight - lastPageHeight) <= 0.5 && !scrollerHeightChanged) return;
+        lastPageHeight = nextHeight;
+        if (scrollerHeightChanged) recordScrollerState();
+        armStopTimer();
+        schedulePass(true);
+      })
+    : undefined;
+  if (page && observer) observer.observe(page);
+  if (pageSpace && pageSpace !== page && observer) observer.observe(pageSpace);
+  eventHost.addEventListener("supermd-window-change", onWindowChange);
+  scroller?.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("wheel", onUserGesture, { capture: true, passive: true });
+  window.addEventListener("touchstart", onUserGesture, { capture: true, passive: true });
+  window.addEventListener("touchmove", onUserGesture, { capture: true, passive: true });
+  window.addEventListener("pointerdown", onUserGesture, { capture: true, passive: true });
+  window.addEventListener("keydown", onKeyDown, { capture: true, passive: true });
+  window.addEventListener("supermd-goto-offset", stop);
+  armStopTimer();
+  remainingFrames--;
+  frame = requestAnimationFrame(runPass);
+  return { stop, recordScrollerState };
+}

@@ -1,116 +1,114 @@
+import { z } from "zod";
+import {
+  assetIdSchema, assetListLimitSchema, assetListOffsetSchema, assetMimeTypeSchema, assetOffsetSchema, createSaveFormatSchema,
+  deviceIdSchema, diagramIdSchema, diagramListLimitSchema, documentContentField, documentViewSchema, exportFormatSchema,
+  headingIndexField, imageFormatSchema, isValidCompatPortableAssetName, isValidPortableAssetName, jobIdSchema,
+  MAX_ASSET_BASE64_CHARS, MAX_ASSET_BYTES, MAX_HEADING_BYTES, MAX_RELAY_OPTIONS_BYTES, MAX_RPC_QUERY_BYTES, MAX_TEXT_BYTES,
+  patchOperationsField, repairIndicesSchema, requestIdSchema, REVISION_RE, rpcViewportWidthSchema, SEARCH_BOOLEAN_FLAGS,
+  searchContextSchema, searchLimitSchema, tabIdField, textLimitSchema, textOffsetSchema, windowIdSchema, wireRevisionSchema,
+} from "./schemas.js";
+
+export { isValidCompatPortableAssetName, isValidPortableAssetName, MAX_TEXT_BYTES };
 export const ACTIONS = new Set(["list_devices", "list_tabs", "read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action", "document_action"]);
 export const DOCUMENT_ACTIONS = new Set(["create", "export", "export_chunk", "outline", "latexfix", "latex_review", "latex_apply", "open", "activate", "close", "save", "snapshot", "job_status", "get_context"]);
 export const MAX_FRAME_BYTES = 5 * 1024 * 1024;
-export const MAX_TEXT_BYTES = 64 * 1024;
 export const MAX_PENDING = 8;
 export const REQUEST_TIMEOUT_MS = 20_000;
 
 export type RpcRequest = {
-  requestId: string;
-  action: string;
-  deviceId?: string;
-  tabId?: string;
-  offset?: number;
-  limit?: number;
-  query?: string;
-  context?: number;
-  caseSensitive?: boolean;
-  wholeWord?: boolean;
-  regex?: boolean;
-  excludeDiagrams?: boolean;
-  expectedRevision?: string;
-  operations?: unknown[];
-  width?: number;
-  imageFormat?: "png" | "jpeg";
-  documentAction?: string;
-  content?: string;
-  options?: Record<string, unknown>;
-  diagramId?: string;
-  format?: string;
-  repairIndices?: number[];
-  jobId?: string;
-  heading?: string | number;
-  filename?: string;
-  windowId?: string;
-  assetId?: string;
-  mimeType?: string;
-  body?: string;
-  assetName?: string;
-  assetPath?: string;
-  assetAction?: "list" | "source" | "attach";
-  view?: "source" | "prose";
+  requestId: string; action: string; deviceId?: string; tabId?: string; offset?: number; limit?: number;
+  query?: string; context?: number; caseSensitive?: boolean; wholeWord?: boolean; regex?: boolean; excludeDiagrams?: boolean;
+  expectedRevision?: string; operations?: unknown[]; width?: number; imageFormat?: "png" | "jpeg"; documentAction?: string;
+  content?: string; options?: Record<string, unknown>; diagramId?: string; format?: string; repairIndices?: number[];
+  jobId?: string; heading?: string | number; filename?: string; windowId?: string; assetId?: string; mimeType?: string;
+  body?: string; assetName?: string; assetPath?: string; assetAction?: "list" | "source" | "attach"; view?: "source" | "prose";
 };
 
-function validPortableAssetBasename(value: string, maxLength: number): boolean {
-  const filename = value.startsWith("assets/") ? value.slice(7) : value;
-  return filename.length >= 1 && filename.length <= maxLength && filename !== "." && filename !== ".." && /^[A-Za-z0-9._-]+$/.test(filename);
-}
+const RPC_ALLOWED_KEYS = new Set([
+  "requestId", "action", "deviceId", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations",
+  "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId",
+  "heading", "filename", "windowId", "assetId", "mimeType", "body", "assetName", "assetPath", "assetAction", "view",
+  ...SEARCH_BOOLEAN_FLAGS,
+]);
+const nonNegativeInt = z.number().int().min(0);
+const exportChunkOffsetSchema = z.number().int().min(0).max(128 * 1024 * 1024);
+const exportChunkLimitSchema = z.number().int().min(1).max(524_288);
+const rpcHeadingSchema = z.union([headingIndexField.refine(Number.isSafeInteger), z.string().refine((s) => Buffer.byteLength(s) <= MAX_HEADING_BYTES)]);
+const rpcFilenameSchema = z.string().refine((s) => Buffer.byteLength(s) <= 256 && !/[\\/\0]/.test(s));
+const rpcAssetPathSchema = z.string().min(1).refine((s) => Buffer.byteLength(s) <= 4096 && !s.includes("\0"));
+const base64BodySchema = z.string().regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/).refine((s) => s.length % 4 === 0);
 
-export function isValidPortableAssetName(value: string): boolean {
-  return validPortableAssetBasename(value, 150);
-}
-
-export function isValidCompatPortableAssetName(value: string): boolean {
-  return validPortableAssetBasename(value, 159);
+function check<T>(schema: z.ZodType<T>, value: unknown, message: string): void {
+  if (value !== undefined && !schema.safeParse(value).success) throw new Error(message);
 }
 
 export function validateRpcRequest(value: unknown): RpcRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid RPC request");
   const r = value as Record<string, unknown>;
-  const allowed = new Set(["requestId", "action", "deviceId", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "windowId", "assetId", "mimeType", "body", "assetName", "assetPath", "assetAction", "view"]);
-  for (const key of ["caseSensitive", "wholeWord", "regex", "excludeDiagrams"]) {
-    allowed.add(key);
-    if (r[key] !== undefined && typeof r[key] !== "boolean") throw new Error(`Invalid ${key}`);
+  for (const key of SEARCH_BOOLEAN_FLAGS) check(z.boolean(), r[key], `Invalid ${key}`);
+  if (Object.keys(r).some((key) => !RPC_ALLOWED_KEYS.has(key))) throw new Error("Unknown RPC field");
+  if (!requestIdSchema.safeParse(r.requestId).success) throw new Error("Invalid requestId");
+  if (typeof r.action !== "string" || !ACTIONS.has(r.action)) throw new Error("Unsupported RPC action");
+  check(deviceIdSchema, r.deviceId, "Invalid device id");
+  check(tabIdField, r.tabId, "Invalid tab id");
+  if (r.query !== undefined && (typeof r.query !== "string" || r.query.length < 1 || Buffer.byteLength(r.query) > MAX_RPC_QUERY_BYTES)) throw new Error("Invalid search query");
+  check(wireRevisionSchema, r.expectedRevision, "Invalid expectedRevision");
+  if (r.operations !== undefined) {
+    if (!Array.isArray(r.operations) || r.operations.length === 0) throw new Error("patch_tab requires non-empty operations");
+    if (!patchOperationsField.safeParse(r.operations).success) throw new Error("Invalid patch operations");
+    if (Buffer.byteLength(JSON.stringify(r.operations)) > MAX_TEXT_BYTES) throw new Error("Text payload exceeds relay limit");
   }
-  if (Object.keys(r).some((key) => !allowed.has(key))) throw new Error("Unknown RPC field");
-  if (typeof r.requestId !== "string" || !/^[a-zA-Z0-9_-]{1,96}$/.test(r.requestId)) throw new Error("Invalid request id");
-  if (typeof r.action !== "string" || !ACTIONS.has(r.action)) throw new Error("Unsupported action");
-  if (r.deviceId !== undefined && (typeof r.deviceId !== "string" || !/^[0-9a-f-]{36}$/i.test(r.deviceId))) throw new Error("Invalid device id");
-  if (r.tabId !== undefined && (typeof r.tabId !== "string" || r.tabId.length > 512)) throw new Error("Invalid tab id");
-  if (r.query !== undefined && (typeof r.query !== "string" || Buffer.byteLength(r.query) > 2048)) throw new Error("Invalid query");
-  if (r.expectedRevision !== undefined && (typeof r.expectedRevision !== "string" || !/^[a-f0-9]{64}$/i.test(r.expectedRevision))) throw new Error("Invalid expected revision");
-  if (r.operations !== undefined && (!Array.isArray(r.operations) || r.operations.length > 100 || Buffer.byteLength(JSON.stringify(r.operations)) > MAX_TEXT_BYTES)) throw new Error("Invalid patch operations");
-  if (r.content !== undefined && (typeof r.content !== "string" || Buffer.byteLength(r.content) > MAX_TEXT_BYTES)) throw new Error("Invalid document content");
-  if (r.options !== undefined && (!r.options || typeof r.options !== "object" || Array.isArray(r.options) || Buffer.byteLength(JSON.stringify(r.options)) > 16 * 1024)) throw new Error("Invalid action options");
-  if (r.diagramId !== undefined && (typeof r.diagramId !== "string" || r.diagramId.length > 128)) throw new Error("Invalid diagram id");
-  if (r.format !== undefined && (typeof r.format !== "string" || !["pdf", "smd", "md", "mdzip"].includes(r.format))) throw new Error("Invalid export format");
-  if (r.repairIndices !== undefined && (!Array.isArray(r.repairIndices) || r.repairIndices.length > 40 || r.repairIndices.some((n) => !Number.isInteger(n) || n < 0))) throw new Error("Invalid repair indices");
-  if (r.jobId !== undefined && (typeof r.jobId !== "string" || r.jobId.length > 128)) throw new Error("Invalid job id");
-  if (r.heading !== undefined && !(typeof r.heading === "string" && Buffer.byteLength(r.heading) <= 512 || typeof r.heading === "number" && Number.isSafeInteger(r.heading) && r.heading >= 0)) throw new Error("Invalid heading");
-  if (r.filename !== undefined && (typeof r.filename !== "string" || Buffer.byteLength(r.filename) > 256 || /[\\/\0]/.test(r.filename))) throw new Error("Invalid filename");
-  if (r.windowId !== undefined && (typeof r.windowId !== "string" || r.windowId.length > 128)) throw new Error("Invalid window id");
-  if (r.assetId !== undefined && (typeof r.assetId !== "string" || r.assetId.length > 512)) throw new Error("Invalid asset id");
-  if (r.mimeType !== undefined && (typeof r.mimeType !== "string" || r.mimeType.length > 128)) throw new Error("Invalid media type");
-  if (r.body !== undefined && (typeof r.body !== "string" || Buffer.byteLength(r.body) > 1_400_000)) throw new Error("Media body is too large");
-  if (r.mimeType !== undefined && !["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml"].includes(String(r.mimeType).toLowerCase())) throw new Error("Unsupported image type");
-  if (r.assetName !== undefined && (typeof r.assetName !== "string" || Buffer.byteLength(r.assetName) > 256 || !(/^[a-f0-9]{64}$/.test(r.assetName) || isValidCompatPortableAssetName(r.assetName)))) throw new Error("Invalid asset name");
-  if (r.assetPath !== undefined && (typeof r.assetPath !== "string" || Buffer.byteLength(r.assetPath) > 4096 || r.assetPath.includes("\0"))) throw new Error("Invalid asset path");
-  if (r.view !== undefined && r.view !== "source" && r.view !== "prose") throw new Error("Invalid document view");
-  if (r.imageFormat !== undefined && (!(["render_tab", "get_diagram_image"] as string[]).includes(r.action as string) || (r.imageFormat !== "png" && r.imageFormat !== "jpeg"))) throw new Error("imageFormat is only valid as png or jpeg on viewport or diagram image captures");
-  for (const key of ["offset", "limit", "context", "width"] as const) {
-    const n = r[key];
-    if (n !== undefined && (typeof n !== "number" || !Number.isInteger(n) || n < 0)) throw new Error(`Invalid ${key}`);
+  if (r.content !== undefined) {
+    if (typeof r.content !== "string") throw new Error("Invalid document content");
+    if (!documentContentField.safeParse(r.content).success || Buffer.byteLength(r.content) > MAX_TEXT_BYTES) throw new Error("Text payload exceeds relay limit");
   }
+  if (r.options !== undefined && (!r.options || typeof r.options !== "object" || Array.isArray(r.options) || Buffer.byteLength(JSON.stringify(r.options)) > MAX_RELAY_OPTIONS_BYTES)) throw new Error("Invalid action options");
+  check(diagramIdSchema, r.diagramId, "Invalid diagramId");
+  check(exportFormatSchema, r.format, "Invalid export format");
+  check(repairIndicesSchema, r.repairIndices, "Invalid repair indices");
+  check(jobIdSchema, r.jobId, "Invalid job id");
+  check(rpcHeadingSchema, r.heading, "Invalid heading");
+  check(rpcFilenameSchema, r.filename, "Invalid filename");
+  check(windowIdSchema, r.windowId, "Invalid window id");
+  check(assetIdSchema, r.assetId, "Invalid asset id");
+  if (r.mimeType !== undefined) {
+    if (typeof r.mimeType !== "string" || r.mimeType.length > 128) throw new Error("Invalid media type");
+    check(assetMimeTypeSchema, r.mimeType.toLowerCase(), "Unsupported image type");
+  }
+  if (r.body !== undefined && (typeof r.body !== "string" || Buffer.byteLength(r.body) > MAX_ASSET_BASE64_CHARS)) throw new Error("Media body is too large");
+  if (r.assetName !== undefined && (typeof r.assetName !== "string" || Buffer.byteLength(r.assetName) > 256 || !(REVISION_RE.test(r.assetName) || isValidCompatPortableAssetName(r.assetName)))) throw new Error("Invalid asset name");
+  check(rpcAssetPathSchema, r.assetPath, "Invalid asset path");
+  check(documentViewSchema, r.view, "Invalid document view");
+  if (r.imageFormat !== undefined && (!(["render_tab", "get_diagram_image"] as string[]).includes(r.action) || !imageFormatSchema.safeParse(r.imageFormat).success)) throw new Error("imageFormat is only valid as png or jpeg on viewport or diagram image captures");
+  for (const key of ["offset", "limit", "context"] as const) check(nonNegativeInt, r[key], `Invalid ${key}`);
+  check(rpcViewportWidthSchema, r.width, "Width must be between 1 and 1600");
   const exportChunk = r.action === "document_action" && r.documentAction === "export_chunk";
-  if (typeof r.offset === "number" && r.offset > (exportChunk ? 128 * 1024 * 1024 : 20_000_000)) throw new Error("Offset is too large");
-  if (typeof r.limit === "number" && r.limit > (exportChunk ? 524288 : 12_000)) throw new Error("Limit is too large");
-  if (typeof r.context === "number" && r.context > 500) throw new Error("Context is too large");
-  if (typeof r.width === "number" && (r.width < 1 || r.width > 1600)) throw new Error("Width must be between 1 and 1600");
-  if (r.action === "document_action" && (typeof r.documentAction !== "string" || !DOCUMENT_ACTIONS.has(r.documentAction))) throw new Error("Unsupported document action");
+  check(exportChunk ? exportChunkOffsetSchema : textOffsetSchema, r.offset, "Offset is too large");
+  check(exportChunk ? exportChunkLimitSchema : textLimitSchema, r.limit, "Limit is too large");
+  check(searchContextSchema, r.context, "Context is too large");
+  if (r.action === "document_action") {
+    if (typeof r.documentAction !== "string" || !DOCUMENT_ACTIONS.has(r.documentAction)) throw new Error("Unsupported document action");
+    const opts = r.options as Record<string, unknown> | undefined;
+    if (r.documentAction === "create" || r.documentAction === "save") check(createSaveFormatSchema, r.format ?? opts?.format, "Create/save format must be md or smd");
+    if (r.documentAction === "outline") check(diagramListLimitSchema, r.limit ?? opts?.limit, "Outline limit must be between 1 and 80");
+  }
   if (["read_tab", "search_tab", "patch_tab", "render_tab", "list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action"].includes(r.action) && typeof r.tabId !== "string") throw new Error("tabId is required");
   if (["get_diagram", "get_diagram_image"].includes(r.action) && (!r.diagramId || !r.expectedRevision)) throw new Error("diagram requests need diagramId and expectedRevision");
-  if (r.action === "replace_tab_asset" && !r.expectedRevision) throw new Error("This action needs the current document revision");
-  if (r.action === "replace_tab_asset" && (!r.assetName || !r.assetPath)) throw new Error("Asset replacement requires assetName and assetPath");
+  if (r.action === "replace_tab_asset") {
+    if (!r.expectedRevision) throw new Error("This action needs the current document revision");
+    if (!r.assetName || !r.assetPath) throw new Error("Asset replacement requires assetName and assetPath");
+  }
   if (r.action === "asset_action") {
     if (!r.expectedRevision) throw new Error("Asset actions need the current document revision");
     if (!["list", "source", "attach"].includes(String(r.assetAction))) throw new Error("Unsupported asset action");
     if (r.assetAction === "source" && !r.assetName) throw new Error("Asset source requires assetName");
-    if (r.assetAction === "list" && ((r.offset !== undefined && (!Number.isInteger(r.offset) || Number(r.offset) > 512)) || (r.limit !== undefined && (!Number.isInteger(r.limit) || Number(r.limit) < 1 || Number(r.limit) > 50)))) throw new Error("Invalid asset page");
+    if (r.assetAction === "source") check(assetOffsetSchema, r.offset, "Offset is too large");
+    if (r.assetAction === "list") { check(assetListOffsetSchema, r.offset, "Invalid asset page"); check(assetListLimitSchema, r.limit, "Invalid asset page"); }
     if (r.assetAction === "attach" && (!r.assetName || !r.mimeType || !r.body)) throw new Error("Attaching an asset requires assetName, mimeType and body");
     if (r.body !== undefined) {
-      if (typeof r.body !== "string" || r.body.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(r.body)) throw new Error("Media body must be base64");
-      const bytes = Buffer.from(r.body, "base64");
-      if (bytes.length < 1 || bytes.length > 1_048_576) throw new Error("Media body must be at most 1 MiB");
+      check(base64BodySchema, r.body, "Media body must be base64");
+      const bytes = Buffer.from(r.body as string, "base64");
+      if (bytes.length < 1 || bytes.length > MAX_ASSET_BYTES) throw new Error("Media body must be at most 1 MiB");
     }
     if (r.assetAction === "attach" && (typeof r.assetName !== "string" || !isValidPortableAssetName(r.assetName))) throw new Error("Invalid new asset name");
   }
@@ -118,9 +116,13 @@ export function validateRpcRequest(value: unknown): RpcRequest {
   if (r.action === "document_action" && ["job_status", "export_chunk"].includes(String(r.documentAction)) && typeof r.jobId !== "string") throw new Error("This action requires jobId");
   if (r.action === "document_action" && ["save", "close", "export", "latex_apply"].includes(String(r.documentAction)) && !r.expectedRevision) throw new Error("This document action requires expectedRevision");
   if (r.content !== undefined && !(r.action === "document_action" && r.documentAction === "create")) throw new Error("Document content is only accepted for create");
-  if (r.action === "list_diagrams" && r.limit !== undefined && (Number(r.limit) < 1 || Number(r.limit) > 80)) throw new Error("Diagram list limit must be between 1 and 80");
-  if (r.action === "search_tab" && r.limit !== undefined && (Number(r.limit) < 1 || Number(r.limit) > 25)) throw new Error("Search limit must be between 1 and 25");
-  if (r.action === "patch_tab" && (!r.expectedRevision || !r.operations)) throw new Error("Patch requires expectedRevision and operations");
+  if (r.operations !== undefined && r.action !== "patch_tab") throw new Error("operations is only accepted for patch_tab");
+  if (r.action === "list_diagrams") check(diagramListLimitSchema, r.limit, "Diagram list limit must be between 1 and 80");
+  if (r.action === "search_tab") check(searchLimitSchema, r.limit, "Search limit must be between 1 and 25");
+  if (r.action === "patch_tab") {
+    if (!r.expectedRevision) throw new Error("Patch requires expectedRevision and operations");
+    if (!r.operations) throw new Error("patch_tab requires non-empty operations");
+  }
   return r as RpcRequest;
 }
 
