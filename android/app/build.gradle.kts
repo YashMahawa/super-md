@@ -1,4 +1,27 @@
+import java.util.Properties
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.process.CommandLineArgumentProvider
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose"); id("com.chaquo.python") }
+val robolectricSdkConfigs = listOf("8.0.0_r4-robolectric-r1-i7", "9-robolectric-4913185-2-i7", "13-robolectric-9030017-i7", "15-robolectric-12650502-i7").associateWith { version ->
+    configurations.detachedConfiguration(dependencies.create("org.robolectric:android-all-instrumented:$version")).apply { isTransitive = false }
+}
+val robolectricDepsProps = layout.buildDirectory.file("generated/robolectric/robolectric-deps.properties")
+val prepareRobolectricSdkProperties by tasks.registering {
+    robolectricSdkConfigs.forEach { (version, config) ->
+        inputs.files(config).withPropertyName("robolectricSdk_$version").withPathSensitivity(PathSensitivity.NONE)
+    }
+    outputs.file(robolectricDepsProps)
+    val resolvedFiles = robolectricSdkConfigs.mapValues { (_, config) -> config.elements }
+    doLast {
+        val props = Properties()
+        for ((version, elements) in resolvedFiles) {
+            props["org.robolectric:android-all-instrumented:$version"] = elements.get().single().asFile.absolutePath
+        }
+        val outFile = robolectricDepsProps.get().asFile
+        outFile.parentFile.mkdirs()
+        outFile.outputStream().use { props.store(it, null) }
+    }
+}
 android {
     namespace = "dev.supermd.studio"
     compileSdk { version = release(37) }
@@ -21,7 +44,15 @@ android {
     // Android extracts them at installation, rather than inflating APK size.
     packaging { jniLibs { useLegacyPackaging = true }; resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
     lint { error += "ObsoleteSdkInt" }
-    testOptions { unitTests.isIncludeAndroidResources = true }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all {
+            it.dependsOn(prepareRobolectricSdkProperties)
+            it.jvmArgumentProviders.add(CommandLineArgumentProvider {
+                listOf("-Drobolectric-deps.properties=${robolectricDepsProps.get().asFile.absolutePath}")
+            })
+        }
+    }
 }
 kotlin { jvmToolchain(17) }
 chaquopy { defaultConfig { version = "3.13"; System.getenv("SUPERMD_BUILD_PYTHON")?.let { buildPython(it) }; pip { install("numpy"); install("matplotlib==3.8.4") } } }
