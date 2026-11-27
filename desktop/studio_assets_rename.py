@@ -533,7 +533,7 @@ def rename_entry(
         return
     for win in _session_windows(studio_obj):
         for tab in win.tabs:
-            if tab["id"] in win.saving and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
+            if (tab["id"] in getattr(win, "saving", ()) or tab["id"] in getattr(win, "_staging_tabs", ())) and folder_ops.matches_path_prefix(tab["path"], str(before), is_directory=is_dir):
                 return _fail_message(studio_obj, "Wait for the current save to finish.")
     _dispatch_rename(
         studio_obj, before, after, final_name, is_dir=is_dir,
@@ -549,7 +549,7 @@ def rename_note(
     rename_fn: Callable[[Path, Path], None] | None = None,
 ) -> None:
     tab = next((t for t in studio_obj.tabs if t["id"] == note_id), None)
-    if not tab or note_id in getattr(studio_obj, "saving", ()):
+    if not tab or note_id in getattr(studio_obj, "saving", ()) or note_id in getattr(studio_obj, "_staging_tabs", ()):
         return
     try:
         has_saved = bool(tab.get("path"))

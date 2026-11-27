@@ -1,12 +1,14 @@
 """Vault-free workspace note link resolution with bounded, cached in-memory scanning."""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
 import threading
 import time
 import urllib.parse
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -25,6 +27,7 @@ _MACOS_MAXPATHLEN = 1024
 MAX_SCAN_FILES = 8_000
 MAX_SCAN_DIRS = 2_500
 MAX_SCAN_DEPTH = 16
+MAX_CACHED_WORKSPACES = 16
 CACHE_TTL_SECONDS = 5.0
 
 
@@ -205,7 +208,7 @@ def _verify_exact_on_disk_path(boundary: Path, candidate: Path) -> bool:
     return current.is_file()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class IndexedNote:
     path: Path
     rel_posix: str
@@ -219,15 +222,117 @@ class IndexedNote:
     ext_rank: int
 
 
-@dataclass(frozen=True)
+_SUBSECOND_RACY_WINDOW_NS = 100_000_000
+_COARSE_RACY_WINDOW_NS = 2_000_000_000
+_RACY_KIND_DIR = 1
+_RACY_KIND_NOTE = 2
+_MASK_128 = (1 << 128) - 1
+_EMPTY_RACY_FINGERPRINT = b""
+
+
+def _racy_window_ns(mtime_ns: int, ctime_ns: int) -> int:
+    if mtime_ns % 1_000_000_000 == 0 and ctime_ns % 1_000_000_000 == 0:
+        return _COARSE_RACY_WINDOW_NS
+    return _SUBSECOND_RACY_WINDOW_NS
+
+
+def _has_note_extension_fast(name: str) -> bool:
+    dot = name.rfind(".")
+    return dot > 0 and name[dot:].lower() in _EXTENSION_PRIORITY
+
+
+def _classify_racy_index_entry(entry: os.DirEntry[str], *, allow_subdirs: bool) -> int | None:
+    name = entry.name
+    if not name or name.startswith("."):
+        return None
+    try:
+        if entry.is_symlink():
+            return None
+        if entry.is_dir(follow_symlinks=False):
+            return _RACY_KIND_DIR if allow_subdirs else None
+        if not _has_note_extension_fast(name):
+            return None
+        if entry.is_file(follow_symlinks=False):
+            return _RACY_KIND_NOTE
+    except OSError:
+        return None
+    return None
+
+
+def _hash_racy_index_entry(name: str, kind: int) -> int:
+    digest = hashlib.blake2b(
+        name.encode("utf-8", "surrogatepass"),
+        digest_size=16,
+        person=b"smdir\x01" if kind == _RACY_KIND_DIR else b"smfil\x02",
+    ).digest()
+    return int.from_bytes(digest, "little")
+
+
+def _finalize_racy_fingerprint(count: int, acc_sum: int, acc_xor: int) -> bytes:
+    if count == 0:
+        return _EMPTY_RACY_FINGERPRINT
+    payload = count.to_bytes(8, "little") + acc_sum.to_bytes(16, "little") + acc_xor.to_bytes(16, "little")
+    return hashlib.blake2b(payload, digest_size=16, person=b"smfin\x00").digest()
+
+
+def _fingerprint_racy_entries(
+    entries: Iterable[os.DirEntry[str]],
+    *,
+    allow_subdirs: bool = True,
+) -> bytes:
+    count = 0
+    acc_sum = 0
+    acc_xor = 0
+    for entry in entries:
+        kind = _classify_racy_index_entry(entry, allow_subdirs=allow_subdirs)
+        if kind is None:
+            continue
+        value = _hash_racy_index_entry(entry.name, kind)
+        acc_sum = (acc_sum + value) & _MASK_128
+        acc_xor ^= value
+        count += 1
+    return _finalize_racy_fingerprint(count, acc_sum, acc_xor)
+
+
+def _scan_index_candidates(
+    directory: Path,
+    *,
+    allow_subdirs: bool,
+    capture_racy_fingerprint: bool,
+) -> tuple[list[os.DirEntry[str]], bytes | None]:
+    candidates: list[os.DirEntry[str]] = []
+    count = 0
+    acc_sum = 0
+    acc_xor = 0
+    with os.scandir(directory) as iterator:
+        for entry in iterator:
+            kind = _classify_racy_index_entry(entry, allow_subdirs=allow_subdirs)
+            if kind is None:
+                continue
+            candidates.append(entry)
+            if capture_racy_fingerprint:
+                value = _hash_racy_index_entry(entry.name, kind)
+                acc_sum = (acc_sum + value) & _MASK_128
+                acc_xor ^= value
+                count += 1
+    candidates.sort(key=lambda e: (e.name.casefold(), e.name))
+    fingerprint = _finalize_racy_fingerprint(count, acc_sum, acc_xor) if capture_racy_fingerprint else None
+    return candidates, fingerprint
+
+
+@dataclass(frozen=True, slots=True)
 class _DirStamp:
     path: Path
     mtime_ns: int
     ctime_ns: int
+    size: int
+    nlink: int
     file_id: tuple[int, int] | None
+    allow_subdirs: bool = True
+    racy_fingerprint: bytes | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class _CachedScan:
     root: Path
     root_fold: str
@@ -241,32 +346,90 @@ class _CachedScan:
 class WorkspaceLinkCache:
     """Thread-safe bounded in-memory note index. Writes zero files to disk."""
 
-    def __init__(self, *, max_files: int = MAX_SCAN_FILES, max_dirs: int = MAX_SCAN_DIRS,
-                 max_depth: int = MAX_SCAN_DEPTH, ttl_seconds: float = CACHE_TTL_SECONDS):
+    def __init__(
+        self,
+        *,
+        max_files: int = MAX_SCAN_FILES,
+        max_dirs: int = MAX_SCAN_DIRS,
+        max_depth: int = MAX_SCAN_DEPTH,
+        max_workspaces: int = MAX_CACHED_WORKSPACES,
+        ttl_seconds: float = CACHE_TTL_SECONDS,
+    ):
         self.max_files = max_files
         self.max_dirs = max_dirs
         self.max_depth = max_depth
+        self.max_workspaces = max_workspaces
         self.ttl_seconds = ttl_seconds
         self._lock = threading.Lock()
         self._entries: dict[str, _CachedScan] = {}
+        self._invalidation_epoch = 0
 
-    def _is_fresh(self, cached: _CachedScan, now: float) -> bool:
-        if (now - cached.scanned_at) > self.ttl_seconds:
-            return False
-        for stamp in cached.dir_stamps:
+    def _validate_stamps(
+        self,
+        dir_stamps: tuple[_DirStamp, ...],
+        scanned_at: float,
+        now: float,
+    ) -> tuple[bool, tuple[_DirStamp, ...] | None]:
+        elapsed_seconds = now - scanned_at
+        if elapsed_seconds > self.ttl_seconds:
+            return False, None
+        elapsed_since_scan_ns = elapsed_seconds * 1_000_000_000
+        check_wall_ns: int | None = None
+        cleaned_stamps: list[_DirStamp] | None = None
+        for idx, stamp in enumerate(dir_stamps):
             try:
                 st = stamp.path.stat(follow_symlinks=False)
             except OSError:
-                return False
-            if st.st_mtime_ns != stamp.mtime_ns or st.st_ctime_ns != stamp.ctime_ns:
-                return False
+                return False, None
+            if (
+                st.st_mtime_ns != stamp.mtime_ns
+                or st.st_ctime_ns != stamp.ctime_ns
+                or st.st_size != stamp.size
+                or st.st_nlink != stamp.nlink
+            ):
+                return False, None
             if stamp.file_id is not None and _stat_identity(st) != stamp.file_id:
-                return False
-        return True
+                return False, None
+            if stamp.racy_fingerprint is not None:
+                if check_wall_ns is None:
+                    check_wall_ns = time.time_ns()
+                try:
+                    with os.scandir(stamp.path) as iterator:
+                        live_fingerprint = _fingerprint_racy_entries(iterator, allow_subdirs=stamp.allow_subdirs)
+                except OSError:
+                    return False, None
+                if live_fingerprint != stamp.racy_fingerprint:
+                    return False, None
+                window_ns = _racy_window_ns(stamp.mtime_ns, stamp.ctime_ns)
+                if (
+                    elapsed_since_scan_ns > window_ns
+                    and check_wall_ns - stamp.mtime_ns > window_ns
+                    and check_wall_ns - stamp.ctime_ns > window_ns
+                ):
+                    if cleaned_stamps is None:
+                        cleaned_stamps = list(dir_stamps)
+                    cleaned_stamps[idx] = _DirStamp(
+                        path=stamp.path,
+                        mtime_ns=stamp.mtime_ns,
+                        ctime_ns=stamp.ctime_ns,
+                        size=stamp.size,
+                        nlink=stamp.nlink,
+                        file_id=stamp.file_id,
+                        allow_subdirs=stamp.allow_subdirs,
+                        racy_fingerprint=None,
+                    )
+        return True, (tuple(cleaned_stamps) if cleaned_stamps is not None else None)
+
+    def _is_fresh(self, cached: _CachedScan, now: float) -> bool:
+        fresh, settled_stamps = self._validate_stamps(cached.dir_stamps, cached.scanned_at, now)
+        if fresh and settled_stamps is not None:
+            cached.dir_stamps = settled_stamps
+        return fresh
 
     def invalidate(self, folder: str | os.PathLike[str] | None = None) -> None:
         if folder is None or not str(folder):
             with self._lock:
+                self._invalidation_epoch += 1
                 self._entries.clear()
             return
 
@@ -281,6 +444,7 @@ class WorkspaceLinkCache:
             target_id = _path_identity(Path(os.path.abspath(Path(folder).expanduser())), follow_symlinks=True)
 
         with self._lock:
+            self._invalidation_epoch += 1
             stale_keys = [
                 key
                 for key, snap in self._entries.items()
@@ -310,39 +474,77 @@ class WorkspaceLinkCache:
         root_id = _stat_identity(root_stat)
 
         with self._lock:
+            epoch_before = self._invalidation_epoch
             cached = self._entries.get(root_fold)
             if cached is None and root_id is not None:
                 cached = next((item for item in self._entries.values() if item.root_id == root_id), None)
-            if (
-                cached is not None
-                and os.fspath(cached.root) == os.fspath(boundary_path)
-                and self._is_fresh(cached, now)
-            ):
-                return cached.entries
+            if cached is not None and os.fspath(cached.root) == os.fspath(boundary_path):
+                cached_stamps = cached.dir_stamps
+                cached_scanned_at = cached.scanned_at
+                cached_entries = cached.entries
+            else:
+                cached = None
+                cached_stamps = ()
+                cached_scanned_at = 0.0
+                cached_entries = ()
 
+        if cached is not None:
+            fresh, settled_stamps = self._validate_stamps(cached_stamps, cached_scanned_at, now)
+            if fresh:
+                with self._lock:
+                    current = self._entries.get(root_fold)
+                    if current is None and root_id is not None:
+                        current = next((item for item in self._entries.values() if item.root_id == root_id), None)
+                    if current is cached and self._invalidation_epoch == epoch_before:
+                        if settled_stamps is not None and cached.dir_stamps is cached_stamps:
+                            cached.dir_stamps = settled_stamps
+                        if root_fold in self._entries and len(self._entries) > 1:
+                            self._entries[root_fold] = self._entries.pop(root_fold)
+                        return cached_entries
+                    epoch_before = self._invalidation_epoch
+
+        max_dirs = max(0, self.max_dirs)
+        max_files = max(0, self.max_files)
         collected: list[IndexedNote] = []
         dir_stamps: list[_DirStamp] = []
         visited_dirs = 0
         truncated = False
+        scan_started_wall_ns = time.time_ns()
         stack: list[tuple[Path, str, int]] = [(boundary_path, "", 0)]
 
         while stack:
             current_dir, rel_prefix, depth = stack.pop()
             visited_dirs += 1
-            if visited_dirs > self.max_dirs:
+            if visited_dirs > max_dirs:
                 truncated = True
                 break
+            allow_subdirs = depth + 1 <= self.max_depth
             try:
                 dir_stat = current_dir.stat(follow_symlinks=False)
-                with os.scandir(current_dir) as iterator:
-                    dir_entries = sorted(iterator, key=lambda e: (e.name.casefold(), e.name))
+                dir_wall_ns = time.time_ns()
+                window_ns = _racy_window_ns(dir_stat.st_mtime_ns, dir_stat.st_ctime_ns)
+                is_racy = (
+                    abs(dir_wall_ns - dir_stat.st_mtime_ns) <= window_ns
+                    or abs(dir_wall_ns - dir_stat.st_ctime_ns) <= window_ns
+                    or abs(scan_started_wall_ns - dir_stat.st_mtime_ns) <= window_ns
+                    or abs(scan_started_wall_ns - dir_stat.st_ctime_ns) <= window_ns
+                )
+                dir_entries, racy_fingerprint = _scan_index_candidates(
+                    current_dir,
+                    allow_subdirs=allow_subdirs,
+                    capture_racy_fingerprint=is_racy,
+                )
             except OSError:
                 continue
             dir_stamps.append(_DirStamp(
                 path=current_dir,
                 mtime_ns=dir_stat.st_mtime_ns,
                 ctime_ns=dir_stat.st_ctime_ns,
+                size=dir_stat.st_size,
+                nlink=dir_stat.st_nlink,
                 file_id=_stat_identity(dir_stat),
+                allow_subdirs=allow_subdirs,
+                racy_fingerprint=racy_fingerprint,
             ))
 
             subdirs: list[tuple[Path, str, int]] = []
@@ -369,7 +571,7 @@ class WorkspaceLinkCache:
                 if is_dir:
                     subdirs.append((child_path, rel_posix, depth + 1))
                 elif ext_rank is not None:
-                    if len(collected) >= self.max_files:
+                    if len(collected) >= max_files:
                         truncated = True
                         break
                     stem = name[:-len(suffix)] if suffix else name
@@ -400,18 +602,22 @@ class WorkspaceLinkCache:
             entries=tuple(collected),
             truncated=truncated,
         )
+        max_workspaces = max(0, self.max_workspaces)
         with self._lock:
-            if root_id is not None:
-                duplicate_keys = [
-                    existing_key
-                    for existing_key, existing in self._entries.items()
-                    if existing_key != root_fold and existing.root_id == root_id
-                ]
-                for existing_key in duplicate_keys:
-                    self._entries.pop(existing_key, None)
-            while len(self._entries) >= 16 and root_fold not in self._entries:
-                self._entries.pop(next(iter(self._entries)))
-            self._entries[root_fold] = snapshot
+            if self._invalidation_epoch == epoch_before and max_workspaces > 0:
+                if root_id is not None:
+                    duplicate_keys = [
+                        existing_key
+                        for existing_key, existing in self._entries.items()
+                        if existing_key != root_fold and existing.root_id == root_id
+                    ]
+                    for existing_key in duplicate_keys:
+                        self._entries.pop(existing_key, None)
+                if root_fold in self._entries:
+                    self._entries.pop(root_fold, None)
+                while len(self._entries) >= max_workspaces:
+                    self._entries.pop(next(iter(self._entries)))
+                self._entries[root_fold] = snapshot
         return snapshot.entries
 
 
