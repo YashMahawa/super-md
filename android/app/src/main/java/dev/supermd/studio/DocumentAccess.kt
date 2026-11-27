@@ -30,6 +30,17 @@ internal fun isDocumentAccessFailure(error: Throwable): Boolean = generateSequen
     .take(16).any { it is SecurityException || it is ErrnoException && it.errno in listOf(OsConstants.EACCES, OsConstants.EPERM) }
 
 /** Grants apply to URIs, not filenames. A tree URI and a plain URI can identify the same document. */
+internal fun canonicalDocumentKey(uri: Uri): String {
+    if (uri.scheme == "content") {
+        val authority = uri.authority
+        if (!authority.isNullOrEmpty()) {
+            val docId = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull()
+            if (!docId.isNullOrEmpty()) return "content-doc:$authority:$docId"
+        }
+    }
+    return "uri:$uri"
+}
+
 internal fun sameDocument(left: Uri, right: Uri): Boolean {
     if (left == right) return true
     if (left.scheme != "content" || right.scheme != "content" || left.authority != right.authority) return false
@@ -129,8 +140,8 @@ internal class DocumentAccess(
 
     fun hasReadGrant(
         uri: Uri,
-        activeFolderUri: Uri? = null,
-        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = null,
+        activeFolderUri: Uri? = activeFolderUriProvider?.invoke(),
+        isConfirmedTreeChild: ((treeUri: Uri, documentId: String) -> Boolean)? = isConfirmedTreeChildProvider,
     ): Boolean = when (val access = resolveReadAccess(uri, activeFolderUri, isConfirmedTreeChild)) {
         is SafReadAccess.InGrantedTree,
         is SafReadAccess.StandaloneDocument -> true

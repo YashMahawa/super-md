@@ -6,17 +6,31 @@ MenuItem {
     id: item
     property var colors: studio.palette
     property bool actionVisible: true
+    property string shortcutText: ""
+    readonly property bool hasShortcutHint: shortcutText.length > 0 && shortcutText !== "Disabled"
     visible: actionVisible
     hoverEnabled: true
     implicitHeight: actionVisible ? 42 : 0
     font.family: "Noto Sans"
     font.pixelSize: 14
     leftPadding: 12
-    rightPadding: 12
+    rightPadding: hasShortcutHint ? shortcutHintLabel.implicitWidth + 24 : 12
     Material.foreground: enabled ? colors.text : colors.muted
     icon.color: Material.foreground
     icon.width: 22
     icon.height: 22
+    Label {
+        id: shortcutHintLabel
+        objectName: "menuShortcutHint"
+        visible: item.hasShortcutHint
+        text: item.hasShortcutHint ? item.shortcutText : ""
+        anchors.right: parent.right
+        anchors.rightMargin: 12
+        anchors.verticalCenter: parent.verticalCenter
+        color: item.colors.muted
+        font.family: "Noto Sans"
+        font.pixelSize: 12
+    }
     background: Rectangle {
         radius: 10
         antialiasing: true

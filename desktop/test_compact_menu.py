@@ -115,19 +115,66 @@ ApplicationWindow {
             self.window.setProperty("width", width)
             QTest.qWait(40)
             self.assertTrue(button.property("visible"), f"More button must stay visible at width={width}")
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
             QTest.qWait(80)
             self.assertTrue(reopen.property("visible"), f"Reopen closed tab must be visible at width={width}")
             self.assertEqual(reopen.property("text"), "Reopen closed tab")
             self.assertTrue(save_as.property("visible"), f"Save as must be visible at width={width}")
             self.assertEqual(save_as.property("text"), "Save as")
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, reopen.mapToScene(QPointF(60, reopen.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, reopen.mapToScene(QPointF(60, reopen.height()/2)).toPoint())
             QTest.qWait(40)
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, button.mapToScene(QPointF(button.width()/2, button.height()/2)).toPoint())
             QTest.qWait(80)
-            QTest.mouseClick(self.window, Qt.LeftButton, Qt.NoModifier, save_as.mapToScene(QPointF(60, save_as.height()/2)).toPoint())
+            QTest.mouseClick(self.window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, save_as.mapToScene(QPointF(60, save_as.height()/2)).toPoint())
             QTest.qWait(40)
         self.assertEqual(self.palette.reopened, 2)
         self.assertEqual(self.palette.saved_as, 2)
+
+    def test_overflow_menu_items_display_shortcut_hints_when_configured(self):
+        engine = QQmlEngine()
+        palette = CompactMenuPalette()
+        engine.rootContext().setContextProperty("studio", palette)
+        component = QQmlComponent(engine)
+        code = '''
+import QtQuick
+import QtQuick.Controls
+ApplicationWindow {
+    id: window
+    width: 840; height: 480; visible: true
+    property int contextMenuCount: 0
+    property int modalDialogCount: 0
+    property var shortcutLabels: ({
+        reopen_tab: "Ctrl+Shift+T",
+        save_as: "Disabled",
+        search_folder: "Ctrl+Shift+F"
+    })
+    function showExport(sharing) {}
+    function openMenu() { noteActions.popup() }
+    Item { x: window.width - 78; y: 64; width: 66; height: 54
+        %s
+    }
+}
+''' % compact_source()
+        component.setData(code.encode(), QUrl.fromLocalFile(str(QML_DIR / "compact-shortcuts-test.qml")))
+        self.assertFalse(component.isError(), str(component.errors()))
+        win = component.create()
+        self.assertIsNotNone(win)
+        try:
+            QTest.qWait(40)
+            QMetaObject.invokeMethod(win, "openMenu")
+            QTest.qWait(80)
+            reopen = win.findChild(QObject, "reopenClosedTabAction")
+            save_as = win.findChild(QObject, "saveAsAction")
+            search = win.findChild(QObject, "compactSearchFolderAction")
+            self.assertEqual(reopen.property("text"), "Reopen closed tab")
+            self.assertTrue(reopen.property("hasShortcutHint"))
+            self.assertEqual(reopen.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Shift+T")
+            self.assertFalse(save_as.property("hasShortcutHint"), "Disabled shortcuts must not render 'Disabled' in menus")
+            self.assertTrue(search.property("hasShortcutHint"))
+            self.assertEqual(search.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Shift+F")
+        finally:
+            win.close(); win.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            engine.deleteLater(); self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 if __name__=="__main__":unittest.main()

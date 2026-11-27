@@ -69,4 +69,43 @@ class ReaderFlushBarrierTest {
         assertFalse(barrier.complete("timeout-token", "note-1", "native", "native", null))
         assertFalse(request.result.await())
     }
+
+    @Test fun flushStatusDistinguishesActiveNoteHandoffFromGenuineFailures() = runBlocking {
+        val barrier = ReaderFlushBarrier()
+
+        val preLoad = barrier.register("pre-load", "note-2")
+        assertFalse(barrier.complete("pre-load", "", null, null, "Reader has not loaded a note yet"))
+        assertFalse(preLoad.result.await())
+        assertEquals(ReaderFlushStatus.WRONG_ACTIVE_NOTE, preLoad.status.await())
+
+        val previousNote = barrier.register("handoff", "note-2")
+        assertFalse(barrier.complete("handoff", "note-1", null, null, "The active note changed before its edit flush"))
+        assertFalse(previousNote.result.await())
+        assertEquals(ReaderFlushStatus.WRONG_ACTIVE_NOTE, previousNote.status.await())
+
+        val malformed = barrier.register("malformed", "note-2")
+        assertFalse(barrier.complete("malformed", "note-1", null, null, "Malformed flush acknowledgement", wellFormed = false))
+        assertFalse(malformed.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, malformed.status.await())
+
+        val sameNoteError = barrier.register("same-note-error", "note-2")
+        assertFalse(barrier.complete("same-note-error", "note-2", null, "native", "Reader has unacknowledged edits for this note"))
+        assertFalse(sameNoteError.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, sameNoteError.status.await())
+
+        val contentMismatch = barrier.register("mismatch", "note-2")
+        assertFalse(barrier.complete("mismatch", "note-2", "reader-text", "native-text", null))
+        assertFalse(contentMismatch.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, contentMismatch.status.await())
+
+        val cancelled = barrier.register("cancelled", "note-2")
+        barrier.cancel(cancelled.token, cancelled)
+        assertFalse(cancelled.result.await())
+        assertEquals(ReaderFlushStatus.FAILED, cancelled.status.await())
+
+        val acknowledged = barrier.register("ok", "note-2")
+        assertTrue(barrier.complete("ok", "note-2", "exact", "exact", null))
+        assertTrue(acknowledged.result.await())
+        assertEquals(ReaderFlushStatus.ACKNOWLEDGED, acknowledged.status.await())
+    }
 }
