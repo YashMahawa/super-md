@@ -6,8 +6,8 @@ startup and the standalone CLI do not load the MCP, ASGI, or Qt runtimes.
 from __future__ import annotations
 
 import argparse
-import hmac
 import base64
+import hmac
 import inspect
 import json
 import os
@@ -18,10 +18,20 @@ from typing import Any
 
 try:
     from . import documents
-    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, validate_patch_operations
+    from .agent_documents import (
+        AgentDocumentError,
+        DocumentStore,
+        RevisionConflict,
+        validate_patch_operations,
+    )
 except ImportError:  # python desktop/mcp_server.py
     import documents
-    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, validate_patch_operations
+    from agent_documents import (
+        AgentDocumentError,
+        DocumentStore,
+        RevisionConflict,
+        validate_patch_operations,
+    )
 
 
 def _valid_diagram_id(value: Any) -> bool:
@@ -349,7 +359,17 @@ def build_mcp_server(roots: list[str], live_client=None):
                 if isinstance(match.get("snippet"), str):
                     match["snippet"] = match["snippet"][:1100]
             return bounded_result(result)
-        return store.search(path, query, limit=limit, context=context)
+        return store.search(
+            path,
+            query,
+            limit=limit,
+            context=context,
+            offset=offset,
+            case_sensitive=case_sensitive,
+            whole_word=whole_word,
+            regex=regex,
+            exclude_diagrams=exclude_diagrams,
+        )
 
     @server.tool()
     def document_action(action: str, path: str | None = None, content: str | None = None,
@@ -917,7 +937,7 @@ def build_mcp_server(roots: list[str], live_client=None):
                 alt = normalized_src.get("totalChars") if key == "total_chars" else (
                     normalized_src.get("nextOffset") if key == "next_offset" else None
                 )
-                field = normalized_src[key] if key in normalized_src else alt
+                field = normalized_src.get(key, alt)
                 if key in ("end", "next_offset") and preview_truncated:
                     if start is not None:
                         visible_source[key] = start + len(returned_text)
@@ -1147,8 +1167,8 @@ def main(argv: list[str] | None = None) -> int:
         if not 1 <= args.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         token = _token(args)
-        from mcp.server.transport_security import TransportSecuritySettings
         import uvicorn
+        from mcp.server.transport_security import TransportSecuritySettings
 
         kwargs = {"host": args.host, "port": args.port,
                   "streamable_http_path": "/mcp", "max_request_body_size": 2 * 1024 * 1024}
