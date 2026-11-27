@@ -21,7 +21,6 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 from PySide6.QtCore import QCoreApplication, QEvent, QMetaObject, QObject, QPointF, QUrl, Qt, Q_ARG, Q_RETURN_ARG
 from PySide6.QtGui import QGuiApplication, QKeyEvent
 from PySide6.QtQml import QQmlApplicationEngine, QQmlComponent, QQmlEngine
-from PySide6.QtQuick import QQuickWindow  # noqa: F401
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
@@ -51,7 +50,7 @@ def _wait_until(predicate, timeout: float = 5.0) -> bool:
             app.processEvents()
         if predicate():
             return True
-        time.sleep(0.015)
+        time.sleep(0.005)
     return bool(predicate())
 
 
@@ -289,17 +288,13 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 
 ApplicationWindow {
-    id: window
-    width: 960; height: 680; visible: true
-    color: viewState.colors.surface
+    id: window; width: 960; height: 680; visible: true; color: viewState.colors.surface
     property var viewState: JSON.parse(studio.snapshot)
     property int modalDialogCount: 0
     function focusReader() {}
     Material.theme: viewState.dark ? Material.Dark : Material.Light
-    Material.primary: viewState.colors.primary
-    Material.accent: viewState.colors.primary
-    Material.background: viewState.colors.surface
-    Material.foreground: viewState.colors.text
+    Material.primary: viewState.colors.primary; Material.accent: viewState.colors.primary
+    Material.background: viewState.colors.surface; Material.foreground: viewState.colors.text
     Connections {
         target: studio
         function onWorkspaceSearchChanged() {
@@ -315,7 +310,8 @@ ApplicationWindow {
 class WorkspaceSearchDesktopTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        QQuickStyle.setStyle("Material")
+        if QGuiApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["Workspace search desktop tests"])
 
     def setUp(self):
@@ -330,6 +326,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.studio.pool.shutdown(wait=True)
         self.session.writes.shutdown(wait=True)
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.temp.cleanup()
 
     def test_shortcuts_register_ctrl_shift_f_portably_and_customize(self):
@@ -433,7 +430,11 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertIn("<b>📓</b>", qml_highlight(emoji_q["matches"][0]))
         finally:
             for obj in engine.rootObjects():
+                if hasattr(obj, "close"):
+                    obj.close()
                 obj.deleteLater()
+            engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             del engine
 
     def test_portable_smd_and_renamed_bundle_search_never_decodes_embedded_images(self):
@@ -1106,9 +1107,8 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertIsNotNone(window, str(component.errors()))
         self.studio.host_window = window
         try:
-            window.show(); window.raise_(); window.requestActivate()
-            QTest.qWaitForWindowExposed(window, 300)
-            QTest.qWait(20)
+            window.show(); window.requestActivate()
+            QTest.qWait(10)
             dialog = window.findChild(QObject, "folderSearchDialog")
             search_input = window.findChild(QObject, "folderSearchInput")
             debounce_timer = window.findChild(QObject, "folderSearchDebounce")
@@ -1124,21 +1124,16 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
     @staticmethod
     def _find_named_item(root_obj: QObject, object_name: str) -> QObject | None:
         def walk(item):
-            if item is None:
-                return None
-            if item.objectName() == object_name:
-                return item
-            if (found := item.findChild(QObject, object_name)) is not None:
-                return found
+            if item is None: return None
+            if item.objectName() == object_name: return item
+            if (found := item.findChild(QObject, object_name)) is not None: return found
             for ch in (item.childItems() if callable(getattr(item, "childItems", None)) else ()):
-                if (hit := walk(ch)) is not None:
-                    return hit
+                if (hit := walk(ch)) is not None: return hit
             return None
-
         return root_obj.findChild(QObject, object_name) or walk(root_obj.contentItem())
 
     @staticmethod
-    def _type_keys(window, text: str, delay_ms: int = 2) -> None:
+    def _type_keys(window, text: str, delay_ms: int = 0) -> None:
         for ch in text:
             mods = Qt.KeyboardModifier.ShiftModifier if ch.isupper() else Qt.KeyboardModifier.NoModifier
             key = int(Qt.Key(ord(ch.upper()))) if ch.isascii() and ch.isalpha() else 0
@@ -1154,6 +1149,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertTrue(_wait_until(lambda: len(self.studio.files) == 2))
 
         with self._real_folder_search_dialog() as (window, dialog, search_input, debounce_timer):
+            self.assertEqual(dialog.property("debounceInterval"), 120)
             self.studio.openFolderSearch()
             self.assertTrue(_wait_until(lambda: bool(dialog.property("opened"))))
             window.requestActivate()
@@ -1163,7 +1159,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             # 1. Rapid keystroke burst coalesces into a single workspace scan for the settled query.
             queries_run: list[str] = []
             with patch("studio.stream_text_search", side_effect=lambda q, *a, **kw: (queries_run.append(q), stream_text_search(q, *a, **kw))[1]):
-                self._type_keys(window, "RocketToken", delay_ms=4)
+                self._type_keys(window, "RocketToken", delay_ms=2)
                 self.app.processEvents()
                 self.assertEqual(search_input.property("text"), "RocketToken")
                 self.assertTrue(bool(debounce_timer.property("running")) and bool(dialog.property("queryPending")))
@@ -1175,6 +1171,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 self.assertEqual({m["name"] for m in self.studio.folderSearchState["matches"]}, {"alpha.md", "beta.md"})
 
             # 2. Editing while a previous generation is scanning cancels & invalidates immediately.
+            dialog.setProperty("debounceInterval", 35)
             scan_started, cancel_observed = threading.Event(), threading.Event()
             captured: dict[str, object] = {}
             stale_hit = [{"name": "stale.md", "relative": "stale.md", "path": "", "tabId": "", "line": 1, "column": 1,
@@ -1195,7 +1192,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
 
             with patch("studio.stream_text_search", side_effect=blocking_then_real_search):
                 QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
-                self._type_keys(window, "SlowQuery", delay_ms=2)
+                self._type_keys(window, "SlowQuery")
                 self.assertTrue(_wait_until(scan_started.is_set))
                 prev_generation, prev_cancel = self.studio._folder_search_generation, captured["cancel_event"]
                 self.assertFalse(prev_cancel.is_set())
@@ -1206,7 +1203,10 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 self.assertTrue(prev_cancel.is_set(), "Previous cancel_event must be set immediately on edit")
                 self.assertGreater(self.studio._folder_search_generation, prev_generation)
                 self.assertTrue(bool(debounce_timer.property("running")) and self.studio.folderSearchState["pending"])
-                self.assertEqual(self.studio.folderSearchState["matches"], [])
+                self.assertEqual(
+                    (self.studio.folderSearchState["matches"], self.studio.folderSearchState["scannedFiles"], self.studio.folderSearchState["truncated"]),
+                    ([], 0, False),
+                )
                 self.assertTrue(cancel_observed.wait(timeout=1.0))
 
                 # Late batch signal from the superseded generation on the GUI thread is dropped.
@@ -1219,7 +1219,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
 
     def test_real_dialog_blocks_stale_enter_while_pending_and_covers_clear_escape_and_activation(self):
         first_note, second_note = self.root / "first.md", self.root / "second.md"
-        first_note.write_text("# First\n\nAlphaHit in first note.\n", encoding="utf-8")
+        first_note.write_text("# First\n\nAlphaHit in first note.\n```mermaid\ngraph TD\n  A[DiagramHit]\n```\n", encoding="utf-8")
         second_note.write_text("# Second\n\nOmegaHit line three.\nFiller.\nOmegaHit line five.\n", encoding="utf-8")
         self.studio.openFolder(str(self.root))
         self.assertTrue(_wait_until(lambda: len(self.studio.files) == 2))
@@ -1227,6 +1227,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.studio.ready = True
 
         with self._real_folder_search_dialog() as (window, dialog, search_input, debounce_timer):
+            dialog.setProperty("debounceInterval", 35)
             status_label = window.findChild(QObject, "folderSearchStatus")
             self.assertIsNotNone(status_label)
 
@@ -1249,16 +1250,18 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             open_and_ack_sync()
 
             # Settle initial query "AlphaHit" -> matches first.md.
-            self._type_keys(window, "AlphaHit", delay_ms=2)
+            self._type_keys(window, "AlphaHit")
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
             self.assertEqual(self.studio.folderSearchState["matches"][0]["name"], "first.md")
             self.assertIsNone(self.studio.flush_operation)
 
-            # Type "OmegaHit" and immediately press Return + Keypad Enter while pending (plus direct slot guard).
+            # Type "OmegaHit" and immediately press Down, Return, and Keypad Enter while pending (plus direct slot guard).
             QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
-            self._type_keys(window, "OmegaHit", delay_ms=2)
+            self._type_keys(window, "OmegaHit")
             self.app.processEvents()
             self.assertTrue(bool(dialog.property("queryPending")) and bool(debounce_timer.property("running")))
+            QTest.keyClick(window, Qt.Key.Key_Down)
+            self.assertEqual(dialog.property("selectedIndex"), 0)
             QTest.keyClick(window, Qt.Key.Key_Return)
             QTest.keyClick(window, Qt.Key.Key_Enter, Qt.KeyboardModifier.KeypadModifier)
             self.studio.openFolderSearchMatch("", str(first_note), "AlphaHit", False)
@@ -1274,11 +1277,11 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
                 self.assertFalse(self.studio.folderSearchState["pending"] or self.studio.folderSearchState["scanning"])
                 self.assertEqual(self.studio.folderSearchState["matches"], [])
                 self.assertIn("Streams live matches", str(status_label.property("text")))
-                QTest.qWait(180)
+                QTest.qWait(55)
                 spy_clear_pending.assert_not_called()
 
             # Settle "OmegaHit", clear settled results, and verify Enter on empty input is a no-op.
-            self._type_keys(window, "OmegaHit", delay_ms=2)
+            self._type_keys(window, "OmegaHit")
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
             select_all_and_clear(Qt.Key.Key_Delete)
             self.assertEqual(self.studio.folderSearchState["matches"], [])
@@ -1287,42 +1290,46 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.app.processEvents()
             self.assertTrue(bool(dialog.property("visible")) and self.studio.flush_operation is None)
 
-            # Toggling Match case while pending stops debounce, keeps input focus, and runs once immediately.
+            # Toggling Diagrams / Match case while pending stops debounce, keeps input focus, and runs once immediately.
             case_toggle = window.findChild(QObject, "folderSearchCaseToggle")
-            self.assertIsNotNone(case_toggle)
-            toggle_queries: list[tuple[str, bool]] = []
-            with patch("studio.stream_text_search", side_effect=lambda q, *a, **kw: (toggle_queries.append((q, bool(kw.get("case_sensitive")))), stream_text_search(q, *a, **kw))[1]):
-                self._type_keys(window, "alphahit", delay_ms=2)
+            diag_toggle = window.findChild(QObject, "folderSearchDiagramsToggle")
+            self.assertTrue(case_toggle is not None and diag_toggle is not None)
+            toggle_queries: list[tuple[str, bool, bool]] = []
+            with patch("studio.stream_text_search", side_effect=lambda q, *a, **kw: (toggle_queries.append((q, bool(kw.get("case_sensitive")), not bool(kw.get("exclude_diagrams", True)))), stream_text_search(q, *a, **kw))[1]):
+                self._type_keys(window, "diagramhit")
                 self.app.processEvents()
                 self.assertTrue(bool(debounce_timer.property("running")))
-                toggle_pt = case_toggle.mapToScene(QPointF(case_toggle.width() / 2.0, case_toggle.height() / 2.0)).toPoint()
-                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, toggle_pt)
+                diag_pt = diag_toggle.mapToScene(QPointF(diag_toggle.width() / 2.0, diag_toggle.height() / 2.0)).toPoint()
+                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, diag_pt)
                 self.assertTrue(bool(search_input.property("activeFocus")))
                 self.assertFalse(bool(debounce_timer.property("running")))
-                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"]))
-                QTest.qWait(160)
-                self.assertEqual(toggle_queries, [("alphahit", True)])
-                self.assertEqual(self.studio.folderSearchState["matches"], [])
+                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
+                QTest.qWait(50)
+                self.assertEqual(toggle_queries, [("diagramhit", False, True)])
+                toggle_pt = case_toggle.mapToScene(QPointF(case_toggle.width() / 2.0, case_toggle.height() / 2.0)).toPoint()
                 QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, toggle_pt)
                 self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"]))
-                self.assertEqual(len(self.studio.folderSearchState["matches"]), 1)
+                self.assertEqual(self.studio.folderSearchState["matches"], [])
+                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, toggle_pt)
+                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, diag_pt)
+                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"]))
 
             select_all_and_clear(Qt.Key.Key_Delete)
 
             # Escape while pending cancels debounce cleanly and never runs after closing.
             with patch("studio.stream_text_search", wraps=stream_text_search) as spy_escape_pending:
-                self._type_keys(window, "AlphaHit", delay_ms=2)
+                self._type_keys(window, "AlphaHit")
                 self.app.processEvents()
                 self.assertTrue(bool(debounce_timer.property("running")))
                 QTest.keyClick(window, Qt.Key.Key_Escape)
                 self.assertTrue(_wait_until(lambda: not bool(dialog.property("visible"))))
                 self.assertFalse(self.studio.folderSearchState["open"] or bool(debounce_timer.property("running")))
-                QTest.qWait(180)
+                QTest.qWait(55)
                 spy_escape_pending.assert_not_called()
 
             # Reopen, search "OmegaHit", step Down to 2nd occurrence, and press Return to activate current result.
             open_and_ack_sync()
-            self._type_keys(window, "OmegaHit", delay_ms=2)
+            self._type_keys(window, "OmegaHit")
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
             settled_matches = list(self.studio.folderSearchState["matches"])
             self.assertEqual([m["line"] for m in settled_matches], [3, 5])
@@ -1344,7 +1351,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "second.md"))
             open_and_ack_sync()
             self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
-            QTest.qWait(30)
+            QTest.qWait(15)
             row0 = self._find_named_item(window, "folderSearchRow_0")
             self.assertIsNotNone(row0)
             center = row0.mapToScene(QPointF(row0.width() / 2.0, row0.height() / 2.0)).toPoint()

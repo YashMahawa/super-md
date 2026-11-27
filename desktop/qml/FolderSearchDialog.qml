@@ -76,12 +76,12 @@ AppDialog {
             triggerSearch()
             return
         }
+        searchDebounce.restart()
         studio.prepareFolderSearch(
             searchField.text,
             matchCaseButton.checked,
             includeDiagramsButton.checked
         )
-        searchDebounce.restart()
     }
 
     function activateMatch(idx) {
@@ -139,6 +139,7 @@ AppDialog {
                 }
                 Keys.onDownPressed: event => {
                     event.accepted = true
+                    if (dialog.queryPending) return
                     const matches = dialog.stateData.matches || []
                     if (matches.length > 0) {
                         dialog.selectedIndex = (dialog.selectedIndex + 1) % matches.length
@@ -147,6 +148,7 @@ AppDialog {
                 }
                 Keys.onUpPressed: event => {
                     event.accepted = true
+                    if (dialog.queryPending) return
                     const matches = dialog.stateData.matches || []
                     if (matches.length > 0) {
                         dialog.selectedIndex = (dialog.selectedIndex - 1 + matches.length) % matches.length
@@ -177,7 +179,7 @@ AppDialog {
                 tonal: !checked
                 highlighted: checked
                 ToolTip.text: "Match case"
-                onToggled: if (!dialog.syncingControls) dialog.triggerSearch()
+                onToggled: if (!dialog.syncingControls && dialog.visible) dialog.triggerSearch()
             }
 
             ActionButton {
@@ -192,7 +194,7 @@ AppDialog {
                 ToolTip.text: checked
                     ? "Including inline SVG, Mermaid, and chart blocks"
                     : "Skipping inline SVG, Mermaid, and chart blocks"
-                onToggled: if (!dialog.syncingControls) dialog.triggerSearch()
+                onToggled: if (!dialog.syncingControls && dialog.visible) dialog.triggerSearch()
             }
         }
 
