@@ -327,7 +327,6 @@ export default function MediaTools({ documentId, content, renderedContent, docum
     };
     const dragEnd = () => { internalDrag = false; };
     const drop = (event: DragEvent) => {
-      if ("__TAURI_INTERNALS__" in window) return; // Native desktop path drop owns image files.
       const element = targetElement(event.target);
       const fromDocument = internalDrag; internalDrag = false;
       if (element instanceof HTMLInputElement && element.type === "file") return;
@@ -380,7 +379,6 @@ export default function MediaTools({ documentId, content, renderedContent, docum
       }).catch((e) => { if (mounted.current) reference.current.onNotice(String(e)); });
     };
     const over = (event: DragEvent) => {
-      if ("__TAURI_INTERNALS__" in window) return;
       const element = targetElement(event.target);
       if (element instanceof HTMLInputElement && element.type === "file") return;
       if (!hasFilePayload(event.dataTransfer)) return;
