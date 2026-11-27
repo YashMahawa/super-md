@@ -234,13 +234,32 @@ class AtomicIoTest(unittest.TestCase):
                     self.assertEqual(published_targets, [])
                     self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 0}])
                     staged.publish()
-                self.assertEqual(published_targets, [recovery.resolve()])
+                self.assertEqual(published_targets, [Path(os.path.abspath(recovery))])
                 self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), nested_payload)
                 self.assertEqual(list(root.glob("*.tmp")), [])
 
                 smd_path = root / "portable.smd"
                 documents.write_portable(smd_path, "# Portable\n", {})
                 self.assertEqual(published_targets[-1], smd_path)
+
+                real_dir = root / "real-dir"
+                alias_dir = root / "alias-dir"
+                real_dir.mkdir()
+                try:
+                    alias_dir.symlink_to(real_dir, target_is_directory=True)
+                except (OSError, NotImplementedError):
+                    pass
+                else:
+                    alias_recovery = alias_dir / "recovery.json"
+                    alias_recovery.write_text('[{"v": 0}]', encoding="utf-8")
+                    published_targets.clear()
+                    with documents.stage_atomic_json(alias_recovery) as sym_staged:
+                        documents.atomic_json(real_dir / "recovery.json", [{"v": 9}])
+                        self.assertTrue(sym_staged.intercepted)
+                        sym_staged.publish()
+                    self.assertEqual(published_targets, [Path(os.path.abspath(alias_recovery))])
+                    self.assertEqual(json.loads(alias_recovery.read_text(encoding="utf-8")), [{"v": 9}])
+                    self.assertEqual(list(real_dir.glob("*.tmp")), [])
             self.assertIn(nested_payload, seen_payloads)
             self.assertIn({"items": ["alpha", {"deep": "beta"}]}, seen_payloads)
             self.assertIn(["alpha", {"deep": "beta"}], seen_payloads)
