@@ -287,12 +287,13 @@ class StudioWorkspaceTest(unittest.TestCase):
         self.assertIsNone(self.studio.flush_operation)
 
         self.studio.openFolderSearch()
-        self.studio.openFolderSearchMatch("tab-42", str(note), "Hamiltonian", True)
+        self.studio.openFolderSearchMatch("tab-42", str(note), "Hamiltonian", True, 10, 21, "Hamiltonian")
         self.assertFalse(self.studio.folderSearchState["open"])
         self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
         self.assertEqual(
             json.loads(self.studio.flush_operation["target"]),
-            {"tabId": "tab-42", "path": str(note), "query": "Hamiltonian", "caseSensitive": True},
+            {"tabId": "tab-42", "path": str(note), "query": "Hamiltonian", "caseSensitive": True,
+             "sourceStart": 10, "sourceEnd": 21, "matchText": "Hamiltonian"},
         )
 
     def test_unbound_simplenamespace_proxies_and_local_path_monkeypatch(self):

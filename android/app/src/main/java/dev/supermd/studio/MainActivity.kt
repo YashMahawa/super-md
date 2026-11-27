@@ -1044,7 +1044,18 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 if (matchingSeed != null) {
-                    payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
+                    val seededJson = JSONObject()
+                        .put("query", matchingSeed.query)
+                        .put("caseSensitive", matchingSeed.caseSensitive)
+                        .put("nonce", matchingSeed.nonce)
+                    if (matchingSeed.sourceStart != null && matchingSeed.sourceEnd != null && matchingSeed.sourceStart >= 0 && matchingSeed.sourceEnd >= matchingSeed.sourceStart) {
+                        seededJson.put("sourceStart", matchingSeed.sourceStart)
+                        seededJson.put("sourceEnd", matchingSeed.sourceEnd)
+                        if (!matchingSeed.matchText.isNullOrEmpty()) {
+                            seededJson.put("matchText", matchingSeed.matchText)
+                        }
+                    }
+                    payload.put("seededFind", seededJson)
                 }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)

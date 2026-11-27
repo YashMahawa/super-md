@@ -1205,6 +1205,22 @@ class Studio(QObject):
             return {"id": "", "name": "Super MD", "content": "", "path": "", "saved": "", "assets": {}, "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "outline": []}
         return next((t for t in self.tabs if t["id"] == self.active), self.tabs[0])
 
+    @staticmethod
+    def _seeded_find_bounds(data: dict) -> dict:
+        start = data.get("sourceStart")
+        end = data.get("sourceEnd")
+        if (
+            isinstance(start, int) and not isinstance(start, bool)
+            and isinstance(end, int) and not isinstance(end, bool)
+            and start >= 0 and end >= start
+        ):
+            bounds: dict[str, object] = {"sourceStart": start, "sourceEnd": end}
+            match_text = data.get("matchText")
+            if isinstance(match_text, str) and match_text:
+                bounds["matchText"] = match_text
+            return bounds
+        return {}
+
     def _consume_seeded_find(self, tab: dict) -> dict | None:
         pending = self._pending_seeded_find
         if not pending or not tab.get("id"):
@@ -1216,7 +1232,9 @@ class Studio(QObject):
         if not matches_id and not matches_path:
             return None
         self._pending_seeded_find = None
-        return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+        seeded = {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+        seeded.update(self._seeded_find_bounds(pending))
+        return seeded
 
     def _notify_sidebar(self):
         if self.retired:
@@ -1797,8 +1815,21 @@ class Studio(QObject):
         studio_workspace.cancel_workspace_search(self)
 
     @Slot(str, str, str, bool)
-    def openFolderSearchMatch(self, tab_id: str, path: str, query: str, case_sensitive: bool = False):
-        studio_workspace.open_folder_search_match(self, tab_id, path, query, case_sensitive)
+    @Slot(str, str, str, bool, int, int)
+    @Slot(str, str, str, bool, int, int, str)
+    def openFolderSearchMatch(
+        self,
+        tab_id: str,
+        path: str,
+        query: str,
+        case_sensitive: bool = False,
+        source_start: int = -1,
+        source_end: int = -1,
+        match_text: str = "",
+    ):
+        studio_workspace.open_folder_search_match(
+            self, tab_id, path, query, case_sensitive, source_start, source_end, match_text
+        )
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -3637,6 +3668,7 @@ class Studio(QObject):
             path = request.get("path") or ""
             query = request.get("query") or ""
             case_sensitive = bool(request.get("caseSensitive", False))
+            bounds = self._seeded_find_bounds(request)
             existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
             if existing is None and path:
                 resolved = os.path.normcase(str(Path(path).resolve(strict=False)))
@@ -3645,17 +3677,18 @@ class Studio(QObject):
                 if existing["id"] == self.active and self.ready:
                     self._pending_seeded_find = None
                     if query:
-                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps({'caseSensitive': case_sensitive})})")
+                        find_opts = {"caseSensitive": case_sensitive, **bounds}
+                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps(find_opts)})")
                     self._focus_open_target(self._activation_generation)
                 else:
-                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive} if query else None
+                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
                     self.selectTab(existing["id"])
                     if existing["id"] == self.active and not self.ready:
                         pass
                     self._focus_open_target(self._activation_generation)
             elif path:
                 local = str(local_path(path))
-                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive} if query else None
+                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
                 def opened(_note, error):
                     if error and self._pending_seeded_find and self._pending_seeded_find.get("path") == local:
                         self._pending_seeded_find = None

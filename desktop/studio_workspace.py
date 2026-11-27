@@ -1,7 +1,7 @@
 """Workspace full-text search, folder visibility probing, subfolder filtering, and directory tree helpers."""
 from __future__ import annotations
 
-import json, os, sys, threading
+import importlib, json, os, sys, threading
 from pathlib import Path
 
 if __package__:
@@ -14,13 +14,7 @@ FOLDER_TREE_SCAN_BUDGET = 25000
 
 def _studio_module():
     mod = sys.modules.get("studio") or sys.modules.get("desktop.studio")
-    if mod is not None:
-        return mod
-    if __package__:
-        from . import studio as mod
-    else:
-        import studio as mod
-    return mod
+    return mod if mod is not None else importlib.import_module(".studio" if __package__ else "studio", __package__ or None)
 
 def _call_optional(obj, attr: str, *args):
     fn = getattr(obj, attr, None)
@@ -305,12 +299,17 @@ def cancel_workspace_search(studio_obj) -> None:
     if changed:
         studio_obj.workspaceSearchChanged.emit()
 
-def open_folder_search_match(studio_obj, tab_id: str, path: str, query: str, case_sensitive: bool = False) -> None:
+def open_folder_search_match(
+    studio_obj, tab_id: str, path: str, query: str, case_sensitive: bool = False,
+    source_start: int = -1, source_end: int = -1, match_text: str = "",
+) -> None:
     if getattr(studio_obj, "retired", False):
         return
     _call_method(studio_obj, "_cancel_folder_search", cancel_folder_search, True)
     studio_obj.workspaceSearchChanged.emit()
-    payload = {"tabId": tab_id or "", "path": path or "", "query": query or "", "caseSensitive": bool(case_sensitive)}
+    bounds_fn = getattr(studio_obj, "_seeded_find_bounds", _studio_module().Studio._seeded_find_bounds)
+    bounds = bounds_fn({"sourceStart": source_start, "sourceEnd": source_end, "matchText": match_text})
+    payload = {"tabId": tab_id or "", "path": path or "", "query": query or "", "caseSensitive": bool(case_sensitive), **bounds}
     studio_obj._flush("open_search_match", json.dumps(payload))
 
 def restore_workspace_folder(studio_obj, folder_path: str, expanded_paths: list[str] | None = None) -> None:
