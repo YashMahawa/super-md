@@ -147,7 +147,7 @@ class StudioSettingsAndProtocolCoordinatorTest {
         assertFalse(conflict.getBoolean("accepted"))
         model.preserveMalformedReaderResync(smdId, "# Malformed envelope draft")
         val conflictDir = File(app.filesDir, "reader-conflicts")
-        await { (conflictDir.listFiles { f -> f.extension == "json" }?.size ?: 0) == 2 && model.state.value.error != null }
+        await { (conflictDir.listFiles { f -> f.extension == "json" }?.size ?: 0) == 2 }
         val payloads = conflictDir.listFiles { f -> f.extension == "json" }!!.map { JSONObject(it.readText()).getString("content") }.toSet()
         assertEquals(setOf("# Conflicting reader text", "# Malformed envelope draft"), payloads)
         assertEquals("Reader edits conflicted with newer native content. A private recovery copy was saved.", model.state.value.error)
