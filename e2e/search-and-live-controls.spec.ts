@@ -646,3 +646,173 @@ test("Seeded folder-search handoff reveals exact offscreen windowed occurrences 
     await expect(introMatch).not.toBeInViewport();
   }
 });
+
+test("Replacement input disables spelling/autocorrections, ignores Enter during inactive/invalid/IME states, and advances the real viewport on Enter", async ({ page }) => {
+  const filler = "Windowed study prose paragraph with equations $x_n + y_n$ for offscreen scrolling.\n\n".repeat(36);
+  let content =
+    `# Replace Enter Spec\n\nIntro ReplaceTarget-01 at top.\n\n` +
+    Array.from({ length: 48 }, (_, i) => {
+      if (i === 22) return `## Section ${i}\n\nMidway ReplaceTarget-22 offscreen match.\n\n${filler}`;
+      if (i === 42) return `## Section ${i}\n\n> [!NOTE]- Folded tail callout\n> Deep ReplaceTarget-42 tail match.\n\n${filler}`;
+      return `## Section ${i}\n\n${filler}`;
+    }).join("");
+  expect(content.length).toBeGreaterThan(85_000);
+
+  await page.exposeFunction("onReplaceEnterChange", (_id: string, command: string, raw: string) => {
+    if (command === "document_changed") content = JSON.parse(raw).content;
+  });
+  await page.addInitScript(() => {
+    window.SuperMD = { post: (id, command, raw) => (window as any).onReplaceEnterChange(id, command, raw) };
+  });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  await page.evaluate(
+    (text) =>
+      window.supermdLoad?.({
+        id: "replace-enter-live",
+        content: text,
+        path: null,
+        mode: "live",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+        spellCheck: true,
+        grammarCheck: true,
+      }),
+    content
+  );
+  await expect(page.locator('[data-windowed-mounted="false"]')).not.toHaveCount(0);
+
+  await page.evaluate(() => window.supermdFind?.(true));
+  const searchbox = page.getByRole("searchbox", { name: "Find in note" });
+  const replaceInput = page.getByRole("textbox", { name: "Replacement text" });
+  await expect(replaceInput).toBeVisible();
+
+  // 1. Replacement input disables spelling and automatic corrections for literal Markdown text.
+  await expect(replaceInput).toHaveAttribute("type", "text");
+  await expect(replaceInput).toHaveAttribute("spellcheck", "false");
+  await expect(replaceInput).toHaveAttribute("autocorrect", "off");
+  await expect(replaceInput).toHaveAttribute("autocapitalize", "none");
+  await expect(replaceInput).toHaveAttribute("autocomplete", "off");
+  expect(await replaceInput.evaluate((el: HTMLInputElement) => el.spellcheck)).toBe(false);
+
+  // Type literal Markdown syntax via real keyboard input.
+  await replaceInput.click();
+  await page.keyboard.type("`replaced_md`");
+  await expect(replaceInput).toHaveValue("`replaced_md`");
+
+  // 2. Inactive at empty query and at passive 0 / 3: Enter in replacement input does not mutate or scroll.
+  await page.keyboard.press("Enter");
+  expect(content).toContain("ReplaceTarget-01");
+
+  await searchbox.fill("ReplaceTarget-\\d+");
+  await page.getByRole("button", { name: "Regular expression" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 3");
+  await replaceInput.focus();
+  await page.keyboard.press("Enter");
+  expect(content).toContain("ReplaceTarget-01");
+  expect(await page.evaluate(() => document.querySelector<HTMLElement>(".android-reading")!.scrollTop)).toBe(0);
+
+  // 3. Invalid regular expression: Enter in replacement input does not mutate or scroll.
+  await searchbox.fill("([unclosed");
+  await expect(page.locator(".reading-search output")).toHaveText("Invalid regular expression");
+  await replaceInput.focus();
+  await page.keyboard.press("Enter");
+  expect(content).toContain("ReplaceTarget-01");
+
+  // Restore valid regex and step to 1 / 3 at top of note.
+  await searchbox.fill("ReplaceTarget-(\\d+)");
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 3");
+  await replaceInput.fill("`item_$1`");
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 3");
+
+  const section22 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Midway ReplaceTarget-22 offscreen match." });
+  await expect(section22).toHaveCount(0);
+
+  // 4. In-progress IME composition in the real replacement input ignores Enter until composition ends.
+  const cdp = await page.context().newCDPSession(page);
+  await replaceInput.focus();
+  await replaceInput.selectText();
+  await cdp.send("Input.imeSetComposition", {
+    text: "`item_$1`",
+    selectionStart: 9,
+    selectionEnd: 9,
+  });
+  const composingHandled = await replaceInput.evaluate((el) => {
+    const ev = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, isComposing: true });
+    el.dispatchEvent(ev);
+    return ev.defaultPrevented;
+  });
+  expect(composingHandled).toBe(false);
+  expect(content).toContain("ReplaceTarget-01");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 3");
+  await cdp.send("Input.insertText", { text: "`item_$1`" });
+  await expect(replaceInput).toHaveValue("`item_$1`");
+
+  // 5. Real Enter on valid selected match 1 / 3 replaces match 1, keeps focus in replacement input, and settles offscreen Section 22 in viewport!
+  await page.keyboard.press("Enter");
+  await expect.poll(() => content).toContain("Intro `item_01` at top.");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 2");
+  await expect(replaceInput).toBeFocused();
+  await expect(section22).toBeVisible();
+  await expect(section22).toBeInViewport();
+
+  // 6. Second consecutive Enter (without refocusing) replaces Section 22 and advances viewport + opens folded callout at Section 42!
+  await page.keyboard.press("Enter");
+  await expect.poll(() => content).toContain("Midway `item_22` offscreen match.");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 1");
+  await expect(replaceInput).toBeFocused();
+  const section42Callout = page.locator("details.callout").filter({ hasText: "Deep ReplaceTarget-42 tail match." });
+  await expect(section42Callout).toHaveAttribute("open", "");
+  await expect(section42Callout).toBeInViewport();
+
+  // 7. Source mode: Enter in replacement input replaces line 1 match and scrolls CodeMirror viewport to distant offscreen match.
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".reading-search")).toHaveCount(0);
+  const sourceNote = [
+    "SourceToken-top on line 1.",
+    ...Array.from({ length: 140 }, (_, idx) => `Line ${idx + 2} filler prose in Markdown source editor.`),
+    "SourceToken-bottom at line 142.",
+  ].join("\n");
+  await page.evaluate(
+    (text) => {
+      window.supermdLoad?.({
+        id: "replace-enter-source",
+        content: text,
+        path: null,
+        mode: "editor",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+        spellCheck: true,
+      });
+      window.supermdFind?.(true);
+    },
+    sourceNote
+  );
+  await searchbox.fill("SourceToken-\\w+");
+  await page.getByRole("button", { name: "Regular expression" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 2");
+  expect(await page.evaluate(() => document.querySelector<HTMLElement>(".cm-scroller")!.scrollTop)).toBeLessThan(80);
+
+  await replaceInput.fill("`replaced_source`");
+  await replaceInput.focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => content).toContain("`replaced_source` on line 1.");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 1");
+  await expect(replaceInput).toBeFocused();
+  await expect
+    .poll(() => page.evaluate(() => document.querySelector<HTMLElement>(".cm-scroller")!.scrollTop))
+    .toBeGreaterThan(500);
+  await expect(page.locator(".cm-content")).toContainText("SourceToken-bottom at line 142.");
+});

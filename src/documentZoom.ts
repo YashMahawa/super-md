@@ -16,7 +16,11 @@ export function enforceDocumentCenter(root:HTMLElement):void {
 export function refreshDocumentExtent(root:HTMLElement):boolean {
   const measured=geometry.get(root);if(!measured || measured.viewport!==root.clientWidth)return false;
   const height=measured.page.offsetHeight;
-  if(height!==measured.height){measured.height=height;measured.space.style.height=`${height*(Number(measured.page.dataset.scale)||1)}px`;}
+  if(height!==measured.height){
+    const beforeTop=root.scrollTop;
+    measured.height=height;measured.space.style.height=`${height*(Number(measured.page.dataset.scale)||1)}px`;
+    if(Math.abs(root.scrollTop-beforeTop)>.5)(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;
+  }
   const bounds=root.getBoundingClientRect();
   // Native chrome may change the viewport's origin without changing its width.
   measured.originX+=bounds.left-measured.bounds.left;measured.originY+=bounds.top-measured.bounds.top;measured.bounds=bounds;
