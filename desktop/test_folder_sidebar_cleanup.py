@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
@@ -294,8 +295,9 @@ ApplicationWindow {
         self.assertTrue(studio_mod._directory_has_visible_note(later_md, depth=1, budget=budget, memo=memo))
         self.assertNotIn(studio_mod.folder_ops.normalize_path_key(later_md), memo)
 
-        # Boundary case: first child subdir finishes exact remaining budget with 0 notes,
-        # leaving second sibling subdir (with valid note) unvisited -> parent must stay visible.
+        # Boundary case: make sibling traversal order deterministic independently of filesystem
+        # os.scandir order and verify both traversal orders while retaining exact exhaustion
+        # and unknown-folder visibility checks.
         parent_boundary = self.root / "BoundaryWorkspace" / "CourseRoot"
         exact_slides = parent_boundary / "01_ExactSlides"
         exact_slides.mkdir(parents=True)
@@ -304,12 +306,75 @@ ApplicationWindow {
         sibling_notes = parent_boundary / "02_Homework"
         sibling_notes.mkdir(parents=True)
         (sibling_notes / "hw1.md").write_text("# HW 1\n", encoding="utf-8")
+
+        real_scandir = studio_mod.os.scandir
+
+        class _OrderedScandir:
+            def __init__(self, target=None, *, reverse: bool = False):
+                self._raw = real_scandir(target)
+                self._it = iter(sorted(self._raw, key=lambda entry: entry.name, reverse=reverse))
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._it)
+
+            def close(self):
+                self._raw.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self.close()
+                return False
+
+        # Order 1: 01_ExactSlides visited before 02_Homework.
+        # 2 entries in CourseRoot + 2 entries in 01_ExactSlides = 4 exact budget units;
+        # 01_ExactSlides resolves False, while 02_Homework sees budget == 0 (unresolved),
+        # keeping both CourseRoot and 02_Homework visible without caching False.
         boundary_memo: dict[str, bool] = {}
-        # 2 entries in CourseRoot + 2 entries in 01_ExactSlides = 4 budget units; 02_Homework sees budget == 0
         boundary_budget = [4]
-        self.assertTrue(studio_mod._directory_has_visible_note(parent_boundary, depth=1, budget=boundary_budget, memo=boundary_memo))
-        self.assertIs(boundary_memo[studio_mod.folder_ops.normalize_path_key(exact_slides)], False)
-        self.assertNotIn(studio_mod.folder_ops.normalize_path_key(parent_boundary), boundary_memo)
+        with mock.patch.object(
+            studio_mod.os, "scandir", side_effect=lambda target=None: _OrderedScandir(target, reverse=False)
+        ):
+            self.assertTrue(
+                studio_mod._directory_has_visible_note(
+                    parent_boundary, depth=1, budget=boundary_budget, memo=boundary_memo
+                )
+            )
+            self.assertEqual(boundary_budget, [0])
+            self.assertIs(boundary_memo[studio_mod.folder_ops.normalize_path_key(exact_slides)], False)
+            self.assertNotIn(studio_mod.folder_ops.normalize_path_key(sibling_notes), boundary_memo)
+            self.assertNotIn(studio_mod.folder_ops.normalize_path_key(parent_boundary), boundary_memo)
+            self.assertFalse(
+                studio_mod._directory_has_visible_note(
+                    exact_slides, depth=2, budget=boundary_budget, memo=boundary_memo
+                )
+            )
+            self.assertTrue(
+                studio_mod._directory_has_visible_note(
+                    sibling_notes, depth=2, budget=boundary_budget, memo=boundary_memo
+                )
+            )
+
+        # Order 2: 02_Homework visited before 01_ExactSlides.
+        # Note-bearing sibling resolves True first, confirming CourseRoot visible before exhausting budget.
+        reverse_memo: dict[str, bool] = {}
+        reverse_budget = [4]
+        with mock.patch.object(
+            studio_mod.os, "scandir", side_effect=lambda target=None: _OrderedScandir(target, reverse=True)
+        ):
+            self.assertTrue(
+                studio_mod._directory_has_visible_note(
+                    parent_boundary, depth=1, budget=reverse_budget, memo=reverse_memo
+                )
+            )
+            self.assertEqual(reverse_budget, [1])
+            self.assertIs(reverse_memo[studio_mod.folder_ops.normalize_path_key(sibling_notes)], True)
+            self.assertIs(reverse_memo[studio_mod.folder_ops.normalize_path_key(parent_boundary)], True)
+            self.assertNotIn(studio_mod.folder_ops.normalize_path_key(exact_slides), reverse_memo)
 
         # End-to-end Studio._load_tree() small-budget fixture
         self.studio._folder_tree_scan_budget = 6
