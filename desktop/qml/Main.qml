@@ -26,6 +26,8 @@ ApplicationWindow {
     flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var reader: readerLoader.item
     property bool sidebar: true
@@ -215,7 +217,7 @@ ApplicationWindow {
         case "find_next": window.focusReader(); studio.command("find_next"); break
         case "find_previous": window.focusReader(); studio.command("find_previous"); break
         case "search_folder": studio.openFolderSearch(); break
-        case "close_tab": studio.closeTabSafely(viewState.active); break
+        case "close_tab": studio.closeTabSafely(window.activeTabId || viewState.active); break
         case "next_tab": studio.cycleTab(1); break
         case "previous_tab": studio.cycleTab(-1); break
         case "move_tab_left": studio.moveActiveTab(-1); break
@@ -429,7 +431,9 @@ ApplicationWindow {
                 WindowControls { visible: studio.showToolbarWindowControls; host: window; colors: viewState.colors; Layout.preferredWidth: 124; Layout.preferredHeight: 36; Layout.alignment: Qt.AlignVCenter; onCloseRequested: studio.closeWindowSafely() }
             }
         }
-        TabStrip { width: parent.width; viewState: window.viewState; shortcutLabels: window.shortcutLabels }
+        TabStrip {
+            width: parent.width; viewState: window.viewState; tabs: window.tabsState; activeTabId: window.activeTabId; shortcutLabels: window.shortcutLabels
+        }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
     }
     SplitView {
@@ -438,7 +442,7 @@ ApplicationWindow {
         handle: Rectangle { implicitWidth: 6; color: window.viewState.colors["surface-low"]; Rectangle { anchors.horizontalCenter: parent.horizontalCenter; width: SplitHandle.pressed || SplitHandle.hovered ? 3 : 1; height: parent.height; color: SplitHandle.pressed || SplitHandle.hovered ? window.Material.primary : window.viewState.colors.outline } }
         WorkspaceSidebar {
             id: folderSidebar; visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay
-            viewState: window.viewState; sidebarState: window.sidebarState; shortcutLabels: window.shortcutLabels
+            viewState: window.viewState; tabsState: window.tabsState; activeTabId: window.activeTabId; sidebarState: window.sidebarState; shortcutLabels: window.shortcutLabels
             section: window.sidebarSection; onSectionEdited: value => window.sidebarSection = value
         }
         Item {

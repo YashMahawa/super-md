@@ -6,6 +6,12 @@ Pane {
     id: sidebar
     required property var viewState
     required property var sidebarState
+    property var tabsState: typeof studio !== "undefined" && studio && studio.tabsSnapshot !== undefined
+        ? JSON.parse(studio.tabsSnapshot)
+        : (sidebar.viewState && sidebar.viewState.tabs ? sidebar.viewState.tabs : [])
+    property string activeTabId: typeof studio !== "undefined" && studio && studio.activeTabId !== undefined
+        ? String(studio.activeTabId)
+        : (sidebar.sidebarState && sidebar.sidebarState.active ? String(sidebar.sidebarState.active) : (sidebar.viewState && sidebar.viewState.active ? String(sidebar.viewState.active) : ""))
     property var shortcutLabels: ({})
     property string section: "folder"
     signal sectionEdited(string value)
@@ -36,6 +42,8 @@ Pane {
             Layout.fillWidth: true
             Layout.fillHeight: true
             viewState: sidebar.viewState
+            tabs: sidebar.tabsState
+            activeTabId: sidebar.activeTabId
             sidebarState: sidebar.sidebarState
             shortcutLabels: sidebar.shortcutLabels
         }
