@@ -10,7 +10,14 @@ ApplicationWindow {
     id: window
     signal readerViewChanged(var readerView)
     onReaderViewChanged: function(view) { if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, view) }
-    Component.onCompleted: { if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader) }
+    property bool readerActivated: !Boolean(studio.deferReaderActivation)
+    function activateReaderIfNeeded() {
+        if (typeof studio.ensureReaderProfile === "function") studio.ensureReaderProfile()
+        if (!readerActivated) readerActivated = true
+        if (!readerLoader.active) readerLoader.active = true
+    }
+    Component.onCompleted: { if (visible || !Boolean(studio.deferReaderActivation)) activateReaderIfNeeded(); if (typeof studio.attachWindowDropFilter === "function") studio.attachWindowDropFilter(window, window.reader) }
+    onVisibleChanged: if (visible) activateReaderIfNeeded()
     width: 1320
     height: 880
     minimumWidth: 760
@@ -65,6 +72,16 @@ ApplicationWindow {
         }
         const requestId = JSON.stringify(request.requestId || "")
         const failure = "window.SuperMD?.post(" + requestId + ", 'agent_result', JSON.stringify({requestId:" + requestId + ",error:'reader is unavailable'}))"
+        if (!window.visible) {
+            if (request.action === "flush_current") {
+                studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, result: {flushed: false}, error: ""}))
+                return
+            }
+            if (request.action === "list_tabs") {
+                studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, result: {tabs: request.tabs || []}, error: ""}))
+                return
+            }
+        }
         if (!window.reader || !viewState.readerReady) {
             studio.post(request.requestId || "", "agent_result", JSON.stringify({requestId: request.requestId, error: "Reader is not ready"}))
             return
@@ -280,7 +297,7 @@ ApplicationWindow {
     color: viewState.colors.surface
     font.family: "Noto Sans"
     onClosing: function(close) {
-        if (!windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
+        if (window.visible && !windowModes.fullscreen) studio.rememberWindow(visibility === Window.Maximized ? viewState.settings.window.width : width, visibility === Window.Maximized ? viewState.settings.window.height : height, visibility === Window.Maximized)
         close.accepted = closingAllowed; if (closingAllowed) intentionalShutdown = true; else studio.closeWindowSafely()
     }
 
@@ -288,14 +305,17 @@ ApplicationWindow {
         target: studio
         function onAllowClose() {
             flushDialog.close(); closeDialog.close()
-            if (studio.backgroundEnabled) { window.hide(); return }
-            intentionalShutdown = true; closingAllowed = true; window.close()
+            if (studio.backgroundEnabled && !studio.hasOtherOpenWindows()) { window.hide(); return }
+            intentionalShutdown = true; closingAllowed = true
+            readerRetryTimer.stop(); readerRecoveryRestoreTimer.stop(); readerStableTimer.stop()
+            if (readerLoader.active) readerLoader.active = false
+            window.close()
         }
-        function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { flushDialog.canClose = canClose; flushDialog.open() } }
-        function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) closeDialog.open() }
+        function onFlushFailed(canClose) { if(!closingAllowed && !closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } flushDialog.canClose = canClose; flushDialog.open() } }
+        function onCloseRequested(name) { flushDialog.close(); closeDialog.title = "Save changes to " + name + "?"; if(!closeDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } closeDialog.open() } }
         function onSaveRequested(name) { window.chooseSaveDestination("Save note", studio.defaultSaveFolder(), studio.defaultSaveLocation(name)) }
         function onSaveAsRequested(name) { window.chooseSaveDestination("Save as", studio.defaultSaveAsFolder(), studio.defaultSaveAsLocation(name)) }
-        function onSaveConflictRequested(name) { flushDialog.close(); closeDialog.close(); saveConflictDialog.title = name + " changed on disk"; if (!saveConflictDialog.visible) saveConflictDialog.open() }
+        function onSaveConflictRequested(name) { flushDialog.close(); closeDialog.close(); saveConflictDialog.title = name + " changed on disk"; if (!saveConflictDialog.visible) { if (!window.visible) { window.show(); window.raise(); window.requestActivate() } saveConflictDialog.open() } }
         function onNoteLocationPickerRequested() { noteFolderDialog.open() }
         function onExportRequested(format) { sharing = false; outputFormat = format; exportDialog.open() }
         function onFolderPickerRequested() { folderDialog.open() }
@@ -337,6 +357,7 @@ ApplicationWindow {
         repeat: false
         onTriggered: {
             if (!window.intentionalShutdown && !window.closingAllowed && !studio.retired && readerLoader) {
+                if (typeof studio.ensureReaderProfile === "function") studio.ensureReaderProfile()
                 readerLoader.active = true
             }
         }
@@ -502,7 +523,7 @@ ApplicationWindow {
                     objectName: "documentReaderLoader"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    active: true
+                    active: window.readerActivated
                     sourceComponent: readerComponent
                     onItemChanged: window.readerViewChanged(item)
                 }
@@ -645,10 +666,7 @@ ApplicationWindow {
     }
     AppDialog {
         id: settingsDialog
-        objectName: "settingsDialog"
-        width: Math.min(840, window.width - 48)
-        height: Math.min(760, window.height - 48)
-        padding: 0
+        objectName: "settingsDialog"; width: Math.min(840, window.width - 48); height: Math.min(760, window.height - 48); padding: 0
         onClosed: settingsOpen = false
         SettingsPage { ownerPopup: settingsDialog; viewState: window.viewState; anchors.fill: parent; onBack: settingsOpen = false }
     }
