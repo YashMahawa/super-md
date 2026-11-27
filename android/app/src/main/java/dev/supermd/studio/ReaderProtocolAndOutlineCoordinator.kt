@@ -5,7 +5,6 @@ import android.util.JsonWriter
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStreamWriter
-import java.nio.file.Files
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -141,7 +140,7 @@ internal class ReaderProtocolAndOutlineCoordinator(
         scope.launch(Dispatchers.IO) {
             var temporary: File? = null
             val saved = runCatching {
-                val root = File(app.filesDir, "reader-conflicts").apply { Files.createDirectories(toPath()) }
+                val root = File(app.filesDir, "reader-conflicts").apply { check((mkdirs() || isDirectory) && isDirectory) }
                 val destination = File(root, "reader-conflict-${UUID.randomUUID()}.json")
                 val tempFile = File(root, destination.name + ".tmp")
                 temporary = tempFile
