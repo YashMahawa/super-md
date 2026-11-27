@@ -3004,287 +3004,48 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             else -> closeAfterSaveNoteId = null
         }
     }
-    private class ReloadArchiveFailedException(cause: Throwable) : Exception(cause.message, cause)
-    private suspend fun reconcileUncommittedReloadArchive(
-        savedSnapshotRef: ClosedNoteReference?,
-        archivedReference: ClosedNoteReference?,
-        previousRefs: List<ClosedNoteReference>?,
-        nextRefs: List<ClosedNoteReference>?,
-        cleanupDirs: MutableSet<String>,
-        changedDuringReload: Boolean,
-    ) {
-        withContext(kotlinx.coroutines.NonCancellable) {
-            if (archivedReference != null && previousRefs != null && nextRefs != null) {
-                val rolledBack = withContext(Dispatchers.IO) {
-                    runCatching { saveClosedNoteIndex(previousRefs) }.isSuccess
-                }
-                if (rolledBack) {
-                    closedNoteRefs = previousRefs
-                    withContext(Dispatchers.IO) {
-                        closedNoteStore.deleteUnindexedSnapshot(archivedReference)
-                    }
-                } else {
-                    closedNoteRefs = nextRefs
-                    archivedReference.assetDirectory?.let(cleanupDirs::remove)
-                    if (!viewModelRetired.get()) {
-                        change { state ->
-                            state.copy(
-                                closedTabs = (
-                                    listOf(archivedReference.placeholder()) +
-                                        state.closedTabs.filterNot { it.id == archivedReference.id }
-                                    ).take(ClosedNoteStore.LIMIT),
-                            )
-                        }
-                    }
-                }
-            } else if (savedSnapshotRef != null) {
-                withContext(Dispatchers.IO) {
-                    closedNoteStore.deleteUnindexedSnapshot(savedSnapshotRef)
-                }
+    private lateinit var reloadCoordinatorCache: ReloadFromDiskCoordinator
+    private val reloadCoordinator: ReloadFromDiskCoordinator
+        get() = if (::reloadCoordinatorCache.isInitialized) reloadCoordinatorCache else synchronized(this) {
+            if (!::reloadCoordinatorCache.isInitialized) {
+                reloadCoordinatorCache = ReloadFromDiskCoordinator(
+                    scope = viewModelScope,
+                    resolver = resolver,
+                    documentAccess = { documentAccess },
+                    media = media,
+                    closedNoteStore = closedNoteStore,
+                    readerActionMutex = readerActionMutex,
+                    closedNoteMutex = closedNoteMutex,
+                    documentWrites = documentWrites,
+                    closingNoteIds = closingNoteIds,
+                    autosavePending = autosavePending,
+                    readerEcho = readerEcho,
+                    savedPortableAssets = savedPortableAssets,
+                    viewModelRetired = viewModelRetired,
+                    readState = { mutable.value },
+                    changeState = ::change,
+                    readClosedNoteRefs = { closedNoteRefs },
+                    writeClosedNoteRefs = { closedNoteRefs = it },
+                    saveClosedNoteIndex = ::saveClosedNoteIndex,
+                    flushActiveNoteLocked = ::flushActiveNoteLocked,
+                    flushRecoveryAndAwait = ::flushRecoveryAndAwait,
+                    readerBarrierFailed = ::readerBarrierFailed,
+                    collectNativePortableAssets = ::collectNativePortableAssets,
+                    cleanupPortableDirectories = ::cleanupPortableDirectories,
+                    invalidateNoteAssets = ::invalidateNoteAssets,
+                    clearReaderEditProtocol = ::clearReaderEditProtocol,
+                    recordPortableBaseline = ::recordPortableBaseline,
+                    isDocumentAccessFailure = ::isDocumentAccessFailure,
+                    requestDocumentAccess = { rawUri, existingNote, writing, explicit ->
+                        requestDocumentAccess(rawUri, existingNote, writing, explicit)
+                    },
+                    fail = ::fail,
+                    readReloadAfterIndexCommitObserver = { reloadAfterIndexCommitObserver },
+                )
             }
-            if (changedDuringReload && !viewModelRetired.get()) {
-                change { state ->
-                    state.copy(
-                        message = "The note changed while reloading from disk. It remains open with the latest draft.",
-                    )
-                }
-            }
-            if (!viewModelRetired.get()) {
-                flushRecoveryAndAwait()
-            }
-            cleanupPortableDirectories(cleanupDirs)
-            cleanupDirs.clear()
+            reloadCoordinatorCache
         }
-    }
-    fun reloadFromDisk(id: String = mutable.value.active.id) = viewModelScope.launch {
-        if (mutable.value.tabs.none { it.id == id && it.uri != null }) return@launch
-        val barrierOk = readerActionMutex.withLock {
-            val currentActiveId = mutable.value.active.id
-            if (id == currentActiveId) flushActiveNoteLocked(currentActiveId) else true
-        }
-        if (!barrierOk) {
-            flushRecoveryAndAwait()
-            readerBarrierFailed()
-            return@launch
-        }
-        val cleanupDirs = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-        val afterIndexCommitObserver = reloadAfterIndexCommitObserver
-        try {
-            closedNoteMutex.withLock {
-                var snapshotNote: Note? = null
-                var rawUri: String? = null
-                var reloaded: Note? = null
-                var savedSnapshotRef: ClosedNoteReference? = null
-                var archivedReference: ClosedNoteReference? = null
-                var previousRefs: List<ClosedNoteReference>? = null
-                var nextRefs: List<ClosedNoteReference>? = null
-                var indexCommitted = false
-                var reloadCommitted = false
-                try {
-                    withContext(Dispatchers.IO) {
-                        documentWrites.withLock {
-                            kotlinx.coroutines.currentCoroutineContext()[Job]?.let { if (!it.isActive) throw kotlinx.coroutines.CancellationException() }
-                            val note = mutable.value.tabs.find { it.id == id } ?: return@withLock
-                            if (id in closingNoteIds) return@withLock
-                            val noteUri = note.uri ?: return@withLock
-                            snapshotNote = note
-                            rawUri = noteUri
-                            val target = documentAccess.resolve(Uri.parse(noteUri))
-                            val loaded = resolver.openInputStream(target)?.use { stream ->
-                                if (note.portable) {
-                                    val opened = media.openFmd(stream)
-                                    cleanupDirs.add(opened.directory)
-                                    Note(id = note.id, name = note.name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = note.relative, assetDirectory = opened.directory, assetsDirty = false)
-                                } else {
-                                    val text = readLimited(stream, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
-                                    Note(id = note.id, name = note.name, uri = target.toString(), content = text, saved = text, relative = note.relative, assetsDirty = false)
-                                }
-                            } ?: error("Document permission is unavailable; choose it again")
-                            reloaded = loaded
-
-                            if (note.dirty) {
-                                try {
-                                    kotlinx.coroutines.currentCoroutineContext()[Job]?.let { if (!it.isActive) throw kotlinx.coroutines.CancellationException() }
-                                    if (mutable.value.tabs.find { it.id == id } != note || id in closingNoteIds) {
-                                        return@withLock
-                                    }
-                                    val collectedAssets = if (note.portable || note.assetsDirty) collectNativePortableAssets(note) else JSONObject()
-                                    val archivedAssetDir = if (!note.portable && collectedAssets.length() == 0) {
-                                        null
-                                    } else {
-                                        media.materializePortableDirectory(
-                                            assets = collectedAssets,
-                                            reuseFromDirectory = note.assetDirectory,
-                                        ).also { cleanupDirs.add(it) }
-                                    }
-                                    kotlinx.coroutines.currentCoroutineContext()[Job]?.let { if (!it.isActive) throw kotlinx.coroutines.CancellationException() }
-                                    val archivedName = if (note.name.startsWith("Recovered ")) note.name else "Recovered ${note.name}"
-                                    val archivedDraft = Note(
-                                        id = UUID.randomUUID().toString(),
-                                        name = archivedName,
-                                        uri = null,
-                                        content = note.content,
-                                        saved = "",
-                                        relative = note.relative,
-                                        assetDirectory = archivedAssetDir,
-                                        assetsDirty = archivedAssetDir != null || note.assetsDirty,
-                                    )
-                                    val ref = closedNoteStore.save(archivedDraft)
-                                    savedSnapshotRef = ref
-                                    kotlinx.coroutines.currentCoroutineContext()[Job]?.let { if (!it.isActive) throw kotlinx.coroutines.CancellationException() }
-                                    if (mutable.value.tabs.find { it.id == id } != note || id in closingNoteIds) {
-                                        return@withLock
-                                    }
-                                    val prev = closedNoteStore.loadIndexStrict()
-                                    val updated = (listOf(ref) + prev).take(ClosedNoteStore.LIMIT)
-                                    saveClosedNoteIndex(updated)
-                                    closedNoteRefs = updated
-                                    archivedReference = ref
-                                    previousRefs = prev
-                                    nextRefs = updated
-                                    indexCommitted = true
-                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                                    throw cancelled
-                                } catch (archiveError: Exception) {
-                                    throw ReloadArchiveFailedException(archiveError)
-                                }
-                            }
-                        }
-                        if (indexCommitted) {
-                            afterIndexCommitObserver?.takeIf { reloadAfterIndexCommitObserver === it }?.invoke()
-                        }
-                    }
-
-                    kotlinx.coroutines.currentCoroutineContext()[Job]?.let { if (!it.isActive) throw kotlinx.coroutines.CancellationException() }
-                    val expectedNote = snapshotNote
-                    val loadedNote = reloaded
-                    if (expectedNote == null || loadedNote == null) {
-                        reconcileUncommittedReloadArchive(
-                            savedSnapshotRef = savedSnapshotRef,
-                            archivedReference = archivedReference,
-                            previousRefs = previousRefs,
-                            nextRefs = nextRefs,
-                            cleanupDirs = cleanupDirs,
-                            changedDuringReload = false,
-                        )
-                        return@withLock
-                    }
-
-                    var changedDuringReload = false
-                    documentWrites.withLock {
-                        val latest = mutable.value.tabs.find { it.id == id }
-                        if (
-                            latest == null ||
-                            id in closingNoteIds ||
-                            latest.uri != expectedNote.uri ||
-                            latest.content != expectedNote.content ||
-                            latest.saved != expectedNote.saved ||
-                            latest.assetDirectory != expectedNote.assetDirectory ||
-                            latest.assetsDirty != expectedNote.assetsDirty
-                        ) {
-                            changedDuringReload = true
-                        } else {
-                            reloadCommitted = true
-                            if (nextRefs != null) {
-                                closedNoteRefs = nextRefs!!
-                            }
-                            archivedReference?.assetDirectory?.let { cleanupDirs.remove(it) }
-                            loadedNote.assetDirectory?.let { cleanupDirs.remove(it) }
-                            if (expectedNote.assetDirectory != null && expectedNote.assetDirectory != loadedNote.assetDirectory) {
-                                cleanupDirs.add(expectedNote.assetDirectory)
-                            }
-                            autosavePending.remove(id)
-                            invalidateNoteAssets(id)
-                            readerEcho.remove(id)
-                            clearReaderEditProtocol(id)
-                            if (loadedNote.portable) {
-                                recordPortableBaseline(id, loadedNote.assetDirectory)
-                            } else {
-                                savedPortableAssets.remove(id)
-                            }
-                            change { state ->
-                                state.copy(
-                                    tabs = state.tabs.map { if (it.id == id) loadedNote else it },
-                                    closedTabs = if (archivedReference != null) {
-                                        (
-                                            listOf(archivedReference!!.placeholder()) +
-                                                state.closedTabs.filterNot { it.id == archivedReference!!.id }
-                                            ).take(ClosedNoteStore.LIMIT)
-                                    } else {
-                                        state.closedTabs
-                                    },
-                                    conflictedTabIds = state.conflictedTabIds - id,
-                                    pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id },
-                                    message = "Reloaded from disk",
-                                )
-                            }
-                        }
-                    }
-                    if (changedDuringReload) {
-                        reconcileUncommittedReloadArchive(
-                            savedSnapshotRef = savedSnapshotRef,
-                            archivedReference = archivedReference,
-                            previousRefs = previousRefs,
-                            nextRefs = nextRefs,
-                            cleanupDirs = cleanupDirs,
-                            changedDuringReload = true,
-                        )
-                    } else {
-                        withContext(kotlinx.coroutines.NonCancellable) {
-                            cleanupPortableDirectories(cleanupDirs)
-                            cleanupDirs.clear()
-                        }
-                    }
-                } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                    if (!reloadCommitted) {
-                        reconcileUncommittedReloadArchive(
-                            savedSnapshotRef = savedSnapshotRef,
-                            archivedReference = archivedReference,
-                            previousRefs = previousRefs,
-                            nextRefs = nextRefs,
-                            cleanupDirs = cleanupDirs,
-                            changedDuringReload = false,
-                        )
-                    } else {
-                        withContext(kotlinx.coroutines.NonCancellable) {
-                            cleanupPortableDirectories(cleanupDirs)
-                            cleanupDirs.clear()
-                        }
-                    }
-                    throw cancelled
-                } catch (archiveFailed: ReloadArchiveFailedException) {
-                    reconcileUncommittedReloadArchive(
-                        savedSnapshotRef = savedSnapshotRef,
-                        archivedReference = archivedReference,
-                        previousRefs = previousRefs,
-                        nextRefs = nextRefs,
-                        cleanupDirs = cleanupDirs,
-                        changedDuringReload = false,
-                    )
-                    fail("Could not archive draft before reloading: ${archiveFailed.message}")
-                    return@withLock
-                } catch (reloadError: Exception) {
-                    reconcileUncommittedReloadArchive(
-                        savedSnapshotRef = savedSnapshotRef,
-                        archivedReference = archivedReference,
-                        previousRefs = previousRefs,
-                        nextRefs = nextRefs,
-                        cleanupDirs = cleanupDirs,
-                        changedDuringReload = false,
-                    )
-                    val failedUri = rawUri
-                    if (failedUri != null && isDocumentAccessFailure(reloadError)) {
-                        requestDocumentAccess(failedUri, snapshotNote, writing = false, explicit = true)
-                    } else {
-                        fail("Could not reload note: ${reloadError.message}")
-                    }
-                    return@withLock
-                }
-            }
-        } finally {
-            cleanupPortableDirectories(cleanupDirs)
-        }
-    }
+    fun reloadFromDisk(id: String = mutable.value.active.id) = reloadCoordinator.reloadFromDisk(id)
     fun save(uri: Uri? = null, noteId: String? = null, expectedRevision: String? = null, forceOverwrite: Boolean = false, manualGuard: Boolean = false, onComplete: ((String?) -> Unit)? = null) = viewModelScope.launch {
         val requestedNoteId = noteId ?: mutable.value.active.id
         if (uri == null && requestWriteAccessIfBlocked(requestedNoteId, explicit = onComplete == null)) {
