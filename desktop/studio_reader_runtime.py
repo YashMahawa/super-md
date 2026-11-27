@@ -6,17 +6,25 @@ import http.client
 import ipaddress
 import os
 import socket
+import sys
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
+from PySide6.QtCore import QUrl
 
-def _studio_module():
-    if __package__:
-        from . import studio
-    else:
-        import studio
-    return studio
+if __package__:
+    from . import folder_ops, python_runtime
+    from .core.paths import resource_root
+    from .documents import MAX_IMAGE, MIMES
+    from .network_tls import client_context
+else:
+    import folder_ops
+    import python_runtime
+    from core.paths import resource_root
+    from documents import MAX_IMAGE, MIMES
+    from network_tls import client_context
 
 
 def public_address(url: str) -> str:
@@ -52,21 +60,34 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 
 
 class PinnedHTTPHandler(urllib.request.HTTPHandler):
-    def http_open(self, request):
-        studio_mod = _studio_module()
-        pinned = studio_mod.public_address(request.full_url)
-        return self.do_open(lambda host, **kwargs: studio_mod._PinnedHTTPConnection(host, pinned=pinned, **kwargs), request)
+    def __init__(self, debuglevel: int = 0, *, public_address_fn: Callable[[str], str] | None = None, connection_cls=None):
+        super().__init__(debuglevel)
+        self._public_address_fn = public_address_fn
+        self._connection_cls = connection_cls
+
+    def http_open(self, request, *, public_address_fn=None, connection_cls=None):
+        resolve_addr = public_address_fn or self._public_address_fn or public_address
+        conn_cls = connection_cls or self._connection_cls or _PinnedHTTPConnection
+        pinned = resolve_addr(request.full_url)
+        return self.do_open(lambda host, **kwargs: conn_cls(host, pinned=pinned, **kwargs), request)
 
 
 class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    def https_open(self, request):
-        studio_mod = _studio_module()
-        pinned = studio_mod.public_address(request.full_url)
-        return self.do_open(
-            lambda host, **kwargs: studio_mod._PinnedHTTPSConnection(host, pinned=pinned, **kwargs),
-            request,
-            context=studio_mod.client_context(),
-        )
+    def __init__(
+        self, debuglevel: int = 0, context=None, check_hostname=None, *,
+        public_address_fn: Callable[[str], str] | None = None, connection_cls=None, client_context_fn: Callable | None = None,
+    ):
+        super().__init__(debuglevel, context=context, check_hostname=check_hostname)
+        self._public_address_fn = public_address_fn
+        self._connection_cls = connection_cls
+        self._client_context_fn = client_context_fn
+
+    def https_open(self, request, *, public_address_fn=None, connection_cls=None, client_context_fn=None):
+        resolve_addr = public_address_fn or self._public_address_fn or public_address
+        conn_cls = connection_cls or self._connection_cls or _PinnedHTTPSConnection
+        ctx_fn = client_context_fn or self._client_context_fn or client_context
+        pinned = resolve_addr(request.full_url)
+        return self.do_open(lambda host, **kwargs: conn_cls(host, pinned=pinned, **kwargs), request, context=ctx_fn())
 
 
 def reader_crashed(studio_obj) -> None:
@@ -109,17 +130,16 @@ def _resolve_contained_note_asset(
     return path
 
 
-def resolve_image_asset(studio_obj, tab, source) -> str:
+def resolve_image_asset(studio_obj, tab, source, *, max_image_bytes: int = MAX_IMAGE, mimes: dict[str, str] = MIMES) -> str:
     if source in tab["assets"]:
         return tab["assets"][source]
-    studio_mod = _studio_module()
     path = _resolve_contained_note_asset(
         tab, urllib.parse.unquote(source),
         missing_note_msg="Save this note to resolve relative images",
         outside_msg="Image is outside the note folder",
-        max_bytes=studio_mod.MAX_IMAGE, size_msg="Image exceeds 25 MB",
+        max_bytes=max_image_bytes, size_msg="Image exceeds 25 MB",
     )
-    mime = studio_mod.MIMES.get(path.suffix[1:].lower())
+    mime = mimes.get(path.suffix[1:].lower())
     if not mime:
         raise ValueError("Unsupported image type")
     return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
@@ -139,18 +159,26 @@ def resolve_text_asset(studio_obj, tab, source) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def find_open_tab(studio_obj, reference, *, canonicalize_local: bool = False):
+def _default_local_path(value: str) -> Path:
+    url = QUrl(value)
+    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+    return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
+
+
+def find_open_tab(
+    studio_obj, reference, *, canonicalize_local: bool = False,
+    local_path_fn: Callable[[str], Path] = _default_local_path,
+):
     if not isinstance(reference, str) or not reference:
         return None
     match = next((item for item in studio_obj.tabs if reference in (item["id"], item["path"])), None)
     if match is not None or not canonicalize_local or "\x00" in reference:
         return match
-    studio_mod = _studio_module()
     try:
-        if studio_mod.QUrl(reference).isLocalFile() or Path(reference).is_absolute():
-            canonical = str(studio_mod.local_path(reference))
+        if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
+            canonical = str(local_path_fn(reference))
             exact = next(
-                (item for item in studio_obj.tabs if item["path"] == canonical or (item["path"] and studio_mod.folder_ops.same_path(item["path"], canonical))),
+                (item for item in studio_obj.tabs if item["path"] == canonical or (item["path"] and folder_ops.same_path(item["path"], canonical))),
                 None,
             )
             if exact is not None:
@@ -164,40 +192,45 @@ def find_open_tab(studio_obj, reference, *, canonicalize_local: bool = False):
     return None
 
 
-def fetch_public_resource(studio_obj, args) -> dict[str, str]:
-    studio_mod = _studio_module()
+def fetch_public_resource(
+    studio_obj, args, *,
+    public_address_fn: Callable[[str], str] = public_address,
+    http_handler_cls=PinnedHTTPHandler,
+    https_handler_cls=PinnedHTTPSHandler,
+    max_image_bytes: int = MAX_IMAGE,
+    mimes: dict[str, str] = MIMES,
+) -> dict[str, str]:
     url = args["url"]
-    (studio_obj._public_url if hasattr(studio_obj, "_public_url") else studio_mod.public_address)(url)
     owner = studio_obj
+    (owner._public_url if hasattr(owner, "_public_url") else public_address_fn)(url)
 
     class PublicRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, request, fp, code, msg, headers, newurl):
-            (owner._public_url if hasattr(owner, "_public_url") else _studio_module().public_address)(newurl)
+            (owner._public_url if hasattr(owner, "_public_url") else public_address_fn)(newurl)
             return super().redirect_request(request, fp, code, msg, headers, newurl)
 
     # Connect to the exact address that was validated. Resolving again in
     # the socket layer would allow DNS rebinding onto a private network.
     opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler({}), studio_mod.PinnedHTTPHandler(), studio_mod.PinnedHTTPSHandler(), PublicRedirect()
+        urllib.request.ProxyHandler({}), http_handler_cls(), https_handler_cls(), PublicRedirect()
     )
     request = urllib.request.Request(url, headers={"User-Agent": "SuperMD/Qt"})
-    limit = studio_mod.MAX_IMAGE if args.get("image") else 2_000_000
+    limit = max_image_bytes if args.get("image") else 2_000_000
     with opener.open(request, timeout=20) as response:
         data = response.read(limit + 1)
         if len(data) > limit:
             raise ValueError("Resource is too large")
         if args.get("image"):
             mime = response.headers.get_content_type()
-            if mime not in studio_mod.MIMES.values():
+            if mime not in mimes.values():
                 raise ValueError("URL did not return a supported image")
             return {"body": f"data:{mime};base64,{base64.b64encode(data).decode()}"}
         return {"body": data.decode("utf-8", errors="replace")}
 
 
-def resolve_pdf_engine(studio_obj=None) -> Path:
-    studio_mod = _studio_module()
-    executable = "smd-engine.exe" if studio_mod.sys.platform == "win32" else "smd-engine"
-    root = studio_mod.ROOT
+def resolve_pdf_engine(studio_obj=None, *, root_dir: Path | None = None, sys_platform: str | None = None) -> Path:
+    executable = "smd-engine.exe" if (sys.platform if sys_platform is None else sys_platform) == "win32" else "smd-engine"
+    root = resource_root() if root_dir is None else root_dir
     candidates = [root / "desktop" / executable, root / "smd-core" / "target" / "release" / executable, root / "smd-core" / "target" / "debug" / executable]
     for path in candidates:
         if path.is_file():
@@ -205,15 +238,15 @@ def resolve_pdf_engine(studio_obj=None) -> Path:
     raise ValueError("Native PDF engine is not installed. Build smd-core's smd-engine binary.")
 
 
-def run_python_cell(studio_obj, executable, code, folder=None, job=None):
+def run_python_cell(studio_obj, executable, code, folder=None, job=None, *, run_fn: Callable | None = None):
     # Explicit Run only. Python is trusted local code, not a sandbox.
-    studio_mod = _studio_module()
+    runner = python_runtime.run if run_fn is None else run_fn
     owned_job = None
     if job is None and hasattr(studio_obj, "_python_jobs"):
         owned_job = studio_obj._python_jobs.register("")
         job = owned_job
     try:
-        return studio_mod.python_runtime.run(executable or studio_obj.settings["python"], code, cwd=folder, job=job)
+        return runner(executable or studio_obj.settings["python"], code, cwd=folder, job=job)
     finally:
         if owned_job is not None:
             studio_obj._python_jobs.discard(owned_job)

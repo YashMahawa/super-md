@@ -280,11 +280,19 @@ def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[
 
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":3,\"step\":0.05,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
-public_address = studio_reader_runtime.public_address
+def public_address(url: str) -> str:
+    return studio_reader_runtime.public_address(url)
+
 _PinnedHTTPConnection = studio_reader_runtime._PinnedHTTPConnection
 _PinnedHTTPSConnection = studio_reader_runtime._PinnedHTTPSConnection
-PinnedHTTPHandler = studio_reader_runtime.PinnedHTTPHandler
-PinnedHTTPSHandler = studio_reader_runtime.PinnedHTTPSHandler
+
+class PinnedHTTPHandler(studio_reader_runtime.PinnedHTTPHandler):
+    def http_open(self, request):
+        return super().http_open(request, public_address_fn=public_address, connection_cls=_PinnedHTTPConnection)
+
+class PinnedHTTPSHandler(studio_reader_runtime.PinnedHTTPSHandler):
+    def https_open(self, request):
+        return super().https_open(request, public_address_fn=public_address, connection_cls=_PinnedHTTPSConnection, client_context_fn=client_context)
 
 def local_path(value: str) -> Path:
     url = QUrl(value)
@@ -7040,23 +7048,27 @@ class Studio(QObject):
         return studio_reader_runtime.reader_crashed(self)
 
     def _asset(self, tab, source):
-        return studio_reader_runtime.resolve_image_asset(self, tab, source)
+        return studio_reader_runtime.resolve_image_asset(self, tab, source, max_image_bytes=MAX_IMAGE, mimes=MIMES)
 
     def _text_asset(self, tab, source):
         return studio_reader_runtime.resolve_text_asset(self, tab, source)
 
     def _find_open_tab(self, reference, *, canonicalize_local: bool = False):
-        return studio_reader_runtime.find_open_tab(self, reference, canonicalize_local=canonicalize_local)
+        return studio_reader_runtime.find_open_tab(self, reference, canonicalize_local=canonicalize_local, local_path_fn=local_path)
 
     def _fetch(self, args):
-        return studio_reader_runtime.fetch_public_resource(self, args)
+        return studio_reader_runtime.fetch_public_resource(
+            self, args, public_address_fn=public_address,
+            http_handler_cls=PinnedHTTPHandler, https_handler_cls=PinnedHTTPSHandler,
+            max_image_bytes=MAX_IMAGE, mimes=MIMES,
+        )
 
     @staticmethod
     def _public_url(url):
-        return studio_reader_runtime.public_address(url)
+        return public_address(url)
 
     def _engine(self):
-        return studio_reader_runtime.resolve_pdf_engine(self)
+        return studio_reader_runtime.resolve_pdf_engine(self, root_dir=ROOT, sys_platform=sys.platform)
 
     def _python(self, executable, code, folder=None, job=None):
-        return studio_reader_runtime.run_python_cell(self, executable, code, folder=folder, job=job)
+        return studio_reader_runtime.run_python_cell(self, executable, code, folder=folder, job=job, run_fn=python_runtime.run)
