@@ -289,36 +289,51 @@ def begin_agent_viewport_capture(studio_obj: Any, request_id: str, args: dict, *
     window.update()
     single_shot_fn(200, lambda rid=request_id: studio_obj._agent_viewport_fallback(rid))
 
-def capture_background_preview(studio_obj: Any, request_id: str, tab_id: str, revision: str, context: dict, args: dict) -> None:
-    if __package__:
-        from .offline_view import render_live_snapshot
-    else:
-        from offline_view import render_live_snapshot
-    tab = next(t for t in studio_obj.tabs if t["id"] == tab_id)
+def capture_background_preview(studio_obj: Any, request_id: str, tab_id: str, revision: str, context: dict, args: dict, *, offline_view_mod: Any = None) -> None:
+    if offline_view_mod is None:
+        if __package__: from . import offline_view as offline_view_mod
+        else: import offline_view as offline_view_mod
+    bridge = getattr(studio_obj.session, "agent_bridge", None)
+    tab = next((t for t in studio_obj.tabs if t["id"] == tab_id), None)
+    if studio_obj.retired or tab is None or tab_id in getattr(studio_obj, "_closing_tabs", ()):
+        if bridge is not None: bridge.complete(request_id, None, "The note for this preview is no longer open", window_id=studio_obj.window_id)
+        return
     content, assets, path = tab["content"], dict(tab.get("assets", {})), tab.get("path", "")
     width = max(320, min(1600, int(args.get("width", 1200))))
     heading = context.get("reading", {}).get("heading") or None
     view = {"dark": studio_obj._dark(), "colors": studio_obj._colors(), "font": studio_obj.settings["font"],
-            "size": studio_obj.settings["size"], "svgAppearance": studio_obj.settings["svgAppearance"],
-            "lineHeight": studio_obj.settings["lineHeight"]}
+            "size": studio_obj.settings["size"], "svgAppearance": studio_obj.settings["svgAppearance"], "lineHeight": studio_obj.settings["lineHeight"]}
+    preview_jobs = getattr(studio_obj, "_preview_jobs", None)
+    preview_job = preview_jobs.register(tab_id) if preview_jobs is not None else None
+
+    def work():
+        try: return offline_view_mod.render_live_snapshot(content, assets, path, width=width, heading=heading, view=view, job=preview_job)
+        except offline_view_mod.PreviewCancelled: return None
+        finally:
+            if preview_jobs is not None: preview_jobs.discard(preview_job)
 
     def done(body, error):
         bridge = getattr(studio_obj.session, "agent_bridge", None)
-        if bridge is None:
-            return
+        if bridge is None: return
+        if body is None and not error:
+            bridge.complete(request_id, None, "Background preview cancelled", window_id=studio_obj.window_id); return
         if error:
-            bridge.complete(request_id, None, str(error), window_id=studio_obj.window_id)
-            return
-        if studio_obj._agent_viewport_revision(tab_id) != revision:
-            bridge.complete(request_id, None, "The note changed during background preview; retry", window_id=studio_obj.window_id)
-            return
+            bridge.complete(request_id, None, str(error), window_id=studio_obj.window_id); return
+        try: current_revision = studio_obj._agent_viewport_revision(tab_id)
+        except ValueError as rev_error:
+            bridge.complete(request_id, None, str(rev_error), window_id=studio_obj.window_id); return
+        if current_revision != revision:
+            bridge.complete(request_id, None, "The note changed during background preview; retry", window_id=studio_obj.window_id); return
         image = QImage.fromData(body, "PNG")
         mime, data = _encode_viewport_image(image, args.get("imageFormat", "png"))
         bridge.complete(request_id, {"tabId": tab_id, "revision": revision, "mime_type": mime, "data": data,
-                                     "width": image.width(), "height": image.height(),
-                                     "context": context, "renderedFrom": "background-preview"}, window_id=studio_obj.window_id)
+                                     "width": image.width(), "height": image.height(), "context": context, "renderedFrom": "background-preview"}, window_id=studio_obj.window_id)
 
-    studio_obj._submit(lambda: render_live_snapshot(content, assets, path, width=width, heading=heading, view=view), done, False)
+    if studio_obj.retired or getattr(studio_obj.pool, "_shutdown", False):
+        if preview_jobs is not None: preview_jobs.discard(preview_job)
+        if bridge is not None: bridge.complete(request_id, None, "Background preview cancelled", window_id=studio_obj.window_id)
+        return
+    studio_obj._submit(work, done, False)
 
 def clear_agent_viewport_capture(studio_obj: Any, pending: dict) -> None:
     if studio_obj._agent_viewport_capture is not pending:

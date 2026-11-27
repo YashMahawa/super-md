@@ -224,6 +224,50 @@ class LatestWriteExecutorTest(unittest.TestCase):
         finally:
             writer.shutdown(wait=True)
 
+    def test_drain_finalizer_runs_after_fifo_and_latest_drains_on_flush_and_shutdown(self):
+        writer = LatestWriteExecutor()
+        started = threading.Event()
+        release = threading.Event()
+        events = []
+        state = {"path": "Draft.md"}
+
+        writer.add_drain_finalizer(lambda: events.append(("finalizer", state["path"])))
+
+        def rename_during_drain():
+            started.set()
+            release.wait(2)
+            state["path"] = "Renamed.md"
+            events.append(("fifo-rename", state["path"]))
+
+        fut = writer.submit(rename_during_drain)
+        self.assertTrue(started.wait(1))
+        captured_before = state["path"]
+        writer.submit_latest("startup", lambda: events.append(("latest-startup", captured_before)))
+        writer.submit_latest("recovery", lambda: events.append(("latest-recovery", captured_before)))
+
+        shutdown_done = threading.Event()
+        t = threading.Thread(target=lambda: (writer.shutdown(wait=True), shutdown_done.set()))
+        t.start()
+        time.sleep(0.02)
+        release.set()
+        t.join(timeout=2)
+        self.assertTrue(shutdown_done.is_set())
+        fut.result(timeout=1)
+        self.assertEqual(events[-1], ("finalizer", "Renamed.md"))
+        self.assertIn(("fifo-rename", "Renamed.md"), events[:-1])
+        self.assertIn(("latest-startup", "Draft.md"), events[:-1])
+        self.assertIn(("latest-recovery", "Draft.md"), events[:-1])
+
+        writer2 = LatestWriteExecutor()
+        flush_events = []
+        writer2.add_drain_finalizer(lambda: flush_events.append("flush-finalizer"))
+        writer2.submit(lambda: flush_events.append("fifo"))
+        writer2.submit_latest("startup", lambda: flush_events.append("latest"))
+        writer2.flush(timeout=1)
+        self.assertEqual(flush_events[-1], "flush-finalizer")
+        self.assertEqual(set(flush_events[:-1]), {"fifo", "latest"})
+        writer2.shutdown(wait=True)
+
 
 if __name__ == "__main__":
     unittest.main()

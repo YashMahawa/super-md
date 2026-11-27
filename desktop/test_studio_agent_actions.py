@@ -239,12 +239,26 @@ class StudioAgentActionsTests(unittest.TestCase):
                 self.studio._begin_agent_viewport_capture(req_id, bad)
 
         self.studio.host_window = _FakeWindow(visible=False)
-        with patch("offline_view.render_live_snapshot", return_value=_png_bytes(120, 90)), patch.object(
+        with patch("offline_view.render_live_snapshot", return_value=_png_bytes(120, 90)) as snap_mock, patch.object(
             self.studio, "_submit", side_effect=lambda work, done, *_a: done(work(), None)
         ):
             self.studio._begin_agent_viewport_capture(req_id, {**base, "imageFormat": "jpeg"})
+        self.assertIsNotNone(snap_mock.call_args.kwargs.get("job"))
         self.assertEqual((bridge.completed[-1][1]["mime_type"], bridge.completed[-1][1]["renderedFrom"]), ("image/jpeg", "background-preview"))
         self.assertFalse(QImage.fromData(base64.b64decode(bridge.completed[-1][1]["data"]), "JPEG").isNull())
+        import offline_view
+        bridge.pending.add((req_id, self.studio.window_id, "render_tab", tab["id"]))
+        with patch("offline_view.render_live_snapshot", side_effect=offline_view.PreviewCancelled("cancelled")), patch.object(
+            self.studio, "_submit", side_effect=lambda work, done, *_a: done(work(), None)
+        ):
+            self.studio._begin_agent_viewport_capture(req_id, base)
+        self.assertEqual(bridge.completed[-1][2], "Background preview cancelled")
+        self.studio._closing_tabs.add(tab["id"])
+        try:
+            self.studio._capture_background_preview("req-closed", tab["id"], rev, {"revision": rev}, {})
+        finally:
+            self.studio._closing_tabs.discard(tab["id"])
+        self.assertEqual(bridge.completed[-1][2], "The note for this preview is no longer open")
 
         frame = QImage(1000, 800, QImage.Format.Format_ARGB32)
         frame.fill(QColor("#118844"))
