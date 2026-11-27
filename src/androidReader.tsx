@@ -28,6 +28,7 @@ import {readingOffset} from "./readingPosition";
 import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
+import { parseFrontmatter } from "./frontmatter";
 import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
@@ -1174,6 +1175,22 @@ export function Reader() {
       }
       if(request.action==='get_context'){
         const analysis=readerSourceAnalysis(note.mode,note.content)?.analysis??analyzeDocument(note.content);
+        const parsedFm=parseFrontmatter(note.content);
+        const fmProps=parsedFm?.properties;
+        const visibleMetadataProps=(()=>{
+          if(!fmProps)return undefined;
+          const out:Record<string,unknown>={};
+          if(fmProps.title)out.title=fmProps.title.slice(0,300);
+          if(fmProps.authors.length){
+            const boundedAuthors=fmProps.authors.slice(0,20).map(a=>a.slice(0,200));
+            out.author=boundedAuthors.join(', ').slice(0,500);
+            out.authors=boundedAuthors;
+          }
+          if(fmProps.tags.length){
+            out.tags=fmProps.tags.slice(0,50).map(t=>t.slice(0,100));
+          }
+          return Object.keys(out).length?out:undefined;
+        })();
         const headingAtOffset=(utf16Offset:number)=>{
           let current='';
           for(const item of analysis.outline){if(item.offset<=utf16Offset)current=item.title;else break;}
@@ -1207,14 +1224,47 @@ export function Reader() {
             selectionText=editorSelectedText(note.id)||window.getSelection()?.toString()||'';
             visibleText=note.content.slice(offset,offset+2000).trim();
           }
-          heading=headingAtOffset(offset);
+          heading=headingAtOffset(offset)||(fmProps?.title?.slice(0,300)??'');
         }else{
           host=document.querySelector<HTMLElement>('.android-reading');
           const bounds=host?.getBoundingClientRect();
           const activeTextarea=note.mode==='live'?host?.querySelector<HTMLTextAreaElement>('.live-active-block textarea'):null;
           const visibleParts:string[]=[];
           let firstBlockHeading='';
+          let propertiesHeaderVisible=false;
           if(host&&bounds){
+            const propsEl=host.querySelector<HTMLElement>('[data-frontmatter-properties],.document-properties');
+            if(propsEl){
+              const pBox=propsEl.getBoundingClientRect();
+              if(pBox.bottom>bounds.top&&pBox.top<bounds.bottom&&pBox.height>0){
+                propertiesHeaderVisible=true;
+                const titleEl=propsEl.querySelector<HTMLElement>('[data-frontmatter-field="title"]');
+                if(titleEl){
+                  const tBox=titleEl.getBoundingClientRect();
+                  if(tBox.bottom>bounds.top&&tBox.top<bounds.bottom&&tBox.height>0){
+                    const tText=titleEl.textContent?.trim();
+                    if(tText)visibleParts.push(tText);
+                  }
+                }
+                const authorEl=propsEl.querySelector<HTMLElement>('[data-frontmatter-field="author"]');
+                if(authorEl){
+                  const aBox=authorEl.getBoundingClientRect();
+                  if(aBox.bottom>bounds.top&&aBox.top<bounds.bottom&&aBox.height>0){
+                    const aText=authorEl.textContent?.trim();
+                    if(aText)visibleParts.push(`Author: ${aText}`);
+                  }
+                }
+                const visibleTags:string[]=[];
+                for(const tagEl of propsEl.querySelectorAll<HTMLElement>('[data-frontmatter-field="tag"]')){
+                  const tagBox=tagEl.getBoundingClientRect();
+                  if(tagBox.bottom>bounds.top&&tagBox.top<bounds.bottom&&tagBox.height>0){
+                    const tagText=tagEl.textContent?.trim();
+                    if(tagText)visibleTags.push(tagText);
+                  }
+                }
+                if(visibleTags.length)visibleParts.push(`Tags: ${visibleTags.join(', ')}`);
+              }
+            }
             const candidates=Array.from(host.querySelectorAll<HTMLElement>('h1,h2,h3,h4,p,li,pre,.live-active-block textarea'));
             for(const element of candidates){
               if(element instanceof HTMLTextAreaElement){
@@ -1236,6 +1286,9 @@ export function Reader() {
             }
           }
           range=host?visibleSourceRange(host,note.content):null;
+          if(propertiesHeaderVisible&&parsedFm&&parsedFm.end>0){
+            range=range?{start:0,end:Math.max(range.end,parsedFm.end)}:{start:0,end:parsedFm.end};
+          }
           if(activeTextarea&&bounds){
             const taRect=activeTextarea.getBoundingClientRect();
             const taStart=Number(activeTextarea.dataset.sourceStart);
@@ -1249,7 +1302,7 @@ export function Reader() {
             const taStart=Number(activeTextarea.dataset.sourceStart);
             if(Number.isInteger(taStart)&&taStart>=0)offset=Math.min(note.content.length,taStart+activeTextarea.selectionStart);
           }
-          heading=firstBlockHeading||headingAtOffset(offset);
+          heading=firstBlockHeading||headingAtOffset(offset)||(fmProps?.title?.slice(0,300)??'');
           scrollFraction=host?host.scrollTop/Math.max(1,host.scrollHeight-host.clientHeight):0;
           visibleText=visibleParts.join('\n').slice(0,2000);
           if(note.mode==='split'){
@@ -1401,6 +1454,7 @@ export function Reader() {
           ...base,
           mode:note.mode,
           zoom:zoomReference.current,
+          ...(visibleMetadataProps?{properties:visibleMetadataProps}:{}),
           reading:{offset:sourceOffset,scrollFraction,heading,visibleText},
           visibleSource,
           diagrams:filteredDiagrams.slice(0,30).map(item=>diagramMetadata(note.content,item)),
