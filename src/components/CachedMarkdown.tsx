@@ -1,7 +1,6 @@
 import {Fragment,jsx,jsxs} from "react/jsx-runtime";
 import {toJsxRuntime} from "hast-util-to-jsx-runtime";
 import {unified,type PluggableList,type Processor} from "unified";
-import remarkParse from "remark-parse";
 import remarkRehype from "remark-rehype";
 import rehypeKatex from "rehype-katex";
 import rehypeHighlight from "rehype-highlight";
@@ -104,7 +103,7 @@ const markdownProcessors=new Map<string,AnyProcessor>();
 function getMarkdownProcessor(remarkPlugins:PluggableList,rehypePlugins:PluggableList,pipelineKey:string):AnyProcessor {
   const hit=markdownProcessors.get(pipelineKey);
   if(hit){markdownProcessors.delete(pipelineKey);markdownProcessors.set(pipelineKey,hit);return hit;}
-  const processor=unified().use(remarkParse).use(remarkPlugins).use(remarkRehype,{allowDangerousHtml:true}).use(normalizeRehypePlugins(rehypePlugins)).freeze();
+  const processor=unified().use(remarkPlugins).use(remarkRehype,{allowDangerousHtml:true}).use(normalizeRehypePlugins(rehypePlugins)).freeze();
   if(markdownProcessors.size>=MAX_PIPELINES)markdownProcessors.delete(markdownProcessors.keys().next().value!);
   markdownProcessors.set(pipelineKey,processor);
   return processor;
