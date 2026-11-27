@@ -342,9 +342,10 @@ class AgentDocumentsTest(unittest.TestCase):
                                      expected_revision=attached["revision"])
 
     def test_existing_151_to_159_char_bundle_opens_exports_and_resaves_without_losing_asset_or_reference(self):
+        import zipfile
+
         from agent_exports import export_pdf, export_smd, find_engine
         from markdown_export import write_markdown_export, write_markdown_zip
-        import zipfile
 
         svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><rect width='32' height='16' fill='#386a57'/></svg>"
         svg_url = "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
