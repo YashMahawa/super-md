@@ -391,7 +391,92 @@ class FolderSearchTest {
             val seed = vm.seededFind.value
             assertNotNull(seed)
             assertEquals("UniqueSeedPhrase", seed!!.query)
+            assertNotNull(seed.sourceStart)
+            assertNotNull(seed.sourceEnd)
+            assertEquals("UniqueSeedPhrase", vm.state.value.active.content.substring(seed.sourceStart!!, seed.sourceEnd!!))
             assertTrue(vm.activeMatchesSeedTarget(vm.state.value.active, seed))
+        } finally {
+            vm.cancelWorkspaceSearch()
+            tempRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun repeatedMatchesAndUnicodeOffsetsPreservedThroughAndroidHandoff() = runBlocking {
+        val app = RuntimeEnvironment.getApplication()
+        val media = MediaStorage(app)
+        val tempRoot = Files.createTempDirectory("supermd-android-occurrence-").toFile()
+        val crlfContent = listOf(
+            "# İstanbul \uD83D\uDCD3 Lab",
+            "First AuroraSignal and second \uD83D\uDCD3 AuroraSignal on same CRLF line.",
+            "Straße precedes [hidden](https://example.com/AuroraSignal) and fourth AURORASIGNAL.",
+        ).joinToString("\r\n")
+        val targetFile = File(tempRoot, "unicode-repeats.md").apply {
+            writeBytes(crlfContent.toByteArray(Charsets.UTF_8))
+        }
+        app.getSharedPreferences("studio-window-search-occurrence-test", 0)
+            .edit()
+            .putBoolean("folderMigrated", true)
+            .putString("folder", Uri.fromFile(tempRoot).toString())
+            .commit()
+        val vm = StudioViewModel(app, "search-occurrence-test")
+        try {
+            val direct = streamTextSearch(
+                query = "aurorasignal",
+                tabs = emptyList(),
+                recents = emptyList(),
+                folderRoot = resolveSearchRoot(app, Uri.fromFile(tempRoot)),
+                media = media,
+                openUriStream = { uri -> File(uri.path!!).inputStream() },
+                caseSensitive = false,
+            )
+            assertEquals(4, direct.matches.size)
+            assertEquals(
+                listOf("AuroraSignal", "AuroraSignal", "AuroraSignal", "AURORASIGNAL"),
+                direct.matches.map { crlfContent.substring(it.sourceStart, it.sourceEnd) },
+            )
+            assertEquals(
+                listOf("AuroraSignal", "AuroraSignal", "AuroraSignal", "AURORASIGNAL"),
+                direct.matches.map { it.matchText },
+            )
+            assertTrue(direct.matches.zipWithNext().all { (a, b) -> a.sourceEnd <= b.sourceStart })
+
+            // Case-insensitive "strasse" folds "Straße" while preserving exact UTF-16 offsets in source.
+            val strasseHits = streamTextSearch(
+                query = "strasse",
+                tabs = emptyList(),
+                recents = emptyList(),
+                folderRoot = resolveSearchRoot(app, Uri.fromFile(tempRoot)),
+                media = media,
+                openUriStream = { uri -> File(uri.path!!).inputStream() },
+                caseSensitive = false,
+            )
+            assertEquals(1, strasseHits.matches.size)
+            val strasseMatch = strasseHits.matches.single()
+            assertEquals("Straße", crlfContent.substring(strasseMatch.sourceStart, strasseMatch.sourceEnd))
+            assertEquals("Straße", strasseMatch.matchText)
+
+            // Handoff of the 2nd repeated match preserves its exact occurrence offsets and matchText on seededFind.
+            val deadline = System.currentTimeMillis() + 5_000
+            vm.openFolderSearch("AuroraSignal")
+            while ((vm.folderSearch.value.scanning || vm.folderSearch.value.matches.size < 4) && System.currentTimeMillis() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                delay(20)
+            }
+            assertEquals(4, vm.folderSearch.value.matches.size)
+            val secondMatch = vm.folderSearch.value.matches[1]
+            vm.openSearchMatch(secondMatch)
+            while (vm.state.value.active.name != targetFile.name && System.currentTimeMillis() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                delay(20)
+            }
+            val seed = vm.seededFind.value
+            assertNotNull(seed)
+            assertEquals(secondMatch.sourceStart, seed!!.sourceStart)
+            assertEquals(secondMatch.sourceEnd, seed.sourceEnd)
+            assertEquals("AuroraSignal", seed.matchText)
+            assertTrue(seed.sourceStart!! > direct.matches[0].sourceEnd)
+            assertEquals("AuroraSignal", vm.state.value.active.content.substring(seed.sourceStart!!, seed.sourceEnd!!))
         } finally {
             vm.cancelWorkspaceSearch()
             tempRoot.deleteRecursively()
@@ -507,12 +592,12 @@ class FolderSearchTest {
         composeRule.onNodeWithText("Close").performClick()
         assertFalse(modalOpen)
 
+        composeRule.onNodeWithContentDescription("Find in note").assertIsDisplayed()
         composeRule.onNode(hasText("Search across notes") and hasClickAction()).assertIsDisplayed().assertHeightIsAtLeast(48.dp).performClick()
         assertEquals(1, folderSearchClicks)
 
         composeRule.onNodeWithContentDescription("More actions").performClick()
-        composeRule.onNode(hasText("Search across notes") and hasAnyAncestor(isPopup())).assertIsDisplayed().performClick()
-        assertEquals(2, folderSearchClicks)
+        assertEquals(0, composeRule.onAllNodes(hasText("Search across notes") and hasAnyAncestor(isPopup())).fetchSemanticsNodes().size)
     }
 
     @OptIn(ExperimentalTestApi::class)
@@ -522,6 +607,7 @@ class FolderSearchTest {
         val manyMatches = (0 until 18).map { idx ->
             val snippet = "Result line %02d with needle context".format(idx)
             val start = snippet.indexOf("needle")
+            val sourceStart = idx * 100 + start
             FolderSearchMatch(
                 key = "m-$idx",
                 tabId = null,
@@ -533,6 +619,9 @@ class FolderSearchTest {
                 snippet = snippet,
                 matchStart = start,
                 matchEnd = start + 6,
+                sourceStart = sourceStart,
+                sourceEnd = sourceStart + 6,
+                matchText = "needle",
                 dirty = false,
                 isOpen = false,
             )
@@ -598,6 +687,9 @@ class FolderSearchTest {
         inputNode.performKeyInput { pressKey(Key.Enter) }
         composeRule.waitForIdle()
         assertEquals("m-12", selectedMatch?.key)
+        assertEquals(12 * 100 + manyMatches[12].matchStart, selectedMatch?.sourceStart)
+        assertEquals(12 * 100 + manyMatches[12].matchEnd, selectedMatch?.sourceEnd)
+        assertEquals("needle", selectedMatch?.matchText)
     }
 
     @Test

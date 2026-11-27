@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import LiveEditor from "./LiveEditor";
 import ReadingSearch, { resolveSourceBlock, resolveSourceHighlightRange, sourceMatches } from "./ReadingSearch";
+import { registerWindowedText } from "../windowedSearch";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 if (!Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = () => {};
@@ -484,11 +485,755 @@ describe("ReadingSearch DOM behavior", () => {
     host.remove();
   });
 
-  it("preserves windowed DOM-order navigation and unmounted source-range mapping when toggling Replace in source", async () => {
-    const { registerWindowedText } = await import("../windowedSearch");
+  it("reveals the selected folder-search occurrence across repeated matches, Unicode offsets, disclosures, and windowed blocks", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
+    const scrolled: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
+
+    const markdown = [
+      "# İstanbul 📓 Field Notes",
+      "",
+      "First AuroraSignal after 📓 emoji.",
+      "",
+      "> [!NOTE]- Folded Lab 📓",
+      "> İstanbul 📓 precedes second AuroraSignal inside closed callout.",
+      "",
+      "Check [reference](https://example.com/AuroraSignal) before third AuroraSignal and Straße.",
+    ].join("\n");
+
+    const allAurora = sourceMatches(markdown, "AuroraSignal", true);
+    // 0: visible paragraph 1
+    // 1: visible inside closed callout after İstanbul 📓
+    // 2: hidden inside link URL (https://example.com/AuroraSignal)
+    // 3: visible after hidden link URL
+    expect(allAurora).toHaveLength(4);
+
+    try {
+      const renderSeeded = async (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; nonce: number }) => {
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch content={markdown} close={() => {}} seed={seed} />
+              <section className="android-reading">
+                <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      };
+
+      // 1. Un-targeted seeded Find preserves existing 1 / 3 behavior.
+      await renderSeeded({ query: "AuroraSignal", caseSensitive: true, nonce: 1 });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+      expect(host.querySelector("details.callout")?.hasAttribute("open")).toBe(false);
+
+      // 2. Selecting occurrence #2 (after Unicode surrogate 📓 + İstanbul inside closed callout) opens disclosure and lands on 2 / 3.
+      await renderSeeded({
+        query: "AuroraSignal",
+        caseSensitive: true,
+        sourceStart: allAurora[1].from,
+        sourceEnd: allAurora[1].to,
+        nonce: 2,
+      });
+      expect(host.querySelector("details.callout")?.hasAttribute("open")).toBe(true);
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+
+      // Next match continues cleanly from 2 / 3 -> 3 / 3.
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+
+      // 3. Selecting source occurrence #4 (index 3, after hidden link URL at index 2) maps via shared source mapper to visible 3 / 3.
+      await renderSeeded({
+        query: "AuroraSignal",
+        caseSensitive: true,
+        sourceStart: allAurora[3].from,
+        sourceEnd: allAurora[3].to,
+        nonce: 3,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+
+      // 4. Full Unicode case-fold expansion ("strasse" -> "Straße" after astral 📓 offsets) reveals and highlights "Straße".
+      const strasseFrom = markdown.indexOf("Straße");
+      expect(strasseFrom).toBeGreaterThan(0);
+      await renderSeeded({
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: strasseFrom,
+        sourceEnd: strasseFrom + "Straße".length,
+        nonce: 4,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+      expect(scrolled.length).toBeGreaterThan(0);
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("treats hidden source hits separately without falsely selecting visible matches or mutating Read mode", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const scrolled: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
+
+    let markdown = [
+      "---",
+      "description: HiddenFrontmatterToken and SharedNeedle",
+      "---",
+      "",
+      "First visible SharedNeedle paragraph.",
+      "",
+      "Middle paragraph with [portal](https://example.com/SharedNeedle) and [spec](https://example.com/OnlyInHiddenUrl).",
+      "",
+      "Last visible SharedNeedle paragraph.",
+    ].join("\n");
+
+    const sharedRanges = sourceMatches(markdown, "SharedNeedle", true);
+    // 0: YAML hidden frontmatter description (hidden)
+    // 1: First visible paragraph (rendered 1 / 2)
+    // 2: Link URL https://example.com/SharedNeedle (hidden)
+    // 3: Last visible paragraph (rendered 2 / 2)
+    expect(sharedRanges).toHaveLength(4);
+    const hiddenFmOnlyRanges = sourceMatches(markdown, "HiddenFrontmatterToken", true);
+    expect(hiddenFmOnlyRanges).toHaveLength(1);
+    const urlOnlyRanges = sourceMatches(markdown, "OnlyInHiddenUrl", true);
+    expect(urlOnlyRanges).toHaveLength(1);
+
+    try {
+      // Read mode (onChange omitted): selecting hidden URL hit scrolls to link owner, shows "In source · 0 / 2",
+      // keeps Replace controls absent, and steps forward to 2 / 2 (not backward to 1 / 2) on Next.
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              seed={{
+                query: "SharedNeedle",
+                caseSensitive: true,
+                sourceStart: sharedRanges[2].from,
+                sourceEnd: sharedRanges[2].to,
+                nonce: 10,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      expect(host.querySelector('button[aria-label="Replace in source"]')).toBeNull();
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+      expect(scrolled.some(el => el.tagName === "A" || el.textContent?.includes("portal"))).toBe(true);
+
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+
+      // Hidden-only URL match and hidden frontmatter description match show "In Markdown source" rather than misleading "No matches".
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              seed={{
+                query: "OnlyInHiddenUrl",
+                caseSensitive: true,
+                sourceStart: urlOnlyRanges[0].from,
+                sourceEnd: urlOnlyRanges[0].to,
+                nonce: 11,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              seed={{
+                query: "HiddenFrontmatterToken",
+                caseSensitive: true,
+                sourceStart: hiddenFmOnlyRanges[0].from,
+                sourceEnd: hiddenFmOnlyRanges[0].to,
+                nonce: 115,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+
+      // Displayed frontmatter fields (#119: title, author, tags) select their rendered DOM match directly,
+      // while hidden frontmatter fields (description) surface "In source · 0 / N" and step into visible matches!
+      const mixedFrontmatter = [
+        "---",
+        "tags: [SharedTag]",
+        "description: Hidden SharedTag note",
+        "title: SharedTag Große Straße",
+        "---",
+        "",
+        "Body SharedTag conclusion.",
+      ].join("\n");
+      const tagHits = sourceMatches(mixedFrontmatter, "SharedTag", true);
+      // Source order: 0 = tags (rendered 2/3), 1 = description (hidden), 2 = title (rendered 1/3), 3 = body (rendered 3/3)
+      expect(tagHits).toHaveLength(4);
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={mixedFrontmatter}
+              close={() => {}}
+              seed={{
+                query: "SharedTag",
+                caseSensitive: true,
+                sourceStart: tagHits[0].from,
+                sourceEnd: tagHits[0].to,
+                matchText: "SharedTag",
+                nonce: 116,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={mixedFrontmatter} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={mixedFrontmatter}
+              close={() => {}}
+              seed={{
+                query: "SharedTag",
+                caseSensitive: true,
+                sourceStart: tagHits[1].from,
+                sourceEnd: tagHits[1].to,
+                matchText: "SharedTag",
+                nonce: 117,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={mixedFrontmatter} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 3");
+
+      const titleStrasseFrom = mixedFrontmatter.indexOf("Straße");
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={mixedFrontmatter}
+              close={() => {}}
+              seed={{
+                query: "strasse",
+                caseSensitive: false,
+                sourceStart: titleStrasseFrom,
+                sourceEnd: titleStrasseFrom + "Straße".length,
+                matchText: "Straße",
+                nonce: 118,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={mixedFrontmatter} onChange={() => {}} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+
+      // Live mode (onChange provided): toggling Replace in source from a hidden URL hit targets that exact hidden source occurrence (3 / 4).
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={markdown}
+              close={() => {}}
+              onChange={(next) => { markdown = next; }}
+              seed={{
+                query: "SharedNeedle",
+                caseSensitive: true,
+                sourceStart: sharedRanges[2].from,
+                sourceEnd: sharedRanges[2].to,
+                nonce: 12,
+              }}
+            />
+            <section className="android-reading">
+              <LiveEditor markdown={markdown} onChange={(next) => { markdown = next; }} documentPath={null} python="" dark={false} />
+            </section>
+          </div>
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+
+      const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+      act(() => replaceToggle.click());
+      expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+
+      const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+      const replaceBtn = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+      act(() => setInputValue(replaceInput, "UpdatedSlug"));
+      act(() => replaceBtn.click());
+      expect(markdown).toContain("[portal](https://example.com/UpdatedSlug)");
+      expect(markdown).toContain("First visible SharedNeedle paragraph.");
+      expect(markdown).toContain("Last visible SharedNeedle paragraph.");
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("falls back passively on stale offsets from same-offset replacement or prior insertion without jumping to a different occurrence while keeping valid Unicode-folded and hidden-source hits", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const origHighlight = (window as typeof window & { Highlight?: unknown }).Highlight;
+    const origCss = (globalThis as typeof globalThis & { CSS?: unknown }).CSS;
+    const scrolled: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
+
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) {
+        this.ranges = ranges;
+      }
+    }
+    const highlightMap = new Map<string, MockHighlight>();
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { highlights: highlightMap }, configurable: true, writable: true });
+
+    try {
+      const renderNote = async (
+        markdown: string,
+        seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number },
+        sourceSession?: string,
+      ) => {
+        highlightMap.clear();
+        scrolled.length = 0;
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch content={markdown} close={() => {}} seed={seed} sourceSession={sourceSession} />
+              <section className="android-reading">
+                <LiveEditor markdown={markdown} onChange={() => {}} documentPath={null} python="" dark={false} />
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      };
+
+      const scannedNote = [
+        "First AuroraSignal in intro.",
+        "",
+        "Second AuroraSignal in body and [hidden](https://example.com/AuroraSignal).",
+      ].join("\n");
+      const scannedHits = sourceMatches(scannedNote, "AuroraSignal", false);
+      expect(scannedHits).toHaveLength(3);
+
+      // 1. Replacement at the exact same offsets (2nd occurrence replaced by equal-length "OtherContent"):
+      //    Must NOT highlight "OtherContent" or claim "In source"; falls back to ordinary seeded Find (1 / 1 on first hit, plus hidden URL ignored in rendered count).
+      const replacedSecondSameOffsets =
+        scannedNote.slice(0, scannedHits[1].from) +
+        "OtherContent" +
+        scannedNote.slice(scannedHits[1].to);
+      expect(replacedSecondSameOffsets.length).toBe(scannedNote.length);
+      await renderNote(replacedSecondSameOffsets, {
+        query: "aurorasignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[1].from,
+        sourceEnd: scannedHits[1].to,
+        matchText: "AuroraSignal",
+        nonce: 101,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(highlightMap.get("smd-search")?.ranges.map(r => r.toString())).toEqual(["AuroraSignal"]);
+      expect(scrolled).toHaveLength(0);
+
+      // 1b. Replacement at the same offsets when NO matches remain anywhere in the note (including inside a hidden URL):
+      //     Must report "No matches" and highlight nothing, NOT "In Markdown source" or the replacement slice.
+      const replacedAllSameOffsets = scannedNote.replaceAll("AuroraSignal", "OtherContent");
+      expect(replacedAllSameOffsets.length).toBe(scannedNote.length);
+      await renderNote(replacedAllSameOffsets, {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[2].from,
+        sourceEnd: scannedHits[2].to,
+        matchText: "AuroraSignal",
+        nonce: 102,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("No matches");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(highlightMap.get("smd-search")?.ranges ?? []).toHaveLength(0);
+      expect(scrolled).toHaveLength(0);
+
+      // 1c. Source/Split session with stale replacement at same offsets stays passive at 0 / 2 without jumping to occurrence 1.
+      await renderNote(
+        replacedSecondSameOffsets,
+        {
+          query: "AuroraSignal",
+          caseSensitive: false,
+          sourceStart: scannedHits[1].from,
+          sourceEnd: scannedHits[1].to,
+          matchText: "AuroraSignal",
+          nonce: 103,
+        },
+        "source-session-stale",
+      );
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
+
+      // 2. Insertion before the old offset (both non-overlapping and partially overlapping shifted offsets):
+      //    Must NOT highlight the unrelated shifted slice or fuzzy-match the neighbor; falls back to ordinary seeded Find (1 / 2).
+      const insertedPrefixNote = "Inserted preface — " + scannedNote;
+      await renderNote(insertedPrefixNote, {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[1].from,
+        sourceEnd: scannedHits[1].to,
+        matchText: "AuroraSignal",
+        nonce: 104,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(highlightMap.get("smd-search")?.ranges.map(r => r.toString())).toEqual(["AuroraSignal", "AuroraSignal"]);
+      expect(scrolled).toHaveLength(0);
+
+      // Partially overlapping 3-char insertion before old offset (shifts "AuroraSignal" by +3 so old [from, to) overlaps new [from+3, to+3)):
+      const overlappingInsertNote = "Hi " + scannedNote;
+      await renderNote(overlappingInsertNote, {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: scannedHits[1].from,
+        sourceEnd: scannedHits[1].to,
+        nonce: 105,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
+
+      // 2b. Insertion that shifts a differently-cased variant onto the exact old offsets when matchText identity was captured:
+      //     Scanned "AURORASIGNAL" at [0, 12), then "aurorasignal " was prepended so [0, 12) now holds "aurorasignal".
+      const caseIdentityNote = "aurorasignal and AURORASIGNAL";
+      await renderNote(caseIdentityNote, {
+        query: "aurorasignal",
+        caseSensitive: false,
+        sourceStart: 17,
+        sourceEnd: 29,
+        matchText: "AuroraSignal", // mismatched identity -> falls back to ordinary seeded Find (1 / 2) instead of 2 / 2
+        nonce: 106,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
+
+      // 2c. Shortened note where old seedRange extends past EOF (previously clamped to content.length):
+      await renderNote("Short AuroraSignal.", {
+        query: "AuroraSignal",
+        caseSensitive: false,
+        sourceStart: 12,
+        sourceEnd: 500,
+        matchText: "AuroraSignal",
+        nonce: 107,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+      expect(scrolled).toHaveLength(0);
+
+      // 3. Valid Unicode case-folding ("strasse" -> "Straße", "istanbul" -> "İstanbul") and deliberate hidden-source hits still validate and reveal!
+      const unicodeAndHidden = "İstanbul Café on Große Straße with [doc](https://example.com/Straße).";
+      const visibleStrasseFrom = unicodeAndHidden.indexOf("Straße");
+      const hiddenStrasseFrom = unicodeAndHidden.lastIndexOf("Straße");
+      await renderNote(unicodeAndHidden, {
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: visibleStrasseFrom,
+        sourceEnd: visibleStrasseFrom + "Straße".length,
+        matchText: "Straße",
+        nonce: 108,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("Straße");
+
+      await renderNote(unicodeAndHidden, {
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: hiddenStrasseFrom,
+        sourceEnd: hiddenStrasseFrom + "Straße".length,
+        matchText: "Straße",
+        nonce: 109,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("composes exact-occurrence and stale-range checks with #83 shared regex/whole-word, native shortcuts, windowed blocks, and source mapping", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const origHighlight = (window as typeof window & { Highlight?: unknown }).Highlight;
+    const origCss = (globalThis as typeof globalThis & { CSS?: unknown }).CSS;
+
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) {
+        this.ranges = ranges;
+      }
+    }
+    const highlightMap = new Map<string, MockHighlight>();
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { highlights: highlightMap }, configurable: true, writable: true });
+
+    try {
+      let markdown = [
+        "---",
+        "description: a+b_header and SharedNeedle",
+        "---",
+        "",
+        "First a+b_one and SharedNeedle intro.",
+        "",
+        "Check [portal](https://example.com/SharedNeedle) before second A+B_two and SharedNeedle outro.",
+      ].join("\n");
+
+      const renderLive = async (
+        seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number } | null,
+        initialReplace = false,
+      ) => {
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch
+                content={markdown}
+                close={() => {}}
+                onChange={(next) => { markdown = next; }}
+                seed={seed}
+                initialReplace={initialReplace}
+              />
+              <section className="android-reading">
+                <LiveEditor markdown={markdown} onChange={(next) => { markdown = next; }} documentPath={null} python="" dark={false} />
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      };
+
+      // 1. Turn ON #83's Match whole word + Regular expression (even with an invalid regex), then deliver a targeted
+      //    folder-search occurrence for "a+b" inside "A+B_two" (2nd body match, non-whole-word + regex metacharacter).
+      await renderLive(null);
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      act(() => {
+        wholeWordBtn.click();
+        regexBtn.click();
+        setInputValue(searchInput, "([unclosed");
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("Invalid regular expression");
+
+      const abHits = sourceMatches(markdown, "a+b", false);
+      expect(abHits).toHaveLength(3); // 0: frontmatter, 1: a+b_one, 2: A+B_two
+      await renderLive({
+        query: "a+b",
+        caseSensitive: false,
+        sourceStart: abHits[2].from,
+        sourceEnd: abHits[2].to,
+        matchText: "A+B",
+        nonce: 201,
+      });
+      expect(wholeWordBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(regexBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+      expect(highlightMap.get("smd-search-current")?.ranges[0]?.toString()).toBe("A+B");
+
+      // 2. Native shortcuts (F3 / Shift+F3 via supermd-find-step, and Ctrl+H via supermd-find-focus { replace: true })
+      //    compose cleanly with hidden-source anchors and YAML frontmatter source mapping.
+      const sharedHits = sourceMatches(markdown, "SharedNeedle", true);
+      expect(sharedHits).toHaveLength(4); // 0: frontmatter, 1: intro (rendered 1/2), 2: hidden link URL, 3: outro (rendered 2/2)
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from,
+        sourceEnd: sharedHits[2].to,
+        matchText: "SharedNeedle",
+        nonce: 202,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+
+      // Shift+F3 from hidden URL steps backward to preceding visible match 1 / 2.
+      act(() => { window.dispatchEvent(new CustomEvent("supermd-find-step", { detail: -1 })); });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+
+      // Re-seed hidden URL and press F3 -> steps forward to following visible match 2 / 2.
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from,
+        sourceEnd: sharedHits[2].to,
+        matchText: "SharedNeedle",
+        nonce: 203,
+      });
+      expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 2");
+      act(() => { window.dispatchEvent(new CustomEvent("supermd-find-step", { detail: 1 })); });
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+
+      // Re-seed hidden URL and press Ctrl+H (supermd-find-focus { replace: true }) -> opens Replace mapped to source 3 / 4!
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from,
+        sourceEnd: sharedHits[2].to,
+        matchText: "SharedNeedle",
+        nonce: 204,
+      });
+      act(() => { window.dispatchEvent(new CustomEvent("supermd-find-focus", { detail: { replace: true } })); });
+      expect(host.querySelector(".search-replace")).not.toBeNull();
+      expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+
+      // Stale folder-search range arriving while wholeWord + regexp + Replace are active resets filters and stays passive at 0 / 4 without jumping.
+      act(() => {
+        wholeWordBtn.click();
+        regexBtn.click();
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await renderLive({
+        query: "SharedNeedle",
+        caseSensitive: true,
+        sourceStart: sharedHits[2].from + 2,
+        sourceEnd: sharedHits[2].to + 2,
+        matchText: "SharedNeedle",
+        nonce: 205,
+      }, true);
+      expect(wholeWordBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(regexBtn.getAttribute("aria-pressed")).toBe("false");
+      expect(host.querySelector("output")?.textContent).toBe("0 / 4");
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+
+      // 3. Unmounted windowed block occurrence handoff mounts the block, selects exact occurrence, and maps Ctrl+H to source.
+      const block0 = "Intro AuroraToken paragraph.";
+      const block1 = "Unmounted first AuroraToken and targeted second AuroraToken in windowed block.";
+      const windowedDoc = `${block0}\n\n${block1}`;
+      const block1Start = block0.length + 2;
+      const winHits = sourceMatches(windowedDoc, "AuroraToken", true);
+      expect(winHits).toHaveLength(3);
+
+      const renderWindowed = (
+        seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number } | null,
+      ) =>
+        act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch
+                content={windowedDoc}
+                close={() => {}}
+                onChange={() => {}}
+                seed={seed}
+              />
+              <section className="android-reading">
+                <div className="markdown-body">
+                  <div id="win-block-1" data-windowed-block="" data-windowed-mounted="true" data-source-start="0" data-source-end={String(block0.length)}>
+                    <p data-source-start="0" data-source-end={String(block0.length)}>{block0}</p>
+                  </div>
+                  <div id="win-block-2" data-windowed-block="" data-windowed-mounted="false" data-source-start={String(block1Start)} data-source-end={String(windowedDoc.length)} />
+                </div>
+              </section>
+            </div>
+          );
+        });
+
+      let unregisterWindowed0: (() => void) | null = null;
+      let unregisterWindowed1: (() => void) | null = null;
+      await renderWindowed(null);
+      const winEl0 = host.querySelector<HTMLElement>("#win-block-1")!;
+      const winEl = host.querySelector<HTMLElement>("#win-block-2")!;
+      unregisterWindowed0 = registerWindowedText(winEl0, block0);
+      unregisterWindowed1 = registerWindowedText(winEl, block1);
+      winEl.addEventListener("supermd-reveal-window", () => {
+        winEl.setAttribute("data-windowed-mounted", "true");
+        winEl.innerHTML = `<p data-source-start="${block1Start}" data-source-end="${windowedDoc.length}">${block1}</p>`;
+      });
+      try {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+        await renderWindowed({
+          query: "AuroraToken",
+          caseSensitive: true,
+          sourceStart: winHits[2].from,
+          sourceEnd: winHits[2].to,
+          matchText: "AuroraToken",
+          nonce: 206,
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+        expect(winEl.getAttribute("data-windowed-mounted")).toBe("true");
+        expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+        expect(highlightMap.get("smd-search-current")?.ranges[0]?.startOffset).toBe(block1.lastIndexOf("AuroraToken"));
+
+        // Ctrl+H preserves 3 / 3 across windowed -> source Replace mode.
+        act(() => { window.dispatchEvent(new CustomEvent("supermd-find-focus", { detail: { replace: true } })); });
+        expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+      } finally {
+        unregisterWindowed0?.();
+        unregisterWindowed1?.();
+      }
+    } finally {
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("preserves windowed DOM-order navigation and unmounted source-range mapping when toggling Replace in source", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const scrolled: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
 
     const part0 = "## First\n\nTarget alpha.";
     const part1 = "## Second\n\nTarget beta.";
@@ -520,72 +1265,91 @@ describe("ReadingSearch DOM behavior", () => {
       );
     };
 
-    await act(async () => { renderWindowed(); });
-    const sections = Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
-    // Register out of DOM order (`sections[2]`, `sections[1]`, then `sections[0]`) to simulate Live block edits.
-    const cleanups = [
-      registerWindowedText(sections[2], "Third\nTarget gamma.\n"),
-      registerWindowedText(sections[1], "Second\nTarget beta.\n"),
-      registerWindowedText(sections[0], "First\nTarget alpha.\n"),
-    ];
-    let revealedSection: HTMLElement | null = null;
-    sections[1].addEventListener("supermd-reveal-window", () => {
-      revealedSection = sections[1];
-      sections[1].setAttribute("data-windowed-mounted", "true");
-      sections[1].innerHTML = "<h2>Second</h2><p>Target beta.</p>";
-    });
+    try {
+      await act(async () => { renderWindowed(); });
+      const sections = Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      // Register out of DOM order (`sections[2]`, `sections[1]`, then `sections[0]`) to simulate Live block edits.
+      const cleanups = [
+        registerWindowedText(sections[2], "Third\nTarget gamma.\n"),
+        registerWindowedText(sections[1], "Second\nTarget beta.\n"),
+        registerWindowedText(sections[0], "First\nTarget alpha.\n"),
+      ];
+      let revealedSection: HTMLElement | null = null;
+      sections[1].addEventListener("supermd-reveal-window", () => {
+        revealedSection = sections[1];
+        sections[1].setAttribute("data-windowed-mounted", "true");
+        sections[1].innerHTML = "<h2>Second</h2><p>Target beta.</p>";
+      });
+      sections[2].addEventListener("supermd-reveal-window", () => {
+        sections[2].setAttribute("data-windowed-mounted", "true");
+        sections[2].innerHTML = `<h2 data-source-start="${start2}" data-source-end="${start2 + 8}">Third</h2><p data-source-start="${start2 + 10}" data-source-end="${end2}">Target gamma.</p>`;
+      });
 
-    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
-    act(() => setInputValue(searchInput, "Target"));
-    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
-    expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      act(() => setInputValue(searchInput, "Target"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
 
-    // Step forward twice: 1 / 3 is sections[0], 2 / 3 reveals unmounted sections[1] in DOM order (not registration order).
-    const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
-    act(() => nextBtn.click());
-    expect(host.querySelector("output")?.textContent).toBe("1 / 3");
-    expect(revealedSection).toBeNull();
+      // Step forward twice: 1 / 3 is sections[0], 2 / 3 reveals unmounted sections[1] in DOM order (not registration order).
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+      expect(revealedSection).toBeNull();
 
-    act(() => nextBtn.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
-    expect(revealedSection).toBe(sections[1]);
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      expect(revealedSection).toBe(sections[1]);
 
-    // Step to 3 / 3 (still unmounted sections[2] until revealed or mapped), or toggle Replace at 2 / 3 and replace only second match.
-    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
-    act(() => replaceToggle.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      // Toggle Replace at 2 / 3 and replace only second match.
+      const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+      act(() => replaceToggle.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
 
-    // Toggling Replace off and back on preserves 2 / 3 synchronously.
-    act(() => replaceToggle.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
-    act(() => replaceToggle.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      // Toggling Replace off and back on preserves 2 / 3 synchronously.
+      act(() => replaceToggle.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      act(() => replaceToggle.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
 
-    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
-    const replaceSingle = () => host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
-    act(() => setInputValue(replaceInput, "Updated"));
-    act(() => replaceSingle().click());
-    expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nTarget gamma.");
+      const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+      const replaceSingle = () => host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+      act(() => setInputValue(replaceInput, "Updated"));
+      act(() => replaceSingle().click());
+      expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nTarget gamma.");
 
-    // Also verify #83 regex + capture-group replacement across the remaining unmounted block in DOM order.
-    await act(async () => { renderWindowed(); });
-    const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
-    const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
-    act(() => regexBtn.click());
-    act(() => wholeWordBtn.click());
-    act(() => setInputValue(searchInput, "Target (\\w+)"));
-    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
-    expect(host.querySelector("output")?.textContent).toBe("0 / 2");
-    const prevBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Previous match"]')!;
-    act(() => prevBtn.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
-    act(() => setInputValue(replaceInput, "Rewritten-$1"));
-    act(() => replaceSingle().click());
-    expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nRewritten-gamma.");
+      // Also verify #83 regex + capture-group replacement across the remaining unmounted block in DOM order,
+      // including 2-rAF settle re-scrolling when unmounted sections[2] mounts.
+      await act(async () => { renderWindowed(); });
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
+      act(() => regexBtn.click());
+      act(() => wholeWordBtn.click());
+      act(() => setInputValue(searchInput, "Target (\\w+)"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+      sections[2].setAttribute("data-windowed-mounted", "false");
+      sections[2].innerHTML = '<span aria-hidden="true" />';
+      scrolled.length = 0;
+      const prevBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Previous match"]')!;
+      act(() => prevBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+      expect(sections[2].getAttribute("data-windowed-mounted")).toBe("true");
+      const syncScrollCount = scrolled.length;
+      expect(syncScrollCount).toBeGreaterThanOrEqual(1);
+      await act(async () => {
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(undefined))));
+      });
+      expect(scrolled.length).toBeGreaterThan(syncScrollCount);
+      act(() => setInputValue(replaceInput, "Rewritten-$1"));
+      act(() => replaceSingle().click());
+      expect(changes.at(-1)).toBe("## First\n\nTarget alpha.\n\n## Second\n\nUpdated beta.\n\n## Third\n\nRewritten-gamma.");
 
-    cleanups.forEach((fn) => fn());
-    act(() => root.unmount());
-    host.remove();
+      cleanups.forEach((fn) => fn());
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      act(() => root.unmount());
+      host.remove();
+    }
   });
 
   it("scrolls precise Range coordinates into the unobstructed band below .reading-search in tall blocks and top lines", async () => {
@@ -1105,6 +1869,138 @@ describe("ReadingSearch DOM behavior", () => {
       Range.prototype.getClientRects = origGetClientRects;
       Range.prototype.getBoundingClientRect = origGetBoundingRect;
       vi.unstubAllGlobals();
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("composes #96 seeded exact occurrences, Unicode case-folded ranges, and passive stale-offset fallback with #110 unobstructed search-bar scrolling", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const tallLines = Array.from({ length: 90 }, (_, i) =>
+      i === 2 ? "Early BeaconHit in code" : i === 85 ? "Late BeaconHit in code" : `Line ${i} filler`,
+    );
+    const headingText = "Hauptstraße BeaconHit Top";
+    const content = `# ${headingText}\n\n\`\`\`txt\n${tallLines.join("\n")}\n\`\`\``;
+    const h1End = 2 + headingText.length;
+    const codeStart = h1End + 2;
+
+    const origHighlight = (window as unknown as { Highlight?: unknown }).Highlight;
+    const origCss = globalThis.CSS;
+    const highlightMap = new Map<string, { ranges: Range[] }>();
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) { this.ranges = ranges; }
+    }
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { ...(origCss ?? {}), highlights: highlightMap }, configurable: true, writable: true });
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+
+    const renderWithSeed = (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number } | null) =>
+      act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch content={content} close={() => {}} onChange={() => {}} seed={seed} />
+            <section className="android-reading">
+              <div className="reader-chrome-spacer" aria-hidden="true" />
+              <div className="document-page-space">
+                <div className="document-page">
+                  <div className="markdown-body">
+                    <h1 data-source-start="0" data-source-end={String(h1End)}>{headingText}</h1>
+                    <pre data-source-start={String(codeStart)} data-source-end={String(content.length)}><code>{tallLines.join("\n")}</code></pre>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>,
+        );
+      });
+
+    try {
+      await renderWithSeed(null);
+      const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+      const spacer = host.querySelector<HTMLElement>(".reader-chrome-spacer")!;
+      const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+      const heading = host.querySelector<HTMLElement>("h1")!;
+      const codeEl = host.querySelector<HTMLElement>("code")!;
+
+      const getSpacerMargin = () => parseFloat(spacer.style.marginBottom || "0") || 0;
+      searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 76);
+      scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+      heading.getBoundingClientRect = () => new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 420, 32);
+      codeEl.getBoundingClientRect = () => new DOMRect(40, 100 + getSpacerMargin() - scroller.scrollTop, 600, 1800);
+
+      const computeRangeRect = (range: Range): DOMRect => {
+        if (heading.contains(range.startContainer)) {
+          return new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 100, 28);
+        }
+        const text = range.startContainer.textContent || "";
+        const lineIdx = text.slice(0, range.startOffset).split("\n").length - 1;
+        return new DOMRect(40, 100 + getSpacerMargin() + lineIdx * 20 - scroller.scrollTop, 110, 20);
+      };
+      Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+      Range.prototype.getClientRects = function () {
+        const r = computeRangeRect(this);
+        return Object.assign([r], { item: (idx: number) => (idx === 0 ? r : null) }) as unknown as DOMRectList;
+      };
+
+      // 1. Seeded 3rd occurrence ("Late BeaconHit" at line 85 of tall block) scrolls exact Range into unobstructed band.
+      const hits = sourceMatches(content, "BeaconHit", true);
+      expect(hits).toHaveLength(3);
+      await renderWithSeed({
+        query: "BeaconHit",
+        caseSensitive: true,
+        sourceStart: hits[2].from,
+        sourceEnd: hits[2].to,
+        matchText: "BeaconHit",
+        nonce: 301,
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+      const lateRect = computeRangeRect(highlightMap.get("smd-search-current")!.ranges[0]);
+      expect(lateRect.top).toBeGreaterThanOrEqual(12 + 76 + 12);
+      expect(lateRect.bottom).toBeLessThanOrEqual(600 - 16);
+
+      // 2. Stale seeded occurrence preserves current scroll position and passive 0 / 3 without scrolling to occurrence 1.
+      const savedScrollTop = scroller.scrollTop;
+      await renderWithSeed({
+        query: "BeaconHit",
+        caseSensitive: true,
+        sourceStart: hits[2].from + 5,
+        sourceEnd: hits[2].to + 5,
+        matchText: "BeaconHit",
+        nonce: 302,
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+      expect(scroller.scrollTop).toBe(savedScrollTop);
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+
+      // 3. Seeded Unicode case-folded "strasse" -> "straße" on line 1 applies .reader-chrome-spacer clearance below .reading-search.
+      const unicodeStart = content.indexOf("straße");
+      await renderWithSeed({
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: unicodeStart,
+        sourceEnd: unicodeStart + "straße".length,
+        matchText: "straße",
+        nonce: 303,
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      const unicodeRange = highlightMap.get("smd-search-current")?.ranges[0];
+      expect(unicodeRange?.toString()).toBe("straße");
+      const unicodeRect = computeRangeRect(unicodeRange!);
+      expect(unicodeRect.top).toBeGreaterThanOrEqual(12 + 76 + 12);
+      expect(getSpacerMargin()).toBeGreaterThan(0);
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
       act(() => root.unmount());
       host.remove();
     }
