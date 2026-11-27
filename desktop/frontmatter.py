@@ -88,7 +88,7 @@ def _parse_single_quoted(text: str) -> tuple[str, str] | None:
 
 
 def _only_trailing_comment(rest: str) -> bool:
-    trimmed = rest.lstrip(" \t")
+    trimmed = rest.lstrip()
     return trimmed == "" or trimmed.startswith("#")
 
 
@@ -97,30 +97,18 @@ def _split_key_value(trimmed: str, allow_compact: bool = False) -> tuple[str, st
         return None
     if trimmed == "-" or trimmed.startswith(("- ", "-\t")):
         return None
-    if trimmed.startswith('"'):
-        parsed = _parse_double_quoted(trimmed)
+    if trimmed[0] in "\"'":
+        parsed = _parse_double_quoted(trimmed) if trimmed[0] == '"' else _parse_single_quoted(trimmed)
         if not parsed:
             return None
         key, rest = parsed
-        after = rest.lstrip(" \t")
+        after = rest.lstrip()
         if not after.startswith(":"):
             return None
         post = after[1:]
         if not allow_compact and post and post[0] not in (" ", "\t"):
             return None
-        return key, post.lstrip(" \t")
-    if trimmed.startswith("'"):
-        parsed = _parse_single_quoted(trimmed)
-        if not parsed:
-            return None
-        key, rest = parsed
-        after = rest.lstrip(" \t")
-        if not after.startswith(":"):
-            return None
-        post = after[1:]
-        if not allow_compact and post and post[0] not in (" ", "\t"):
-            return None
-        return key, post.lstrip(" \t")
+        return key, post.lstrip()
     if trimmed[0] in "[]{}|>*&!%@":
         return None
     for idx, ch in enumerate(trimmed):
@@ -131,7 +119,7 @@ def _split_key_value(trimmed: str, allow_compact: bool = False) -> tuple[str, st
             key = trimmed[:idx].strip()
             if not key or any(c in key for c in "[]{}\"'"):
                 return None
-            return key, after.lstrip(" \t")
+            return key, after.lstrip()
     return None
 
 
@@ -344,7 +332,7 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
         if trimmed == "-":
             return ""
         if trimmed.startswith(("- ", "-\t")):
-            return trimmed[1:].lstrip(" \t")
+            return trimmed[1:].lstrip()
         return None
 
     def consume_quoted(idx: int, initial: str, min_indent: int) -> int | None:
