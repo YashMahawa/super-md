@@ -111,3 +111,60 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
     pollIntervalMs: 10,
   }), /Timed out waiting/);
 });
+
+it('backs off on HTTP 403 rate-limit responses while still failing closed on permission errors', async () => {
+  let clock = 1_700_000_000_000;
+  const sleeps = [];
+  let calls = 0;
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    now: () => clock,
+    sleep: async ms => {
+      sleeps.push(ms);
+      clock += ms;
+    },
+    timeoutMs: 120_000,
+    pollIntervalMs: 5_000,
+    fetchImpl: async input => {
+      calls++;
+      if (calls === 1) {
+        return new Response(JSON.stringify({ message: 'API rate limit exceeded for installation ID 1.' }), {
+          status: 403,
+          headers: {
+            'x-ratelimit-remaining': '0',
+            'x-ratelimit-reset': String(Math.floor(clock / 1000) + 30),
+          },
+        });
+      }
+      if (calls === 2) {
+        return new Response(JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }), {
+          status: 403,
+          headers: { 'retry-after': '12' },
+        });
+      }
+      const url = new URL(input);
+      const body = url.pathname.endsWith('/jobs')
+        ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'completed', conclusion: 'success' }] }
+        : url.pathname.endsWith('/artifacts')
+          ? { total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }
+          : run;
+      return new Response(JSON.stringify(body), { status: 200 });
+    },
+  });
+  assert.deepEqual(result, names);
+  assert.deepEqual(sleeps, [31_000, 12_000]);
+
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: async () => new Response(JSON.stringify({ message: 'Resource not accessible by integration' }), {
+      status: 403,
+      headers: { 'x-ratelimit-remaining': '999' },
+    }),
+  }), /HTTP 403/);
+});

@@ -116,7 +116,7 @@ export function mermaidSandboxPlugin(
   const getSandboxBundle = () => {
     if (!cachedBundlePromise) {
       const buildId = ++latestBuildId;
-      let buildPromise: Promise<{ script: string; html: string }>;
+      let buildPromise: Promise<{ script: string; html: string }> | null = null;
       buildPromise = (async () => {
         const built = buildSandboxScript
           ? await buildSandboxScript()
