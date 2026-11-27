@@ -7,11 +7,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-if __package__ and "." in __package__:
-    from ..agent_live import LiveTabClient, read_discovery
-else:
-    from agent_live import LiveTabClient, read_discovery
-
+from .live_client import LiveTabClient, read_discovery
 
 UNAVAILABLE_REASON = (
     "Live Agent Access is disabled or Super MD is not running. "
@@ -64,7 +60,7 @@ class MultiSessionLiveClient:
                     row.update({"id": qualified, "windowId": window_id, "sessionId": session_id})
                     rows.append(row)
                 sessions[session_id] = (client, local_ids)
-            except Exception:
+            except Exception:  # noqa: BLE001, S112
                 # A closed or stale session is omitted. Do not expose discovery
                 # contents, authentication material, or exception messages.
                 continue
@@ -88,14 +84,14 @@ class MultiSessionLiveClient:
         if isinstance(tab_id, str) and tab_id.startswith("tab:"):
             tab_id = tab_id[4:]
         with self._lock:
-            for _session, (client, local_ids) in self._sessions.items():
+            for client, local_ids in self._sessions.values():
                 if tab_id in local_ids:
                     local_id, window_id = local_ids[tab_id]
                     return client, local_id, window_id
         # Refreshing lets a newly opened tab be addressed after one list call.
         self._refresh()
         with self._lock:
-            for _session, (client, local_ids) in self._sessions.items():
+            for client, local_ids in self._sessions.values():
                 if tab_id in local_ids:
                     local_id, window_id = local_ids[tab_id]
                     return client, local_id, window_id
@@ -123,7 +119,7 @@ class MultiSessionLiveClient:
         client, local_id, window_id = self._route(tab_id)
         method = getattr(client, "outline_tab", None)
         if not callable(method):
-            raise ValueError("Live heading outlines are not available from this desktop bridge")
+            raise ValueError("Live heading outlines are not available from this desktop bridge")  # noqa: TRY004
         return method(local_id, window_id=window_id, offset=offset, limit=limit)
 
     def patch_tab(self, tab_id: str, expected_revision: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
@@ -138,7 +134,7 @@ class MultiSessionLiveClient:
         client, local_id, window_id = self._route(tab_id)
         method = getattr(client, "get_tab_image", None)
         if not callable(method):
-            raise ValueError("Live asset images are not available from this desktop bridge")
+            raise ValueError("Live asset images are not available from this desktop bridge")  # noqa: TRY004
         return method(local_id, asset_name=asset_name, expected_revision=expected_revision, window_id=window_id)
 
     def document_action(self, tab_id: str | None, action: str, **params):
@@ -256,6 +252,6 @@ class MultiSessionLiveClient:
         client, local_id, window_id = self._route(tab_id)
         method = getattr(client, "attach_tab", None)
         if not callable(method):
-            raise ValueError("Attaching files to live tabs is not available from this desktop bridge")
+            raise ValueError("Attaching files to live tabs is not available from this desktop bridge")  # noqa: TRY004
         return method(local_id, asset_path=asset_path, expected_revision=expected_revision, name=name,
                       window_id=window_id)
