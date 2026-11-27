@@ -135,7 +135,7 @@ jobs:
           if-no-files-found: error
 
   desktop:
-    needs: prepare
+    needs: [prepare, native_frontend]
     if: needs.prepare.outputs.reuse_packages != 'true'
     strategy:
       fail-fast: false
@@ -224,11 +224,6 @@ jobs:
       - run: npx tsc -b --pretty false
       - name: Build the relay for cross-platform Qt/MCP integration tests
         run: npm ci --prefix agent-relay && npm run build --prefix agent-relay
-      - name: Wait for same-run frontend artifacts for this tag checkout
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
       - uses: actions/download-artifact@v4
         with:
           name: native-frontend-dist-${{ steps.source.outputs.sha }}
@@ -422,8 +417,8 @@ jobs:
         run: gh release upload "$RELEASE_TAG" "$RUNNER_TEMP/Super-MD-${{ needs.prepare.outputs.version }}-arm64-release.apk" --clobber
 
   publish:
-    needs: [prepare, desktop, android]
-    if: ${{ always() && needs.prepare.result == 'success' && needs.android.result == 'success' && (needs.desktop.result == 'success' || (needs.desktop.result == 'skipped' && needs.prepare.outputs.reuse_packages == 'true')) }}
+    needs: [prepare, native_frontend, desktop, android]
+    if: ${{ always() && needs.prepare.result == 'success' && needs.android.result == 'success' && ((needs.native_frontend.result == 'success' && needs.desktop.result == 'success') || (needs.native_frontend.result == 'skipped' && needs.desktop.result == 'skipped' && needs.prepare.outputs.reuse_packages == 'true')) }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

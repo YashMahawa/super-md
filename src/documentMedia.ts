@@ -6,10 +6,25 @@ import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
 import { maskFrontmatter } from "./frontmatter";
 import { remarkObsidianMath } from "./obsidianMath";
+import {
+  isRemoteImageApproved,
+  isRemoteOrExplicitScheme,
+  loadedReaderImageData,
+  normalizeApprovedImageUrls,
+  normalizeTrustedImageHosts,
+  type RemoteImageConsentPolicy,
+} from "./remoteImageConsent";
 
 export interface ImportedImage { source: string; alt: string }
 export interface LinkDetails { url: string; title: string; thumbnail?: string }
-export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source);
+export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source) && source.length <= 7 + 150;
+const compatPortableAssetSource = (source: string, ext: string) => {
+  if (!source.startsWith("assets/")) return false;
+  const name = source.slice(7);
+  if (!name || name.length > 159 || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name)) return false;
+  const actualExt = name.split(".").pop()?.toLowerCase();
+  return ext === "jpg" ? actualExt === "jpg" || actualExt === "jpeg" : actualExt === ext;
+};
 export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&").replace(/[\r\n]+/g, " ");
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
@@ -84,24 +99,61 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 }
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
-export async function prepareFmd(markdown: string, documentPath: string | null) {
+export type PrepareFmdOptions = RemoteImageConsentPolicy & { portable?: boolean };
+
+interface NormalizedFmdConsent {
+  noteId?: string;
+  trustedHosts: Set<string>;
+  approvedUrls: Set<string>;
+  loadedImageData?: ReadonlyMap<string, string> | Record<string, string>;
+}
+
+async function prepareFmdInternal(
+  markdown: string,
+  documentPath: string | null,
+  portableDoc: boolean,
+  consent: NormalizedFmdConsent,
+  shared: Map<string, Promise<string | null>>,
+  assets: Record<string, string>,
+): Promise<string> {
   const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
   const tree = processor.parse(maskFrontmatter(markdown));
-  const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
-  const shared = new Map<string, Promise<string>>();
+  const work: Promise<void>[] = [];
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const definitions = new Map<string, any>(); const usedDefinitions = new Set<string>();
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
   const collect = (source: string, replace: (name: string) => void) => {
-    if (!shared.has(source)) shared.set(source, (async () => {
-      const data = /^data:image\//.test(source) ? source : /^https?:/.test(source) ? (await invoke<{ body: string }>("fetch_resource", { url: source, image: true })).body : await invoke<string>("load_asset", { documentPath: documentPath || "", source });
-      const type = data.match(/^data:image\/([^;]+);base64,/)?.[1];
+    if (!shared.has(source)) shared.set(source, (async (): Promise<string | null> => {
+      let data: string;
+      if (/^data:/i.test(source)) {
+        if (!/^data:image\//i.test(source)) throw new Error(`Unsupported image ${source}`);
+        data = source;
+      } else if (isRemoteOrExplicitScheme(source)) {
+        const preloaded = loadedReaderImageData(source, {
+          noteId: consent.noteId,
+          loadedImageData: consent.loadedImageData,
+          trustedHosts: consent.trustedHosts,
+          approvedUrls: consent.approvedUrls,
+          enforcePolicy: true,
+        });
+        if (preloaded) {
+          data = preloaded;
+        } else if (isRemoteImageApproved(source, consent.trustedHosts, consent.approvedUrls)) {
+          data = (await invoke<{ body: string }>("fetch_resource", { url: source, image: true })).body;
+        } else {
+          return null;
+        }
+      } else {
+        data = await invoke<string>("load_asset", { documentPath: documentPath || "", source });
+      }
+      const type = data.match(/^data:image\/([^;]+);base64,/i)?.[1]?.toLowerCase();
       if (!type) throw new Error(`Unsupported image ${source}`);
-      const name = attachmentSource(source) ? source : `assets/image-${crypto.randomUUID()}.${type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type}`;
+      const ext = type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type;
+      const name = attachmentSource(source) || (portableDoc && compatPortableAssetSource(source, ext)) ? source : `assets/image-${crypto.randomUUID()}.${ext}`;
       assets[name] = data;
       return name;
     })());
-    work.push(shared.get(source)!.then(replace));
+    work.push(shared.get(source)!.then((name) => { if (name !== null) replace(name); }));
   };
   visit(tree, (node: any) => {
     if (node.type === "image") collect(node.url, (name) => { edits.push({ start: node.position.start.offset, end: node.position.end.offset, value: `![${markdownLabel(node.alt || "")}](<${name}>${node.title ? ` "${node.title.replace(/["\\]/g, "\\$&")}"` : ""})` }); });
@@ -132,18 +184,49 @@ export async function prepareFmd(markdown: string, documentPath: string | null) 
     const stepSources = new Set(deck.steps.map(step => step?.image).filter((image): image is string => typeof image === "string" && image.length > 0));
     if (!stepSources.size && !deck.steps.some(step=>typeof step.markdown==="string")) return;
     const rewritten = new Map<string, string>();
+    let markdownChanged = false;
     const offset = work.length;
     for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
-    for(const step of deck.steps) if(typeof step.markdown==='string') work.push(prepareFmd(step.markdown,documentPath).then(prepared=>{step.markdown=prepared.content;Object.assign(assets,prepared.assets);}));
+    for(const step of deck.steps) if(typeof step.markdown==='string') {
+      const originalMarkdown = step.markdown;
+      work.push(prepareFmdInternal(originalMarkdown, documentPath, portableDoc, consent, shared, assets).then(prepared => {
+        if (prepared !== originalMarkdown) {
+          step.markdown = prepared;
+          markdownChanged = true;
+        }
+      }));
+    }
     // All corresponding assets must finish loading before serializing this deck.
     const waiting = work.splice(offset);
     work.push(Promise.all(waiting).then(() => {
-      for (const step of deck.steps!) if (typeof step.image === "string" && rewritten.has(step.image)) step.image = rewritten.get(step.image);
-      edits.push({start: payloadStart, end: payloadEnd, value: JSON.stringify(deck, null, 2)});
+      let imageChanged = false;
+      for (const step of deck.steps!) {
+        if (typeof step.image === "string" && rewritten.has(step.image)) {
+          step.image = rewritten.get(step.image);
+          imageChanged = true;
+        }
+      }
+      if (imageChanged || markdownChanged) {
+        edits.push({start: payloadStart, end: payloadEnd, value: JSON.stringify(deck, null, 2)});
+      }
     }));
   });
   await Promise.all(work);
   let content = markdown;
   for (const edit of edits.sort((a, b) => b.start - a.start)) content = content.slice(0, edit.start) + edit.value + content.slice(edit.end);
+  return content;
+}
+
+export async function prepareFmd(markdown: string, documentPath: string | null, options: PrepareFmdOptions = {}) {
+  const portableDoc = options.portable ?? /\.(?:smd|fmd)$/i.test(documentPath || "");
+  const assets: Record<string, string> = {};
+  const shared = new Map<string, Promise<string | null>>();
+  const consent: NormalizedFmdConsent = {
+    noteId: options.noteId,
+    trustedHosts: normalizeTrustedImageHosts(options.trustedImageHosts),
+    approvedUrls: normalizeApprovedImageUrls(options.approvedImageUrls),
+    loadedImageData: options.loadedImageData,
+  };
+  const content = await prepareFmdInternal(markdown, documentPath, portableDoc, consent, shared, assets);
   return { content, assets };
 }

@@ -2,6 +2,7 @@
 from __future__ import annotations
 import base64, hashlib, json, os, sys, time
 from pathlib import Path
+from core.paths import resource_root
 
 def preview(store, path_value, output_value, *, width=1200, height=900, heading=None, dark=False, snapshot_value=None):
     if not 320 <= width <= 2400 or not 240 <= height <= 2400:
@@ -27,7 +28,7 @@ def preview(store, path_value, output_value, *, width=1200, height=900, heading=
     from PySide6.QtGui import QFontDatabase
     from documents import MIMES, atomic_write
     from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
-    root=Path(sys._MEIPASS)/'resources' if getattr(sys,'frozen',False) else Path(__file__).resolve().parent.parent
+    root=resource_root()
     reader=root/'dist'/'qt-reader.html'
     if not reader.is_file():raise ValueError('Build or install the offline reader before previewing notes')
     register_reader_schemes()
