@@ -1,11 +1,9 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-const fallback = vi.hoisted(() => vi.fn(async () => "fallback"));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: fallback }));
 import { invoke } from "./nativeBridge";
 
 beforeEach(() => { vi.useFakeTimers(); window.SuperMD = { post: vi.fn() }; });
-afterEach(() => { delete window.SuperMD; vi.clearAllTimers(); vi.useRealTimers(); fallback.mockClear(); });
+afterEach(() => { delete window.SuperMD; vi.clearAllTimers(); vi.useRealTimers(); });
 describe("native request lifecycle", () => {
   it("correlates concurrent replies and ignores duplicate or unknown replies", async () => {
     const a = invoke("read", { path: "A" }); const b = invoke("read", { path: "B" });
@@ -27,8 +25,8 @@ describe("native request lifecycle", () => {
     await vi.advanceTimersByTimeAsync(Number(timeout) - 1); expect(vi.getTimerCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(1); await rejected; window.supermdReply!(id, "late", null); expect(vi.getTimerCount()).toBe(0);
   });
-  it("keeps the legacy host fallback", async () => {
-    delete window.SuperMD; await expect(invoke("doctor", { detail: true })).resolves.toBe("fallback");
-    expect(fallback).toHaveBeenCalledWith("doctor", { detail: true });
+  it("rejects when native host bridge is unavailable", async () => {
+    delete window.SuperMD;
+    await expect(invoke("doctor", { detail: true })).rejects.toThrow("Native host bridge unavailable for doctor");
   });
 });

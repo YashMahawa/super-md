@@ -12,6 +12,8 @@
 // Allow long cell labels to wrap when generated fractional columns are narrow.
 #show table.cell: set text(hyphenate: true)
 #show raw: set text(font: "DejaVu Sans Mono", size: .86em)
+// Reserve the full height and depth of inline math on consecutive lines.
+#show math.equation.where(block: false): set text(top-edge: "bounds", bottom-edge: "bounds")
 #show link: set text(fill: smd-link)
 #show table.cell.where(y: 0): set text(weight: "bold")
 #set page(footer: context align(center, text(size: 8pt, fill: rgb("#686868"), counter(page).display())))
