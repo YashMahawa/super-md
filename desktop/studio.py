@@ -34,6 +34,10 @@ try:
 except ImportError:  # pragma: no cover
     shiboken6 = None
 from network_tls import client_context
+if __package__:
+    from . import studio_reader_runtime
+else:
+    import studio_reader_runtime
 from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPaths, QTimer, QUrl, QFileSystemWatcher, QProcess, Qt, QPointF, QRect, QMetaObject, QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
@@ -419,37 +423,18 @@ def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":3,\"step\":0.05,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
-    """Resolve once and return a global IP for the URL's host, or refuse."""
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http","https") or not parsed.hostname or parsed.username or parsed.password:
-        raise ValueError("Use a public web URL")
-    addresses = socket.getaddrinfo(parsed.hostname,parsed.port or (443 if parsed.scheme=="https" else 80),type=socket.SOCK_STREAM)
-    if not addresses or any(not ipaddress.ip_address(address[4][0]).is_global for address in addresses):
-        raise ValueError("Private, local and reserved network addresses are not allowed")
-    return addresses[0][4][0]
+    return studio_reader_runtime.public_address(url)
 
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, host, *args, pinned="", **kwargs):
-        super().__init__(host, *args, **kwargs); self.pinned = pinned
-    def connect(self):
-        self.sock = socket.create_connection((self.pinned, self.port), self.timeout)
+_PinnedHTTPConnection = studio_reader_runtime._PinnedHTTPConnection
+_PinnedHTTPSConnection = studio_reader_runtime._PinnedHTTPSConnection
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, *args, pinned="", **kwargs):
-        super().__init__(host, *args, **kwargs); self.pinned = pinned
-    def connect(self):
-        # TLS still verifies the certificate against the requested hostname.
-        self.sock = self._context.wrap_socket(socket.create_connection((self.pinned, self.port), self.timeout), server_hostname=self.host)
-
-class PinnedHTTPHandler(urllib.request.HTTPHandler):
+class PinnedHTTPHandler(studio_reader_runtime.PinnedHTTPHandler):
     def http_open(self, request):
-        pinned = public_address(request.full_url)
-        return self.do_open(lambda host, **kwargs: _PinnedHTTPConnection(host, pinned=pinned, **kwargs), request)
+        return super().http_open(request, public_address_fn=public_address, connection_cls=_PinnedHTTPConnection)
 
-class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+class PinnedHTTPSHandler(studio_reader_runtime.PinnedHTTPSHandler):
     def https_open(self, request):
-        pinned = public_address(request.full_url)
-        return self.do_open(lambda host, **kwargs: _PinnedHTTPSConnection(host, pinned=pinned, **kwargs), request, context=client_context())
+        return super().https_open(request, public_address_fn=public_address, connection_cls=_PinnedHTTPSConnection, client_context_fn=client_context)
 
 def local_path(value: str) -> Path:
     url = QUrl(value)
@@ -7123,106 +7108,30 @@ class Studio(QObject):
 
     @Slot()
     def readerCrashed(self):
-        if self.retired:return
-        # Native tab text and persisted positions are authoritative. Reloading
-        # a renderer must not restore an older recovery snapshot or run cells.
-        self.ready=False
-        self._last_reader_text=None
-        self._last_reader_agent_seq.clear()
-        self.reader_overlay=False
-        self.image_overlay=False
-        self._emit(False)
+        return studio_reader_runtime.reader_crashed(self)
 
     def _asset(self, tab, source):
-        if source in tab["assets"]: return tab["assets"][source]
-        if not tab["path"]: raise ValueError("Save this note to resolve relative images")
-        root = Path(tab["path"]).parent.resolve()
-        path = (root / urllib.parse.unquote(source)).resolve()
-        if not path.is_relative_to(root): raise ValueError("Image is outside the note folder")
-        if path.stat().st_size > MAX_IMAGE: raise ValueError("Image exceeds 25 MB")
-        mime = MIMES.get(path.suffix[1:].lower())
-        if not mime: raise ValueError("Unsupported image type")
-        return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+        return studio_reader_runtime.resolve_image_asset(self, tab, source, max_image_bytes=MAX_IMAGE, mimes=MIMES)
 
     def _text_asset(self, tab, source):
-        if not isinstance(source, str) or len(source) > 4096 or Path(source).suffix.lower() not in (".mmd", ".mermaid"):
-            raise ValueError("Only local .mmd or .mermaid source files can be inlined")
-        if not tab.get("path"): raise ValueError("Save this note to resolve relative diagram source files")
-        root = Path(tab["path"]).parent.resolve()
-        relative = urllib.parse.unquote(source.split("#", 1)[0].split("?", 1)[0])
-        requested = root / relative
-        current = root
-        for part in Path(relative).parts:
-            current = current / part
-            if current.is_symlink(): raise ValueError("Diagram source symlink paths are not allowed")
-        path = requested.resolve(strict=True)
-        if not path.is_relative_to(root) or not path.is_file(): raise ValueError("Diagram source is outside the note folder")
-        if path.stat().st_size > 2_000_000: raise ValueError("Diagram source exceeds 2 MB")
-        return path.read_text(encoding="utf-8")
+        return studio_reader_runtime.resolve_text_asset(self, tab, source)
 
     def _find_open_tab(self, reference, *, canonicalize_local: bool = False):
-        if not isinstance(reference, str) or not reference:
-            return None
-        match = next((item for item in self.tabs if reference in (item["id"], item["path"])), None)
-        if match is not None or not canonicalize_local or "\x00" in reference:
-            return match
-        try:
-            if QUrl(reference).isLocalFile() or Path(reference).is_absolute():
-                canonical = str(local_path(reference))
-                exact = next((item for item in self.tabs if item["path"] == canonical or (item["path"] and folder_ops.same_path(item["path"], canonical))), None)
-                if exact is not None:
-                    return exact
-                return next(
-                    (
-                        item for item in self.tabs
-                        if item["path"] and not Path(item["path"]).is_symlink() and os.path.samefile(item["path"], canonical)
-                    ),
-                    None,
-                )
-        except OSError:
-            pass
-        return None
+        return studio_reader_runtime.find_open_tab(self, reference, canonicalize_local=canonicalize_local, local_path_fn=local_path)
 
     def _fetch(self, args):
-        url = args["url"]
-        self._public_url(url)
-        owner = self
-        class PublicRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self,request,fp,code,msg,headers,newurl):
-                owner._public_url(newurl)
-                return super().redirect_request(request,fp,code,msg,headers,newurl)
-        # Connect to the exact address that was validated. Resolving again in
-        # the socket layer would allow DNS rebinding onto a private network.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), PinnedHTTPHandler(), PinnedHTTPSHandler(), PublicRedirect())
-        request = urllib.request.Request(url,headers={"User-Agent":"SuperMD/Qt"})
-        with opener.open(request,timeout=20) as response:
-            data = response.read((MAX_IMAGE if args.get("image") else 2_000_000)+1)
-            if len(data) > (MAX_IMAGE if args.get("image") else 2_000_000): raise ValueError("Resource is too large")
-            if args.get("image"):
-                mime = response.headers.get_content_type()
-                if mime not in MIMES.values(): raise ValueError("URL did not return a supported image")
-                return {"body":f"data:{mime};base64,{base64.b64encode(data).decode()}"}
-            return {"body":data.decode("utf-8",errors="replace")}
+        return studio_reader_runtime.fetch_public_resource(
+            self, args, public_address_fn=public_address,
+            http_handler_cls=PinnedHTTPHandler, https_handler_cls=PinnedHTTPSHandler,
+            max_image_bytes=MAX_IMAGE, mimes=MIMES,
+        )
 
     @staticmethod
     def _public_url(url):
         return public_address(url)
 
     def _engine(self):
-        executable = "smd-engine.exe" if sys.platform == "win32" else "smd-engine"
-        candidates = [ROOT / "desktop" / executable, ROOT / "smd-core" / "target" / "release" / executable, ROOT / "smd-core" / "target" / "debug" / executable]
-        for path in candidates:
-            if path.is_file(): return path
-        raise ValueError("Native PDF engine is not installed. Build smd-core's smd-engine binary.")
+        return studio_reader_runtime.resolve_pdf_engine(self, root_dir=ROOT, sys_platform=sys.platform)
 
     def _python(self, executable, code, folder=None, job=None):
-        # Explicit Run only. Python is trusted local code, not a sandbox.
-        owned_job = None
-        if job is None and hasattr(self, "_python_jobs"):
-            owned_job = self._python_jobs.register("")
-            job = owned_job
-        try:
-            return python_runtime.run(executable or self.settings["python"], code, cwd=folder, job=job)
-        finally:
-            if owned_job is not None:
-                self._python_jobs.discard(owned_job)
+        return studio_reader_runtime.run_python_cell(self, executable, code, folder=folder, job=job, run_fn=python_runtime.run)
