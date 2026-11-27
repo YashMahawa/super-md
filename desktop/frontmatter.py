@@ -432,9 +432,7 @@ def _parse_yaml_mapping(yaml_body: str) -> dict[str, object] | None:
                 return None
             if state == "balanced":
                 ok, val = _parse_flow_value(_strip_flow_comment(comb))
-                if not ok:
-                    return None
-                return val, idx + 1
+                return (val if ok else comb), idx + 1
             idx += 1
             if idx >= len(lines):
                 return None
