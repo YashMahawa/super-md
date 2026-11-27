@@ -97,7 +97,8 @@ class DocumentStore:
             if not must_exist and not absolute.parent.is_dir():
                 continue
             try:
-                resolved = absolute.resolve(strict=must_exist)
+                resolved = Path(fs_ops._clean_path_input(
+                    absolute.resolve(strict=must_exist), error="Path is outside the configured workspace roots or does not exist"))
             except (OSError, RuntimeError):
                 continue
             if resolved == root or root in resolved.parents:

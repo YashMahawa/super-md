@@ -1188,31 +1188,37 @@ class AgentDocumentsTest(unittest.TestCase):
 
         from agent import fs_ops
 
-        selected_root, stripped_decoy, trailing_decoy = (
-            self.root / " Study notes ", self.root / "Study notes", self.root / "Study notes ",
-        )
-        for directory in (selected_root, stripped_decoy, trailing_decoy):
+        base = self.root.resolve(strict=True)
+        selected_root = base / (" Study notes " if os.name != "nt" else " Study notes")
+        stripped_decoy = base / "Study notes"
+        decoys = [stripped_decoy, *([base / "Study notes "] if os.name != "nt" else [])]
+        for directory in (selected_root, *decoys):
             directory.mkdir()
-        (stripped_decoy / "note.md").write_text("# Decoy\n", encoding="utf-8")
-        (trailing_decoy / "note.md").write_text("# Trailing decoy\n", encoding="utf-8")
+        for decoy in decoys:
+            (decoy / "note.md").write_text("# Decoy\n", encoding="utf-8")
         for bad_root in ("", "   ", "\t\n", "bad\0root"):
             with self.assertRaises(AgentDocumentError):
                 DocumentStore([bad_root])
         ws = DocumentStore([str(selected_root)])
         self.assertEqual(ws.roots, (selected_root.resolve(strict=True),))
-        for bad_target in ("", "   ", "note\0.md", str(stripped_decoy / "note.md"), str(trailing_decoy / "note.md")):
+        for bad_target in ("", "   ", "note\0.md", *(str(d / "note.md") for d in decoys)):
             with self.assertRaises(AgentDocumentError):
                 ws.resolve(bad_target)
-        created = ws.create(" spaced note .md ", "# Spaced\nalpha\n")
-        self.assertTrue((selected_root / " spaced note .md ").is_file())
-        self.assertFalse((stripped_decoy / " spaced note .md ").exists())
-        patched = ws.patch(str(selected_root / " spaced note .md "), expected_revision=created["revision"],
+        note_name = " spaced note .md " if os.name != "nt" else " spaced note .md"
+        created = ws.create(note_name, "# Spaced\nalpha\n")
+        self.assertTrue((selected_root / note_name).is_file())
+        self.assertFalse((selected_root / note_name.strip()).exists())
+        self.assertFalse((stripped_decoy / note_name).exists())
+        patched = ws.patch(str(selected_root / note_name), expected_revision=created["revision"],
                            operations=[{"type": "replace", "old": "alpha", "new": "beta"}])
         self.assertNotEqual(patched["revision"], created["revision"])
-        self.assertEqual(ws.read(" spaced note .md ", view="source")["text"], "# Spaced\nbeta\n")
+        self.assertEqual(ws.read(note_name, view="source")["text"], "# Spaced\nbeta\n")
         with self.assertRaises(RevisionConflict):
-            ws.patch(" spaced note .md ", expected_revision=created["revision"],
+            ws.patch(note_name, expected_revision=created["revision"],
                      operations=[{"type": "replace", "old": "beta", "new": "gamma"}])
+        orig_resolve = Path.resolve
+        with patch.object(Path, "resolve", lambda p, strict=False: Path("\\\\?\\" + str(orig_resolve(p, strict=strict)))):
+            self.assertEqual(DocumentStore([str(selected_root)]).resolve(note_name), selected_root / note_name)
         junction_dir = selected_root / "junction-sub"
         junction_dir.mkdir()
         (junction_dir / "inside.md").write_text("# Inside\n", encoding="utf-8")

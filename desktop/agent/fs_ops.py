@@ -64,9 +64,7 @@ def _clean_path_input(value: str | os.PathLike[str], *, error: str) -> str:
     raw = os.fspath(value) if isinstance(value, (str, os.PathLike)) else ""
     if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
         raise AgentDocumentError(error)
-    if raw.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + raw[8:]
-    return raw.removeprefix("\\\\?\\")
+    return ("\\\\" + raw[8:]) if raw[:8].upper() == "\\\\?\\UNC\\" else raw.removeprefix("\\\\?\\")
 
 
 def _symlink_component(path: Path) -> Path | None:
