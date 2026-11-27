@@ -315,6 +315,40 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+internal data class AgentSavePrecheckFailure(val message: String, val revisionConflict: Boolean = false)
+
+internal fun buildAgentTabJson(
+    note: Note, tabId: String, revision: String, id: String? = null,
+    nameOverride: String? = null, pathOverride: String? = null, uriOverride: String? = null,
+    active: Boolean? = null, saved: Boolean? = null, mode: String? = null, format: String? = null,
+    savedAs: Boolean? = null, closed: Boolean? = null, activeTabId: String? = null,
+): JSONObject = JSONObject().apply {
+    if (id != null) put("id", id)
+    if (closed != null) put("closed", closed)
+    if (activeTabId != null) put("activeTabId", activeTabId)
+    put("tabId", tabId).put("name", nameOverride ?: note.name)
+    put("path", pathOverride ?: (note.uri ?: note.id)).put("uri", uriOverride ?: (note.uri ?: JSONObject.NULL))
+    if (active != null) put("active", active)
+    if (saved != null) put("saved", saved)
+    if (mode != null) put("mode", mode)
+    if (format != null) put("format", format)
+    if (savedAs != null) put("savedAs", savedAs)
+    put("revision", revision)
+}
+
+internal fun validateAgentSavePrecheck(
+    note: Note?, requestedFormat: String?, expectedRevision: String,
+    currentRevision: String = note?.let { agentContentRevision(it.content) }.orEmpty(), saveAs: Boolean,
+): AgentSavePrecheckFailure? {
+    if (note == null) return AgentSavePrecheckFailure("The requested tab is not open on this device")
+    val actualFormat = if (note.portable) "smd" else "md"
+    if (requestedFormat != null && requestedFormat != actualFormat)
+        return AgentSavePrecheckFailure("Android ${if (saveAs) "Save As" else "save"} preserves this note's $actualFormat format; converting formats is not supported")
+    if (!currentRevision.equals(expectedRevision, ignoreCase = true))
+        return AgentSavePrecheckFailure("Revision conflict: the note changed; read it again before saving", revisionConflict = true)
+    return null
+}
+
 @Composable private fun Studio(model: StudioViewModel, activity: MainActivity) {
     val state by model.state.collectAsStateWithLifecycle()
     val systemDark = androidx.compose.foundation.isSystemInDarkTheme()
@@ -688,16 +722,33 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     reply(null, "The requested tab is inactive. Activate it in Super MD before using this Android reader action.")
                 } else scope.launch { action() }
             }
+            fun replySavedTab(target: String, nameOverride: String? = null, pathOverride: String? = null, savedAs: Boolean = false) {
+                val saved = model.state.value.tabs.firstOrNull { it.id == target }
+                if (saved == null) reply(null, "The note closed while it was saving")
+                else reply(buildAgentTabJson(saved, canonicalTabId(saved), activity.agentRevision(saved.content),
+                    nameOverride = nameOverride, pathOverride = pathOverride, uriOverride = pathOverride,
+                    active = saved.id == model.state.value.activeId, saved = !saved.dirty, savedAs = if (savedAs) true else null), null)
+            }
+            fun withFlushedActiveTab(fallbackError: String, notifyAssetsChanged: (JSONObject) -> Boolean, mutation: suspend () -> JSONObject) = withSelectedTab {
+                val flush = JSONObject(request.toString()).put("action", "flush_current")
+                activity.dispatchAgentRequest(web!!, flush) { _, flushError ->
+                    if (flushError != null) reply(null, flushError)
+                    else scope.launch {
+                        runCatching { mutation() }
+                            .onSuccess { if (notifyAssetsChanged(it)) web?.evaluateJavascript("window.dispatchEvent(new Event('supermd-assets-changed'))", null); reply(it, null) }
+                            .onFailure { sendAgentReply(request.optString("tabId"), null, it.message ?: fallbackError) }
+                    }
+                }
+            }
             when (request.optString("action")) {
                 "list_tabs" -> {
                     val tabs = org.json.JSONArray()
                     val liveState = model.state.value
                     liveState.tabs.take(100).forEach { note ->
                         val id = canonicalTabId(note)
-                        tabs.put(JSONObject().put("id", id).put("tabId", id).put("name", note.name).put("saved", !note.dirty)
-                            .put("active", note.id == liveState.activeId).put("mode", if (note.id == liveState.activeId) liveState.mode else "live")
-                            .put("path", note.uri ?: note.id).put("uri", note.uri ?: JSONObject.NULL)
-                            .put("revision", activity.agentRevision(note.content)))
+                        val isActive = note.id == liveState.activeId
+                        tabs.put(buildAgentTabJson(note, id, activity.agentRevision(note.content), id = id,
+                            active = isActive, saved = !note.dirty, mode = if (isActive) liveState.mode else "live"))
                     }
                     reply(JSONObject().put("tabs", tabs), null)
                 }
@@ -713,10 +764,8 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                             if (created == null) reply(null, "Super MD could not create a tab")
                             else {
                                 val updated = model.state.value.tabs.firstOrNull { it.id == created.id } ?: created
-                                reply(JSONObject().put("tabId", canonicalTabId(updated)).put("name", updated.name)
-                                    .put("path", updated.uri ?: updated.id).put("uri", updated.uri ?: JSONObject.NULL)
-                                    .put("active", updated.id == model.state.value.activeId).put("format", if (updated.portable) "smd" else "md")
-                                    .put("revision", activity.agentRevision(updated.content)), null)
+                                reply(buildAgentTabJson(updated, canonicalTabId(updated), activity.agentRevision(updated.content),
+                                    active = updated.id == model.state.value.activeId, format = if (updated.portable) "smd" else "md"), null)
                             }
                         }
                     }
@@ -739,9 +788,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                     else {
                                         val note = model.state.value.tabs.firstOrNull { it.id == target }
                                         if (note == null || model.state.value.activeId != target) reply(null, "The requested tab is no longer open")
-                                        else reply(JSONObject().put("tabId", canonicalTabId(note)).put("name", note.name)
-                                            .put("path", note.uri ?: note.id).put("uri", note.uri ?: JSONObject.NULL).put("active", true)
-                                            .put("revision", activity.agentRevision(note.content)), null)
+                                        else reply(buildAgentTabJson(note, canonicalTabId(note), activity.agentRevision(note.content), active = true), null)
                                     }
                                 }
                             }
@@ -749,63 +796,30 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     }
                     "save" -> {
                         val target = request.optString("tabId")
-                        val options = request.optJSONObject("options")
+                        val saveAs = request.optJSONObject("options")?.optBoolean("saveAs", false) == true
                         val requestedFormat = request.optString("format").takeIf { it.isNotBlank() }
-                        if (options?.optBoolean("saveAs", false) == true) {
-                            val note = model.state.value.tabs.firstOrNull { it.id == target }
-                            if (note == null) reply(null, "The requested tab is not open on this device")
-                            else if (requestedFormat != null && requestedFormat != (if (note.portable) "smd" else "md"))
-                                reply(null, "Android Save As preserves this note's ${if (note.portable) "smd" else "md"} format; converting formats is not supported")
-                            else if (!activity.agentRevision(note.content).equals(request.optString("expectedRevision"), ignoreCase = true))
-                                sendAgentReply(target, null, "Revision conflict: the note changed; read it again before saving")
-                            else {
-                                model.busy(true)
-                                scope.launch {
-                                    runCatching { model.saveAgentAs(target, request.getString("expectedRevision"), request.getString("filename")) }
-                                        .onFailure { error -> model.fail("Could not save as: ${error.message}"); sendAgentReply(target, null, error.message ?: "Could not save as") }
-                                        .onSuccess { (path, name) ->
-                                            val saved = model.state.value.tabs.firstOrNull { it.id == target }
-                                            if (saved == null) reply(null, "The note closed while it was saving")
-                                            else reply(JSONObject().put("tabId", canonicalTabId(saved)).put("name", name).put("path", path).put("uri", path)
-                                                .put("active", saved.id == model.state.value.activeId).put("revision", activity.agentRevision(saved.content))
-                                                .put("saved", !saved.dirty).put("savedAs", true), null)
-                                        }
-                                }
+                        val note = model.state.value.tabs.firstOrNull { it.id == target }
+                        val precheck = validateAgentSavePrecheck(note, requestedFormat, request.optString("expectedRevision"),
+                            note?.let { activity.agentRevision(it.content) }.orEmpty(), saveAs)
+                        if (precheck != null) {
+                            if (precheck.revisionConflict) sendAgentReply(target, null, precheck.message)
+                            else reply(null, precheck.message)
+                        } else if (saveAs) {
+                            model.busy(true)
+                            scope.launch {
+                                runCatching { model.saveAgentAs(target, request.getString("expectedRevision"), request.getString("filename")) }
+                                    .onFailure { error -> model.fail("Could not save as: ${error.message}"); sendAgentReply(target, null, error.message ?: "Could not save as") }
+                                    .onSuccess { (path, name) -> replySavedTab(target, nameOverride = name, pathOverride = path, savedAs = true) }
                             }
-                        }
-                        else {
-                            val note = model.state.value.tabs.firstOrNull { it.id == target }
-                            if (note == null) reply(null, "The requested tab is not open on this device")
-                            else if (requestedFormat != null && requestedFormat != (if (note.portable) "smd" else "md"))
-                                reply(null, "Android save preserves this note's ${if (note.portable) "smd" else "md"} format; converting formats is not supported")
-                            else if (!activity.agentRevision(note.content).equals(request.optString("expectedRevision"), ignoreCase = true))
-                                sendAgentReply(target, null, "Revision conflict: the note changed; read it again before saving")
-                            else if (note.portable) {
-                                model.busy(true)
-                                scope.launch {
-                                    runCatching { model.saveAgentPortable(target, request.getString("expectedRevision")) }
-                                        .onFailure { error -> sendAgentReply(target, null, model.reportDocumentSaveFailure(target, error, "Could not save portable note: ${error.message}")) }
-                                        .onSuccess {
-                                            val saved = model.state.value.tabs.firstOrNull { it.id == target }
-                                            if (saved == null) reply(null, "The note closed while it was saving")
-                                            else reply(JSONObject().put("tabId", canonicalTabId(saved)).put("name", saved.name)
-                                                .put("path", saved.uri ?: saved.id).put("uri", saved.uri ?: JSONObject.NULL)
-                                                .put("active", saved.id == model.state.value.activeId).put("revision", activity.agentRevision(saved.content))
-                                                .put("saved", !saved.dirty), null)
-                                        }
-                                }
+                        } else if (note!!.portable) {
+                            model.busy(true)
+                            scope.launch {
+                                runCatching { model.saveAgentPortable(target, request.getString("expectedRevision")) }
+                                    .onFailure { error -> sendAgentReply(target, null, model.reportDocumentSaveFailure(target, error, "Could not save portable note: ${error.message}")) }
+                                    .onSuccess { replySavedTab(target) }
                             }
-                            else model.save(noteId = target, expectedRevision = request.optString("expectedRevision")) { error ->
-                                if (error != null) sendAgentReply(target, null, error)
-                                else {
-                                    val saved = model.state.value.tabs.firstOrNull { it.id == target }
-                                    if (saved == null) reply(null, "The note closed while it was saving")
-                                    else reply(JSONObject().put("tabId", canonicalTabId(saved)).put("name", saved.name)
-                                        .put("path", saved.uri ?: saved.id).put("uri", saved.uri ?: JSONObject.NULL)
-                                        .put("active", saved.id == model.state.value.activeId).put("revision", activity.agentRevision(saved.content))
-                                        .put("saved", !saved.dirty), null)
-                                }
-                            }
+                        } else model.save(noteId = target, expectedRevision = request.optString("expectedRevision")) { error ->
+                            if (error != null) sendAgentReply(target, null, error) else replySavedTab(target)
                         }
                     }
                     "close" -> {
@@ -820,10 +834,9 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                 if (error != null) sendAgentReply(target, null, error)
                                 else {
                                     val current = model.state.value
-                                    reply(JSONObject().put("closed", true).put("activeTabId", canonicalTabId(current.active))
-                                        .put("tabId", canonicalTabId(current.active)).put("name", current.active.name)
-                                        .put("path", current.active.uri ?: current.active.id).put("uri", current.active.uri ?: JSONObject.NULL)
-                                        .put("revision", activity.agentRevision(current.active.content)), null)
+                                    val activeTabId = canonicalTabId(current.active)
+                                    reply(buildAgentTabJson(current.active, activeTabId, activity.agentRevision(current.active.content),
+                                        closed = true, activeTabId = activeTabId), null)
                                 }
                             }
                         }
@@ -864,38 +877,10 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                 }
                 "render_tab" -> withSelectedTab { runCatching { activity.captureAgentViewport(web!!, request.optInt("width", 1200), request.optString("imageFormat", "png")) }.onSuccess { reply(it, null) }.onFailure { reply(null, it.message ?: "Could not capture the reading viewport") } }
                 "get_diagram", "get_diagram_image", "list_diagrams" -> withSelectedTab(snapshotSafeWhenInactive = true) { activity.dispatchAgentRequest(web!!, request) { result, error -> sendAgentReply(request.optString("tabId"), result, error) } }
-                "replace_tab_asset" -> withSelectedTab {
-                    val flush = JSONObject(request.toString()).put("action", "flush_current")
-                    activity.dispatchAgentRequest(web!!, flush) { _, flushError ->
-                        if (flushError != null) reply(null, flushError)
-                        else scope.launch {
-                            runCatching {
-                                model.replacePortableAsset(
-                                    request.getString("tabId"), request.getString("assetName"),
-                                    request.getString("assetPath"), request.getString("expectedRevision"),
-                                )
-                            }.onSuccess {
-                                if (it.optBoolean("changed")) web?.evaluateJavascript("window.dispatchEvent(new Event('supermd-assets-changed'))", null)
-                                reply(it, null)
-                            }
-                                .onFailure { sendAgentReply(request.optString("tabId"), null, it.message ?: "Could not replace the portable image") }
-                        }
-                    }
+                "replace_tab_asset" -> withFlushedActiveTab("Could not replace the portable image", { it.optBoolean("changed") }) {
+                    model.replacePortableAsset(request.getString("tabId"), request.getString("assetName"), request.getString("assetPath"), request.getString("expectedRevision"))
                 }
-                "asset_action" -> withSelectedTab {
-                    val flush = JSONObject(request.toString()).put("action", "flush_current")
-                    activity.dispatchAgentRequest(web!!, flush) { _, flushError ->
-                        if (flushError != null) reply(null, flushError)
-                        else scope.launch {
-                            runCatching { model.agentAssetAction(request) }
-                                .onSuccess {
-                                    if (request.optString("assetAction") == "attach") web?.evaluateJavascript("window.dispatchEvent(new Event('supermd-assets-changed'))", null)
-                                    reply(it, null)
-                                }
-                                .onFailure { sendAgentReply(request.optString("tabId"), null, it.message ?: "Could not use the portable image asset") }
-                        }
-                    }
-                }
+                "asset_action" -> withFlushedActiveTab("Could not use the portable image asset", { request.optString("assetAction") == "attach" }) { model.agentAssetAction(request) }
                 "read_tab", "search_tab", "patch_tab", "get_context", "outline_tab", "latex_review", "latex_apply" -> withSelectedTab(snapshotSafeWhenInactive = request.optString("action") in setOf("read_tab", "search_tab", "patch_tab", "outline_tab")) { activity.dispatchAgentRequest(web!!, request) { result, error -> sendAgentReply(request.optString("tabId"), result, error) } }
                 else -> reply(null, "This action is not supported by the Android live reader.")
             }
