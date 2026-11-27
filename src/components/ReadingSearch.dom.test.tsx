@@ -128,11 +128,11 @@ describe("ReadingSearch DOM behavior", () => {
     host.remove();
   });
 
-  it("maps body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
+  it("maps displayed metadata and body matches accurately across YAML frontmatter when toggling Replace in source", async () => {
     const host = document.createElement("div");
     document.body.append(host);
     const root = createRoot(host);
-    let current = "---\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
+    let current = "---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nAlpha body.";
     const changes: string[] = [];
 
     await act(async () => {
@@ -151,22 +151,210 @@ describe("ReadingSearch DOM behavior", () => {
     act(() => setInputValue(searchInput, "Alpha"));
     await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
 
-    // Body search ignores rendered YAML properties, counting only the 1 body match.
-    expect(host.querySelector("output")?.textContent).toBe("0 / 1");
+    // Rendered search includes displayed title, author, and tags (3 matches) + 1 body match = 4, excluding description.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 4");
     const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    // Match 1 in DOM order is displayed title ("Alpha Study"), which is source match 4 / 5 in YAML key order!
     act(() => nextButton.click());
-    expect(host.querySelector("output")?.textContent).toBe("1 / 1");
-
-    // Toggling Replace in source maps that active body match to source match 2 / 2 (after frontmatter title).
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
     const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
     act(() => replaceToggle.click());
-    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(host.querySelector("output")?.textContent).toBe("4 / 5");
+    // Toggle Replace back off -> returns to 1 / 4!
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 4");
+
+    // Step to match 4 / 4 (Alpha body.) and toggle Replace in source -> maps to source match 5 / 5!
+    act(() => nextButton.click()); // 2 / 4 (author: Dr. Alpha)
+    act(() => nextButton.click()); // 3 / 4 (tag: alpha-tag)
+    act(() => nextButton.click()); // 4 / 4 (Alpha body.)
+    expect(host.querySelector("output")?.textContent).toBe("4 / 4");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("5 / 5");
 
     const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
     const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
     act(() => setInputValue(replaceInput, "Beta"));
     act(() => buttons[0].click());
-    expect(changes.at(-1)).toBe("---\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+    expect(changes.at(-1)).toBe("---\ntags: [alpha-tag, beta-tag]\nauthor: Dr. Alpha\ndescription: Hidden Alpha Note\ntitle: Alpha Study\n---\n\n# Heading\n\nBeta body.");
+
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  it("maps quoted, folded, flow, and duplicate frontmatter values across Replace in source while redacting hidden fields", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    let current = [
+      "---",
+      "subtitle: Hidden Orbit Subtitle",
+      "tags: ['orbit-one', \"orbit-two\", orbit-one]",
+      "author:",
+      "  - { given: \"Ada\", family: \"Orbit\" }",
+      "  - \"Ada Orbit\"",
+      "  - 'Grace Orbit'",
+      "description: >",
+      "  Hidden Orbit description",
+      "title: >-",
+      "  Folded Orbit",
+      "  Atlas",
+      "aliases: [OrbitAlias]",
+      "---",
+      "",
+      "Body Orbit conclusion.",
+    ].join("\n");
+    const changes: string[] = [];
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Orbit"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Rendered matches:
+    // 1: title ("Folded Orbit Atlas")
+    // 2: author #1 ("Ada Orbit", deduplicated)
+    // 3: author #2 ("Grace Orbit")
+    // 4: tag #1 ('orbit-one', deduplicated)
+    // 5: tag #2 ("orbit-two")
+    // 6: body ("Body Orbit conclusion.")
+    // Excluded from rendered Find: subtitle, duplicate tag 'orbit-one', duplicate author "Ada Orbit", description, aliases.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 6");
+
+    const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+
+    // Step to match 3 / 6 ("Grace Orbit" — second author in the single <dd data-frontmatter-field="author">)
+    act(() => nextButton.click()); // 1 / 6: folded title
+    act(() => nextButton.click()); // 2 / 6: flow author Ada Orbit
+    act(() => nextButton.click()); // 3 / 6: quoted author Grace Orbit
+    expect(host.querySelector("output")?.textContent).toBe("3 / 6");
+
+    // Source matches for "Orbit" (11 total):
+    // 0: subtitle, 1: 'orbit-one', 2: "orbit-two", 3: duplicate orbit-one,
+    // 4: { family: "Orbit" }, 5: duplicate "Ada Orbit", 6: 'Grace Orbit',
+    // 7: description, 8: folded title, 9: OrbitAlias, 10: Body Orbit
+    // Match 3 / 6 ('Grace Orbit') maps to source index 6 -> "7 / 11"!
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("7 / 11");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 6");
+
+    // Step to match 5 / 6 ("orbit-two" tag after deduplicated 'orbit-one') -> source index 2 -> "3 / 11"!
+    act(() => nextButton.click()); // 4 / 6: 'orbit-one'
+    act(() => nextButton.click()); // 5 / 6: "orbit-two"
+    expect(host.querySelector("output")?.textContent).toBe("5 / 6");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 11");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
+    act(() => setInputValue(replaceInput, "phase"));
+    act(() => buttons[0].click());
+    expect(changes.at(-1)).toContain('tags: [\'orbit-one\', "phase-two", orbit-one]');
+
+    act(() => root.unmount());
+    host.remove();
+  });
+
+  it("maps Find and Replace offsets accurately across U+00A0 frontmatter keys, quoted values, flow maps, and sequence/flow tags", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    let current = [
+      "---",
+      "description: \u00a0\"Hidden Symmetry Description\"",
+      "\"tags\"\u00a0:",
+      "  - \u00a0'symmetry-seq'",
+      "keywords: \u00a0[\u00a0\"symmetry-flow\"\u00a0]",
+      "'author'\u00a0: \u00a0[\u00a0{\u00a0\"given\"\u00a0:\u00a0\"Emmy\",\u00a0'family'\u00a0:\u00a0'Symmetry'\u00a0}\u00a0]",
+      "\"title\"\u00a0: \u00a0\"Symmetry Kernel\"",
+      "---",
+      "",
+      "Body Symmetry note.",
+    ].join("\n");
+    const changes: string[] = [];
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Displayed title omits surrounding quotes and displayed tags render as individual badges (not a raw "[...]" string).
+    expect(host.querySelector('[data-frontmatter-field="title"]')?.textContent).toBe("Symmetry Kernel");
+    expect(host.querySelector('[data-frontmatter-field="author"]')?.textContent).toBe("Emmy Symmetry");
+    expect(Array.from(host.querySelectorAll('[data-frontmatter-field="tag"]')).map((el) => el.textContent)).toEqual([
+      "symmetry-seq",
+      "symmetry-flow",
+    ]);
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Symmetry"));
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // 5 rendered matches (title, author, seq tag, flow tag, body), excluding hidden description.
+    expect(host.querySelector("output")?.textContent).toBe("0 / 5");
+    const nextButton = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+
+    // Match 1 / 5 (displayed title "Symmetry Kernel") maps to source match 5 / 6 (after description, seq tag, flow tag, author).
+    act(() => nextButton.click());
+    expect(host.querySelector("output")?.textContent).toBe("1 / 5");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("5 / 6");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const replaceButtons = () => Array.from(host.querySelectorAll<HTMLButtonElement>(".search-replace button"));
+    act(() => setInputValue(replaceInput, "Invariant"));
+    act(() => replaceButtons()[0].click());
+    expect(changes.at(-1)).toContain("\"title\"\u00a0: \u00a0\"Invariant Kernel\"");
+
+    // Re-render updated content and verify Replace offset mapping on sequence and flow tags.
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} onChange={(next) => { current = next; changes.push(next); }} />
+          <section className="android-reading">
+            <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
+          </section>
+        </div>
+      );
+    });
+    await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+    // Toggle Replace off, step to flow tag ("symmetry-flow" — rendered match 3 / 4: author, seq tag, flow tag, body) -> source match 3 / 5.
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("4 / 4");
+    act(() => nextButton.click()); // 1 / 4 (author: Emmy Symmetry)
+    act(() => nextButton.click()); // 2 / 4 (seq tag: symmetry-seq)
+    act(() => nextButton.click()); // 3 / 4 (flow tag: symmetry-flow)
+    expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3 / 5");
+    const nextReplaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    act(() => setInputValue(nextReplaceInput, "invariant"));
+    act(() => replaceButtons()[0].click());
+    expect(changes.at(-1)).toContain("keywords: \u00a0[\u00a0\"invariant-flow\"\u00a0]");
+    expect(changes.at(-1)).toContain("  - \u00a0'symmetry-seq'");
+    expect(changes.at(-1)).toContain("description: \u00a0\"Hidden Symmetry Description\"");
 
     act(() => root.unmount());
     host.remove();
