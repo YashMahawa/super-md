@@ -632,7 +632,8 @@ export default function Editor({ sessionId = "default", documentPath = null, val
     }
     const mountedView = new EditorView({ state, parent: host.current });
     view.current = mountedView;
-    const noteId = ownerNoteId.current;
+    const noteId = getActiveReaderNoteId();
+    ownerNoteId.current = noteId;
     visibleEditors.set(sessionId, mountedView);
     visibleEditorNotes.set(sessionId, noteId);
     syncEditorSearchDismissible(noteId);

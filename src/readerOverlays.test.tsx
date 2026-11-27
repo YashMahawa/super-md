@@ -366,4 +366,50 @@ describe("Android Back / dismissReaderOverlay for active Live edits and Source s
     expect(document.documentElement.dataset.readerDismissible).toBe("false");
     expect(invoke).toHaveBeenCalledWith("reader_dismissible_changed", { id: tabA, open: false });
   });
+
+  it("refreshes Editor note-ID scoping when sessionId changes without remounting", async () => {
+    const tabA = `unkeyed-a-${Date.now()}`;
+    const tabB = `unkeyed-b-${Date.now()}`;
+
+    setActiveReaderNoteId(tabA);
+    await act(async () => {
+      root.render(
+        <Editor
+          sessionId={tabA}
+          value="# Tab A\n\nSearchable A."
+          onChange={() => {}}
+          dark={false}
+          focusMode={false}
+        />,
+      );
+    });
+
+    act(() => {
+      window.dispatchEvent(new Event("supermd-find"));
+    });
+    expect(document.documentElement.dataset.readerDismissible).toBe("true");
+    expect(invoke).toHaveBeenCalledWith("reader_dismissible_changed", { id: tabA, open: true });
+
+    vi.clearAllMocks();
+    setActiveReaderNoteId(tabB);
+    await act(async () => {
+      root.render(
+        <Editor
+          sessionId={tabB}
+          value="# Tab B\n\nSearchable B."
+          onChange={() => {}}
+          dark={false}
+          focusMode={false}
+        />,
+      );
+    });
+    expect(document.documentElement.dataset.readerNoteId).toBe(tabB);
+    expect(document.documentElement.dataset.readerDismissible).toBe("false");
+
+    act(() => {
+      window.dispatchEvent(new Event("supermd-find"));
+    });
+    expect(document.documentElement.dataset.readerDismissible).toBe("true");
+    expect(invoke).toHaveBeenCalledWith("reader_dismissible_changed", { id: tabB, open: true });
+  });
 });
