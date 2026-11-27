@@ -181,3 +181,54 @@ internal fun probeDocumentStamp(resolver: ContentResolver, target: Uri): ProbedD
         null
     }
 }
+
+internal fun canProbeDocumentStampForTarget(
+    documentAccess: DocumentAccess,
+    resolver: ContentResolver,
+    parsedUri: Uri,
+    target: Uri,
+    ownShareAuthority: String,
+): Boolean =
+    !parsedUri.scheme.equals("content", ignoreCase = true) ||
+        parsedUri.authority == ownShareAuthority ||
+        documentAccess.hasReadGrant(target) ||
+        (!TestAuthorityGrants.isRegistered(target.authority) &&
+            resolver.persistedUriPermissions.any { it.isReadPermission && sameDocument(it.uri, target) })
+
+internal fun verifyProbedStampAfterRead(
+    resolver: ContentResolver,
+    target: Uri,
+    canProbeStamp: Boolean,
+    beforeWallMs: Long,
+    beforeStamp: ProbedDocumentStamp?,
+): ProbedDocumentStamp? {
+    if (!canProbeStamp || beforeStamp == null || !beforeStamp.isVerifiableAt(beforeWallMs)) return null
+    val afterStamp = runCatching { probeDocumentStamp(resolver, target) }.getOrNull() ?: return null
+    return beforeStamp.takeIf { afterStamp == it }
+}
+
+internal fun recordVerifiedDocumentStampIfStable(
+    refreshStamps: DocumentRefreshStampStore,
+    resolver: ContentResolver,
+    noteId: String,
+    target: Uri,
+    canProbeStamp: Boolean,
+    beforeWallMs: Long,
+    beforeStamp: ProbedDocumentStamp?,
+    savedMarkdown: String,
+    portable: Boolean,
+    assetDirectory: String?,
+    portableAssets: JSONObject?,
+) {
+    val verified = verifyProbedStampAfterRead(resolver, target, canProbeStamp, beforeWallMs, beforeStamp) ?: return
+    refreshStamps.record(
+        noteId,
+        VerifiedDocumentStamp(
+            stamp = verified,
+            savedMarkdown = savedMarkdown,
+            portable = portable,
+            assetDirectory = assetDirectory,
+            portableAssets = portableAssets?.let(::shallowCopyPortableAssets),
+        ),
+    )
+}
