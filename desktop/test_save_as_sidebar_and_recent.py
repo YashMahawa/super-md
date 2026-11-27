@@ -15,11 +15,13 @@ import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
 from PySide6.QtCore import QEvent, QMetaObject, QObject, QStandardPaths, QUrl
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuick import QQuickItem
+from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -70,6 +72,8 @@ def _try_make_dir_link(link_path: Path, target_dir: Path) -> bool:
 class SaveAsSidebarAndRecentTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if QGuiApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["Save As sidebar and recent tests"])
 
     def setUp(self):
@@ -149,6 +153,7 @@ class SaveAsSidebarAndRecentTest(unittest.TestCase):
         workspace_dir = self.root / "Workspace"
         nested_dir = workspace_dir / "Semester 1" / "Week 2"
         nested_dir.mkdir(parents=True)
+        (workspace_dir / "Semester 1" / "Overview.md").write_text("# Semester 1\n", encoding="utf-8")
         archive_dir = workspace_dir / "Archive" / "Spring"
         archive_dir.mkdir(parents=True)
         other_dir = self.root / "Other Project"
@@ -168,9 +173,11 @@ class SaveAsSidebarAndRecentTest(unittest.TestCase):
                 lambda: self._has_file_entry(self._sidebar_files(win1), workspace_dir / "Semester 1", directory=True)
                 and self._has_file_entry(self._sidebar_files(win2), workspace_dir / "Semester 1", directory=True)
             )
-            # Subfolders start collapsed; nested Week 2 is not yet visible in either window.
+            # Subfolders start collapsed and empty Archive is hidden by hideNonNoteFolders (#151).
             self.assertFalse(self._has_file_entry(self._sidebar_files(win1), nested_dir))
             self.assertFalse(self._has_file_entry(self._sidebar_files(win2), nested_dir))
+            self.assertFalse(self._has_file_entry(self._sidebar_files(win1), workspace_dir / "Archive"))
+            self.assertFalse(self._has_file_entry(self._sidebar_files(win2), workspace_dir / "Archive"))
 
             # Explicit newNoteLocation preference precedence (#134) remains intact over open folder.
             win1.setNoteLocation(str(preferred_dir))
@@ -267,6 +274,8 @@ class SaveAsSidebarAndRecentTest(unittest.TestCase):
         md_export_dir = workspace_dir / "Bundles" / "Markdown Copy"
         for directory in (offline_dir, live_dir, final_dir, md_export_dir):
             directory.mkdir(parents=True)
+        index_md = workspace_dir / "Index.md"
+        index_md.write_text("# Portable Index\n", encoding="utf-8")
 
         png_bytes = b"\x89PNG\r\n\x1a\n" + (b"portable-asset-bytes-" * 8)
         png_data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
@@ -277,8 +286,10 @@ class SaveAsSidebarAndRecentTest(unittest.TestCase):
         win1.openFolder(str(workspace_dir))
         win2.openFolder(str(workspace_dir))
         self.wait_until(
-            lambda: self._has_file_entry(self._sidebar_files(win1), workspace_dir / "Bundles", directory=True)
+            lambda: self._has_file_entry(self._sidebar_files(win1), index_md, directory=False)
+            and self._has_file_entry(self._sidebar_files(win2), index_md, directory=False)
         )
+        self.assertFalse(self._has_file_entry(self._sidebar_files(win1), workspace_dir / "Bundles"))
 
         # 1. Offline (_save_text) portable .smd save on untitled note into collapsed subfolder.
         win1.ready = False
@@ -381,16 +392,17 @@ class SaveAsSidebarAndRecentTest(unittest.TestCase):
         outside_dir = self.root / "Outside Target"
         outside_dir.mkdir()
 
+        target_md = sub_dir / "Limits.md"
+        target_md.write_text("# Old Limits\n", encoding="utf-8")
+        other_md = workspace_dir / "Overview.md"
+        other_md.write_text("# Overview\n", encoding="utf-8")
+
         win = self.make_window()
         win.openFolder(str(workspace_dir))
         self.wait_until(
             lambda: self._has_file_entry(self._sidebar_files(win), workspace_dir / "Topics", directory=True)
         )
-
-        target_md = sub_dir / "Limits.md"
-        target_md.write_text("# Old Limits\n", encoding="utf-8")
-        other_md = workspace_dir / "Overview.md"
-        other_md.write_text("# Overview\n", encoding="utf-8")
+        self.assertFalse(self._has_file_entry(self._sidebar_files(win), target_md))
 
         # Seed pinned and recent with non-canonical .. and QUrl slash variants of target_md.
         non_canon_dotdot = str(workspace_dir / "Topics" / "Calculus" / ".." / "Calculus" / "Limits.md")
@@ -473,12 +485,15 @@ class SaveAsSidebarAndRecentTest(unittest.TestCase):
         workspace_dir = self.root / "Agent Workspace"
         agent_sub = workspace_dir / "Research" / "2026"
         agent_sub.mkdir(parents=True)
+        readme_md = workspace_dir / "README.md"
+        readme_md.write_text("# Agent Workspace\n", encoding="utf-8")
 
         win = self.make_window()
         win.openFolder(str(workspace_dir))
         self.wait_until(
-            lambda: self._has_file_entry(self._sidebar_files(win), workspace_dir / "Research", directory=True)
+            lambda: self._has_file_entry(self._sidebar_files(win), readme_md, directory=False)
         )
+        self.assertFalse(self._has_file_entry(self._sidebar_files(win), workspace_dir / "Research"))
         self.assertFalse(self._has_file_entry(self._sidebar_files(win), agent_sub))
 
         tab = win._current()
@@ -503,6 +518,8 @@ class SaveAsSidebarAndRecentTest(unittest.TestCase):
 class SaveAsQmlSidebarIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if QGuiApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["Save As QML integration tests"])
 
     def assertSamePath(self, actual: str | os.PathLike[str], expected: str | os.PathLike[str]) -> None:
@@ -517,6 +534,7 @@ class SaveAsQmlSidebarIntegrationTest(unittest.TestCase):
         self.unit5_dir = self.workspace_dir / "Semester 2" / "Unit 5"
         self.unit4_dir.mkdir(parents=True)
         self.unit5_dir.mkdir(parents=True)
+        (self.workspace_dir / "Semester 2" / "Syllabus.md").write_text("# Semester 2\n", encoding="utf-8")
 
         self.session = Session(True, data=self.data_dir)
         self.session.settings["welcomed"] = True
