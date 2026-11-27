@@ -1,4 +1,4 @@
-"""Unified top-of-file YAML frontmatter boundary and mapping validator."""
+"""Unified single-pass top-of-file YAML frontmatter parser and displayed metadata extractor."""
 from __future__ import annotations
 
 import re
@@ -6,7 +6,25 @@ import re
 _BLOCK_SCALAR_HEADER = re.compile(r"^([|>])(?:([+-])([1-9])?|([1-9])([+-])?)?[ \t]*(?:#.*)?$")
 _CLOSER = re.compile(r"^(?:---|\.\.\.)[ \t]*$")
 _HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
-_SIMPLE_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "0": "\0", " ": " "}
+_SIMPLE_ESCAPES: dict[str, str] = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "b": "\b",
+    "f": "\f",
+    "0": "\0",
+    " ": " ",
+}
+
+
+def _strip_inline_comment(value: str) -> str:
+    for idx, ch in enumerate(value):
+        if ch == "#" and (idx == 0 or value[idx - 1] in (" ", "\t")):
+            return value[:idx].rstrip()
+    return value.rstrip()
 
 
 def _parse_double_quoted(text: str) -> tuple[str, str] | None:
@@ -92,6 +110,60 @@ def _only_trailing_comment(rest: str) -> bool:
     return trimmed == "" or trimmed.startswith("#")
 
 
+def _parse_plain_scalar(raw: str) -> object:
+    cleaned = _strip_inline_comment(raw).strip()
+    if cleaned == "" or cleaned == "~" or cleaned.lower() == "null":
+        return None
+    if cleaned.lower() == "true":
+        return True
+    if cleaned.lower() == "false":
+        return False
+    return cleaned
+
+
+def _split_top_level_commas(inner: str) -> list[str] | None:
+    parts: list[str] = []
+    start = 0
+    depth_bracket = 0
+    depth_brace = 0
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch == '"':
+            parsed = _parse_double_quoted(inner[i:])
+            if parsed is None:
+                return None
+            i = n - len(parsed[1])
+            continue
+        if ch == "'":
+            parsed = _parse_single_quoted(inner[i:])
+            if parsed is None:
+                return None
+            i = n - len(parsed[1])
+            continue
+        if ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket -= 1
+            if depth_bracket < 0:
+                return None
+        elif ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+            if depth_brace < 0:
+                return None
+        elif ch == "," and depth_bracket == 0 and depth_brace == 0:
+            parts.append(inner[start:i])
+            start = i + 1
+        i += 1
+    if depth_bracket != 0 or depth_brace != 0:
+        return None
+    parts.append(inner[start:])
+    return parts
+
+
 def _split_key_value(trimmed: str, allow_compact: bool = False) -> tuple[str, str] | None:
     if not trimmed or trimmed.startswith("#"):
         return None
@@ -121,6 +193,64 @@ def _split_key_value(trimmed: str, allow_compact: bool = False) -> tuple[str, st
                 return None
             return key, after.lstrip()
     return None
+
+
+def _parse_flow_value(raw: str) -> tuple[bool, object]:
+    trimmed = raw.strip()
+    if not trimmed:
+        return True, None
+    if trimmed.startswith('"'):
+        parsed = _parse_double_quoted(trimmed)
+        if parsed is None or not _only_trailing_comment(parsed[1]):
+            return False, None
+        return True, parsed[0]
+    if trimmed.startswith("'"):
+        parsed = _parse_single_quoted(trimmed)
+        if parsed is None or not _only_trailing_comment(parsed[1]):
+            return False, None
+        return True, parsed[0]
+    if trimmed.startswith("["):
+        if not trimmed.endswith("]"):
+            return False, None
+        inner = trimmed[1:-1].strip()
+        if not inner:
+            return True, []
+        items = _split_top_level_commas(inner)
+        if items is None:
+            return False, None
+        out_list: list[object] = []
+        for item in items:
+            if not item.strip():
+                continue
+            ok, val = _parse_flow_value(item)
+            if not ok:
+                return False, None
+            out_list.append(val)
+        return True, out_list
+    if trimmed.startswith("{"):
+        if not trimmed.endswith("}"):
+            return False, None
+        inner = trimmed[1:-1].strip()
+        if not inner:
+            return True, {}
+        pairs = _split_top_level_commas(inner)
+        if pairs is None:
+            return False, None
+        out_map: dict[str, object] = {}
+        for pair in pairs:
+            if not pair.strip():
+                continue
+            kv = _split_key_value(pair.strip(), allow_compact=True)
+            if kv is None:
+                return False, None
+            ok, val = _parse_flow_value(kv[1])
+            if not ok:
+                return False, None
+            out_map[kv[0]] = val
+        return True, out_map
+    if any(c in trimmed for c in "[]{}") and _split_top_level_commas(trimmed) is None:
+        return False, None
+    return True, _parse_plain_scalar(trimmed)
 
 
 def _strip_flow_comment(line: str) -> str:
@@ -217,91 +347,10 @@ def _flow_state(text: str) -> str:
     return "balanced" if closed_top else "incomplete"
 
 
-def _split_top_level_commas(inner: str) -> list[str] | None:
-    parts: list[str] = []
-    start = 0
-    depth_bracket = 0
-    depth_brace = 0
-    i = 0
-    n = len(inner)
-    while i < n:
-        ch = inner[i]
-        if ch == '"':
-            parsed = _parse_double_quoted(inner[i:])
-            if parsed is None:
-                return None
-            i = n - len(parsed[1])
-            continue
-        if ch == "'":
-            parsed = _parse_single_quoted(inner[i:])
-            if parsed is None:
-                return None
-            i = n - len(parsed[1])
-            continue
-        if ch == "[":
-            depth_bracket += 1
-        elif ch == "]":
-            depth_bracket -= 1
-            if depth_bracket < 0:
-                return None
-        elif ch == "{":
-            depth_brace += 1
-        elif ch == "}":
-            depth_brace -= 1
-            if depth_brace < 0:
-                return None
-        elif ch == "," and depth_bracket == 0 and depth_brace == 0:
-            parts.append(inner[start:i])
-            start = i + 1
-        i += 1
-    if depth_bracket != 0 or depth_brace != 0:
-        return None
-    parts.append(inner[start:])
-    return parts
-
-
-def _is_valid_flow_value(raw: str) -> bool:
-    trimmed = raw.strip()
-    if not trimmed:
-        return True
-    if trimmed.startswith('"'):
-        parsed = _parse_double_quoted(trimmed)
-        return parsed is not None and _only_trailing_comment(parsed[1])
-    if trimmed.startswith("'"):
-        parsed = _parse_single_quoted(trimmed)
-        return parsed is not None and _only_trailing_comment(parsed[1])
-    if trimmed.startswith("["):
-        if not trimmed.endswith("]"):
-            return False
-        inner = trimmed[1:-1].strip()
-        if not inner:
-            return True
-        items = _split_top_level_commas(inner)
-        return items is not None and all(not item.strip() or _is_valid_flow_value(item) for item in items)
-    if trimmed.startswith("{"):
-        if not trimmed.endswith("}"):
-            return False
-        inner = trimmed[1:-1].strip()
-        if not inner:
-            return True
-        pairs = _split_top_level_commas(inner)
-        if pairs is None:
-            return False
-        for pair in pairs:
-            if not pair.strip():
-                continue
-            kv = _split_key_value(pair.strip(), True)
-            if kv is None or not _is_valid_flow_value(kv[1]):
-                return False
-        return True
-    if any(c in trimmed for c in "[]{}") and _split_top_level_commas(trimmed) is None:
-        return False
-    return True
-
-
-def _is_valid_yaml_mapping(yaml_body: str) -> bool:
+def _parse_yaml_mapping(yaml_body: str) -> dict[str, object] | None:
+    """Validate and parse a top-level YAML mapping in one single pass."""
     if not yaml_body:
-        return True
+        return {}
     lines: list[tuple[str, int, str]] = []
     for raw_line in yaml_body.split("\n"):
         raw = raw_line.removesuffix("\r")
@@ -317,7 +366,7 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
                 break
         trimmed = raw.strip()
         if leading_tab and trimmed and not trimmed.startswith("#"):
-            return False
+            return None
         lines.append((raw, indent, trimmed))
 
     def is_blank(idx: int) -> bool:
@@ -335,13 +384,15 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
             return trimmed[1:].lstrip()
         return None
 
-    def consume_quoted(idx: int, initial: str, min_indent: int) -> int | None:
+    def parse_quoted(idx: int, initial: str, min_indent: int) -> tuple[str, int] | None:
         comb = initial
         is_double = initial.startswith('"')
         while True:
             parsed = _parse_double_quoted(comb) if is_double else _parse_single_quoted(comb)
             if parsed is not None:
-                return idx + 1 if _only_trailing_comment(parsed[1]) else None
+                if not _only_trailing_comment(parsed[1]):
+                    return None
+                return parsed[0], idx + 1
             idx += 1
             if idx >= len(lines):
                 return None
@@ -352,14 +403,15 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
                 return None
             comb += "\n" + lines[idx][2]
 
-    def consume_flow(idx: int, initial: str, min_indent: int) -> int | None:
+    def parse_flow(idx: int, initial: str, min_indent: int) -> tuple[object, int] | None:
         comb = _strip_flow_comment(initial)
         while True:
             state = _flow_state(comb)
             if state == "error":
                 return None
             if state == "balanced":
-                return idx + 1 if _is_valid_flow_value(comb) else None
+                ok, val = _parse_flow_value(comb)
+                return (val, idx + 1) if ok else None
             idx += 1
             if idx >= len(lines):
                 return None
@@ -369,30 +421,68 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
                 return None
             comb += " " + _strip_flow_comment(lines[idx][2])
 
-    def consume_block_scalar(idx: int, header: str, parent_indent: int) -> int | None:
-        if not _BLOCK_SCALAR_HEADER.match(header):
+    def parse_block_scalar(idx: int, header: str, parent_indent: int) -> tuple[str, int] | None:
+        match = _BLOCK_SCALAR_HEADER.match(header)
+        if not match:
             return None
+        style = match.group(1)
+        chomp = match.group(2) or match.group(5) or "clip"
+        indent_digit = match.group(3) or match.group(4)
+        raw_content: list[str] = []
         idx += 1
         while idx < len(lines):
-            if lines[idx][2] == "":
+            raw_line, line_indent, line_trimmed = lines[idx]
+            if line_trimmed == "":
+                raw_content.append("")
                 idx += 1
                 continue
-            if lines[idx][1] <= parent_indent:
+            if line_indent <= parent_indent:
                 break
+            raw_content.append(raw_line)
             idx += 1
-        return idx
+        while raw_content and raw_content[-1] == "" and chomp == "-":
+            raw_content.pop()
+        block_indent: int | None = (parent_indent + int(indent_digit)) if indent_digit else None
+        if block_indent is None:
+            for raw_line in raw_content:
+                if raw_line != "":
+                    leading = len(raw_line) - len(raw_line.lstrip(" "))
+                    if block_indent is None or leading < block_indent:
+                        block_indent = leading
+        if block_indent is None:
+            return "", idx
+        dedented = ["" if line == "" else line[min(len(line), block_indent):] for line in raw_content]
+        if style == "|":
+            out = "\n".join(dedented)
+        else:
+            parts: list[str] = []
+            for i, curr in enumerate(dedented):
+                if i == 0:
+                    parts.append(curr)
+                    continue
+                prev = dedented[i - 1]
+                more_indented = curr.startswith((" ", "\t")) or prev.startswith((" ", "\t"))
+                if curr == "" or prev == "" or more_indented:
+                    parts.append("\n" + curr)
+                else:
+                    parts.append(" " + curr)
+            out = "".join(parts)
+        if chomp in ("-", "clip"):
+            out = out.rstrip("\n")
+        return out, idx
 
-    def consume_value(idx: int, rest: str, key_indent: int) -> int | None:
+    def parse_value(idx: int, rest: str, key_indent: int) -> tuple[object, int] | None:
         if rest == "" or rest.startswith("#"):
             nxt = next_meaningful(idx + 1)
             if nxt >= len(lines):
-                return len(lines)
+                return None, len(lines)
             _, n_indent, n_trimmed = lines[nxt]
             if n_indent >= key_indent and seq_item(n_trimmed) is not None:
-                return consume_seq(nxt, n_indent)
+                return parse_seq(nxt, n_indent)
             if n_indent > key_indent:
                 if _split_key_value(n_trimmed) is not None:
-                    return consume_map(nxt, n_indent)
+                    return parse_map(nxt, n_indent)
+                parts: list[str] = []
                 cur = nxt
                 while cur < len(lines):
                     if is_blank(cur):
@@ -402,25 +492,29 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
                         break
                     if _split_key_value(lines[cur][2]) is not None or seq_item(lines[cur][2]) is not None:
                         break
+                    parts.append(_strip_inline_comment(lines[cur][2]))
                     cur += 1
-                return cur
-            return nxt
+                return _parse_plain_scalar(" ".join(parts)), cur
+            return None, nxt
         if rest[0] in "|>":
-            return consume_block_scalar(idx, rest, key_indent)
+            return parse_block_scalar(idx, rest, key_indent)
         if rest[0] in "\"'":
-            return consume_quoted(idx, rest, key_indent + 1)
+            return parse_quoted(idx, rest, key_indent + 1)
         if rest[0] in "[{":
-            return consume_flow(idx, rest, key_indent)
+            return parse_flow(idx, rest, key_indent)
+        parts = [_strip_inline_comment(rest)]
         cur = idx + 1
         while cur < len(lines):
             if is_blank(cur) or lines[cur][1] <= key_indent:
                 break
             if _split_key_value(lines[cur][2]) is not None or seq_item(lines[cur][2]) is not None:
                 break
+            parts.append(_strip_inline_comment(lines[cur][2]))
             cur += 1
-        return cur
+        return _parse_plain_scalar(" ".join(parts)), cur
 
-    def consume_seq(idx: int, seq_indent: int) -> int | None:
+    def parse_seq(idx: int, seq_indent: int) -> tuple[list[object], int] | None:
+        items: list[object] = []
         while idx < len(lines):
             if is_blank(idx):
                 idx += 1
@@ -437,46 +531,55 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
                 nxt = next_meaningful(idx + 1)
                 if nxt < len(lines) and lines[nxt][1] > seq_indent:
                     if seq_item(lines[nxt][2]) is not None:
-                        after = consume_seq(nxt, lines[nxt][1])
-                        if after is None:
+                        sub_seq = parse_seq(nxt, lines[nxt][1])
+                        if sub_seq is None:
                             return None
-                        idx = after
+                        items.append(sub_seq[0])
+                        idx = sub_seq[1]
                         continue
                     if _split_key_value(lines[nxt][2]) is not None:
-                        after = consume_map(nxt, lines[nxt][1])
-                        if after is None:
+                        sub_map = parse_map(nxt, lines[nxt][1])
+                        if sub_map is None:
                             return None
-                        idx = after
+                        items.append(sub_map[0])
+                        idx = sub_map[1]
                         continue
+                items.append(None)
                 idx = nxt
                 continue
             kv = _split_key_value(item)
             if kv is not None:
-                after_val = consume_value(idx, kv[1], seq_indent + 1)
-                if after_val is None:
+                first_val = parse_value(idx, kv[1], seq_indent + 1)
+                if first_val is None:
                     return None
-                peek = next_meaningful(after_val)
+                obj: dict[str, object] = {kv[0]: first_val[0]}
+                next_idx = first_val[1]
+                peek = next_meaningful(next_idx)
                 if peek < len(lines) and lines[peek][1] >= seq_indent + 2 and seq_item(lines[peek][2]) is None:
-                    after_map = consume_map(peek, lines[peek][1])
-                    if after_map is None:
+                    rest_map = parse_map(peek, lines[peek][1])
+                    if rest_map is None:
                         return None
-                    after_val = after_map
-                idx = after_val
+                    obj.update(rest_map[0])
+                    next_idx = rest_map[1]
+                items.append(obj)
+                idx = next_idx
                 continue
             if item[0] in "|>":
-                after = consume_block_scalar(idx, item, seq_indent)
+                parsed_item = parse_block_scalar(idx, item, seq_indent)
             elif item[0] in "\"'":
-                after = consume_quoted(idx, item, seq_indent + 1)
+                parsed_item = parse_quoted(idx, item, seq_indent + 1)
             elif item[0] in "[{":
-                after = consume_flow(idx, item, seq_indent + 1)
+                parsed_item = parse_flow(idx, item, seq_indent + 1)
             else:
-                after = idx + 1
-            if after is None:
+                parsed_item = (_parse_plain_scalar(item), idx + 1)
+            if parsed_item is None:
                 return None
-            idx = after
-        return idx
+            items.append(parsed_item[0])
+            idx = parsed_item[1]
+        return items, idx
 
-    def consume_map(idx: int, map_indent: int) -> int | None:
+    def parse_map(idx: int, map_indent: int) -> tuple[dict[str, object], int] | None:
+        result: dict[str, object] = {}
         while idx < len(lines):
             if is_blank(idx):
                 idx += 1
@@ -489,26 +592,132 @@ def _is_valid_yaml_mapping(yaml_body: str) -> bool:
             kv = _split_key_value(trimmed)
             if kv is None:
                 return None
-            after = consume_value(idx, kv[1], map_indent)
+            after = parse_value(idx, kv[1], map_indent)
             if after is None:
                 return None
-            idx = after
-        return idx
+            result[kv[0]] = after[0]
+            idx = after[1]
+        return result, idx
 
     first = next_meaningful(0)
     if first >= len(lines):
-        return True
+        return {}
     if lines[first][1] != 0:
-        return False
-    end = consume_map(first, 0)
-    return end is not None and next_meaningful(end) >= len(lines)
+        return None
+    parsed_root = parse_map(first, 0)
+    if parsed_root is None or next_meaningful(parsed_root[1]) < len(lines):
+        return None
+    return parsed_root[0]
 
 
-def frontmatter_end(markdown: str) -> int:
-    """Return the character offset after valid top-of-file YAML frontmatter, or 0."""
+def _scalar_to_string(value: object) -> str | None:
+    if isinstance(value, str):
+        trimmed = value.strip()
+        return trimmed or None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
+
+
+def _lookup_ci(entries: dict[str, object], target: str) -> object:
+    if target in entries:
+        return entries[target]
+    lower = target.lower()
+    for key, value in entries.items():
+        if key.lower() == lower:
+            return value
+    return None
+
+
+def _extract_author_name(value: object) -> str | None:
+    direct = _scalar_to_string(value)
+    if direct:
+        return direct
+    if isinstance(value, dict):
+        raw_name = _lookup_ci(value, "name")
+        name = raw_name if raw_name is not None else _lookup_ci(value, "literal")
+        direct_name = _scalar_to_string(name)
+        if direct_name:
+            return direct_name
+        if isinstance(name, dict):
+            literal = _scalar_to_string(_lookup_ci(name, "literal"))
+            if literal:
+                return literal
+            parts = [p for p in (_scalar_to_string(_lookup_ci(name, "given")), _scalar_to_string(_lookup_ci(name, "family"))) if p]
+            if parts:
+                return " ".join(parts)
+        parts = [p for p in (_scalar_to_string(_lookup_ci(value, "given")), _scalar_to_string(_lookup_ci(value, "family"))) if p]
+        if parts:
+            return " ".join(parts)
+    return None
+
+
+def _normalize_visible_metadata(entries: dict[str, object]) -> dict[str, object] | None:
+    """Extract only the reader-displayed frontmatter fields (title, author/authors, tags)."""
+    out: dict[str, object] = {}
+    title = _scalar_to_string(_lookup_ci(entries, "title"))
+    if title:
+        out["title"] = title[:300]
+
+    authors: list[str] = []
+    seen_authors: set[str] = set()
+    for key in ("author", "authors", "creator"):
+        val = _lookup_ci(entries, key)
+        if val is None:
+            continue
+        candidates = val if isinstance(val, list) else [val]
+        for item in candidates:
+            name = _extract_author_name(item)
+            if name and name not in seen_authors:
+                seen_authors.add(name)
+                authors.append(name[:200])
+                if len(authors) >= 20:
+                    break
+        if len(authors) >= 20:
+            break
+    if authors:
+        out["author"] = ", ".join(authors)[:500]
+        out["authors"] = authors
+
+    tags: list[str] = []
+    seen_tags: set[str] = set()
+
+    def add_tag(raw: str | None) -> None:
+        if not raw or len(tags) >= 50:
+            return
+        trimmed = raw.strip()
+        if not trimmed or trimmed in seen_tags:
+            return
+        seen_tags.add(trimmed)
+        tags.append(trimmed[:100])
+
+    for key in ("tags", "tag", "keywords"):
+        val = _lookup_ci(entries, key)
+        if val is None:
+            continue
+        if isinstance(val, list):
+            for item in val:
+                add_tag(_scalar_to_string(item))
+        else:
+            scalar = _scalar_to_string(val)
+            if scalar:
+                if "," in scalar:
+                    for part in scalar.split(","):
+                        add_tag(part)
+                else:
+                    add_tag(scalar)
+    if tags:
+        out["tags"] = tags
+
+    return out or None
+
+
+def _parse_frontmatter_entries(markdown: str) -> tuple[int, dict[str, object] | None]:
     cursor = 1 if markdown.startswith("\ufeff") else 0
     if not markdown.startswith("---", cursor):
-        return 0
+        return 0, None
     cursor += 3
     n = len(markdown)
     while cursor < n and markdown[cursor] in (" ", "\t"):
@@ -518,7 +727,7 @@ def frontmatter_end(markdown: str) -> int:
     elif cursor < n and markdown[cursor] == "\n":
         cursor += 1
     else:
-        return 0
+        return 0, None
 
     yaml_start = cursor
     line_start = cursor
@@ -544,13 +753,37 @@ def frontmatter_end(markdown: str) -> int:
         line_start = next_start
 
     if yaml_end < 0 or fm_end < 0:
-        return 0
+        return 0, None
     yaml_slice = markdown[yaml_start:yaml_end]
     if yaml_slice.endswith("\n"):
         yaml_slice = yaml_slice[:-1].removesuffix("\r")
-    if not _is_valid_yaml_mapping(yaml_slice):
-        return 0
-    return fm_end
+    entries = _parse_yaml_mapping(yaml_slice)
+    if entries is None:
+        return 0, None
+    return fm_end, entries
+
+
+def parse_frontmatter(markdown: str) -> tuple[int, dict[str, object] | None]:
+    """Validate YAML frontmatter and extract bounded displayed properties in one pass.
+
+    Returns ``(fm_end, properties)`` where ``fm_end`` is ``0`` when no valid YAML
+    mapping frontmatter header is present, and ``properties`` contains only the
+    displayed ``title``, ``author``/``authors``, and ``tags`` fields (or ``None``).
+    """
+    fm_end, entries = _parse_frontmatter_entries(markdown)
+    if not fm_end or entries is None:
+        return 0, None
+    return fm_end, _normalize_visible_metadata(entries)
+
+
+def frontmatter_end(markdown: str) -> int:
+    """Return the character offset after valid top-of-file YAML frontmatter, or 0."""
+    return _parse_frontmatter_entries(markdown)[0]
+
+
+def extract_visible_metadata(markdown: str) -> dict[str, object] | None:
+    """Return bounded displayed frontmatter metadata, or None when absent/malformed."""
+    return parse_frontmatter(markdown)[1]
 
 
 def mask_frontmatter(markdown: str) -> str:

@@ -1,7 +1,6 @@
-import {createContext,Fragment,useCallback,useContext,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type DragEvent,type KeyboardEvent as ReactKeyboardEvent,type ReactNode,type RefObject} from 'react';
-import {PencilSimpleIcon} from '@phosphor-icons/react';
+import {createContext,Fragment,useCallback,useContext,useEffect,useLayoutEffect,useMemo,useRef,useState,type ClipboardEvent,type DragEvent,type KeyboardEvent as ReactKeyboardEvent,type RefObject} from 'react';
 import MarkdownPreview from './MarkdownPreview';
-import WindowedBlock,{type WindowHeading} from './WindowedBlock';
+import {LiveBlockShell} from './LiveBlockShell';
 import type {RenderedMarkdownBlock} from './CachedMarkdown';
 import {analyzeDocument,type SourceBlock,type SourceDocumentAnalysis} from '../documentAnalysis';
 import {selectedMarkdown,setSelectedMarkdownDrag} from '../copySource';
@@ -24,7 +23,6 @@ import {handleLiveEditorKey} from '../liveEditorKeys';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 const CARET_KEYS=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End']);
-const fullscreenInteractiveSelector='a,button,input,select,textarea,summary,details,img,.note-image,.interactive-chart,.inline-diagram,.svg-figure,.mermaid,.step-cards,.remote-image-card,.image-error,.code-container';
 export type {SourceBlock} from '../documentAnalysis';
 export function splitMarkdownBlocks(markdown:string):SourceBlock[]{return analyzeDocument(markdown).bodyBlocks;}
 
@@ -48,10 +46,11 @@ export function replayActiveLiveBlockHistory(direction: "undo" | "redo"): boolea
 }
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
+  noteId?:string;
   latexAutofix?:boolean;
   typewriterScroll?:boolean;
   markdown:string;onChange:(value:string)=>void;documentPath:string|null;savedDocumentPath?:string|null;python:string;dark:boolean;
-  trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;onNotice?:(message:string)=>void;
+  trustedImageHosts?:string[];approvedImageUrls?:readonly string[];onTrustImageHost?:(host:string)=>void;onApproveImageUrl?:(noteId:string|undefined,url:string)=>void;onRemoteImageLoaded?:(noteId:string|undefined,url:string,data:string)=>void;onNotice?:(message:string)=>void;
 }
 interface EditingSession {
   session:number;
@@ -119,80 +118,6 @@ function ActiveBlockEditor(){
   );
 }
 
-interface LiveBlockShellProps {
-  windowed:boolean;estimate:number;text:string;headings:WindowHeading[];
-  start:number;end:number;blockIndex:number;active:boolean;protectedHint:boolean;
-  onOpen:(element:HTMLElement,start:number,end:number,protectedHint:boolean)=>void;
-  children:ReactNode;
-}
-function LiveBlockShell({windowed,estimate,text,headings,start,end,blockIndex,active,protectedHint,onOpen,children}:LiveBlockShellProps){
-  const [hovered,setHovered]=useState(false);
-  const [focused,setFocused]=useState(false);
-  const [tapped,setTapped]=useState(false);
-  const blockElRef=useRef<HTMLElement|null>(null);
-  const pressingRef=useRef(false);
-  const tapStartRef=useRef<{id:number;x:number;y:number;moved:boolean}|null>(null);
-  useLayoutEffect(()=>{
-    let f2=0;
-    const f1=requestAnimationFrame(()=>{f2=requestAnimationFrame(()=>{if(blockElRef.current&&!pressingRef.current)blockElRef.current.dataset.liveMeasured='true';});});
-    return()=>{cancelAnimationFrame(f1);cancelAnimationFrame(f2);};
-  },[]);
-  useEffect(()=>{
-    if(active){setTapped(false);return;}
-    if(!blockElRef.current?.contains(document.activeElement))setFocused(false);
-  },[active]);
-  useEffect(()=>{
-    if(!tapped)return;
-    const clearOutside=(event:PointerEvent)=>{
-      const target=event.target instanceof Node?event.target:null;
-      if(target&&!blockElRef.current?.contains(target))setTapped(false);
-    };
-    document.addEventListener('pointerdown',clearOutside,true);
-    return()=>document.removeEventListener('pointerdown',clearOutside,true);
-  },[tapped]);
-  const revealed=!active&&(hovered||focused||tapped);
-  return <WindowedBlock blockRef={blockElRef} enabled={windowed&&!active} estimate={estimate} text={text} headings={headings} className="live-block" data-source-start={start} data-source-end={end} tabIndex={0} role="group" aria-label={`Editable block ${blockIndex+1}`}
-    onPointerEnter={event=>{blockElRef.current=event.currentTarget;if(event.pointerType==='mouse'&&event.buttons===0&&!document.querySelector('.is-panning'))setHovered(true);}}
-    onPointerMove={event=>{
-      blockElRef.current=event.currentTarget;
-      if(tapStartRef.current?.id===event.pointerId&&Math.hypot(event.clientX-tapStartRef.current.x,event.clientY-tapStartRef.current.y)>8)tapStartRef.current.moved=true;
-      if(event.pointerType==='mouse'&&event.buttons===0&&!hovered&&!document.querySelector('.is-panning'))setHovered(true);
-    }}
-    onPointerLeave={event=>{pressingRef.current=false;if(event.pointerType==='mouse')setHovered(false);}}
-    onPointerDown={event=>{
-      blockElRef.current=event.currentTarget;
-      pressingRef.current=true;
-      if(event.pointerType==='mouse')return;
-      tapStartRef.current={id:event.pointerId,x:event.clientX,y:event.clientY,moved:false};
-    }}
-    onPointerUp={event=>{
-      pressingRef.current=false;
-      if(event.pointerType==='mouse')return;
-      const tap=tapStartRef.current;tapStartRef.current=null;
-      if(active||!tap||tap.id!==event.pointerId||tap.moved||Math.hypot(event.clientX-tap.x,event.clientY-tap.y)>8)return;
-      if(document.querySelector('.is-panning')||window.getSelection()?.toString())return;
-      const target=event.target instanceof Element?event.target:null;
-      if(target?.closest('.live-block-edit,.live-active-block,.image-viewer,.reading-search,.media-dialog,.math-repair-panel'))return;
-      if(document.documentElement.dataset.fullscreen==='true'&&!target?.closest(fullscreenInteractiveSelector))return;
-      setTapped(true);
-    }}
-    onPointerCancel={()=>{pressingRef.current=false;tapStartRef.current=null;}}
-    onFocus={event=>{blockElRef.current=event.currentTarget;if(!pressingRef.current)setFocused(true);}}
-    onBlur={event=>{if(!event.currentTarget.contains(event.relatedTarget as Node|null))setFocused(false);}}
-    onDoubleClick={event=>{
-      if(active||(event.target as Element).closest('a,button,input,select,textarea'))return;
-      window.getSelection()?.removeAllRanges();onOpen(event.currentTarget,start,end,protectedHint);
-    }}
-    onKeyDown={event=>{if(!active&&event.target===event.currentTarget&&(event.key==='Enter'||event.key==='F2')){event.preventDefault();onOpen(event.currentTarget,start,end,protectedHint);}}}>
-    {revealed?<button type="button" className="live-block-edit" data-independent-zoom aria-label="Edit block" title="Edit block" onClick={event=>{
-      event.preventDefault();event.stopPropagation();
-      const owner=event.currentTarget.closest<HTMLElement>('.live-block');
-      if(owner)onOpen(owner,start,end,protectedHint);
-    }}><PencilSimpleIcon size={13} weight="bold" aria-hidden="true"/><span>Edit</span></button>:null}
-    {active?<ActiveBlockEditor/>:children}
-  </WindowedBlock>;
-}
-
 function translateRenderedRange(start:number,end:number,editing:EditingSession|null,syncedMarkdown:string):[number,number] {
   if(!editing||end<=editing.baseSplitEnd)return [start,end];
   const delta=syncedMarkdown.length-editing.baseMarkdown.length;
@@ -213,7 +138,7 @@ interface LiveEditorState {
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,savedDocumentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,onNotice,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({noteId,markdown,onChange,documentPath,savedDocumentPath,python,dark,trustedImageHosts=noTrustedHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,onNotice,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<EditingSession|null>(null);
   const [draftText,setDraftText]=useState('');
   const [caret,setCaret]=useState(0);
@@ -1218,7 +1143,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
     const protectedHint=['code','math','html','definition'].includes(entry.node.type);
     return (
       <Fragment key={blockKey}>
-        <LiveBlockShell windowed={entry.windowed} estimate={entry.estimate} text={entry.text} headings={entry.headings} start={start} end={end} blockIndex={low} active={active} protectedHint={protectedHint} onOpen={openRenderedBlock}>
+        <LiveBlockShell windowed={entry.windowed} estimate={entry.estimate} text={entry.text} headings={entry.headings} start={start} end={end} blockIndex={low} active={active} protectedHint={protectedHint} onOpen={openRenderedBlock} editor={<ActiveBlockEditor/>}>
           {entry.content}
         </LiveBlockShell>
         {insertedBelow&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
@@ -1247,7 +1172,7 @@ export default function LiveEditor({markdown,onChange,documentPath,savedDocument
   return <ActiveDraftContext.Provider value={activeDraftValue}>
     <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={dragStart}>
       {!frontmatter&&!renderedSource.trim()?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):<>
-        <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} savedDocumentPath={savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} onNotice={onNotice} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
+        <MarkdownPreview noteId={noteId} markdown={renderedSource} onChange={previewChange} documentPath={documentPath} savedDocumentPath={savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} onNotice={onNotice} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
         {!hasBodyNodes?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
       </>}
     </div>
