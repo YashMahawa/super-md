@@ -19,6 +19,7 @@ class HeadingSlugConformanceTest(unittest.TestCase):
         suite = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
         self.assertEqual(suite["version"], 1)
         self.assertTrue(24 <= len(suite["cases"]) <= 30)
+        self.assertTrue(any(c["documentSlug"] != c["agentSlug"] for c in suite["cases"]))
         for case in suite["cases"]:
             with self.subTest(case=case["id"]):
                 self.assertEqual(agent_documents._heading_slug(case["input"]), case["agentSlug"])

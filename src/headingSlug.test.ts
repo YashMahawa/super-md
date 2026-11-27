@@ -9,6 +9,7 @@ describe('heading slug cross-runtime conformance',()=>{
     expect(conformance.version).toBe(1);
     expect(conformance.cases.length).toBeGreaterThanOrEqual(24);
     expect(conformance.cases.length).toBeLessThanOrEqual(30);
+    expect(conformance.cases.some(entry=>entry.documentSlug!==entry.agentSlug)).toBe(true);
     for(const entry of conformance.cases){
       expect(headingSlug(entry.input),`documentSlug (${entry.id})`).toBe(entry.documentSlug);
       expect(agentHeadingSlug(entry.input),`agentSlug (${entry.id})`).toBe(entry.agentSlug);

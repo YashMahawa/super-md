@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use smd_core::{export, heading_slug, normalize_callouts, source, PdfOptions};
+use smd_core::{export, normalize_callouts, slug::heading_slug, source, PdfOptions};
 use std::collections::HashMap;
 
 #[derive(Deserialize)]
@@ -23,9 +23,12 @@ fn heading_slug_matches_shared_conformance_corpus() {
     let suite: ConformanceSuite = serde_json::from_str(raw).expect("valid conformance JSON");
     assert_eq!(suite.version, 1);
     assert!((24..=30).contains(&suite.cases.len()));
+    assert!(
+        suite.cases.iter().any(|c| c.document_slug != c.agent_slug),
+        "fixture must preserve distinct documentSlug (NFKC) and agentSlug (NFKD) expectations"
+    );
     for case in &suite.cases {
         assert!(!case.id.is_empty());
-        let _ = &case.agent_slug;
         assert_eq!(
             heading_slug(&case.input),
             case.document_slug,
