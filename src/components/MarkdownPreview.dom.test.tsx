@@ -367,4 +367,135 @@ describe("relative note navigation", () => {
     expect(loadAsset).toHaveBeenCalledWith("open_workspace_link", { documentPath: "/notes/index.md", target: "../outside.md", fragment: "", wikilink: false });
     expect(host.querySelector('[role="status"].reader-link-notice')?.textContent).toContain("Linked note is outside the authorized folder.");
   });
+
+  it("toggles only the intended nested task checkbox and leaves tasks containing study sliders checked", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+
+    const chartSpec = JSON.stringify({
+      title: "Damped wave",
+      series: [{ expression: "a * sin(x)" }],
+      sliders: [{ name: "a", label: "Amplitude", min: 0.5, max: 3, step: 0.5, value: 1 }],
+    });
+    const stepsSpec = JSON.stringify({
+      title: "Study walkthrough",
+      steps: [
+        { label: "Baseline", markdown: "Initial hypothesis" },
+        { label: "Verified", markdown: "Confirmed result" },
+      ],
+    });
+
+    let markdown = [
+      "# Study Checklist",
+      "",
+      "- [x] Parent task",
+      "  - [ ] Nested child A",
+      "    - [x] Deeply nested leaf",
+      "  - Grouping note",
+      "    - [ ] Nested under plain bullet",
+      "- [x] Calibrate oscillator slider",
+      "",
+      "  ```smd-chart",
+      `  ${chartSpec}`,
+      "  ```",
+      "- [x] Step through derivation slider",
+      "",
+      "  ```smd-steps",
+      `  ${stepsSpec}`,
+      "  ```",
+    ].join("\n");
+
+    const changes: string[] = [];
+    const renderCurrent = async () => {
+      await act(async () => {
+        root?.render(
+          <MarkdownPreview
+            markdown={markdown}
+            documentPath="/notes/tasks.md"
+            python=""
+            dark={false}
+            fullDocumentAccessibility
+            onChange={(next) => {
+              changes.push(next);
+              markdown = next;
+            }}
+          />,
+        );
+      });
+    };
+
+    await renderCurrent();
+
+    const getCheckboxes = () => Array.from(host.querySelectorAll<HTMLInputElement>('input[type="checkbox"][data-task-checkbox]'));
+    expect(getCheckboxes().map((box) => box.checked)).toEqual([true, false, true, false, true, true]);
+
+    // 1. Checking "Nested child A" must toggle only index 1, leaving checked "Parent task" and "Deeply nested leaf" untouched.
+    changes.length = 0;
+    await act(async () => {
+      getCheckboxes()[1].click();
+    });
+    expect(changes).toHaveLength(1);
+    expect(markdown).toContain("- [x] Parent task\n  - [x] Nested child A\n    - [x] Deeply nested leaf");
+    await renderCurrent();
+    expect(getCheckboxes().map((box) => box.checked)).toEqual([true, true, true, false, true, true]);
+
+    // 2. Unchecking "Deeply nested leaf" must toggle only index 2, leaving both ancestors checked.
+    changes.length = 0;
+    await act(async () => {
+      getCheckboxes()[2].click();
+    });
+    expect(changes).toHaveLength(1);
+    expect(markdown).toContain("- [x] Parent task\n  - [x] Nested child A\n    - [ ] Deeply nested leaf");
+    await renderCurrent();
+    expect(getCheckboxes().map((box) => box.checked)).toEqual([true, true, false, false, true, true]);
+
+    // 3. Checking "Nested under plain bullet" must toggle only index 3 without mutating "Parent task".
+    changes.length = 0;
+    await act(async () => {
+      getCheckboxes()[3].click();
+    });
+    expect(changes).toHaveLength(1);
+    expect(markdown).toContain("  - Grouping note\n    - [x] Nested under plain bullet");
+    expect(markdown).toContain("- [x] Parent task");
+    await renderCurrent();
+
+    // 4. Unchecking "Parent task" must toggle only index 0 without unchecking its nested children.
+    changes.length = 0;
+    await act(async () => {
+      getCheckboxes()[0].click();
+    });
+    expect(changes).toHaveLength(1);
+    expect(markdown).toContain("- [ ] Parent task\n  - [x] Nested child A\n    - [ ] Deeply nested leaf");
+    expect(markdown).toContain("    - [x] Nested under plain bullet");
+    await renderCurrent();
+    expect(getCheckboxes().map((box) => box.checked)).toEqual([false, true, false, true, true, true]);
+
+    // 5. Changing the smd-chart study slider inside a checked task updates the slider output while leaving the task checked.
+    changes.length = 0;
+    const chartSlider = host.querySelector<HTMLInputElement>('.chart-controls input[type="range"]')!;
+    expect(chartSlider).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(chartSlider, "2.5");
+      chartSlider.dispatchEvent(new Event("input", { bubbles: true }));
+      chartSlider.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(host.querySelector(".chart-slider-head output")?.textContent).toBe("2.5");
+    expect(changes).toHaveLength(0);
+    expect(markdown).toContain("- [x] Calibrate oscillator slider");
+    expect(getCheckboxes()[4].checked).toBe(true);
+
+    // 6. Changing the smd-steps study slider inside a checked task advances the step while leaving the task checked.
+    const stepSlider = host.querySelector<HTMLInputElement>('.step-cards-slider[type="range"]')!;
+    expect(stepSlider).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(stepSlider, "2");
+      stepSlider.dispatchEvent(new Event("input", { bubbles: true }));
+      stepSlider.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(host.querySelector(".step-cards-step-title")?.textContent).toBe("Verified");
+    expect(changes).toHaveLength(0);
+    expect(markdown).toContain("- [x] Step through derivation slider");
+    expect(getCheckboxes()[5].checked).toBe(true);
+  });
 });

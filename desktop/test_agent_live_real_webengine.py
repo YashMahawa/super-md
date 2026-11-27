@@ -339,7 +339,8 @@ def _probe(directory: str) -> int:
             sequence.append(("confirm_created_closed",lambda _row:("list",)))
             start_next()
         elif key=="confirm_created_closed":
-            still_open=any(row.get("id")==state["created_target"] for row in result.get("tabs",[]))
+            created_id=str(state["created_target"] or "").removeprefix("tab:")
+            still_open=any(row.get("id") in (state["created_target"],created_id) for row in result.get("tabs",[]))
             if still_open:
                 sequence.insert(0,("confirm_created_closed",lambda _row:("list",)))
                 QTimer.singleShot(100,start_next)
@@ -415,7 +416,8 @@ def _probe(directory: str) -> int:
             sequence.append(("confirm_saved_closed",lambda _row:("list",)))
             start_next()
         elif key=="confirm_saved_closed":
-            still_open=any(row.get("id")==state["saved_target"] for row in result.get("tabs",[]))
+            saved_id=str(state["saved_target"] or "").removeprefix("tab:")
+            still_open=any(row.get("id") in (state["saved_target"],saved_id) for row in result.get("tabs",[]))
             if still_open:
                 sequence.insert(0,("confirm_saved_closed",lambda _row:("list",)))
                 QTimer.singleShot(100,start_next)
