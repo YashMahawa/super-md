@@ -1,7 +1,7 @@
 """WebChannel reader IPC command router and worker dispatch helpers for Studio."""
 from __future__ import annotations
 
-import base64, json, math, re, stat, tempfile, time, urllib.parse, uuid
+import base64, json, math, urllib.parse, uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,24 +19,6 @@ def _set_agent_banner_unreviewed(studio_obj: Any, request_id: str, tab_id: Any, 
         studio_obj.recovery_timer.start(800)
         studio_obj._emit(False)
     studio_obj.replied.emit(request_id, "true", "")
-
-def _cleanup_failed_agent_export(studio_obj: Any, request_id: str, agent_export: dict | None = None, *, error: Any = None, clear_pending_export: bool = False) -> dict | None:
-    exports = getattr(studio_obj, "_agent_exports", None)
-    info = agent_export if agent_export is not None else (exports.get(request_id) if exports is not None else None)
-    if exports is not None: exports.pop(request_id, None)
-    if not info: return None
-    if clear_pending_export and getattr(studio_obj, "pending_export", "") == info.get("path"):
-        studio_obj.pending_export = ""
-    if error is not None and (records := getattr(studio_obj, "_agent_job_records", None)) is not None:
-        if record := records.get(info.get("jobId")):
-            record.update(status="failed", error=str(error)[:1000])
-    try:
-        reserved = Path(info["path"])
-        if reserved.exists() and reserved.stat().st_size == 0:
-            reserved.unlink()
-    except (OSError, TypeError, KeyError):
-        pass
-    return info
 
 def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, args: dict) -> bool:
     st = _studio_module()
@@ -269,56 +251,6 @@ def _handle_immediate_command(studio_obj: Any, request_id: str, command: str, ar
         return False
     return True
 
-def _export_pdf_worker(studio_obj: Any, output: str, args: dict, job: Any, export_result: Any) -> dict:
-    assert job is not None
-    st, destination = _studio_module(), Path(output)
-    stage = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.stage.pdf")
-    process = rust_temp = None
-    try:
-        job.check()
-        if not destination.parent.is_dir(): raise ValueError("The PDF destination folder is unavailable")
-        engine = studio_obj._engine()
-        args["assets"].update(studio_obj.session.font_store.pdf_assets(args["options"]["fontFamily"]))
-        job.check()
-        with tempfile.TemporaryFile() as request_file, tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(args): request_file.write(chunk.encode("utf-8"))
-            request_file.flush()
-            request_file.seek(0)
-            job.check()
-            process = st.subprocess.Popen([str(engine), "export-json", str(stage)], stdin=request_file, stdout=stdout_file, stderr=stderr_file)
-            rust_temp = stage.with_name(f".{stage.name}.{process.pid}.tmp")
-            job.attach_process(process)
-            deadline = time.monotonic() + 120
-            while True:
-                try:
-                    process.wait(timeout=0.1)
-                    break
-                except st.subprocess.TimeoutExpired:
-                    if not job.cancelled.is_set() and time.monotonic() < deadline: continue
-                    job.stop_process()
-                    try: process.wait(timeout=2)
-                    except st.subprocess.TimeoutExpired:
-                        try: process.kill()
-                        except OSError: pass
-                        process.wait()
-                    job.check()
-                    raise ValueError("PDF export timed out")
-            job.check()
-            stderr_file.seek(0)
-            error_text = stderr_file.read(64 * 1024).decode("utf-8", errors="replace").strip()
-        if process.returncode: raise ValueError(error_text or "PDF export failed")
-        if not stage.is_file() or stage.stat().st_size < 5: raise ValueError("PDF export produced an incomplete file")
-        with stage.open("rb") as generated:
-            if generated.read(5) != b"%PDF-": raise ValueError("PDF export produced an invalid file")
-        job.promote(stage, destination, lambda: studio_obj.readerCall.emit("window.supermdExportPhase?.(" + json.dumps(job.job_id) + ",'publishing')"))
-        return export_result(output)
-    finally:
-        for owned in (stage, rust_temp):
-            if owned is not None:
-                try: owned.unlink(missing_ok=True)
-                except OSError: pass
-        studio_obj._export_jobs.discard(job.job_id, job)
-
 def _run_worker_command(
     studio_obj: Any, command: str, args: dict, captured: dict, *, context: dict | None, output: str,
     save_as: str, force_portable_overwrite: bool, python: str, python_job: Any, export_job: Any, export_result: Any,
@@ -369,26 +301,13 @@ def _run_worker_command(
                 return {**result, "provenance": {"verified": False, "unsaved": True, "reason": f"Could not save execution output: {error}"}}
         return result
     if command == "export_markdown_native":
-        if not output: raise ValueError("Choose a Markdown destination")
-        if not isinstance(args.get("archive", False), bool): raise ValueError("archive must be a boolean")
-        if captured.get("path") and Path(output).resolve() == Path(captured["path"]).resolve():
-            raise ValueError("Markdown export must not overwrite the original note")
-        (st.write_markdown_zip if args.get("archive", False) else st.write_markdown_export)(Path(output), args.get("content"), args.get("assets", {}))
-        return export_result(output)
+        return st.studio_exports.execute_export_markdown_native(output, args, captured, export_result)
+    if command == "export_fmd_native" and not args.get("save") and not save_as:
+        return st.studio_exports.execute_export_smd_native(output, args, export_result)
     if command == "export_fmd_native":
-        if args.get("save") or save_as:
-            return st.studio_saves.execute_portable_tab_save(output, args, captured, force_portable_overwrite=force_portable_overwrite, export_result=export_result)
-        target_path = Path(output)
-        st.write_portable(target_path, args["content"], args["assets"])
-        result_data = export_result(target_path)
-        try:
-            file_stat = target_path.stat()
-            result_data["_stamp"] = (file_stat.st_mtime_ns, file_stat.st_size)
-        except OSError:
-            pass
-        return result_data
+        return st.studio_saves.execute_portable_tab_save(output, args, captured, force_portable_overwrite=force_portable_overwrite, export_result=export_result)
     if command == "export_pdf_native":
-        return _export_pdf_worker(studio_obj, output, args, export_job, export_result)
+        return st.studio_exports.execute_export_pdf_native(studio_obj, output, args, export_job, export_result)
     raise ValueError(f"Unsupported command: {command}")
 
 def _finish_worker_command(
@@ -400,7 +319,7 @@ def _finish_worker_command(
     if command.startswith("export_") and studio_obj.pending_export == output: studio_obj.pending_export = ""
     if error and studio_obj.pending_save_as == save_as: studio_obj.pending_save_as = studio_obj.pending_save_as_tab = ""
     if error:
-        if agent_export_info: _cleanup_failed_agent_export(studio_obj, request_id, agent_export_info, error=error)
+        if agent_export_info: st.studio_exports.fail_agent_export(studio_obj, request_id, agent_export_info, error)
         else: studio_obj.replied.emit(request_id, "null", error)
         return
     if command == "run_python" and isinstance(result, dict) and result.get("_cancelled"):
@@ -422,26 +341,9 @@ def _finish_worker_command(
     if command == "export_fmd_native" and ((args.get("save") and target) or save_as):
         st.studio_saves.finalize_portable_tab_save(studio_obj, args, captured, target, save_as=save_as, save_as_tab=save_as_tab)
     elif command.startswith("export_"):
-        exported_path = result["path"]
-        studio_obj.message = f"Exported {Path(exported_path).name}"
-        if st.is_searchable_note_name(Path(exported_path).name): studio_obj._refresh_open_folder_trees(exported_path)
+        st.studio_exports.finalize_standalone_export(studio_obj, result["path"])
     if agent_export_info:
-        if record := studio_obj._agent_job_records.get(agent_export_info.get("jobId")):
-            artifact_path = Path(result.get("path", ""))
-            try:
-                artifact_stat = artifact_path.stat(follow_symlinks=False)
-                artifact_bytes, artifact_hash = result.get("bytes"), result.get("sha256")
-                if (artifact_path.is_symlink() or not stat.S_ISREG(artifact_stat.st_mode)
-                        or not isinstance(artifact_bytes, int) or isinstance(artifact_bytes, bool)
-                        or artifact_bytes != artifact_stat.st_size or not isinstance(artifact_hash, str)
-                        or not re.fullmatch(r"[0-9a-f]{64}", artifact_hash)):
-                    raise ValueError("Export artifact metadata does not match the completed file")
-                record.update(status="completed", bytes=artifact_bytes, sha256=artifact_hash, path=str(artifact_path), filename=artifact_path.name,
-                              _fingerprint={"device": artifact_stat.st_dev, "inode": artifact_stat.st_ino, "size": artifact_stat.st_size, "mtimeNs": artifact_stat.st_mtime_ns})
-            except (OSError, ValueError) as failure:
-                record.update(status="failed", error=str(failure)[:500])
-        if result.get("path"): studio_obj._agent_owned_files.add(str(Path(result["path"]).resolve()))
-        studio_obj._agent_exports.pop(request_id, None)
+        st.studio_exports.complete_agent_export(studio_obj, request_id, agent_export_info, result)
     if not agent_export_info:
         studio_obj.replied.emit(request_id, json.dumps(result), "")
 
@@ -511,5 +413,6 @@ def post_message(studio_obj: Any, id: str, command: str, raw: str) -> None:
                            studio_obj.writes if command in ("export_fmd_native", "export_markdown_native") else None)
     except Exception as error:
         if python_job is not None: studio_obj._python_jobs.discard(python_job)
-        _cleanup_failed_agent_export(studio_obj, id, clear_pending_export=True)
+        if hasattr(studio_obj, "_agent_exports"):
+            _studio_module().studio_exports.cleanup_failed_post_agent_export(studio_obj, id)
         studio_obj.replied.emit(id, "null", str(error))

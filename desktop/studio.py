@@ -42,13 +42,18 @@ from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPat
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
     atomic_write, atomic_json, stage_atomic_json, bundle, decode_base64_chunked,
-    encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    encode_base64_chunked, image_data, is_valid_asset_filename,
+    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
+try:
+    from . import studio_exports
+except ImportError:
+    import studio_exports
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
@@ -81,7 +86,7 @@ DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
-DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
+DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackground=False)
 
 def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
     return studio_saves.preserve_unchanged_assets(old_assets, new_assets)
@@ -511,35 +516,7 @@ class WorkspaceDropFilter(QObject):
         return True
 
 def export_destination(value: str, format: str) -> Path:
-    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
-    # These are known payload extensions, not merely dotted stem names.  In
-    # particular, .fmd is an older portable format and must not be silently
-    # rewritten as .fmd.pdf/.fmd.smd.
-    payload_formats = {
-        ".pdf": "pdf",
-        ".smd": "smd",
-        ".md": "md",
-        ".markdown": "md",
-        ".txt": "md",
-        ".zip": "mdzip",
-    }
-    if format not in suffixes:
-        raise ValueError("Unsupported export format")
-    destination = local_path(value)
-    if not destination.name or destination.is_dir():
-        raise ValueError("Choose a file destination for the export")
-    expected = suffixes[format]
-    existing_suffix = destination.suffix.casefold()
-    if existing_suffix == ".fmd":
-        raise ValueError("Legacy .fmd files are not a supported export destination; choose .smd or a new filename")
-    if existing_suffix in payload_formats:
-        if payload_formats[existing_suffix] != format:
-            raise ValueError(f"Choose a filename ending in {expected} for this export")
-        return destination
-    target = destination.with_name(destination.name + expected)
-    if target.exists():
-        raise ValueError(f"The {expected} destination already exists; choose its full filename to confirm replacement")
-    return target
+    return studio_exports.export_destination(value, format)
 
 def _same_closed_revision(current: dict, captured: dict) -> bool:
     """Compare content-bearing fields after a background close snapshot."""
@@ -642,6 +619,7 @@ class Session(QObject):
         self.startup_windows = []
         self._pending_startup_windows = []
         self.quitting = False
+        self.update_installed = False
         self.locations = {}
         self.drafts = {}
         self.windows = {}
@@ -657,8 +635,14 @@ class Session(QObject):
         self.theme_restored = False
         self._load_theme_library()
         self.initial_recovery = []
+        settings_path = self.data / "settings.json"
+        stored_settings = None
+        can_persist_migration = not settings_path.exists()
         try:
-            stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(stored, dict) and isinstance(stored.get("settings"), dict):
+                stored_settings = stored["settings"]
+                can_persist_migration = True
             self.settings.update({k:v for k,v in stored["settings"].items() if k in DEFAULTS})
             if not stored["settings"].get("widthMigrated") and stored["settings"].get("widthPercent") == 80:
                 self.settings["widthPercent"] = 90  # 80% was the old default, not a choice.
@@ -666,12 +650,42 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
+        had_explicit_keep_in_background = isinstance(stored_settings, dict) and "keepInBackground" in stored_settings
+        fresh_service_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
+        migrated_keep_in_background = not had_explicit_keep_in_background and (
+            (isinstance(stored_settings, dict) and any(
+                stored_settings.get(key) is True
+                for key in ("agentAccessEnabled", "cloudAgentEnabled", "background", "backgroundEnabled")
+            ))
+            or (self.data / "agent-sessions").is_dir()
+            or (self.data / "agent-cloud.json").is_file()
+            or (
+                not fresh_service_log
+                and (
+                    (self.data / "background-service.log").is_file()
+                    or (self.data.name == "qt-studio" and (self.data.parent / "background-service.log").is_file())
+                )
+            )
+        )
         # Local MCP access and cloud relay reconnection are explicit, persisted
         # opt-ins; each desktop launch mints a fresh temporary loopback token.
         self.settings["agentAccessEnabled"] = self.settings.get("agentAccessEnabled") is True
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
+        self.settings["keepInBackground"] = (
+            stored_settings.get("keepInBackground") is True
+            if had_explicit_keep_in_background
+            else bool(migrated_keep_in_background)
+        )
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
+        if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
+            try:
+                atomic_write(
+                    settings_path,
+                    json.dumps({"settings": self.settings, "recent": self.recent, "pinned": self.pinned}, ensure_ascii=False).encode("utf-8"),
+                )
+            except OSError:
+                pass
         try:
             workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
             self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
@@ -902,6 +916,7 @@ class Studio(QObject):
         self.backgroundWriteCompleted.connect(self._complete_background_write)
         self.data = self.session.data
         self.settings = self.session.settings
+        self._defer_reader_activation = False
         self._agent_error = ""
         self._agent_cloud_error = ""
         self._agent_cloud_config_path = self.data / "agent-cloud.json"
@@ -1310,7 +1325,7 @@ class Studio(QObject):
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "portable": bool(tab.get("portable", False)), "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             pending_heading = tab.pop("pendingHeading", None)
             if pending_heading:
                 payload["pendingHeading"] = pending_heading
@@ -2357,6 +2372,9 @@ class Studio(QObject):
                 bridge.stop()
                 self.settings["cloudAgentEnabled"] = False
                 self._agent_error = ""
+            background = getattr(self.session, "background", None)
+            if background is not None:
+                background._cli_started_agent_access = False
             self.settings["agentAccessEnabled"] = bool(enabled)
             self._preferences()
             self._emit(False)
@@ -2605,8 +2623,23 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def backgroundEnabled(self):
+        if getattr(self.session, "update_installed", False):
+            return False
         service=getattr(self.session,"background",None)
         return bool(service and service.enabled and not service.quitting)
+
+    @Slot(result=bool)
+    def hasOtherOpenWindows(self):
+        return any(
+            other is not self
+            and not other.retired
+            and (getattr(other, "host_window", None) is None or other.host_window.isVisible())
+            for other in self.session.windows.values()
+        )
+
+    @Property(bool,notify=changed)
+    def deferReaderActivation(self):
+        return bool(getattr(self, "_defer_reader_activation", False))
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -2730,18 +2763,22 @@ class Studio(QObject):
             if error:self.update_status='Update installation failed: '+error;return
             path,prepared_kind=prepared
             if prepared_kind=='appimage':
+                self.session.update_installed=True;self.session.changed.emit()
                 self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
             else:
                 opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
                 if isinstance(opened,tuple):opened=opened[0]
                 if not opened:
                     self.update_status='Could not open the verified installer. It is still available in Downloads.'
-                elif prepared_kind in ('deb','rpm'):
-                    self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
-                elif prepared_kind=='macos':
-                    self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
                 else:
-                    self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+                    self.session.update_installed=True;self.session.changed.emit()
+                    if prepared_kind in ('deb','rpm'):
+                        self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
+                    elif prepared_kind=='macos':
+                        self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
+                    else:
+                        self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+            self._emit(False)
         self._submit(prepare,done,False)
 
     def _can_move(self):
@@ -3249,7 +3286,10 @@ class Studio(QObject):
 
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
-        data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
+        persisted_settings = dict(self.settings)
+        if getattr(getattr(self.session, "background", None), "_cli_started_agent_access", False):
+            persisted_settings["agentAccessEnabled"] = False
+        data = json.dumps({"settings": persisted_settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
         self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 
@@ -3554,6 +3594,7 @@ class Studio(QObject):
         value,
         *,
         explicit,
+        background=False,
         activation_generation=None,
         completion_callback=None,
         batch_insert=None,
@@ -3568,14 +3609,14 @@ class Studio(QObject):
             self.openFolder(str(path))
             if completion_callback: completion_callback(None, "A folder cannot be opened as a document")
             return
-        if explicit and activation_generation is None:
+        if explicit and not background and activation_generation is None:
             self._activation_generation += 1
             activation_generation = self._activation_generation
         elif activation_generation is None:
             activation_generation = self._activation_generation
-        restoring = not explicit and str(path) in self._restoring_paths
+        restoring = not explicit and not background and str(path) in self._restoring_paths
         def activate_existing(target_tab):
-            if explicit and activation_generation == self._activation_generation:
+            if explicit and not background and activation_generation == self._activation_generation:
                 if should_activate_fn is None or should_activate_fn(target_tab):
                     if pending_heading:
                         target_tab["pendingHeading"] = pending_heading
@@ -3638,10 +3679,15 @@ class Studio(QObject):
                 keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
             if should_activate_fn is not None:
-                should_activate = bool(explicit and activation_generation == self._activation_generation and should_activate_fn(note))
+                should_activate = bool(
+                    not background
+                    and explicit
+                    and activation_generation == self._activation_generation
+                    and should_activate_fn(note)
+                )
             else:
-                should_activate = (explicit and activation_generation == self._activation_generation)
-            if restoring and activation_generation == self._activation_generation:
+                should_activate = (not background and explicit and activation_generation == self._activation_generation)
+            if restoring and not background and activation_generation == self._activation_generation:
                 target_active = self._startup_active or self.session.startup_active
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
             if should_activate:
@@ -3653,12 +3699,12 @@ class Studio(QObject):
             self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
             self._preferences(notify=False)
             self.recovery_timer.start(800)
-            emit_load = should_activate if (should_activate_fn is not None or explicit) else True
+            emit_load = False if background else (should_activate if (should_activate_fn is not None or explicit) else True)
             for window in list(self.session.windows.values()):
                 if window is self:
                     window._emit(emit_load)
                 else:
-                    window._emit()
+                    window._emit(False if background else True)
             if explicit and should_activate:
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(note, None)
@@ -4091,7 +4137,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility","keepInBackground") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())
@@ -4125,6 +4171,14 @@ class Studio(QObject):
     def saveSafely(self): studio_saves.save_safely(self)
 
     @Slot()
+    def ensureReaderProfile(self):
+        if getattr(self, "_defer_reader_activation", False):
+            self._defer_reader_activation = False
+        callback = getattr(self.session, "ensure_reader_profile", None)
+        if callable(callback):
+            callback()
+
+    @Slot()
     def saveAsSafely(self): studio_saves.save_as_safely(self)
 
     @Slot()
@@ -4144,6 +4198,8 @@ class Studio(QObject):
 
     @Slot(str)
     def resolveConflict(self, choice): studio_saves.resolve_conflict(self, choice)
+
+    def _reload_current_from_disk(self): studio_saves.reload_current_from_disk(self)
 
     def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
         studio_saves.save_text(self, tab, path, automatic=automatic, force_overwrite=force_overwrite, force_portable=force_portable)
@@ -4496,9 +4552,7 @@ class Studio(QObject):
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
-        suffix = "zip" if format == "mdzip" else format
-        filename = (folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix
-        return QUrl.fromLocalFile(str(self._default_output_directory() / folder_ops._pure_path(filename).name))
+        return studio_exports.default_export_location(self, format)
 
     @Slot(str, result=QUrl)
     def defaultThemeExportLocation(self, name):
@@ -4571,6 +4625,14 @@ class Studio(QObject):
 
     @Slot(result=bool)
     def requestWindowClose(self):
+        bg = getattr(self.session, "background", None)
+        if (
+            bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        ):
+            return True
         dirty = next((t for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])), None)
         if dirty:
             self.pending_close = "window"
@@ -4581,7 +4643,13 @@ class Studio(QObject):
 
     @Slot(str)
     def resolveClose(self, choice):
-        if choice == "cancel": self.pending_close = ""; return
+        if choice == "cancel":
+            was_window = self.pending_close == "window"
+            self.pending_close = ""
+            if was_window:
+                service = getattr(self.session, "background", None)
+                if service is not None: service.cancel_quit()
+            return
         if choice == "save": self.save(); return
         if choice == "discard":
             # For a single-tab close, "discard" confirms closing the dirty
@@ -4618,21 +4686,7 @@ class Studio(QObject):
 
     @Slot(str, str)
     def exportTo(self, value, format):
-        if self.pending_export:
-            self.message = "An export is already in progress; finish or cancel it before choosing another destination"
-            self._emit(False)
-            return
-        self.pending_save_as = ""
-        self.pending_export = ""
-        try:
-            self.pending_export = str(export_destination(value, format))
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-        if format in ("md", "mdzip"): self.readerCall.emit(f"window.supermdExportMarkdown?.({str(format == 'mdzip').lower()})")
-        elif format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
-        else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")
+        studio_exports.export_to(self, value, format)
 
     @Slot(str)
     def command(self, action):
@@ -4682,159 +4736,16 @@ class Studio(QObject):
 
     @staticmethod
     def _agent_export_metadata(path: Path, format: str) -> dict:
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as source:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                digest.update(chunk)
-        return {"path": str(path), "filename": path.name, "format": format,
-                "bytes": size, "sha256": digest.hexdigest()}
+        return studio_exports.agent_export_metadata(path, format)
 
     def _agent_export_native(self, request_id: str, args: dict):
-        tab_id = args.get("id")
-        target = next((tab for tab in self.tabs if tab["id"] == tab_id), None)
-        if target is None or target["id"] != self.active:
-            raise ValueError("Export the currently active live tab")
-        fmt = args.get("format")
-        if fmt not in ("pdf", "smd", "md"):
-            raise ValueError("Export format must be PDF, SMD or Markdown")
-        expected = args.get("expectedRevision")
-        current = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
-        if not isinstance(expected, str) or expected != current:
-            raise ValueError("Live tab revision changed; inspect it again before exporting")
-        if self.pending_export or self.pending_save_as:
-            raise ValueError("Finish the current save or export before starting another one")
-        content, assets = args.get("content"), args.get("assets", {})
-        if not isinstance(content, str) or len(content.encode("utf-8")) > 20_000_000:
-            raise ValueError("Prepared export content must be a string under 20 MB")
-        if not isinstance(assets, dict) or len(assets) > 512 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in assets.items()):
-            raise ValueError("Prepared export assets are invalid")
-        if sum(len(value) for value in assets.values()) > 110_000_000:
-            raise ValueError("Prepared export assets exceed the bounded total size")
-        options = args.get("options", {})
-        if fmt == "pdf":
-            from agent_exports import validate_pdf_options
-            if not isinstance(options, dict):
-                raise ValueError("PDF options must be an object")
-            supplied = dict(options)
-            options = {**DEFAULT_PDF, **self.settings.get("pdf", {}), **supplied}
-            options["themeAccent"] = supplied.get("themeAccent") or self._colors().get("primary", "#386a57")
-            options = validate_pdf_options(options)
-        output = self._agent_export_path(args.get("filename", ""), fmt, target)
-        self.pending_export = str(output)
-        job_id = uuid.uuid4().hex
-        while len(self._agent_job_records) >= 20:
-            removable = next((key for key, value in self._agent_job_records.items()
-                              if value.get("status") in ("completed", "failed", "cancelled")), None)
-            if removable is None:
-                self.pending_export = ""
-                output.unlink(missing_ok=True)
-                raise ValueError("The desktop already has 20 active agent export jobs")
-            self._agent_job_records.pop(removable, None)
-        self._agent_exports[request_id] = {"path": str(output), "format": fmt, "jobId": job_id}
-        self._agent_job_records[job_id] = {"jobId": job_id, "action": "export_document", "status": "running", "filename": output.name,
-                                           "format": fmt, "path": str(output), "bytes": 0}
-        command = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native"}[fmt]
-        forwarded = {"id": tab_id, "content": content, "assets": assets, "options": options,
-                     "expectedRevision": expected, "save": False, "jobId": job_id}
-        try:
-            self.post(request_id, command, json.dumps(forwarded, ensure_ascii=False, separators=(",", ":")))
-            self.replied.emit(request_id, json.dumps({"jobId": job_id, "status": "running",
-                                                     "filename": output.name, "format": fmt}), "")
-        except Exception:
-            self._agent_exports.pop(request_id, None)
-            self.pending_export = ""
-            try:
-                output.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        studio_exports.agent_export_native(self, request_id, args)
 
     def _agent_job_status(self, job_id):
-        if not isinstance(job_id, str) or not job_id:
-            raise ValueError("jobId is required")
-        record = self._agent_job_records.get(job_id)
-        if not record:
-            raise ValueError("Export job is unavailable or expired")
-        result = {key: value for key, value in record.items() if key != "path" and not key.startswith("_")}
-        if record.get("status") == "completed":
-            if record.get("path"):
-                result["path"] = record["path"]
-            if record.get("action") == "export_document" and isinstance(record.get("_fingerprint"), dict):
-                result["downloadable"] = True
-        return result
+        return studio_exports.agent_job_status(self, job_id)
 
     def _agent_export_chunk(self, job_id, offset=0, limit=262_144):
-        """Read one bounded segment from a completed, registered export artifact."""
-        if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
-            raise ValueError("jobId is required")
-        record = self._agent_job_records.get(job_id)
-        if not isinstance(record, dict) or record.get("action") != "export_document":
-            raise ValueError("Export artifact job is unavailable or is not an export")
-        if record.get("status") != "completed":
-            raise ValueError("Export artifact is not completed")
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise ValueError("offset must be a nonnegative byte offset")
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 524_288:
-            raise ValueError("limit must be between 1 and 524,288 bytes")
-        total = record.get("bytes")
-        fingerprint = record.get("_fingerprint")
-        expected_hash = record.get("sha256")
-        file_path = record.get("path")
-        fmt = record.get("format")
-        filename = record.get("filename")
-        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-            raise ValueError("Export artifact metadata is invalid or incomplete")
-        if offset > total:
-            raise ValueError("offset must be between 0 and the artifact byte count")
-        if (not isinstance(fingerprint, dict) or fmt not in ("pdf", "smd", "md")
-                or not isinstance(filename, str) or not filename
-                or not isinstance(file_path, str) or not isinstance(expected_hash, str)
-                or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)):
-            raise ValueError("Export artifact metadata is invalid or incomplete")
-        path = Path(file_path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            path_stat = path.stat(follow_symlinks=False)
-            registered_identity = (fingerprint.get("device"), fingerprint.get("inode"),
-                                   fingerprint.get("size"), fingerprint.get("mtimeNs"))
-            if (path.is_symlink() or not stat.S_ISREG(path_stat.st_mode)
-                    or (path_stat.st_dev, path_stat.st_ino, path_stat.st_size, path_stat.st_mtime_ns) != registered_identity):
-                raise ValueError("Export artifact changed after completion")
-            fd = os.open(path, flags)
-        except (OSError, ValueError) as error:
-            raise ValueError("Export artifact changed after completion") from error
-        try:
-            before = os.fstat(fd)
-            expected_identity = (fingerprint.get("device"), fingerprint.get("inode"),
-                                 fingerprint.get("size"), fingerprint.get("mtimeNs"))
-            actual_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            if not stat.S_ISREG(before.st_mode) or actual_identity != expected_identity:
-                raise ValueError("Export artifact changed after completion")
-            with os.fdopen(fd, "rb") as stream:
-                fd = -1
-                stream.seek(offset)
-                body = stream.read(min(limit, total - offset))
-                after = os.fstat(stream.fileno())
-                if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != actual_identity
-                        or len(body) != min(limit, total - offset)):
-                    raise ValueError("Export artifact changed during retrieval")
-        except OSError as error:
-            raise ValueError("Export artifact could not be read") from error
-        finally:
-            if fd >= 0:
-                os.close(fd)
-        mime = {"pdf": "application/pdf", "smd": "application/x-supermd",
-                "md": "text/markdown"}[fmt]
-        next_offset = offset + len(body)
-        return {"jobId": job_id, "filename": filename, "format": fmt, "mimeType": mime,
-                "bytes": total, "sha256": expected_hash, "offset": offset,
-                "nextOffset": next_offset if next_offset < total else None,
-                "body": base64.b64encode(body).decode("ascii")}
+        return studio_exports.agent_export_chunk(self, job_id, offset, limit)
 
     _RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot for the agent patch; retry the patch"
     _RECOVERY_ERROR_SUPERSEDED = "Could not confirm draft recovery snapshot for the agent patch because the recovery write was superseded; retry the patch"
@@ -5457,7 +5368,7 @@ class Studio(QObject):
                 else:
                     metadata = self._agent_tab_result(result)
                     record.update(status="completed", **metadata)
-            self._open_note(resolved, explicit=not background, completion_callback=opened)
+            self._open_note(resolved, explicit=not background, background=background, completion_callback=opened)
             return {"status": "opening", "jobId": job_id, "path": resolved, "windowId": self.window_id,
                     "active": not background, "format": fmt}
         raise ValueError("Unsupported native document action")
@@ -5620,12 +5531,14 @@ class Studio(QObject):
                     raise ValueError("Asset exceeds 25 MB")
 
             filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
-            if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+            if not is_valid_asset_filename(filename):
                 raise ValueError("Asset name must be a simple filename")
             ext = Path(filename).suffix.lower().lstrip(".")
             if not ext:
                 ext = next((item for item, kind in MIMES.items() if kind == mime), "")
                 filename += "." + ext
+                if not is_valid_asset_filename(filename):
+                    raise ValueError("Asset name must be a simple filename")
             if MIMES.get(ext) != mime:
                 raise ValueError("Asset name extension must match the image type")
             if not _matches_media_signature(mime, raw):

@@ -317,6 +317,11 @@ class AgentDocumentsTest(unittest.TestCase):
         attached = self.store.attach_asset("portable.smd", "图形 with space.svg", expected_revision=revision)
         self.assertRegex(attached["asset"]["name"], r"^assets/[A-Za-z0-9._-]+\.svg$")
         revision = attached["revision"]
+        for bad_name in ("a" * 147 + ".png", "a" * 155 + ".png", "a" * 147, ".", ".."):
+            with self.assertRaisesRegex(AgentDocumentError, "simple filename"):
+                self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name=bad_name)
+        max_attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name="a" * 146 + ".png")
+        revision = max_attached["revision"]
         attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision)
         output = self.root / "extracted.png"
         extracted = self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
@@ -326,6 +331,66 @@ class AgentDocumentsTest(unittest.TestCase):
         with self.assertRaises(RevisionConflict):
             self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
                                      expected_revision=attached["revision"])
+
+    def test_existing_151_to_159_char_bundle_opens_exports_and_resaves_without_losing_asset_or_reference(self):
+        from agent_exports import export_pdf, export_smd, find_engine
+        from markdown_export import write_markdown_export, write_markdown_zip
+        import zipfile
+
+        svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><rect width='32' height='16' fill='#386a57'/></svg>"
+        svg_url = "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
+        compat_key = "assets/" + ("a" * 155) + ".svg"
+        self.assertEqual(len(compat_key.removeprefix("assets/")), 159)
+        markdown = f"# Legacy Bundle\n\n![Diagram](<{compat_key}>)\n"
+        legacy_path = self.root / "legacy.smd"
+        legacy_path.write_bytes(compressed_bundle(markdown, {compat_key: svg_url}))
+
+        # 1. Open and inspect existing bundle with 159-char basename.
+        info = self.store.inspect("legacy.smd")
+        self.assertEqual(info["asset_count"], 1)
+        read_res = self.store.read("legacy.smd", view="source")
+        self.assertEqual(read_res["text"], markdown)
+        asset_res = self.store.read_asset("legacy.smd", compat_key, expected_revision=info["revision"])
+        self.assertEqual(asset_res["data"], svg_bytes)
+
+        # 2. Export existing bundle to portable .smd, Markdown + companion folder, Markdown ZIP, and PDF.
+        export_smd(self.store, "legacy.smd", "exported-copy.smd")
+        exported_md, exported_assets, exported_portable = self.store._load(self.root / "exported-copy.smd")[:3]
+        self.assertTrue(exported_portable)
+        self.assertEqual(exported_md, markdown)
+        self.assertEqual(exported_assets, {compat_key: svg_url})
+
+        md_dir = self.root / "md-export"
+        md_dir.mkdir()
+        write_markdown_export(md_dir / "legacy.md", markdown, {compat_key: svg_url})
+        self.assertEqual((md_dir / "legacy.md").read_text(encoding="utf-8"), markdown)
+        self.assertEqual((md_dir / compat_key).read_bytes(), svg_bytes)
+
+        zip_path = self.root / "legacy-export.zip"
+        write_markdown_zip(zip_path, markdown, {compat_key: svg_url})
+        with zipfile.ZipFile(zip_path) as archive:
+            self.assertEqual(archive.read("legacy-export.md").decode("utf-8"), markdown)
+            self.assertEqual(archive.read(compat_key), svg_bytes)
+
+        try:
+            engine = find_engine()
+        except AgentDocumentError:
+            engine = None
+        if engine is not None:
+            export_pdf(self.store, "legacy.smd", "legacy.pdf", engine=engine)
+            self.assertTrue((self.root / "legacy.pdf").read_bytes().startswith(b"%PDF-"))
+
+        # 3. Edit and re-save existing bundle without losing its 159-char asset or Markdown reference.
+        patched = self.store.patch(
+            "legacy.smd",
+            expected_revision=info["revision"],
+            operations=[{"type": "replace", "old": "# Legacy Bundle", "new": "# Legacy Bundle\n\nRe-saved note body."}],
+        )
+        reopened_text = self.store.read("legacy.smd", view="source")["text"]
+        self.assertIn(f"![Diagram](<{compat_key}>)", reopened_text)
+        self.assertIn("Re-saved note body.", reopened_text)
+        reopened_asset = self.store.read_asset("legacy.smd", compat_key, expected_revision=patched["revision"])
+        self.assertEqual(reopened_asset["data"], svg_bytes)
 
     def test_explicit_asset_read_returns_exact_bytes_only_for_current_revision(self):
         payload = "<svg xmlns='http://www.w3.org/2000/svg'><text>Σ</text></svg>".encode("utf-8")

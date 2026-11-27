@@ -466,7 +466,15 @@ def _qt_bridge_class():
                     except Exception as error:
                         self._reply(500, {"error": f"desktop request failed ({type(error).__name__})"})
 
-            self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            class _LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+                def server_bind(self):
+                    import socketserver
+                    socketserver.TCPServer.server_bind(self)
+                    host, port = self.server_address[:2]
+                    self.server_name = str(host)
+                    self.server_port = int(port)
+
+            self.server = _LoopbackHTTPServer(("127.0.0.1", 0), Handler)
             self.server.daemon_threads = True
             self.server.timeout = 0.5
             self.server.request_queue_size = 8
@@ -930,6 +938,8 @@ def _qt_bridge_class():
                         parent["completed"] = 0
                         parent["fallback"] = {}
                     for studio in candidates:
+                        host_window = getattr(studio, "host_window", None)
+                        window_visible = host_window is None or host_window.isVisible()
                         tab_rows = []
                         for tab in studio.tabs:
                             source = tab["content"]
@@ -939,14 +949,14 @@ def _qt_bridge_class():
                                              "isDirty": tab["content"] != tab["saved"],
                                              "sourceLength": len(source),
                                              "revision": __import__("hashlib").sha256(source.encode("utf-8")).hexdigest(),
-                                             "active": tab["id"] == studio.active})
+                                             "active": window_visible and tab["id"] == studio.active})
                         child_id = uuid.uuid4().hex
                         with self._lock:
                             self._dispatches[child_id] = (request_id, studio.window_id, "list")
                             if request_id in self._pending:
                                 self._pending[request_id]["fallback"][studio.window_id] = tab_rows
                         request = {"action": "list_tabs", "requestId": child_id, "tabs": tab_rows,
-                                   "windowId": studio.window_id, "activeTabId": studio.active}
+                                   "windowId": studio.window_id, "activeTabId": studio.active if window_visible else ""}
                         studio.agentRequest.emit(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
                     return
                 elif action == "create_document":
@@ -1322,11 +1332,13 @@ def _qt_bridge_class():
                 try:
                     if studio is None or studio.retired:
                         raise ValueError("The target desktop window was closed")
+                    host_window = getattr(studio, "host_window", None)
+                    hidden_window = host_window is not None and not host_window.isVisible()
                     if payload["action"] in ("list_diagrams", "get_diagram"):
                         target = next((tab for tab in studio.tabs if tab["id"] == payload.get("tabId")), None)
                         if target is None:
                             raise ValueError("The requested live tab is no longer open")
-                        if payload.get("tabId") == studio.active:
+                        if payload.get("tabId") == studio.active and not hidden_window:
                             request = {**payload, "requestId": parent_id}
                         else:
                             request = {**payload, "requestId": parent_id, "_snapshot": True,
@@ -1340,7 +1352,7 @@ def _qt_bridge_class():
                             parent_entry["window_id"] = studio.window_id
                         studio.agentRequest.emit(encoded)
                         return True
-                    if payload["action"] == "patch_tab" and payload.get("tabId") == studio.active:
+                    if payload["action"] == "patch_tab" and payload.get("tabId") == studio.active and not hidden_window:
                         # Let the active reader apply through its editor/history path. Native
                         # patches remain appropriate for inactive tabs, where no reader view
                         # exists and switching tabs would disturb the user's current draft.
@@ -1398,6 +1410,9 @@ def _qt_bridge_class():
             if dispatch_type == "list":
                 rows = result.get("tabs") if isinstance(result, dict) else None
                 fallback_by_id = {row.get("id"): row for row in fallback if isinstance(row, dict)}
+                owner_studio = self.session.windows.get(expected_window)
+                owner_host = getattr(owner_studio, "host_window", None) if owner_studio is not None else None
+                owner_visible = owner_host is None or owner_host.isVisible()
                 merged_rows = []
                 if isinstance(rows, list):
                     for row in rows:
@@ -1407,6 +1422,8 @@ def _qt_bridge_class():
                         merged.update({key: row[key] for key in (
                             "id", "windowId", "title", "path", "format", "isDirty",
                             "sourceLength", "revision", "active") if key in row})
+                        if not owner_visible:
+                            merged["active"] = False
                         if merged.get("id"):
                             merged_rows.append(merged)
                 else:
