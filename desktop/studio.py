@@ -739,11 +739,8 @@ class Session(QObject):
                 if canonical_note_location is not None
                 else folder_ops.strip_extended_length_prefix(raw_note_location)
             )
-        if isinstance(stored_settings, dict) and "shortcuts" in stored_settings:
-            shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
-            self.settings["shortcuts"] = shortcuts or default_shortcuts()
-        else:
-            self.settings["shortcuts"] = default_shortcuts()
+        shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
+        self.settings["shortcuts"] = shortcuts or default_shortcuts()
         if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
             try:
                 atomic_write(

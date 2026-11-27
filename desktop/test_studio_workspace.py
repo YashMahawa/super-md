@@ -18,8 +18,7 @@ _DESKTOP_DIR = str(Path(__file__).resolve().parent)
 if _DESKTOP_DIR not in sys.path:
     sys.path.insert(0, _DESKTOP_DIR)
 
-import studio as studio_mod, studio_workspace
-import folder_ops
+import folder_ops, studio as studio_mod, studio_workspace
 from studio import Session, Studio
 from test_studio import QuietStudio
 
@@ -30,16 +29,12 @@ class WorkspaceQuietStudio(QuietStudio):
             super().__init__(isolated, session)
 
     def _preferences(self, notify: bool = True):
-        if not self.retired and notify:
-            self.session.changed.emit()
+        if not self.retired and notify: self.session.changed.emit()
 
     def _recover(self):
         with self.session._rename_state_lock:
             self.session.workspace[self.window_id] = [{"path": t["path"], "id": t["id"]} for t in self.tabs if t["path"] or self._is_dirty(t)]
-            self.session.window_workspaces[self.window_id] = {
-                "folder": self.folder, "expanded": sorted(self.expanded) if self.folder else [],
-                "active": self._current()["path"], "activeId": self.active,
-            }
+            self.session.window_workspaces[self.window_id] = {"folder": self.folder, "expanded": sorted(self.expanded) if self.folder else [], "active": self._current()["path"], "activeId": self.active}
             self.session._last_recovered_window_id = self.window_id
 
 
@@ -136,15 +131,12 @@ class StudioWorkspaceTest(unittest.TestCase):
             (vault / "symlink_dir").symlink_to(outside, target_is_directory=True)
         except OSError:
             pass
-        orig_is_link, junction_dir = folder_ops._is_link_or_junction, vault / "junction_dir"
-        sidebar_signals: list[int] = []
+        orig_is_link, junction_dir, sidebar_signals = folder_ops._is_link_or_junction, vault / "junction_dir", []
         on_sidebar = lambda: sidebar_signals.append(1)
         self.studio.sidebarChanged.connect(on_sidebar)
         try:
-            with (
-                patch.object(studio_mod.folder_ops, "_is_link_or_junction", side_effect=lambda p: (Path(p).name == "junction_dir" and folder_ops.same_path(p, junction_dir)) or orig_is_link(Path(p))),
-                patch.object(self.session.workspace_links, "invalidate", wraps=self.session.workspace_links.invalidate) as spy_inv,
-            ):
+            is_junc = lambda p: (Path(p).name == "junction_dir" and folder_ops.same_path(p, junction_dir)) or orig_is_link(Path(p))
+            with patch.object(studio_mod.folder_ops, "_is_link_or_junction", side_effect=is_junc), patch.object(self.session.workspace_links, "invalidate", wraps=self.session.workspace_links.invalidate) as spy_inv:
                 rev_before = self.studio._files_revision
                 self.studio.openFolder(str(vault))
                 self.assertTrue(_wait_until(lambda: len(self.studio.files) == 2))
@@ -152,23 +144,17 @@ class StudioWorkspaceTest(unittest.TestCase):
                 self.assertGreaterEqual(len(sidebar_signals), 1)
                 spy_inv.assert_called_with(self.studio.folder)
                 self.assertEqual([e["name"] for e in self.studio.files], ["topics", "alpha.md"])
-
                 topics = vault / "topics"
                 self.studio.toggleDirectory(str(topics))
                 self.assertTrue(_wait_until(lambda: any(e["name"] == "beta.smd" for e in self.studio.files)))
-                self.assertEqual(
-                    [(e["name"], e["depth"], e["expanded"]) for e in self.studio.files],
-                    [("topics", 0, True), ("deep", 1, False), ("beta.smd", 1, False), ("alpha.md", 0, False)],
-                )
+                self.assertEqual([(e["name"], e["depth"], e["expanded"]) for e in self.studio.files], [("topics", 0, True), ("deep", 1, False), ("beta.smd", 1, False), ("alpha.md", 0, False)])
                 self.studio.toggleDirectory(str(topics))
                 self.assertTrue(_wait_until(lambda: all(e["name"] != "beta.smd" for e in self.studio.files)))
-
                 spy_inv.reset_mock()
                 self.studio._restore_workspace_folder(str(vault), [str(topics), str(vault / "junction_dir"), str(outside)])
                 self.assertTrue(_wait_until(lambda: any(e["name"] == "beta.smd" for e in self.studio.files)))
                 self.assertEqual(self.studio.expanded, {folder_ops.canonical_path_str(vault), folder_ops.canonical_path_str(topics)})
                 spy_inv.assert_called_once_with(self.studio.folder)
-
                 spy_inv.reset_mock()
                 rev_pre_close = self.studio._files_revision
                 self.studio.closeFolder()
@@ -318,15 +304,11 @@ class StudioWorkspaceTest(unittest.TestCase):
         self.studio.cancelWorkspaceSearch()
         self.assertFalse(self.studio.folderSearchState["open"])
         self.assertEqual((self.studio.folderSearchState["matches"], self.studio.flush_operation), ([], None))
-
         self.studio.openFolderSearch()
         self.studio.openFolderSearchMatch("tab-42", str(note), "Hamiltonian", True, 10, 21, "Hamiltonian")
         self.assertFalse(self.studio.folderSearchState["open"])
         self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
-        self.assertEqual(
-            json.loads(self.studio.flush_operation["target"]),
-            {"tabId": "tab-42", "path": str(note), "query": "Hamiltonian", "caseSensitive": True, "sourceStart": 10, "sourceEnd": 21, "matchText": "Hamiltonian"},
-        )
+        self.assertEqual(json.loads(self.studio.flush_operation["target"]), {"tabId": "tab-42", "path": str(note), "query": "Hamiltonian", "caseSensitive": True, "sourceStart": 10, "sourceEnd": 21, "matchText": "Hamiltonian"})
 
     def test_unbound_simplenamespace_proxies_and_local_path_monkeypatch(self):
         dir_a, dir_b = self.root / "win_a", self.root / "win_b"
@@ -372,15 +354,13 @@ class StudioWorkspaceTest(unittest.TestCase):
         self.assertEqual([e["name"] for e in standalone.files], ["sub", "note_a.md"])
 
     def test_canonical_native_folder_paths_preserve_outer_whitespace_and_reject_links(self):
-        ws_name = " Workspace " if os.name != "nt" else " Workspace"
-        sub_name = " Sub " if os.name != "nt" else " Sub"
+        ws_name, sub_name = (" Workspace ", " Sub ") if os.name != "nt" else (" Workspace", " Sub")
         ws_dir, decoy_ws, outside = self.root / ws_name, self.root / "Workspace", self.root / "outside"
         sub_dir = ws_dir / sub_name
         for d in (sub_dir, decoy_ws, outside / "nested"): d.mkdir(parents=True, exist_ok=True)
         self.assertFalse(os.path.samefile(ws_dir, decoy_ws))
         for p, txt in ((ws_dir / "Root.md", "# Root\n"), (sub_dir / "Nested.md", "# Nested\n"), (decoy_ws / "Decoy.md", "# Decoy\n"), (outside / "nested" / "Leak.md", "# Leak\n")):
             p.write_text(txt, encoding="utf-8")
-
         symlink_root, symlink_sub, links_ok = self.root / "symlink_ws", ws_dir / "symlink_sub", False
         try:
             symlink_root.symlink_to(outside, target_is_directory=True)
@@ -388,25 +368,20 @@ class StudioWorkspaceTest(unittest.TestCase):
             links_ok = True
         except OSError:
             pass
-
-        ws_canon = str(studio_mod._canonical_approved_directory(ws_dir))
-        sub_canon = str(studio_mod._canonical_approved_directory(sub_dir))
+        ws_canon, sub_canon = str(studio_mod._canonical_approved_directory(ws_dir)), str(studio_mod._canonical_approved_directory(sub_dir))
         self.studio.openFolder(QUrl.fromLocalFile(str(ws_dir)).toString())
         self.assertEqual(self.studio.folder, ws_canon)
         self.assertNotEqual(self.studio.folder, str(studio_mod._canonical_approved_directory(decoy_ws)))
         self.assertTrue(_wait_until(lambda: [e["name"] for e in self.studio.files] == [sub_name, "Root.md"]))
-
         for invalid in ("", "   ") + ((str(symlink_root), str(symlink_root / "nested")) if links_ok else ()):
             self.studio.openFolder(invalid)
             self.assertEqual(self.studio.folder, ws_canon)
         for invalid_toggle in ("", "   ") + ((str(symlink_sub),) if links_ok else ()):
             self.studio.toggleDirectory(invalid_toggle)
         self.assertEqual(self.studio.expanded, {ws_canon})
-
         self.studio.toggleDirectory(QUrl.fromLocalFile(str(sub_dir)).toString())
         self.assertEqual(self.studio.expanded, {ws_canon, sub_canon})
         self.assertTrue(_wait_until(lambda: any(e["name"] == "Nested.md" for e in self.studio.files)))
-
         restored_expanded = [sub_canon, str(decoy_ws)] + ([str(symlink_sub)] if links_ok else [])
         self.studio.closeFolder()
         if links_ok:
@@ -422,19 +397,16 @@ class StudioWorkspaceTest(unittest.TestCase):
         sub.mkdir(parents=True)
         note = sub / "Lecture.md"
         note.write_text("# Lecture\n", encoding="utf-8")
-
         self.studio.openFolder(str(vault))
         self.assertTrue(_wait_until(lambda: len(self.studio.files) == 1))
         self.studio.toggleDirectory(str(sub))
         self.assertTrue(_wait_until(lambda: any(e["name"] == "Lecture.md" for e in self.studio.files)))
         self.studio.openNote(str(note))
         self.assertTrue(_wait_until(lambda: any(folder_ops.same_path(t["path"], note) for t in self.studio.tabs)))
-
         resume = self.studio._hold_watches_for_rename(str(sub), is_dir=True, new_path=str(renamed_sub))
         try:
             watched_mid = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
-            for suspended in (vault, sub, note):
-                self.assertNotIn(folder_ops.canonical_path_str(suspended), watched_mid)
+            for suspended in (vault, sub, note): self.assertNotIn(folder_ops.canonical_path_str(suspended), watched_mid)
             orig_rename, attempts = Path.rename, []
             def flaky_win_rename(self_path, target):
                 attempts.append(1)
@@ -457,7 +429,6 @@ class StudioWorkspaceTest(unittest.TestCase):
             self.assertTrue(any(folder_ops.same_path(t["path"], note) for t in self.studio.tabs))
         finally:
             self.studio._sync_path_change(str(sub), str(renamed_sub), is_dir=True, on_rebound=resume.set)
-
         rebound_note = str(renamed_sub / "Lecture.md")
         self.assertTrue(_wait_until(lambda: any(e["name"] == "Lecture.md" and folder_ops.same_path(e["path"], rebound_note) for e in self.studio.files)))
         self.assertTrue(any(folder_ops.same_path(t["path"], rebound_note) for t in self.studio.tabs))
