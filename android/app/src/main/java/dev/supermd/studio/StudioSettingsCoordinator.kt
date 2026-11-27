@@ -20,6 +20,7 @@ internal class StudioSettingsCoordinator(
     private val performReaderBarrier: suspend (String, () -> Unit) -> Boolean,
     private val readerBarrierFailed: () -> Unit,
     private val setImageOverlay: (Boolean) -> Unit,
+    private val persistNoteViewState: (Note) -> Unit,
 ) {
     fun inspectStorage() {
         val initial = readState()
@@ -110,34 +111,113 @@ internal class StudioSettingsCoordinator(
     }
 
     fun mode(value: String) {
+        if (value !in VALID_VIEW_MODES) return
         val expectedActiveId = readState().active.id
         scope.launch {
             val accepted = performReaderBarrier(expectedActiveId) {
-                changeState { it.copy(mode = value, editorFocused = if (value == "reader") false else it.editorFocused) }
+                var updatedNote: Note? = null
+                changeState { s ->
+                    if (s.tabs.isEmpty()) {
+                        s.copy(defaultMode = value, mode = value, editorFocused = if (value == "reader") false else s.editorFocused)
+                    } else {
+                        val targetId = expectedActiveId.takeIf { candidate -> s.tabs.any { it.id == candidate } } ?: s.active.id
+                        val nextTabs = s.tabs.map { tab ->
+                            if (tab.id == targetId) tab.copy(viewMode = value).also { updatedNote = it } else tab
+                        }
+                        s.copy(tabs = nextTabs, editorFocused = if (value == "reader") false else s.editorFocused)
+                    }
+                }
+                updatedNote?.let(persistNoteViewState)
             }
             if (!accepted) readerBarrierFailed()
         }
     }
 
-    fun fullscreen(value: Boolean) = changeState { s ->
-        if (value == s.fullscreen) s else s.copy(
-            fullscreen = value,
-            // Fullscreen is a chrome change, not a request to load an old scale.
-            fullscreenZoom = if (value) s.normalZoom else s.fullscreenZoom,
-        )
+    fun fullscreen(value: Boolean) {
+        var updatedNote: Note? = null
+        changeState { s ->
+            if (value == s.fullscreen) s else {
+                val current = s.active
+                val entryZoom = s.effectiveNormalZoom(current)
+                val updatedTabs = if (value && current.id.isNotEmpty() && (current.viewNormalZoom != null || current.viewFullscreenZoom != null || entryZoom != s.defaultFullscreenZoom)) {
+                    s.tabs.map { tab ->
+                        if (tab.id == current.id) tab.copy(viewFullscreenZoom = entryZoom).also { updatedNote = it } else tab
+                    }
+                } else s.tabs
+                s.copy(
+                    tabs = updatedTabs,
+                    fullscreen = value,
+                    // Fullscreen is a chrome change, not a request to load an old scale.
+                    fullscreenZoom = if (value) entryZoom else s.fullscreenZoom,
+                )
+            }
+        }
+        updatedNote?.let(persistNoteViewState)
     }
 
     // Reader gestures are acknowledgements, not a second command back to WebView.
     // Only an explicit native control/shortcut advances the command generation.
-    fun zoom(value: Float) = changeState { s ->
-        val command = maxOf(System.currentTimeMillis(), s.zoomCommand + 1)
-        if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f), zoomCommand = command)
-        else s.copy(normalZoom = value.coerceIn(40f, 300f), zoomCommand = command)
+    fun zoom(value: Float) {
+        if (!value.isFinite()) return
+        val clamped = value.coerceIn(40f, 300f)
+        var updatedNote: Note? = null
+        changeState { s ->
+            val command = maxOf(System.currentTimeMillis(), s.zoomCommand + 1)
+            if (s.tabs.isEmpty()) {
+                if (s.fullscreen) s.copy(defaultFullscreenZoom = clamped, fullscreenZoom = clamped, zoomCommand = command)
+                else s.copy(defaultNormalZoom = clamped, normalZoom = clamped, zoomCommand = command)
+            } else {
+                val targetId = s.active.id
+                val nextTabs = s.tabs.map { tab ->
+                    if (tab.id == targetId) {
+                        (if (s.fullscreen) tab.copy(viewFullscreenZoom = clamped) else tab.copy(viewNormalZoom = clamped))
+                            .also { updatedNote = it }
+                    } else tab
+                }
+                s.copy(tabs = nextTabs, zoomCommand = command)
+            }
+        }
+        updatedNote?.let(persistNoteViewState)
     }
 
-    fun readerZoom(value: Float, fullscreen: Boolean) = changeState { s ->
-        if (fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f))
-        else s.copy(normalZoom = value.coerceIn(40f, 300f))
+    fun readerZoom(value: Float, fullscreen: Boolean, id: String? = null) {
+        if (!value.isFinite()) return
+        val clamped = value.coerceIn(40f, 300f)
+        var updatedNote: Note? = null
+        changeState { s ->
+            val targetId = id?.takeIf { candidate -> s.tabs.any { it.id == candidate } }
+                ?: if (id == null) s.active.id else return@changeState s
+            val nextTabs = s.tabs.map { tab ->
+                if (tab.id == targetId) {
+                    (if (fullscreen) tab.copy(viewFullscreenZoom = clamped) else tab.copy(viewNormalZoom = clamped))
+                        .also { updatedNote = it }
+                } else tab
+            }
+            s.copy(tabs = nextTabs)
+        }
+        updatedNote?.let(persistNoteViewState)
+    }
+
+    fun defaultView(mode: String? = null, normalZoom: Float? = null, fullscreenZoom: Float? = null) {
+        val validMode = mode?.takeIf { it in VALID_VIEW_MODES }
+        val validNormal = normalZoom?.takeIf { it.isFinite() }?.coerceIn(40f, 300f)
+        val validFull = fullscreenZoom?.takeIf { it.isFinite() }?.coerceIn(40f, 300f)
+        if (validMode == null && validNormal == null && validFull == null) return
+        changeState { s ->
+            val updated = s.copy(
+                defaultMode = validMode ?: s.defaultMode,
+                defaultNormalZoom = validNormal ?: s.defaultNormalZoom,
+                defaultFullscreenZoom = validFull ?: s.defaultFullscreenZoom,
+            ).syncedActiveView()
+            if (updated.zoom != s.zoom) {
+                updated.copy(zoomCommand = maxOf(System.currentTimeMillis(), s.zoomCommand + 1))
+            } else updated
+        }
+        prefs.edit().apply {
+            validMode?.let { putString("readingMode", it) }
+            validNormal?.let { putFloat("normalZoom", it) }
+            validFull?.let { putFloat("fullscreenZoom", it) }
+        }.apply()
     }
 
     fun appearance(accent: String? = null, theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) {

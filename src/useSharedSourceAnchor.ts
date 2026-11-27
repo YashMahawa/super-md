@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, type RefObject } from "react";
-import type { PortableEditorSession } from "./components/Editor";
+import { editorReadingOffset, editorViewContext, type PortableEditorSession } from "./components/Editor";
 import { cancelHeadingNavigation, navigateToHeading, resolveHeadingOffset } from "./documentNavigation";
 import { invoke } from "./nativeBridge";
 import type { NoteHistory } from "./noteHistory";
@@ -51,6 +51,7 @@ export interface SharedSourceAnchorRefs {
   suppressedRestoreToken: RefObject<string | null>;
   suppressedRestoreKey: RefObject<string | null>;
   suppressRestoreForSeed: RefObject<boolean>;
+  suppressRestoreSeedNoteId?: RefObject<string | null>;
 }
 
 export function handoffSharedSourceAnchorOnLoad(options: {
@@ -87,7 +88,7 @@ export function handoffSharedSourceAnchorOnLoad(options: {
   }
   if (old && (old.id !== next.id || old.mode !== next.mode)) onHistoryBoundary?.();
   if (old && old.id === next.id && old.mode !== next.mode) {
-    if (hasNewPendingHeading) {
+    if (hasNewPendingHeading || hasActiveSeedNavigation) {
       modeAnchor.current = null; splitPane.current = null; primeEditorAnchor(next.id, null);
     } else {
       savePosition.current();
@@ -138,8 +139,29 @@ export function snapshotOutgoingTabOrPathAnchor(options: {
 const ANCHOR_SETTLE_INPUTS = ["wheel", "touchstart", "keydown", "pointerdown", "supermd-goto-offset"] as const;
 const ANCHOR_SETTLE_DELAYS = [120, 320, 700] as const;
 
+function isEditorOffsetVisible(id: string, content: string, targetOffset: number): boolean {
+  const lineStart = content.lastIndexOf("\n", Math.max(0, targetOffset - 1)) + 1;
+  const nextNewline = content.indexOf("\n", targetOffset);
+  const lineEnd = nextNewline === -1 ? content.length : nextNewline;
+  const topVisibleOffset = editorReadingOffset(id);
+  if (topVisibleOffset !== undefined && topVisibleOffset > lineEnd) return false;
+  const ctx = editorViewContext(id);
+  if (!ctx || typeof ctx.visibleStart !== "number" || typeof ctx.visibleEnd !== "number") return true;
+  if (ctx.scroller && ctx.scroller.clientHeight <= 0) return true;
+  if (ctx.scroller && ctx.scroller.scrollTop > ctx.scroller.clientHeight) {
+    if (ctx.visibleStart === 0) return true;
+    if (ctx.scroller.clientHeight > 120 && content.includes("\n") && !content.slice(ctx.visibleStart, ctx.visibleEnd).includes("\n")) return true;
+  }
+  if (lineStart < ctx.visibleStart) return false;
+  if (lineEnd > ctx.visibleEnd) return false;
+  const atBottom = Boolean(ctx.scroller && ctx.scroller.scrollTop + ctx.scroller.clientHeight >= ctx.scroller.scrollHeight - 4);
+  if (!atBottom && ctx.visibleEnd > ctx.visibleStart && lineEnd >= ctx.visibleEnd) return false;
+  return true;
+}
+
 export interface SettleSharedSourceAnchorOptions {
   id: string;
+  content?: string;
   targetMode: AnchorViewMode;
   getTargetZoom: () => number;
   anchor: SharedSourceAnchor;
@@ -158,7 +180,7 @@ export interface SettleSharedSourceAnchorOptions {
 // fonts). Re-apply the shared source anchor until stable, and stop immediately
 // when the person scrolls, types or opens search/live edit.
 export function settleSharedSourceAnchor({
-  id, targetMode, getTargetZoom, anchor, allowExactTop, readingSelector, getReadingRoot,
+  id, content, targetMode, getTargetZoom, anchor, allowExactTop, readingSelector, getReadingRoot,
   shouldStop, onExternalScroll, runApplyPass, onSecondFrameSettled, onCleanup, delays = ANCHOR_SETTLE_DELAYS,
 }: SettleSharedSourceAnchorOptions): () => void {
   let stopped = false, applying = false;
@@ -178,17 +200,32 @@ export function settleSharedSourceAnchor({
   ANCHOR_SETTLE_INPUTS.forEach(name => window.addEventListener(name, stop, { capture: true, passive: true }));
   window.addEventListener("scroll", onScroll, { capture: true, passive: true });
   let firstPass = true;
+  let editorTopValid = true;
   const apply = () => {
     if (stopped) return;
     if (readingSnapshot && hasExternalAnchorScroll(readingSnapshot)) { commitExternalScroll(readingSnapshot.element); return; }
     if (shouldStop()) { stopped = true; return; }
     const updateSelection = firstPass; firstPass = false; applying = true;
     const execute = () => {
+      const anchorForPass = editorTopValid ? anchor : { ...anchor, editorTop: undefined };
       const readingRoot = getReadingRoot();
       const targetZoom = getTargetZoom();
-      const effectiveAllowExactTop = allowExactTop && !(Boolean(readingRoot?.querySelector('[data-windowed-mounted="false"]')) && anchor.offset > 0);
-      applySharedAnchor({ id, targetMode, targetZoom, anchor, readingRoot, allowExactTop: effectiveAllowExactTop, updateSelection });
-      const requestedReadingTop = effectiveAllowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - targetZoom) < 1 ? anchor.readingTop : undefined;
+      const useSourceOffsetForWindowed = Boolean(readingRoot?.querySelector('[data-windowed-mounted="false"]')) && anchor.offset > 0;
+      const effectiveAllowExactTop = allowExactTop && (targetMode === "editor" ? editorTopValid : !useSourceOffsetForWindowed);
+      applySharedAnchor({ id, targetMode, targetZoom, anchor: anchorForPass, readingRoot, allowExactTop: effectiveAllowExactTop, updateSelection });
+      if (
+        allowExactTop &&
+        editorTopValid &&
+        content !== undefined &&
+        (targetMode === "editor" || targetMode === "split") &&
+        Math.abs(targetZoom - 100) >= 1 &&
+        anchor.offset > 0 &&
+        !isEditorOffsetVisible(id, content, anchor.offset)
+      ) {
+        editorTopValid = false;
+        revealEditorOffset(id, anchor.offset, { caretOffset: anchor.caretOffset, updateSelection: false });
+      }
+      const requestedReadingTop = allowExactTop && !useSourceOffsetForWindowed && anchor.mode === targetMode && Math.abs(anchor.zoom - targetZoom) < 1 ? anchor.readingTop : undefined;
       readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
       return readingSnapshot;
     };
@@ -220,13 +257,14 @@ export interface UseSharedSourceAnchorOptions {
   state: SharedAnchorReaderState | null;
   reference: RefObject<SharedAnchorReaderState | null>;
   zoomReference: RefObject<number>;
+  getPaintedZoom?: () => number;
   refs: SharedSourceAnchorRefs;
 }
 
-export function useSharedSourceAnchor({ state, reference, zoomReference, refs }: UseSharedSourceAnchorOptions): void {
+export function useSharedSourceAnchor({ state, reference, zoomReference, getPaintedZoom, refs }: UseSharedSourceAnchorOptions): void {
   const {
     noteViews, savePosition, modeAnchor, splitPane, restoringSplit, restoringSplitSeq,
-    splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed,
+    splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed, suppressRestoreSeedNoteId,
   } = refs;
 
   useEffect(() => {
@@ -312,6 +350,7 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
     const settleAnchor = (anchor: SharedSourceAnchor, allowExactTop: boolean) =>
       settleSharedSourceAnchor({
         id: state.id,
+        content: state.content,
         targetMode: state.mode,
         getTargetZoom: () => zoomReference.current,
         anchor,
@@ -336,10 +375,14 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
       return settleAnchor(anchor, false);
     }
     if (suppressRestoreForSeed.current) {
+      const seedOwnerId = suppressRestoreSeedNoteId?.current ?? null;
       suppressRestoreForSeed.current = false;
-      suppressedRestoreKey.current = null;
-      primeEditorAnchor(state.id, null);
-      return;
+      if (suppressRestoreSeedNoteId) suppressRestoreSeedNoteId.current = null;
+      if (!seedOwnerId || seedOwnerId === state.id) {
+        suppressedRestoreKey.current = null;
+        primeEditorAnchor(state.id, null);
+        return;
+      }
     }
     if (suppressedRestoreKey.current === `${state.id}:${state.mode}`) return;
     suppressedRestoreKey.current = null;
@@ -401,8 +444,9 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
     const save = () => {
       if (reference.current?.id !== state.id || reference.current?.mode !== state.mode) return;
       if (!roots.some(node => node.isConnected)) return;
-      const snap = captureSharedAnchor({ id: state.id, mode: state.mode, zoom: zoomReference.current, readingRoot: document.querySelector<HTMLElement>(".android-reading"), preferredSplitPane: splitPane.current });
-      const location: ReadingLocation = { top: Math.max(0, state.mode === "editor" ? (snap.editorTop ?? 0) : (snap.readingTop ?? 0)), offset: snap.offset, zoom: zoomReference.current, mode: state.mode };
+      const paintedZoom = getPaintedZoom ? getPaintedZoom() : zoomReference.current;
+      const snap = captureSharedAnchor({ id: state.id, mode: state.mode, zoom: paintedZoom, readingRoot: document.querySelector<HTMLElement>(".android-reading"), preferredSplitPane: splitPane.current });
+      const location: ReadingLocation = { top: Math.max(0, state.mode === "editor" ? (snap.editorTop ?? 0) : (snap.readingTop ?? 0)), offset: snap.offset, zoom: paintedZoom, mode: state.mode };
       saveReadingLocation(path, location);
       void invoke("reading_position", { id: state.id, location }).catch(() => {});
     };

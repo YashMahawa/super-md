@@ -175,6 +175,10 @@ internal class SafWorkspaceCoordinator(
             positions.keys().forEach { uriKey -> record(uriKey, null) }
         }
         runCatching {
+            val views = JSONObject(prefs.getString("noteViewStates", "{}") ?: "{}")
+            views.keys().forEach { uriKey -> record(uriKey, null) }
+        }
+        runCatching {
             val grants = JSONArray(prefs.getString("linkedAssetGrants", "[]") ?: "[]")
             for (i in 0 until grants.length()) {
                 record(grants.optJSONObject(i)?.optString("document"), null)
@@ -200,6 +204,21 @@ internal class SafWorkspaceCoordinator(
                 }
             }
             if (updated) { editor.putString("readingPositions", nextPositions.toString()); changed = true }
+        }
+        val oldViews = runCatching { JSONObject(prefs.getString("noteViewStates", "{}") ?: "{}") }.getOrDefault(JSONObject())
+        if (oldViews.length() > 0) {
+            val nextViews = JSONObject()
+            var updated = false
+            for (key in oldViews.keys()) {
+                val value = oldViews.optJSONObject(key) ?: continue
+                val mapped = transformUri(key)
+                if (mapped == null) updated = true
+                else {
+                    if (mapped != key) updated = true
+                    if (!nextViews.has(mapped)) nextViews.put(mapped, value)
+                }
+            }
+            if (updated) { editor.putString("noteViewStates", nextViews.toString()); changed = true }
         }
         val oldGrants = runCatching { JSONArray(prefs.getString("linkedAssetGrants", "[]") ?: "[]") }.getOrDefault(JSONArray())
         if (oldGrants.length() > 0) {

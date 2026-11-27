@@ -46,7 +46,21 @@ internal data class UriRemap(
     val newRelative: String? = null,
 )
 
-data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null, val assetsDirty: Boolean = false) {
+internal val VALID_VIEW_MODES = setOf("live", "editor", "reader", "split")
+
+data class Note(
+    val id: String = UUID.randomUUID().toString(),
+    val name: String = "Untitled.md",
+    val uri: String? = null,
+    val content: String = "",
+    val saved: String = "",
+    val relative: String? = null,
+    val assetDirectory: String? = null,
+    val assetsDirty: Boolean = false,
+    val viewMode: String? = null,
+    val viewNormalZoom: Float? = null,
+    val viewFullscreenZoom: Float? = null,
+) {
     val dirty get() = content != saved || assetsDirty
     val portable get() = assetDirectory != null
     val requiresCloseConfirmation get() = if (uri == null) (content.isNotBlank() || assetsDirty) && dirty else dirty
@@ -80,12 +94,33 @@ private fun renamedRelative(relative:String?,name:String)=relative?.let {val par
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
 private val EMPTY_NOTE = Note(id = "", name = "Super MD", content = "", saved = "")
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.5,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val defaultMode: String = mode, val defaultNormalZoom: Float = normalZoom, val defaultFullscreenZoom: Float = fullscreenZoom, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.5,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
     val pendingCloseNote get() = pendingCloseNoteId?.let { id -> tabs.find { it.id == id } }
     val pendingSaveConflictNote get() = pendingSaveConflictNoteId?.let { id -> tabs.find { it.id == id } }
+    fun effectiveMode(note: Note = active): String = note.viewMode?.takeIf { it in VALID_VIEW_MODES } ?: defaultMode
+    fun effectiveNormalZoom(note: Note = active): Float = (note.viewNormalZoom ?: defaultNormalZoom).coerceIn(40f, 300f)
+    fun effectiveFullscreenZoom(note: Note = active): Float = (note.viewFullscreenZoom ?: defaultFullscreenZoom).coerceIn(40f, 300f)
+    fun syncedActiveView(): StudioState {
+        if (tabs.isEmpty()) {
+            val cleanMode = defaultMode.takeIf { it in VALID_VIEW_MODES } ?: "live"
+            val cleanNormal = defaultNormalZoom.coerceIn(40f, 300f)
+            val cleanFull = defaultFullscreenZoom.coerceIn(40f, 300f)
+            return copy(mode = cleanMode, normalZoom = cleanNormal, fullscreenZoom = cleanFull)
+        }
+        val current = active
+        val nextMode = effectiveMode(current)
+        val nextNormal = effectiveNormalZoom(current)
+        val nextFull = effectiveFullscreenZoom(current)
+        val nextFocused = if (nextMode == "reader") false else editorFocused
+        return if (mode == nextMode && normalZoom == nextNormal && fullscreenZoom == nextFull && editorFocused == nextFocused) {
+            this
+        } else {
+            copy(mode = nextMode, normalZoom = nextNormal, fullscreenZoom = nextFull, editorFocused = nextFocused)
+        }
+    }
     fun writeNeedsAccess(id: String): Boolean {
         if (blockedWriteUris.isEmpty()) return false
         val uri = tabs.firstOrNull { it.id == id }?.uri ?: return false
@@ -593,8 +628,43 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun readerBarrierFailed() {
         mutable.value = mutable.value.copy(message = "The reader could not confirm its latest edits. The action was canceled; keep the note open and try again.")
     }
+    private data class SavedNoteViewState(
+        val viewMode: String? = null,
+        val viewNormalZoom: Float? = null,
+        val viewFullscreenZoom: Float? = null,
+    )
+    private fun savedNoteViewState(rawUri: String?): SavedNoteViewState? {
+        if (rawUri.isNullOrBlank()) return null
+        return runCatching {
+            val map = JSONObject(prefs.getString("noteViewStates", "{}") ?: "{}")
+            val record = map.optJSONObject(rawUri)
+                ?: map.keys().asSequence().firstOrNull { key -> runCatching { sameDocumentUri(key, rawUri) }.getOrDefault(false) }?.let(map::optJSONObject)
+                ?: return null
+            val mode = record.optString("mode").takeIf { it in VALID_VIEW_MODES }
+            val normal = if (record.has("normalZoom")) record.optDouble("normalZoom", Double.NaN).toFloat().takeIf { it.isFinite() }?.coerceIn(40f, 300f) else null
+            val full = if (record.has("fullscreenZoom")) record.optDouble("fullscreenZoom", Double.NaN).toFloat().takeIf { it.isFinite() }?.coerceIn(40f, 300f) else null
+            if (mode == null && normal == null && full == null) null else SavedNoteViewState(mode, normal, full)
+        }.getOrNull()
+    }
+    private fun persistNoteViewState(note: Note) {
+        val uri = note.uri ?: return
+        if (note.viewMode == null && note.viewNormalZoom == null && note.viewFullscreenZoom == null) return
+        val map = runCatching { JSONObject(prefs.getString("noteViewStates", "{}") ?: "{}") }.getOrDefault(JSONObject())
+        val existingKey = map.keys().asSequence().firstOrNull { key -> key == uri || runCatching { sameDocumentUri(key, uri) }.getOrDefault(false) }
+        if (existingKey != null) map.remove(existingKey)
+        val record = JSONObject().apply {
+            note.viewMode?.takeIf { it in VALID_VIEW_MODES }?.let { put("mode", it) }
+            note.viewNormalZoom?.takeIf { it.isFinite() }?.let { put("normalZoom", it.coerceIn(40f, 300f).toDouble()) }
+            note.viewFullscreenZoom?.takeIf { it.isFinite() }?.let { put("fullscreenZoom", it.coerceIn(40f, 300f).toDouble()) }
+        }
+        if (record.length() == 0) return
+        map.put(uri, record)
+        while (map.length() > 200) map.remove(map.keys().next())
+        prefs.edit().putString("noteViewStates", map.toString()).apply()
+    }
     private fun remember(note: Note) {
         val uri = note.uri ?: return
+        persistNoteViewState(note)
         storeRecent(listOf(RecentNote(note.name,uri,note.relative,recentMutable.value.any {sameDocumentUri(it.uri,uri)&&it.pinned}))+recentMutable.value.filterNot {sameDocumentUri(it.uri,uri)})
     }
     private fun storeRecent(notes:List<RecentNote>) {
@@ -666,6 +736,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
         if (key == "recent") {recentMutable.value=loadRecent();observeActive()}
         if(key in setOf("restorePosition","fullDocumentAccessibility","centerLock","startup","imageAppearance","svgAppearance","imageContrast","patternKind","patternOpacity","patternSize","patternSpacing"))mutable.value=readingPreferences(mutable.value)
+        if (key in setOf("readingMode", "normalZoom", "fullscreenZoom")) {
+            val previous = mutable.value
+            val updated = previous.copy(
+                defaultMode = prefs.getString("readingMode", previous.defaultMode)?.takeIf { it in VALID_VIEW_MODES } ?: previous.defaultMode,
+                defaultNormalZoom = prefs.getFloat("normalZoom", previous.defaultNormalZoom).takeIf { it.isFinite() }?.coerceIn(40f, 300f) ?: previous.defaultNormalZoom,
+                defaultFullscreenZoom = prefs.getFloat("fullscreenZoom", previous.defaultFullscreenZoom).takeIf { it.isFinite() }?.coerceIn(40f, 300f) ?: previous.defaultFullscreenZoom,
+            ).syncedActiveView()
+            mutable.value = if (updated.zoom != previous.zoom) {
+                updated.copy(zoomCommand = maxOf(System.currentTimeMillis(), previous.zoomCommand + 1))
+            } else updated
+        }
         if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts", "spellCheck", "grammarCheck")) {
             mutable.value = mutable.value.copy(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), pdf = prefs.getString("pdf", null) ?: StudioState().pdf, welcomed = prefs.getBoolean("welcomed", false))
                 .copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
@@ -1361,7 +1442,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
 
     private fun change(block: (StudioState) -> StudioState) {
         val previous = mutable.value
-        val next = block(previous)
+        val next = block(previous).syncedActiveView()
         mutable.value = next
         syncNoteAssetScopes(previous, next)
         observeActive()
@@ -1371,11 +1452,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val restoredFolder = windowPrefs.getString("folder", if (workspaceKey == "main" && !windowPrefs.getBoolean("folderMigrated", false)) prefs.getString("folder", null) else null)
         val restoredRelative = if (restoredFolder != null) normalizeFolderRelative(windowPrefs.getString("folderRelative", "") ?: "") else ""
         listedRelative = restoredRelative
-        var s = StudioState(theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = restoredFolder, folderRelative = restoredRelative, pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
+        val configuredMode = prefs.getString("readingMode", "live")?.takeIf { it in VALID_VIEW_MODES } ?: "live"
+        val configuredNormalZoom = prefs.getFloat("normalZoom", 100f).takeIf { it.isFinite() }?.coerceIn(40f, 300f) ?: 100f
+        val configuredFullscreenZoom = prefs.getFloat("fullscreenZoom", 100f).takeIf { it.isFinite() }?.coerceIn(40f, 300f) ?: 100f
+        var s = StudioState(mode = configuredMode, normalZoom = configuredNormalZoom, fullscreenZoom = configuredFullscreenZoom, defaultMode = configuredMode, defaultNormalZoom = configuredNormalZoom, defaultFullscreenZoom = configuredFullscreenZoom, theme = prefs.getString("theme", "system")!!, fullscreenTheme = prefs.getString("fullTheme", "black")!!, motion = prefs.getBoolean("motion", true), welcomed = prefs.getBoolean("welcomed", false), font = prefs.getString("font", "Manrope")!!, size = prefs.getFloat("size", 15f), folder = restoredFolder, folderRelative = restoredRelative, pdf = prefs.getString("pdf", null) ?: StudioState().pdf)
         s = s.copy(spellCheck=prefs.getBoolean("spellCheck",false),grammarCheck=prefs.getBoolean("grammarCheck",false),accent = prefs.getString("accent","system")!!, widthPercent = prefs.getFloat("widthPercent",100f),lineHeight = prefs.getFloat("lineHeight",1.65f),autosave = prefs.getBoolean("autosave",true),customFonts = fonts.families)
         try {
             if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
+        if (prefs.contains("readingMode")) s = s.copy(defaultMode = configuredMode)
+        if (prefs.contains("normalZoom")) s = s.copy(defaultNormalZoom = configuredNormalZoom)
+        if (prefs.contains("fullscreenZoom")) s = s.copy(defaultFullscreenZoom = configuredFullscreenZoom)
         migrateLegacyCustomTheme()
         s=themePreferences(readingPreferences(s)).copy(selectionAssistant=SelectionActions.provider(prefs.getString("selectionAssistant",null)),latexAutofix=prefs.getBoolean("latexAutofix",false),typewriterScroll=prefs.getBoolean("typewriterScroll",false))
         if(s.welcomed) {
@@ -1391,7 +1478,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val refs=indexResult.getOrDefault(emptyList()).filterNot {it.id in activeIds}.take(ClosedNoteStore.LIMIT)
         closedNoteRefs=refs
         return s.copy(activeId=activeId, closedTabs=closedNotesForRestore(refs,s.closedTabs,activeIds,indexResult.isSuccess),
-            error=closedNoteIndexError?.let {"Closed-note recovery index could not be read; historical snapshots were left untouched. $it"} ?: s.error)
+            error=closedNoteIndexError?.let {"Closed-note recovery index could not be read; historical snapshots were left untouched. $it"} ?: s.error).syncedActiveView()
     }
     private lateinit var studioSettingsCache: StudioSettingsCoordinator
     private val studioSettings: StudioSettingsCoordinator
@@ -1402,6 +1489,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     readState = { mutable.value }, writeState = { mutable.value = it }, changeState = ::change,
                     performReaderBarrier = ::performReaderBarrier, readerBarrierFailed = ::readerBarrierFailed,
                     setImageOverlay = { readerProtocolAndOutline.setImageOverlay(it) },
+                    persistNoteViewState = ::persistNoteViewState,
                 )
             }
             studioSettingsCache
@@ -1418,6 +1506,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun readingPosition(id: String, location: JSONObject) = studioSettings.readingPosition(id, location)
     private fun recoverySignature(state: StudioState) = RecoverySnapshotSignature(
         state.tabs, state.closedTabs, state.activeId, state.mode, state.normalZoom, state.fullscreenZoom,
+        state.defaultMode, state.defaultNormalZoom, state.defaultFullscreenZoom,
     )
     private fun schedulePersist() { recoveryWriter.schedule(mutable.value) }
     fun flush(): Job? = recoveryWriter.flush(mutable.value)
@@ -1855,7 +1944,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun mode(value: String) = studioSettings.mode(value)
     fun fullscreen(value: Boolean) = studioSettings.fullscreen(value)
     fun zoom(value: Float) = studioSettings.zoom(value)
-    fun readerZoom(value: Float, fullscreen: Boolean) = studioSettings.readerZoom(value, fullscreen)
+    fun readerZoom(value: Float, fullscreen: Boolean, id: String? = null) = studioSettings.readerZoom(value, fullscreen, id)
+    fun defaultView(mode: String? = null, normalZoom: Float? = null, fullscreenZoom: Float? = null) =
+        studioSettings.defaultView(mode, normalZoom, fullscreenZoom)
     fun appearance(accent: String? = null, theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) =
         studioSettings.appearance(accent, theme, fullTheme, motion, font, size)
     fun pdf(value: String) = studioSettings.pdf(value)
@@ -2188,13 +2279,32 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
             val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
             val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
+            val view = savedNoteViewState(target.toString()) ?: savedNoteViewState(originalUri.toString())
             if (portable) {
                 val opened = media.openFmd(buffered)
-                Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
-                    .also { recordPortableBaseline(it.id, opened.directory) }
+                Note(
+                    name = name,
+                    uri = target.toString(),
+                    content = opened.markdown,
+                    saved = opened.markdown,
+                    relative = relative,
+                    assetDirectory = opened.directory,
+                    viewMode = view?.viewMode,
+                    viewNormalZoom = view?.viewNormalZoom,
+                    viewFullscreenZoom = view?.viewFullscreenZoom,
+                ).also { recordPortableBaseline(it.id, opened.directory) }
             } else {
                 val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
-                Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
+                Note(
+                    name = name,
+                    uri = target.toString(),
+                    content = content,
+                    saved = content,
+                    relative = relative,
+                    viewMode = view?.viewMode,
+                    viewNormalZoom = view?.viewNormalZoom,
+                    viewFullscreenZoom = view?.viewFullscreenZoom,
+                )
             }
         }
     }
@@ -2876,7 +2986,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun updatePersistedMetadata(transformUri: (String) -> String?) =
         safWorkspace.updatePersistedMetadata(transformUri)
     private fun remapPersistedMetadata(remaps: List<UriRemap>) = safWorkspace.remapPersistedMetadata(remaps)
-    private fun applyUriRemaps(
+    internal fun applyUriRemaps(
         remaps: List<UriRemap>,
         oldFolderPrefix: String? = null,
         newFolderPrefix: String? = null,

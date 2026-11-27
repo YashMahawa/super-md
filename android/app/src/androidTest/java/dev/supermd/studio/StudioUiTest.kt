@@ -1519,4 +1519,113 @@ ax.set_title("Matplotlib 3D figure")
             compose.waitUntil(10000) {compose.activity.resources.configuration.orientation==android.content.res.Configuration.ORIENTATION_PORTRAIT}
         }
     }
+    @Test fun tabSwitchesPreservePerNoteModeAndZoomAndUseDefaultsForNewNotes() {
+        welcome()
+        val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
+        temporaryNoteState=model.state.value
+        val originalDefaultMode=model.state.value.defaultMode
+        val originalDefaultZoom=model.state.value.defaultNormalZoom
+        val createdIds=mutableListOf<String>()
+        val savedNoteOne=java.io.File(compose.activity.cacheDir,"tab-view-note-one-${System.nanoTime()}.md").apply {
+            writeText("# Note One\n\n"+("Paragraph in note one. ".repeat(10)+"\n\n").repeat(30))
+        }
+        val scaleScript="document.querySelector('.document-page')?.dataset.scale || document.querySelector('.android-source')?.style.getPropertyValue('--workspace-scale') || ''"
+        try {
+            compose.runOnIdle { model.defaultView(mode="live",normalZoom=110f) }
+
+            // Open saved Note One -> opens with configured defaults (live @ 110%), then customized to reader @ 160%.
+            compose.runOnIdle { model.open(android.net.Uri.fromFile(savedNoteOne)) }
+            compose.waitUntil(15_000) { model.state.value.active.uri == android.net.Uri.fromFile(savedNoteOne).toString() }
+            val noteOneId=model.state.value.active.id.also(createdIds::add)
+            compose.runOnIdle {
+                assertEquals("live",model.state.value.mode)
+                assertEquals(110f,model.state.value.zoom,.01f)
+            }
+            javascriptUntil("document.querySelector('.android-document h1')?.textContent?.trim()==='Note One'") {it=="true"}
+            javascriptUntil(scaleScript) {it=="\"1.1\""}
+
+            compose.runOnIdle {
+                model.mode("reader")
+                model.zoom(160f)
+            }
+            compose.waitUntil(15_000) { model.state.value.mode=="reader" && kotlin.math.abs(model.state.value.zoom-160f)<.01f }
+            javascriptUntil("Boolean(document.querySelector('.markdown-body'))") {it=="true"}
+            javascriptUntil(scaleScript) {it=="\"1.6\""}
+
+            // Create unsaved Draft Two -> opens with configured defaults (live @ 110%), then customized to editor @ 135%.
+            val createdDraftTwo=AtomicReference<String?>(null)
+            compose.runOnIdle {
+                model.newNote(titleHint="DraftTwo",content="# Unsaved Draft Two\n\nScratch source lines.\n") { created ->
+                    createdDraftTwo.set(created?.id)
+                }
+            }
+            compose.waitUntil(15_000) { createdDraftTwo.get()!=null && model.state.value.activeId==createdDraftTwo.get() }
+            val draftTwoId=createdDraftTwo.get()!!.also(createdIds::add)
+            compose.runOnIdle {
+                assertEquals("live",model.state.value.mode)
+                assertEquals(110f,model.state.value.zoom,.01f)
+                assertTrue(model.state.value.active.dirty)
+            }
+            javascriptUntil("document.querySelector('.android-document h1')?.textContent?.trim()==='Unsaved Draft Two'") {it=="true"}
+            javascriptUntil(scaleScript) {it=="\"1.1\""}
+
+            compose.runOnIdle {
+                model.mode("editor")
+                model.zoom(135f)
+            }
+            compose.waitUntil(15_000) { model.state.value.mode=="editor" && kotlin.math.abs(model.state.value.zoom-135f)<.01f }
+            javascriptUntil("Boolean(document.querySelector('.cm-editor'))") {it=="true"}
+            javascriptUntil(scaleScript) {it=="\"1.35\""}
+
+            // Switch back to saved Note One -> restores reader @ 160%.
+            compose.runOnIdle { model.select(noteOneId) }
+            compose.waitUntil(15_000) { model.state.value.activeId==noteOneId }
+            compose.runOnIdle {
+                assertEquals("reader",model.state.value.mode)
+                assertEquals(160f,model.state.value.zoom,.01f)
+            }
+            javascriptUntil("Boolean(document.querySelector('.markdown-body'))") {it=="true"}
+            javascriptUntil(scaleScript) {it=="\"1.6\""}
+
+            // Switch back to Unsaved Draft Two -> restores editor @ 135% and unsaved draft text.
+            compose.runOnIdle { model.select(draftTwoId) }
+            compose.waitUntil(15_000) { model.state.value.activeId==draftTwoId }
+            compose.runOnIdle {
+                assertEquals("editor",model.state.value.mode)
+                assertEquals(135f,model.state.value.zoom,.01f)
+                assertTrue(model.state.value.active.content.contains("Unsaved Draft Two"))
+            }
+            javascriptUntil("Boolean(document.querySelector('.cm-editor'))") {it=="true"}
+            javascriptUntil(scaleScript) {it=="\"1.35\""}
+
+            // Create brand-new Note Three -> uses configured defaults (live @ 110%).
+            val createdThree=AtomicReference<String?>(null)
+            compose.runOnIdle { model.newNote(titleHint="FreshThree") { created -> createdThree.set(created?.id) } }
+            compose.waitUntil(15_000) { createdThree.get()!=null && model.state.value.activeId==createdThree.get() }
+            val noteThreeId=createdThree.get()!!.also(createdIds::add)
+            compose.runOnIdle {
+                assertEquals(noteThreeId,model.state.value.activeId)
+                assertEquals("live",model.state.value.mode)
+                assertEquals(110f,model.state.value.zoom,.01f)
+            }
+            javascriptUntil("Boolean(document.querySelector('.live-document'))") {it=="true"}
+            javascriptUntil(scaleScript) {it=="\"1.1\""}
+        } finally {
+            createdIds.asReversed().forEach { id ->
+                if (model.state.value.tabs.any { it.id == id }) {
+                    compose.runOnIdle { model.close(id, discardChanges = true) }
+                    compose.waitUntil(15_000) { model.state.value.tabs.none { it.id == id } }
+                }
+            }
+            val restoreId = temporaryNoteState!!.active.id
+            if (model.state.value.tabs.any { it.id == restoreId } && model.state.value.activeId != restoreId) {
+                compose.runOnIdle { model.select(restoreId) }
+                compose.waitUntil(15_000) { model.state.value.activeId == restoreId }
+            }
+            compose.runOnIdle {
+                model.defaultView(mode=originalDefaultMode,normalZoom=originalDefaultZoom)
+            }
+            savedNoteOne.delete()
+        }
+    }
 }

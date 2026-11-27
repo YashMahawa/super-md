@@ -748,7 +748,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                         val id = canonicalTabId(note)
                         val isActive = note.id == liveState.activeId
                         tabs.put(buildAgentTabJson(note, id, activity.agentRevision(note.content), id = id,
-                            active = isActive, saved = !note.dirty, mode = if (isActive) liveState.mode else "live"))
+                            active = isActive, saved = !note.dirty, mode = liveState.effectiveMode(note)))
                     }
                     reply(JSONObject().put("tabs", tabs), null)
                 }
@@ -1015,7 +1015,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             }
         }
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
+        LaunchedEffect(readerReady, state.active.id, state.active.name, state.active.uri, state.active.content, state.active.relative, state.active.assetDirectory, state.active.portable, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
             if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active

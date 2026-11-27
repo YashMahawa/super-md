@@ -150,6 +150,9 @@ internal class ReloadFromDiskCoordinator(
                                         relative = note.relative,
                                         assetDirectory = opened.directory,
                                         assetsDirty = false,
+                                        viewMode = note.viewMode,
+                                        viewNormalZoom = note.viewNormalZoom,
+                                        viewFullscreenZoom = note.viewFullscreenZoom,
                                     )
                                 } else {
                                     val text = readLimited(stream, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
@@ -161,6 +164,9 @@ internal class ReloadFromDiskCoordinator(
                                         saved = text,
                                         relative = note.relative,
                                         assetsDirty = false,
+                                        viewMode = note.viewMode,
+                                        viewNormalZoom = note.viewNormalZoom,
+                                        viewFullscreenZoom = note.viewFullscreenZoom,
                                     )
                                 }
                             } ?: error("Document permission is unavailable; choose it again")
@@ -192,6 +198,9 @@ internal class ReloadFromDiskCoordinator(
                                         relative = note.relative,
                                         assetDirectory = archivedAssetDir,
                                         assetsDirty = archivedAssetDir != null || note.assetsDirty,
+                                        viewMode = note.viewMode,
+                                        viewNormalZoom = note.viewNormalZoom,
+                                        viewFullscreenZoom = note.viewFullscreenZoom,
                                     )
                                     val ref = closedNoteStore.save(archivedDraft)
                                     savedSnapshotRef = ref
@@ -268,7 +277,9 @@ internal class ReloadFromDiskCoordinator(
                             }
                             changeState { state ->
                                 state.copy(
-                                    tabs = state.tabs.map { if (it.id == id) loadedNote else it },
+                                    tabs = state.tabs.map {
+                                        if (it.id == id) loadedNote.copy(viewMode = it.viewMode, viewNormalZoom = it.viewNormalZoom, viewFullscreenZoom = it.viewFullscreenZoom) else it
+                                    },
                                     closedTabs = if (archivedReference != null) {
                                         (
                                             listOf(archivedReference!!.placeholder()) +
