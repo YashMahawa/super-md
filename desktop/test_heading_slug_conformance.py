@@ -38,7 +38,8 @@ class HeadingSlugConformanceTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "note.md").write_text(source, encoding="utf-8")
+            (root / "note.md").write_bytes(source.encode("utf-8"))
+            (root / "note-crlf.md").write_bytes(source.replace("\n", "\r\n").encode("utf-8"))
             store = DocumentStore([root])
             math_sec = store.read("note.md", heading="h2o-r2-space")
             self.assertEqual(math_sec["text"], "## ℍ₂O & ℝ² Space\nVector space notes.\n\n")
@@ -46,6 +47,8 @@ class HeadingSlugConformanceTest(unittest.TestCase):
             self.assertEqual(hz_sec["text"], "## Trade™ 100㎐\nFrequency spec.\n")
             exact_sec = store.read("note.md", heading="ℍ₂O & ℝ² Space")
             self.assertEqual(exact_sec["text"], math_sec["text"])
+            crlf_sec = store.read("note-crlf.md", heading="h2o-r2-space")
+            self.assertEqual(crlf_sec["text"], "## ℍ₂O & ℝ² Space\r\nVector space notes.\r\n\r\n")
 
 
 if __name__ == "__main__":
