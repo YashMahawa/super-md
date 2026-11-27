@@ -26,6 +26,35 @@
     body
   }
 })
+#let smd-tagged-equation(body, tag) = block(width: 100%, breakable: false, layout(size => {
+  let tag-box = text(tag)
+  let tag-size = measure(tag-box)
+  let gap = 12pt
+  let eq = math.equation(block: true, body)
+  let eq-size = measure(eq)
+  let available = calc.max(40pt, size.width - 2 * (tag-size.width + gap))
+  if eq-size.width <= available {
+    box(width: size.width, {
+      align(center, eq)
+      place(right + horizon, tag-box)
+    })
+  } else {
+    let max-eq = calc.max(40pt, size.width - tag-size.width - gap)
+    let fitted = if eq-size.width > max-eq and eq-size.width > 0pt {
+      let factor = max-eq / eq-size.width
+      scale(x: factor * 100%, y: factor * 100%, reflow: true, eq)
+    } else {
+      eq
+    }
+    grid(
+      columns: (1fr, auto),
+      column-gutter: gap,
+      align: (center + horizon, right + horizon),
+      fitted,
+      tag-box,
+    )
+  }
+}))
 // Highlight each code block once, then fit synthesized lines individually while
 // keeping the outer 1.2em row height and breakable pagination across pages.
 #let smd-code(code, lang: none) = context {
