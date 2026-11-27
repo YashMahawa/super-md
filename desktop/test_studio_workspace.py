@@ -117,6 +117,66 @@ class StudioWorkspaceTest(unittest.TestCase):
             self.assertGreater(self.studio._files_revision, rev_pre_close)
             spy_inv.assert_called_once_with(folder_ops.canonical_path_str(vault))
 
+    def test_folder_visibility_toggle_scan_budget_pinned_dirs_watches_and_picker(self):
+        vault = self.root / "visibility_vault"
+        for sub in (
+            vault / "00_Empty",
+            vault / "01_LegacyMarkdown",
+            vault / "02_HeavyAssets",
+            vault / "03_NotesMd",
+            vault / "04_PortableSmd",
+            vault / "05_Nested" / "TxtDir",
+        ):
+            sub.mkdir(parents=True, exist_ok=True)
+        (vault / "01_LegacyMarkdown" / "doc.markdown").write_text("# Legacy\n", encoding="utf-8")
+        for idx in range(8):
+            (vault / "02_HeavyAssets" / f"img_{idx}.png").write_bytes(b"\x89PNG\r\n")
+        (vault / "03_NotesMd" / "note.md").write_text("# Note\n", encoding="utf-8")
+        (vault / "04_PortableSmd" / "pack.smd").write_bytes(b"{}")
+        (vault / "05_Nested" / "TxtDir" / "plain.txt").write_text("Plain\n", encoding="utf-8")
+
+        self.assertEqual(studio_mod.FOLDER_TREE_NOTE_SUFFIXES, frozenset({".md", ".smd", ".txt"}))
+        self.studio.openFolder(str(vault))
+        self.assertTrue(_wait_until(lambda: [e["name"] for e in self.studio.files] == ["03_NotesMd", "04_PortableSmd", "05_Nested"]))
+        self.assertEqual(
+            {folder_ops.canonical_path_str(d) for d in self.studio.note_watcher.directories()},
+            {folder_ops.canonical_path_str(vault)},
+        )
+
+        # Single visibility toggle reveals empty/asset/.markdown subfolders and note rows, then rehides them.
+        self.studio.setting("hideNonNoteFolders", "false")
+        self.assertTrue(_wait_until(lambda: "00_Empty" in [e["name"] for e in self.studio.files]))
+        self.studio.toggleDirectory(str(vault / "01_LegacyMarkdown"))
+        self.assertTrue(_wait_until(lambda: "doc.markdown" in [e["name"] for e in self.studio.files]))
+        self.studio.setting("hideNonNoteFolders", "true")
+        self.assertTrue(_wait_until(lambda: [e["name"] for e in self.studio.files] == ["03_NotesMd", "04_PortableSmd", "05_Nested"]))
+
+        # Small scan budget keeps unresolved folder (02_HeavyAssets) and subsequent valid note folders visible.
+        self.studio._folder_tree_scan_budget = 4
+        self.studio._load_tree()
+        self.assertTrue(
+            _wait_until(lambda: [e["name"] for e in self.studio.files] == ["02_HeavyAssets", "03_NotesMd", "04_PortableSmd", "05_Nested"])
+        )
+        self.studio._folder_tree_scan_budget = None
+
+        # Newly created empty subfolder stays pinned until collapsed.
+        self.studio.createSubfolder(str(vault), "99_PinnedDrafts")
+        self.assertTrue(_wait_until(lambda: "99_PinnedDrafts" in [e["name"] for e in self.studio.files]))
+        self.studio.toggleDirectory(str(vault / "99_PinnedDrafts"))
+        self.assertTrue(_wait_until(lambda: "99_PinnedDrafts" not in [e["name"] for e in self.studio.files]))
+
+        # Closing folder releases folder directory watches; native picker signal stays intact.
+        self.studio.closeFolder()
+        self.assertNotIn(
+            folder_ops.canonical_path_str(vault),
+            {folder_ops.canonical_path_str(d) for d in self.studio.note_watcher.directories()},
+        )
+        picker_requests: list[int] = []
+        self.studio.folderPickerRequested.connect(lambda: picker_requests.append(1))
+        with patch.object(studio_mod.sys, "platform", "darwin"):
+            self.studio.chooseFolder()
+        self.assertEqual(picker_requests, [1])
+
     def test_subfolder_filter_matches_ancestors_discards_stale_generations_and_restores_tree(self):
         vault = self.root / "course_notes"
         (vault / "Physics" / "Optics").mkdir(parents=True)
@@ -200,8 +260,10 @@ class StudioWorkspaceTest(unittest.TestCase):
     def test_unbound_simplenamespace_proxies_and_local_path_monkeypatch(self):
         dir_a, dir_b = self.root / "win_a", self.root / "win_b"
         (dir_a / "sub").mkdir(parents=True)
+        (dir_a / "empty_sub").mkdir()
         dir_b.mkdir()
         (dir_a / "note_a.md").write_text("# A\n", encoding="utf-8")
+        (dir_a / "sub" / "nested.txt").write_text("Nested\n", encoding="utf-8")
 
         refreshed: list[str] = []
         win_a = SimpleNamespace(folder=folder_ops.canonical_path_str(dir_a), retired=False, _load_tree=lambda: refreshed.append("a"))

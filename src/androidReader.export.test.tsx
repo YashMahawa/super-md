@@ -3,7 +3,7 @@ import { act, type ReactNode } from "react";
 import type { Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
-const { native, prepareMarkdown, preparePdfMock, prepareFmdMock, mediaBytesMock, editorBridge, readerTree } = vi.hoisted(() => {
+const { native, prepareMarkdown, preparePdfMock, prepareFmdMock, mediaBytesMock, editorBridge, previewBridge, readerTree } = vi.hoisted(() => {
   if (typeof document !== "undefined") {
     document.body.innerHTML = '<div id="root"></div>';
   }
@@ -15,6 +15,12 @@ const { native, prepareMarkdown, preparePdfMock, prepareFmdMock, mediaBytesMock,
     mediaBytesMock: vi.fn(),
     editorBridge: {
       onChange: null as ((value: string) => void) | null,
+    },
+    previewBridge: {
+      noteId: undefined as string | undefined,
+      onTrustImageHost: null as ((host: string) => void) | null,
+      onApproveImageUrl: null as ((noteId: string | undefined, url: string) => void) | null,
+      onRemoteImageLoaded: null as ((noteId: string | undefined, url: string, data: string) => void) | null,
     },
     readerTree: {
       element: null as ReactNode,
@@ -59,23 +65,43 @@ vi.mock("./components/Editor", () => ({
 }));
 vi.mock("./components/LiveEditor", () => ({ default: () => <div className="mock-live-editor" /> }));
 vi.mock("./components/MarkdownPreview", () => ({
-  default: ({ markdown, onChange }: { markdown: string; onChange?: (value: string) => void }) => (
-    <div className="mock-preview">
-      {markdown.includes("- [") && (
-        <input
-          type="checkbox"
-          checked={markdown.includes("- [x]")}
-          onChange={(event) =>
-            onChange?.(
-              event.target.checked
-                ? markdown.replace("- [ ]", "- [x]")
-                : markdown.replace("- [x]", "- [ ]"),
-            )
-          }
-        />
-      )}
-    </div>
-  ),
+  default: ({
+    noteId,
+    markdown,
+    onChange,
+    onTrustImageHost,
+    onApproveImageUrl,
+    onRemoteImageLoaded,
+  }: {
+    noteId?: string;
+    markdown: string;
+    onChange?: (value: string) => void;
+    onTrustImageHost?: (host: string) => void;
+    onApproveImageUrl?: (noteId: string | undefined, url: string) => void;
+    onRemoteImageLoaded?: (noteId: string | undefined, url: string, data: string) => void;
+  }) => {
+    previewBridge.noteId = noteId;
+    previewBridge.onTrustImageHost = onTrustImageHost ?? null;
+    previewBridge.onApproveImageUrl = onApproveImageUrl ?? null;
+    previewBridge.onRemoteImageLoaded = onRemoteImageLoaded ?? null;
+    return (
+      <div className="mock-preview">
+        {markdown.includes("- [") && (
+          <input
+            type="checkbox"
+            checked={markdown.includes("- [x]")}
+            onChange={(event) =>
+              onChange?.(
+                event.target.checked
+                  ? markdown.replace("- [ ]", "- [x]")
+                  : markdown.replace("- [x]", "- [ ]"),
+              )
+            }
+          />
+        )}
+      </div>
+    );
+  },
 }));
 vi.mock("./components/MediaTools", () => ({ default: () => null }));
 vi.mock("./components/ImageViewer", () => ({ default: () => null }));
@@ -102,6 +128,10 @@ beforeEach(() => {
   prepareFmdMock.mockReset();
   mediaBytesMock.mockReset();
   editorBridge.onChange = null;
+  previewBridge.noteId = undefined;
+  previewBridge.onTrustImageHost = null;
+  previewBridge.onApproveImageUrl = null;
+  previewBridge.onRemoteImageLoaded = null;
   document.body.innerHTML = "";
   localStorage.clear();
 });
@@ -492,7 +522,11 @@ it("flushes pending editProtocol edits before Portable, PDF, and Markdown export
     releasePatch = null;
     await portablePromise;
   });
-  expect(prepareFmdMock).toHaveBeenCalledWith("# Portable flushed\n", "/vault/Flush.md");
+  expect(prepareFmdMock).toHaveBeenCalledWith(
+    "# Portable flushed\n",
+    "/vault/Flush.md",
+    expect.objectContaining({ trustedImageHosts: [] }),
+  );
   expect(native).toHaveBeenCalledWith(
     "export_fmd_native",
     expect.objectContaining({ id: "tab-flush", originalContent: "# Portable flushed\n", save: true }),
@@ -794,4 +828,196 @@ it("acknowledges android_flush handoffs before supermdLoad without spurious edit
     ),
   );
   expect(host.querySelector(".reader-edit-error")).not.toBeNull();
+});
+
+it("forwards note and host image consent policy to portable in-place save, portable export, and agent smd export without cross-tab leakage", async () => {
+  await mountReader();
+  const png = "data:image/png;base64,aGVsbG8=";
+  prepareFmdMock.mockImplementation(async (markdown: string) => ({ content: markdown, assets: {} }));
+
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-consent-a",
+      content: "![Once](https://once.example/a.png)\n![Host](https://trusted.example/b.png)\n",
+      path: "/vault/ConsentA.smd",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  expect(previewBridge.noteId).toBe("tab-consent-a");
+  await act(async () => {
+    previewBridge.onApproveImageUrl?.(previewBridge.noteId, "https://once.example/a.png");
+    previewBridge.onRemoteImageLoaded?.(previewBridge.noteId, "https://once.example/a.png", png);
+    previewBridge.onTrustImageHost?.("trusted.example");
+  });
+
+  // 1. In-place save (save = true) and portable export (save = false) forward both note and host policy plus cached bytes.
+  for (const saveInPlace of [true, false]) {
+    prepareFmdMock.mockClear();
+    await act(async () => {
+      await (window.supermdPortable!(saveInPlace) as unknown as Promise<void>);
+    });
+    expect(prepareFmdMock).toHaveBeenCalledTimes(1);
+    expect(prepareFmdMock).toHaveBeenLastCalledWith(
+      "![Once](https://once.example/a.png)\n![Host](https://trusted.example/b.png)\n",
+      "/vault/ConsentA.smd",
+      expect.objectContaining({
+        noteId: "tab-consent-a",
+        trustedImageHosts: ["trusted.example"],
+        approvedImageUrls: ["https://once.example/a.png"],
+        loadedImageData: new Map([["https://once.example/a.png", png]]),
+      }),
+    );
+  }
+
+  // 2. Agent smd export forwards the same note/host consent policy.
+  let agentError = "";
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      window.supermdAgentRequest!(
+        { requestId: "req-smd", action: "export_document", format: "smd", filename: "ConsentA.smd" },
+        (_result, error) => {
+          agentError = error;
+          resolve();
+        },
+      );
+    });
+  });
+  expect(agentError).toBe("");
+  expect(prepareFmdMock).toHaveBeenLastCalledWith(
+    "![Once](https://once.example/a.png)\n![Host](https://trusted.example/b.png)\n",
+    "/vault/ConsentA.smd",
+    expect.objectContaining({
+      noteId: "tab-consent-a",
+      trustedImageHosts: ["trusted.example"],
+      approvedImageUrls: ["https://once.example/a.png"],
+      loadedImageData: new Map([["https://once.example/a.png", png]]),
+    }),
+  );
+
+  // 3. Switching to another tab preserves trusted host policy but isolates per-note one-time approvals.
+  prepareFmdMock.mockClear();
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-consent-b",
+      content: "![Once](https://once.example/a.png)\n",
+      path: "/vault/ConsentB.smd",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  await act(async () => {
+    await (window.supermdPortable!(false) as unknown as Promise<void>);
+  });
+  expect(prepareFmdMock).toHaveBeenCalledTimes(1);
+  const [, , tabBPolicy] = prepareFmdMock.mock.calls[0];
+  expect(tabBPolicy).toEqual({
+    noteId: "tab-consent-b",
+    trustedImageHosts: ["trusted.example"],
+    approvedImageUrls: [],
+  });
+
+  // 4. Switching tabs while an approved remote image finishes resolving records consent and bytes on the originating tab, not the newly active tab.
+  prepareFmdMock.mockClear();
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-inflight-origin",
+      content: "![Inflight](https://once.example/inflight.png)\n",
+      path: "/vault/Origin.smd",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  const originId = previewBridge.noteId;
+  expect(originId).toBe("tab-inflight-origin");
+  await act(async () => {
+    previewBridge.onApproveImageUrl?.(originId, "https://once.example/inflight.png");
+  });
+
+  // Switch active note BEFORE the image load callback runs.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-inflight-other",
+      content: "![Inflight](https://once.example/inflight.png)\n",
+      path: "/vault/Other.smd",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  expect(previewBridge.noteId).toBe("tab-inflight-other");
+  await act(async () => {
+    previewBridge.onRemoteImageLoaded?.(originId, "https://once.example/inflight.png", png);
+  });
+
+  // Active tab-inflight-other must NOT receive tab-inflight-origin's consent or loaded bytes.
+  for (const saveInPlace of [true, false]) {
+    prepareFmdMock.mockClear();
+    await act(async () => {
+      await (window.supermdPortable!(saveInPlace) as unknown as Promise<void>);
+    });
+    expect(prepareFmdMock).toHaveBeenCalledTimes(1);
+    expect(prepareFmdMock).toHaveBeenLastCalledWith(
+      "![Inflight](https://once.example/inflight.png)\n",
+      "/vault/Other.smd",
+      {
+        noteId: "tab-inflight-other",
+        trustedImageHosts: ["trusted.example"],
+        approvedImageUrls: [],
+      },
+    );
+  }
+
+  // Returning to tab-inflight-origin preserves both its approval and the bytes resolved after switching away.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "tab-inflight-origin",
+      content: "![Inflight](https://once.example/inflight.png)\n",
+      path: "/vault/Origin.smd",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  for (const saveInPlace of [true, false]) {
+    prepareFmdMock.mockClear();
+    await act(async () => {
+      await (window.supermdPortable!(saveInPlace) as unknown as Promise<void>);
+    });
+    expect(prepareFmdMock).toHaveBeenCalledTimes(1);
+    expect(prepareFmdMock).toHaveBeenLastCalledWith(
+      "![Inflight](https://once.example/inflight.png)\n",
+      "/vault/Origin.smd",
+      {
+        noteId: "tab-inflight-origin",
+        trustedImageHosts: ["trusted.example"],
+        approvedImageUrls: ["https://once.example/inflight.png"],
+        loadedImageData: new Map([["https://once.example/inflight.png", png]]),
+      },
+    );
+  }
 });
