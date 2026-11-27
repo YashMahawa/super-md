@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import unittest
 from pathlib import Path
 
-from frontmatter import (
+_DESKTOP_DIR = Path(__file__).resolve().parent
+if str(_DESKTOP_DIR) not in sys.path:
+    sys.path.insert(0, str(_DESKTOP_DIR))
+
+from frontmatter import (  # noqa: E402
     _parse_frontmatter_entries,
     extract_visible_metadata,
     frontmatter_end,
