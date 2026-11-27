@@ -20,7 +20,7 @@ from PySide6.QtTest import QTest
 
 import folder_ops
 from documents import write_portable
-from external_open import ExternalOpenRouter, StudioApplication
+from external_open import ExternalOpenRouter
 from instance import InstanceBroker
 from studio import ROOT, SAMPLE, Session, Studio
 
@@ -37,6 +37,7 @@ class FakeHostWindow(QObject):
         self._visibility = QWindow.Visibility.Windowed if visible else QWindow.Visibility.Hidden
         self.shown = 0
         self.shown_normal = 0
+        self.shown_maximized = 0
         self.raised = 0
         self.activated = 0
         self.focused = 0
@@ -63,6 +64,11 @@ class FakeHostWindow(QObject):
         self._visible = True
         self._visibility = QWindow.Visibility.Windowed
         self.shown_normal += 1
+
+    def showMaximized(self) -> None:
+        self._visible = True
+        self._visibility = QWindow.Visibility.Maximized
+        self.shown_maximized += 1
 
     def hide(self) -> None:
         self._visible = False
@@ -323,6 +329,65 @@ class ExternalFileOpenRouterUnitTest(unittest.TestCase):
         self.assertIs(routed_again, win)
         self.assertEqual(win.host_window.shown_normal, 1)
 
+        # Hidden tray/background window with deferred reader activation and maximized window state
+        # initializes reader profile, clears _defer_reader_activation, and restores maximized.
+        profile_inits: list[bool] = []
+        self.session.ensure_reader_profile = lambda: profile_inits.append(True)
+        self.session.settings["window"] = {"maximized": True}
+        hidden_max = self._create_window(show_window=False)
+        hidden_max._defer_reader_activation = True
+        woken = self.router.open_requested(None)
+        self.assertIs(woken, hidden_max)
+        self.assertEqual(profile_inits, [True])
+        self.assertFalse(hidden_max._defer_reader_activation)
+        self.assertEqual(hidden_max.host_window.shown_maximized, 1)
+
+    def test_outer_whitespace_folder_and_note_paths_preserved_without_stripping(self) -> None:
+        win = self._create_window()
+        initial_note = self.session.data / "keep-open.md"
+        initial_note.write_text("# Keep Open", encoding="utf-8")
+        win.openPath(str(initial_note))
+        self._wait_for(lambda: [t["path"] for t in win.tabs] == [str(initial_note.resolve())])
+        preserved_tab_ids = [t["id"] for t in win.tabs]
+
+        folder_name = "Study folder " if os.name != "nt" else " Study folder"
+        decoy_name = "Study folder"
+        study_folder = self.session.data / folder_name
+        decoy_folder = self.session.data / decoy_name
+        study_folder.mkdir()
+        decoy_folder.mkdir()
+        (study_folder / "expected-study.md").write_text("# Expected Study", encoding="utf-8")
+        (decoy_folder / "wrong-decoy.md").write_text("# Decoy", encoding="utf-8")
+
+        self.assertFalse(folder_ops.same_path(study_folder, decoy_folder))
+        folder_signals: list[bool] = []
+        win.workspaceFolderDropped.connect(lambda: folder_signals.append(True))
+
+        routed_folder_win = self.router.open_requested(str(study_folder))
+        self.assertIs(routed_folder_win, win)
+        self._wait_for(lambda: [entry["name"] for entry in win.files] == ["expected-study.md"])
+        self.assertEqual(win.folder, str(study_folder.resolve()))
+        self.assertTrue(win.folder.endswith(" ") if os.name != "nt" else win.folder.endswith(" Study folder"))
+        self.assertEqual(win.defaultSaveFolder().toLocalFile(), str(study_folder.resolve()))
+        self.assertEqual([t["id"] for t in win.tabs], preserved_tab_ids)
+        self.assertEqual(folder_signals, [True])
+
+        note_name = " Study note .md " if os.name != "nt" else " Study note.md"
+        outer_ws_note = study_folder / note_name
+        outer_ws_note.write_text("# Outer Whitespace Note", encoding="utf-8")
+        routed_note_win = self.router.open_requested(str(outer_ws_note))
+        self.assertIs(routed_note_win, win)
+        self._wait_for(lambda: any(t["path"] == str(outer_ws_note.resolve()) for t in win.tabs))
+        self.assertEqual(win._current()["name"], note_name)
+        self.assertEqual(win._current()["path"], str(outer_ws_note.resolve()))
+
+        # Requesting the same outer-whitespace note again reuses its existing tab.
+        win.selectTab(preserved_tab_ids[0])
+        reused_win = self.router.open_requested(str(outer_ws_note))
+        self.assertIs(reused_win, win)
+        self.assertEqual(len(win.tabs), 2)
+        self.assertEqual(win._current()["path"], str(outer_ws_note.resolve()))
+
 
 def _forward_via_broker_client(app_name: str, target: str) -> None:
     QStandardPaths.setTestModeEnabled(True)
@@ -337,6 +402,7 @@ def _forward_via_broker_client(app_name: str, target: str) -> None:
 
 def _external_route_e2e_probe() -> None:
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
+    from main import StudioApplication
     from reader_assets import register_reader_schemes
 
     QStandardPaths.setTestModeEnabled(True)
@@ -564,6 +630,57 @@ def _external_route_e2e_probe() -> None:
             )
             win1.host_window.setProperty("settingsOpen", False)
             app.processEvents()
+
+            # 8. Real QFileOpenEvent and real InstanceBroker IPC with valid outer-whitespace
+            #    folder ('Study folder ' on POSIX / ' Study folder' on Windows) and note paths:
+            #    preserves exact path bytes without stripping or colliding with 'Study folder'.
+            app.sendEvent(win1.host_window, QEvent(QEvent.Type.WindowActivate))
+            win1.host_window.setProperty("sidebar", False)
+            win1_tabs_before_ws_folder = [t["id"] for t in win1.tabs]
+            ws_folder_name = "Study folder " if os.name != "nt" else " Study folder"
+            ws_folder = tmp_path / ws_folder_name
+            ws_decoy = tmp_path / "Study folder"
+            ws_folder.mkdir()
+            ws_decoy.mkdir()
+            (ws_folder / "outer-space-chapter.md").write_text("# Outer Space Chapter", encoding="utf-8")
+            (ws_decoy / "wrong-decoy.md").write_text("# Wrong Decoy", encoding="utf-8")
+
+            app.sendEvent(app, QFileOpenEvent(str(ws_folder)))
+            pump_until(
+                lambda: win1.folder == str(ws_folder.resolve())
+                and [entry["name"] for entry in win1.files] == ["outer-space-chapter.md"],
+                desc="QFileOpenEvent folder with outer whitespace ('Study folder ')",
+            )
+            if [t["id"] for t in win1.tabs] != win1_tabs_before_ws_folder:
+                raise AssertionError(f"Opening outer-whitespace folder altered win1 tabs: {win1.tabs}")
+            if not bool(win1.host_window.property("sidebar")) or win1.host_window.property("sidebarSection") != "folder":
+                raise AssertionError("Outer-whitespace folder did not reveal folder sidebar")
+
+            ws_note_name = " Broker study note .md " if os.name != "nt" else " Broker study note.md"
+            ws_note = ws_folder / ws_note_name
+            ws_note.write_text("# Outer Whitespace Broker Note", encoding="utf-8")
+            send_broker_open(str(ws_note))
+            pump_until(
+                lambda: win1._current()["path"] == str(ws_note.resolve())
+                and win1._current()["name"] == ws_note_name,
+                desc="InstanceBroker note with outer whitespace",
+            )
+            win1_tab_count = len(win1.tabs)
+
+            # Re-open the same outer-whitespace note via QFileOpenEvent while win3 is active:
+            # reuses win1's existing tab without creating a duplicate tab or extra window!
+            win1.selectTab(win1_tabs_before_ws_folder[0])
+            app.sendEvent(win3.host_window, QEvent(QEvent.Type.WindowActivate))
+            app.sendEvent(app, QFileOpenEvent(str(ws_note)))
+            pump_until(
+                lambda: win1._current()["path"] == str(ws_note.resolve()),
+                desc="QFileOpenEvent reuse of outer-whitespace note tab",
+            )
+            if len(win1.tabs) != win1_tab_count or len(studios) != 3:
+                raise AssertionError(
+                    f"Expected outer-whitespace note tab reuse in win1 without new window: "
+                    f"tabs={len(win1.tabs)}, windows={len(studios)}"
+                )
 
             screenshot_out = os.environ.get("SUPERMD_EXT_OPEN_SCREENSHOT", "").strip()
             if screenshot_out:

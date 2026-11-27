@@ -1,29 +1,13 @@
 """Desktop external file-open routing across Qt FileOpen events and single-instance IPC."""
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, Signal
+from PySide6.QtCore import QEvent, QObject
 from PySide6.QtGui import QGuiApplication, QWindow
-from PySide6.QtWidgets import QApplication
 
 try:
     from .studio import local_path
 except ImportError:
     from studio import local_path
-
-
-class StudioApplication(QApplication):
-    openRequested = Signal(str)
-
-    def event(self, event):
-        # Native macOS open events target the application. Do not install a
-        # Python global event filter over Qt Quick/WebEngine's internal objects:
-        # PySide's wrapper creation can itself send events and recurse.
-        if event.type() == QEvent.Type.FileOpen:
-            path = event.file() or (event.url().toLocalFile() if event.url().isLocalFile() else "")
-            if path:
-                self.openRequested.emit(path)
-                return True
-        return super().event(event)
 
 
 class _WindowActivationTracker(QObject):
@@ -37,12 +21,21 @@ class _WindowActivationTracker(QObject):
         window.installEventFilter(self)
         if hasattr(window, "activeChanged"):
             window.activeChanged.connect(self._on_active_changed)
+        if hasattr(window, "visibleChanged"):
+            window.visibleChanged.connect(self._on_visible_changed)
 
     def _on_active_changed(self, *_) -> None:
         if getattr(self._studio, "retired", False):
             return
         is_active = self.window.isActive() if hasattr(self.window, "isActive") else False
         if is_active:
+            self._router.mark_active(self._studio)
+
+    def _on_visible_changed(self, *_) -> None:
+        if getattr(self._studio, "retired", False):
+            return
+        is_visible = self.window.isVisible() if hasattr(self.window, "isVisible") else False
+        if is_visible:
             self._router.mark_active(self._studio)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
@@ -176,10 +169,30 @@ class ExternalOpenRouter:
         if window is not None:
             visibility = window.visibility() if hasattr(window, "visibility") else None
             is_visible = window.isVisible() if hasattr(window, "isVisible") else True
-            if visibility == QWindow.Visibility.Minimized and hasattr(window, "showNormal"):
-                window.showNormal()
-            elif not is_visible and hasattr(window, "show"):
-                window.show()
+            if not is_visible:
+                ensure_profile = getattr(studio, "ensureReaderProfile", None)
+                if callable(ensure_profile):
+                    ensure_profile()
+                else:
+                    if getattr(studio, "_defer_reader_activation", False):
+                        studio._defer_reader_activation = False
+                    session_ensure = getattr(getattr(studio, "session", None), "ensure_reader_profile", None)
+                    if callable(session_ensure):
+                        session_ensure()
+            session = getattr(studio, "session", None)
+            settings = getattr(session, "settings", None)
+            remembered = settings.get("window") if isinstance(settings, dict) else None
+            wants_maximized = isinstance(remembered, dict) and bool(remembered.get("maximized"))
+            if visibility == QWindow.Visibility.Minimized:
+                if wants_maximized and hasattr(window, "showMaximized"):
+                    window.showMaximized()
+                elif hasattr(window, "showNormal"):
+                    window.showNormal()
+            elif not is_visible:
+                if wants_maximized and hasattr(window, "showMaximized"):
+                    window.showMaximized()
+                elif hasattr(window, "show"):
+                    window.show()
             if hasattr(window, "raise_"):
                 window.raise_()
             if hasattr(window, "requestActivate"):
@@ -187,7 +200,7 @@ class ExternalOpenRouter:
         self.mark_active(studio)
 
     def open_requested(self, note: str | None = None):
-        raw = str(note).strip() if note is not None else ""
+        raw = note if isinstance(note, str) else (str(note) if note is not None else "")
         ordered = self._ordered_live_studios()
         if not raw:
             hidden = next(
