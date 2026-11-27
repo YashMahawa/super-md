@@ -2,12 +2,17 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
-import atomic_io
-import documents
+if __package__:
+    from . import atomic_io, documents
+else:
+    import atomic_io
+    import documents
 
 
 class AtomicIoTest(unittest.TestCase):
@@ -19,6 +24,31 @@ class AtomicIoTest(unittest.TestCase):
         self.assertIs(documents._write_json_str, atomic_io._write_json_str)
         self.assertIs(documents._write_json_value, atomic_io._write_json_value)
         self.assertIs(documents.os, atomic_io.os)
+
+    def test_repo_root_package_imports_resolve_cleanly_in_clean_subprocess(self):
+        env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONSAFEPATH", "PYTHONSTARTUP"}}
+        repo_root = Path(__file__).resolve().parent.parent
+        for probe in (
+            "from desktop import atomic_io, documents\n"
+            "from desktop.core import closed_notes\n"
+            "assert documents.atomic_json is atomic_io.atomic_json\n"
+            "assert documents.atomic_write is atomic_io.atomic_write\n"
+            "assert documents.atomic_output_file is atomic_io.atomic_output_file\n"
+            "assert closed_notes.atomic_json is atomic_io.atomic_json\n",
+            "from desktop.core import closed_notes\n"
+            "from desktop import atomic_io, documents\n"
+            "assert documents.atomic_json is atomic_io.atomic_json\n"
+            "assert closed_notes.atomic_json is atomic_io.atomic_json\n",
+        ):
+            proc = subprocess.run(
+                [sys.executable, "-E", "-c", probe],
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + "\n" + proc.stderr)
 
     def test_mid_write_failures_preserve_target_and_remove_temp_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -48,7 +78,7 @@ class AtomicIoTest(unittest.TestCase):
 
             write_target = root / "note.md"
             write_target.write_bytes(b"keep-markdown")
-            with patch("documents.os.replace", side_effect=OSError("disk full")):
+            with patch(f"{documents.__name__}.os.replace", side_effect=OSError("disk full")):
                 with self.assertRaises(OSError):
                     documents.atomic_write(write_target, b"discarded")
             self.assertEqual(write_target.read_bytes(), b"keep-markdown")
@@ -63,7 +93,7 @@ class AtomicIoTest(unittest.TestCase):
 
             smd_target = root / "note.smd"
             smd_target.write_bytes(b"keep-portable")
-            with patch("documents.MAX_FILE", 32):
+            with patch(f"{documents.__name__}.MAX_FILE", 32):
                 with self.assertRaises(ValueError):
                     documents.write_portable(smd_target, "# Exceeds 32-byte compressed limit\n", {})
             self.assertEqual(smd_target.read_bytes(), b"keep-portable")
@@ -128,7 +158,7 @@ class AtomicIoTest(unittest.TestCase):
                 attempts = 0
                 sleeps.clear()
                 with patch.object(documents.os, "name", "nt"), \
-                     patch("documents.os.replace", side_effect=transient_lock), \
+                     patch(f"{documents.__name__}.os.replace", side_effect=transient_lock), \
                      patch("time.sleep", side_effect=sleeps.append):
                     documents.atomic_json(target, {"winerror": winerr})
                 self.assertEqual((attempts, sleeps), (3, [0.005, 0.01]))
@@ -138,7 +168,7 @@ class AtomicIoTest(unittest.TestCase):
             fatal_target.write_bytes(b"untouched")
             fatal = PermissionError("non-sharing permission error")
             fatal.winerror = 13
-            for replace_ctx in (patch.object(documents.os, "replace", side_effect=fatal), patch("documents.os.replace", side_effect=fatal)):
+            for replace_ctx in (patch.object(documents.os, "replace", side_effect=fatal), patch(f"{documents.__name__}.os.replace", side_effect=fatal)):
                 with patch.object(documents.os, "name", "nt"), replace_ctx, patch("time.sleep") as sleep_spy:
                     with self.assertRaises(PermissionError):
                         documents.atomic_write(fatal_target, b"blocked")

@@ -10,10 +10,16 @@ import stat
 import threading
 import zlib
 from pathlib import Path
-from atomic_io import (
-    _replace_with_windows_sharing_retry, _write_json_str, _write_json_value,
-    atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate,
-)
+if __package__:
+    from .atomic_io import (
+        _replace_with_windows_sharing_retry, _write_json_str, _write_json_value,
+        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate,
+    )
+else:
+    from atomic_io import (
+        _replace_with_windows_sharing_retry, _write_json_str, _write_json_value,
+        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate,
+    )
 
 MIMES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "svg": "image/svg+xml", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 MAX_FILE = 120_000_000
@@ -231,9 +237,7 @@ def _validated_image_meta(data: str) -> tuple[str, int]:
 def _is_cached_validated_asset(data: str) -> bool:
     return _lookup_validated_asset(data) is not None
 
-
 set_trusted_ascii_predicate(_is_cached_validated_asset)
-
 
 def image_data(data: str) -> tuple[str, bytes]:
     mime, encoded_start, _ = _parse_image_header(data)
@@ -425,40 +429,23 @@ def compressed_bundle(
         raise ValueError("Compressed SMD exceeds 120 MB")
     return data
 
-def write_portable(
-    path: Path,
-    markdown: str,
-    assets: dict[str, str],
-    *,
-    validated_assets: dict[str, str] | None = None,
-) -> None:
+def write_portable(path: Path, markdown: str, assets: dict[str, str], *, validated_assets: dict[str, str] | None = None) -> None:
     """Atomically save the unchanged v1 JSON envelope in deterministic gzip."""
-    value = bundle(markdown, assets, validated_assets=validated_assets)
-    hasher = hashlib.sha256()
+    value, hasher = bundle(markdown, assets, validated_assets=validated_assets), hashlib.sha256()
     with atomic_output_file(path, buffering=_B64_DECODE_CHUNK) as raw:
         class _HashingWriter:
             def write(self, data: bytes) -> int:
                 hasher.update(data)
                 return raw.write(data)
-
-            def flush(self) -> None:
-                raw.flush()
-
+            def flush(self) -> None: raw.flush()
         _write_gzip_json(_HashingWriter(), value, _trusted_ascii_assets=True)
         if raw.tell() > MAX_FILE:
             raise ValueError("Compressed SMD exceeds 120 MB")
     try:
         st = path.stat()
-        _cache_portable_file(
-            (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns),
-            hasher.hexdigest(),
-            markdown,
-            assets,
-            assets_decoded=True,
-        )
+        _cache_portable_file((st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns), hasher.hexdigest(), markdown, assets, assets_decoded=True)
     except OSError:
         pass
-
 
 def open_note(path: Path, *, decode_assets: bool = True) -> tuple[str, dict[str, str], bool]:
     before = path.stat()
