@@ -11,7 +11,7 @@ export type HighlightRegistry = Map<string, unknown>;
 export type SourceRange = { from: number; to: number };
 
 const MAX_SEARCH_MATCHES = 5000, MAX_HIDDEN_SCAN_CHARS = 200_000;
-const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
+const INLINE_HTML_TAG_TOKEN = /<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/yi;
 const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
 const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|is-offstage)(?:\s|$)/;
 const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
@@ -24,7 +24,6 @@ const readingMatchesCache = new WeakMap<Element, { root: Element; version: numbe
 const sourceHighlightCache = new WeakMap<Element, { root: Element; version: number; connected: boolean; content: string; ranges: SourceRange[]; activeIndex: number; key: string; range: Range | null }>();
 const highlightSyncCache = new WeakMap<HighlightRegistry, { allRef?: Range[]; allSnaps?: RangeLike[]; current?: RangeLike | null }>();
 let cachedFmContent: string | null = null, cachedFmResult: ParsedFrontmatter | null = null;
-
 function getParsedFrontmatter(content: string): ParsedFrontmatter | null {
   if (cachedFmContent !== content) { cachedFmContent = content; cachedFmResult = parseFrontmatter(content, { includeSpans: true }); }
   return cachedFmResult;
@@ -32,7 +31,6 @@ function getParsedFrontmatter(content: string): ParsedFrontmatter | null {
 const isFrontmatterPropertiesContainer = (el: Element): boolean => el.hasAttribute("data-frontmatter-properties") || el.classList.contains("document-properties");
 const isAllowedFrontmatterField = (el: Element): el is HTMLElement => ["title", "author", "tag"].includes(el.getAttribute("data-frontmatter-field") ?? "");
 export const rangeStartElement = (r: Range | null): Element | null => r ? (r.startContainer.nodeType === Node.ELEMENT_NODE ? r.startContainer as Element : r.startContainer.parentElement) : null;
-
 function hasRelevantSearchMutation(records: MutationRecord[]): boolean {
   return records.some(r => {
     if (r.type !== "attributes" || r.attributeName !== "style") return true;
@@ -40,7 +38,6 @@ function hasRelevantSearchMutation(records: MutationRecord[]): boolean {
     return Boolean(s && (s.display === "none" || s.visibility === "hidden")) || Boolean(r.oldValue && /(?:none|hidden)/i.test(r.oldValue));
   });
 }
-
 export function getSearchDomVersion(el: Element): { root: Element; version: number } {
   const root = el.closest(".android-reading,.reading-scroll") ?? el.closest(".live-document,.markdown-body") ?? el;
   let entry = domVersions.get(root);
@@ -56,7 +53,6 @@ export function getSearchDomVersion(el: Element): { root: Element; version: numb
   }
   return { root, version: entry.version };
 }
-
 function searchOptionKey(query: string, options: SearchMatchConfig): string {
   const { caseSensitive, wholeWord, regexp } = normalizeSearchOptions(options);
   return `${query}\0${caseSensitive ? 1 : 0}${wholeWord ? 1 : 0}${regexp ? 1 : 0}`;
@@ -70,7 +66,6 @@ export function findMatchingSourceRangeIndex(ranges: SourceRange[], target: Sour
   for (let i = firstSourceRangeFrom(ranges, target.from); i < ranges.length && ranges[i].from === target.from; i++) if (ranges[i].to === target.to) return i;
   return ranges.findIndex(r => r.from === target.from && r.to === target.to);
 }
-
 function isHiddenOrExcludedSearchElement(el: Element): boolean {
   if (EXCLUDED_SEARCH_TAGS.has(el.localName) || !el.hasAttributes()) return EXCLUDED_SEARCH_TAGS.has(el.localName);
   const cls = el.className;
@@ -84,25 +79,20 @@ function isHiddenOrExcludedSearchElement(el: Element): boolean {
   }
   return false;
 }
-
 export const nextSearchIndex = (index: number, direction: number, count: number): number =>
   count <= 0 ? -1 : index < 0 ? (direction < 0 ? count - 1 : 0) : ((index + direction) % count + count) % count;
-
 export function revealMountedBlock(element: Element): void {
   if (!(element instanceof HTMLElement)) return;
   const w = element.closest<HTMLElement>("[data-windowed-block]");
   if (w?.getAttribute("data-windowed-mounted") === "true") return;
-  if (w?.getAttribute("data-windowed-mounted") === "false") flushSync(() => revealWindowed(element));
-  else revealWindowed(element);
+  if (w?.getAttribute("data-windowed-mounted") === "false") flushSync(() => revealWindowed(element)); else revealWindowed(element);
 }
-
 export function scrollTargetIntoView(target: Element | null, host?: Element | null): void {
   if (!target) return;
   const scroller = target.closest<HTMLElement>(".android-reading,.reading-scroll") ?? (host?.matches(".android-reading,.reading-scroll") ? host as HTMLElement : host?.closest<HTMLElement>(".android-reading,.reading-scroll") ?? null);
   if (scroller) refreshDocumentExtent(scroller);
   target.scrollIntoView?.({ block: "center", behavior: "instant" });
 }
-
 function expandRegexReplacement(replacement: string, match: RegExpExecArray, source: string): string {
   return replacement.replace(/\$(?:\$|&|`|'|(\d{1,2})|<([^>]+)>)/g, (token, digits?: string, groupName?: string) => {
     if (token === "$$") return "$";
@@ -118,9 +108,10 @@ function expandRegexReplacement(replacement: string, match: RegExpExecArray, sou
   });
 }
 
-function skipInlineCodeSpan(raw: string, openIndex: number): number {
+function skipInlineCodeSpan(raw: string, openIndex: number, unclosedTicks?: Set<number>): number {
   let ticks = 1;
   while (raw[openIndex + ticks] === "`") ticks++;
+  if (unclosedTicks?.has(ticks)) return openIndex + ticks - 1;
   for (let pos = openIndex + ticks; pos < raw.length; ) {
     const hit = raw.indexOf("`", pos);
     if (hit < 0) break;
@@ -129,55 +120,65 @@ function skipInlineCodeSpan(raw: string, openIndex: number): number {
     if (run === ticks) return hit + run - 1;
     pos = hit + run;
   }
+  unclosedTicks?.add(ticks);
   return openIndex + ticks - 1;
 }
-
-function scanBalancedInlineDelimiter(raw: string, openIndex: number, openChar: string, closeChar: string, allowCodeSpans: boolean): number {
+function scanBalancedInlineDelimiter(raw: string, openIndex: number, openChar: string, closeChar: string, allowCodeSpans: boolean, unclosedTicks?: Set<number>): number {
   if (raw[openIndex] !== openChar) return raw.length;
   for (let i = openIndex, depth = 0; i < raw.length; i++) {
     const ch = raw[i];
     if (ch === "\\") { i++; continue; }
-    if (allowCodeSpans && ch === "`") { i = skipInlineCodeSpan(raw, i); continue; }
+    if (allowCodeSpans && ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
     if (ch === openChar) depth++;
     else if (ch === closeChar && --depth === 0) return i;
   }
   return raw.length;
 }
-
 export const markdownBracketEnd = (raw: string, openIndex = 0): number => scanBalancedInlineDelimiter(raw, openIndex, "[", "]", true);
-
-export function markdownLinkTailEnd(raw: string, afterBracket: number): number {
+export function markdownLinkTailEnd(raw: string, afterBracket: number, unclosedTicks?: Set<number>): number {
   if (raw[afterBracket] === "(") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "(", ")", false); return close < raw.length ? close + 1 : raw.length; }
-  if (raw[afterBracket] === "[") { const close = markdownBracketEnd(raw, afterBracket); return close < raw.length ? close + 1 : raw.length; }
+  if (raw[afterBracket] === "[") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "[", "]", true, unclosedTicks); return close < raw.length ? close + 1 : raw.length; }
   return afterBracket;
 }
-
 export function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
-  const hidden: SourceRange[] = [];
+  if (!raw || raw.length > MAX_HIDDEN_SCAN_CHARS) return [];
+  const rawHidden: SourceRange[] = [], stack: Array<{ openIndex: number; isImage: boolean; slot: number }> = [], unclosedTicks = new Set<number>();
+  let noCommentClose = false;
   for (let i = 0; i < raw.length; i++) {
     const ch = raw[i];
     if (ch === "\\") { i++; continue; }
-    if (ch === "`") { i = skipInlineCodeSpan(raw, i); continue; }
+    if (ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
     if (ch === "<") {
-      INLINE_HTML_HIDDEN_TOKEN.lastIndex = i;
-      const htmlMatch = INLINE_HTML_HIDDEN_TOKEN.exec(raw);
-      if (htmlMatch && htmlMatch.index === i) { const end = i + htmlMatch[0].length; hidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
-    }
-    if (ch === "!" && raw[i + 1] === "[") {
-      const close = markdownBracketEnd(raw, i + 1), end = close < raw.length ? markdownLinkTailEnd(raw, close + 1) : 0;
-      if (end > close + 1) { hidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
-    }
-    if (ch === "[") {
-      const close = markdownBracketEnd(raw, i), end = close < raw.length ? markdownLinkTailEnd(raw, close + 1) : 0;
-      if (end > close + 1) {
-        hidden.push({ from: offset + i, to: offset + i + 1 }, ...hiddenSpansInSlice(raw.slice(i + 1, close), offset + i + 1), { from: offset + close, to: offset + end });
-        i = Math.max(i, end - 1);
+      if (raw.startsWith("<!--", i)) {
+        const close = noCommentClose ? -1 : raw.indexOf("-->", i + 4);
+        if (close >= 0) { rawHidden.push({ from: offset + i, to: offset + close + 3 }); i = close + 2; continue; }
+        noCommentClose = true;
+      } else {
+        INLINE_HTML_TAG_TOKEN.lastIndex = i;
+        const tagMatch = INLINE_HTML_TAG_TOKEN.exec(raw);
+        if (tagMatch) { const end = i + tagMatch[0].length; rawHidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
+      }
+    } else if (ch === "!" && raw[i + 1] === "[") {
+      stack.push({ openIndex: i, isImage: true, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i }); i++;
+    } else if (ch === "[") {
+      stack.push({ openIndex: i, isImage: false, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i });
+    } else if (ch === "]" && stack.length) {
+      const frame = stack.pop()!, end = markdownLinkTailEnd(raw, i + 1, unclosedTicks);
+      if (end > i + 1) {
+        if (frame.isImage) { rawHidden.length = frame.slot; rawHidden.push({ from: offset + frame.openIndex, to: offset + end }); }
+        else { rawHidden[frame.slot].to = offset + frame.openIndex + 1; rawHidden.push({ from: offset + i, to: offset + end }); }
+        i = end - 1;
       }
     }
   }
+  const hidden: SourceRange[] = [];
+  for (const span of rawHidden) {
+    if (span.to <= span.from) continue;
+    const prev = hidden[hidden.length - 1];
+    if (prev && prev.to >= span.from) prev.to = Math.max(prev.to, span.to); else hidden.push(span);
+  }
   return hidden;
 }
-
 function sourceBounds(el: Element, content?: string): { start: number; end: number } | null {
   if (!(el instanceof HTMLElement) || el.tagName === "TEXTAREA") return null;
   const attrStart = el.getAttribute("data-source-start"), attrEnd = el.getAttribute("data-source-end");
@@ -209,7 +210,6 @@ function sourceBounds(el: Element, content?: string): { start: number; end: numb
   }
   return null;
 }
-
 export function openDisclosuresFor(target: Element | null, scope?: Element | null, range?: Range | null, sourceRange?: SourceRange): boolean {
   let opened = false;
   for (const anchor of [rangeStartElement(range ?? null), target, scope]) {
@@ -229,7 +229,6 @@ export function openDisclosuresFor(target: Element | null, scope?: Element | nul
   }
   return opened;
 }
-
 function visibleSourceSpan(owner: HTMLElement, content: string): { start: number; end: number } | null {
   const bounds = sourceBounds(owner, content);
   if (!bounds) return null;
@@ -276,9 +275,14 @@ const ownerHiddenSpans = (owner: HTMLElement, content: string, visible: { start:
   !owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= MAX_HIDDEN_SCAN_CHARS
     ? hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start) : [];
 
+function isCoveredByHiddenSpan(hidden: SourceRange[], candidate: SourceRange): boolean {
+  const idx = firstSourceRangeFrom(hidden, candidate.from);
+  return (idx < hidden.length && hidden[idx].from === candidate.from && candidate.to <= hidden[idx].to) || (idx > 0 && candidate.to <= hidden[idx - 1].to);
+}
+
 function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, visible = visibleSourceSpan(owner, content), hidden?: SourceRange[]): boolean {
   if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
-  return deepestSourceOwner(owner, candidate, content) === owner && !(hidden ?? ownerHiddenSpans(owner, content, visible)).some(h => candidate.from >= h.from && candidate.to <= h.to);
+  return deepestSourceOwner(owner, candidate, content) === owner && !isCoveredByHiddenSpan(hidden ?? ownerHiddenSpans(owner, content, visible), candidate);
 }
 
 function directOwnerDomRanges(owner: HTMLElement, query: string, options: SearchMatchConfig): Range[] {
@@ -417,24 +421,20 @@ function collectSearchText(root: Element, initialBlock: Element | null, state: {
         const value = (child as Text).data;
         if (!value) continue;
         if (state.block !== currentBlock) { state.text += "\n"; state.block = currentBlock; }
-        const start = state.text.length;
-        state.parts.push({ node: child as Text, start, end: start + value.length }); state.text += value;
+        state.parts.push({ node: child as Text, start: state.text.length, end: state.text.length + value.length }); state.text += value;
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         const childEl = child as Element;
         if (isHiddenOrExcludedSearchElement(childEl)) continue;
-        if (isFrontmatterPropertiesContainer(childEl)) { walkFrontmatterFields(childEl); continue; }
-        walk(childEl, isAllowedFrontmatterField(childEl) || SEARCH_BLOCK_TAGS.has(childEl.localName) ? childEl : currentBlock);
+        if (isFrontmatterPropertiesContainer(childEl)) walkFrontmatterFields(childEl);
+        else walk(childEl, isAllowedFrontmatterField(childEl) || SEARCH_BLOCK_TAGS.has(childEl.localName) ? childEl : currentBlock);
       }
     }
   };
-  if (isFrontmatterPropertiesContainer(root)) walkFrontmatterFields(root);
-  else walk(root, initialBlock);
+  if (isFrontmatterPropertiesContainer(root)) walkFrontmatterFields(root); else walk(root, initialBlock);
 }
-
 function matchPartsToRanges(parts: Array<{ node: Text; start: number; end: number }>, text: string, pattern: RegExp): Range[] {
   if (!parts.length) return [];
-  // Case folding can expand Unicode characters and invalidate DOM offsets.
-  // Regex matches retain the original UTF-16 positions instead.
+  // Case folding can expand Unicode characters and invalidate DOM offsets; regex matches retain UTF-16 positions.
   const ranges: Range[] = [];
   let match: RegExpExecArray | null, firstIndex = 0, lastIndex = 0;
   while ((match = nextSearchMatch(pattern, text)) && ranges.length < MAX_SEARCH_MATCHES) {
@@ -451,7 +451,6 @@ function matchPartsToRanges(parts: Array<{ node: Text; start: number; end: numbe
   }
   return ranges;
 }
-
 export function readingMatches(host: Element, query: string, options: SearchMatchConfig = false): Range[] {
   const { pattern } = compileSearchPattern(query, options, false);
   if (!pattern) return [];
@@ -503,10 +502,9 @@ function visibleBlockSourceIndices(block: HTMLElement, content: string, sourceRa
 }
 
 export function insertDomRangeInOrder(ranges: Range[], target: Range): { ranges: Range[]; index: number } {
-  let index = ranges.findIndex(m => sameDomRange(m, target));
-  if (index >= 0) return { ranges, index };
-  const augmented = [...ranges], pos = augmented.findIndex(m => m.compareBoundaryPoints(Range.START_TO_START, target) > 0);
-  index = pos < 0 ? augmented.length : pos;
+  const existing = ranges.findIndex(m => sameDomRange(m, target));
+  if (existing >= 0) return { ranges, index: existing };
+  const augmented = [...ranges], pos = augmented.findIndex(m => m.compareBoundaryPoints(Range.START_TO_START, target) > 0), index = pos < 0 ? augmented.length : pos;
   augmented.splice(index, 0, target);
   return { ranges: augmented, index };
 }
@@ -520,7 +518,6 @@ function findWindowedDomMatch(liveWindowed: WindowedMatch[], domRange: Range, qu
   }
   return -1;
 }
-
 export function translateSourceIndexToRendered(host: Element | null, content: string, sourceRanges: SourceRange[], sourceIdx: number, query: string, options: SearchMatchConfig = false, knownWindowed?: WindowedMatch[] | null, knownMatches?: Range[]): number {
   const sr = sourceIdx >= 0 && host ? sourceRanges[sourceIdx] : undefined;
   if (!sr || !host) return -1;

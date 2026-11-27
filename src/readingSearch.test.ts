@@ -1113,5 +1113,71 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
     clean1();
     act(()=>root.unmount());
   });
+
+  it("bounds hiddenSpansInSlice non-recursively across deeply nested bracket/link markup while preserving exact UTF-16 offsets and escape-only URL tails",()=>{
+    // 1. 2,500-deep nested links (~95 KB, well within 200 KB block limit) with astral UTF-16 surrogates (`📓`),
+    //    inner `<mark>`, HTML comment, inline code, and escape-only URL tails containing unmatched backticks and escaped `\)`.
+    //    Recursive `.slice()` + `...` spread would overflow the call stack or degrade quadratically; stack traversal stays linear & merges adjacent spans.
+    const depth=2500;
+    const prefix="📓 Intro ";
+    const core="See <!-- hidden Straße --><mark>Straße</mark> and `[keep](https://visible.example/Straße)`";
+    const tailUnit="](https://example.com/Straße`v1\\)ok)";
+    const deepNested=prefix+"[".repeat(depth)+core+tailUnit.repeat(depth)+" 💡 omega";
+    const baseOffset=42;
+    const hidden=hiddenSpansInSlice(deepNested,baseOffset);
+    const isHidden=(from:number,to:number)=>hidden.some(h=>from>=h.from&&to<=h.to);
+
+    // Adjacent `[` openings merge into 1 span, comment+`<mark>` merge into 1 span, `</mark>` stays 1 span, and all 2,500 `](...)` tails merge into 1 span = 4 disjoint sorted spans!
+    expect(hidden).toHaveLength(4);
+    for(let i=1;i<hidden.length;i++) expect(hidden[i-1].to).toBeLessThan(hidden[i].from);
+
+    // Exact UTF-16 offsets: `📓` occupies 2 UTF-16 code units, so opening `[` run spans `[prefix.length, prefix.length + depth)`.
+    expect(hidden[0]).toEqual({from:baseOffset+prefix.length,to:baseOffset+prefix.length+depth});
+    const visibleStrasseFrom=deepNested.indexOf("<mark>Straße</mark>")+"<mark>".length;
+    const codeStrasseFrom=deepNested.indexOf("visible.example/Straße")+"visible.example/".length;
+    const firstTailStrasseFrom=deepNested.indexOf("https://example.com/Straße")+"https://example.com/".length;
+    const lastTailStrasseFrom=deepNested.lastIndexOf("Straße");
+    const omegaFrom=deepNested.lastIndexOf("omega");
+    expect(deepNested.slice(visibleStrasseFrom,visibleStrasseFrom+6)).toBe("Straße");
+    expect(deepNested.slice(codeStrasseFrom,codeStrasseFrom+6)).toBe("Straße");
+    expect(deepNested.slice(firstTailStrasseFrom,firstTailStrasseFrom+6)).toBe("Straße");
+    expect(deepNested.slice(lastTailStrasseFrom,lastTailStrasseFrom+6)).toBe("Straße");
+    expect(isHidden(baseOffset+visibleStrasseFrom,baseOffset+visibleStrasseFrom+6)).toBe(false);
+    expect(isHidden(baseOffset+codeStrasseFrom,baseOffset+codeStrasseFrom+6)).toBe(false);
+    expect(isHidden(baseOffset+firstTailStrasseFrom,baseOffset+firstTailStrasseFrom+6)).toBe(true);
+    expect(isHidden(baseOffset+lastTailStrasseFrom,baseOffset+lastTailStrasseFrom+6)).toBe(true);
+    expect(isHidden(baseOffset+omegaFrom,baseOffset+omegaFrom+5)).toBe(false);
+
+    // 2. Pathological 25,000 unclosed `[` brackets + badge image-in-link `[![alt](img)](dest)` + unclosed outer `[` before `![alt](img)` + >200 KB guard.
+    const unclosedLead="📓 "+"[".repeat(25_000)+"[Visible Straße](https://example.com/Straße`tail) [![Badge Straße](https://img.example/Straße`1.png)](https://dest.example/Straße`2) [unclosed ![Img Straße](https://img.example/Straße`3.png)";
+    const unclosedHidden=hiddenSpansInSlice(unclosedLead,10);
+    const isUnclosedHidden=(from:number,to:number)=>unclosedHidden.some(h=>from>=h.from&&to<=h.to);
+    const unclosedHits=sourceMatches(unclosedLead,"Straße",true);
+    // 0: Visible Straße (visible)
+    // 1: first link escape-only backtick URL (hidden)
+    // 2: badge image alt (hidden)
+    // 3: badge image URL (hidden)
+    // 4: badge outer link URL (hidden)
+    // 5: trailing image alt after unclosed `[` (hidden)
+    // 6: trailing image URL after unclosed `[` (hidden)
+    expect(unclosedHits).toHaveLength(7);
+    expect(unclosedHits.map(r=>isUnclosedHidden(r.from+10,r.to+10))).toEqual([false,true,true,true,true,true,true]);
+    expect(isUnclosedHidden(10+2,10+2+25_000)).toBe(false);
+    expect(hiddenSpansInSlice("[x](https://example.com)".repeat(9000),0)).toEqual([]);
+
+    // 3. End-to-end `resolveSourceHighlightRange` on a rendered block containing deeply nested links, astral UTF-16 offsets, and escape-only URL tails.
+    const blockNested="📓 "+"[".repeat(400)+"Lead <mark>Straße</mark>"+"](https://example.com/Straße`x\\)y)".repeat(400)+" after";
+    const host=document.createElement("div");
+    host.className="markdown-body";
+    host.innerHTML=`<p data-source-start="0" data-source-end="${blockNested.length}">📓 <a href="https://example.com/Straße%60x)y">Lead <mark>Straße</mark></a> after</p>`;
+    document.body.append(host);
+    const nestedMatches=sourceMatches(blockNested,"straße",false);
+    expect(nestedMatches).toHaveLength(401);
+    expect(isValidSeedOccurrence(blockNested,nestedMatches[0],"strasse",false,"Straße")).toBe(true);
+    expect(resolveSourceHighlightRange(host,blockNested,nestedMatches,0,"straße",false)?.toString()).toBe("Straße");
+    expect(resolveSourceHighlightRange(host,blockNested,nestedMatches,1,"straße",false)).toBeNull();
+    expect(resolveSourceHighlightRange(host,blockNested,nestedMatches,400,"straße",false)).toBeNull();
+    host.remove();
+  });
 });
 
