@@ -94,9 +94,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     pendingSeedRange.current = extractSeedRange(seed);
     pendingSeedMatchText.current = extractSeedMatchText(seed);
     setHiddenSourceHit(false);
-    hiddenSourceAnchorRef.current = null;
-    pendingReplaceIndex.current = null;
-    customCurrentRangeRef.current = null;
+    hiddenSourceAnchorRef.current = null; pendingReplaceIndex.current = null; customCurrentRangeRef.current = null;
     if (index !== -1) updateIndex(-1);
     setQuery(seed.query.slice(0, 200));
     if (seed.caseSensitive !== undefined) setCaseSensitive(Boolean(seed.caseSensitive));
@@ -424,22 +422,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const moveRef = useRef(move); moveRef.current = move;
 
   const effectiveIndex = pendingReplaceIndex.current !== null ? pendingReplaceIndex.current : index;
-  const criteriaSynced =
-    prevState.current.query === query &&
-    prevState.current.caseSensitive === caseSensitive &&
-    prevState.current.wholeWord === wholeWord &&
-    prevState.current.regexp === regexp &&
-    (prevState.current.content === content || pendingReplaceIndex.current !== null);
+  const criteriaSynced = prevState.current.query === query && prevState.current.caseSensitive === caseSensitive
+    && prevState.current.wholeWord === wholeWord && prevState.current.regexp === regexp
+    && (prevState.current.content === content || pendingReplaceIndex.current !== null);
   const activeReplaceRanges = activeReplacing && criteriaSynced && query && !regexError
-    ? (prevState.current.content === content && sourceRanges.length ? sourceRanges : getSourceRanges())
-    : [];
-  const canSingleReplace = Boolean(
-    activeReplacing &&
-    onChange &&
-    effectiveIndex >= 0 &&
-    effectiveIndex < activeReplaceRanges.length &&
-    activeReplaceRanges[effectiveIndex]
-  );
+    ? (prevState.current.content === content && sourceRanges.length ? sourceRanges : getSourceRanges()) : [];
+  const canSingleReplace = Boolean(activeReplacing && onChange && effectiveIndex >= 0 && effectiveIndex < activeReplaceRanges.length && activeReplaceRanges[effectiveIndex]);
 
   const handleSingleReplace = () => {
     if (!canSingleReplace || !onChange) return;
