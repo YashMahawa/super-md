@@ -289,9 +289,17 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             self.studio.createFolderNote(str(self.open_root), "Patched Note", "md")
             self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "Patched Note.md").is_file())
             self.studio.createSubfolder(str(self.open_root), "Subfolder")
-            self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "Subfolder").is_dir())
+            self._wait_for(
+                lambda: self.studio.busy == 0
+                and (self.open_root / "Subfolder").is_dir()
+                and any(item["name"] == "Subfolder" for item in self.studio.files)
+            )
             self.studio.renameEntry(str(self.open_root / "Subfolder"), "RenamedSub")
-            self._wait_for(lambda: self.studio.busy == 0 and (self.open_root / "RenamedSub").is_dir())
+            self._wait_for(
+                lambda: self.studio.busy == 0
+                and (self.open_root / "RenamedSub").is_dir()
+                and any(item["name"] == "RenamedSub" for item in self.studio.files)
+            )
         self.assertEqual(invalidations, [self.studio.folder, self.studio.folder, None])
         self.assertIn((self.open_root / "Patched Note.md").resolve(), [p.resolve() for p in atomic_calls])
         lightweight = SimpleNamespace(
