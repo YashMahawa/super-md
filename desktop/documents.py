@@ -1,7 +1,6 @@
 """Portable SMD compatibility and bounded asset access, without Qt dependencies."""
 import base64
 from collections import OrderedDict
-import gzip
 import hashlib
 import json
 import os
@@ -11,13 +10,11 @@ import threading
 import zlib
 from pathlib import Path
 if __package__:
-    from .atomic_io import (_ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _bind_reexport_namespace,
-        _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, _write_json_value,
-        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate, stage_atomic_json)
+    from . import atomic_io as _atomic_io
+    from .atomic_io import _ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, atomic_output_file, set_trusted_ascii_predicate
 else:
-    from atomic_io import (_ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _bind_reexport_namespace,
-        _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, _write_json_value,
-        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate, stage_atomic_json)
+    import atomic_io as _atomic_io
+    from atomic_io import _ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, atomic_output_file, set_trusted_ascii_predicate
 
 MIMES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "svg": "image/svg+xml", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 MAX_FILE = 120_000_000
@@ -234,9 +231,8 @@ def _validated_image_meta(data: str) -> tuple[str, int]:
 
 def _is_cached_validated_asset(data: str) -> bool:
     return _lookup_validated_asset(data) is not None
-
 set_trusted_ascii_predicate(_is_cached_validated_asset)
-_bind_reexport_namespace(globals())
+
 
 def image_data(data: str) -> tuple[str, bytes]:
     mime, encoded_start, _ = _parse_image_header(data)
@@ -413,12 +409,7 @@ def _write_gzip_json(target, value: dict, *, _trusted_ascii_assets: bool = False
     json.dump(value, BoundedTextWriter(), ensure_ascii=False, separators=(",", ":"))
     emit(compressor.flush())
 
-def compressed_bundle(
-    markdown: str,
-    assets: dict[str, str],
-    *,
-    validated_assets: dict[str, str] | None = None,
-) -> bytes:
+def compressed_bundle(markdown: str, assets: dict[str, str], *, validated_assets: dict[str, str] | None = None) -> bytes:
     value = bundle(markdown, assets, validated_assets=validated_assets)
     import io
     output = io.BytesIO()
@@ -431,7 +422,7 @@ def compressed_bundle(
 def write_portable(path: Path, markdown: str, assets: dict[str, str], *, validated_assets: dict[str, str] | None = None) -> None:
     """Atomically save the unchanged v1 JSON envelope in deterministic gzip."""
     value, hasher = bundle(markdown, assets, validated_assets=validated_assets), hashlib.sha256()
-    with atomic_output_file(path, buffering=_B64_DECODE_CHUNK) as raw:
+    with atomic_output_file(path, buffering=_B64_DECODE_CHUNK, replace_fn=_replace_with_windows_sharing_retry) as raw:
         class _HashingWriter:
             def write(self, data: bytes) -> int:
                 hasher.update(data)
@@ -709,6 +700,11 @@ def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int =
             return text_handle.read()
     except OSError:
         return None
+
+def atomic_write(path: Path, data: bytes) -> None: _atomic_io.atomic_write(path, data, replace_fn=_replace_with_windows_sharing_retry)
+def _write_json_value(raw, value, seen: set[int]) -> None: _atomic_io._write_json_value(raw, value, seen, write_str=_write_json_str, write_value=_write_json_value)
+def stage_atomic_json(target_path: Path, *, abort_check=None) -> _StagedAtomicJsonScope: return _atomic_io.stage_atomic_json(target_path, abort_check=abort_check, replace_fn=_replace_with_windows_sharing_retry)
+def atomic_json(path: Path, value) -> None: _atomic_io.atomic_json(path, value, write_value=_write_json_value, replace_fn=_replace_with_windows_sharing_retry)
 
 def materialize_assets(root: Path, assets: dict[str,str]) -> None:
     """Save a portable note as Markdown without dropping its pictures or overwriting others."""

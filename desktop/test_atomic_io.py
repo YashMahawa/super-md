@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 from pathlib import Path
@@ -18,16 +19,33 @@ else:
 class AtomicIoTest(unittest.TestCase):
     def test_documents_reexports_atomic_io_symbols_and_os_singleton(self):
         self.assertIs(documents.atomic_output_file, atomic_io.atomic_output_file)
-        self.assertIs(documents.atomic_write, atomic_io.atomic_write)
-        self.assertIs(documents.atomic_json, atomic_io.atomic_json)
-        self.assertIs(documents.stage_atomic_json, atomic_io.stage_atomic_json)
         self.assertIs(documents._StagedAtomicJsonScope, atomic_io._StagedAtomicJsonScope)
         self.assertIs(documents._stage_target_key, atomic_io._stage_target_key)
         self.assertIs(documents._ATOMIC_JSON_STAGE_TLS, atomic_io._ATOMIC_JSON_STAGE_TLS)
         self.assertIs(documents._replace_with_windows_sharing_retry, atomic_io._replace_with_windows_sharing_retry)
         self.assertIs(documents._write_json_str, atomic_io._write_json_str)
-        self.assertIs(documents._write_json_value, atomic_io._write_json_value)
         self.assertIs(documents.os, atomic_io.os)
+        for name in ("atomic_write", "atomic_json", "stage_atomic_json", "_write_json_value"):
+            self.assertTrue(callable(getattr(documents, name)), name)
+
+    def test_atomic_io_has_no_monkeypatch_detection_or_module_registries(self):
+        source = Path(atomic_io.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=atomic_io.__file__)
+        for forbidden in (
+            "sys.modules",
+            "_reexport_namespaces",
+            "_bind_reexport_namespace",
+            "_resolve_reexported",
+            "_DEFAULT_",
+        ):
+            self.assertNotIn(forbidden, source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                self.assertNotIn("sys", [alias.name for alias in node.names])
+            elif isinstance(node, ast.ImportFrom):
+                self.assertNotEqual(node.module, "sys")
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                self.assertNotEqual(node.func.id, "globals")
 
     def test_repo_root_package_imports_resolve_cleanly_in_clean_subprocess(self):
         env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONSAFEPATH", "PYTHONSTARTUP"}}
@@ -35,15 +53,14 @@ class AtomicIoTest(unittest.TestCase):
         for probe in (
             "from desktop import atomic_io, documents\n"
             "from desktop.core import closed_notes\n"
-            "assert documents.atomic_json is atomic_io.atomic_json\n"
-            "assert documents.stage_atomic_json is atomic_io.stage_atomic_json\n"
-            "assert documents.atomic_write is atomic_io.atomic_write\n"
             "assert documents.atomic_output_file is atomic_io.atomic_output_file\n"
-            "assert closed_notes.atomic_json is atomic_io.atomic_json\n",
+            "assert all(callable(getattr(documents, n)) for n in ('atomic_json', 'stage_atomic_json', 'atomic_write', '_write_json_value'))\n"
+            "assert closed_notes.atomic_json is documents.atomic_json\n",
             "from desktop.core import closed_notes\n"
             "from desktop import atomic_io, documents\n"
-            "assert documents.atomic_json is atomic_io.atomic_json\n"
-            "assert closed_notes.atomic_json is atomic_io.atomic_json\n",
+            "assert documents.atomic_output_file is atomic_io.atomic_output_file\n"
+            "assert callable(documents.atomic_json)\n"
+            "assert closed_notes.atomic_json is documents.atomic_json\n",
         ):
             proc = subprocess.run(
                 [sys.executable, "-E", "-c", probe],
@@ -181,42 +198,68 @@ class AtomicIoTest(unittest.TestCase):
                 self.assertEqual(fatal_target.read_bytes(), b"untouched")
                 self.assertEqual(list(root.glob("*.tmp")), [])
 
-    def test_stage_atomic_json_and_documents_writer_monkeypatch_propagation(self):
+    def test_stage_atomic_json_and_documents_collaborator_monkeypatch_propagation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             recovery = root / "recovery.json"
             recovery.write_text('[{"v": 0}]', encoding="utf-8")
 
             seen_payloads: list[object] = []
+            seen_strings: list[str] = []
+            published_targets: list[Path] = []
             real_write_val = documents._write_json_value
+            real_write_str = documents._write_json_str
+            real_replace_retry = documents._replace_with_windows_sharing_retry
 
             def spy_write_val(raw, value, seen):
                 seen_payloads.append(value)
                 return real_write_val(raw, value, seen)
 
-            with patch.object(documents, "_write_json_value", side_effect=spy_write_val):
+            def spy_write_str(raw, text):
+                seen_strings.append(text)
+                return real_write_str(raw, text)
+
+            def spy_replace_retry(src, dst):
+                published_targets.append(Path(dst))
+                return real_replace_retry(src, dst)
+
+            nested_payload = [{"v": 1, "nested": {"items": ["alpha", {"deep": "beta"}]}}]
+            with patch.object(documents, "_write_json_value", side_effect=spy_write_val), \
+                 patch.object(documents, "_write_json_str", side_effect=spy_write_str), \
+                 patch.object(documents, "_replace_with_windows_sharing_retry", side_effect=spy_replace_retry):
                 with documents.stage_atomic_json(recovery) as staged:
-                    documents.atomic_json(recovery, [{"v": 1}])
+                    documents.atomic_json(recovery, nested_payload)
                     self.assertTrue(staged.intercepted)
                     self.assertIsNotNone(staged.temporary)
+                    self.assertEqual(published_targets, [])
                     self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 0}])
                     staged.publish()
-                self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 1}])
+                self.assertEqual(published_targets, [recovery.resolve()])
+                self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), nested_payload)
                 self.assertEqual(list(root.glob("*.tmp")), [])
-            self.assertTrue(any(item == [{"v": 1}] for item in seen_payloads))
+
+                smd_path = root / "portable.smd"
+                documents.write_portable(smd_path, "# Portable\n", {})
+                self.assertEqual(published_targets[-1], smd_path)
+            self.assertIn(nested_payload, seen_payloads)
+            self.assertIn({"items": ["alpha", {"deep": "beta"}]}, seen_payloads)
+            self.assertIn(["alpha", {"deep": "beta"}], seen_payloads)
+            self.assertIn({"deep": "beta"}, seen_payloads)
+            self.assertIn("beta", seen_payloads)
+            self.assertTrue({"nested", "items", "alpha", "deep", "beta"}.issubset(seen_strings))
 
             with documents.stage_atomic_json(recovery) as discarded:
                 documents.atomic_json(recovery, [{"v": 2}])
                 self.assertTrue(discarded.intercepted)
                 discarded.discard()
-            self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 1}])
+            self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), nested_payload)
             self.assertEqual(list(root.glob("*.tmp")), [])
 
             with documents.stage_atomic_json(recovery, abort_check=lambda: True) as aborted:
                 documents.atomic_json(recovery, [{"v": 3}])
                 self.assertTrue(aborted.intercepted)
                 self.assertIsNone(aborted.temporary)
-            self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 1}])
+            self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), nested_payload)
             self.assertEqual(list(root.glob("*.tmp")), [])
 
 
