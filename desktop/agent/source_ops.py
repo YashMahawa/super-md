@@ -6,6 +6,11 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 
+if "." in (__package__ or ""):
+    from .. import frontmatter
+else:
+    import frontmatter
+
 MAX_PAGE_CHARS = 12_000
 MAX_SEARCH_RESULTS = 25
 MAX_OUTLINE_PAGE = 80
@@ -146,10 +151,15 @@ def _scan_read_only(
     *,
     collect_headings: bool = False,
     collect_fences: bool = False,
+    fm_end: int | None = None,
 ) -> tuple[list[dict], list[_FencedSpan]]:
     has_fences = "```" in text or "~~~" in text
     if not collect_headings and not (collect_fences and has_fences):
         return [], []
+    resolved_fm_end = (
+        (frontmatter.frontmatter_end(text) if text.startswith(("---", "\ufeff---")) else 0)
+        if fm_end is None else fm_end
+    )
     step_fence = _resolve_step_fence()
     headings: list[dict] = []
     fences: list[_FencedSpan] = []
@@ -158,6 +168,10 @@ def _scan_read_only(
     opened: _OpenFence | None = None
     for line in text.splitlines(keepends=True):
         line_len = len(line)
+        if offset < resolved_fm_end:
+            offset += line_len
+            line_number += 1
+            continue
         body = line.rstrip("\r\n")
         if has_fences:
             is_fence_line, opened, closed = step_fence(
@@ -206,8 +220,8 @@ def _read_headings_and_svg_spans(
     return headings, svg_spans
 
 
-def _headings(text: str, *, include_internal: bool = False) -> list[dict]:
-    found, _ = _scan_read_only(text, collect_headings=True)
+def _headings(text: str, *, include_internal: bool = False, fm_end: int | None = None) -> list[dict]:
+    found, _ = _scan_read_only(text, collect_headings=True, fm_end=fm_end)
     if include_internal:
         return _heading_sections(text, found)
     return [{k: v for k, v in item.items() if k != "start"} for item in found]
@@ -225,11 +239,11 @@ def _heading_sections(text: str, headings: list[dict]) -> list[dict]:
             for index, heading in enumerate(headings)]
 
 
-def outline_source(source: str, offset: int = 0, limit: int = MAX_OUTLINE_PAGE) -> dict:
+def outline_source(source: str, offset: int = 0, limit: int = MAX_OUTLINE_PAGE, *, _fm_end: int | None = None) -> dict:
     """Pure bounded outline page with code-point positions and section ranges."""
     if not isinstance(source, str):
         raise AgentDocumentError("source must be text")
-    headings = _headings(source, include_internal=True)
+    headings = _headings(source, include_internal=True, fm_end=_fm_end)
     if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= len(headings):
         raise AgentDocumentError("outline offset must be between 0 and the heading count")
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_OUTLINE_PAGE:

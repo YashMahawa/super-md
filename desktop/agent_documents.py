@@ -23,9 +23,10 @@ from pathlib import Path
 from typing import Iterator
 
 try:  # package import and direct-script import are both supported
-    from . import documents
+    from . import documents, frontmatter
 except ImportError:
     import documents
+    import frontmatter
 
 try:
     from .agent.source_ops import (
@@ -500,9 +501,10 @@ class DocumentStore:
         with _path_lock(path):
             entry = self._load_entry(path)
             assets = self._entry_asset_metadata(entry, limit=40)
-        outline = outline_source(entry.text)
+        fm_end, props = frontmatter.parse_frontmatter(entry.text)
+        outline = outline_source(entry.text, _fm_end=fm_end)
         headings = outline["headings"]
-        return {
+        result = {
             "path": self.display_path(path), "format": "smd" if entry.portable or path.suffix.lower() == ".smd" else "markdown",
             "portable": entry.portable, "revision": entry.revision, "sha256": entry.revision,
             "bytes": entry.raw_size, "characters": len(entry.text), "lines": len(entry.text.splitlines()),
@@ -510,6 +512,9 @@ class DocumentStore:
             "headings_truncated": outline["truncated"], "next_heading_offset": outline["nextOffset"],
             "assets": assets, "asset_count": len(entry.assets),
         }
+        if props is not None:
+            result["properties"] = props
+        return result
 
     def outline(self, path_value: str, *, offset: int = 0, limit: int = MAX_OUTLINE_PAGE) -> dict:
         path = self.resolve(path_value)
