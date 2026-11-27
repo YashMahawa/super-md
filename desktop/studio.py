@@ -768,6 +768,8 @@ class Session(QObject):
             if had_explicit_keep_in_background
             else bool(migrated_keep_in_background)
         )
+        if not isinstance(self.settings.get("hideNonNoteFolders"), bool):
+            self.settings["hideNonNoteFolders"] = True
         raw_note_location = self.settings.get("newNoteLocation")
         if (not isinstance(raw_note_location, str) or not raw_note_location.strip() or "\0" in raw_note_location
                 or len(raw_note_location) > 4096 or _is_disallowed_root_setting(raw_note_location)):
