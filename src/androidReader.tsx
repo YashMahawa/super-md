@@ -27,6 +27,7 @@ import { extractSelectedText } from "./copySource";
 import {readingOffset} from "./readingPosition";
 import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,hasExternalAnchorScroll,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,snapshotAnchorScroll,type AnchorScrollSnapshot,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
+import { clearNoteDisclosures, hasNoteDisclosureOverrides } from "./disclosureState";
 import { analyzeDocument } from "./documentAnalysis";
 import { parseFrontmatter } from "./frontmatter";
 import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
@@ -210,6 +211,8 @@ export function Reader() {
   const zoomGestureAt = useRef(0);
   const pendingChange = useRef(0);
   const noteViews = useRef(new Map<string, NoteView>());
+  const seenNoteIds = useRef(new Set<string>());
+  useEffect(() => () => { clearNoteDisclosures(seenNoteIds.current); seenNoteIds.current.clear(); }, []);
   const histories=useRef(new Map<string,NoteHistory>());
   const trimHistories=(active:string)=>trimHistoryCache(histories.current,active);
   const replaying=useRef(false);
@@ -328,16 +331,21 @@ export function Reader() {
         refs: { noteViews, savePosition, modeAnchor, splitPane, suppressedRestoreKey },
         onOutgoingTabSwitch: () => { if (!seededFind) setSearchSeed(null); },
       });
+      seenNoteIds.current.add(next.id);
       if (next.viewState && old?.id !== next.id) {
         importEditorSession(next.id, next.viewState.editor);
-        importRenderedViews(next.content, next.viewState.rendered);
+        importRenderedViews(next.content, next.viewState.rendered, next.id);
         const history=next.viewState.history;
         histories.current.delete(next.id);
         if(validHistory(history)){const imported=transferHistory(history);if(imported)histories.current.set(next.id,imported);}
         trimHistories(next.id);
         const importedAnchor=parseImportedAnchor(next.viewState.anchor);
-        noteViews.current.set(next.id, {top:next.viewState.top, ...(importedAnchor?{anchor:importedAnchor}:{})});
+        noteViews.current.set(next.id, {top:next.viewState.top, ...(importedAnchor?{anchor:importedAnchor}:{}), ...(next.viewState.rendered?{rendered:next.viewState.rendered}:{})});
       } else if (old && old.id !== next.id) {
+        const existingView = noteViews.current.get(next.id);
+        if (existingView?.rendered && !hasNoteDisclosureOverrides(next.id)) {
+          importRenderedViews(next.content, existingView.rendered, next.id);
+        }
         trimHistories(next.id);
       }
       // Native snapshots may have been queued before the latest pinch frame.
@@ -524,13 +532,14 @@ export function Reader() {
       if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
       else if (operation.action === "detach_tab") id = operation.target;
       const captureView = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader";
-      const baseView = captureView ? {editor:exportEditorSession(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
+      const baseView = captureView ? {editor:exportEditorSession(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content,current.id)};})() : noteViews.current.get(id))} : undefined;
       void (async()=>{
         if(current.editProtocol===1)await edits.current!.flush(current.id);
         // Snapshot after the acknowledgement barrier, including edits made while waiting.
         const latest=reference.current;
-        const view=baseView?{...baseView,history:transferHistory(histories.current.get(id))}:undefined;
-        await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
+        const flushedContent=latest?.id===current.id?latest.content:current.content;
+        const view=baseView?{...baseView,...(id===current.id&&flushedContent!==current.content?{rendered:exportRenderedViews(flushedContent,current.id)}:{}),history:transferHistory(histories.current.get(id))}:undefined;
+        await invoke("document_flushed",{id:current.id,content:flushedContent,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
     window.supermdFind = (replaceOrQuery, options) => {

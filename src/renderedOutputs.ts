@@ -1,5 +1,7 @@
 import type { PythonContext, PythonProvenance, PythonResult } from "./types";
 import {invoke} from './nativeBridge';
+import {clearNoteDisclosures,exportNoteDisclosuresForMap,hasNoteDisclosureOverrides,importNoteDisclosuresForMap,syncMountedNoteDisclosures} from './disclosureState';
+import {validDisclosureDefaults} from './documentAnalysis';
 export const chartValues = new Map<string, Record<string, number>>();
 export const chartZooms = new Map<string, number>();
 export const chartCenters = new Map<string, {x:number;y:number}>();
@@ -136,19 +138,29 @@ export function remember<T>(map: Map<string, T>, key: string, value: T) {
   }
 }
 
-export function exportRenderedViews(content: string) {
+export function exportRenderedViews(content: string, noteId?: string) {
   const selected = <T,>(map: Map<string, T>) => [...map].filter(([key]) => content.includes(key));
   const pythonScoped=[...scopedPythonResults].flatMap(([key,value])=>{
     const source=scopedPythonSources.get(key),context=scopedPythonContexts.get(key);
     return source&&context&&content.includes(source)&&verifiedProvenance(value.provenance,context)?[[source,context,value] as [string,PythonContext,PythonResult]]:[];
   });
-  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), steps:selected(stepIndices), python:selected(pythonResults),pythonScoped};
+  let disclosures: [string, boolean][] = [];
+  if (noteId) {
+    syncMountedNoteDisclosures(noteId);
+    if (hasNoteDisclosureOverrides(noteId)) {
+      disclosures = exportNoteDisclosuresForMap(
+        noteId,
+        content.length <= 2_000_000 ? validDisclosureDefaults(content) : undefined,
+      );
+    }
+  }
+  const result = {values:selected(chartValues), zooms:selected(chartZooms), centers:selected(chartCenters), grids:selected(chartGrids), steps:selected(stepIndices), disclosures, python:selected(pythonResults),pythonScoped};
   // Avoid carrying huge derived images through the UI bridge. This is optional
   // runtime state, not source/assets, and never executes Python on restore.
   if (JSON.stringify(result).length > 8_000_000) {result.python = [];result.pythonScoped=[];}
   return result;
 }
-export function importRenderedViews(content: string, data: Partial<ReturnType<typeof exportRenderedViews>> | undefined) {
+export function importRenderedViews(content: string, data: Partial<ReturnType<typeof exportRenderedViews>> | undefined, noteId?: string) {
   if (!data) return;
   const restore = <T,>(map: Map<string, T>, pairs: [string, T][] | undefined, valid:(value:T)=>boolean) => {
     if (!Array.isArray(pairs)) return;
@@ -160,6 +172,16 @@ export function importRenderedViews(content: string, data: Partial<ReturnType<ty
   restore(chartCenters, data.centers, value => !!value && finite(value.x) && finite(value.y));
   restore(chartGrids, data.grids, value => typeof value === "boolean");
   restore(stepIndices, data.steps, value => typeof value === "number" && Number.isInteger(value) && value >= 0 && value < 40);
+  if (noteId && Array.isArray(data.disclosures)) {
+    if (data.disclosures.length === 0) clearNoteDisclosures([noteId]);
+    else {
+      importNoteDisclosuresForMap(
+        noteId,
+        data.disclosures,
+        content.length <= 2_000_000 ? validDisclosureDefaults(content) : undefined,
+      );
+    }
+  }
   if(Array.isArray(data.python))for(const pair of data.python.slice(0,60))if(Array.isArray(pair)&&typeof pair[0]==='string'&&content.includes(pair[0])&&validPython(pair[1]))rememberPythonOutput(pair[0],{...pair[1],provenance:{verified:false,reason:'Unscoped legacy output'}});
   if(Array.isArray(data.pythonScoped))for(const entry of data.pythonScoped.slice(0,60)){
     if(!Array.isArray(entry)||typeof entry[0]!=='string'||!content.includes(entry[0]))continue;

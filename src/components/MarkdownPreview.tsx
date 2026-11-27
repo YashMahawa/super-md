@@ -1,4 +1,4 @@
-import { Children, createContext, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
+import { Children, createContext, isValidElement, lazy, memo, Suspense, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type DetailsHTMLAttributes, type ReactNode, type RefObject } from "react";
 import { invoke } from "../nativeBridge";
 import CachedMarkdown,{type MarkdownBlockRenderer} from "./CachedMarkdown";
 import rehypeKatex from "rehype-katex";
@@ -22,7 +22,8 @@ import {DocumentAppearance} from '../documentAppearance';
 import {parseValidatedSvg} from '../svgImage';
 import {adaptValidatedSvg,decodeSvgDataUri} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
-import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
+import type {DisclosureDescriptor, PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
+import {calloutDisclosureBaseKey, codeDisclosureBaseKey, defaultCalloutOpen, defaultCodeDisclosureOpen, getNoteDisclosure, hashDisclosureSignature, scopedDisclosureKey, setNoteDisclosure} from '../disclosureState';
 import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
 import {commitMediaLayout} from '../mediaLayout';
 import {registerMedia,installMediaMenu} from '../mediaExport';
@@ -229,6 +230,7 @@ interface Props extends ReaderAccessibilityPreference {
   onNotice?: (message: string) => void;
   renderBlock?:MarkdownBlockRenderer;
   sourceAnalysis?:SourceDocumentAnalysis;
+  disclosureScope?:string;
 }
 
 interface MarkdownPreviewLiveState {
@@ -236,6 +238,7 @@ interface MarkdownPreviewLiveState {
   tasks: number[];
   onChange?: (markdown: string) => void;
   pythonCells: PythonCellSource[];
+  disclosures: DisclosureDescriptor[];
   resolvedNotePath: string | null;
   savedDocumentPath?: string | null;
   onNotice?: (message: string) => void;
@@ -245,6 +248,7 @@ interface MarkdownPreviewLiveState {
 
 interface MarkdownPreviewContextValue {
   noteId?: string;
+  disclosureScope?: string;
   documentPath: string | null;
   python: string;
   dark: boolean;
@@ -259,6 +263,7 @@ interface MarkdownPreviewContextValue {
 
 const EMPTY_TASKS: number[] = [];
 const EMPTY_PYTHON_CELLS: PythonCellSource[] = [];
+const EMPTY_DISCLOSURES: DisclosureDescriptor[] = [];
 const NOOP = () => {};
 const DEFAULT_LIVE_STATE: RefObject<MarkdownPreviewLiveState> = {
   current: {
@@ -266,6 +271,7 @@ const DEFAULT_LIVE_STATE: RefObject<MarkdownPreviewLiveState> = {
     tasks: EMPTY_TASKS,
     onChange: undefined,
     pythonCells: EMPTY_PYTHON_CELLS,
+    disclosures: EMPTY_DISCLOSURES,
     resolvedNotePath: null,
     savedDocumentPath: undefined,
     onNotice: undefined,
@@ -275,6 +281,7 @@ const DEFAULT_LIVE_STATE: RefObject<MarkdownPreviewLiveState> = {
 };
 const MarkdownPreviewContext = createContext<MarkdownPreviewContextValue>({
   noteId: undefined,
+  disclosureScope: undefined,
   documentPath: null,
   python: "",
   dark: false,
@@ -387,8 +394,96 @@ const MarkdownLink: Components['a'] = ({ node: _node, href, children, ...props }
   );
 };
 
+function DisclosureDetails({
+  noteId,
+  disclosureKey,
+  defaultOpen,
+  children,
+  onClick,
+  onToggle,
+  ...props
+}: Omit<DetailsHTMLAttributes<HTMLDetailsElement>, "open"> & {
+  noteId?: string;
+  disclosureKey?: string;
+  defaultOpen: boolean;
+}) {
+  const detailsRef = useRef<HTMLDetailsElement>(null);
+  const latestTargetRef = useRef({ noteId, disclosureKey, defaultOpen });
+  latestTargetRef.current = { noteId, disclosureKey, defaultOpen };
+  const [, setRevision] = useState(0);
+  const resolvedOpen = getNoteDisclosure(noteId, disclosureKey, defaultOpen);
+  useLayoutEffect(() => {
+    const el = detailsRef.current;
+    if (!el) return;
+    const targetOpen = getNoteDisclosure(noteId, disclosureKey, defaultOpen);
+    if (el.open !== targetOpen) el.open = targetOpen;
+  }, [noteId, disclosureKey, defaultOpen]);
+  useLayoutEffect(() => {
+    const el = detailsRef.current;
+    return () => {
+      const { noteId: currentNoteId, disclosureKey: currentKey, defaultOpen: currentDefault } = latestTargetRef.current;
+      if (el && currentNoteId && currentKey) {
+        setNoteDisclosure(currentNoteId, currentKey, el.open, currentDefault);
+      }
+    };
+  }, []);
+  const syncFromDom = (el: HTMLDetailsElement) => {
+    const { noteId: currentNoteId, disclosureKey: currentKey, defaultOpen: currentDefault } = latestTargetRef.current;
+    if (!currentNoteId || !currentKey) return;
+    const nextOpen = el.open;
+    if (nextOpen === getNoteDisclosure(currentNoteId, currentKey, currentDefault)) return;
+    setNoteDisclosure(currentNoteId, currentKey, nextOpen, currentDefault);
+    setRevision(value => value + 1);
+  };
+  return (
+    <details
+      {...props}
+      ref={detailsRef}
+      open={resolvedOpen}
+      data-disclosure-key={noteId && disclosureKey ? disclosureKey : undefined}
+      data-disclosure-default={noteId && disclosureKey ? (defaultOpen ? "true" : "false") : undefined}
+      onClick={event => {
+        onClick?.(event);
+        const el = event.currentTarget;
+        queueMicrotask(() => {
+          if (el.isConnected) syncFromDom(el);
+        });
+      }}
+      onToggle={event => {
+        onToggle?.(event);
+        if (event.target !== event.currentTarget) return;
+        syncFromDom(event.currentTarget);
+      }}
+    >
+      {children}
+    </details>
+  );
+}
+
+const MarkdownDetails: Components['details'] = ({ node, children, open: hastOpen, ...props }) => {
+  const { noteId, disclosureScope, liveStateRef } = useContext(MarkdownPreviewContext);
+  const nodeData = node as { position?: { start?: { offset?: number }; end?: { offset?: number } }; properties?: Record<string, unknown> } | undefined;
+  const offset = Number(nodeData?.properties?.['data-source-start'] ?? nodeData?.position?.start?.offset);
+  const endOffset = Number(nodeData?.properties?.['data-source-end'] ?? nodeData?.position?.end?.offset);
+  const fold = typeof nodeData?.properties?.['data-callout-fold'] === 'string' ? nodeData.properties['data-callout-fold'] : '';
+  const type = typeof nodeData?.properties?.['data-callout-type'] === 'string' ? nodeData.properties['data-callout-type'] : '';
+  const defaultOpen = type ? defaultCalloutOpen(fold) : Boolean(hastOpen);
+  const matched = Number.isInteger(offset) && offset >= 0
+    ? liveStateRef.current.disclosures.find(entry => entry.kind === 'callout' && entry.offset === offset)
+    : undefined;
+  const fallbackKey = !matched && type && Number.isInteger(offset) && Number.isInteger(endOffset) && offset >= 0 && endOffset > offset
+    ? `${calloutDisclosureBaseKey(fold, type, liveStateRef.current.markdown.slice(offset, endOffset))}#0`
+    : undefined;
+  const disclosureKey = matched || fallbackKey ? scopedDisclosureKey(disclosureScope, matched?.key ?? fallbackKey!) : undefined;
+  return (
+    <DisclosureDetails {...props} noteId={noteId} disclosureKey={disclosureKey} defaultOpen={matched?.defaultOpen ?? defaultOpen}>
+      {children}
+    </DisclosureDetails>
+  );
+};
+
 const MarkdownPre: Components['pre'] = ({ node, children }) => {
-  const { noteId, documentPath, python, dark, trustedImageHosts, approvedImageUrls, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, liveStateRef } = useContext(MarkdownPreviewContext);
+  const { noteId, disclosureScope, documentPath, python, dark, trustedImageHosts, approvedImageUrls, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, liveStateRef } = useContext(MarkdownPreviewContext);
   const child = Children.only(children) as React.ReactElement<{ className?: string; children?: ReactNode }>;
   const language = child.props.className?.match(/language-([\w-]+)/)?.[1];
   const source = textOf(child.props.children).replace(/\n$/, "");
@@ -407,18 +502,21 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   const protectedBlock = (block: ReactNode) => <CodeBlockBoundary key={`${language}:${source}`} source={source}>{block}</CodeBlockBoundary>;
   if (language === "smd-tree") return protectedBlock(<InlineDiagram diagram={parseBinaryTreeSource(source)} />);
   if (language === "smd-diagram") return protectedBlock(<InlineDiagram diagram={parseDiagramSource(source)} />);
-  if (language === "smd-steps") return (
-    <CodeBlockBoundary key={language} source={source}>
-      <StepCards
-        source={source}
-        sourceStart={srcStart}
-        sourceEnd={srcEnd}
-        renderImage={(src, alt) => <AssetImage noteId={noteId} src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} />}
-        renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
-        renderMarkdown={text => <MemoizedMarkdownPreview noteId={noteId} markdown={text} documentPath={documentPath} savedDocumentPath={liveStateRef.current.savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} onNotice={liveStateRef.current.onNotice} />}
-      />
-    </CodeBlockBoundary>
-  );
+  if (language === "smd-steps") {
+    const deckHash = hashDisclosureSignature(source);
+    return (
+      <CodeBlockBoundary key={language} source={source}>
+        <StepCards
+          source={source}
+          sourceStart={srcStart}
+          sourceEnd={srcEnd}
+          renderImage={(src, alt) => <AssetImage noteId={noteId} src={src} alt={alt} documentPath={documentPath} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} />}
+          renderChart={chartSource => <ThemedChart source={chartSource} dark={dark} />}
+          renderMarkdown={text => <MemoizedMarkdownPreview noteId={noteId} disclosureScope={scopedDisclosureKey(disclosureScope, `step:${deckHash}:${hashDisclosureSignature(text)}`)} markdown={text} documentPath={documentPath} savedDocumentPath={liveStateRef.current.savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} onNotice={liveStateRef.current.onNotice} />}
+        />
+      </CodeBlockBoundary>
+    );
+  }
   if (language === "smd-chart") return protectedBlock(<ThemedChart source={source} dark={dark} />);
   if (language === "svg") return protectedBlock(<ThemedSvg source={source} dark={dark} />);
   if (language === "mermaid") return protectedBlock(<Suspense fallback={<span className="image-loading" role="status">Loading diagram…</span>}><ThemedMermaid source={source} dark={dark} /></Suspense>);
@@ -428,7 +526,13 @@ const MarkdownPre: Components['pre'] = ({ node, children }) => {
   const fenced = lineBreak >= 0 && (srcEnd === undefined || lineBreak < srcEnd) && /^[ \t>]*(`{3,}|~{3,})/.test(sourceText.slice(srcStart, lineBreak));
   const bodyStart = fenced ? lineBreak + 1 : srcStart;
   const bodyEnd = fenced && bodyStart !== undefined ? Math.min(srcEnd ?? bodyStart + source.length, bodyStart + source.length) : srcEnd;
-  return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source} /><details className="code-disclosure" open={source.split("\n").length <= 12}><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre data-source-start={bodyStart} data-source-end={bodyEnd}>{children}</pre></details></div>;
+  const defaultOpen = defaultCodeDisclosureOpen(source);
+  const matched = srcStart !== undefined
+    ? liveStateRef.current.disclosures.find(entry => entry.kind === "code" && entry.offset === srcStart)
+    : undefined;
+  const fallbackKey = !matched ? `${codeDisclosureBaseKey(language || "", source)}#0` : undefined;
+  const disclosureKey = scopedDisclosureKey(disclosureScope, matched?.key ?? fallbackKey!);
+  return <div className="code-container" data-source-start={srcStart} data-source-end={srcEnd}><CopyCode source={source} /><DisclosureDetails noteId={noteId} disclosureKey={disclosureKey} defaultOpen={matched?.defaultOpen ?? defaultOpen} className="code-disclosure"><summary>{language || "Code"} <span>{source.split("\n").length} lines</span></summary><pre data-source-start={bodyStart} data-source-end={bodyEnd}>{children}</pre></DisclosureDetails></div>;
 };
 
 const MARKDOWN_COMPONENTS: Components = {
@@ -437,10 +541,11 @@ const MARKDOWN_COMPONENTS: Components = {
   li: MarkdownListItem,
   img: MarkdownImage,
   a: MarkdownLink,
+  details: MarkdownDetails,
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, onChange, onNotice, renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ noteId, disclosureScope, markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, onChange, onNotice, renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
   const [linkNotice, setLinkNotice] = useState("");
   const resolvedNotePath = savedDocumentPath === undefined ? documentPath : savedDocumentPath;
@@ -454,11 +559,11 @@ function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, py
   const analysis=useMemo(()=>sourceAnalysis?.source===markdown?sourceAnalysis.analysis:analyzeDocument(markdown),[markdown,sourceAnalysis]);
   const editable=Boolean(onChange);
   const tasks=editable?analysis.tasks:EMPTY_TASKS;
-  const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice});
-  liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice};
+  const liveStateRef=useRef<MarkdownPreviewLiveState>({markdown,tasks,onChange,pythonCells:analysis.pythonCells,disclosures:analysis.disclosures,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice});
+  liveStateRef.current={markdown,tasks,onChange,pythonCells:analysis.pythonCells,disclosures:analysis.disclosures,resolvedNotePath,savedDocumentPath,onNotice,reportLinkNotice,clearLinkNotice};
   const previewContext=useMemo<MarkdownPreviewContextValue>(
-    ()=>({noteId,documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable,liveStateRef}),
-    [noteId,documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable],
+    ()=>({noteId,disclosureScope,documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable,liveStateRef}),
+    [noteId,disclosureScope,documentPath,python,dark,trustedImageHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,editable],
   );
   const resolvedSourceAnalysis=useMemo(
     ()=>sourceAnalysis?.source===markdown?sourceAnalysis:{source:markdown,analysis},

@@ -5,6 +5,7 @@ import { invoke } from "./nativeBridge";
 import type { NoteHistory } from "./noteHistory";
 import { loadReadingLocation, saveReadingLocation, type ReadingLocation } from "./readingLocations";
 import { exportRenderedViews } from "./renderedOutputs";
+import { syncMountedNoteDisclosures } from "./disclosureState";
 import { markScrollInput, scrollInputVersion } from "./scrollAnchor";
 import { applySharedAnchor, captureSharedAnchor, clearProgrammaticAnchorScroll, detectSplitPaneFromTarget, hasExternalAnchorScroll, isProgrammaticAnchorScroll, primeEditorAnchor, revealEditorOffset, snapshotAnchorScroll, type AnchorScrollSnapshot, type AnchorViewMode, type SharedSourceAnchor, type SplitAnchorPane } from "./sourceAnchor";
 
@@ -112,12 +113,13 @@ export function snapshotOutgoingTabOrPathAnchor(options: {
   onOutgoingTabSwitch?: () => void;
 }): void {
   const { old, next, zoom, unconsumedOldHeadingOffset, refs: { noteViews, savePosition, modeAnchor, splitPane, suppressedRestoreKey }, onOutgoingTabSwitch } = options;
+  if (old && old.id === next.id && old.mode !== next.mode) syncMountedNoteDisclosures(old.id);
   if (old && old.id !== next.id) {
     savePosition.current();
     const readingRoot = document.querySelector<HTMLElement>(".android-reading");
     const outgoingAnchor = captureSharedAnchor({ id: old.id, mode: old.mode, zoom, readingRoot, preferredSplitPane: splitPane.current });
     if (unconsumedOldHeadingOffset !== null && unconsumedOldHeadingOffset > 0 && outgoingAnchor.offset === 0) outgoingAnchor.offset = unconsumedOldHeadingOffset;
-    noteViews.current.set(old.id, { top: outgoingAnchor.readingTop ?? 0, anchor: outgoingAnchor, rendered: exportRenderedViews(old.content) });
+    noteViews.current.set(old.id, { top: outgoingAnchor.readingTop ?? 0, anchor: outgoingAnchor, rendered: exportRenderedViews(old.content, old.id) });
     if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
     if (suppressedRestoreKey.current?.startsWith(`${old.id}:`)) suppressedRestoreKey.current = null;
     onOutgoingTabSwitch?.();

@@ -150,3 +150,104 @@ test('closed answer content stays out of ordinary copy and drag until opened whi
     expect(afterReclose.copy).toBe(whileClosed.copy);
   }
 });
+
+test('preserves per-note folded callouts and code across windowed remounts and tab switches while keeping closed answers out of copy',async({page})=>{
+  await page.addInitScript(()=>{
+    window.SuperMD={post(id){queueMicrotask(()=>window.supermdReply?.(id,null,null));}};
+  });
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+
+  const longCode=Array.from({length:15},(_,idx)=>`export const step${idx+1} = ${idx+1};`).join('\n');
+  const filler=Array.from({length:130},(_,idx)=>`## Section ${idx+1}\n\n${'Windowed reading paragraph with study prose. '.repeat(20)}`).join('\n\n');
+  const content=[
+    '# Windowed Disclosure Check',
+    '',
+    '> [!answer] Revealed derivation',
+    '> Antiderivative result $F(x) = x^3$.',
+    '',
+    '> [!solution] Untouched solution',
+    '> Must stay hidden while closed.',
+    '',
+    '```ts',
+    longCode,
+    '```',
+    '',
+    filler,
+    '',
+    '## Bottom Marker',
+    '',
+    'Reached the end of the windowed note.',
+  ].join('\n');
+
+  const loadTab=(id:string,mode:'reader'|'live'='reader')=>page.evaluate(({tabId,md,viewMode})=>window.supermdLoad?.({
+    id:tabId,
+    path:`/notes/${tabId}.md`,
+    content:md,
+    mode:viewMode,
+    dark:false,
+    fullscreen:false,
+    colors:{},
+    font:'Manrope',
+    size:18,
+    zoom:100,
+  }),{tabId:id,md:content,viewMode:mode});
+
+  await loadTab('windowed-tab-a','reader');
+
+  const answerDetails=page.locator('details.callout-answer');
+  const solutionDetails=page.locator('details.callout-solution');
+  const codeDetails=page.locator('details.code-disclosure');
+  await expect(answerDetails).not.toHaveAttribute('open','');
+  await expect(solutionDetails).not.toHaveAttribute('open','');
+  await expect(codeDetails).not.toHaveAttribute('open','');
+
+  // Deliberately open the [!answer] and >12-line code disclosure in Tab A, leaving [!solution] closed
+  await answerDetails.locator('summary.callout-title').click();
+  await codeDetails.locator('summary').click();
+  await expect(answerDetails).toHaveAttribute('open','');
+  await expect(codeDetails).toHaveAttribute('open','');
+
+  // Clear focus and click caret selection before scrolling so top windowed blocks are not focus/selection-pinned
+  await page.evaluate(()=>{
+    window.getSelection()?.removeAllRanges();
+    if(document.activeElement instanceof HTMLElement)document.activeElement.blur();
+  });
+  await page.locator('.android-reading').evaluate(scroller=>{scroller.scrollTop=scroller.scrollHeight;});
+  await expect(answerDetails).toHaveCount(0);
+  await expect(solutionDetails).toHaveCount(0);
+  await expect(codeDetails).toHaveCount(0);
+
+  // Copy whole note while top blocks are unmounted offscreen: opened [!answer] stays included, closed [!solution] stays omitted
+  const offscreenCopy=await page.locator('.markdown-body').evaluate(root=>{
+    const range=document.createRange();
+    range.selectNodeContents(root);
+    const selection=window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const copied=new DataTransfer();
+    root.dispatchEvent(new ClipboardEvent('copy',{bubbles:true,cancelable:true,clipboardData:copied}));
+    selection.removeAllRanges();
+    return copied.getData('text/plain');
+  });
+  expect(offscreenCopy).toContain('> [!answer] Revealed derivation\n> Antiderivative result $F(x) = x^3$.');
+  expect(offscreenCopy).not.toContain('Must stay hidden while closed.');
+
+  // Scroll back to top: remounted windowed blocks preserve open [!answer] and open >12-line code while keeping [!solution] closed
+  await page.locator('.android-reading').evaluate(scroller=>{scroller.scrollTop=0;});
+  await expect(answerDetails).toHaveAttribute('open','');
+  await expect(codeDetails).toHaveAttribute('open','');
+  await expect(solutionDetails).not.toHaveAttribute('open','');
+
+  // Switch to Tab B with identical Markdown: owner defaults stay closed (no cross-note leakage)
+  await loadTab('windowed-tab-b','reader');
+  await expect(answerDetails).not.toHaveAttribute('open','');
+  await expect(codeDetails).not.toHaveAttribute('open','');
+  await expect(solutionDetails).not.toHaveAttribute('open','');
+
+  // Switch back to Tab A: per-note disclosure state is restored
+  await loadTab('windowed-tab-a','reader');
+  await expect(answerDetails).toHaveAttribute('open','');
+  await expect(codeDetails).toHaveAttribute('open','');
+  await expect(solutionDetails).not.toHaveAttribute('open','');
+});
