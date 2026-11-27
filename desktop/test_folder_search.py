@@ -63,6 +63,7 @@ def _webengine_e2e_probe() -> int:
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuick import QQuickItem, QQuickWindow  # noqa: F401
     from PySide6.QtQuickControls2 import QQuickStyle
+    from PySide6.QtSvg import QSvgRenderer
     from PySide6.QtTest import QTest
     from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
@@ -127,6 +128,15 @@ def _webengine_e2e_probe() -> int:
 
         search_dialog = window.findChild(QObject, "folderSearchDialog")
         assert search_dialog is not None
+
+        note_find = window.findChild(QObject, "findInNoteButton")
+        folder_search = window.findChild(QObject, "sidebarFolderSearchButton")
+        assert note_find is not None and folder_search is not None
+        assert note_find.property("glyph") == "MagnifyingGlass"
+        assert folder_search.property("glyph") == "FolderSearch"
+        for button in (note_find, folder_search):
+            glyph = button.property("glyph")
+            assert QSvgRenderer(str(root / "icons" / f"{glyph}.svg")).isValid()
 
         def send_window_shortcut(action_id: str) -> None:
             assert _wait_until(lambda: int(window.property("modalDialogCount") or 0) == 0), (

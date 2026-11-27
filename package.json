@@ -16,6 +16,7 @@
     "test:browser": "playwright test",
     "test:coverage": "vitest run --coverage",
     "test:pdf": "cargo test --manifest-path smd-core/Cargo.toml",
+    "test:scripts": "node scripts/run-node-tests.mjs",
     "android:release": "scripts/build-android.sh"
   },
   "dependencies": {
