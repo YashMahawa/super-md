@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
@@ -99,15 +100,17 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             bounded.invalidate(vault_ref)
             self.assertTrue(any(item.name == "Note-00-Fresh.md" for item in bounded.scan(vault_ref)))
 
-    def test_scan_skips_binary_opens_and_xattrs_on_unrelated_assets_while_rejecting_eligible_aliases_and_seeing_mutations(self):
+    def _verify_asset_skip_alias_rejection_and_mutation_visibility(self) -> None:
         with tempfile.TemporaryDirectory() as base_dir:
             base = Path(base_dir).resolve()
             root = base / "Vault"
             root.mkdir()
+            root = root.resolve()
             outside = base / "Outside.md"
             outside.write_text("# Outside\n", encoding="utf-8")
             outside_dir = base / "OutsideDir"
             outside_dir.mkdir()
+            outside_dir = outside_dir.resolve()
             (outside_dir / "Leaked.md").write_text("# Leaked\n", encoding="utf-8")
 
             for idx in range(24):
@@ -188,16 +191,19 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                         workspace_folder=root,
                         cache=cache,
                     )
+            else:
+                self.assertIn("BookmarkAlias.md", scanned_names)
 
             # Simulated Windows directory junction on a nested folder is still rejected.
             junction_dir = root / "JunctionSubdir"
             junction_dir.mkdir()
             (junction_dir / "HiddenBehindJunction.md").write_text("# Junction\n", encoding="utf-8")
             cache.invalidate(root)
+            real_is_symlink_or_junction = workspace_links._is_symlink_or_junction
             with mock.patch.object(
                 workspace_links,
                 "_is_symlink_or_junction",
-                side_effect=lambda p: p.name == "JunctionSubdir",
+                side_effect=lambda p: p.name == "JunctionSubdir" or real_is_symlink_or_junction(p),
             ):
                 rescanned = cache.scan(root)
             self.assertFalse(any(item.name == "HiddenBehindJunction.md" for item in rescanned))
@@ -206,6 +212,8 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             # Real directory mutation (creating a note directly on disk without calling cache.invalidate)
             # is visible immediately on the next lookup within TTL.
             xattr_alias.unlink()
+            if os.name != "posix":
+                bookmark_alias.unlink()
             cache.invalidate(root)
             self.assertEqual(len(cache.scan(root)), 24)
             mutated = root / "Section-2" / "FreshlyMutated.md"
@@ -220,6 +228,19 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                 ),
                 mutated.resolve(),
             )
+
+    def test_scan_skips_binary_opens_and_xattrs_on_unrelated_assets_while_rejecting_eligible_aliases_and_seeing_mutations(self):
+        self._verify_asset_skip_alias_rejection_and_mutation_visibility()
+        if os.name == "posix":
+            fake_nt_os = types.SimpleNamespace(
+                **{k: v for k, v in vars(os).items() if k != "getxattr"},
+            )
+            fake_nt_os.name = "nt"
+            with (
+                mock.patch.object(workspace_links, "os", fake_nt_os),
+                mock.patch.object(sys.modules[__name__], "os", fake_nt_os),
+            ):
+                self._verify_asset_skip_alias_rejection_and_mutation_visibility()
 
     def test_case_insensitive_fs_preserves_exact_case_ranking_and_invalidates_across_case_variants(self):
         with tempfile.TemporaryDirectory() as root_dir:
