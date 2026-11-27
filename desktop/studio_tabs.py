@@ -1,18 +1,15 @@
 """Note tab model, cross-window tab drag/detach, note open/navigation, and close/recovery helpers."""
 from __future__ import annotations
 
-import copy, json, os, sys
+import copy, importlib, json, os, sys
 from pathlib import Path
 
 def _studio_module():
-    mod = sys.modules.get("studio") or sys.modules.get("desktop.studio")
-    if mod is not None:
-        return mod
-    if __package__:
-        from . import studio as mod
-    else:
-        import studio as mod
-    return mod
+    return (
+        sys.modules.get("studio")
+        or sys.modules.get("desktop.studio")
+        or importlib.import_module(".studio" if __package__ else "studio", __package__ or None)
+    )
 
 def _call_optional(obj, attr: str, *args, **kwargs):
     fn = getattr(obj, attr, None)
@@ -235,7 +232,7 @@ def focus_open_target(studio_obj, generation: int) -> None:
         )
 
 def open_note_workflow(
-    studio_obj, value, *, explicit: bool, activation_generation=None,
+    studio_obj, value, *, explicit: bool, background: bool = False, activation_generation=None,
     completion_callback=None, batch_insert=None, should_activate_fn=None, pending_heading=None,
 ) -> None:
     done = completion_callback or (lambda *_: None)
@@ -250,13 +247,13 @@ def open_note_workflow(
         done(None, "A folder cannot be opened as a document")
         return
     if activation_generation is None:
-        if explicit:
+        if explicit and not background:
             studio_obj._activation_generation += 1
         activation_generation = studio_obj._activation_generation
-    restoring = not explicit and str(path) in studio_obj._restoring_paths
+    restoring = not explicit and not background and str(path) in studio_obj._restoring_paths
 
     def activate_existing(target_tab):
-        if not (explicit and activation_generation == studio_obj._activation_generation) or (should_activate_fn is not None and not should_activate_fn(target_tab)):
+        if not (explicit and not background and activation_generation == studio_obj._activation_generation) or (should_activate_fn is not None and not should_activate_fn(target_tab)):
             return
         if pending_heading:
             target_tab["pendingHeading"] = pending_heading
@@ -313,8 +310,8 @@ def open_note_workflow(
         if restoring:
             keys = [entry["path"] or entry["id"] for entry in studio_obj._startup_entries] or studio_obj._startup_order
             studio_obj.tabs.sort(key=lambda t: keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
-        should_activate = bool(explicit and activation_generation == studio_obj._activation_generation and (should_activate_fn is None or should_activate_fn(note)))
-        if restoring and activation_generation == studio_obj._activation_generation:
+        should_activate = bool(not background and explicit and activation_generation == studio_obj._activation_generation and (should_activate_fn is None or should_activate_fn(note)))
+        if restoring and not background and activation_generation == studio_obj._activation_generation:
             target_active = studio_obj._startup_active or studio_obj.session.startup_active
             should_activate = str(path) == target_active or not any(t["id"] == studio_obj.active for t in studio_obj.tabs)
         if should_activate:
@@ -324,9 +321,9 @@ def open_note_workflow(
         studio_obj.settings["welcomed"] = True
         _prepend_recent(studio_obj, path, fops)
         studio_obj.recovery_timer.start(800)
-        emit_load = should_activate if (should_activate_fn is not None or explicit) else True
+        emit_load = False if background else (should_activate if (should_activate_fn is not None or explicit) else True)
         for window in list(studio_obj.session.windows.values()):
-            _call_optional(window, "_emit", emit_load) if window is studio_obj else _call_optional(window, "_emit")
+            _call_optional(window, "_emit", emit_load if window is studio_obj else not background)
         if explicit and should_activate:
             _call_method(studio_obj, "_focus_open_target", focus_open_target, activation_generation)
         done(note, None)
@@ -483,6 +480,9 @@ def finish_remove_tab(studio_obj, tab_id: str) -> None:
     _call_optional(studio_obj, "_emit")
 
 def request_window_close(studio_obj) -> bool:
+    bg, host = getattr(studio_obj.session, "background", None), getattr(studio_obj, "host_window", None)
+    if bg is not None and getattr(bg, "_stopping_from_cli", False) and host is not None and not host.isVisible():
+        return True
     dirty = next((t for t in studio_obj.tabs if _call_method(studio_obj, "_is_dirty", is_dirty, t) and _has_note_substance(t)), None)
     if not dirty:
         return True
@@ -493,7 +493,9 @@ def request_window_close(studio_obj) -> bool:
 
 def resolve_close(studio_obj, choice: str) -> None:
     if choice == "cancel":
-        studio_obj.pending_close = ""
+        was_window, studio_obj.pending_close = studio_obj.pending_close == "window", ""
+        if was_window:
+            _call_optional(getattr(studio_obj.session, "background", None), "cancel_quit")
     elif choice == "save":
         studio_obj.save()
     elif choice == "discard":

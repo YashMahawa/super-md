@@ -102,9 +102,10 @@ class StudioTabsTest(unittest.TestCase):
     def test_open_note_reuse_startup_restore_pending_heading_folder_redirect_and_navigation(self):
         vault = self.root / "vault"
         vault.mkdir()
-        alpha, beta = vault / "alpha.md", vault / "beta.md"
+        alpha, beta, gamma = vault / "alpha.md", vault / "beta.md", vault / "gamma.md"
         alpha.write_text("# Alpha\n\n## Details\n", encoding="utf-8")
         beta.write_text("# Beta\n", encoding="utf-8")
+        gamma.write_text("# Gamma\n", encoding="utf-8")
 
         picker_hits: list[int] = []
         self.studio.folderPickerRequested.connect(lambda: picker_hits.append(1))
@@ -152,6 +153,9 @@ class StudioTabsTest(unittest.TestCase):
         self.studio.tabNumber(1)
         self.assertEqual(self.studio.active, alpha_tab["id"])
         self.studio.tabNumber(9)
+        self.assertEqual(self.studio.active, beta_id)
+        self.studio._open_note(str(gamma), explicit=True, background=True)
+        self.assertTrue(_wait_until(lambda: any(t["path"] == str(gamma) for t in self.studio.tabs)))
         self.assertEqual(self.studio.active, beta_id)
 
     def test_tab_drag_move_preview_and_cross_window_transfer(self):
@@ -238,9 +242,17 @@ class StudioTabsTest(unittest.TestCase):
         self.studio.newNote()
         self.studio._current()["content"] = "Window close draft"
         allow_closes: list[int] = []
+        cancel_quits: list[int] = []
         self.studio.allowClose.connect(lambda: allow_closes.append(1))
+        self.session.background = SimpleNamespace(_stopping_from_cli=True, cancel_quit=lambda: cancel_quits.append(1))
+        self.studio.host_window = SimpleNamespace(isVisible=lambda: False)
+        self.assertTrue(self.studio.requestWindowClose())
+        self.studio.host_window = None
         self.assertFalse(self.studio.requestWindowClose())
         self.assertEqual(self.studio.pending_close, "window")
+        self.studio.resolveClose("cancel")
+        self.assertEqual((self.studio.pending_close, cancel_quits), ("", [1]))
+        self.assertFalse(self.studio.requestWindowClose())
         self.studio.resolveClose("discard")
         self.assertEqual((len(allow_closes), len(self.studio.closed_tabs)), (1, 1))
         self.assertEqual(self.session.closed_note_store.load(self.studio.closed_tabs[0])["content"], "Window close draft")
