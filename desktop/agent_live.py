@@ -500,7 +500,7 @@ def _qt_bridge_class():
                 except OSError:
                     pass
             self._enabled = True
-            self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, name="supermd-agent-live", daemon=True)
+            self.thread = threading.Thread(target=self.server.serve_forever, name="supermd-agent-live", daemon=True)
             self.thread.start()
             self.enabledChanged.emit()
             return self.status()

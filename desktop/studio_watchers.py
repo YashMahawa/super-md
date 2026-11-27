@@ -26,8 +26,8 @@ class _StoppedFileWatcher:
 _STOPPED_WATCHER = _StoppedFileWatcher()
 
 def _default_local_path(value: str) -> Path:
-    raw = QUrl(value).toLocalFile() if ("://" in value or value[:5].lower() == "file:") and QUrl(value).isLocalFile() else value
-    resolved = Path(raw).expanduser().resolve()
+    url = QUrl(value)
+    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
     return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
 
 def _default_preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:

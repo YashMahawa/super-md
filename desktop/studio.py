@@ -2,7 +2,6 @@
 from __future__ import annotations
 import base64
 import concurrent.futures
-import contextlib
 import copy
 import hashlib
 import http.client
@@ -369,8 +368,8 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(lambda host, **kwargs: _PinnedHTTPSConnection(host, pinned=pinned, **kwargs), request, context=client_context())
 
 def local_path(value: str) -> Path:
-    raw = QUrl(value).toLocalFile() if ("://" in value or value[:5].lower() == "file:") and QUrl(value).isLocalFile() else value
-    resolved = Path(raw).expanduser().resolve()
+    url = QUrl(value)
+    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
     return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
 
 
@@ -497,13 +496,10 @@ class Session(QObject):
         self._rename_state_lock = threading.RLock()
         self._retired_persist_needed = False
         self._last_recovered_window_id = ""
-        self._recovery_stamps: dict[str, tuple[object, int, int]] = {}
         self.data = Path(data) if data is not None else (Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio")
         self.data=self.data.resolve()
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)
-        if self.font_store.families:
-            Studio._cached_fonts = None
         self.python_outputs = PythonOutputs(self.data/"derived-python")
         self.reader_assets = ReaderAssetStore(self.reader_asset_is_current, self.reader_asset_payload)
         self.closed_note_store = ClosedNoteStore(self.data/"closed-notes")
@@ -580,9 +576,8 @@ class Session(QObject):
             if had_explicit_keep_in_background
             else bool(migrated_keep_in_background)
         )
-        if (isinstance(stored_settings, dict) and "shortcuts" in stored_settings) or not isinstance(self.settings.get("shortcuts"), dict):
-            shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
-            self.settings["shortcuts"] = shortcuts or default_shortcuts()
+        shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
+        self.settings["shortcuts"] = shortcuts or default_shortcuts()
         if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
             try:
                 atomic_write(
@@ -694,23 +689,9 @@ class Session(QObject):
             drafts_payload = [_snapshot_tab_state(tab, include_view_state=False) for tabs in self.drafts.values() for tab in tabs]
             return settings_bytes, positions_bytes, workspace_payload, drafts_payload
 
-    def _write_recovery_json(self, key: str, path: Path, value: object, *, check_equal: bool) -> None:
-        prev = self._recovery_stamps.get(key)
-        if check_equal and prev is not None and prev[0] == value and os.access(path.parent, os.W_OK) and not path.is_symlink():
-            with contextlib.suppress(OSError):
-                st = path.stat()
-                if (st.st_mtime_ns, st.st_size) == (prev[1], prev[2]): return
-        atomic_json(path, value)
-        self._recovery_stamps.pop(key, None)
-        if check_equal:
-            with contextlib.suppress(OSError):
-                st = path.stat()
-                self._recovery_stamps[key] = (copy.deepcopy(value), st.st_mtime_ns, st.st_size)
-
     def _enqueue_retired_persistence(self):
         if getattr(self.writes, "_shutdown", False):
             return
-        self._recovery_stamps.clear()
         settings_bytes, positions_bytes, workspace_payload, drafts_payload = self._build_retired_persistence_payloads()
         try:
             self.writes.submit(lambda: atomic_write(self.data / "settings.json", settings_bytes))
@@ -726,7 +707,6 @@ class Session(QObject):
             if not self._retired_persist_needed:
                 return
             self._retired_persist_needed = False
-            self._recovery_stamps.clear()
             settings_bytes, positions_bytes, workspace_payload, drafts_payload = self._build_retired_persistence_payloads()
         atomic_write(self.data / "settings.json", settings_bytes)
         atomic_write(self.data / "reading-positions.json", positions_bytes)
@@ -836,13 +816,8 @@ class Session(QObject):
         return payload if isinstance(payload, str) and id(payload) == grant.embedded_identity else None
 
 class Studio(QObject):
-    _BRAND_SVG_CACHE: dict[Path, str] = {}
-    _cached_fonts: list[str] | None = None
-    _cached_isolated_theme: tuple | None = None
     changed = Signal()
     sidebarChanged = Signal()
-    paletteChanged = Signal()
-    fontsChanged = Signal()
     tabsChanged = Signal()
     activeTabChanged = Signal()
     shortcutsChanged = Signal()
@@ -877,9 +852,7 @@ class Studio(QObject):
     def __init__(self, isolated: bool = False, session: Session | None = None):
         super().__init__()
         self.setObjectName("studio")
-        if ROOT not in Studio._BRAND_SVG_CACHE:
-            Studio._BRAND_SVG_CACHE[ROOT] = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
-        self._brand_svg = Studio._BRAND_SVG_CACHE[ROOT]
+        self._brand_svg = (ROOT/"public/brand-mark-fixed.svg").read_text(encoding="utf-8")
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
         self._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
         self._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
@@ -1000,13 +973,7 @@ class Studio(QObject):
         self._agent_job_records = {}
         self.reader_edits = ReaderEdits()
         self.system_dark = None
-        if isolated and not os.environ.get("SUPERMD_SYSTEM_PALETTE"):
-            scheme = QGuiApplication.styleHints().colorScheme().name
-            if Studio._cached_isolated_theme is None or Studio._cached_isolated_theme[0] != scheme:
-                Studio._cached_isolated_theme = (scheme, (detect_system_dark(scheme), read_system_palette()))
-            self.system_mode, self.system_colors = Studio._cached_isolated_theme[1][1]
-        else:
-            self.system_mode, self.system_colors = read_system_palette()
+        self.system_mode, self.system_colors = read_system_palette()
         self._theme_result = None
         self._theme_running = False
         self._theme_pending = False
@@ -1033,7 +1000,7 @@ class Studio(QObject):
         self.custom_theme_watcher.directoryChanged.connect(lambda *_:self.custom_theme_timer.start())
         QTimer.singleShot(0,self._restore_custom_theme)
         self.system_preferences = QProcess(self)
-        if not isolated and sys.platform.startswith("linux") and shutil.which("gsettings"):
+        if sys.platform.startswith("linux") and shutil.which("gsettings"):
             self.system_preferences.readyReadStandardOutput.connect(self._system_setting_changed)
             self.system_preferences.start("gsettings",["monitor","org.gnome.desktop.interface"])
         self.theme_timer = QTimer(self)
@@ -1138,16 +1105,7 @@ class Studio(QObject):
         self._emitted_sidebar_key = self._sidebar_slice_key()
         self._emitted_tabs_key = self._tabs_slice_key()
         self._emitted_active_tab_id = self.active if self.tabs else ""
-        self._emitted_palette_key = self._palette_slice_key()
-        if isolated and not os.environ.get("SUPERMD_SYSTEM_PALETTE") and type(self)._refresh_theme is Studio._refresh_theme:
-            scheme = QGuiApplication.styleHints().colorScheme().name
-            if Studio._cached_isolated_theme is None or Studio._cached_isolated_theme[0] != scheme:
-                Studio._cached_isolated_theme = (scheme, (detect_system_dark(scheme), read_system_palette()))
-            self._theme_result = Studio._cached_isolated_theme[1]
-            self.system_dark, (self.system_mode, self.system_colors) = self._theme_result
-            self._emitted_palette_key = self._palette_slice_key()
-        else:
-            self._refresh_theme()
+        self._refresh_theme()
         # Only the first real desktop window may restore the user's opted-in
         # cloud connection. The cloud client handles network retry/backoff.
         if not isolated and len(self.session.windows) == 1 and self.settings.get("cloudAgentEnabled"):
@@ -1317,26 +1275,12 @@ class Studio(QObject):
             self._emitted_active_tab_id = active_id
             self.activeTabChanged.emit()
 
-    def _palette_slice_key(self):
-        dark, _ = self._tokens()
-        saved = tuple((i.get("id"), i.get("name"), i.get("source")) for i in self.session.saved_themes)
-        s = self.settings
-        return (dark, getattr(self, "_token_key", None), id(self.session.custom_theme), self.session.active_theme_kind,
-                self.session.active_theme_id, bool(self.session.theme_source), saved, s["theme"], s["fullTheme"], self.fullscreen,
-                s.get("patternKind", ""), s.get("patternOpacity", -1), s.get("patternSize", 0), s.get("patternSpacing", 0))
-
-    def _notify_palette(self):
-        if not self.retired and (key := self._palette_slice_key()) != getattr(self, "_emitted_palette_key", None):
-            self._emitted_palette_key = key
-            self.paletteChanged.emit()
-
     def _emit(self, load=True):
         if self.retired: return
         self._preview_jobs.retain_tabs(tab["id"] for tab in self.tabs)
         self._watch_notes()
         self._notify_sidebar()
         self._notify_tabs()
-        self._notify_palette()
         self.changed.emit()
         if load and self.ready and self.tabs:
             tab = self._current()
@@ -1363,37 +1307,37 @@ class Studio(QObject):
 
     def _colors(self): return studio_chrome.colors_for(self)
 
-    @Property("QVariantMap", notify=paletteChanged)
+    @Property("QVariantMap", notify=changed)
     def palette(self): return studio_chrome.palette(self)
 
-    @Property("QVariantMap",notify=paletteChanged)
+    @Property("QVariantMap",notify=changed)
     def themeMetrics(self): return studio_chrome.theme_metrics(self.session.custom_theme)
 
-    @Property(str,notify=paletteChanged)
+    @Property(str,notify=changed)
     def customThemeName(self): return studio_chrome.custom_theme_name(self.session.custom_theme)
 
-    @Property(bool,notify=paletteChanged)
+    @Property(bool,notify=changed)
     def customThemeActive(self): return studio_chrome.custom_theme_active(self.session.custom_theme)
 
     @Property("QVariantList",constant=True)
     def bundledThemes(self): return studio_chrome.bundled_themes(ROOT)
 
-    @Property("QVariantList",notify=paletteChanged)
+    @Property("QVariantList",notify=changed)
     def savedThemes(self): return studio_chrome.saved_themes(self.session)
 
-    @Property(str,notify=paletteChanged)
+    @Property(str,notify=changed)
     def activeThemeKind(self): return studio_chrome.active_theme_kind(self.session)
 
-    @Property(str,notify=paletteChanged)
+    @Property(str,notify=changed)
     def activeThemeId(self): return studio_chrome.active_theme_id(self.session)
 
-    @Property(bool,notify=paletteChanged)
+    @Property(bool,notify=changed)
     def customThemeHasSource(self): return studio_chrome.custom_theme_has_source(self.session)
 
-    @Property("QVariantMap",notify=paletteChanged)
+    @Property("QVariantMap",notify=changed)
     def themeArtwork(self): return studio_chrome.theme_artwork(self.session.custom_theme, self.settings, fullscreen=self.fullscreen, dark=self._dark())
 
-    @Property("QVariantMap",notify=paletteChanged)
+    @Property("QVariantMap",notify=changed)
     def themeBackground(self): return studio_chrome.theme_background(self.session.custom_theme, self.settings, dark=self._dark())
 
     @Slot()
@@ -2250,12 +2194,10 @@ class Studio(QObject):
                 if 0 <= point.x() <= strip.width() and 0 <= point.y() <= strip.height(): return
         self.detachTab(tab_id)
 
-    @Property("QStringList", notify=fontsChanged)
+    @Property("QStringList", notify=changed)
     def fonts(self):
-        if Studio._cached_fonts is None:
-            preferred = ["Manrope", "Roboto", "Noto Sans", "Noto Serif", "JetBrains Mono", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]
-            Studio._cached_fonts = preferred + sorted(set(QFontDatabase.families()) - set(preferred))
-        return list(Studio._cached_fonts)
+        preferred = ["Manrope", "Roboto", "Noto Sans", "Noto Serif", "JetBrains Mono", "Libertinus Serif", "New Computer Modern", "DejaVu Sans Mono"]
+        return preferred + sorted(set(QFontDatabase.families()) - set(preferred))
 
     @Property(bool, constant=True)
     def fedoraWindowFrame(self):
@@ -2342,16 +2284,13 @@ class Studio(QObject):
     def importFont(self,value):
         try:
             family=self.session.font_store.import_file(local_path(value))
-            Studio._cached_fonts = None
-            for window in tuple(self.session.windows.values()):
-                if not window.retired: window.fontsChanged.emit()
             self.settings["font"] = family
             self.message = "Imported " + family + " for reading and PDF export"
             self._preferences(); self._emit()
         except (OSError,ValueError) as error:
             self.message = str(error); self._emit(False)
 
-    @Property(str,notify=paletteChanged)
+    @Property(str,notify=changed)
     def brand(self):
         svg = self._brand_svg
         colors = self._colors()
@@ -2503,9 +2442,8 @@ class Studio(QObject):
             # Snapshot only unsaved tabs. Asset bytes stay in recovery, never in displayed source.
             self.session.drafts[self.window_id] = [_snapshot_tab_state(t, include_view_state=False) for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])]
             drafts = [_snapshot_tab_state(tab, include_view_state=False) for tabs in self.session.drafts.values() for tab in tabs]
-        check_drafts = not drafts or all(not t.get("assets") and len(t.get("content", "")) < 32768 for t in drafts)
-        self.session.writes.submit_latest("startup",lambda:self.session._write_recovery_json("startup",self.data/"startup.json",workspace,check_equal=True),lambda error:self._notify_recovery_write("startup",error))
-        self.session.writes.submit_latest("recovery",lambda:self.session._write_recovery_json("recovery",self.data/"recovery.json",drafts,check_equal=check_drafts),lambda error:self._notify_recovery_write("recovery",error))
+        self.session.writes.submit_latest("startup",lambda:atomic_json(self.data/"startup.json",workspace),lambda error:self._notify_recovery_write("startup",error))
+        self.session.writes.submit_latest("recovery",lambda:atomic_json(self.data/"recovery.json",drafts),lambda error:self._notify_recovery_write("recovery",error))
 
     def _notify_recovery_write(self,category,error):
         try:self.completed.emit((self._recovery_write_completed,(category,error),None,False))
