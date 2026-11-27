@@ -20,6 +20,8 @@ import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersona
 import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type {SourceChange} from '../readerEdits';
+import {navigateExternalLink,navigateWorkspaceLink,resolveHeadingOffset} from '../documentNavigation';
+import {findSourceLinkAtOffset} from '../workspaceLinks';
 import {
   TYPEWRITER_SHORTCUT,
   centerCursorEffect,
@@ -43,6 +45,7 @@ interface Props extends WritingOptions {
   typewriterScroll?:boolean;
   onTypewriterChange?:(enabled:boolean)=>void;
   sessionId?: string;
+  documentPath?: string | null;
   value: string;
   onChange: (value: string, changes?:SourceChange[]) => void;
   dark: boolean;
@@ -377,11 +380,13 @@ export function importEditorSession(id: string, data: PortableEditorSession | un
   incomingWeights.set(id,size);let retained=[...incomingWeights.values()].reduce((n,size)=>n+size,0);
   while(incomingSessions.size>40||retained>4_000_000){const first=incomingSessions.keys().next().value!;incomingSessions.delete(first);retained-=incomingWeights.get(first)||0;incomingWeights.delete(first);}
 }
-export default function Editor({ sessionId = "default", value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,onTypewriterChange }: Props) {
+export default function Editor({ sessionId = "default", documentPath = null, value, onChange, dark, focusMode,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,onTypewriterChange }: Props) {
   pasteSettings.set(sessionId,latexAutofix);
   typewriterHandlers.set(sessionId,onTypewriterChange);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
+  const documentPathRef = useRef(documentPath);
+  documentPathRef.current = documentPath;
   const changeHandler = useRef(onChange);
   changeHandler.current = onChange;
   callbacks.set(sessionId, onChange);
@@ -473,7 +478,37 @@ export default function Editor({ sessionId = "default", value, onChange, dark, f
         lineNumbers(),
         foldGutter(),
         history({ minDepth: 30 }),
-        EditorView.domEventHandlers({paste(event,editor){
+        EditorView.domEventHandlers({
+          mousedown(event, editor) {
+            if (event.button !== 0 || (!event.ctrlKey && !event.metaKey) || event.altKey || event.shiftKey) return false;
+            const pos = editor.posAtCoords({x: event.clientX, y: event.clientY});
+            if (pos === null) return false;
+            for (let node = syntaxTree(editor.state).resolveInner(pos, 0); node; node = node.parent!) {
+              if (['FencedCode', 'CodeBlock', 'InlineCode', 'HTMLBlock', 'Image'].includes(node.name)) return false;
+            }
+            const line = editor.state.doc.lineAt(pos);
+            const classified = findSourceLinkAtOffset(line.text, pos - line.from);
+            if (!classified || classified.kind === 'none') return false;
+            event.preventDefault();
+            if (classified.kind === 'same-note') {
+              const targetOffset = resolveHeadingOffset(editor.state.doc.toString(), classified.fragment);
+              if (targetOffset !== null) {
+                editor.dispatch({selection: {anchor: targetOffset}, effects: EditorView.scrollIntoView(targetOffset, {y: 'start'})});
+                editor.focus();
+              }
+              return true;
+            }
+            if (classified.kind === 'workspace') {
+              navigateWorkspaceLink(classified, documentPathRef.current);
+              return true;
+            }
+            if (classified.kind === 'external') {
+              navigateExternalLink(classified.url, true);
+              return true;
+            }
+            return true;
+          },
+          paste(event,editor){
           if(event.defaultPrevented||event.clipboardData?.files.length)return false;
           const text=event.clipboardData?.getData('text/plain');
           if(!text)return false;
