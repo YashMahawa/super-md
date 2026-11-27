@@ -30,6 +30,10 @@ class QuietStudio(Studio):
         return
 
 
+def _qt_url_local_path(url: QUrl) -> Path:
+    return Path(url.toLocalFile())
+
+
 class FakeHostWindow(QObject):
     def __init__(self, *, visible: bool = True):
         super().__init__()
@@ -366,27 +370,60 @@ class ExternalFileOpenRouterUnitTest(unittest.TestCase):
         routed_folder_win = self.router.open_requested(str(study_folder))
         self.assertIs(routed_folder_win, win)
         self._wait_for(lambda: [entry["name"] for entry in win.files] == ["expected-study.md"])
-        self.assertEqual(win.folder, str(study_folder.resolve()))
+        expected_study_folder = Path(folder_ops.strip_extended_length_prefix(str(study_folder.resolve())))
+        expected_decoy_folder = Path(folder_ops.strip_extended_length_prefix(str(decoy_folder.resolve())))
+        self.assertEqual(win.folder, str(expected_study_folder))
+        self.assertEqual(os.fsencode(win.folder), os.fsencode(expected_study_folder))
+        self.assertEqual(Path(win.folder).name, folder_name)
+        self.assertFalse(folder_ops.same_path(win.folder, decoy_folder))
         self.assertTrue(win.folder.endswith(" ") if os.name != "nt" else win.folder.endswith(" Study folder"))
-        self.assertEqual(win.defaultSaveFolder().toLocalFile(), str(study_folder.resolve()))
+
+        save_folder_url = win.defaultSaveFolder()
+        save_folder_local = save_folder_url.toLocalFile()
+        save_folder_path = _qt_url_local_path(save_folder_url)
+        self.assertEqual(save_folder_url, QUrl.fromLocalFile(str(expected_study_folder)))
+        self.assertEqual(save_folder_path, expected_study_folder)
+        self.assertEqual(os.fsencode(save_folder_path), os.fsencode(expected_study_folder))
+        self.assertNotEqual(save_folder_path, expected_decoy_folder)
+        self.assertTrue(folder_ops.same_path(save_folder_local, expected_study_folder))
+        self.assertFalse(folder_ops.same_path(save_folder_local, decoy_folder))
+        self.assertEqual(folder_ops._pure_path(save_folder_local).name, folder_name)
+        self.assertTrue(save_folder_local.endswith(" ") if os.name != "nt" else save_folder_local.endswith(" Study folder"))
+
+        save_location_url = win.defaultSaveLocation("Untitled.md")
+        save_location_local = save_location_url.toLocalFile()
+        save_location_path = _qt_url_local_path(save_location_url)
+        expected_save_location = expected_study_folder / "Untitled.md"
+        self.assertEqual(save_location_url, QUrl.fromLocalFile(str(expected_save_location)))
+        self.assertEqual(save_location_path, expected_save_location)
+        self.assertEqual(os.fsencode(save_location_path), os.fsencode(expected_save_location))
+        self.assertEqual(folder_ops._pure_path(save_location_local).parent.name, folder_name)
+        self.assertEqual(folder_ops._pure_path(save_location_local).name, "Untitled.md")
+
         self.assertEqual([t["id"] for t in win.tabs], preserved_tab_ids)
         self.assertEqual(folder_signals, [True])
 
         note_name = " Study note .md " if os.name != "nt" else " Study note.md"
         outer_ws_note = study_folder / note_name
         outer_ws_note.write_text("# Outer Whitespace Note", encoding="utf-8")
+        expected_outer_ws_note = Path(folder_ops.strip_extended_length_prefix(str(outer_ws_note.resolve())))
         routed_note_win = self.router.open_requested(str(outer_ws_note))
         self.assertIs(routed_note_win, win)
-        self._wait_for(lambda: any(t["path"] == str(outer_ws_note.resolve()) for t in win.tabs))
+        self._wait_for(lambda: any(t["path"] == str(expected_outer_ws_note) for t in win.tabs))
         self.assertEqual(win._current()["name"], note_name)
-        self.assertEqual(win._current()["path"], str(outer_ws_note.resolve()))
+        self.assertEqual(Path(win._current()["path"]).name, note_name)
+        self.assertEqual(win._current()["path"], str(expected_outer_ws_note))
+        self.assertEqual(os.fsencode(win._current()["path"]), os.fsencode(expected_outer_ws_note))
+        self.assertEqual(_qt_url_local_path(win.defaultSaveAsFolder()), expected_study_folder)
+        self.assertEqual(_qt_url_local_path(win.defaultSaveAsLocation(note_name)), expected_outer_ws_note)
 
         # Requesting the same outer-whitespace note again reuses its existing tab.
         win.selectTab(preserved_tab_ids[0])
         reused_win = self.router.open_requested(str(outer_ws_note))
         self.assertIs(reused_win, win)
         self.assertEqual(len(win.tabs), 2)
-        self.assertEqual(win._current()["path"], str(outer_ws_note.resolve()))
+        self.assertEqual(win._current()["path"], str(expected_outer_ws_note))
+        self.assertEqual(os.fsencode(win._current()["path"]), os.fsencode(expected_outer_ws_note))
 
 
 def _forward_via_broker_client(app_name: str, target: str) -> None:
@@ -419,7 +456,7 @@ def _external_route_e2e_probe() -> None:
     if not broker.claim_or_forward(None):
         raise RuntimeError("Primary InstanceBroker failed to claim fresh test lock")
 
-    with tempfile.TemporaryDirectory(prefix="supermd-ext-route-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="supermd-ext-route-", ignore_cleanup_errors=True) as tmp:
         tmp_path = Path(tmp)
         probe_html = tmp_path / "probe-reader.html"
         probe_html.write_text(
@@ -629,7 +666,10 @@ def _external_route_e2e_probe() -> None:
                 desc="modal-blocked win1 skipped in favor of eligible win3",
             )
             win1.host_window.setProperty("settingsOpen", False)
-            app.processEvents()
+            pump_until(
+                lambda: int(win1.host_window.property("modalDialogCount") or 0) == 0,
+                desc="win1 settings modal closed",
+            )
 
             # 8. Real QFileOpenEvent and real InstanceBroker IPC with valid outer-whitespace
             #    folder ('Study folder ' on POSIX / ' Study folder' on Windows) and note paths:
@@ -644,13 +684,26 @@ def _external_route_e2e_probe() -> None:
             ws_decoy.mkdir()
             (ws_folder / "outer-space-chapter.md").write_text("# Outer Space Chapter", encoding="utf-8")
             (ws_decoy / "wrong-decoy.md").write_text("# Wrong Decoy", encoding="utf-8")
+            expected_ws_folder = Path(folder_ops.strip_extended_length_prefix(str(ws_folder.resolve())))
 
             app.sendEvent(app, QFileOpenEvent(str(ws_folder)))
             pump_until(
-                lambda: win1.folder == str(ws_folder.resolve())
+                lambda: win1.folder == str(expected_ws_folder)
                 and [entry["name"] for entry in win1.files] == ["outer-space-chapter.md"],
-                desc="QFileOpenEvent folder with outer whitespace ('Study folder ')",
+                desc="QFileOpenEvent folder with outer whitespace",
             )
+            if os.fsencode(win1.folder) != os.fsencode(expected_ws_folder) or Path(win1.folder).name != ws_folder_name:
+                raise AssertionError(f"Outer-whitespace folder bytes/basename mismatch: {win1.folder!r}")
+            if folder_ops.same_path(win1.folder, ws_decoy):
+                raise AssertionError(f"Outer-whitespace folder collided with decoy: {win1.folder!r}")
+            e2e_save_folder_local = win1.defaultSaveFolder().toLocalFile()
+            if (
+                _qt_url_local_path(win1.defaultSaveFolder()) != expected_ws_folder
+                or folder_ops._pure_path(e2e_save_folder_local).name != ws_folder_name
+                or folder_ops.same_path(e2e_save_folder_local, ws_decoy)
+                or _qt_url_local_path(win1.defaultSaveLocation("Untitled.md")) != expected_ws_folder / "Untitled.md"
+            ):
+                raise AssertionError(f"Outer-whitespace defaultSaveFolder mismatch: {e2e_save_folder_local!r}")
             if [t["id"] for t in win1.tabs] != win1_tabs_before_ws_folder:
                 raise AssertionError(f"Opening outer-whitespace folder altered win1 tabs: {win1.tabs}")
             if not bool(win1.host_window.property("sidebar")) or win1.host_window.property("sidebarSection") != "folder":
@@ -659,21 +712,24 @@ def _external_route_e2e_probe() -> None:
             ws_note_name = " Broker study note .md " if os.name != "nt" else " Broker study note.md"
             ws_note = ws_folder / ws_note_name
             ws_note.write_text("# Outer Whitespace Broker Note", encoding="utf-8")
+            expected_ws_note = Path(folder_ops.strip_extended_length_prefix(str(ws_note.resolve())))
             send_broker_open(str(ws_note))
             pump_until(
-                lambda: win1._current()["path"] == str(ws_note.resolve())
+                lambda: win1._current()["path"] == str(expected_ws_note)
                 and win1._current()["name"] == ws_note_name,
                 desc="InstanceBroker note with outer whitespace",
             )
+            if os.fsencode(win1._current()["path"]) != os.fsencode(expected_ws_note):
+                raise AssertionError(f"Outer-whitespace note path bytes mismatch: {win1._current()['path']!r}")
             win1_tab_count = len(win1.tabs)
 
             # Re-open the same outer-whitespace note via QFileOpenEvent while win3 is active:
             # reuses win1's existing tab without creating a duplicate tab or extra window!
             win1.selectTab(win1_tabs_before_ws_folder[0])
             app.sendEvent(win3.host_window, QEvent(QEvent.Type.WindowActivate))
-            app.sendEvent(app, QFileOpenEvent(str(ws_note)))
+            app.sendEvent(app, QFileOpenEvent(QUrl.fromLocalFile(str(ws_note))))
             pump_until(
-                lambda: win1._current()["path"] == str(ws_note.resolve()),
+                lambda: win1._current()["path"] == str(expected_ws_note),
                 desc="QFileOpenEvent reuse of outer-whitespace note tab",
             )
             if len(win1.tabs) != win1_tab_count or len(studios) != 3:
@@ -703,7 +759,10 @@ def _external_route_e2e_probe() -> None:
                 studio.stop()
                 studio.pool.shutdown(wait=True)
                 studio._search_pool.shutdown(wait=True)
+                studio.deleteLater()
             session.writes.shutdown(wait=True)
+            app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            app.processEvents()
 
 
 class ExternalFileOpenEndToEndRouteTest(unittest.TestCase):
