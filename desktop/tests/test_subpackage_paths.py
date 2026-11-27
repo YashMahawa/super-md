@@ -151,12 +151,17 @@ class SubpackagePathsTest(unittest.TestCase):
                 "assert linux_appdata == (smoke_root / 'linux/service-data/SuperMD/super-md').resolve()\n"
                 "assert linux_env['QT_QUICK_BACKEND'] == 'software'\n"
                 "assert 'CFFIXED_USER_HOME' not in linux_env and 'QT_WAYLAND_CLIENT_BUFFER_INTEGRATION' not in linux_env\n"
-                "mac_appdata, _ = check_packaged.service_appdata_path(smoke_root / 'mac', {}, platform='darwin')\n"
+                "mac_appdata, mac_env = check_packaged.service_appdata_path(\n"
+                "    smoke_root / 'mac', {'CFFIXED_USER_HOME': '/stale'}, platform='darwin'\n"
+                ")\n"
+                "expected_mac_home = str((smoke_root / 'mac/service-home').resolve())\n"
                 "assert mac_appdata == (smoke_root / 'mac/service-home/Library/Application Support/SuperMD/super-md').resolve()\n"
-                "win_appdata, _ = check_packaged.service_appdata_path(\n"
-                "    smoke_root / 'win', {'APPDATA': str(smoke_root / 'roaming')}, platform='win32'\n"
+                "assert mac_env['HOME'] == expected_mac_home and mac_env['CFFIXED_USER_HOME'] == expected_mac_home\n"
+                "win_appdata, win_env = check_packaged.service_appdata_path(\n"
+                "    smoke_root / 'win', {'APPDATA': str(smoke_root / 'roaming'), 'CFFIXED_USER_HOME': '/stale'}, platform='win32'\n"
                 ")\n"
                 "assert win_appdata == (smoke_root / 'roaming').resolve() / 'SuperMD/super-md'\n"
+                "assert 'CFFIXED_USER_HOME' not in win_env\n"
             )
             env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
             completed = subprocess.run(
@@ -169,6 +174,43 @@ class SubpackagePathsTest(unittest.TestCase):
                 timeout=15,
             )
             self.assertEqual(completed.returncode, 0, completed.stdout + "\n" + completed.stderr)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group cleanup check")
+    def test_check_service_smoke_cleans_up_daemon_when_sessions_dir_diverges(self) -> None:
+        import check_packaged
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            wrong_appdata = root / "wrong-appdata/SuperMD/super-md"
+            (wrong_appdata / "qt-studio/agent-sessions").mkdir(parents=True)
+            fake_exe = root / "fake-super-md"
+            fake_exe.write_text(
+                f"#!{sys.executable}\n"
+                "import json, subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                f"wrong = Path({str(wrong_appdata)!r})\n"
+                "args = sys.argv[1:]\n"
+                "if args == ['agent', 'service', 'status']:\n"
+                "    print(json.dumps({'ok': True, 'result': {'running': False, 'action': 'status'}}))\n"
+                "    raise SystemExit(0)\n"
+                "if args == ['agent', 'service', 'start']:\n"
+                "    proc = subprocess.Popen(\n"
+                "        [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+                "        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+                "        start_new_session=True,\n"
+                "    )\n"
+                "    (wrong / 'native-instance.lock').write_text(f'{proc.pid}\\nsuper-md\\n', encoding='utf-8')\n"
+                "    sessions = wrong / 'qt-studio/agent-sessions'\n"
+                "    print(json.dumps({'ok': True, 'result': {'running': True, 'action': 'start', 'sessionsDirectory': str(sessions)}}))\n"
+                "    raise SystemExit(0)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            fake_exe.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "unexpected sessionsDirectory"):
+                check_packaged.check_service_smoke(fake_exe, root / "smoke", dict(os.environ))
+            leaked_pid = int((wrong_appdata / "native-instance.lock").read_text(encoding="utf-8").splitlines()[0])
+            self.assertFalse(check_packaged._pid_alive(leaked_pid))
 
 
 if __name__ == "__main__":

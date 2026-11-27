@@ -68,6 +68,7 @@ def service_appdata_path(root: Path, env: dict[str, str], *, platform: str = sys
     if platform == "darwin":
         for sub in ("Library/Application Support", "Library/Caches", "Library/Preferences"):
             (home / sub).mkdir(parents=True, exist_ok=True)
+        service_env["CFFIXED_USER_HOME"] = str(home)
         return (home / "Library/Application Support/SuperMD/super-md").resolve(), service_env
     if platform == "win32":
         roaming = env.get("APPDATA") or os.environ.get("APPDATA")
@@ -128,6 +129,17 @@ def _read_lock_pid(appdata: Path) -> tuple[int, int | None]:
     return pid, pgid
 
 
+def _try_read_lock_pid(*candidates: Path) -> tuple[int | None, int | None]:
+    for candidate in candidates:
+        lock_file = candidate / "native-instance.lock"
+        if lock_file.is_file():
+            try:
+                return _read_lock_pid(candidate)
+            except (OSError, RuntimeError):
+                continue
+    return None, None
+
+
 def _stop_process_tree(pid: int | None, pgid: int | None) -> None:
     if os.name == "nt":
         if not pid or not _pid_alive(pid):
@@ -143,6 +155,11 @@ def _stop_process_tree(pid: int | None, pgid: int | None) -> None:
                 time.sleep(0.1)
         return
     own_pgid = os.getpgrp()
+    if pgid and pgid != own_pgid and _pgid_alive(pgid):
+        try:
+            os.killpg(int(pgid), signal.SIGTERM)
+        except OSError:
+            pass
     if pid and _pid_alive(pid):
         try:
             os.kill(int(pid), signal.SIGTERM)
@@ -245,11 +262,14 @@ def check_service_smoke(executable: Path, root: Path, env: dict[str, str]) -> di
 
         started = run_cli_json("agent", "service", "start", timeout=60)
         start_result = started.get("result") if isinstance(started.get("result"), dict) else {}
+        sessions_raw = str(start_result.get("sessionsDirectory", ""))
+        sessions_dir = Path(sessions_raw).resolve() if sessions_raw else Path()
+        actual_appdata = sessions_dir.parents[1] if sessions_raw and len(sessions_dir.parents) >= 2 else appdata
+        active_pid, active_pgid = _try_read_lock_pid(appdata, actual_appdata)
         if not started.get("ok") or start_result.get("running") is not True or start_result.get("action") != "start":
             raise RuntimeError(f"Packaged service failed to start: {started}{service_log_tail()}")
-        sessions_dir = Path(str(start_result.get("sessionsDirectory", ""))).resolve()
         expected_sessions = (appdata / "qt-studio" / "agent-sessions").resolve()
-        if sessions_dir != expected_sessions:
+        if not sessions_raw or sessions_dir != expected_sessions:
             raise RuntimeError(f"Packaged service used unexpected sessionsDirectory {sessions_dir} != {expected_sessions}")
         if len(list(sessions_dir.glob("*.json"))) != 1:
             raise RuntimeError(f"Expected 1 live discovery session file in {sessions_dir}")
@@ -291,6 +311,7 @@ def check_service_smoke(executable: Path, root: Path, env: dict[str, str]) -> di
 
         restarted = run_cli_json("agent", "service", "start", timeout=60)
         restart_result = restarted.get("result") if isinstance(restarted.get("result"), dict) else {}
+        active_pid, active_pgid = _try_read_lock_pid(appdata)
         if not restarted.get("ok") or restart_result.get("running") is not True:
             raise RuntimeError(f"Packaged service failed to restart for note forwarding: {restarted}{service_log_tail()}")
         active_pid, active_pgid = _read_lock_pid(appdata)
@@ -358,7 +379,8 @@ def check(executable: Path, version: str, graphics: str) -> None:
     executable = executable.resolve()
     if sys.platform == "darwin":
         require_macos_qtwebengine_process(executable.parents[2])
-    with tempfile.TemporaryDirectory(prefix="supermd-packaged-check-") as folder:
+    folder = tempfile.mkdtemp(prefix="supermd-packaged-check-")
+    try:
         root = Path(folder)
         env = dict(os.environ, XDG_CONFIG_HOME=str(root / "config"),
                    XDG_DATA_HOME=str(root / "data"), XDG_CACHE_HOME=str(root / "cache"),
@@ -447,6 +469,8 @@ def check(executable: Path, version: str, graphics: str) -> None:
                           "readerColors":evidence['readerColors'],"pdfBytes":pdf.stat().st_size,
                           "trustedCAsWithoutHostPaths":tls_evidence['x509_ca'],
                           "serviceSmoke":service_evidence["serviceSmoke"]}))
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 if __name__ == "__main__":
