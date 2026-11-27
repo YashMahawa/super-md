@@ -1061,6 +1061,7 @@ class Studio(QObject):
         self._folder_search_include_diagrams = False
         self._folder_search_matches: list[dict] = []
         self._folder_search_scanning = False
+        self._folder_search_pending = False
         self._folder_search_scanned_files = 0
         self._folder_search_truncated = False
         self._folder_search_generation = 0
@@ -1645,6 +1646,7 @@ class Studio(QObject):
         if self._storage_cancel_event is not None:self._storage_cancel_event.set()
         self._cancel_subfolder_search()
         if self._folder_search_cancel is not None:self._folder_search_cancel.set()
+        self._folder_search_pending = False
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
         self._python_jobs.cancel_all(retire=True)
@@ -1890,7 +1892,8 @@ class Studio(QObject):
             "caseSensitive": self._folder_search_case_sensitive,
             "includeDiagrams": self._folder_search_include_diagrams,
             "matches": self._folder_search_matches,
-            "scanning": self._folder_search_scanning or sync_pending,
+            "pending": self._folder_search_pending,
+            "scanning": self._folder_search_scanning or self._folder_search_pending or sync_pending,
             "scannedFiles": self._folder_search_scanned_files,
             "truncated": self._folder_search_truncated,
             "hasFolder": bool(self.folder),
@@ -1926,6 +1929,7 @@ class Studio(QObject):
             self._folder_search_cancel = None
         self._folder_search_generation += 1
         self._folder_search_scanning = False
+        self._folder_search_pending = False
         if close:
             self._folder_search_open = False
             self._folder_search_matches = []
@@ -1941,6 +1945,7 @@ class Studio(QObject):
         if self.retired:
             return
         self._folder_search_open = True
+        self._folder_search_pending = False
         self._folder_search_tabs_sig = None
         if self.ready and self.tabs and not self.flush_operation:
             self._flush("sync_for_search")
@@ -1949,6 +1954,27 @@ class Studio(QObject):
             self.workspaceSearchChanged.emit()
             if self._folder_search_query.strip():
                 self._start_folder_search()
+
+    @Slot(str, bool, bool)
+    def prepareFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
+        if self.retired:
+            return
+        self._folder_search_query = query if isinstance(query, str) else ""
+        self._folder_search_case_sensitive = bool(case_sensitive)
+        self._folder_search_include_diagrams = bool(include_diagrams)
+        if not self._folder_search_open:
+            self._folder_search_open = True
+        if self._folder_search_cancel is not None:
+            self._folder_search_cancel.set()
+            self._folder_search_cancel = None
+        self._folder_search_generation += 1
+        self._folder_search_matches = []
+        self._folder_search_scanned_files = 0
+        self._folder_search_truncated = False
+        self._folder_search_tabs_sig = None
+        self._folder_search_scanning = False
+        self._folder_search_pending = bool(self._folder_search_query.strip())
+        self.workspaceSearchChanged.emit()
 
     @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
@@ -1967,6 +1993,7 @@ class Studio(QObject):
             self._folder_search_cancel = None
         self._folder_search_generation += 1
         generation = self._folder_search_generation
+        self._folder_search_pending = False
         self._folder_search_matches = []
         self._folder_search_scanned_files = 0
         self._folder_search_truncated = False
@@ -2023,14 +2050,14 @@ class Studio(QObject):
 
     @Slot()
     def closeFolderSearch(self):
-        if not self._folder_search_open and not self._folder_search_scanning:
+        if not self._folder_search_open and not self._folder_search_scanning and not self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
 
     @Slot()
     def cancelWorkspaceSearch(self):
-        changed = self._folder_search_open or self._folder_search_scanning
+        changed = self._folder_search_open or self._folder_search_scanning or self._folder_search_pending
         self._cancel_folder_search(close=True)
         if changed:
             self.workspaceSearchChanged.emit()
@@ -2048,7 +2075,7 @@ class Studio(QObject):
         source_end: int = -1,
         match_text: str = "",
     ):
-        if self.retired:
+        if self.retired or self._folder_search_pending:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
@@ -4170,11 +4197,14 @@ class Studio(QObject):
         elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
-                current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
-                if current_sig != self._folder_search_tabs_sig:
-                    self._start_folder_search()
-                else:
+                if self._folder_search_pending:
                     self.workspaceSearchChanged.emit()
+                else:
+                    current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
+                    if current_sig != self._folder_search_tabs_sig:
+                        self._start_folder_search()
+                    else:
+                        self.workspaceSearchChanged.emit()
         elif operation["action"] == "open_search_match":
             request = json.loads(operation["target"])
             tab_id = request.get("tabId") or ""
@@ -4620,7 +4650,7 @@ class Studio(QObject):
             win._recover()
             if win.folder:
                 win._load_tree()
-            if win._folder_search_open and win._folder_search_query.strip():
+            if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
                 win._start_folder_search()
             win._emit()
 
