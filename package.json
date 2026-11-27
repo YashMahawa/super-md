@@ -12,7 +12,7 @@
     "desktop": "python desktop/main.py",
     "package": "python desktop/package.py",
     "package:native": "npm run build:native && python desktop/package.py",
-    "test": "vitest run",
+    "test": "vitest run && cargo test --manifest-path smd-core/Cargo.toml",
     "test:browser": "playwright test",
     "test:coverage": "vitest run --coverage",
     "test:pdf": "cargo test --manifest-path smd-core/Cargo.toml",
