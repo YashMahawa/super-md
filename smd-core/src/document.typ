@@ -14,6 +14,20 @@
 #show raw: set text(font: "DejaVu Sans Mono", size: .86em)
 // Reserve the full height and depth of inline math on consecutive lines.
 #show math.equation.where(block: false): set text(top-edge: "bounds", bottom-edge: "bounds")
+#show math.equation.where(block: false): equation => context {
+  let height = measure(equation).height
+  if height > 1.2em.to-absolute() {
+    // A zero-width probe below the baseline exposes the equation's ascent.
+    // Adjust the edges directly so the equation still wraps as inline math.
+    let probe = box(width: 0pt, height: height, baseline: (at: top))
+    let ascent = measure(probe + equation).height - height
+    let clearance = .2em
+    set text(top-edge: ascent + clearance, bottom-edge: -(height - ascent + clearance))
+    equation
+  } else {
+    equation
+  }
+}
 #show link: set text(fill: smd-link)
 #show table.cell.where(y: 0): set text(weight: "bold")
 #set page(footer: context align(center, text(size: 8pt, fill: rgb("#686868"), counter(page).display())))
