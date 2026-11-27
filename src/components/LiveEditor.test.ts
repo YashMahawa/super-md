@@ -21,7 +21,7 @@ import {
   type EditSpan,
   type EditingSession,
 } from "../liveBlockHistory";
-import { resolveDoubleClickCaretRange, resolveLiveCaretOffset } from "../liveInsertionPoint";
+import { resolveDoubleClickCaretRange, resolveLiveCaretOffset } from "../liveSelectionRange";
 
 describe("live Markdown blocks", () => {
   it("keeps fenced code and callouts intact across blank lines", () => {
@@ -259,10 +259,11 @@ describe("liveBlockHistory helpers", () => {
     expect(resolveReanchoredHistoryTarget(next, nextFm)).toBeNull();
   });
 
-  it("guards invalid block and range inputs in live caret resolution helpers", () => {
+  it("guards invalid block, non-collapsed, and out-of-bounds range inputs in live caret resolution helpers", () => {
     expect(resolveLiveCaretOffset(null, null, "# Heading", 0, 9)).toBeNull();
-    expect(resolveLiveCaretOffset({ contains: () => false } as unknown as HTMLElement, {} as Range, "# Heading", 0, 9)).toBeNull();
-    expect(resolveLiveCaretOffset({ contains: () => true } as unknown as HTMLElement, {} as Range, "# Heading", 9, 3)).toBeNull();
+    expect(resolveLiveCaretOffset({ contains: () => false } as unknown as HTMLElement, { collapsed: true } as Range, "# Heading", 0, 9)).toBeNull();
+    expect(resolveLiveCaretOffset({ contains: () => true } as unknown as HTMLElement, { collapsed: false } as Range, "# Heading", 0, 9)).toBeNull();
+    expect(resolveLiveCaretOffset({ contains: () => true } as unknown as HTMLElement, { collapsed: true } as Range, "# Heading", 9, 3)).toBeNull();
     expect(typeof resolveDoubleClickCaretRange).toBe("function");
   });
 });

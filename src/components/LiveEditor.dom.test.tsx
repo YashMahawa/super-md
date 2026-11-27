@@ -1919,7 +1919,7 @@ it("preserves the clicked rendered text caret on double-click across inline emph
   const root = createRoot(host);
 
   const proseBlock = [
-    "Review *italic* and **bold** plus [reference guide](https://example.com/docs?mode=live) with `npm test`, $x^2 + 1$, ==key==, and \\*literal\\* above",
+    "Review *italic* and **bold** plus [reference guide](https://example.com/docs?mode=live) with `npm test`, $x^2 + 1$, ==key==, %%note comment%%<!-- html comment --> ![diagram](diagram.png){width=240} and \\*literal\\* above",
     "then inspect the target phrase below.",
   ].join("\n");
   const listBlock = [

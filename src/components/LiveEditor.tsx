@@ -26,7 +26,8 @@ import {
   type PendingBlockFocus,
   type SelectionDirection,
 } from '../liveBlockHistory';
-import {resolveLiveCaretOffset,useLiveInsertionPoint,type SavedLiveSelection} from '../liveInsertionPoint';
+import {useLiveInsertionPoint,type SavedLiveSelection} from '../liveInsertionPoint';
+import {resolveLiveCaretOffset} from '../liveSelectionRange';
 import {useLiveViewportHold} from '../useLiveViewportHold';
 
 const noTrustedHosts:string[]=[];
@@ -323,7 +324,7 @@ export default function LiveEditor({markdown,onChange,onHistory,historyReplayTok
     const activeDoc=currentEditing?syncedMarkdownRef.current:latestMarkdown;
     const [start,end]=translateRenderedRange(renderedStart,renderedEnd,currentEditing,activeDoc);
     const caretOffset=!protectedHint&&caretRange
-      ?resolveLiveCaretOffset(element,caretRange,frozenSource,renderedStart,renderedEnd,latestAnalysis.source===frozenSource?latestAnalysis.analysis.tree:undefined)
+      ?resolveLiveCaretOffset(element,caretRange,frozenSource,renderedStart,renderedEnd,latestAnalysis)
       :null;
     openDocBlock(element,start,end,activeDoc,caretOffset!==null?{start:caretOffset,end:caretOffset}:undefined,protectedHint);
   },[openDocBlock]);

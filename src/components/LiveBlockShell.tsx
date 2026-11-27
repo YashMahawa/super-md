@@ -1,6 +1,6 @@
 import {useEffect,useLayoutEffect,useRef,useState,type ReactNode} from 'react';
 import {PencilSimpleIcon} from '@phosphor-icons/react';
-import {resolveDoubleClickCaretRange} from '../liveInsertionPoint';
+import {resolveDoubleClickCaretRange} from '../liveSelectionRange';
 import WindowedBlock,{type WindowHeading} from './WindowedBlock';
 
 export const fullscreenInteractiveSelector='a,button,input,select,textarea,summary,details,img,.note-image,.interactive-chart,.inline-diagram,.svg-figure,.mermaid,.step-cards,.remote-image-card,.image-error,.code-container';
