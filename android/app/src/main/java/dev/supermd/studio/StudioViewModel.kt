@@ -392,6 +392,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     markDocumentWriteBlocked(resolved.toString())
                     promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) || sameDocumentUri(it, resolved.toString()) }
                 }
+                invalidateRefreshStamps(note.id, request.uri, resolved.toString())
                 accessRequestsMutable.value = null
                 mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
                 if (barrierRejected) readerBarrierFailed()
@@ -405,6 +406,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     markDocumentWriteBlocked(resolved.toString())
                     promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) || sameDocumentUri(it, resolved.toString()) }
                 }
+                invalidateRefreshStamps("", request.uri, resolved.toString())
                 accessRequestsMutable.value = null
                 open(resolved, pendingHeading = carriedHeading)
             }
@@ -433,9 +435,42 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     var requestSaveAs: ((Note) -> Unit)? = null
     var requestPortableWrite: ((Boolean) -> Boolean)? = null
     private val savedPortableAssets = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
+    internal val refreshStamps = DocumentRefreshStampStore()
+    @Volatile internal var refreshClockMs: () -> Long = System::currentTimeMillis
     private var closeAfterSaveNoteId: String? = null
     private var portableForceOverwrite = false
     private var portableSaveAsNoteId: String? = null
+    private fun invalidateRefreshStamps(noteId: String, vararg uris: String?) {
+        liveStudioViewModels(this).forEach { vm ->
+            vm.refreshStamps.invalidate(noteId)
+            uris.forEach { raw -> if (!raw.isNullOrBlank()) vm.refreshStamps.invalidateUri(raw) }
+        }
+    }
+    private fun canProbeStampForTarget(parsedUri: Uri, target: Uri, ownShareAuthority: String): Boolean =
+        canProbeDocumentStampForTarget(documentAccess, resolver, parsedUri, target, ownShareAuthority)
+    private fun recordVerifiedStampIfStable(
+        noteId: String,
+        target: Uri,
+        canProbeStamp: Boolean,
+        beforeWallMs: Long,
+        beforeStamp: ProbedDocumentStamp?,
+        savedMarkdown: String,
+        portable: Boolean,
+        assetDirectory: String?,
+        portableAssets: JSONObject?,
+    ) = recordVerifiedDocumentStampIfStable(
+        refreshStamps = refreshStamps,
+        resolver = resolver,
+        noteId = noteId,
+        target = target,
+        canProbeStamp = canProbeStamp,
+        beforeWallMs = beforeWallMs,
+        beforeStamp = beforeStamp,
+        savedMarkdown = savedMarkdown,
+        portable = portable,
+        assetDirectory = assetDirectory,
+        portableAssets = portableAssets,
+    )
     private fun recordPortableBaseline(id: String, directory: String?) {
         if (directory == null) savedPortableAssets.remove(id)
         else runCatching { media.portableAssets(directory) }.getOrNull()?.let { savedPortableAssets[id] = it }
@@ -1013,7 +1048,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if(archived.isFailure){fail("Could not preserve a deleted note's edits. Its draft is still open; save it to another file.");return@launch}
                 if(mutable.value!==s){refreshMetadata();return@launch} // Never overwrite edits made during archive I/O.
             }
-            discarded.forEach {readerEcho.remove(it.id)}
+            discarded.forEach {
+                readerEcho.remove(it.id)
+                refreshStamps.invalidate(it.id)
+            }
             val kept=s.tabs.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
             val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
@@ -1144,6 +1182,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         readerFlushRequester = null
         folderSearchController.cancel()
         invalidateAllNoteAssets()
+        refreshStamps.clear()
         recoveryWriter.closeAfterLatest(mutable.value)
         prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
         resolver.unregisterContentObserver(documentObserver)
@@ -1206,6 +1245,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             target
                         }
                         if (note.portable) recordPortableBaseline(note.id, note.assetDirectory)
+                        invalidateRefreshStamps(note.id, note.uri, writtenTarget.toString())
                         clearDocumentAccessFailure(writtenTarget.toString())
                         change { s->s.copy(tabs=s.tabs.map { if(it.id==note.id)it.copy(saved=note.content,assetsDirty=false,uri=writtenTarget.toString()) else it }, conflictedTabIds=s.conflictedTabIds-note.id) }
                         mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
@@ -1214,6 +1254,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     }
                 } catch (_: ExternalConflictDetectedException) {
                     autosavePending.remove(note.id)
+                    invalidateRefreshStamps(note.id, note.uri)
                     change { s -> s.copy(conflictedTabIds = s.conflictedTabIds + note.id, message = "This file changed on disk. Autosave is paused for this tab.") }
                 } catch(error:Exception) {if(isDocumentAccessFailure(error))requestDocumentAccess(note.uri!!,note,writing=true) else fail("Autosave paused: ${error.message}")}
             }
@@ -1505,7 +1546,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 }
             }
             if(!accepted)readerBarrierFailed()
-            else if(switchedUri != null)refreshExternal(switchedUri, immediate = true)
+            else if(switchedUri != null)refreshExternal(switchedUri, immediate = true, forceVerifyTarget = false)
         }
     }
     private data class RefreshTabSnapshot(
@@ -1544,6 +1585,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     preIoBaselineAssets = RefreshTabSnapshot::preIoBaselineAssets,
                     readResolvedBaseline = RefreshTabSnapshot::resolvedBaselineAssets,
                     writeResolvedBaseline = { snapshot, resolved -> snapshot.resolvedBaselineAssets = resolved },
+                    refreshStamps = refreshStamps,
+                    readRefreshClockMs = { refreshClockMs() },
+                    forceVerifyRefreshUris = forceVerifyRefreshUris,
                 )
             }
             externalRefreshCache
@@ -1559,18 +1603,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     @Volatile internal var portablePostWriteObserver: (suspend () -> Unit)? = null
     private val pendingRefreshLock = Any()
     private val pendingRefreshUris = mutableMapOf<String, Long>()
+    private val forceVerifyRefreshUris = mutableMapOf<String, Long>()
     private var refreshAllGeneration = 0L
     private var refreshGeneration = 0L
     fun refreshExternal(changedUri: Uri? = null, immediate: Boolean = false) =
         externalRefresh.refreshExternal(changedUri, immediate)
+    internal fun refreshExternal(changedUri: Uri?, immediate: Boolean, forceVerifyTarget: Boolean) =
+        externalRefresh.refreshExternal(changedUri, immediate, forceVerifyTarget)
     @androidx.annotation.VisibleForTesting
     internal fun isRefreshExternalActive(): Boolean = refreshJob?.isActive == true
 
     internal suspend fun refreshExternalTabs(
         snapshotTabs: List<Note>,
+        forceVerifyUris: Set<String> = emptySet(),
         onCommitted: (() -> Unit)? = null,
     ) {
-        externalRefresh.refreshExternalTabs(snapshotTabs, onCommitted)
+        externalRefresh.refreshExternalTabs(snapshotTabs, forceVerifyUris, onCommitted)
     }
     fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
     private fun migrateLegacyClosedNotes() = viewModelScope.launch {
@@ -1638,6 +1686,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         clearReaderEditProtocol(id)
         autosavePending.remove(id)
         savedPortableAssets.remove(id)
+        refreshStamps.invalidate(id)
         change { state ->
             val remaining = state.tabs.filterNot { it.id == id }
             val next = remaining.ifEmpty { listOf(Note()) }
@@ -1775,6 +1824,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             readerEcho.remove(id)
             clearReaderEditProtocol(id)
             autosavePending.remove(id)
+            refreshStamps.invalidate(id)
             change { state ->
                 val remaining = state.tabs.filterNot { it.id == id }
                 val next = remaining.ifEmpty { listOf(Note()) }
@@ -1807,6 +1857,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 performCurrentReaderBarrier {
                     if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performCurrentReaderBarrier
                     readerEcho.remove(note.id)
+                    refreshStamps.invalidate(note.id)
                     if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
                     closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                     updatedRefs = closedNoteRefs
@@ -1842,6 +1893,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val restored=if(ref!=null)withContext(Dispatchers.IO){closedNoteStore.loadForRecovery(ref,note)}
                     else legacy?.takeIf {it.content.isNotEmpty() || it.saved.isNotEmpty() || it.assetDirectory!=null} ?: note
                 val accepted=performReaderBarrier(expectedActiveId) {
+                    refreshStamps.invalidate(note.id)
                     closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                     change {s->
                         if(s.tabs.any {it.id==note.id})s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
@@ -2174,6 +2226,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 relative = relative ?: existing.relative,
             )
         }
+        val canProbeStamp = externalIntentFlags == null &&
+            canProbeStampForTarget(originalUri, target, "${app.packageName}.share")
+        val beforeWallMs = refreshClockMs()
+        val beforeStamp = if (canProbeStamp) {
+            runCatching { probeDocumentStamp(resolver, target) }.getOrNull()
+        } else null
         val inputStream = if (externalIntentFlags != null) {
             ExternalDocumentEntryGuard.openVerifiedExternalInputStream(app, resolver, target, externalIntentFlags, externalCaller)
         } else {
@@ -2191,7 +2249,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (portable) {
                 val opened = media.openFmd(buffered)
                 Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
-                    .also { recordPortableBaseline(it.id, opened.directory) }
+                    .also { created ->
+                        recordPortableBaseline(created.id, opened.directory)
+                        recordVerifiedStampIfStable(
+                            noteId = created.id,
+                            target = target,
+                            canProbeStamp = canProbeStamp,
+                            beforeWallMs = beforeWallMs,
+                            beforeStamp = beforeStamp,
+                            savedMarkdown = created.saved,
+                            portable = true,
+                            assetDirectory = opened.directory,
+                            portableAssets = savedPortableAssets[created.id],
+                        )
+                    }
             } else {
                 val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
                 Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
@@ -2200,6 +2271,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun retainOpenedNote(note: Note, activate: Boolean, headingFragment: String? = null): String {
         val existing = mutable.value.tabs.find { it.uri != null && note.uri != null && sameDocumentUri(it.uri, note.uri) }
+        if (existing != null && existing.id != note.id) refreshStamps.invalidate(note.id)
         val targetId = existing?.id ?: note.id
         val jump = headingFragment?.takeIf { it.isNotBlank() }?.let { PendingHeadingJump(targetId, it, UUID.randomUUID().toString()) }
         change { state ->
@@ -2481,6 +2553,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                     "The note changed while it was saving; the portable file was restored"
                                 }
                                 recordPortableBaseline(id, nextDirectory)
+                                invalidateRefreshStamps(id, note.uri, target.toString())
                                 change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = nextDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
                                 mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                                 openedDirectory = null
@@ -2525,6 +2598,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         "The note changed while Save As was writing; the new copy was removed"
                     }
                     if (note.portable) recordPortableBaseline(id, note.assetDirectory)
+                    invalidateRefreshStamps(id, note.uri, destination.toString())
                     change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(uri = destination.toString(), name = savedName, saved = note.content, assetsDirty = false, assetDirectory = note.assetDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, pendingSaveConflictNoteId = state.pendingSaveConflictNoteId?.takeUnless { it == id }, busy = false, message = "Saved as $savedName") }
                     mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                 }
@@ -2744,6 +2818,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     },
                     fail = ::fail,
                     readReloadAfterIndexCommitObserver = { reloadAfterIndexCommitObserver },
+                    ownShareAuthority = "${getApplication<Application>().packageName}.share",
+                    refreshStamps = refreshStamps,
+                    readRefreshClockMs = { refreshClockMs() },
                 )
             }
             reloadCoordinatorCache
@@ -2812,6 +2889,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val (writtenTarget, savedName, openRel) = savedResult
             savedPortableAssets.remove(note.id)
             autosavePending.remove(note.id)
+            invalidateRefreshStamps(note.id, note.uri, writtenTarget.toString())
             clearDocumentAccessFailure(writtenTarget.toString())
             change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, relative = openRel ?: it.relative, assetsDirty = false, assetDirectory = null) else it }, conflictedTabIds = s.conflictedTabIds - note.id, pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == note.id }, message = "Saved") }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
@@ -2825,6 +2903,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (shouldCloseAfterSave) close(requestedNoteId)
         } catch (_: ExternalConflictDetectedException) {
             autosavePending.remove(requestedNoteId)
+            invalidateRefreshStamps(requestedNoteId, mutable.value.tabs.firstOrNull { it.id == requestedNoteId }?.uri)
             if (manualGuard) {
                 change { s -> s.copy(busy = false, conflictedTabIds = s.conflictedTabIds + requestedNoteId, pendingSaveConflictNoteId = requestedNoteId) }
             } else {
@@ -3592,6 +3671,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 withContext(Dispatchers.Main) {
                     invalidateNoteAssets(id)
                     recordPortableBaseline(id, note.assetDirectory)
+                    invalidateRefreshStamps(id, note.uri)
                     change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = it.content, assetsDirty = false) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable image replaced") }
                     mutable.value.tabs.find { it.id == id }?.let(::remember)
                 }
@@ -3696,6 +3776,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             if (!matches) return@withContext false
                             invalidateNoteAssets(id)
                             recordPortableBaseline(id, writtenDirectory)
+                            invalidateRefreshStamps(id, note.uri)
                             change { state -> state.copy(tabs = state.tabs.map {
                                 if (it.id == id && it.content == writtenSource && it.uri == note.uri && it.assetDirectory == directory)
                                     it.copy(saved = writtenSource, assetsDirty = false, assetDirectory = writtenDirectory) else it
@@ -3762,6 +3843,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             portableForceOverwrite = false
             if (save && !force && !diskMatchesBaseline(target, note)) {
                 autosavePending.remove(effectiveId)
+                invalidateRefreshStamps(effectiveId, note.uri, target.toString())
                 withContext(Dispatchers.Main) {
                     change { s -> s.copy(busy = false, conflictedTabIds = s.conflictedTabIds + effectiveId, pendingSaveConflictNoteId = effectiveId) }
                 }
@@ -3801,6 +3883,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         autosavePending.remove(effectiveId)
                         clearDocumentAccessFailure(destination.toString())
                         recordPortableBaseline(effectiveId, nextDirectory!!)
+                        invalidateRefreshStamps(effectiveId, note.uri, destination.toString())
                         change { s ->
                             s.copy(
                                 tabs = s.tabs.map {
@@ -3830,6 +3913,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     } else {
                         portableOutput = null
                         portableDestinationIsNew = false
+                        liveStudioViewModels(this@StudioViewModel).forEach { vm ->
+                            vm.refreshStamps.invalidateUri(destination.toString())
+                        }
                         if (!finishShare(destination)) mutable.value = mutable.value.copy(busy = false, message = "Portable .smd exported")
                     }
                 }

@@ -59,12 +59,16 @@ internal class ExternalRefreshCoordinator<Snapshot>(
     private val preIoBaselineAssets: (Snapshot) -> JSONObject?,
     private val readResolvedBaseline: (Snapshot) -> JSONObject?,
     private val writeResolvedBaseline: (Snapshot, JSONObject?) -> Unit,
+    private val refreshStamps: DocumentRefreshStampStore = DocumentRefreshStampStore(),
+    private val readRefreshClockMs: () -> Long = System::currentTimeMillis,
+    private val forceVerifyRefreshUris: MutableMap<String, Long> = mutableMapOf(),
 ) {
     private data class CleanExternalUpdate<Snapshot>(
         val snapshot: Snapshot,
         val markdown: String,
         val directory: String? = null,
         val assets: JSONObject? = null,
+        val verifiedStamp: ProbedDocumentStamp? = null,
     )
 
     private val resolver get() = app.contentResolver
@@ -155,10 +159,17 @@ internal class ExternalRefreshCoordinator<Snapshot>(
         synchronized(pendingRefreshLock) {
             if (readRefreshAllGeneration() <= snapshotGen) writeRefreshAllGeneration(0L)
             pendingRefreshUris.entries.removeIf { it.value <= snapshotGen }
+            forceVerifyRefreshUris.entries.removeIf { it.value <= snapshotGen }
         }
     }
 
-    fun refreshExternal(changedUri: Uri? = null, immediate: Boolean = false) {
+    fun refreshExternal(changedUri: Uri? = null, immediate: Boolean = false) =
+        refreshExternal(changedUri = changedUri, immediate = immediate, forceVerifyTarget = changedUri != null)
+
+    fun refreshExternal(changedUri: Uri?, immediate: Boolean, forceVerifyTarget: Boolean) {
+        if (forceVerifyTarget && changedUri != null) {
+            refreshStamps.invalidateUri(changedUri.toString())
+        }
         val state = readState()
         val conflicted = state.conflictedTabIds
         val hasCandidate = state.tabs.any { tab ->
@@ -169,8 +180,13 @@ internal class ExternalRefreshCoordinator<Snapshot>(
         synchronized(pendingRefreshLock) {
             val gen = readRefreshGeneration() + 1L
             writeRefreshGeneration(gen)
-            if (changedUri == null) writeRefreshAllGeneration(gen)
-            else pendingRefreshUris[changedUri.toString()] = gen
+            if (changedUri == null) {
+                writeRefreshAllGeneration(gen)
+            } else {
+                val raw = changedUri.toString()
+                pendingRefreshUris[raw] = gen
+                if (forceVerifyTarget) forceVerifyRefreshUris[raw] = gen
+            }
         }
         readRefreshJob()?.cancel()
         writeRefreshJob(
@@ -183,21 +199,27 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                 ) {
                     runCatching { startupFolderJob.join() }
                 }
-                val (snapshotGen, checkAll, requestedUris) = synchronized(pendingRefreshLock) {
-                    Triple(readRefreshGeneration(), readRefreshAllGeneration() > 0L, pendingRefreshUris.keys.toSet())
+                val (snapshotGen, checkAll, requestedAndForce) = synchronized(pendingRefreshLock) {
+                    Triple(
+                        readRefreshGeneration(),
+                        readRefreshAllGeneration() > 0L,
+                        pendingRefreshUris.keys.toSet() to forceVerifyRefreshUris.keys.toSet(),
+                    )
                 }
+                val (requestedUris, forceVerifyUris) = requestedAndForce
                 val current = readState()
                 val snapshotTabs = current.tabs.filter { tab ->
                     tab.uri != null && tab.id !in current.conflictedTabIds &&
                         (checkAll || requestedUris.any { target -> sameDocumentUri(tab.uri, target) })
                 }
-                refreshExternalTabs(snapshotTabs) { completePendingRefresh(snapshotGen) }
+                refreshExternalTabs(snapshotTabs, forceVerifyUris) { completePendingRefresh(snapshotGen) }
             },
         )
     }
 
     suspend fun refreshExternalTabs(
         snapshotTabs: List<Note>,
+        forceVerifyUris: Set<String> = emptySet(),
         onCommitted: (() -> Unit)? = null,
     ) {
         val initialConflicted = readState().conflictedTabIds
@@ -206,7 +228,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
             .map { note ->
                 createSnapshot(
                     note,
-                    if (note.portable) savedPortableAssets[note.id]?.let { JSONObject(it.toString()) } else null,
+                    if (note.portable) savedPortableAssets[note.id]?.let(::shallowCopyPortableAssets) else null,
                 )
             }
         if (snapshots.isEmpty()) {
@@ -237,7 +259,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                         } else {
                             createSnapshot(
                                 note,
-                                if (note.portable) savedPortableAssets[note.id]?.let { JSONObject(it.toString()) } else null,
+                                if (note.portable) savedPortableAssets[note.id]?.let(::shallowCopyPortableAssets) else null,
                             )
                         }
                         val documentAccess = readDocumentAccess()
@@ -248,6 +270,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                         } catch (cancelled: CancellationException) {
                             throw cancelled
                         } catch (error: Throwable) {
+                            refreshStamps.invalidate(note.id)
                             if (isDocumentAccessFailure(error)) newlyBlockedUris[noteUriRaw] = clearSeq
                             return@withLock
                         }
@@ -257,6 +280,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                             } catch (cancelled: CancellationException) {
                                 throw cancelled
                             } catch (error: Throwable) {
+                                refreshStamps.invalidate(note.id)
                                 if (isDocumentAccessFailure(error)) newlyBlockedUris[noteUriRaw] = clearSeq
                                 return@withLock
                             }
@@ -269,10 +293,42 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                                 newlyBlockedUris[noteUriRaw] = clearSeq
                             }
                         }
+                        val forceVerify = forceVerifyUris.any { sameDocumentUri(noteUriRaw, it) }
+                        if (forceVerify) refreshStamps.invalidate(note.id)
+                        val canProbeStamp = note.portable &&
+                            canProbeDocumentStampForTarget(documentAccess, resolver, parsedUri, target, ownShareAuthority)
+                        val beforeWallMs = readRefreshClockMs()
+                        val beforeStamp = if (canProbeStamp) {
+                            try {
+                                probeDocumentStamp(resolver, target)
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Throwable) {
+                                refreshStamps.invalidate(note.id)
+                                if (isDocumentAccessFailure(error)) newlyBlockedUris[noteUriRaw] = clearSeq
+                                return@withLock
+                            }
+                        } else null
                         if (note.dirty) {
+                            val preIoAssets = preIoBaselineAssets(snapshot)
+                            val hasAuthoritativePortableBaseline = note.portable && (!note.assetsDirty || preIoAssets != null)
                             val expectedAssets = if (note.portable) {
-                                preIoBaselineAssets(snapshot) ?: baselinePortableAssets(note).also { writeResolvedBaseline(snapshot, it) }
+                                preIoAssets ?: baselinePortableAssets(note).also { writeResolvedBaseline(snapshot, it) }
                             } else null
+                            if (
+                                !forceVerify &&
+                                hasAuthoritativePortableBaseline &&
+                                refreshStamps.matchesBaseline(
+                                    noteId = note.id,
+                                    probed = beforeStamp,
+                                    savedMarkdown = note.saved,
+                                    portable = true,
+                                    assetDirectory = note.assetDirectory,
+                                    expectedPortableAssets = expectedAssets,
+                                )
+                            ) {
+                                return@withLock
+                            }
                             val matches = try {
                                 val stream = resolver.openInputStream(target) ?: return@withLock
                                 stream.use { input ->
@@ -286,32 +342,99 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                             } catch (cancelled: CancellationException) {
                                 throw cancelled
                             } catch (error: Throwable) {
+                                refreshStamps.invalidate(note.id)
                                 if (isDocumentAccessFailure(error)) newlyBlockedUris[noteUriRaw] = clearSeq
                                 return@withLock
                             }
-                            if (!matches) dirtyConflicts[note.id] = snapshot
+                            if (!matches) {
+                                refreshStamps.invalidate(note.id)
+                                dirtyConflicts[note.id] = snapshot
+                            } else if (hasAuthoritativePortableBaseline) {
+                                recordVerifiedDocumentStampIfStable(
+                                    refreshStamps = refreshStamps,
+                                    resolver = resolver,
+                                    noteId = note.id,
+                                    target = target,
+                                    canProbeStamp = canProbeStamp,
+                                    beforeWallMs = beforeWallMs,
+                                    beforeStamp = beforeStamp,
+                                    savedMarkdown = note.saved,
+                                    portable = true,
+                                    assetDirectory = note.assetDirectory,
+                                    portableAssets = expectedAssets,
+                                )
+                            }
                         } else if (note.portable) {
+                            val expectedAssets = preIoBaselineAssets(snapshot)
+                                ?: baselinePortableAssets(note).also { writeResolvedBaseline(snapshot, it) }
+                            if (
+                                !forceVerify &&
+                                note.content == note.saved &&
+                                refreshStamps.matchesBaseline(
+                                    noteId = note.id,
+                                    probed = beforeStamp,
+                                    savedMarkdown = note.saved,
+                                    portable = true,
+                                    assetDirectory = note.assetDirectory,
+                                    expectedPortableAssets = expectedAssets,
+                                )
+                            ) {
+                                return@withLock
+                            }
+                            val unchangedOnDisk = try {
+                                val stream = resolver.openInputStream(target) ?: return@withLock
+                                stream.use { input ->
+                                    media.portableEnvelopeMatches(input, note.content, expectedAssets)
+                                }
+                            } catch (cancelled: CancellationException) {
+                                throw cancelled
+                            } catch (error: Throwable) {
+                                refreshStamps.invalidate(note.id)
+                                if (isDocumentAccessFailure(error)) newlyBlockedUris[noteUriRaw] = clearSeq
+                                return@withLock
+                            }
+                            if (unchangedOnDisk) {
+                                recordVerifiedDocumentStampIfStable(
+                                    refreshStamps = refreshStamps,
+                                    resolver = resolver,
+                                    noteId = note.id,
+                                    target = target,
+                                    canProbeStamp = canProbeStamp,
+                                    beforeWallMs = beforeWallMs,
+                                    beforeStamp = beforeStamp,
+                                    savedMarkdown = note.saved,
+                                    portable = true,
+                                    assetDirectory = note.assetDirectory,
+                                    portableAssets = expectedAssets,
+                                )
+                                return@withLock
+                            }
+                            refreshStamps.invalidate(note.id)
+                            val extractWallMs = readRefreshClockMs()
+                            val extractBeforeStamp = if (canProbeStamp) {
+                                runCatching { probeDocumentStamp(resolver, target) }.getOrNull()
+                            } else null
                             val disk = try {
                                 resolver.openInputStream(target)?.use(media::openFmd)
                             } catch (cancelled: CancellationException) {
                                 throw cancelled
                             } catch (error: Throwable) {
+                                refreshStamps.invalidate(note.id)
                                 if (isDocumentAccessFailure(error)) newlyBlockedUris[noteUriRaw] = clearSeq
                                 return@withLock
                             } ?: return@withLock
                             pendingPortableDirs.add(disk.directory)
-                            val expectedAssets = preIoBaselineAssets(snapshot)
-                                ?: baselinePortableAssets(note).also { writeResolvedBaseline(snapshot, it) }
                             val diskAssets = runCatching { media.portableAssets(disk.directory) }.getOrNull()
                             if (diskAssets == null || (disk.markdown == note.content && portableAssetsMatch(expectedAssets, diskAssets))) {
                                 deletePortableDirectoryIfUnreferenced(disk.directory)
                                 pendingPortableDirs.remove(disk.directory)
                             } else {
+                                val verifiedStamp = verifyProbedStampAfterRead(resolver, target, canProbeStamp, extractWallMs, extractBeforeStamp)
                                 cleanUpdates[note.id]?.directory?.let { prev ->
                                     deletePortableDirectoryIfUnreferenced(prev)
                                     pendingPortableDirs.remove(prev)
                                 }
-                                cleanUpdates[note.id] = CleanExternalUpdate(snapshot, disk.markdown, disk.directory, diskAssets)
+                                cleanUpdates[note.id] = CleanExternalUpdate(snapshot, disk.markdown, disk.directory, diskAssets, verifiedStamp)
                             }
                         } else {
                             val text = try {
@@ -319,10 +442,14 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                             } catch (cancelled: CancellationException) {
                                 throw cancelled
                             } catch (error: Throwable) {
+                                refreshStamps.invalidate(note.id)
                                 if (isDocumentAccessFailure(error)) newlyBlockedUris[noteUriRaw] = clearSeq
                                 return@withLock
                             } ?: return@withLock
-                            if (text != note.content) cleanUpdates[note.id] = CleanExternalUpdate(snapshot, text)
+                            if (text != note.content) {
+                                refreshStamps.invalidate(note.id)
+                                cleanUpdates[note.id] = CleanExternalUpdate(snapshot, text)
+                            }
                         }
                     }
                 }
@@ -367,7 +494,10 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                         newlyConflicted.add(id)
                     }
                 }
-                newlyConflicted.forEach { autosavePending.remove(it) }
+                newlyConflicted.forEach {
+                    autosavePending.remove(it)
+                    refreshStamps.invalidate(it)
+                }
                 if (newlyConflicted.isEmpty() && adoptableUpdates.isEmpty()) return@withLock
                 committedAny = true
                 val previousPortableDirs = adoptableUpdates.mapNotNull { (id, update) ->
@@ -375,6 +505,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                     if (update.directory != null && oldDir != null && oldDir != update.directory) id to oldDir else null
                 }
                 adoptableUpdates.forEach { (id, update) ->
+                    refreshStamps.invalidate(id)
                     invalidateNoteAssets(id)
                     readerEcho.remove(id)
                     clearReaderEditProtocol(id)
@@ -402,6 +533,23 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                         },
                         conflictedTabIds = s.conflictedTabIds + newlyConflicted,
                         message = if (newlyConflicted.isNotEmpty()) "This file changed on disk. Autosave is paused for this tab." else s.message,
+                    )
+                }
+                adoptableUpdates.forEach { (id, update) ->
+                    val verified = update.verifiedStamp ?: return@forEach
+                    val expectedDir = update.directory ?: snapshotNote(update.snapshot).assetDirectory
+                    val adopted = readState().tabs.firstOrNull {
+                        it.id == id && it.portable && !it.dirty && it.saved == update.markdown && it.assetDirectory == expectedDir
+                    } ?: return@forEach
+                    refreshStamps.record(
+                        id,
+                        VerifiedDocumentStamp(
+                            stamp = verified,
+                            savedMarkdown = adopted.saved,
+                            portable = true,
+                            assetDirectory = adopted.assetDirectory,
+                            portableAssets = update.assets?.let(::shallowCopyPortableAssets),
+                        ),
                     )
                 }
                 previousPortableDirs.forEach { (id, oldDir) ->

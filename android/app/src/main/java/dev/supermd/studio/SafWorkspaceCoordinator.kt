@@ -222,6 +222,12 @@ internal class SafWorkspaceCoordinator(
 
     fun remapPersistedMetadata(remaps: List<UriRemap>) {
         if (remaps.isEmpty()) return
+        liveViewModels().forEach { vm ->
+            remaps.forEach { remap ->
+                vm.refreshStamps.invalidateUri(remap.oldUri)
+                vm.refreshStamps.invalidateUri(remap.newUri)
+            }
+        }
         updatePersistedMetadata { raw -> remaps.firstOrNull { sameDocumentUri(raw, it.oldUri) }?.newUri ?: raw }
     }
 

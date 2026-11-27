@@ -48,6 +48,9 @@ internal class ReloadFromDiskCoordinator(
     private val requestDocumentAccess: (rawUri: String, existingNote: Note?, writing: Boolean, explicit: Boolean) -> Unit,
     private val fail: (String) -> Unit,
     private val readReloadAfterIndexCommitObserver: () -> (suspend () -> Unit)?,
+    private val ownShareAuthority: String = "",
+    private val refreshStamps: DocumentRefreshStampStore = DocumentRefreshStampStore(),
+    private val readRefreshClockMs: () -> Long = System::currentTimeMillis,
 ) {
     private class ReloadArchiveFailedException(cause: Throwable) : Exception(cause.message, cause)
 
@@ -121,6 +124,7 @@ internal class ReloadFromDiskCoordinator(
                 var snapshotNote: Note? = null
                 var rawUri: String? = null
                 var reloaded: Note? = null
+                var reloadedVerifiedStamp: ProbedDocumentStamp? = null
                 var savedSnapshotRef: ClosedNoteReference? = null
                 var archivedReference: ClosedNoteReference? = null
                 var previousRefs: List<ClosedNoteReference>? = null
@@ -136,7 +140,18 @@ internal class ReloadFromDiskCoordinator(
                             val noteUri = note.uri ?: return@withLock
                             snapshotNote = note
                             rawUri = noteUri
-                            val target = documentAccess().resolve(Uri.parse(noteUri))
+                            val parsedNoteUri = Uri.parse(noteUri)
+                            val access = documentAccess()
+                            val target = access.resolve(parsedNoteUri)
+                            val canProbeStamp = note.portable && canProbeDocumentStampForTarget(
+                                documentAccess = access,
+                                resolver = resolver,
+                                parsedUri = parsedNoteUri,
+                                target = target,
+                                ownShareAuthority = ownShareAuthority,
+                            )
+                            val beforeWallMs = readRefreshClockMs()
+                            val beforeStamp = if (canProbeStamp) runCatching { probeDocumentStamp(resolver, target) }.getOrNull() else null
                             val loaded = resolver.openInputStream(target)?.use { stream ->
                                 if (note.portable) {
                                     val opened = media.openFmd(stream)
@@ -164,6 +179,9 @@ internal class ReloadFromDiskCoordinator(
                                     )
                                 }
                             } ?: error("Document permission is unavailable; choose it again")
+                            reloadedVerifiedStamp = if (loaded.portable) {
+                                verifyProbedStampAfterRead(resolver, target, canProbeStamp, beforeWallMs, beforeStamp)
+                            } else null
                             reloaded = loaded
 
                             if (note.dirty) {
@@ -266,6 +284,21 @@ internal class ReloadFromDiskCoordinator(
                             } else {
                                 savedPortableAssets.remove(id)
                             }
+                            refreshStamps.invalidate(id)
+                            if (loadedNote.portable) {
+                                reloadedVerifiedStamp?.let { verified ->
+                                    refreshStamps.record(
+                                        id,
+                                        VerifiedDocumentStamp(
+                                            stamp = verified,
+                                            savedMarkdown = loadedNote.saved,
+                                            portable = true,
+                                            assetDirectory = loadedNote.assetDirectory,
+                                            portableAssets = savedPortableAssets[id]?.let(::shallowCopyPortableAssets),
+                                        ),
+                                    )
+                                }
+                            }
                             changeState { state ->
                                 state.copy(
                                     tabs = state.tabs.map { if (it.id == id) loadedNote else it },
@@ -328,6 +361,7 @@ internal class ReloadFromDiskCoordinator(
                     fail("Could not archive draft before reloading: ${archiveFailed.message}")
                     return@withLock
                 } catch (reloadError: Exception) {
+                    refreshStamps.invalidate(id)
                     reconcileUncommittedReloadArchive(
                         savedSnapshotRef = savedSnapshotRef,
                         archivedReference = archivedReference,
