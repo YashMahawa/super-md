@@ -218,9 +218,15 @@ class FolderSearchUiTest(unittest.TestCase):
 
     def test_qml_filter_searches_collapsed_subfolders_renders_empty_state_and_clears_on_folder_switch(self):
         self.studio.openFolder(str(self.workspace))
-        self.wait_until(lambda: len(self.studio.files) == 3)
-        # Initially collapsed: only top-level Archive, Courses, and Overview.md are listed.
-        self.assertEqual([f["name"] for f in self.studio.files], ["Archive", "Courses", "Overview.md"])
+        self.wait_until(lambda: len(self.studio.files) == 2)
+        # Empty Archive is hidden by default when hideNonNoteFolders is enabled.
+        self.assertEqual([f["name"] for f in self.studio.files], ["Courses", "Overview.md"])
+
+        # Toggling hideNonNoteFolders off shows Archive; toggling back on hides it again.
+        self.studio.setting("hideNonNoteFolders", "false")
+        self.wait_until(lambda: [f["name"] for f in self.studio.files] == ["Archive", "Courses", "Overview.md"])
+        self.studio.setting("hideNonNoteFolders", "true")
+        self.wait_until(lambda: [f["name"] for f in self.studio.files] == ["Courses", "Overview.md"])
 
         filter_field = self.named("folderFilterField")
         empty_state = self.named("folderEmptyState")
