@@ -158,15 +158,11 @@ class DropSafetyTest {
             openCount.incrementAndGet()
             val entry = entries[uri.lastPathSegment] ?: throw java.io.FileNotFoundException(uri.toString())
             val pipe = ParcelFileDescriptor.createPipe()
-            val readEnd = pipe[0]
-            val writeEnd = pipe[1]
-            Thread {
-                ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
-                    out.write(entry.bytes)
-                    out.flush()
-                }
-            }.apply { isDaemon = true }.start()
-            return readEnd
+            ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { out ->
+                out.write(entry.bytes)
+                out.flush()
+            }
+            return pipe[0]
         }
 
         override fun insert(uri: Uri, values: ContentValues?): Uri? = null
@@ -899,20 +895,26 @@ class DropSafetyTest {
 
         // 1. Granted pipe-streamed content:// image drops succeed (descriptor stat is S_IFIFO).
         var droppedImages: JSONArray? = null
+        var droppedDone = false
         model.importDropped(listOf(pngUri, svgUri), activeId, dragReadPermissionGranted = true) {
             droppedImages = it
+            droppedDone = true
         }
-        drainMain { droppedImages != null }
+        drainMain { droppedDone }
+        assertNotNull("Expected streamed drop to succeed, error=${model.state.value.error}, msg=${model.state.value.message}", droppedImages)
         assertEquals(2, droppedImages!!.length())
         assertEquals("photo", droppedImages!!.getJSONObject(0).getString("alt"))
         assertEquals("vector", droppedImages!!.getJSONObject(1).getString("alt"))
 
         // 2. User-granted picker imports succeed on pipe-streamed content:// providers (both granted and exported picker URIs).
         var pickedImages: JSONArray? = null
+        var pickedDone = false
         model.importPickedImages(listOf(pngUri, ungrantedStreamUri), activeId) {
             pickedImages = it
+            pickedDone = true
         }
-        drainMain { pickedImages != null }
+        drainMain { pickedDone }
+        assertNotNull("Expected streamed picker import to succeed, error=${model.state.value.error}, msg=${model.state.value.message}", pickedImages)
         assertEquals(2, pickedImages!!.length())
         assertEquals("photo", pickedImages!!.getJSONObject(0).getString("alt"))
         assertEquals("ungranted", pickedImages!!.getJSONObject(1).getString("alt"))
