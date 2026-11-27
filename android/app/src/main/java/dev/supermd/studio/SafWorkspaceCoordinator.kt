@@ -16,7 +16,7 @@ import org.json.JSONObject
 internal class SafWorkspaceCoordinator(
     private val owner: StudioViewModel, private val scope: CoroutineScope,
     private val prefs: SharedPreferences, private val windowPrefs: SharedPreferences,
-    private val resolver: ContentResolver, private val documentAccess: DocumentAccess,
+    private val resolver: ContentResolver, private val readDocumentAccess: () -> DocumentAccess,
     private val confirmedTreeDocumentKeys: MutableSet<String>,
     private val readState: () -> StudioState, private val writeState: (StudioState) -> Unit,
     private val changeState: ((StudioState) -> StudioState) -> Unit,
@@ -77,7 +77,7 @@ internal class SafWorkspaceCoordinator(
                 val targetFolder = Uri.parse(readState().folder ?: uri.toString())
                 val pass = SafProjectionPass(resolver)
                 val listing = withContext(Dispatchers.IO) {
-                    listSafFolderListing(resolver, documentAccess, targetFolder, requestedRelative, pass)
+                    listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass)
                 }
                 confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
                 if (seq == readListFolderSeq() && readState().folder != null) {
@@ -136,7 +136,7 @@ internal class SafWorkspaceCoordinator(
         val pass = SafProjectionPass(resolver)
         val found = findRelativeInSafTree(
             pass = pass,
-            documentAccess = documentAccess,
+            documentAccess = readDocumentAccess(),
             folderUri = folderUri,
             targetUri = uri,
             preferredDirRelative = readListedRelative(),

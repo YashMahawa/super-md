@@ -3322,7 +3322,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (!::safWorkspaceCache.isInitialized) {
                 safWorkspaceCache = SafWorkspaceCoordinator(
                     owner = this, scope = viewModelScope, prefs = prefs, windowPrefs = windowPrefs,
-                    resolver = resolver, documentAccess = documentAccess, confirmedTreeDocumentKeys = confirmedTreeDocumentKeys,
+                    resolver = resolver, readDocumentAccess = { documentAccess }, confirmedTreeDocumentKeys = confirmedTreeDocumentKeys,
                     readState = { mutable.value }, writeState = { mutable.value = it }, changeState = ::change,
                     readListedRelative = { listedRelative }, writeListedRelative = { listedRelative = it },
                     readListFolderSeq = { listFolderSeq }, writeListFolderSeq = { listFolderSeq = it },

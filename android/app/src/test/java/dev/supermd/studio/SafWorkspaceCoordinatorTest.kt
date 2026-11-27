@@ -58,7 +58,12 @@ class SafWorkspaceCoordinatorTest {
         val restored = newModel(key); await { restored.state.value.folderRelative == "Course/Week1" && restored.state.value.files.any { it.name == "Notes.md" } }
         assertTrue(restored.navigateFolderUp()); await { restored.state.value.folderRelative == "Course" }
         assertTrue(restored.navigateFolderUp()); await { restored.state.value.folderRelative == "" }
-        assertFalse(restored.navigateFolderUp()); restored.closeFolder()
+        assertFalse(restored.navigateFolderUp())
+        restored.documentAccess = DocumentAccess(object : ContextWrapper(app) {
+            override fun checkUriPermission(uri: Uri?, pid: Int, uid: Int, modeFlags: Int) = android.content.pm.PackageManager.PERMISSION_DENIED
+        })
+        restored.listFolder(treeUri, ""); await { restored.state.value.error == "Could not list folder: Choose the folder again to restore access" }
+        restored.closeFolder()
         assertNull(restored.state.value.folder); assertEquals("", restored.state.value.folderRelative); assertTrue(restored.state.value.files.isEmpty())
         assertNull(app.getSharedPreferences("studio-window-$key", 0).getString("folder", null)); assertFalse(restored.navigateFolderUp())
     }
