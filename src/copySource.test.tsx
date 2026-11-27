@@ -222,3 +222,208 @@ it("serializes highlight, subscript, superscript, kbd, underline, and strikethro
   expect(selectedMarkdown(selection)).toBe("==key==");
   selection.removeAllRanges();host.remove();
 });
+
+it("keeps closed answer and folded callout bodies out of copy while preserving callout markers and open disclosures",()=>{
+  const markdown=[
+    "> [!question] Practice prompt",
+    "> Compute the derivative of $f(x) = x^3$.",
+    "",
+    "> [!answer] Worked **derivative** $f'(x)$",
+    "> Secret step: $f'(x) = 3x^2$.",
+    ">",
+    "> ```ts",
+    "> const secret = 3;",
+    "> ```",
+    "",
+    "> [!solution]",
+    "> Hidden default-titled solution.",
+    "",
+    "> [!note]- Folded hint",
+    "> Use the power rule.",
+    "",
+    ':::callout answer "Portable answer"',
+    "Portable secret body.",
+    ":::",
+    "",
+    "> [!tip]+ Expanded tip",
+    "> Keep units aligned.",
+    "",
+    "> [!tip] **Useful** $x^2$ [reference](https://example.com)",
+    "> Body stays below.",
+    "",
+    "> [!warning]",
+    "> Check domain bounds.",
+  ].join("\n");
+
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="python3" dark={false}/>);
+  document.body.append(host);
+  const article=host.querySelector(".markdown-body")!;
+  const selection=window.getSelection()!,range=document.createRange();
+
+  range.selectNodeContents(article);
+  selection.removeAllRanges();selection.addRange(range);
+  const closedCopy=selectedMarkdown(selection,markdown)!;
+  expect(extractSelectedText({source:markdown})).toBe(closedCopy);
+
+  // Closed answer/solution/folded bodies must never leak into ordinary copy
+  expect(closedCopy).not.toContain("Secret step");
+  expect(closedCopy).not.toContain("3x^2");
+  expect(closedCopy).not.toContain("const secret = 3");
+  expect(closedCopy).not.toContain("Hidden default-titled solution");
+  expect(closedCopy).not.toContain("Use the power rule");
+  expect(closedCopy).not.toContain("Portable secret body");
+
+  // Callout markers and open/non-collapsible callouts are preserved cleanly
+  expect(closedCopy.replace(/\n{3,}/g,"\n\n")).toBe([
+    "> [!question] Practice prompt",
+    "> Compute the derivative of $f(x) = x^3$.",
+    "",
+    "> [!answer] Worked **derivative** $f'(x)$",
+    "",
+    "> [!solution]",
+    "",
+    "> [!note]- Folded hint",
+    "",
+    "> [!answer] Portable answer",
+    "",
+    "> [!tip]+ Expanded tip",
+    "> Keep units aligned.",
+    "",
+    "> [!tip] **Useful** $x^2$ [reference](https://example.com)",
+    "> Body stays below.",
+    "",
+    "> [!warning]",
+    "> Check domain bounds.",
+  ].join("\n"));
+
+  // Opening the answer disclosure makes its full callout Markdown copyable without code UI chrome
+  const answerDetails=host.querySelector("details.callout-answer")!;
+  answerDetails.setAttribute("open","");
+  range.selectNodeContents(answerDetails);
+  selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe([
+    "> [!answer] Worked **derivative** $f'(x)$",
+    "> Secret step: $f'(x) = 3x^2$.",
+    ">",
+    "> ```ts",
+    "> const secret = 3;",
+    "> ```",
+  ].join("\n"));
+
+  // Closing the disclosure again immediately hides its answer content from copy
+  answerDetails.removeAttribute("open");
+  range.selectNodeContents(answerDetails);
+  selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe("> [!answer] Worked **derivative** $f'(x)$");
+
+  selection.removeAllRanges();host.remove();
+});
+
+it("clamps selections touching closed disclosures, handles nested callouts, and strips code toolbar chrome",()=>{
+  const markdown=[
+    "Opening paragraph.",
+    "",
+    "> [!question] Outer question",
+    "> First think carefully.",
+    ">",
+    "> > [!answer] Nested answer",
+    "> > Hidden nested $y = 2x$.",
+    "",
+    "```python",
+    "value = 42",
+    "```",
+    "",
+    "Closing paragraph.",
+  ].join("\n");
+
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="python3" dark={false}/>);
+  document.body.append(host);
+  const article=host.querySelector(".markdown-body")!;
+  const nestedAnswer=article.querySelector("details.callout-answer")!;
+  const summary=nestedAnswer.querySelector("summary")!;
+  const hiddenPara=nestedAnswer.querySelector("p")!;
+  const paragraphs=Array.from(article.querySelectorAll(":scope > div > p, :scope > p"));
+  const openingPara=paragraphs[0]!;
+  const closingPara=paragraphs[paragraphs.length-1]!;
+  const selection=window.getSelection()!,range=document.createRange();
+
+  // Programmatic selection strictly inside closed answer body yields empty copy and blocks drag override
+  range.selectNodeContents(hiddenPara);
+  selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe("");
+  expect(extractSelectedText({source:markdown})).toBe("");
+  expect(hasSelectedText()).toBe(false);
+  const payload=new Map<string,string>(),transfer={setData:(t:string,v:string)=>payload.set(t,v),clearData:(t:string)=>payload.delete(t)} as unknown as DataTransfer;
+  const drag=new Event("dragstart",{bubbles:true,cancelable:true});
+  Object.defineProperty(drag,"dataTransfer",{value:transfer});Object.defineProperty(drag,"target",{value:hiddenPara});
+  Object.defineProperty(drag,"clientX",{value:5});Object.defineProperty(drag,"clientY",{value:5});
+  Object.defineProperty(document,"caretPositionFromPoint",{configurable:true,value:()=>({offsetNode:hiddenPara.firstChild!,offset:1})});
+  expect(setSelectedMarkdownDrag(drag as DragEvent,markdown)).toBe(false);
+  expect(payload.size).toBe(0);
+
+  // Browser triple-click on <summary> (ending at offset 0 of hidden body paragraph) copies only the callout header
+  range.setStart(summary.firstChild!,0);range.setEnd(hiddenPara,0);
+  selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection,markdown)).toBe("> [!answer] Nested answer");
+
+  // Selection starting before closed disclosure and ending inside its hidden body omits the hidden body
+  range.setStart(openingPara.firstChild!,0);range.setEnd(hiddenPara.firstChild!,6);
+  selection.removeAllRanges();selection.addRange(range);
+  const headCopy=selectedMarkdown(selection,markdown)!;
+  expect(headCopy).toContain("Opening paragraph.");
+  expect(headCopy).toContain("> > [!answer] Nested answer");
+  expect(headCopy).not.toContain("Hidden nested");
+
+  // Selection starting inside closed disclosure hidden body and ending in visible closing paragraph omits the hidden body
+  range.setStart(hiddenPara.firstChild!,0);range.setEndAfter(closingPara);
+  selection.removeAllRanges();selection.addRange(range);
+  const tailCopy=selectedMarkdown(selection,markdown)!;
+  expect(tailCopy).not.toContain("Hidden nested");
+  expect(tailCopy).not.toContain("Python");
+  expect(tailCopy).toContain("```python\nvalue = 42\n```");
+  expect(tailCopy).toContain("Closing paragraph.");
+
+  // Generic HTML <details> open vs closed preserves summary separation and hides closed body
+  const genericHost=document.createElement("article");genericHost.className="markdown-body";
+  genericHost.innerHTML='<details><summary>Closed summary</summary><p>Hidden detail</p></details><details open><summary>Open summary</summary><p>Visible detail</p></details>';
+  document.body.append(genericHost);
+  range.selectNodeContents(genericHost);selection.removeAllRanges();selection.addRange(range);
+  expect(selectedMarkdown(selection)?.replace(/\n{3,}/g,"\n\n")).toBe("Closed summary\n\nOpen summary\n\nVisible detail");
+
+  selection.removeAllRanges();genericHost.remove();host.remove();
+});
+
+it("filters closed callouts in unmounted windowed blocks while keeping open callouts and fenced examples intact",()=>{
+  const b1="> [!answer] Offscreen answer\n> Offscreen secret $x=9$.";
+  const b2="> [!tip]+ Offscreen open\n> Visible offscreen tip.";
+  const b3="```markdown\n> [!answer] Documented syntax\n> Preserved inside code fence.\n```";
+  const doc=`${b1}\n\n${b2}\n\n${b3}`;
+  const s1=0,e1=b1.length;
+  const s2=e1+2,e2=s2+b2.length;
+  const s3=e2+2,e3=s3+b3.length;
+  const host=document.createElement("article");host.className="markdown-body";
+  host.innerHTML=[
+    `<section data-windowed-mounted="false" data-source-start="${s1}" data-source-end="${e1}"></section>`,
+    `<section data-windowed-mounted="false" data-source-start="${s2}" data-source-end="${e2}"></section>`,
+    `<section data-windowed-mounted="false" data-source-start="${s3}" data-source-end="${e3}"></section>`,
+  ].join("");
+  document.body.append(host);
+  const range=document.createRange(),selection=window.getSelection()!;
+  range.selectNodeContents(host);selection.removeAllRanges();selection.addRange(range);
+  const copied=selectedMarkdown(selection,doc)!;
+  expect(copied).not.toContain("Offscreen secret");
+  expect(copied.replace(/\n{3,}/g,"\n\n")).toBe([
+    "> [!answer] Offscreen answer",
+    "",
+    "> [!tip]+ Offscreen open",
+    "> Visible offscreen tip.",
+    "",
+    "```markdown",
+    "> [!answer] Documented syntax",
+    "> Preserved inside code fence.",
+    "```",
+  ].join("\n"));
+  selection.removeAllRanges();host.remove();
+});

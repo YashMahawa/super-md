@@ -51,7 +51,7 @@ import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZo
 import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
-import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
+import {recordHistory,replayHistory,transferHistory,trimHistoryCache,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
 import {mediaFilter,mediaTone,type MediaAppearance} from './mediaAppearance';
@@ -225,7 +225,7 @@ export function Reader() {
   const pendingChange = useRef(0);
   const noteViews = useRef(new Map<string, NoteView>());
   const histories=useRef(new Map<string,NoteHistory>());
-  const trimHistories=(active:string)=>{let retained=[...histories.current.values()].reduce((size,h)=>size+historySize(h),0);for(const [id,cached] of histories.current){if(histories.current.size<=40&&retained<=4_000_000)break;if(id===active)continue;histories.current.delete(id);retained-=historySize(cached);}};
+  const trimHistories=(active:string)=>trimHistoryCache(histories.current,active);
   const replaying=useRef(false);
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
@@ -374,10 +374,13 @@ export function Reader() {
         importEditorSession(next.id, next.viewState.editor);
         importRenderedViews(next.content, next.viewState.rendered);
         const history=next.viewState.history;
-        if(validHistory(history))histories.current.set(next.id,{undo:structuredClone(history.undo),redo:structuredClone(history.redo),last:0});
+        histories.current.delete(next.id);
+        if(validHistory(history)){const imported=transferHistory(history);if(imported)histories.current.set(next.id,imported);}
         trimHistories(next.id);
         const importedAnchor=parseImportedAnchor(next.viewState.anchor);
         noteViews.current.set(next.id, {top:next.viewState.top, ...(importedAnchor?{anchor:importedAnchor}:{})});
+      } else if (old && old.id !== next.id) {
+        trimHistories(next.id);
       }
       // Native snapshots may have been queued before the latest pinch frame.
       // Within one workspace mode the reader owns its gesture scale; explicit
@@ -444,7 +447,7 @@ export function Reader() {
         const applied=replayActiveLiveBlockHistory(direction);
         if(applied&&current&&previousContent!==undefined){
           const history=histories.current.get(current.id);
-          if(history)replayHistory(history,previousContent,direction);
+          if(history){replayHistory(history,previousContent,direction);histories.current.delete(current.id);histories.current.set(current.id,history);trimHistories(current.id);}
         }
         replaying.current=false;
         if(applied)return;
@@ -573,11 +576,13 @@ export function Reader() {
       let id = current.id;
       if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
       else if (operation.action === "detach_tab") id = operation.target;
-      const view = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader" ? {editor:exportEditorSession(id),history:histories.current.get(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
+      const captureView = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader";
+      const baseView = captureView ? {editor:exportEditorSession(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
       void (async()=>{
         if(current.editProtocol===1)await edits.current!.flush(current.id);
         // Snapshot after the acknowledgement barrier, including edits made while waiting.
         const latest=reference.current;
+        const view=baseView?{...baseView,history:transferHistory(histories.current.get(id))}:undefined;
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
@@ -1140,6 +1145,9 @@ export function Reader() {
       recordHistory(history,previous.content,content,now);
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
       trimHistories(previous.id);
+    } else {
+      const history=histories.current.get(previous.id);
+      if(history){histories.current.delete(previous.id);histories.current.set(previous.id,history);trimHistories(previous.id);}
     }
     const next = { ...reference.current!, content }; setState(next); reference.current = next;
     // The bridge receives every edit immediately, so closing/rotating cannot lose
