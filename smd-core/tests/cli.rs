@@ -105,6 +105,39 @@ fn inline_data_images_export_and_pack_but_remote_images_never_download_implicitl
 }
 
 #[test]
+fn cli_export_normalizes_spaced_aliased_portable_and_section_wikilinks_without_corrupting_code() {
+    let w = Workspace::new();
+    fs::create_dir(w.file("DM Images")).unwrap();
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"#386a57\"/></svg>";
+    fs::write(w.file("DM Images/proof.svg"), svg).unwrap();
+    let markdown = [
+        "# Probability Notes",
+        "",
+        "Study [[Task Note]], [[Lecture 2#Bayes Law|Bayes]], [[study.smd]], [Deck](study.smd), and [[#Probability Notes|Top]].",
+        "",
+        "![[DM Images/proof.svg|Proof Diagram]]",
+        "",
+        "Keep `[[Task Note]]` and:",
+        "",
+        "```python",
+        "grid = [[1, 0], [0, 1]]",
+        "```",
+    ].join("\n");
+    fs::write(w.file("lecture.md"), markdown).unwrap();
+    success(w.run(&["export", "lecture.md", "lecture.pdf"]));
+    pdf(&w.file("lecture.pdf"));
+    if let Ok(output) = Command::new("pdftotext").arg(w.file("lecture.pdf")).arg("-").output() {
+        if output.status.success() {
+            let extracted = String::from_utf8_lossy(&output.stdout);
+            assert!(extracted.contains("Study Task Note, Bayes, study.smd, Deck, and Top."), "{extracted}");
+            assert!(!extracted.contains("\\["), "{extracted}");
+            assert!(extracted.contains("Keep [[Task Note]]"), "{extracted}");
+            assert!(extracted.contains("grid = [[1, 0], [0, 1]]"), "{extracted}");
+        }
+    }
+}
+
+#[test]
 fn cli_export_renders_vector_diagrams_sized_images_multiline_code_and_page_breaks() {
     let w = Workspace::new();
     let badge = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"120\" height=\"40\"><rect width=\"120\" height=\"40\" fill=\"#386a57\"/></svg>";
@@ -416,3 +449,168 @@ fn cli_and_in_app_prepared_pdf_exports_produce_identical_pdf_properties_and_omit
     assert!(app_corpus.contains("2026-05-20") || app_corpus.contains("D:20260520"));
     assert_eq!(cli_bytes, app_bytes, "CLI and in-app PDF exports with deterministic date must have identical metadata and bytes");
 }
+
+#[test]
+fn cli_distinguishes_outside_root_from_missing_and_preserves_output_on_oversized_assets() {
+    use base64::Engine;
+
+    let w = Workspace::new();
+    fs::create_dir_all(w.file("notes")).unwrap();
+
+    let valid_svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect width="32" height="32" fill="#386a57"/></svg>"##;
+    let outside_svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><circle cx="16" cy="16" r="12" fill="#b3261e"/></svg>"##;
+    fs::write(w.file("notes/diagram.svg"), valid_svg).unwrap();
+    fs::write(w.file("outside-root.svg"), outside_svg).unwrap();
+
+    // 1. Normal portable pack and PDF export checks with explicit exit code 0 assertions.
+    fs::write(
+        w.file("notes/normal.md"),
+        "# Authorized Note\n\n![Diagram](diagram.svg)\n\n$$e^{i\\pi} + 1 = 0$$\n",
+    )
+    .unwrap();
+
+    let pack_ok = w.run(&["pack", "notes/normal.md", "notes/normal.smd"]);
+    assert_eq!(
+        pack_ok.status.code(),
+        Some(0),
+        "normal pack should exit 0, stderr: {}",
+        String::from_utf8_lossy(&pack_ok.stderr)
+    );
+    let packed_bytes = fs::read(w.file("notes/normal.smd")).unwrap();
+    assert!(packed_bytes.starts_with(&[0x1f, 0x8b]), "packed .smd must use gzip envelope");
+    let inspect_ok = w.run(&["inspect", "notes/normal.smd"]);
+    assert_eq!(inspect_ok.status.code(), Some(0));
+    let inspected: serde_json::Value = serde_json::from_slice(&inspect_ok.stdout).unwrap();
+    assert_eq!(inspected["format"], "supermd-smd");
+    assert_eq!(inspected["assets"][0]["bytes"], valid_svg.len());
+
+    let export_md_ok = w.run(&["export", "notes/normal.md", "notes/normal.pdf"]);
+    assert_eq!(
+        export_md_ok.status.code(),
+        Some(0),
+        "normal markdown export should exit 0, stderr: {}",
+        String::from_utf8_lossy(&export_md_ok.stderr)
+    );
+    pdf(&w.file("notes/normal.pdf"));
+
+    let export_smd_ok = w.run(&["export", "notes/normal.smd", "notes/normal-from-smd.pdf"]);
+    assert_eq!(
+        export_smd_ok.status.code(),
+        Some(0),
+        "normal portable export should exit 0, stderr: {}",
+        String::from_utf8_lossy(&export_smd_ok.stderr)
+    );
+    pdf(&w.file("notes/normal-from-smd.pdf"));
+
+    // Sentinel preexisting outputs that every refused CLI command must leave untouched.
+    let preexisting_pdf = b"%PDF-1.4\n% preexisting user export sentinel\n";
+    let preexisting_smd = b"preexisting portable archive sentinel bytes";
+    fs::write(w.file("preserved.pdf"), preexisting_pdf).unwrap();
+    fs::write(w.file("preserved.smd"), preexisting_smd).unwrap();
+
+    // 2. Real existing file outside the authorized note root vs missing files.
+    fs::write(w.file("notes/outside-real.md"), "# Escape\n\n![Outside](../outside-root.svg)\n").unwrap();
+    fs::write(w.file("notes/missing-in-root.md"), "# Missing\n\n![Missing](missing-local.svg)\n").unwrap();
+    fs::write(w.file("notes/missing-parent.md"), "# Missing Parent\n\n![Missing](../missing-outside.svg)\n").unwrap();
+
+    for (subcommand, destination, sentinel) in [
+        ("export", "preserved.pdf", preexisting_pdf.as_slice()),
+        ("pack", "preserved.smd", preexisting_smd.as_slice()),
+    ] {
+        let outside_out = w.run(&[subcommand, "notes/outside-real.md", destination]);
+        let outside_err = String::from_utf8_lossy(&outside_out.stderr);
+        assert_eq!(outside_out.status.code(), Some(1), "{subcommand} outside-root must exit 1");
+        assert!(
+            outside_err.contains("Image is outside the note folder"),
+            "{subcommand} on a real file outside the authorized root must report boundary refusal, got: {outside_err}"
+        );
+        assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+
+        for missing_note in ["notes/missing-in-root.md", "notes/missing-parent.md"] {
+            let missing_out = w.run(&[subcommand, missing_note, destination]);
+            let missing_err = String::from_utf8_lossy(&missing_out.stderr);
+            assert_eq!(missing_out.status.code(), Some(1), "{subcommand} {missing_note} must exit 1");
+            assert!(!missing_err.trim().is_empty(), "{subcommand} {missing_note} must report an error");
+            assert!(
+                !missing_err.contains("Image is outside the note folder"),
+                "{subcommand} {missing_note} must report a missing file rather than an outside-root refusal, got: {missing_err}"
+            );
+            assert_ne!(outside_err.as_ref(), missing_err.as_ref());
+            assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(w.file("outside-root.svg"), w.file("notes/symlink-outside.svg")).unwrap();
+        fs::write(w.file("notes/outside-symlink.md"), "# Symlink Escape\n\n![Symlink](symlink-outside.svg)\n").unwrap();
+        for (subcommand, destination, sentinel) in [
+            ("export", "preserved.pdf", preexisting_pdf.as_slice()),
+            ("pack", "preserved.smd", preexisting_smd.as_slice()),
+        ] {
+            let sym_out = w.run(&[subcommand, "notes/outside-symlink.md", destination]);
+            let sym_err = String::from_utf8_lossy(&sym_out.stderr);
+            assert_eq!(sym_out.status.code(), Some(1));
+            assert!(
+                sym_err.contains("Image is outside the note folder"),
+                "{subcommand} symlink to real outside file must report boundary refusal, got: {sym_err}"
+            );
+            assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+        }
+    }
+
+    // 3. Synthetic oversized asset (> 25 MB) must be refused with exit code 1 and preserve preexisting outputs.
+    let svg_prefix = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><!--"#;
+    let svg_suffix = br#"--><rect width="16" height="16" fill="black"/></svg>"#;
+    let target_len = smd_core::portable::MAX_IMAGE + 1;
+    let mut oversized_svg = Vec::with_capacity(target_len);
+    oversized_svg.extend_from_slice(svg_prefix);
+    oversized_svg.resize(target_len - svg_suffix.len(), b'a');
+    oversized_svg.extend_from_slice(svg_suffix);
+    assert_eq!(oversized_svg.len(), smd_core::portable::MAX_IMAGE + 1);
+    fs::write(w.file("notes/oversized.svg"), &oversized_svg).unwrap();
+    fs::write(w.file("notes/oversized.md"), "# Oversized\n\n![Huge](oversized.svg)\n").unwrap();
+
+    for (subcommand, destination, sentinel) in [
+        ("export", "preserved.pdf", preexisting_pdf.as_slice()),
+        ("pack", "preserved.smd", preexisting_smd.as_slice()),
+    ] {
+        let huge_out = w.run(&[subcommand, "notes/oversized.md", destination]);
+        let huge_err = String::from_utf8_lossy(&huge_out.stderr);
+        assert_eq!(huge_out.status.code(), Some(1), "{subcommand} oversized asset must exit 1");
+        assert!(
+            huge_err.contains("Image exceeds 25 MB"),
+            "{subcommand} oversized asset must report size refusal, got: {huge_err}"
+        );
+        assert_eq!(
+            fs::read(w.file(destination)).unwrap(),
+            sentinel,
+            "{subcommand} must preserve preexisting {destination} when refusing an oversized asset"
+        );
+    }
+
+    let inline_oversized_b64 = base64::engine::general_purpose::STANDARD.encode(&oversized_svg);
+    fs::write(
+        w.file("notes/oversized-inline.md"),
+        format!("# Inline Oversized\n\n![Huge](data:image/svg+xml;base64,{inline_oversized_b64})\n"),
+    )
+    .unwrap();
+    for (subcommand, destination, sentinel) in [
+        ("export", "preserved.pdf", preexisting_pdf.as_slice()),
+        ("pack", "preserved.smd", preexisting_smd.as_slice()),
+    ] {
+        let inline_out = w.run(&[subcommand, "notes/oversized-inline.md", destination]);
+        let inline_err = String::from_utf8_lossy(&inline_out.stderr);
+        assert_eq!(inline_out.status.code(), Some(1), "{subcommand} oversized inline asset must exit 1");
+        assert!(
+            inline_err.contains("Image exceeds 25 MB"),
+            "{subcommand} oversized inline asset must report size refusal, got: {inline_err}"
+        );
+        assert_eq!(
+            fs::read(w.file(destination)).unwrap(),
+            sentinel,
+            "{subcommand} must preserve preexisting {destination} when refusing an oversized inline asset"
+        );
+    }
+}
+
