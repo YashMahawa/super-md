@@ -77,10 +77,10 @@ class ThemeLibraryControllerTest {
         assertTrue(model.isObservingCustomTheme)
 
         val exportedFile = File(Files.createTempDirectory("theme-out").toFile().also(tempDirs::add), "exported.json")
-        model.exportCustomTheme(Uri.fromFile(exportedFile))
+        val exportJob = model.exportCustomTheme(Uri.fromFile(exportedFile))
         var sharedIntent: Intent? = null
-        model.shareCustomTheme { sharedIntent = it }
-        await { exportedFile.isFile && sharedIntent != null }
+        val shareJob = model.shareCustomTheme { sharedIntent = it }
+        await { exportJob.isCompleted && shareJob.isCompleted && exportedFile.isFile && sharedIntent != null }
         assertEquals("Legacy Ink", JSONObject(exportedFile.readText()).getString("name"))
         assertNotNull(sharedIntent!!.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java))
 
@@ -90,7 +90,7 @@ class ThemeLibraryControllerTest {
 
         model.themeValidator = { raw -> JSONObject().put("theme", JSONObject(raw)).toString() }
         model.selectSavedTheme(model.state.value.savedThemes.single().id)
-        await { model.isObservingCustomTheme }
+        await { model.isObservingCustomTheme && model.state.value.activeThemeKind == "saved" }
         store.clear()
         assertFalse("Clearing ViewModel must unregister theme ContentObserver", model.isObservingCustomTheme)
     }
