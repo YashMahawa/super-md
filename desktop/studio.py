@@ -67,16 +67,20 @@ from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_work
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 from core.paths import DESKTOP_DIR, resource_root
 
-if __package__:
-    from . import studio_workspace
-else:
-    import studio_workspace
+if __package__: from . import studio_workspace
+else: import studio_workspace
 
 FOLDER_TREE_NOTE_SUFFIXES = studio_workspace.FOLDER_TREE_NOTE_SUFFIXES
 FOLDER_TREE_SCAN_BUDGET = studio_workspace.FOLDER_TREE_SCAN_BUDGET
-_is_folder_tree_note_name = studio_workspace.is_folder_tree_note_name
-_probe_directory_visible_note = studio_workspace.probe_directory_visible_note
-_directory_has_visible_note = studio_workspace.directory_has_visible_note
+
+def _is_folder_tree_note_name(filename: str) -> bool:
+    return studio_workspace.is_folder_tree_note_name(filename, suffixes=FOLDER_TREE_NOTE_SUFFIXES)
+
+def _probe_directory_visible_note(dir_path: Path, *, depth: int, max_depth: int = MAX_FOLDER_DEPTH, budget: list[int] | None = None, memo: dict[str, bool] | None = None) -> bool | None:
+    return studio_workspace.probe_directory_visible_note(dir_path, depth=depth, max_depth=max_depth, budget=budget, memo=memo, folder_ops_mod=folder_ops, scandir_fn=os.scandir, is_note_fn=_is_folder_tree_note_name, probe_fn=_probe_directory_visible_note)
+
+def _directory_has_visible_note(dir_path: Path, *, depth: int, max_depth: int = MAX_FOLDER_DEPTH, budget: list[int] | None = None, memo: dict[str, bool] | None = None) -> bool:
+    return studio_workspace.directory_has_visible_note(dir_path, depth=depth, max_depth=max_depth, budget=budget, memo=memo, probe_fn=_probe_directory_visible_note)
 
 
 ROOT = resource_root()
@@ -926,6 +930,8 @@ class Session(QObject):
             if had_explicit_keep_in_background
             else bool(migrated_keep_in_background)
         )
+        if not isinstance(self.settings.get("hideNonNoteFolders"), bool):
+            self.settings["hideNonNoteFolders"] = True
         raw_note_location = self.settings.get("newNoteLocation")
         if (not isinstance(raw_note_location, str) or not raw_note_location.strip() or "\0" in raw_note_location
                 or len(raw_note_location) > 4096 or _is_disallowed_root_setting(raw_note_location)):
@@ -2373,53 +2379,26 @@ class Studio(QObject):
         )
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
-    def folderSearchState(self):
-        return studio_workspace.folder_search_state(self)
-
-    def _search_snapshots(self):
-        return studio_workspace.search_snapshots(self)
-
-    def _cancel_folder_search(self, close: bool = False):
-        studio_workspace.cancel_folder_search(self, close)
-
+    def folderSearchState(self): return studio_workspace.folder_search_state(self)
+    def _search_snapshots(self): return studio_workspace.search_snapshots(self, canon_key_fn=canonical_note_key)
+    def _cancel_folder_search(self, close: bool = False): studio_workspace.cancel_folder_search(self, close)
     @Slot()
-    def openFolderSearch(self):
-        studio_workspace.open_folder_search(self)
-
+    def openFolderSearch(self): studio_workspace.open_folder_search(self, stream_search_fn=stream_text_search, canon_key_fn=canonical_note_key)
     @Slot(str, bool, bool)
     def updateFolderSearch(self, query: str, case_sensitive: bool = False, include_diagrams: bool = False):
-        studio_workspace.update_folder_search(self, query, case_sensitive, include_diagrams)
-
-    def _start_folder_search(self):
-        studio_workspace.start_folder_search(self)
-
+        studio_workspace.update_folder_search(self, query, case_sensitive, include_diagrams, stream_search_fn=stream_text_search, canon_key_fn=canonical_note_key)
+    def _start_folder_search(self): studio_workspace.start_folder_search(self, stream_search_fn=stream_text_search, canon_key_fn=canonical_note_key)
     def _on_workspace_search_batch(self, generation: int, batch, scanned: int, truncated: bool, done: bool):
         studio_workspace.on_workspace_search_batch(self, generation, batch, scanned, truncated, done)
-
     @Slot()
-    def closeFolderSearch(self):
-        studio_workspace.close_folder_search(self)
-
+    def closeFolderSearch(self): studio_workspace.close_folder_search(self)
     @Slot()
-    def cancelWorkspaceSearch(self):
-        studio_workspace.cancel_workspace_search(self)
-
+    def cancelWorkspaceSearch(self): studio_workspace.cancel_workspace_search(self)
     @Slot(str, str, str, bool)
     @Slot(str, str, str, bool, int, int)
     @Slot(str, str, str, bool, int, int, str)
-    def openFolderSearchMatch(
-        self,
-        tab_id: str,
-        path: str,
-        query: str,
-        case_sensitive: bool = False,
-        source_start: int = -1,
-        source_end: int = -1,
-        match_text: str = "",
-    ):
-        studio_workspace.open_folder_search_match(
-            self, tab_id, path, query, case_sensitive, source_start, source_end, match_text
-        )
+    def openFolderSearchMatch(self, tab_id: str, path: str, query: str, case_sensitive: bool = False, source_start: int = -1, source_end: int = -1, match_text: str = ""):
+        studio_workspace.open_folder_search_match(self, tab_id, path, query, case_sensitive, source_start, source_end, match_text, seeded_find_bounds_fn=getattr(self, "_seeded_find_bounds", None))
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -3786,6 +3765,8 @@ class Studio(QObject):
     def _open_dropped_notes(self, note_paths: list[Path], *, notice: str = ""):
         if not note_paths or self.retired:
             return
+        if notice:
+            self.message = notice
         self._activation_generation += 1
         batch_generation = self._activation_generation
         highest_activated_index = -1
@@ -4163,41 +4144,27 @@ class Studio(QObject):
         self._submit(read_note,finished,False,self.writes)
 
     def _restore_workspace_folder(self, folder_path: str, expanded_paths: list[str] | None = None):
-        studio_workspace.restore_workspace_folder(self, folder_path, expanded_paths)
-
-    def _cancel_subfolder_search(self):
-        studio_workspace.cancel_subfolder_search(self)
-
-    def _clear_folder_filter(self):
-        studio_workspace.clear_folder_filter(self)
-
+        studio_workspace.restore_workspace_folder(self, folder_path, expanded_paths, canonical_approved_dir_fn=_canonical_approved_directory, folder_ops_mod=folder_ops)
+    def _cancel_subfolder_search(self): studio_workspace.cancel_subfolder_search(self)
+    def _clear_folder_filter(self): studio_workspace.clear_folder_filter(self)
     @Slot(str)
     def setFolderFilter(self, query):
-        studio_workspace.set_folder_filter(self, query)
-
+        studio_workspace.set_folder_filter(self, query, folder_ops_mod=folder_ops, is_searchable_fn=is_searchable_note_name, scandir_fn=os.scandir, max_depth=MAX_FOLDER_DEPTH)
     def _start_subfolder_search(self):
-        studio_workspace.start_subfolder_search(self)
-
+        studio_workspace.start_subfolder_search(self, folder_ops_mod=folder_ops, is_searchable_fn=is_searchable_note_name, scandir_fn=os.scandir, max_depth=MAX_FOLDER_DEPTH)
     @Slot(str)
     def openFolder(self, value):
-        studio_workspace.open_folder(self, value)
-
-    def _is_within_open_folder(self, candidate) -> bool:
-        return studio_workspace.is_within_open_folder(self, candidate)
-
+        studio_workspace.open_folder(self, value, raw_local_path_fn=_raw_local_path, canonical_approved_dir_fn=_canonical_approved_directory, folder_ops_mod=folder_ops)
+    def _is_within_open_folder(self, candidate) -> bool: return studio_workspace.is_within_open_folder(self, candidate, folder_ops_mod=folder_ops)
     def _refresh_open_folder_trees(self, *candidates) -> None:
-        studio_workspace.refresh_open_folder_trees(self, *candidates)
-
+        studio_workspace.refresh_open_folder_trees(self, *candidates, is_within_fn=getattr(self, "_is_within_open_folder", None), folder_ops_mod=folder_ops)
     def _load_tree(self):
-        studio_workspace.load_tree(self)
-
+        studio_workspace.load_tree(self, folder_ops_mod=folder_ops, is_searchable_fn=is_searchable_note_name, scandir_fn=os.scandir, has_visible_note_fn=_directory_has_visible_note, max_depth=MAX_FOLDER_DEPTH, default_scan_budget=FOLDER_TREE_SCAN_BUDGET)
     @Slot(str)
     def toggleDirectory(self, path):
-        studio_workspace.toggle_directory(self, path)
-
+        studio_workspace.toggle_directory(self, path, raw_local_path_fn=_raw_local_path, canonical_approved_dir_fn=_canonical_approved_directory, folder_ops_mod=folder_ops)
     @Slot()
-    def closeFolder(self):
-        studio_workspace.close_folder(self)
+    def closeFolder(self): studio_workspace.close_folder(self)
 
     @Slot(str)
     def setMode(self, mode):

@@ -16,7 +16,6 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from http.server import ThreadingHTTPServer
 from PySide6.QtCore import QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import QGuiApplication
 
@@ -26,8 +25,6 @@ from agent_live_client import MultiSessionLiveClient
 from documents import open_note, write_portable
 from mcp_server import build_mcp_server
 from studio import Session, Studio, _validate_local_tab_asset_path
-
-_ORIG_SERVE_FOREVER = ThreadingHTTPServer.serve_forever
 
 
 PNG_BYTES = base64.b64decode(
@@ -42,61 +39,32 @@ class QuietStudio(Studio):
         session = session or Session(isolated)
         if not session.settings.get("python"):
             session.settings["python"] = sys.executable
-        with patch("studio.shutil.which", return_value=None):
-            super().__init__(isolated, session)
+        super().__init__(isolated, session)
 
     def _refresh_theme(self):
         self.system_dark = True
-
-    def _restore_update(self):
-        pass
 
 
 class AgentLiveFileAccessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Super MD live file access tests"])
-        cls._poll_patcher = patch.object(
-            ThreadingHTTPServer,
-            "serve_forever",
-            lambda srv, poll_interval=0.02: _ORIG_SERVE_FOREVER(srv, poll_interval=poll_interval),
-        )
-        cls._poll_patcher.start()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._poll_patcher.stop()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name).resolve(strict=True)
-        self._session: Session | None = None
-        self._studio: QuietStudio | None = None
-
-    @property
-    def session(self) -> Session:
-        if self._session is None:
-            self._session = Session(isolated=True)
-            self._session.settings["python"] = sys.executable
-        return self._session
-
-    @property
-    def studio(self) -> QuietStudio:
-        if self._studio is None:
-            self._studio = QuietStudio(True, self.session)
-        return self._studio
+        self.session = Session(isolated=True)
+        self.session.settings["python"] = sys.executable
+        self.studio = QuietStudio(True, self.session)
 
     def tearDown(self):
-        if self._studio is not None:
-            self._studio.stop()
-            self._studio._search_pool.shutdown(wait=True, cancel_futures=True)
-            self._studio.pool.shutdown(wait=True, cancel_futures=True)
-            self._studio.deleteLater()
-        if self._session is not None:
-            self._session.writes.shutdown(wait=True)
-            shutil.rmtree(self._session.data, ignore_errors=True)
+        self.studio.stop()
+        self.studio.pool.shutdown(wait=True, cancel_futures=True)
+        self.session.writes.shutdown(wait=True)
+        self.studio.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
+        shutil.rmtree(self.session.data, ignore_errors=True)
         self.temp.cleanup()
 
     def _rev(self, text: str) -> str:
@@ -203,9 +171,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                         })
         finally:
             second_studio.stop()
-            second_studio._search_pool.shutdown(wait=True, cancel_futures=True)
             second_studio.pool.shutdown(wait=True, cancel_futures=True)
-            retired_studio._search_pool.shutdown(wait=True, cancel_futures=True)
             retired_studio.pool.shutdown(wait=True, cancel_futures=True)
             second_studio.deleteLater()
             retired_studio.deleteLater()
@@ -460,8 +426,6 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 try:
                     if request["action"] == "flush_current":
                         result = {"flushed": True}
-                    elif request["action"] == "list_tabs":
-                        result = {"tabs": request["tabs"]}
                     elif request["action"] == "asset_action":
                         result = self.studio._attach_tab_asset_native(request)
                     else:
@@ -476,7 +440,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 task = asyncio.create_task(coro)
                 while not task.done():
                     self.app.processEvents()
-                    await asyncio.sleep(0.002)
+                    await asyncio.sleep(0.01)
                 return await task
 
             with patch.object(QStandardPaths, "writableLocation", return_value=str(downloads_dir)):
@@ -580,7 +544,6 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             studio1._recover()
         finally:
             studio1.stop()
-            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             studio1.pool.shutdown(wait=True, cancel_futures=True)
             session1.writes.shutdown(wait=True)
             studio1.deleteLater()
@@ -624,7 +587,6 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             studio2.closeFolder()
         finally:
             studio2.stop()
-            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             studio2.pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
@@ -654,7 +616,6 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 self.assertEqual(studio3.folder, "")
             finally:
                 studio3.stop()
-                studio3._search_pool.shutdown(wait=True, cancel_futures=True)
                 studio3.pool.shutdown(wait=True, cancel_futures=True)
                 session3.writes.shutdown(wait=True)
                 studio3.deleteLater()
@@ -892,7 +853,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                     task = asyncio.create_task(coro)
                     while not task.done():
                         self.app.processEvents()
-                        await asyncio.sleep(0.002)
+                        await asyncio.sleep(0.01)
                     return await task
 
                 async with Client(server) as client:
@@ -944,7 +905,6 @@ class AgentLiveFileAccessTests(unittest.TestCase):
         finally:
             bridge.stop()
             studio1.stop()
-            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             studio1.pool.shutdown(wait=True, cancel_futures=True)
             session1.writes.shutdown(wait=True)
             studio1.deleteLater()
@@ -978,7 +938,6 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             self.assertTrue(studio2._is_tab_live_authorized(restored_user))
         finally:
             studio2.stop()
-            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             studio2.pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
@@ -1116,11 +1075,19 @@ class AgentLiveFileAccessTests(unittest.TestCase):
         decoy_svg = decoy_note_dir / "decoy-fig.svg"
         selected_ws_smd = selected_ws_dir / "ws-approved.smd"
         selected_ws_svg = selected_ws_dir / "ws-approved.svg"
+        selected_ws_empty_sub = selected_ws_dir / "AssetsOnly"
+        selected_ws_notes_sub = selected_ws_dir / "NotesSub"
+        selected_ws_empty_sub.mkdir()
+        selected_ws_notes_sub.mkdir()
+        (selected_ws_empty_sub / "diagram.svg").write_bytes(SVG_BYTES)
+        selected_ws_sub_note = selected_ws_notes_sub / "nested-topic.md"
+        selected_ws_sub_note.write_text("# Nested topic\n\nOuter whitespace needle match\n", encoding="utf-8")
         decoy_ws_note = decoy_ws_dir / "ws-decoy.md"
         decoy_ws_svg = decoy_ws_dir / "ws-decoy.svg"
 
-        for note_file in (selected_note, decoy_note, decoy_ws_note):
+        for note_file in (selected_note, decoy_note):
             note_file.write_text(f"# {note_file.stem}\n", encoding="utf-8")
+        decoy_ws_note.write_text("# ws-decoy\n\nOuter whitespace needle match\n", encoding="utf-8")
         write_portable(
             selected_ws_smd,
             "# Approved workspace portable note\n",
@@ -1228,13 +1195,47 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 })
                 self.assertEqual(attached["assetName"], "assets/from-note-loc.svg")
 
+                # #151 folder sidebar filtering & folder search honor the exact outer-whitespace folder
+                # and both independent Boolean preferences (keepInBackground & hideNonNoteFolders).
+                self.assertIs(studio1.settings["keepInBackground"], False)
+                self.assertIs(studio1.settings["hideNonNoteFolders"], True)
+                deadline = time.monotonic() + 3.0
+                while [f["name"] for f in studio1.files] != ["NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertEqual([f["name"] for f in studio1.files], ["NotesSub", "ws-approved.smd"])
+
+                studio1.setting("keepInBackground", "true")
+                self.assertIs(studio1.settings["keepInBackground"], True)
+                self.assertIs(studio1.settings["hideNonNoteFolders"], True)
+
+                studio1.setting("hideNonNoteFolders", "false")
+                self.assertIs(studio1.settings["hideNonNoteFolders"], False)
+                self.assertIs(studio1.settings["keepInBackground"], True)
+                deadline = time.monotonic() + 3.0
+                while [f["name"] for f in studio1.files] != ["AssetsOnly", "NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertEqual([f["name"] for f in studio1.files], ["AssetsOnly", "NotesSub", "ws-approved.smd"])
+
+                studio1.openFolderSearch()
+                studio1.updateFolderSearch("Outer whitespace needle match", False, False)
+                deadline = time.monotonic() + 3.0
+                while studio1._folder_search_scanning and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                matched_paths = [m["path"] for m in studio1._folder_search_matches]
+                self.assertEqual(matched_paths, [str(selected_ws_sub_note.resolve(strict=True))])
+                self.assertNotIn(str(decoy_ws_note.resolve(strict=True)), matched_paths)
+                studio1.closeFolderSearch()
+
                 studio1._preferences()
                 studio1._recover()
         finally:
             bridge1.stop()
             studio1.stop()
-            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             studio1.pool.shutdown(wait=True, cancel_futures=True)
+            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             session1.writes.shutdown(wait=True)
             studio1.deleteLater()
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
@@ -1242,6 +1243,8 @@ class AgentLiveFileAccessTests(unittest.TestCase):
 
         saved_settings_json = json.loads((app_data / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(saved_settings_json["settings"]["newNoteLocation"], expected_note_dir_str)
+        self.assertIs(saved_settings_json["settings"]["keepInBackground"], True)
+        self.assertIs(saved_settings_json["settings"]["hideNonNoteFolders"], False)
         self.assertEqual(
             os.fsencode(saved_settings_json["settings"]["newNoteLocation"]),
             os.fsencode(expected_note_dir_str),
@@ -1256,8 +1259,23 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             restored_tab = self._await_tab_path(studio2, selected_ws_smd)
             self.assertEqual(session2.settings["newNoteLocation"], expected_note_dir_str)
             self.assertEqual(studio2.settings["newNoteLocation"], expected_note_dir_str)
+            self.assertIs(studio2.settings["keepInBackground"], True)
+            self.assertIs(studio2.settings["hideNonNoteFolders"], False)
             self.assertEqual(studio2.folder, expected_ws_dir_str)
             self.assertEqual(studio2._agent_mcp_roots(), [expected_ws_dir_str, expected_note_dir_str])
+            deadline = time.monotonic() + 3.0
+            while [f["name"] for f in studio2.files] != ["AssetsOnly", "NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertEqual([f["name"] for f in studio2.files], ["AssetsOnly", "NotesSub", "ws-approved.smd"])
+            studio2.setting("hideNonNoteFolders", "true")
+            self.assertIs(studio2.settings["hideNonNoteFolders"], True)
+            self.assertIs(studio2.settings["keepInBackground"], True)
+            deadline = time.monotonic() + 3.0
+            while [f["name"] for f in studio2.files] != ["NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertEqual([f["name"] for f in studio2.files], ["NotesSub", "ws-approved.smd"])
 
             self.assertTrue(studio2._agent_path_allowed(selected_note))
             self.assertTrue(studio2._agent_path_allowed(selected_ws_smd))
@@ -1314,8 +1332,8 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             self.assertFalse(studio2._agent_path_allowed(decoy_note))
         finally:
             studio2.stop()
-            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             studio2.pool.shutdown(wait=True, cancel_futures=True)
+            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)

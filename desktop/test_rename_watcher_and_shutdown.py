@@ -18,7 +18,6 @@ DESKTOP = Path(__file__).resolve().parent
 if str(DESKTOP) not in sys.path:
     sys.path.insert(0, str(DESKTOP))
 
-from PySide6.QtCore import QEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -30,276 +29,14 @@ from workspace_links import resolve_workspace_link
 
 
 class QuietStudio(Studio):
-    def __init__(self, isolated: bool = False, session: Session | None = None):
-        session = session or Session(isolated)
-        if not session.settings.get("python"):
-            session.settings["python"] = sys.executable
-        with mock.patch.object(studio.shutil, "which", return_value=None):
-            super().__init__(isolated, session)
-
     def _choose_default_python(self, emit=True):
         self.python_status = "No Python interpreter configured."
 
-    def _refresh_theme(self):
-        self.system_dark = True
-
-    def _restore_update(self):
-        pass
-
-
-_QUIT_SCENARIO_WORKER = textwrap.dedent(
-    """
-    import json, os, sys, threading, time, traceback
-    from pathlib import Path
-    from unittest import mock
-
-    cout = sys.stdout
-    sys.path.insert(0, os.environ["SUPERMD_TEST_DESKTOP"])
-    from PySide6.QtCore import QEvent, QTimer
-    from PySide6.QtWidgets import QApplication
-    import folder_ops
-    import studio
-    from studio import Session, Studio
-
-    class QuietStudio(Studio):
-        def __init__(self, isolated=False, session=None):
-            session = session or Session(isolated)
-            if not session.settings.get("python"):
-                session.settings["python"] = sys.executable
-            with mock.patch.object(studio.shutil, "which", return_value=None):
-                super().__init__(isolated, session)
-
-        def _choose_default_python(self, emit=True):
-            self.python_status = "No Python interpreter configured."
-
-        def _refresh_theme(self):
-            self.system_dark = True
-
-        def _restore_update(self):
-            pass
-
-    app = QApplication([])
-    orig_rename = Path.rename
-
-    while True:
-        raw_line = sys.stdin.readline()
-        if not raw_line:
-            break
-        raw_line = raw_line.strip()
-        if not raw_line:
-            continue
-        cmd = json.loads(raw_line)
-        if cmd.get("kind") == "quit":
-            cout.flush()
-            sys.stderr.flush()
-            os._exit(0)
-
-        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-        app.processEvents()
-
-        session = None
-        st = None
-        patcher = None
-        allow_disk_rename = threading.Event()
-        mark_quitting = None
-        try:
-            session = Session(False, data=Path(cmd["state_dir"]))
-
-            def _mark_quitting(s=session):
-                s.quitting = True
-
-            mark_quitting = _mark_quitting
-            app.aboutToQuit.connect(mark_quitting)
-            st = QuietStudio(False, session)
-
-            workspace = Path(cmd["workspace"])
-            old_note = Path(cmd["old_note"])
-            old_dir = Path(cmd["old_dir"]) if cmd.get("old_dir") else None
-            unsaved_text = cmd["unsaved_text"]
-            finish_before_stop = bool(cmd["finish_before_stop"])
-            rename_folder = bool(cmd["rename_folder"])
-
-            st.openFolder(str(workspace))
-            if rename_folder and old_dir is not None:
-                st.toggleDirectory(str(old_dir))
-            st.openNote(str(old_note))
-
-            worker_entered = threading.Event()
-            disk_renamed = threading.Event()
-
-            def gated_rename(self_path, target):
-                worker_entered.set()
-                allow_disk_rename.wait(timeout=5.0)
-                result = orig_rename(self_path, target)
-                disk_renamed.set()
-                return result
-
-            patcher = mock.patch.object(Path, "rename", gated_rename)
-            patcher.start()
-
-            def poll_ready_and_rename():
-                if not folder_ops.same_path(st._current().get("path", ""), old_note):
-                    QTimer.singleShot(5, poll_ready_and_rename)
-                    return
-                if not st.files:
-                    QTimer.singleShot(5, poll_ready_and_rename)
-                    return
-                tab_id = st.active
-                st.pinRecent(str(old_note))
-                st.post(
-                    "pos-quit",
-                    "reading_position",
-                    json.dumps({
-                        "id": tab_id,
-                        "location": {"top": 6, "offset": 0.42, "zoom": 110, "mode": "live"},
-                    }),
-                )
-                st.post(
-                    "dirty-quit",
-                    "document_changed",
-                    json.dumps({"id": tab_id, "content": unsaved_text}),
-                )
-                if rename_folder and old_dir is not None:
-                    st.renameEntry(str(old_dir), "Published")
-                else:
-                    st.renameNote(tab_id, "Renamed.md")
-
-                def wait_worker_then_quit():
-                    if not worker_entered.is_set():
-                        QTimer.singleShot(5, wait_worker_then_quit)
-                        return
-                    app.quit()
-
-                QTimer.singleShot(2, wait_worker_then_quit)
-
-            QTimer.singleShot(0, poll_ready_and_rename)
-            status = app.exec()
-
-            # Normal quit left app.exec(); no Qt event loop will service queued signals after this point.
-            assert old_note.is_file(), "Expected old path to exist when app.exec() exited"
-
-            if finish_before_stop:
-                # Worker finishes after app.exec() exits, before Studio.stop() runs;
-                # Session.renameCompleted sits unserviced in Qt's event queue.
-                allow_disk_rename.set()
-                assert disk_renamed.wait(timeout=3.0), "Expected disk rename to finish before stop()"
-                time.sleep(0.02)
-                st.stop()
-                st.pool.shutdown(wait=False, cancel_futures=True)
-                st._search_pool.shutdown(wait=False, cancel_futures=True)
-                session.writes.shutdown(wait=True)
-            else:
-                # Exact main.py shutdown order: Studio.stop() runs first while worker is still blocked,
-                # then the worker completes the real filesystem rename during session.writes.shutdown(wait=True).
-                st.stop()
-                assert old_note.is_file(), "Expected rename to still be in flight after Studio.stop()"
-
-                def release_during_writer_drain(s=session):
-                    deadline = time.monotonic() + 2.0
-                    while time.monotonic() < deadline and not getattr(s.writes, "_shutdown", False):
-                        time.sleep(0.005)
-                    allow_disk_rename.set()
-
-                releaser = threading.Thread(target=release_during_writer_drain, daemon=True)
-                releaser.start()
-                st.pool.shutdown(wait=False, cancel_futures=True)
-                st._search_pool.shutdown(wait=False, cancel_futures=True)
-                session.writes.shutdown(wait=True)
-                releaser.join(timeout=2.0)
-                assert disk_renamed.is_set(), "Expected disk rename to complete during writer shutdown drain"
-
-            patcher.stop()
-            patcher = None
-            cout.write(json.dumps({"ok": True, "status": status}) + "\\n")
-            cout.flush()
-        except BaseException:
-            tb = traceback.format_exc()
-            allow_disk_rename.set()
-            if patcher is not None:
-                try:
-                    patcher.stop()
-                except Exception:
-                    pass
-            if st is not None:
-                try:
-                    if not st.retired:
-                        st.stop()
-                    st.pool.shutdown(wait=False, cancel_futures=True)
-                    st._search_pool.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
-            if session is not None:
-                try:
-                    session.writes.shutdown(wait=True)
-                except Exception:
-                    pass
-            cout.write(json.dumps({"ok": False, "error": tb}) + "\\n")
-            cout.flush()
-        finally:
-            if mark_quitting is not None:
-                try:
-                    app.aboutToQuit.disconnect(mark_quitting)
-                except (RuntimeError, TypeError):
-                    pass
-            if session is not None:
-                try:
-                    session.renameCompleted.disconnect()
-                except (RuntimeError, TypeError):
-                    pass
-                session.deleteLater()
-            if st is not None:
-                st.deleteLater()
-    """
-)
-
 
 class RenameWatcherAndShutdownTest(unittest.TestCase):
-    _quit_worker: subprocess.Popen[str] | None = None
-
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
-
-    @classmethod
-    def tearDownClass(cls):
-        worker = cls._quit_worker
-        cls._quit_worker = None
-        if worker is None:
-            return
-        try:
-            if worker.poll() is None and worker.stdin:
-                worker.stdin.write('{"kind":"quit"}\n')
-                worker.stdin.flush()
-                worker.wait(timeout=3)
-        except Exception:
-            pass
-        if worker.poll() is None:
-            worker.kill()
-        try:
-            worker.communicate(timeout=2)
-        except Exception:
-            pass
-
-    @classmethod
-    def _ensure_quit_worker(cls) -> subprocess.Popen[str]:
-        if cls._quit_worker is None or cls._quit_worker.poll() is not None:
-            cls._quit_worker = subprocess.Popen(
-                [sys.executable, "-u", "-c", _QUIT_SCENARIO_WORKER],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                env={
-                    **os.environ,
-                    "QT_QPA_PLATFORM": "offscreen",
-                    "QT_QUICK_BACKEND": "software",
-                    "SUPERMD_TEST_DESKTOP": str(DESKTOP),
-                    "PYTHONUTF8": "1",
-                    "PYTHONIOENCODING": "utf-8",
-                },
-            )
-        return cls._quit_worker
 
     def setUp(self):
         self.session = Session(True)
@@ -340,17 +77,17 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
             self.app.processEvents()
             if predicate():
                 return
-            QTest.qWait(5)
+            QTest.qWait(15)
         self.app.processEvents()
         self.assertTrue(predicate(), "Timed out waiting for condition")
 
     def _settle_watchers(self):
-        QTest.qWait(10)
+        QTest.qWait(40)
         self.app.processEvents()
         if self.studio.external_timer.isActive():
             self.studio.external_timer.stop()
             self.studio._refresh_external_notes()
-        QTest.qWait(10)
+        QTest.qWait(30)
         self.app.processEvents()
 
     def _same_path_list(self, actual, expected) -> bool:
@@ -464,7 +201,7 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
                 self.studio._refresh_external_notes()
                 reconcile_gate.set()
                 self.assertTrue(reconcile_finished.wait(timeout=3.0))
-                QTest.qWait(10)
+                QTest.qWait(40)
                 self.app.processEvents()
 
                 self.assertTrue(any(t["id"] == overview_tab_id for t in self.studio.tabs))
@@ -567,7 +304,7 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
                 self.studio._refresh_external_notes()
                 dir_reconcile_gate.set()
                 self.assertTrue(dir_reconcile_done.wait(timeout=3.0))
-                QTest.qWait(10)
+                QTest.qWait(40)
                 self.app.processEvents()
 
                 self.assertTrue(any(t["id"] == week1_tab_id for t in self.studio.tabs))
@@ -806,45 +543,156 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
             unsaved_text = "# Draft\n\nUnsaved draft edits retained across normal quit."
             old_note.write_text(saved_text, encoding="utf-8")
 
-            worker = self._ensure_quit_worker()
-            assert worker.stdin is not None and worker.stdout is not None
-            reply: dict[str, object] = {}
-            errors: list[BaseException] = []
-            cmd_payload = {
-                "state_dir": str(state_dir),
-                "workspace": str(workspace_canon),
-                "old_note": str(old_note),
-                "old_dir": str(old_dir) if old_dir else "",
-                "unsaved_text": unsaved_text,
-                "finish_before_stop": finish_before_stop,
-                "rename_folder": rename_folder,
+            env = {
+                **os.environ,
+                "QT_QPA_PLATFORM": "offscreen",
+                "QT_QUICK_BACKEND": "software",
+                "SUPERMD_TEST_DESKTOP": str(DESKTOP),
+                "SUPERMD_TEST_STATE_DIR": str(state_dir),
+                "SUPERMD_TEST_WORKSPACE": str(workspace_canon),
+                "SUPERMD_TEST_OLD_NOTE": str(old_note),
+                "SUPERMD_TEST_OLD_DIR": str(old_dir) if old_dir else "",
+                "SUPERMD_TEST_UNSAVED_TEXT": unsaved_text,
+                "SUPERMD_TEST_FINISH_BEFORE_STOP": "1" if finish_before_stop else "0",
+                "SUPERMD_TEST_RENAME_FOLDER": "1" if rename_folder else "0",
             }
 
-            def call_quit_worker():
-                try:
-                    worker.stdin.write(json.dumps(cmd_payload) + "\n")
-                    worker.stdin.flush()
-                    line = worker.stdout.readline()
-                    if not line:
-                        stderr_out = worker.stderr.read() if worker.stderr and worker.poll() is not None else ""
-                        raise RuntimeError(f"Quit worker EOF: {stderr_out}")
-                    reply["data"] = json.loads(line)
-                except BaseException as exc:
-                    errors.append(exc)
+            quit_script = textwrap.dedent(
+                """
+                import json, os, sys, threading, time
+                from pathlib import Path
+                from unittest import mock
 
-            reader_thread = threading.Thread(target=call_quit_worker, daemon=True)
-            reader_thread.start()
-            reader_thread.join(timeout=30.0)
-            if errors:
-                raise errors[0]
-            self.assertIn("data", reply, "Quit scenario worker timed out")
-            worker_res = reply["data"]
-            assert isinstance(worker_res, dict)
-            self.assertTrue(
-                worker_res.get("ok"),
-                f"Quit worker failed:\n{worker_res.get('error', worker_res)}",
+                sys.path.insert(0, os.environ["SUPERMD_TEST_DESKTOP"])
+                from PySide6.QtCore import QTimer
+                from PySide6.QtWidgets import QApplication
+                import folder_ops
+                from studio import Session, Studio
+
+                class QuietStudio(Studio):
+                    def _choose_default_python(self, emit=True):
+                        self.python_status = "No Python interpreter configured."
+
+                app = QApplication([])
+                session = Session(False, data=Path(os.environ["SUPERMD_TEST_STATE_DIR"]))
+                app.aboutToQuit.connect(lambda: setattr(session, "quitting", True))
+                st = QuietStudio(False, session)
+
+                workspace = Path(os.environ["SUPERMD_TEST_WORKSPACE"])
+                old_note = Path(os.environ["SUPERMD_TEST_OLD_NOTE"])
+                old_dir = Path(os.environ["SUPERMD_TEST_OLD_DIR"]) if os.environ["SUPERMD_TEST_OLD_DIR"] else None
+                unsaved_text = os.environ["SUPERMD_TEST_UNSAVED_TEXT"]
+                finish_before_stop = os.environ["SUPERMD_TEST_FINISH_BEFORE_STOP"] == "1"
+                rename_folder = os.environ["SUPERMD_TEST_RENAME_FOLDER"] == "1"
+
+                st.openFolder(str(workspace))
+                if rename_folder and old_dir is not None:
+                    st.toggleDirectory(str(old_dir))
+                st.openNote(str(old_note))
+
+                worker_entered = threading.Event()
+                allow_disk_rename = threading.Event()
+                disk_renamed = threading.Event()
+                orig_rename = Path.rename
+
+                def gated_rename(self_path, target):
+                    worker_entered.set()
+                    allow_disk_rename.wait(timeout=5.0)
+                    result = orig_rename(self_path, target)
+                    disk_renamed.set()
+                    return result
+
+                patcher = mock.patch.object(Path, "rename", gated_rename)
+                patcher.start()
+
+                def poll_ready_and_rename():
+                    if not folder_ops.same_path(st._current().get("path", ""), old_note):
+                        QTimer.singleShot(15, poll_ready_and_rename)
+                        return
+                    if not st.files:
+                        QTimer.singleShot(15, poll_ready_and_rename)
+                        return
+                    tab_id = st.active
+                    st.pinRecent(str(old_note))
+                    st.post(
+                        "pos-quit",
+                        "reading_position",
+                        json.dumps({
+                            "id": tab_id,
+                            "location": {"top": 6, "offset": 0.42, "zoom": 110, "mode": "live"},
+                        }),
+                    )
+                    st.post(
+                        "dirty-quit",
+                        "document_changed",
+                        json.dumps({"id": tab_id, "content": unsaved_text}),
+                    )
+                    if rename_folder and old_dir is not None:
+                        st.renameEntry(str(old_dir), "Published")
+                    else:
+                        st.renameNote(tab_id, "Renamed.md")
+
+                    def wait_worker_then_quit():
+                        if not worker_entered.is_set():
+                            QTimer.singleShot(10, wait_worker_then_quit)
+                            return
+                        app.quit()
+
+                    QTimer.singleShot(5, wait_worker_then_quit)
+
+                QTimer.singleShot(0, poll_ready_and_rename)
+                status = app.exec()
+
+                # Normal quit left app.exec(); no Qt event loop will service queued signals after this point.
+                assert old_note.is_file(), "Expected old path to exist when app.exec() exited"
+
+                if finish_before_stop:
+                    # Worker finishes after app.exec() exits, before Studio.stop() runs;
+                    # Session.renameCompleted sits unserviced in Qt's event queue.
+                    allow_disk_rename.set()
+                    assert disk_renamed.wait(timeout=3.0), "Expected disk rename to finish before stop()"
+                    time.sleep(0.02)
+                    st.stop()
+                    st.pool.shutdown(wait=False, cancel_futures=True)
+                    st._search_pool.shutdown(wait=False, cancel_futures=True)
+                    session.writes.shutdown(wait=True)
+                else:
+                    # Exact main.py shutdown order: Studio.stop() runs first while worker is still blocked,
+                    # then the worker completes the real filesystem rename during session.writes.shutdown(wait=True).
+                    st.stop()
+                    assert old_note.is_file(), "Expected rename to still be in flight after Studio.stop()"
+
+                    def release_during_writer_drain():
+                        deadline = time.monotonic() + 2.0
+                        while time.monotonic() < deadline and not getattr(session.writes, "_shutdown", False):
+                            time.sleep(0.005)
+                        allow_disk_rename.set()
+
+                    releaser = threading.Thread(target=release_during_writer_drain, daemon=True)
+                    releaser.start()
+                    st.pool.shutdown(wait=False, cancel_futures=True)
+                    st._search_pool.shutdown(wait=False, cancel_futures=True)
+                    session.writes.shutdown(wait=True)
+                    releaser.join(timeout=2.0)
+                    assert disk_renamed.is_set(), "Expected disk rename to complete during writer shutdown drain"
+
+                patcher.stop()
+                sys.exit(status)
+                """
             )
-            self.assertEqual(worker_res.get("status"), 0)
+
+            proc1 = subprocess.run(
+                [sys.executable, "-c", quit_script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                proc1.returncode,
+                0,
+                f"Quit subprocess failed:\nSTDOUT:\n{proc1.stdout}\nSTDERR:\n{proc1.stderr}",
+            )
 
             # 1. Filesystem contains only the renamed item, with saved baseline on disk.
             self.assertFalse(old_note.exists())
@@ -889,53 +737,92 @@ class RenameWatcherAndShutdownTest(unittest.TestCase):
             self.assertEqual(recovery_json[0]["content"], unsaved_text)
             self.assertEqual(recovery_json[0]["saved"], saved_text)
 
-            # 3. Fresh Session/Studio (separate process from _quit_worker) loads the persisted state files
-            #    and restores the renamed note, pin, reading position, and draft.
-            reopen_session = Session(False, data=state_dir)
-            loads: list[dict] = []
-            reopen_st = QuietStudio(False, reopen_session)
-            reopen_st.readerLoad.connect(lambda payload: loads.append(json.loads(payload)))
-            try:
-                self.wait_until(
-                    lambda: not (reopen_st._restoring_paths or (reopen_st.folder and not reopen_st.files))
-                )
-                reopen_st.ready = True
-                reopen_st._emit(True)
-                current = reopen_st._current()
-                report = {
-                    "tabs": [
-                        {
-                            "id": t["id"],
-                            "name": t["name"],
-                            "path": t["path"],
-                            "content": t["content"],
-                            "saved": t["saved"],
-                            "dirty": reopen_st._is_dirty(t),
-                            "conflict": bool(t.get("conflict")),
-                        }
-                        for t in reopen_st.tabs
-                    ],
-                    "activePath": current.get("path", ""),
-                    "activeName": current.get("name", ""),
-                    "folder": reopen_st.folder,
-                    "files": [f["name"] for f in reopen_st.files],
-                    "hideNonNoteFolders": bool(reopen_st.settings.get("hideNonNoteFolders", True)),
-                    "pinned": list(reopen_session.pinned),
-                    "recent": list(reopen_st.recent),
-                    "locations": dict(reopen_session.locations),
-                    "expanded": sorted(reopen_st.expanded),
-                    "lastReaderLoad": loads[-1] if loads else None,
-                }
-            finally:
-                if not reopen_st.retired:
-                    reopen_st.stop()
-                reopen_st.pool.shutdown(wait=True, cancel_futures=True)
-                reopen_st._search_pool.shutdown(wait=True, cancel_futures=True)
-                reopen_session.writes.shutdown(wait=True)
-                reopen_st.deleteLater()
-                reopen_session.deleteLater()
-                self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-                self.app.processEvents()
+            # 3. Fresh process loads the same state files and restores renamed note, pin, reading position, and draft.
+            reopen_script = textwrap.dedent(
+                """
+                import json, os, sys
+                from pathlib import Path
+
+                sys.path.insert(0, os.environ["SUPERMD_TEST_DESKTOP"])
+                from PySide6.QtCore import QTimer
+                from PySide6.QtWidgets import QApplication
+                from studio import Session, Studio
+
+                class QuietStudio(Studio):
+                    def _choose_default_python(self, emit=True):
+                        self.python_status = "No Python interpreter configured."
+
+                app = QApplication([])
+                session = Session(False, data=Path(os.environ["SUPERMD_TEST_STATE_DIR"]))
+                loads = []
+                st = QuietStudio(False, session)
+                st.readerLoad.connect(lambda payload: loads.append(json.loads(payload)))
+
+                attempts = 0
+                def check_restored():
+                    global attempts
+                    attempts += 1
+                    if (st._restoring_paths or (st.folder and not st.files)) and attempts < 80:
+                        QTimer.singleShot(15, check_restored)
+                        return
+                    st.ready = True
+                    st._emit(True)
+                    current = st._current()
+                    report = {
+                        "tabs": [
+                            {
+                                "id": t["id"],
+                                "name": t["name"],
+                                "path": t["path"],
+                                "content": t["content"],
+                                "saved": t["saved"],
+                                "dirty": st._is_dirty(t),
+                                "conflict": bool(t.get("conflict")),
+                            }
+                            for t in st.tabs
+                        ],
+                        "activePath": current.get("path", ""),
+                        "activeName": current.get("name", ""),
+                        "folder": st.folder,
+                        "files": [f["name"] for f in st.files],
+                        "hideNonNoteFolders": bool(st.settings.get("hideNonNoteFolders", True)),
+                        "pinned": list(session.pinned),
+                        "recent": list(st.recent),
+                        "locations": dict(session.locations),
+                        "expanded": sorted(st.expanded),
+                        "lastReaderLoad": loads[-1] if loads else None,
+                    }
+                    print("REOPEN_REPORT:" + json.dumps(report))
+                    st.stop()
+                    st.pool.shutdown(wait=False, cancel_futures=True)
+                    st._search_pool.shutdown(wait=False, cancel_futures=True)
+                    session.writes.shutdown(wait=True)
+                    app.quit()
+
+                QTimer.singleShot(30, check_restored)
+                sys.exit(app.exec())
+                """
+            )
+
+            proc2 = subprocess.run(
+                [sys.executable, "-c", reopen_script],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                proc2.returncode,
+                0,
+                f"Reopen subprocess failed:\nSTDOUT:\n{proc2.stdout}\nSTDERR:\n{proc2.stderr}",
+            )
+            report_line = next(
+                (line for line in proc2.stdout.splitlines() if line.startswith("REOPEN_REPORT:")),
+                None,
+            )
+            self.assertIsNotNone(report_line, f"Missing REOPEN_REPORT in stdout:\n{proc2.stdout}")
+            assert report_line is not None
+            report = json.loads(report_line.removeprefix("REOPEN_REPORT:"))
 
             self.assertTrue(folder_ops.same_path(report["activePath"], new_note))
             self.assertEqual(report["activeName"], new_note.name)
