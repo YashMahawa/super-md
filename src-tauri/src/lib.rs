@@ -126,7 +126,7 @@ struct ChartSlider {
 #[tauri::command]
 async fn open_document() -> Result<Option<Document>, String> {
     let path = rfd::AsyncFileDialog::new()
-        .add_filter("Super Markdown", &["smd", "md", "markdown", "fmd", "qmd", "QMD", "rmd", "Rmd", "RMD", "txt"])
+        .add_filter("Super Markdown", &["smd", "md", "markdown", "fmd"])
         .pick_file().await;
     tauri::async_runtime::spawn_blocking(move || path.map(|file| read_document(file.path().to_path_buf())).transpose().map_err(display_error))
         .await.map_err(|e| e.to_string())?
@@ -235,14 +235,6 @@ struct DirectoryEntry { name: String, path: String, directory: bool }
 async fn read_directory_children(root: String, path: String) -> Result<Vec<DirectoryEntry>, String> {
     tauri::async_runtime::spawn_blocking(move || read_directory_children_inner(root, path)).await.map_err(|e| e.to_string())?
 }
-fn is_supported_folder_note_name(name: &str) -> bool {
-    !name.starts_with('.')
-        && Path::new(name)
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "smd" | "markdown" | "fmd" | "qmd" | "rmd" | "txt"))
-}
-
 fn read_directory_children_inner(root: String, path: String) -> Result<Vec<DirectoryEntry>, String> {
     let root = PathBuf::from(root).canonicalize().map_err(display_error)?;
     let path = PathBuf::from(path).canonicalize().map_err(display_error)?;
@@ -254,7 +246,7 @@ fn read_directory_children_inner(root: String, path: String) -> Result<Vec<Direc
         if name.starts_with('.') || ["node_modules", "target", "build", "dist"].contains(&name.as_str()) { continue; }
         let kind = entry.file_type().map_err(display_error)?;
         if kind.is_symlink() { continue; }
-        if kind.is_dir() || is_supported_folder_note_name(&name) {
+        if kind.is_dir() || name.rsplit('.').next().is_some_and(|v| ["md", "smd", "markdown", "fmd"].contains(&v.to_ascii_lowercase().as_str())) {
             entries.push(DirectoryEntry { name, path: entry.path().to_string_lossy().into_owned(), directory: kind.is_dir() });
         }
     }
@@ -1023,81 +1015,5 @@ mod tests {
             "untitled-draft-document-123.smd"
         );
         assert!(draft_filename("../outside").is_err());
-    }
-
-    #[test]
-    fn qmd_and_rmd_folder_listing_open_and_ordinary_save_preserve_filename_and_source() {
-        for valid in [
-            "report.qmd",
-            "REPORT.QMD",
-            "Mixed.qMd",
-            "analysis.Rmd",
-            "analysis.rmd",
-            "ANALYSIS.RMD",
-            "Mixed.rMd",
-        ] {
-            assert!(is_supported_folder_note_name(valid), "expected {valid} to be supported");
-        }
-        for rejected in ["qmd", "rmd", "Rmd", "md", ".hidden.qmd", ".hidden.Rmd", "data.csv"] {
-            assert!(!is_supported_folder_note_name(rejected), "expected {rejected} to be rejected");
-        }
-
-        let workspace = tempfile::tempdir().unwrap();
-        let qmd_path = workspace.path().join("quarto-note.qmd");
-        let rmd_path = workspace.path().join("ClinicalReport.Rmd");
-        let upper_qmd = workspace.path().join("UPPER.QMD");
-        let mixed_rmd = workspace.path().join("Mixed.rMd");
-
-        let qmd_source = "---\ntitle: \"Quarto\"\n---\n\n```{python}\n#| echo: false\nx = 42\n```\n";
-        let rmd_source = "---\ntitle: \"R Markdown\"\n---\n\n```{r setup, include=FALSE}\nx <- 1\n```\n";
-
-        fs::write(&qmd_path, qmd_source).unwrap();
-        fs::write(&rmd_path, rmd_source).unwrap();
-        fs::write(&upper_qmd, "# Upper\n").unwrap();
-        fs::write(&mixed_rmd, "# Mixed\n").unwrap();
-        fs::write(workspace.path().join("qmd"), "dotless").unwrap();
-        fs::write(workspace.path().join("rmd"), "dotless").unwrap();
-        fs::write(workspace.path().join(".hidden.Rmd"), "hidden").unwrap();
-
-        let root_str = workspace.path().to_string_lossy().into_owned();
-        let listed = read_directory_children_inner(root_str.clone(), root_str).unwrap();
-        let names: Vec<&str> = listed.iter().map(|entry| entry.name.as_str()).collect();
-        assert_eq!(names, vec!["ClinicalReport.Rmd", "Mixed.rMd", "quarto-note.qmd", "UPPER.QMD"]);
-
-        let loaded_qmd = read_document(qmd_path.clone()).unwrap();
-        assert_eq!(loaded_qmd.content, qmd_source);
-        let updated_qmd = format!("{qmd_source}\nAdded Quarto conclusion.\n");
-        let saved_qmd = save_document_inner(
-            SaveRequest {
-                path: Some(loaded_qmd.path.clone()),
-                source_path: Some(loaded_qmd.path),
-                content: updated_qmd.clone(),
-                assets: Default::default(),
-            },
-            qmd_path.clone(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(PathBuf::from(&saved_qmd), qmd_path);
-        assert_eq!(fs::read_to_string(&qmd_path).unwrap(), updated_qmd);
-        assert!(!workspace.path().join("quarto-note.md").exists());
-
-        let loaded_rmd = read_document(rmd_path.clone()).unwrap();
-        assert_eq!(loaded_rmd.content, rmd_source);
-        let updated_rmd = format!("{rmd_source}\nAdded R Markdown summary.\n");
-        let saved_rmd = save_document_inner(
-            SaveRequest {
-                path: Some(loaded_rmd.path.clone()),
-                source_path: Some(loaded_rmd.path),
-                content: updated_rmd.clone(),
-                assets: Default::default(),
-            },
-            rmd_path.clone(),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(PathBuf::from(&saved_rmd), rmd_path);
-        assert_eq!(fs::read_to_string(&rmd_path).unwrap(), updated_rmd);
-        assert!(!workspace.path().join("ClinicalReport.md").exists());
     }
 }

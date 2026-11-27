@@ -19,17 +19,29 @@ it('routes directory requests through the shared bridge and shows failures',asyn
   act(()=>root.unmount());
 });
 
-it('lists .qmd and .Rmd notes with exact case, filters file names case-insensitively, and opens them',async()=>{
+it('lists .qmd and .Rmd notes in visible folders with exact case, filters file names case-insensitively, and opens them',async()=>{
   localStorage.clear();const host=document.createElement('div'),root=createRoot(host),open=vi.fn();
-  vi.mocked(invoke).mockResolvedValueOnce([
-    {name:'biostats',path:'/lab/biostats',directory:true},
-    {name:'ClinicalTrial.Rmd',path:'/lab/ClinicalTrial.Rmd',directory:false},
-    {name:'quarto-report.qmd',path:'/lab/quarto-report.qmd',directory:false},
-    {name:'UPPER_MODEL.QMD',path:'/lab/UPPER_MODEL.QMD',directory:false},
-  ]);
+  vi.mocked(invoke).mockImplementation(async(_cmd,args)=>{
+    if((args as {path?:string})?.path==='/lab/biostats'){
+      return [
+        {name:'Overview.md',path:'/lab/biostats/Overview.md',directory:false},
+        {name:'SurvivalModel.RMD',path:'/lab/biostats/SurvivalModel.RMD',directory:false},
+      ];
+    }
+    return [
+      {name:'biostats',path:'/lab/biostats',directory:true},
+      {name:'ClinicalTrial.Rmd',path:'/lab/ClinicalTrial.Rmd',directory:false},
+      {name:'quarto-report.qmd',path:'/lab/quarto-report.qmd',directory:false},
+      {name:'UPPER_MODEL.QMD',path:'/lab/UPPER_MODEL.QMD',directory:false},
+    ];
+  });
   await act(async()=>root.render(<FolderPanel root="/lab" activePath="/lab/ClinicalTrial.Rmd" onChoose={vi.fn()} onHide={vi.fn()} onOpen={open}/>));
   const labels=()=>Array.from(host.querySelectorAll('.folder-tree button.folder-entry span')).map(x=>x.textContent);
   expect(labels()).toEqual(['biostats','ClinicalTrial.Rmd','quarto-report.qmd','UPPER_MODEL.QMD']);
+
+  const biostatsButton=Array.from(host.querySelectorAll<HTMLButtonElement>('.folder-tree button.folder-entry')).find(x=>x.textContent==='biostats')!;
+  await act(async()=>biostatsButton.click());
+  expect(labels()).toEqual(['biostats','Overview.md','SurvivalModel.RMD','ClinicalTrial.Rmd','quarto-report.qmd','UPPER_MODEL.QMD']);
 
   const filterInput=host.querySelector('input[aria-label="Filter file names"]') as HTMLInputElement;
   const setInputValue=(value:string)=>{
@@ -40,7 +52,7 @@ it('lists .qmd and .Rmd notes with exact case, filters file names case-insensiti
   };
 
   await act(async()=>setInputValue('.rmd'));
-  expect(labels()).toEqual(['biostats','ClinicalTrial.Rmd']);
+  expect(labels()).toEqual(['biostats','SurvivalModel.RMD','ClinicalTrial.Rmd']);
 
   await act(async()=>setInputValue('.QMD'));
   expect(labels()).toEqual(['biostats','quarto-report.qmd','UPPER_MODEL.QMD']);

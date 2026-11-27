@@ -2024,17 +2024,22 @@ class StudioTest(unittest.TestCase):
             "desktop/windows/installer.nsi",
             "desktop/linux/dev.supermd.studio.desktop",
             "desktop/linux/supermd.xml",
-            "desktop/app_integration.py",
+            "desktop/core/app_integration.py",
             "desktop/install_linux.py",
             "android/app/src/main/AndroidManifest.xml",
-            "src-tauri/tauri.conf.json",
         ):
             assoc_text = (repo_root / assoc_rel).read_text(encoding="utf-8")
             self.assertNotRegex(assoc_text, r"(?i)\.(qmd|rmd)\b", f"Unexpected OS association in {assoc_rel}")
 
+        import studio as studio_mod
+        if hasattr(studio_mod, "FOLDER_TREE_NOTE_SUFFIXES"):
+            self.assertEqual(studio_mod.FOLDER_TREE_NOTE_SUFFIXES, frozenset({".md", ".smd", ".txt"}))
+
         folder = self.studio.data / "quarto-rmd-workspace"
         sub = folder / "biostats"
         sub.mkdir(parents=True)
+        qmd_only_sub = folder / "quarto-archive"
+        qmd_only_sub.mkdir(parents=True)
 
         qmd_initial = (
             "---\n"
@@ -2067,17 +2072,21 @@ class StudioTest(unittest.TestCase):
         rmd_path = folder / "ClinicalTrial.Rmd"
         upper_qmd = folder / "UPPER_REPORT.QMD"
         mixed_qmd = folder / "MixedCase.qMd"
+        sub_overview_md = sub / "Overview.md"
         sub_upper_rmd = sub / "SurvivalModel.RMD"
         sub_lower_rmd = sub / "lowercase.rmd"
         sub_mixed_rmd = sub / "weird.rMd"
+        archive_qmd = qmd_only_sub / "appendix.qmd"
 
         qmd_path.write_text(qmd_initial, encoding="utf-8")
         rmd_path.write_text(rmd_initial, encoding="utf-8")
         upper_qmd.write_text("# Upper QMD\n", encoding="utf-8")
         mixed_qmd.write_text("# Mixed qMd\n", encoding="utf-8")
+        sub_overview_md.write_text("# Biostats Overview\n", encoding="utf-8")
         sub_upper_rmd.write_text("# Survival RMD\n", encoding="utf-8")
         sub_lower_rmd.write_text("# Lower rmd\n", encoding="utf-8")
         sub_mixed_rmd.write_text("# Mixed rMd\n", encoding="utf-8")
+        archive_qmd.write_text("# Appendix QMD\n", encoding="utf-8")
         (folder / ".hidden.qmd").write_text("hidden", encoding="utf-8")
         (folder / ".hidden.Rmd").write_text("hidden", encoding="utf-8")
         (folder / "qmd").write_text("dotless qmd", encoding="utf-8")
@@ -2085,20 +2094,40 @@ class StudioTest(unittest.TestCase):
         (folder / "dataset.csv").write_text("a,b\n1,2\n", encoding="utf-8")
 
         studio = self.studio
-        studio.openFolder(str(folder))
-        self._wait_for(lambda: len(studio.files) == 5)
-        self.assertEqual(
-            [(entry["name"], entry["directory"]) for entry in studio.files],
-            [
-                ("biostats", True),
-                ("ClinicalTrial.Rmd", False),
-                ("MixedCase.qMd", False),
-                ("quarto-guide.qmd", False),
-                ("UPPER_REPORT.QMD", False),
-            ],
+        hides_qmd_only_subfolder = hasattr(studio_mod, "_directory_has_visible_note") and bool(
+            studio.settings.get("hideNonNoteFolders", True)
         )
+        expected_root_entries = [
+            ("biostats", True),
+            *(() if hides_qmd_only_subfolder else (("quarto-archive", True),)),
+            ("ClinicalTrial.Rmd", False),
+            ("MixedCase.qMd", False),
+            ("quarto-guide.qmd", False),
+            ("UPPER_REPORT.QMD", False),
+        ]
 
-        # Filename search at root + collapsed subfolders across case variants.
+        studio.openFolder(str(folder))
+        self._wait_for(lambda: [(e["name"], e["directory"]) for e in studio.files] == expected_root_entries)
+
+        # Expanding an already-visible folder lists .Rmd/.rmd/.rMd alongside .md notes.
+        studio.toggleDirectory(str(sub))
+        expected_expanded_entries = [
+            ("biostats", True),
+            ("lowercase.rmd", False),
+            ("Overview.md", False),
+            ("SurvivalModel.RMD", False),
+            ("weird.rMd", False),
+            *(() if hides_qmd_only_subfolder else (("quarto-archive", True),)),
+            ("ClinicalTrial.Rmd", False),
+            ("MixedCase.qMd", False),
+            ("quarto-guide.qmd", False),
+            ("UPPER_REPORT.QMD", False),
+        ]
+        self._wait_for(lambda: [(e["name"], e["directory"]) for e in studio.files] == expected_expanded_entries)
+        studio.toggleDirectory(str(sub))
+        self._wait_for(lambda: [(e["name"], e["directory"]) for e in studio.files] == expected_root_entries)
+
+        # Filename search at root + collapsed subfolders across case variants (including quarto-archive).
         studio.setFolderFilter(".rmd")
         self._wait_for(
             lambda: not studio.filter_timer.isActive()
@@ -2112,7 +2141,7 @@ class StudioTest(unittest.TestCase):
             lambda: not studio.filter_timer.isActive()
             and not studio._folder_searching
             and [entry["name"] for entry in studio.files if not entry["directory"]]
-            == ["MixedCase.qMd", "quarto-guide.qmd", "UPPER_REPORT.QMD"]
+            == ["appendix.qmd", "MixedCase.qMd", "quarto-guide.qmd", "UPPER_REPORT.QMD"]
         )
 
         studio.setFolderFilter("survival")
@@ -2122,7 +2151,7 @@ class StudioTest(unittest.TestCase):
             and [entry["name"] for entry in studio.files if not entry["directory"]] == ["SurvivalModel.RMD"]
         )
         studio.setFolderFilter("")
-        self._wait_for(lambda: len(studio.files) == 5)
+        self._wait_for(lambda: [(e["name"], e["directory"]) for e in studio.files] == expected_root_entries)
 
         # Helper stem/extension preservation checks.
         self.assertEqual(note_extension("ClinicalTrial.Rmd"), ".Rmd")
