@@ -45,6 +45,10 @@ from markdown_export import write_markdown_export, write_markdown_zip
 import offline_view
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
+if __package__:
+    from . import studio_agent_setup
+else:
+    import studio_agent_setup
 from python_outputs import PythonOutputs
 try:
     from . import studio_exports
@@ -250,92 +254,10 @@ def _normalize_mcp_roots(roots) -> list[str]:
 
 
 def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen=None, platform=None, cli_script=None):
-    """Return a directly executable, absolute MCP stdio command for this install."""
-    frozen = getattr(sys, "frozen", False) if frozen is None else bool(frozen)
-    # Resolving a source venv's Python symlink would bypass that environment
-    # and lose its MCP dependencies. Frozen launchers can use canonical paths.
-    executable_path = Path(os.path.abspath(Path(executable or sys.executable).expanduser()))
-    if frozen:
-        executable_path = executable_path.resolve()
-    platform = sys.platform if platform is None else platform
-    if frozen:
-        if platform.startswith("win"):
-            command = str(executable_path.with_name("super-md-cli.exe").resolve())
-        elif platform.startswith("linux"):
-            appimage = os.environ.get("APPIMAGE", "")
-            appimage_path = Path(appimage).expanduser() if appimage else None
-            appdir = os.environ.get("APPDIR", "")
-            from_image = bool(appdir and executable_path.is_relative_to(Path(appdir).resolve()))
-            command = str(appimage_path.resolve()) if from_image and appimage_path and appimage_path.is_file() else str(executable_path)
-        else:
-            command = str(executable_path)
-        args = ["agent", "mcp"]
-    else:
-        if platform.startswith("win") and executable_path.name.casefold() == "pythonw.exe":
-            console_python = executable_path.with_name("python.exe")
-            if console_python.is_file():
-                executable_path = console_python
-        script = Path(cli_script or DESKTOP_DIR / "agent_cli.py").expanduser().resolve()
-        command = str(executable_path)
-        args = [str(script), "mcp"]
-    for root_path in _normalize_mcp_roots(roots):
-        args.extend(["--root", root_path])
-    args.extend(["--live-sessions-dir", str(Path(discovery_dir).expanduser().resolve()), "--transport", "stdio"])
-    return {"command": command, "args": args}
-
-
-_REQUIRED_SKILL_PACKAGE_FILES = (
-    "SKILL.md",
-    "references/study-notes.md",
-    "references/visual-authoring.md",
-    "references/agent-connection.md",
-    "assets/study-visual-example.svg",
-)
-
-
-def _bundle_agent_skill_markdown(skill_dir: Path) -> str:
-    router = (skill_dir / "SKILL.md").read_text(encoding="utf-8").rstrip()
-    router = (router
-              .replace("(references/study-notes.md)", "(#exam-ready-study-notes)")
-              .replace("(references/visual-authoring.md)", "(#diagram-and-interaction-guide)")
-              .replace("(references/agent-connection.md)", "(#agent-connection)"))
-    study_notes = (skill_dir / "references" / "study-notes.md").read_text(encoding="utf-8").strip()
-    visual_authoring = (skill_dir / "references" / "visual-authoring.md").read_text(encoding="utf-8").strip()
-    connection = (skill_dir / "references" / "agent-connection.md").read_text(encoding="utf-8").strip()
-    return (f"{router}\n\n{study_notes}\n\n{visual_authoring}\n\n"
-            f"# Agent connection\n\n{connection}\n")
-
-
-def _build_agent_skill_zip_bytes(root_dir: Path) -> bytes:
-    dist_zip = root_dir / "dist" / "super-md-skill.zip"
-    if dist_zip.is_file():
-        raw = dist_zip.read_bytes()
-        with zipfile.ZipFile(io.BytesIO(raw), "r") as archive:
-            names = set(archive.namelist())
-            if any(name.endswith("/local-preferences.md") or name == "local-preferences.md" for name in names):
-                raise ValueError("Skill archive must not contain local-preferences.md")
-            if all(f"super-md/{rel}" in names for rel in _REQUIRED_SKILL_PACKAGE_FILES):
-                return raw
-    if getattr(sys, "frozen", False):
-        raise FileNotFoundError("Bundled super-md-skill.zip is missing from this installation")
-    source_dir = root_dir / "dist" / "super-md-skill"
-    if not source_dir.is_dir():
-        source_dir = root_dir / "docs" / "skills" / "super-md"
-    for rel in _REQUIRED_SKILL_PACKAGE_FILES:
-        if not (source_dir / rel).is_file():
-            raise FileNotFoundError(f"Missing required skill file: {rel}")
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
-        for file_path in sorted(source_dir.rglob("*")):
-            rel_parts = file_path.relative_to(source_dir).parts
-            if any(part.startswith(".") or part == "local-preferences.md" for part in rel_parts):
-                continue
-            if file_path.is_file() and not file_path.is_symlink():
-                info = zipfile.ZipInfo("super-md/" + "/".join(rel_parts))
-                info.date_time = (1980, 1, 1, 0, 0, 0)
-                info.compress_type = zipfile.ZIP_STORED
-                archive.writestr(info, file_path.read_bytes())
-    return buffer.getvalue()
+    return studio_agent_setup.agent_mcp_setup_config(
+        discovery_dir, roots=roots, executable=executable, frozen=frozen,
+        platform=platform, cli_script=cli_script, root=ROOT, normalize_roots_fn=_normalize_mcp_roots,
+    )
 
 
 _SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
@@ -1278,26 +1200,7 @@ class Studio(QObject):
             QTimer.singleShot(0, self._restore_cloud_connection)
 
     def _restore_cloud_connection(self):
-        if self.retired or not self.settings.get("cloudAgentEnabled") or self._cloud_revocation_pending:
-            return
-        bridge = getattr(self.session, "agent_bridge", None)
-        if bridge is None or bridge.cloudClient.enabled:
-            return
-        try:
-            try:
-                from .agent_cloud import read_cloud_config
-            except ImportError:
-                from agent_cloud import read_cloud_config
-            config = read_cloud_config(self._agent_cloud_config_path)
-            was_enabled = bridge.enabled
-            bridge.start_cloud(config)
-            self._cloud_started_local_bridge = not was_enabled
-            self._agent_cloud_error = ""
-        except Exception as error:
-            # Keep the opt-in on transient errors so the user can retry without
-            # re-pairing. Invalid pairing is surfaced, never silently replaced.
-            self._agent_cloud_error = f"Cloud auto-connect failed: {str(error)[:140]}"
-        self._emit(False)
+        studio_agent_setup._restore_cloud_connection(self)
 
     @property
     def files(self): return getattr(self, "_files", [])
@@ -2296,17 +2199,11 @@ class Studio(QObject):
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        return bool(bridge and bridge.enabled)
+        return studio_agent_setup.agent_access_enabled(self)
 
     @Property(str, notify=changed)
     def agentAccessStatus(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if self._agent_error:
-            return self._agent_error
-        if not bridge or not bridge.enabled:
-            return "Off · no live tabs are exposed"
-        return "On · loopback only (fresh token each launch)"
+        return studio_agent_setup.agent_access_status(self)
 
     def _agent_mcp_roots(self) -> list[str]:
         windows = [self]
@@ -2330,143 +2227,48 @@ class Studio(QObject):
 
     @Property(str, notify=changed)
     def agentSetupInstructions(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if not bridge or not bridge.enabled:
-            return "Enable live agent access to prepare the local MCP server configuration."
-        return json.dumps(
-            agent_mcp_setup_config(bridge.discovery_dir, roots=self._agent_mcp_roots()),
-            ensure_ascii=False,
-            indent=2,
+        return studio_agent_setup.agent_setup_instructions(
+            self, root=ROOT, normalize_roots_fn=_normalize_mcp_roots,
         )
 
     @Property(str, notify=changed)
     def agentAccessTabsSummary(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if not bridge or not bridge.enabled:
-            return "No tabs are exposed."
-        studios = [window for window in self.session.windows.values() if not window.retired]
-        tabs = sum(len(window.tabs) for window in studios)
-        return f"{tabs} open tabs across {len(studios)} windows are available to the local MCP server."
+        return studio_agent_setup.agent_access_tabs_summary(self)
 
     @Property(bool, notify=changed)
     def cloudAgentConfigured(self):
-        return self._agent_cloud_config_path.is_file()
+        return studio_agent_setup.cloud_agent_configured(self)
 
     @Property(bool, notify=changed)
     def cloudAgentRevocationPending(self):
-        return self._cloud_revocation_pending
+        return studio_agent_setup.cloud_agent_revocation_pending(self)
 
     @Property(bool, notify=changed)
     def cloudAgentEnabled(self):
-        bridge = getattr(self.session, "agent_bridge", None)
-        return bool(bridge and bridge.cloudClient.enabled)
+        return studio_agent_setup.cloud_agent_enabled(self)
 
     @Property(str, notify=changed)
     def cloudAgentStatus(self):
-        if self._agent_cloud_error:
-            return self._agent_cloud_error
-        if self._cloud_revocation_pending:
-            return "Disconnecting and revoking this desktop pairing…"
-        bridge = getattr(self.session, "agent_bridge", None)
-        return bridge.cloudClient.status if bridge else "Cloud relay is unavailable."
+        return studio_agent_setup.cloud_agent_status(self)
 
     @Property(str, notify=changed)
     def cloudRelayOrigin(self):
-        if not self.cloudAgentConfigured:
-            return ""
-        try:
-            try:
-                from .agent_cloud import read_cloud_config
-            except ImportError:
-                from agent_cloud import read_cloud_config
-            return read_cloud_config(self._agent_cloud_config_path)["serverOrigin"]
-        except Exception:
-            return ""
+        return studio_agent_setup.cloud_relay_origin(self)
 
     @Property(str, notify=changed)
     def cloudConnectorUrl(self):
-        if not self.cloudAgentConfigured:
-            return ""
-        try:
-            try:
-                from .agent_cloud import connector_url, read_cloud_config
-            except ImportError:
-                from agent_cloud import connector_url, read_cloud_config
-            return connector_url(read_cloud_config(self._agent_cloud_config_path))
-        except Exception:
-            return ""
+        return studio_agent_setup.cloud_connector_url(self)
 
     def _best_effort_revoke_cloud_config(self, config):
-        if not config:
-            return
-        def run():
-            try:
-                try:
-                    from .agent_cloud import revoke
-                except ImportError:
-                    from agent_cloud import revoke
-                revoke(config, timeout=8)
-            except Exception:
-                pass
-        threading.Thread(target=run, name="supermd-agent-cloud-revoke-old", daemon=True).start()
+        studio_agent_setup.best_effort_revoke_cloud_config(config)
 
     @Slot(bool, str)
     def _finish_cloud_revocation(self, confirmed, device_id):
-        erased = False
-        try:
-            try:
-                from .agent_cloud import read_cloud_config
-            except ImportError:
-                from agent_cloud import read_cloud_config
-            current = read_cloud_config(self._agent_cloud_config_path)
-            if current.get("deviceId") == device_id:
-                self._agent_cloud_config_path.unlink(missing_ok=True)
-                erased = not self._agent_cloud_config_path.exists()
-        except FileNotFoundError:
-            erased = True
-        except Exception:
-            confirmed = False
-        self._cloud_revocation_pending = False
-        self.settings["cloudAgentEnabled"] = False
-        self._preferences()
-        if not erased:
-            self._agent_cloud_error = "Relay revoke finished, but the local pairing file could not be erased. Remove it from app data before reconnecting."
-        elif confirmed:
-            self._agent_cloud_error = "Relay revocation confirmed; local pairing credentials were erased."
-        else:
-            self._agent_cloud_error = "Local pairing credentials were erased, but relay revocation could not be confirmed."
-        self._emit(False)
+        studio_agent_setup.finish_cloud_revocation(self, confirmed, device_id)
 
     @Slot()
     def revokeCloudAgent(self):
-        if self._cloud_revocation_pending:
-            return
-        try:
-            try:
-                from .agent_cloud import read_cloud_config, revoke
-            except ImportError:
-                from agent_cloud import read_cloud_config, revoke
-            config = read_cloud_config(self._agent_cloud_config_path)
-            bridge = getattr(self.session, "agent_bridge", None)
-            self.settings["cloudAgentEnabled"] = False
-            self._preferences()
-            self._cloud_revocation_pending = True
-            self._agent_cloud_error = ""
-            device_id = config["deviceId"]
-            def run():
-                confirmed = False
-                try:
-                    if bridge:
-                        bridge.stop_cloud()
-                    revoke(config, timeout=8)
-                    confirmed = True
-                except Exception:
-                    pass
-                self.cloudRevocationFinished.emit(confirmed, device_id)
-            threading.Thread(target=run, name="supermd-agent-cloud-revoke", daemon=True).start()
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-        self._emit(False)
+        studio_agent_setup.revoke_cloud_agent(self)
 
     @Slot(str)
     def _cloud_status_changed(self, _status):
@@ -2474,221 +2276,43 @@ class Studio(QObject):
 
     @Slot(str, result=bool)
     def createAgentPairing(self, server_origin):
-        try:
-            if self._cloud_revocation_pending:
-                raise ValueError("Wait for desktop pairing revocation to finish")
-            old_config = None
-            try:
-                try:
-                    from .agent_cloud import read_cloud_config
-                except ImportError:
-                    from agent_cloud import read_cloud_config
-                old_config = read_cloud_config(self._agent_cloud_config_path)
-            except Exception:
-                pass
-            bridge = getattr(self.session, "agent_bridge", None)
-            if bridge and bridge.cloudClient.enabled:
-                bridge.stop_cloud()
-                self.settings["cloudAgentEnabled"] = False
-                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
-                    bridge.stop()
-                self._cloud_started_local_bridge = False
-            try:
-                from .agent_cloud import device_config, new_pairing, write_cloud_config
-            except ImportError:
-                from agent_cloud import device_config, new_pairing, write_cloud_config
-            write_cloud_config(self._agent_cloud_config_path, device_config(new_pairing(server_origin)))
-            self._best_effort_revoke_cloud_config(old_config)
-            self._agent_cloud_error = ""
-            self._emit(False)
-            return True
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-            self._emit(False)
-            return False
+        return studio_agent_setup.create_agent_pairing(self, server_origin)
 
     @Slot(str, result=bool)
     def importAgentPairing(self, source):
-        try:
-            if self._cloud_revocation_pending:
-                raise ValueError("Wait for desktop pairing revocation to finish")
-            old_config = None
-            try:
-                try:
-                    from .agent_cloud import read_cloud_config
-                except ImportError:
-                    from agent_cloud import read_cloud_config
-                old_config = read_cloud_config(self._agent_cloud_config_path)
-            except Exception:
-                pass
-            bridge = getattr(self.session, "agent_bridge", None)
-            if bridge and bridge.cloudClient.enabled:
-                bridge.stop_cloud()
-                self.settings["cloudAgentEnabled"] = False
-                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
-                    bridge.stop()
-                self._cloud_started_local_bridge = False
-            try:
-                from .agent_cloud import device_config, validate_pairing, write_cloud_config
-            except ImportError:
-                from agent_cloud import device_config, validate_pairing, write_cloud_config
-            path = local_path(source)
-            if path.stat().st_size > 16_000:
-                raise ValueError("Pairing file is too large")
-            pairing = validate_pairing(json.loads(path.read_text(encoding="utf-8")))
-            write_cloud_config(self._agent_cloud_config_path, device_config(pairing))
-            self._best_effort_revoke_cloud_config(old_config)
-            self._agent_cloud_error = ""
-            self._emit(False)
-            return True
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-            self._emit(False)
-            return False
+        return studio_agent_setup.import_agent_pairing(self, source, local_path_fn=local_path)
 
     @Slot(str, result=bool)
     def exportAgentPairing(self, destination):
-        try:
-            try:
-                from .agent_cloud import export_pairing, read_cloud_config
-            except ImportError:
-                from agent_cloud import export_pairing, read_cloud_config
-            path = local_path(destination)
-            export_pairing(path, read_cloud_config(self._agent_cloud_config_path))
-            self.message = f"Pairing file saved to {path}"
-            self._agent_cloud_error = ""
-            self._emit(False)
-            return True
-        except Exception as error:
-            self._agent_cloud_error = str(error)[:180]
-            self._emit(False)
-            return False
+        return studio_agent_setup.export_agent_pairing(self, destination, local_path_fn=local_path)
 
     @Slot(bool)
     def setCloudAgentEnabled(self, enabled):
-        bridge = getattr(self.session, "agent_bridge", None)
-        try:
-            if bridge is None:
-                raise ValueError("Cloud agent access is unavailable in this app session")
-            if enabled:
-                try:
-                    from .agent_cloud import read_cloud_config
-                except ImportError:
-                    from agent_cloud import read_cloud_config
-                config = read_cloud_config(self._agent_cloud_config_path)
-                was_enabled = bridge.enabled
-                bridge.start_cloud(config)
-                self._cloud_started_local_bridge = not was_enabled
-            else:
-                bridge.stop_cloud()
-                if self._cloud_started_local_bridge and not self.settings.get("agentAccessEnabled", False):
-                    bridge.stop()
-                self._cloud_started_local_bridge = False
-            self.settings["cloudAgentEnabled"] = bool(enabled)
-            self._preferences()
-            self._agent_cloud_error = ""
-        except Exception as error:
-            self.settings["cloudAgentEnabled"] = False
-            self._agent_cloud_error = str(error)[:180]
-        self._emit(False)
+        studio_agent_setup.set_cloud_agent_enabled(self, enabled)
 
     @Slot()
     def copyCloudConnectorUrl(self):
-        url = self.cloudConnectorUrl
-        if not url:
-            self._agent_cloud_error = "Create or import a pairing before copying the connector URL."
-        else:
-            QGuiApplication.clipboard().setText(url)
-            self._agent_cloud_error = "Connector URL copied. Treat it as a secret."
-        self._emit(False)
+        studio_agent_setup.copy_cloud_connector_url(self, gui_app_cls=QGuiApplication)
 
     @Slot(bool)
     def setAgentAccessEnabled(self, enabled):
-        bridge = getattr(self.session, "agent_bridge", None)
-        if bridge is None:
-            self._agent_error = "Live agent access is unavailable in this app session."
-            self._emit(False)
-            return
-        try:
-            if enabled:
-                bridge.start()
-                self._agent_error = ""
-            else:
-                bridge.stop()
-                self.settings["cloudAgentEnabled"] = False
-                self._agent_error = ""
-            background = getattr(self.session, "background", None)
-            if background is not None:
-                background._cli_started_agent_access = False
-            self.settings["agentAccessEnabled"] = bool(enabled)
-            self._preferences()
-            self._emit(False)
-        except Exception as error:
-            self._agent_error = f"Could not enable live agent access ({type(error).__name__})."
-            self.settings["agentAccessEnabled"] = False
-            self._emit(False)
+        studio_agent_setup.set_agent_access_enabled(self, enabled)
 
     @Slot()
     def copyAgentSetupInstructions(self):
-        if not self.agentAccessEnabled:
-            self._agent_error = "Enable live agent access before copying its MCP configuration."
-            self._emit(False)
-            return
-        QGuiApplication.clipboard().setText(self.agentSetupInstructions)
-        self._agent_error = ""
-        self.message = "MCP server configuration copied to clipboard"
-        self._emit(False)
+        studio_agent_setup.copy_agent_setup_instructions(self, gui_app_cls=QGuiApplication)
 
     @Slot(str)
     def saveAgentSetupInstructions(self, destination):
-        if not self.agentAccessEnabled:
-            self._agent_error = "Enable live agent access before saving its setup guide."
-            self._emit(False)
-            return
-        try:
-            path = local_path(destination)
-            if path.suffix.casefold() != ".md":
-                path = path.with_suffix(".md")
-            skill_path = ROOT / "dist" / "super-md-agent-SKILL.md"
-            if skill_path.is_file():
-                skill = skill_path.read_text(encoding="utf-8").rstrip()
-            elif not getattr(sys, "frozen", False):
-                skill = _bundle_agent_skill_markdown(ROOT / "docs" / "skills" / "super-md").rstrip()
-            else:
-                raise FileNotFoundError("Bundled super-md-agent-SKILL.md is missing")
-            guide = (skill + "\n\n# Connection for this installation\n\n"
-                     "This local MCP server can inspect and revise tabs that are open in this Super MD app session. "
-                     "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
-                     "## MCP client configuration\n\n```json\n" + self.agentSetupInstructions + "\n```\n\n"
-                     "Live access is off by default. Enable it in Super MD Settings → AI agents before starting the MCP server. "
-                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n\n"
-                     "## Cloud relay connector\n\n"
-                     "Cloud relay connector URLs are secret bearer credentials and are not included in saved setup guides. "
-                     "To connect a cloud MCP client, open Super MD Settings → AI agents and use Copy MCP connector URL to get your own connector.\n")
-            atomic_write(path, guide.encode("utf-8"))
-            self._agent_error = ""
-            self.message = f"Setup guide saved to {path}"
-            self._emit(False)
-        except (OSError, ValueError, TypeError) as error:
-            self._agent_error = f"Could not save setup guide ({type(error).__name__})."
-            self._emit(False)
+        studio_agent_setup.save_agent_setup_instructions(
+            self, destination, root=ROOT, atomic_write_fn=atomic_write, local_path_fn=local_path,
+        )
 
     @Slot(str, result=bool)
     def exportAgentSkill(self, destination):
-        try:
-            path = local_path(destination)
-            if path.suffix.casefold() != ".zip":
-                path = path.with_suffix(".zip")
-            raw = _build_agent_skill_zip_bytes(ROOT)
-            atomic_write(path, raw)
-            self._agent_error = ""
-            self.message = f"Skill package saved to {path}"
-            self._emit(False)
-            return True
-        except (OSError, ValueError, TypeError, zipfile.BadZipFile) as error:
-            self._agent_error = f"Could not save skill package ({type(error).__name__})."
-            self._emit(False)
-            return False
+        return studio_agent_setup.export_agent_skill(
+            self, destination, root=ROOT, atomic_write_fn=atomic_write, local_path_fn=local_path,
+        )
 
     @Property(bool,notify=changed)
     def readerFullscreen(self):return self.fullscreen
