@@ -33,6 +33,8 @@ ApplicationWindow {
     flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var reader: readerLoader.item
     property bool sidebar: true
@@ -249,7 +251,7 @@ ApplicationWindow {
         case "find_next": window.focusReader(); studio.command("find_next"); break
         case "find_previous": window.focusReader(); studio.command("find_previous"); break
         case "search_folder": studio.openFolderSearch(); break
-        case "close_tab": studio.closeTabSafely(viewState.active); break
+        case "close_tab": studio.closeTabSafely(window.activeTabId || viewState.active); break
         case "next_tab": studio.cycleTab(1); break
         case "previous_tab": studio.cycleTab(-1); break
         case "move_tab_left": studio.moveActiveTab(-1); break
@@ -497,8 +499,7 @@ ApplicationWindow {
                     TapHandler { onTapped: window.openAgentSettings() }
                     Hint { requested: agentPillHover.hovered; text: (viewState.agentConnection && viewState.agentConnection.detail ? viewState.agentConnection.detail + " · " : "") + "Open AI agent settings" }
                 }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
-                ActionButton { objectName: "folderSearchButton"; visible: window.width >= 1060; text: window.width < 1260 ? "" : "Search notes"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Search across notes", "search_folder"); onClicked: studio.openFolderSearch() }
+                ActionButton { objectName: "findInNoteButton"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -510,7 +511,6 @@ ApplicationWindow {
                         implicitWidth: 250
                         NoteMenuItem { objectName: "reopenClosedTabAction"; text: "Reopen closed tab"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.reopen_tab || "") : ""; icon.source: "../icons/Undo.svg"; enabled: typeof viewState !== "undefined" ? Boolean(viewState.closedCount) : true; onTriggered: studio.reopenTab() }
                         NoteMenuItem { objectName: "saveAsAction"; text: "Save as"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.save_as || "") : ""; icon.source: "../icons/FloppyDisk.svg"; enabled: typeof viewState !== "undefined" ? !viewState.busy : true; onTriggered: studio.saveAsSafely() }
-                        NoteMenuItem { objectName: "compactSearchFolderAction"; text: "Search across notes"; shortcutText: typeof window.shortcutLabels !== "undefined" ? (window.shortcutLabels.search_folder || "") : ""; actionVisible: window.width < 1060; icon.source: "../icons/MagnifyingGlass.svg"; onTriggered: studio.openFolderSearch() }
                         NoteMenuItem { text: "Insert image or link"; actionVisible: window.width < 1060; icon.source: "../icons/Image.svg"; onTriggered: studio.command("insert") }
                         NoteMenuItem { text: "Fix LaTeX"; actionVisible: window.width < 1060; icon.source: "../icons/Bug.svg"; onTriggered: studio.command("repair") }
                         NoteMenuItem { text: "Share note"; actionVisible: window.width < 1060; icon.source: "../icons/ShareNetwork.svg"; onTriggered: window.showExport(true) }
@@ -524,6 +524,8 @@ ApplicationWindow {
         TabStrip {
             width: parent.width
             viewState: window.viewState
+            tabs: window.tabsState
+            activeTabId: window.activeTabId
             shortcutLabels: window.shortcutLabels
         }
         Rectangle {
@@ -593,6 +595,8 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     viewState: window.viewState
+                    tabs: window.tabsState
+                    activeTabId: window.activeTabId
                     sidebarState: window.sidebarState
                     shortcutLabels: window.shortcutLabels
                 }

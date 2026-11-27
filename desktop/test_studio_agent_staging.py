@@ -202,6 +202,11 @@ class StudioAgentStagingUnitTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(ValueError, "Live tab revision changed; inspect it again before editing"):
                     Studio._stage_inactive_patch_tab_sync(proxy, "t2", "# Disk v0\n", "# Staged v2\n", [{"index": 0}], True)
+
+                renamed, real_json, seen_paths = root / "BgRenamed.md", studio_module.atomic_json, []
+                with patch.object(studio_module, "atomic_json", side_effect=lambda p, payload: (seen_paths.append(payload[0]["path"]), real_json(p, payload), bg_tab.__setitem__("path", str(renamed)) if len(seen_paths) == 1 else None)[1]):
+                    Studio._stage_inactive_patch_tab_sync(proxy, "t2", "# Staged v1\n", "# Staged v2\n", [{"index": 0}], True)
+                self.assertEqual((seen_paths, json.loads((root / "recovery.json").read_text(encoding="utf-8"))[0]["path"]), ([str(note_file), str(renamed)], str(renamed)))
             finally:
                 writes.shutdown(wait=True)
 

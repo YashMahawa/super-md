@@ -6,18 +6,42 @@ ColumnLayout {
     id: root
     objectName: "folderSidebar"
     required property var viewState
+    property var tabs: typeof studio !== "undefined" && studio && studio.tabsSnapshot !== undefined
+        ? JSON.parse(studio.tabsSnapshot)
+        : (viewState && viewState.tabs ? viewState.tabs : [])
+    property string activeTabId: typeof studio !== "undefined" && studio && studio.activeTabId !== undefined
+        ? String(studio.activeTabId)
+        : (sidebarState && sidebarState.active ? String(sidebarState.active) : (viewState && viewState.active ? String(viewState.active) : ""))
     property var sidebarState: typeof studio !== "undefined" && studio && studio.sidebarSnapshot !== undefined ? JSON.parse(studio.sidebarSnapshot) : viewState
     property var shortcutLabels: ({})
     readonly property string currentFolder: sidebarState.folder || ""
     property string selectedPath: ""
     property string selectedName: ""
     property bool selectedDirectory: false
-    spacing: 12
+    readonly property string activeTabPath: {
+        const tabs = root.viewState && root.viewState.tabs ? root.viewState.tabs : []
+        const activeId = root.sidebarState && root.sidebarState.active !== undefined
+            ? root.sidebarState.active
+            : (root.viewState ? root.viewState.active : "")
+        for (let i = 0; i < tabs.length; i += 1) {
+            if (tabs[i].id === activeId) return tabs[i].path || ""
+        }
+        return ""
+    }
+    spacing: 8
 
-    onCurrentFolderChanged: {
+    function resetSelection() {
         selectedPath = ""
         selectedName = ""
         selectedDirectory = false
+    }
+
+    onCurrentFolderChanged: resetSelection()
+
+    onSidebarStateChanged: {
+        if (selectedPath && !sidebarState.folderSearching && !(sidebarState.files || []).some(item => root.samePathKey(item.path, selectedPath))) {
+            resetSelection()
+        }
     }
 
     function noteStem(name) {
@@ -26,6 +50,14 @@ ColumnLayout {
         if (known !== raw && known.length > 0) return known
         const custom = raw.replace(/\.[A-Za-z][A-Za-z0-9]{0,15}$/, "")
         return custom.length > 0 ? custom : raw
+    }
+
+    function samePathKey(a, b) {
+        if (!a || !b) return false
+        const left = String(a).replace(/\\/g, "/").replace(/\/+$/, "")
+        const right = String(b).replace(/\\/g, "/").replace(/\/+$/, "")
+        if (Qt.platform.os === "windows") return left.toLowerCase() === right.toLowerCase()
+        return left === right
     }
 
     function shortcutHint(label, key, fallback) {
@@ -109,8 +141,8 @@ ColumnLayout {
             openRenameFor(selectedEntry.path, selectedEntry.name, Boolean(selectedEntry.directory))
             return
         }
-        const activeId = sidebarState.active || viewState.active
-        const activeTab = (viewState.tabs || []).find(t => t.id === activeId)
+        const activeId = sidebarState.active || root.activeTabId || viewState.active
+        const activeTab = (root.tabs || []).find(t => t.id === activeId)
         if (activeTab && activeTab.path && root.isInsideOpenFolder(activeTab.path)) {
             openRenameFor(activeTab.path, activeTab.name, false)
             return
@@ -124,6 +156,7 @@ ColumnLayout {
 
     ActionButton {
         objectName: "openFolderSidebarButton"
+        visible: !sidebarState.folder
         text: "Open folder"; glyph: "FolderOpen"; tonal: true; Layout.fillWidth: true
         onClicked: studio.chooseFolder()
     }
@@ -131,7 +164,7 @@ ColumnLayout {
     ActionButton {
         objectName: "sidebarFolderSearchButton"
         text: "Search across notes"
-        glyph: "MagnifyingGlass"
+        glyph: "FolderSearch"
         compact: true
         tonal: true
         Layout.fillWidth: true
@@ -139,65 +172,81 @@ ColumnLayout {
         onClicked: studio.openFolderSearch()
     }
 
-    RowLayout {
+    Rectangle {
         id: folderHeaderBar
         objectName: "folderHeaderBar"
         visible: !!sidebarState.folder
         Layout.fillWidth: true
-        spacing: 4
-        Label {
-            text: root.folderDisplayName(sidebarState.folder)
-            font.weight: Font.DemiBold; Layout.fillWidth: true; elide: Text.ElideMiddle; color: viewState.colors.text
-        }
-        ActionButton {
-            objectName: "headerNewItemButton"
-            glyph: "Plus"; compact: true
-            Accessible.name: "New note or subfolder"
-            ToolTip.text: root.shortcutHint("New note in folder", "new_folder_note", "Ctrl+Alt+N")
-            onClicked: headerCreateMenu.popup()
-            NoteContextMenu {
-                id: headerCreateMenu
-                objectName: "headerCreateMenu"
-                implicitWidth: 310
-                NoteMenuItem { objectName: "headerNewMarkdownItem"; text: "New Markdown note (.md)"; shortcutText: root.shortcutLabels.new_folder_note || ""; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("md", sidebarState.folder) }
-                NoteMenuItem { objectName: "headerNewPortableItem"; text: "New portable note (.smd)"; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("smd", sidebarState.folder) }
-                MenuSeparator {}
-                NoteMenuItem { objectName: "headerNewSubfolderItem"; text: "New subfolder"; shortcutText: root.shortcutLabels.new_subfolder || ""; icon.source: "../icons/FolderOpen.svg"; onTriggered: root.openCreateDialog("folder", sidebarState.folder) }
-            }
-        }
-        ActionButton {
-            objectName: "headerNewSubfolderButton"
-            glyph: "FolderOpen"; compact: true
-            Accessible.name: "New subfolder"
-            ToolTip.text: root.shortcutHint("New subfolder", "new_subfolder", "Ctrl+Alt+Shift+N")
-            onClicked: root.openCreateDialog("folder", sidebarState.folder)
-        }
-        ActionButton {
-            objectName: "closeFolderButton"
-            glyph: "X"; compact: true
-            Accessible.name: "Close folder"
-            ToolTip.text: "Close folder (notes stay open)"
-            onClicked: { root.selectedPath = ""; studio.closeFolder() }
-        }
-    }
+        implicitHeight: 42
+        radius: 12
+        antialiasing: true
+        color: viewState.colors["surface-high"]
+        border.width: 1
+        border.color: viewState.colors.outline
 
-    TextField {
-        id: filter
-        objectName: "folderFilterField"
-        property string backendFilter: sidebarState.folderFilter || ""
-        visible: !!sidebarState.folder
-        Layout.fillWidth: true
-        placeholderText: "Filter files"
-        selectByMouse: true
-        onTextChanged: {
-            if (text !== backendFilter)
-                studio.setFolderFilter(text)
-        }
-        onBackendFilterChanged: {
-            if (backendFilter === "" && text !== "")
-                text = ""
-            else if (!activeFocus && text !== backendFilter)
-                text = backendFilter
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 10
+            anchors.rightMargin: 4
+            spacing: 4
+
+            ToolButton {
+                enabled: false
+                focusPolicy: Qt.NoFocus
+                padding: 0
+                background: null
+                icon.source: "../icons/FolderOpen.svg"
+                icon.color: viewState.colors.primary
+                icon.width: 18
+                icon.height: 18
+                Layout.preferredWidth: 20
+                Layout.preferredHeight: 20
+            }
+
+            Label {
+                objectName: "folderHeaderTitle"
+                text: root.folderDisplayName(sidebarState.folder)
+                font.pixelSize: 14
+                font.weight: Font.DemiBold
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                color: viewState.colors.text
+                Hint { requested: parent.truncated; text: sidebarState.folder }
+            }
+
+            ActionButton {
+                objectName: "headerNewItemButton"
+                glyph: "Plus"; compact: true
+                implicitWidth: 30; implicitHeight: 30
+                Layout.preferredWidth: 30; Layout.preferredHeight: 30
+                leftPadding: 6; rightPadding: 6; topPadding: 6; bottomPadding: 6
+                icon.width: 18; icon.height: 18
+                Accessible.name: "New note or subfolder"
+                ToolTip.text: root.shortcutHint("New note in folder", "new_folder_note", "Ctrl+Alt+N")
+                onClicked: headerCreateMenu.popup()
+                NoteContextMenu {
+                    id: headerCreateMenu
+                    objectName: "headerCreateMenu"
+                    implicitWidth: 310
+                    NoteMenuItem { objectName: "headerNewMarkdownItem"; text: "New Markdown note (.md)"; shortcutText: root.shortcutLabels.new_folder_note || ""; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("md", sidebarState.folder) }
+                    NoteMenuItem { objectName: "headerNewPortableItem"; text: "New portable note (.smd)"; icon.source: "../icons/File.svg"; onTriggered: root.openCreateDialog("smd", sidebarState.folder) }
+                    NoteMenuItem { objectName: "headerNewSubfolderItem"; text: "New subfolder"; shortcutText: root.shortcutLabels.new_subfolder || ""; icon.source: "../icons/FolderOpen.svg"; onTriggered: root.openCreateDialog("folder", sidebarState.folder) }
+                    MenuSeparator {}
+                    NoteMenuItem { objectName: "headerSwitchFolderItem"; text: "Switch folder…"; icon.source: "../icons/FolderOpen.svg"; onTriggered: studio.chooseFolder() }
+                }
+            }
+
+            ActionButton {
+                objectName: "closeFolderButton"
+                glyph: "X"; compact: true
+                implicitWidth: 30; implicitHeight: 30
+                Layout.preferredWidth: 30; Layout.preferredHeight: 30
+                leftPadding: 6; rightPadding: 6; topPadding: 6; bottomPadding: 6
+                icon.width: 18; icon.height: 18
+                Accessible.name: "Close folder"
+                ToolTip.text: "Close folder (notes stay open)"
+                onClicked: { root.resetSelection(); studio.closeFolder() }
+            }
         }
     }
 
@@ -227,27 +276,78 @@ ColumnLayout {
             anchors.fill: parent
             visible: (sidebarState.files || []).length > 0
             clip: true
+            spacing: 2
             model: sidebarState.files || []
             delegate: ItemDelegate {
                 id: fileEntry
                 objectName: "fileEntry"
                 required property var modelData
                 readonly property bool isSelected: root.selectedPath === modelData.path
-                width: ListView.view.width - 14
-                height: 40
+                readonly property bool isActiveNote: !modelData.directory && root.samePathKey(modelData.path, root.activeTabPath)
+                width: ListView.view.width - 10
+                height: 36
                 hoverEnabled: true
-                leftPadding: 10 + modelData.depth * 16; rightPadding: 34
+                leftPadding: 8 + modelData.depth * 14
+                rightPadding: 32
                 text: (modelData.directory ? (modelData.expanded ? "▾ " : "▸ ") : "") + modelData.name
                 Accessible.name: modelData.name + (modelData.directory ? ", folder" : ", note")
 
-                contentItem: Text {
-                    text: fileEntry.text; font: fileEntry.font; color: viewState.colors.text
-                    elide: Text.ElideRight; verticalAlignment: Text.AlignVCenter
+                contentItem: RowLayout {
+                    spacing: 6
+
+                    ToolButton {
+                        visible: fileEntry.modelData.directory
+                        enabled: false
+                        focusPolicy: Qt.NoFocus
+                        padding: 0
+                        background: null
+                        icon.source: "../icons/CaretDown.svg"
+                        icon.color: viewState.colors.muted
+                        icon.width: 14
+                        icon.height: 14
+                        rotation: fileEntry.modelData.expanded ? 0 : -90
+                        Behavior on rotation { enabled: studio.motionEnabled; NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+                        Layout.preferredWidth: 14
+                        Layout.preferredHeight: 14
+                    }
+
+                    ToolButton {
+                        enabled: false
+                        focusPolicy: Qt.NoFocus
+                        padding: 0
+                        background: null
+                        icon.source: fileEntry.modelData.directory ? "../icons/FolderOpen.svg" : "../icons/File.svg"
+                        icon.color: fileEntry.isActiveNote
+                            ? (viewState.colors["on-primary-container"] || viewState.colors.primary)
+                            : (fileEntry.modelData.directory ? viewState.colors.primary : viewState.colors.muted)
+                        icon.width: 17
+                        icon.height: 17
+                        Layout.preferredWidth: 18
+                        Layout.preferredHeight: 18
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: fileEntry.modelData.name
+                        font.family: "Noto Sans"
+                        font.pixelSize: 13
+                        font.weight: fileEntry.modelData.directory || fileEntry.isActiveNote ? Font.DemiBold : Font.Normal
+                        color: fileEntry.isActiveNote
+                            ? (viewState.colors["on-primary-container"] || viewState.colors.text)
+                            : viewState.colors.text
+                        elide: Text.ElideRight
+                        verticalAlignment: Text.AlignVCenter
+                    }
                 }
 
                 background: Rectangle {
-                    radius: 12; antialiasing: true
-                    color: fileEntry.hovered || fileEntry.down || fileEntry.visualFocus || fileEntry.isSelected ? viewState.colors["surface-high"] : "transparent"
+                    radius: 10
+                    antialiasing: true
+                    color: fileEntry.isActiveNote
+                        ? (viewState.colors["primary-container"] || viewState.colors["surface-high"])
+                        : (fileEntry.hovered || fileEntry.down || fileEntry.visualFocus || fileEntry.isSelected
+                            ? viewState.colors["surface-high"]
+                            : "transparent")
                     border.width: fileEntry.visualFocus || fileEntry.isSelected ? 1 : 0
                     border.color: viewState.colors.primary
                 }
@@ -274,9 +374,9 @@ ColumnLayout {
                     objectName: "folderEntryMoreButton"
                     visible: fileEntry.hovered || fileEntry.visualFocus || fileEntry.isSelected
                     anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
-                    width: 28; height: 28; compact: true
+                    width: 26; height: 26; compact: true
                     topPadding: 0; bottomPadding: 0; leftPadding: 0; rightPadding: 0
-                    glyph: "More"; icon.width: 16; icon.height: 16
+                    glyph: "More"; icon.width: 15; icon.height: 15
                     Accessible.name: "Actions for " + modelData.name; ToolTip.text: "Actions"
                     onClicked: root.openContextMenuFor(fileEntry, modelData.path, modelData.name, modelData.directory, width, height)
                 }
