@@ -42,17 +42,60 @@ def _sample_png_bytes(width: int = 64, height: int = 48) -> bytes:
     return bytes(encoded)
 
 
+_TEST_KERNEL32 = None
+
+
+def _test_kernel32():
+    global _TEST_KERNEL32
+    if _TEST_KERNEL32 is not None:
+        return _TEST_KERNEL32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    kernel32.GetExitCodeProcess.restype = ctypes.c_int
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_int
+    kernel32.IsProcessInJob.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    kernel32.IsProcessInJob.restype = ctypes.c_int
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    _TEST_KERNEL32 = kernel32
+    return kernel32
+
+
+def _pid_in_windows_job(pid: int, job_handle: int) -> bool:
+    kernel32 = _test_kernel32()
+    proc_handle = kernel32.OpenProcess(0x1000, 0, pid)
+    if not proc_handle:
+        raise AssertionError(f"OpenProcess failed for pid {pid}: {ctypes.get_last_error()}")
+    try:
+        in_job = ctypes.c_int(0)
+        ok = kernel32.IsProcessInJob(
+            ctypes.c_void_p(proc_handle),
+            ctypes.c_void_p(job_handle),
+            ctypes.byref(in_job),
+        )
+        if not ok:
+            raise AssertionError(f"IsProcessInJob failed for pid {pid}: {ctypes.get_last_error()}")
+        return bool(in_job.value)
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(proc_handle))
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
-        kernel32.GetExitCodeProcess.restype = ctypes.c_int
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32 = _test_kernel32()
+        handle = kernel32.OpenProcess(0x00100000 | 0x1000, 0, pid)
+        if handle:
+            try:
+                return kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0x00000102
+            finally:
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
         handle = kernel32.OpenProcess(0x1000, 0, pid)
         if not handle:
             return False
@@ -90,17 +133,12 @@ def _best_effort_kill(pid: int) -> None:
     if pid <= 0:
         return
     if os.name == "nt":
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-        kernel32.TerminateProcess.restype = ctypes.c_int
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-        kernel32.CloseHandle.restype = ctypes.c_int
-        handle = kernel32.OpenProcess(0x0001, 0, pid)
+        kernel32 = _test_kernel32()
+        handle = kernel32.OpenProcess(0x00100000 | 0x0001, 0, pid)
         if handle:
             try:
                 kernel32.TerminateProcess(ctypes.c_void_p(handle), 1)
+                kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 1000)
             finally:
                 kernel32.CloseHandle(ctypes.c_void_p(handle))
         return
@@ -118,7 +156,7 @@ def _read_nonempty(path: Path) -> str | None:
     return text or None
 
 
-def _await_file(path: Path, timeout: float = 20.0) -> str:
+def _await_file(path: Path, timeout: float = 25.0) -> str:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = _read_nonempty(path)
@@ -128,7 +166,7 @@ def _await_file(path: Path, timeout: float = 20.0) -> str:
     raise AssertionError(f"Timed out waiting for marker file {path}")
 
 
-def _wait_until(predicate, timeout: float = 20.0, *, pump_app: QApplication | None = None) -> bool:
+def _wait_until(predicate, timeout: float = 25.0, *, pump_app: QApplication | None = None) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if pump_app is not None:
@@ -401,11 +439,13 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                 self.spawned_pids.extend([t_pid, t_child_pid])
 
                 # Timed-out helper AND its descendant process must both be terminated,
-                # while the sibling preview tree and unrelated subprocess stay alive.
+                # while the sibling preview tree and unrelated subprocess stay alive
+                # and have not yet published their delayed PNG artifact.
                 self.assertTrue(_wait_until(lambda: not _pid_alive(t_pid) and not _pid_alive(t_child_pid), timeout=8.0))
                 self.assertTrue(_pid_alive(sib_pid))
                 self.assertTrue(_pid_alive(sib_child_pid))
                 self.assertIsNone(unrelated.poll())
+                self.assertEqual(sibling_result, {})
 
                 # Concurrent sibling preview completes with its PNG artifact intact once released.
                 sibling_release.write_text("done", encoding="utf-8")
@@ -445,6 +485,7 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                 tab_a_helper = root / "tab_a_helper.pid"
                 tab_a_child = root / "tab_a_child.pid"
                 tab_b_helper = root / "tab_b_helper.pid"
+                tab_b_child = root / "tab_b_child.pid"
                 tab_b_release = root / "tab_b_release.txt"
                 win2_helper = root / "win2_helper.pid"
                 win2_child = root / "win2_child.pid"
@@ -463,6 +504,7 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     "# B\nSPEC:" + json.dumps({
                         "png_b64": self.png_b64,
                         "helper_pid_file": str(tab_b_helper),
+                        "child_pid_file": str(tab_b_child),
                         "release_file": str(tab_b_release),
                     }),
                     encoding="utf-8",
@@ -495,29 +537,38 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                 tab_b = next(t for t in window1.tabs if same_path(t.get("path", ""), note_b))
                 tab_w2 = next(t for t in window2.tabs if same_path(t.get("path", ""), note_w2))
 
-                window1.selectTab(tab_a["id"])
+                window1.selectTab(tab_b["id"])
+                rev_b = window1._agent_viewport_revision(tab_b["id"])
                 window2.selectTab(tab_w2["id"])
-                rev_a = window1._agent_viewport_revision(tab_a["id"])
                 rev_w2 = window2._agent_viewport_revision(tab_w2["id"])
 
                 with mock.patch.object(offline_view, "_agent_cli_command", return_value=[sys.executable, str(fake_cli)]):
+                    # Start tab_b's preview in window1 first, then switch to tab_a and start tab_a's preview,
+                    # plus tab_w2's preview in window2 so all three preview trees run concurrently.
+                    window1._capture_background_preview("req-b", tab_b["id"], rev_b, {"revision": rev_b}, {"width": 800})
+                    window1.selectTab(tab_a["id"])
+                    rev_a = window1._agent_viewport_revision(tab_a["id"])
                     window1._capture_background_preview("req-a", tab_a["id"], rev_a, {"revision": rev_a}, {"width": 800})
                     window2._capture_background_preview("req-w2", tab_w2["id"], rev_w2, {"revision": rev_w2}, {"width": 800})
 
                     pid_a = int(_await_file(tab_a_helper))
                     pid_a_child = int(_await_file(tab_a_child))
+                    pid_b = int(_await_file(tab_b_helper))
+                    pid_b_child = int(_await_file(tab_b_child))
                     pid_w2 = int(_await_file(win2_helper))
                     pid_w2_child = int(_await_file(win2_child))
-                    self.spawned_pids.extend([pid_a, pid_a_child, pid_w2, pid_w2_child])
+                    self.spawned_pids.extend([pid_a, pid_a_child, pid_b, pid_b_child, pid_w2, pid_w2_child])
 
-                    # Both preview trees are live before closing tab_a.
+                    # All three preview trees are live before closing tab_a.
                     self.assertTrue(_pid_alive(pid_a))
                     self.assertTrue(_pid_alive(pid_a_child))
+                    self.assertTrue(_pid_alive(pid_b))
+                    self.assertTrue(_pid_alive(pid_b_child))
                     self.assertTrue(_pid_alive(pid_w2))
                     self.assertTrue(_pid_alive(pid_w2_child))
 
-                    # Closing tab_a in window1 returns promptly without blocking Qt, kills tab_a's helper tree,
-                    # activates tab_b cleanly, and leaves window2 and unrelated subprocesses running cleanly.
+                    # Closing tab_a in window1 returns promptly without blocking Qt, kills only tab_a's helper tree,
+                    # re-activates sibling tab_b cleanly, and leaves sibling tab_b, window2, and unrelated subprocesses alive.
                     close_started = time.monotonic()
                     window1.closeTab(tab_a["id"])
                     self.assertLess(time.monotonic() - close_started, 1.0)
@@ -531,9 +582,13 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                             pump_app=self.app,
                         )
                     )
+                    self.assertTrue(_pid_alive(pid_b))
+                    self.assertTrue(_pid_alive(pid_b_child))
                     self.assertTrue(_pid_alive(pid_w2))
                     self.assertTrue(_pid_alive(pid_w2_child))
                     self.assertIsNone(unrelated.poll())
+                    self.assertIsNone(bridge.get("req-b"))
+                    self.assertIsNone(bridge.get("req-w2"))
 
                     res_a, err_a, owner_a = bridge.get("req-a")
                     self.assertIsNone(res_a)
@@ -541,13 +596,8 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     self.assertEqual(owner_a, window1.window_id)
                     self.assertEqual(window1.message, "")
 
-                    # Remaining tab_b in window1 and concurrent tab_w2 in window2 complete with valid PNG artifacts.
-                    rev_b = window1._agent_viewport_revision(tab_b["id"])
-                    window1._capture_background_preview("req-b", tab_b["id"], rev_b, {"revision": rev_b}, {"width": 800})
-                    pid_b = int(_await_file(tab_b_helper))
-                    self.spawned_pids.append(pid_b)
-                    self.assertTrue(_pid_alive(pid_b))
-
+                    # Delayed artifact publication: sibling tab_b in window1 and concurrent tab_w2 in window2
+                    # publish their valid PNG artifacts only once released.
                     tab_b_release.write_text("done", encoding="utf-8")
                     win2_release.write_text("done", encoding="utf-8")
 
@@ -565,7 +615,7 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     self.assertEqual(res_w2["renderedFrom"], "background-preview")
                     self.assertEqual((res_b["width"], res_b["height"]), (64, 48))
                     self.assertEqual((res_w2["width"], res_w2["height"]), (64, 48))
-                    self.assertTrue(_wait_until(lambda: not _pid_alive(pid_w2_child), timeout=8.0))
+                    self.assertTrue(_wait_until(lambda: not _pid_alive(pid_b_child) and not _pid_alive(pid_w2_child), timeout=8.0))
                     self.assertIsNone(unrelated.poll())
 
                     # Now start another long preview in window1 and another in window2, then close window1 via stop():
@@ -618,6 +668,7 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                     self.assertTrue(_pid_alive(pid_w2_keep))
                     self.assertTrue(_pid_alive(pid_w2_keep_child))
                     self.assertIsNone(unrelated.poll())
+                    self.assertIsNone(bridge.get("req-w2-2"))
 
                     win2_keep_release.write_text("done", encoding="utf-8")
                     self.assertTrue(_wait_until(lambda: bridge.get("req-w2-2") is not None, pump_app=self.app))
@@ -804,6 +855,147 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
 
             for mod in (offline_view, process_tree):
                 self.assertNotIn("taskkill", Path(mod.__file__).read_text(encoding="utf-8").lower())
+
+    def test_actual_platform_process_tree_ownership_and_delayed_assign(self):
+        unrelated = self._start_unrelated_process()
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            root = Path(folder)
+            fake_cli = root / "fake_agent_cli.py"
+            _write_fake_agent_cli(fake_cli)
+            note = root / "owned.md"
+            helper_pid_file = root / "owned_helper.pid"
+            child_pid_file = root / "owned_child.pid"
+            release_file = root / "owned_release.txt"
+            target_png = root / "owned.png"
+            note.write_text(
+                "# Owned\nSPEC:" + json.dumps({
+                    "png_b64": self.png_b64,
+                    "helper_pid_file": str(helper_pid_file),
+                    "child_pid_file": str(child_pid_file),
+                    "release_file": str(release_file),
+                }),
+                encoding="utf-8",
+            )
+
+            orig_assign = process_tree.WindowsJob.assign
+
+            def delayed_assign(job_self, proc):
+                time.sleep(0.05)
+                return orig_assign(job_self, proc)
+
+            cmd = [
+                sys.executable,
+                str(fake_cli),
+                "--root",
+                str(root),
+                "preview",
+                str(note),
+                str(target_png),
+                "--width",
+                "640",
+            ]
+            cell_helper_pid_file = root / "cell_helper.pid"
+            cell_child_pid_file = root / "cell_child.pid"
+            cell_script = (
+                "import os, pathlib, subprocess, sys\n"
+                "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding='utf-8')\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+                "pathlib.Path(sys.argv[2]).write_text(str(child.pid), encoding='utf-8')\n"
+                "child.wait()\n"
+            )
+            cell_cmd = [
+                sys.executable,
+                "-c",
+                cell_script,
+                str(cell_helper_pid_file),
+                str(cell_child_pid_file),
+            ]
+            with mock.patch.object(process_tree.WindowsJob, "assign", delayed_assign):
+                controller = offline_view._spawn_preview_process(
+                    cmd,
+                    stdout_path=root / "stdout.txt",
+                    stderr_path=root / "stderr.txt",
+                )
+                cell_controller = python_runtime._spawn_cell_process(
+                    cell_cmd,
+                    cwd=root,
+                    env=dict(os.environ),
+                    stderr_path=root / "cell_stderr.txt",
+                )
+                try:
+                    h_pid = int(_await_file(helper_pid_file))
+                    c_pid = int(_await_file(child_pid_file))
+                    cell_h_pid = int(_await_file(cell_helper_pid_file))
+                    cell_c_pid = int(_await_file(cell_child_pid_file))
+                    self.spawned_pids.extend([h_pid, c_pid, cell_h_pid, cell_c_pid])
+                    self.assertTrue(_pid_alive(h_pid))
+                    self.assertTrue(_pid_alive(c_pid))
+                    self.assertTrue(_pid_alive(cell_h_pid))
+                    self.assertTrue(_pid_alive(cell_c_pid))
+                    self.assertFalse(target_png.exists())
+
+                    if os.name == "nt":
+                        self.assertIsNotNone(controller._win_job)
+                        self.assertIsNotNone(cell_controller._win_job)
+                        job_handle = controller._win_job._handle
+                        cell_job_handle = cell_controller._win_job._handle
+                        self.assertIsNotNone(job_handle)
+                        self.assertIsNotNone(cell_job_handle)
+                        assert job_handle is not None and cell_job_handle is not None
+                        self.assertNotEqual(job_handle, cell_job_handle)
+                        self.assertTrue(_pid_in_windows_job(h_pid, job_handle))
+                        self.assertTrue(_pid_in_windows_job(c_pid, job_handle))
+                        self.assertFalse(_pid_in_windows_job(h_pid, cell_job_handle))
+                        self.assertFalse(_pid_in_windows_job(c_pid, cell_job_handle))
+                        self.assertTrue(_pid_in_windows_job(cell_h_pid, cell_job_handle))
+                        self.assertTrue(_pid_in_windows_job(cell_c_pid, cell_job_handle))
+                        self.assertFalse(_pid_in_windows_job(cell_h_pid, job_handle))
+                        self.assertFalse(_pid_in_windows_job(cell_c_pid, job_handle))
+                        self.assertFalse(_pid_in_windows_job(unrelated.pid, job_handle))
+                        self.assertFalse(_pid_in_windows_job(unrelated.pid, cell_job_handle))
+                    else:
+                        self.assertEqual(os.getpgid(h_pid), h_pid)
+                        self.assertEqual(os.getpgid(c_pid), h_pid)
+                        self.assertEqual(os.getpgid(cell_h_pid), cell_h_pid)
+                        self.assertEqual(os.getpgid(cell_c_pid), cell_h_pid)
+                        self.assertNotEqual(h_pid, cell_h_pid)
+                        self.assertNotEqual(os.getpgid(unrelated.pid), h_pid)
+                        self.assertNotEqual(os.getpgid(unrelated.pid), cell_h_pid)
+
+                    controller.terminate()
+                    self.assertTrue(_wait_until(lambda: not _pid_alive(h_pid) and not _pid_alive(c_pid), timeout=8.0))
+                    self.assertTrue(_pid_alive(cell_h_pid))
+                    self.assertTrue(_pid_alive(cell_c_pid))
+                    self.assertIsNone(unrelated.poll())
+                finally:
+                    controller.terminate()
+                    cell_controller.terminate()
+
+            self.assertTrue(
+                _wait_until(
+                    lambda: not _pid_alive(h_pid)
+                    and not _pid_alive(c_pid)
+                    and not _pid_alive(cell_h_pid)
+                    and not _pid_alive(cell_c_pid),
+                    timeout=8.0,
+                )
+            )
+            self.assertIsNone(unrelated.poll())
+
+            if os.name == "nt":
+                never_ran_pid = root / "never_ran_helper.pid"
+                unassigned_content = "# Never\nSPEC:" + json.dumps({
+                    "png_b64": self.png_b64,
+                    "helper_pid_file": str(never_ran_pid),
+                })
+                with (
+                    mock.patch.object(offline_view, "_agent_cli_command", return_value=[sys.executable, str(fake_cli)]),
+                    mock.patch.object(process_tree.WindowsJob, "assign", return_value=False),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "Could not assign offline preview process to Windows Job Object"):
+                        offline_view.render_live_snapshot(unassigned_content, {}, "", width=640, timeout=10)
+                self.assertFalse(never_ran_pid.exists(), "preview helper ran despite Windows Job Object assignment failure")
+                self.assertIsNone(unrelated.poll())
 
 
 if __name__ == "__main__":

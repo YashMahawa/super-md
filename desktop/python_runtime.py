@@ -15,20 +15,36 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from core.process_tree import (
-    CREATE_SUSPENDED,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JobObjectExtendedLimitInformation,
-    OwnedProcessTree,
-    WindowsJob,
-    contained_spawn_kwargs,
-    posix_pgid_alive,
-    posix_safe_pgid,
-    read_tail,
-    spawn_contained_process,
-    terminate_posix_tree,
-    terminate_windows_tree,
-)
+if __package__:
+    from .core.process_tree import (
+        CREATE_SUSPENDED,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JobObjectExtendedLimitInformation,
+        OwnedProcessTree,
+        WindowsJob,
+        contained_spawn_kwargs,
+        posix_pgid_alive,
+        posix_safe_pgid,
+        read_tail,
+        spawn_contained_process,
+        terminate_posix_tree,
+        terminate_windows_tree,
+    )
+else:
+    from core.process_tree import (
+        CREATE_SUSPENDED,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JobObjectExtendedLimitInformation,
+        OwnedProcessTree,
+        WindowsJob,
+        contained_spawn_kwargs,
+        posix_pgid_alive,
+        posix_safe_pgid,
+        read_tail,
+        spawn_contained_process,
+        terminate_posix_tree,
+        terminate_windows_tree,
+    )
 
 BUNDLED = "bundled"
 CELL_FLAG = "--python-cell"

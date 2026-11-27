@@ -8,15 +8,26 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from core.paths import DESKTOP_DIR
-from core.process_tree import (
-    CREATE_SUSPENDED,
-    OwnedProcessTree,
-    contained_spawn_kwargs,
-    read_tail,
-    spawn_contained_process,
-    terminate_posix_tree,
-)
+if __package__:
+    from .core.paths import DESKTOP_DIR
+    from .core.process_tree import (
+        CREATE_SUSPENDED,
+        OwnedProcessTree,
+        contained_spawn_kwargs,
+        read_tail,
+        spawn_contained_process,
+        terminate_posix_tree,
+    )
+else:
+    from core.paths import DESKTOP_DIR
+    from core.process_tree import (
+        CREATE_SUSPENDED,
+        OwnedProcessTree,
+        contained_spawn_kwargs,
+        read_tail,
+        spawn_contained_process,
+        terminate_posix_tree,
+    )
 
 
 DEFAULT_PREVIEW_TIMEOUT = 55.0
