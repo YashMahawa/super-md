@@ -95,10 +95,7 @@ def hold_watches_for_rename(studio_obj: Any, target_path: str, *, is_dir: bool, 
             session._watch_suspensions.append(entry)
     suspend_fn = getattr(studio_obj, "_suspend_watches_for_prefix", None)
     if callable(suspend_fn):
-        try:
-            suspend_fn(target_path, is_dir=is_dir, new_path=new_path)
-        except TypeError:
-            suspend_fn(target_path, is_dir=is_dir)
+        suspend_fn(target_path, is_dir=is_dir, new_path=new_path)
     else:
         suspend_watches_for_prefix(studio_obj, target_path, is_dir=is_dir, new_path=new_path)
     return resume_event
@@ -351,7 +348,6 @@ def create_subfolder(studio_obj: Any, parent_path: str, name: str) -> None:
 def submit_rename(
     studio_obj: Any, before: Path, after: Path, final_name: str, *,
     is_dir: bool, message_builder: Callable[[str], str], symlink_error: str, exists_error: str,
-    is_windows_fn: Callable[[], bool] = _default_is_windows,
     rename_fn: Callable[[Path, Path], None] = rename_path_with_windows_retry,
 ) -> None:
     if getattr(studio_obj, "retired", False) or getattr(getattr(studio_obj, "writes", None), "_shutdown", False):
@@ -370,10 +366,7 @@ def submit_rename(
                     same_inode = os.path.samestat(before.stat(), after.stat())
             if not same_inode:
                 raise ValueError(exists_error)
-        if rename_fn is rename_path_with_windows_retry:
-            rename_path_with_windows_retry(before, after, is_windows_fn=is_windows_fn)
-        else:
-            rename_fn(before, after)
+        rename_fn(before, after)
         return before_canon, folder_ops.canonical_path_str(after.resolve(strict=True)), is_dir
 
     if getattr(studio_obj, "writes", None) is None:
@@ -509,25 +502,21 @@ def submit_rename(
 
 def _dispatch_rename(
     studio_obj: Any, before: Path, after: Path, final_name: str, *,
-    is_windows_fn: Callable[[], bool] = _default_is_windows,
-    rename_fn: Callable[[Path, Path], None] = rename_path_with_windows_retry,
+    rename_fn: Callable[[Path, Path], None] | None = None,
     **kwargs: Any,
 ) -> None:
-    fn = getattr(studio_obj, "_submit_rename", None)
-    if callable(fn):
-        if rename_fn is rename_path_with_windows_retry and is_windows_fn is _default_is_windows:
-            return fn(before, after, final_name, **kwargs)
-        try:
-            return fn(before, after, final_name, is_windows_fn=is_windows_fn, rename_fn=rename_fn, **kwargs)
-        except TypeError:
-            return fn(before, after, final_name, **kwargs)
-    return submit_rename(studio_obj, before, after, final_name, is_windows_fn=is_windows_fn, rename_fn=rename_fn, **kwargs)
+    if rename_fn is None and callable(fn := getattr(studio_obj, "_submit_rename", None)):
+        return fn(before, after, final_name, **kwargs)
+    return submit_rename(
+        studio_obj, before, after, final_name,
+        rename_fn=rename_path_with_windows_retry if rename_fn is None else rename_fn,
+        **kwargs,
+    )
 
 
 def rename_entry(
     studio_obj: Any, entry_path: str, name: str, *,
-    is_windows_fn: Callable[[], bool] = _default_is_windows,
-    rename_fn: Callable[[Path, Path], None] = rename_path_with_windows_retry,
+    rename_fn: Callable[[Path, Path], None] | None = None,
 ) -> None:
     if not studio_obj.folder:
         return _fail_message(studio_obj, "Open a folder first.")
@@ -551,14 +540,13 @@ def rename_entry(
         message_builder=lambda new_str: f"Renamed to {Path(new_str).name}",
         symlink_error="Symlinks are not allowed inside the open folder.",
         exists_error="An item with that name already exists.",
-        is_windows_fn=is_windows_fn, rename_fn=rename_fn,
+        rename_fn=rename_fn,
     )
 
 
 def rename_note(
     studio_obj: Any, note_id: str, name: str, *,
-    is_windows_fn: Callable[[], bool] = _default_is_windows,
-    rename_fn: Callable[[Path, Path], None] = rename_path_with_windows_retry,
+    rename_fn: Callable[[Path, Path], None] | None = None,
 ) -> None:
     tab = next((t for t in studio_obj.tabs if t["id"] == note_id), None)
     if not tab or note_id in getattr(studio_obj, "saving", ()):
@@ -580,14 +568,13 @@ def rename_note(
     if before.name == final_name:
         return
     if getattr(studio_obj, "folder", "") and folder_ops.matches_path_prefix(str(before), studio_obj.folder, is_directory=True):
-        rename_entry_fn = getattr(studio_obj, "renameEntry", None)
-        if callable(rename_entry_fn) and rename_fn is rename_path_with_windows_retry and is_windows_fn is _default_is_windows:
+        if rename_fn is None and callable(rename_entry_fn := getattr(studio_obj, "renameEntry", None)):
             return rename_entry_fn(str(before), final_name)
-        return rename_entry(studio_obj, str(before), final_name, is_windows_fn=is_windows_fn, rename_fn=rename_fn)
+        return rename_entry(studio_obj, str(before), final_name, rename_fn=rename_fn)
     _dispatch_rename(
         studio_obj, before, after, final_name, is_dir=False,
         message_builder=lambda _new_str: f"Renamed to {final_name}",
         symlink_error="Symlinks are not allowed.",
         exists_error="A file with that name already exists.",
-        is_windows_fn=is_windows_fn, rename_fn=rename_fn,
+        rename_fn=rename_fn,
     )

@@ -868,11 +868,8 @@ class Session(QObject):
 
     def _build_retired_persistence_payloads(self):
         with self._rename_state_lock:
-            persisted_settings = copy.deepcopy(self.settings)
-            if getattr(getattr(self, "background", None), "_cli_started_agent_access", False):
-                persisted_settings["agentAccessEnabled"] = False
             settings_bytes = json.dumps({
-                "settings": persisted_settings,
+                "settings": copy.deepcopy(self.settings),
                 "recent": list(self.recent),
                 "pinned": list(self.pinned),
             }).encode()
@@ -1724,9 +1721,23 @@ class Studio(QObject):
             self._reload_changed_content(effective_changed)
             if self.folder and (effective_changed or emitted_location_change):
                 self.session.workspace_links.invalidate(self.folder)
-            if self.folder and effective_changed and any(
-                folder_ops.same_path(ch, self.folder) or folder_ops.matches_path_prefix(ch, self.folder, is_directory=True)
-                for ch in effective_changed
+            if self.folder and (
+                any(
+                    folder_ops.same_path(ch, self.folder)
+                    or folder_ops.matches_path_prefix(ch, self.folder, is_directory=True)
+                    for ch in effective_changed
+                )
+                or (
+                    emitted_location_change
+                    and any(
+                        folder_ops.matches_path_prefix(p, self.folder, is_directory=True)
+                        for old, new in result.items()
+                        for p in (old, new)
+                        if p
+                        and not self._is_path_suspended(old, current_suspensions)
+                        and not (new and self._is_path_suspended(new, current_suspensions))
+                    )
+                )
             ):
                 self._load_tree()
         self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
@@ -4764,26 +4775,21 @@ class Studio(QObject):
     def _submit_rename(
         self, before: Path, after: Path, final_name: str, *,
         is_dir: bool, message_builder, symlink_error: str, exists_error: str,
-        is_windows_fn=None, rename_fn=None,
+        rename_fn=None,
     ):
         studio_assets_rename.submit_rename(
             self, before, after, final_name, is_dir=is_dir, message_builder=message_builder,
             symlink_error=symlink_error, exists_error=exists_error,
-            is_windows_fn=_is_windows if is_windows_fn is None else is_windows_fn,
             rename_fn=_rename_path_with_windows_retry if rename_fn is None else rename_fn,
         )
 
     @Slot(str, str)
     def renameEntry(self, entry_path, name):
-        studio_assets_rename.rename_entry(
-            self, entry_path, name, is_windows_fn=_is_windows, rename_fn=_rename_path_with_windows_retry
-        )
+        studio_assets_rename.rename_entry(self, entry_path, name)
 
     @Slot(str, str)
     def renameNote(self, id, name):
-        studio_assets_rename.rename_note(
-            self, id, name, is_windows_fn=_is_windows, rename_fn=_rename_path_with_windows_retry
-        )
+        studio_assets_rename.rename_note(self, id, name)
 
     @staticmethod
     def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
@@ -5449,14 +5455,6 @@ class Studio(QObject):
     def _attach_tab_asset_native(self, args):
         return studio_portable_assets.attach_tab_asset_native(
             self, args,
-            write_portable_fn=write_portable,
-            open_note_fn=open_note,
-            matches_signature_fn=_matches_media_signature,
-            validate_local_asset_fn=_validate_local_tab_asset_path,
-            valid_asset_filename_fn=is_valid_asset_filename,
-            is_dirty_fn=Studio._is_dirty,
-            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
-            extra_asset_roots_fn=Studio._extra_asset_roots,
             prepare_fn=Studio._prepare_attach_tab_asset,
             run_sync_fn=Studio._run_prepared_write_sync,
         )
@@ -5590,13 +5588,6 @@ class Studio(QObject):
     def _replace_tab_asset_native(self, args):
         return studio_portable_assets.replace_tab_asset_native(
             self, args,
-            write_portable_fn=write_portable,
-            open_note_fn=open_note,
-            matches_signature_fn=_matches_media_signature,
-            validate_local_asset_fn=_validate_local_tab_asset_path,
-            is_dirty_fn=Studio._is_dirty,
-            apply_saved_assets_fn=Studio._apply_saved_tab_assets,
-            extra_asset_roots_fn=Studio._extra_asset_roots,
             prepare_fn=Studio._prepare_replace_tab_asset,
             run_sync_fn=Studio._run_prepared_write_sync,
         )

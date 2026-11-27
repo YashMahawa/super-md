@@ -85,6 +85,11 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
                 if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
             } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
             self.assertFalse({"studio", "desktop.studio", "sys"} & imported)
+            top_funcs = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+            for cmp_node in (n for n in ast.walk(tree) if isinstance(n, ast.Compare)):
+                for op, comp in zip(cmp_node.ops, cmp_node.comparators):
+                    if isinstance(op, (ast.Is, ast.IsNot)) and isinstance(comp, ast.Name):
+                        self.assertNotIn(comp.id, top_funcs)
 
     def test_rename_entry_pipeline_handles_folder_note_samestat_links_and_watcher_restore(self):
         sub = self.open_root / "Drafts"
@@ -302,15 +307,25 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             )
         self.assertEqual(invalidations, [self.studio.folder, self.studio.folder, None])
         self.assertIn((self.open_root / "Patched Note.md").resolve(), [p.resolve() for p in atomic_calls])
+        seeded_win = SimpleNamespace(
+            retired=False, tabs=[], folder=str(self.open_root), expanded=set(), _pinned_visible_dirs=set(),
+            _agent_open_paths=set(), _agent_owned_files=set(), _folder_search_open=False, _folder_search_query="",
+            _pending_seeded_find={"path": str(self.open_root / "a.md"), "sourceStart": 10, "sourceEnd": 15, "matchText": "topic"},
+            _watch_notes=lambda force=False: None, _recover=lambda: None, _load_tree=lambda: None, _emit=lambda *a: None,
+        )
         lightweight = SimpleNamespace(
             folder=str(self.open_root), tabs=[], recent=[], active="", settings={}, message="", _activation_generation=0,
             _agent_open_paths=set(), _agent_owned_files=set(), writes=None,
-            session=SimpleNamespace(locations={}, pinned=[], workspace={}, startup_paths=[], startup_active="", startup_entries=[]),
+            session=SimpleNamespace(windows={"w1": seeded_win}, locations={}, pinned=[], workspace={}, startup_paths=[], startup_active="", startup_entries=[]),
             _save_positions=lambda: None, _preferences=lambda notify=True: None, _watch_notes=lambda force=False: None,
             recovery_timer=SimpleNamespace(start=lambda _ms: None), _emit=lambda *a: None, _focus_open_target=lambda _g: None,
             _note=lambda *a: {"id": "n1"}, _submit=lambda work, done, executor=None: done(work(), None),
         )
         studio_assets_rename.sync_path_change(lightweight, str(self.open_root / "a.md"), str(self.open_root / "b.md"), is_dir=False, message="Moved")
+        self.assertEqual(
+            seeded_win._pending_seeded_find,
+            {"path": str(self.open_root / "b.md"), "sourceStart": 10, "sourceEnd": 15, "matchText": "topic"},
+        )
         studio_assets_rename.create_subfolder(lightweight, str(self.open_root), "DoubleSub")
         studio_assets_rename.create_folder_note(lightweight, str(self.open_root), "DoubleNote", "md")
         self.assertTrue((self.open_root / "DoubleSub").is_dir() and (self.open_root / "DoubleNote.md").is_file())
