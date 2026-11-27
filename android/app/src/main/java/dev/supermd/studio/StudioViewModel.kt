@@ -4856,6 +4856,37 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             result(null)
         }
     }
+    internal suspend fun export(
+        content: String,
+        options: String,
+        assets: JSONObject,
+        destination: Uri? = outputUri,
+        job: PdfExportJob? = null,
+        onPublishing: (suspend (PdfExportJob) -> Unit)? = null,
+    ) = withContext(Dispatchers.IO + kotlinx.coroutines.NonCancellable) {
+        val target = destination ?: error("Choose a PDF destination first")
+        val outputTarget = prepareExportDestination(target, NativeExportFormat.PDF, allowRename = target == outputUri && pdfDestinationIsNew)
+        val staging = File(getApplication<Application>().cacheDir, "pdf-${UUID.randomUUID()}").apply { mkdirs() }
+        try {
+            val assetDir = File(staging, "assets").apply { mkdirs() }
+            assets.keys().forEach { key -> require(Regex("[a-zA-Z0-9_.-]+").matches(key)); File(assetDir, key).writeBytes(Base64.decode(assets.getString(key), Base64.DEFAULT)) }
+            fonts.addPdfFonts(JSONObject(options).optString("fontFamily"),assetDir)
+            val output = File(staging, "document.pdf")
+            val error = PdfEngine.export(content, options, assetDir.absolutePath, output.absolutePath)
+            if (error.isNotEmpty()) error(error)
+            verifyExportHeader(output, NativeExportFormat.PDF)
+            if (job != null) {
+                check(job.beginPublishing()) { "PDF export cancelled" }
+                onPublishing?.invoke(job)
+            }
+            resolver.openOutputStream(outputTarget, "wt")?.use { stream -> output.inputStream().use { it.copyTo(stream) } } ?: error("Cannot write PDF destination")
+            job?.succeed()
+            withContext(Dispatchers.Main) { if (!finishShare(outputTarget)) mutable.value = mutable.value.copy(busy = false, message = "PDF exported"); outputUri = null; pdfDestinationIsNew = false }
+        } catch (error: Exception) {
+            job?.fail()
+            throw error
+        } finally { staging.deleteRecursively() }
+    }
 
     private data class AdmittedDroppedNoteCandidate(
         val admitted: AdmittedExternalDrop,
@@ -5104,37 +5135,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             admittedHandles.forEach { runCatching { it.close() } }
             onComplete()
         }
-    }
-    internal suspend fun export(
-        content: String,
-        options: String,
-        assets: JSONObject,
-        destination: Uri? = outputUri,
-        job: PdfExportJob? = null,
-        onPublishing: (suspend (PdfExportJob) -> Unit)? = null,
-    ) = withContext(Dispatchers.IO + kotlinx.coroutines.NonCancellable) {
-        val target = destination ?: error("Choose a PDF destination first")
-        val outputTarget = prepareExportDestination(target, NativeExportFormat.PDF, allowRename = target == outputUri && pdfDestinationIsNew)
-        val staging = File(getApplication<Application>().cacheDir, "pdf-${UUID.randomUUID()}").apply { mkdirs() }
-        try {
-            val assetDir = File(staging, "assets").apply { mkdirs() }
-            assets.keys().forEach { key -> require(Regex("[a-zA-Z0-9_.-]+").matches(key)); File(assetDir, key).writeBytes(Base64.decode(assets.getString(key), Base64.DEFAULT)) }
-            fonts.addPdfFonts(JSONObject(options).optString("fontFamily"),assetDir)
-            val output = File(staging, "document.pdf")
-            val error = PdfEngine.export(content, options, assetDir.absolutePath, output.absolutePath)
-            if (error.isNotEmpty()) error(error)
-            verifyExportHeader(output, NativeExportFormat.PDF)
-            if (job != null) {
-                check(job.beginPublishing()) { "PDF export cancelled" }
-                onPublishing?.invoke(job)
-            }
-            resolver.openOutputStream(outputTarget, "wt")?.use { stream -> output.inputStream().use { it.copyTo(stream) } } ?: error("Cannot write PDF destination")
-            job?.succeed()
-            withContext(Dispatchers.Main) { if (!finishShare(outputTarget)) mutable.value = mutable.value.copy(busy = false, message = "PDF exported"); outputUri = null; pdfDestinationIsNew = false }
-        } catch (error: Exception) {
-            job?.fail()
-            throw error
-        } finally { staging.deleteRecursively() }
     }
 }
 

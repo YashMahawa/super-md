@@ -268,6 +268,12 @@ internal object ExternalDocumentEntryGuard {
     private fun providerAuthority(uri: Uri): String? =
         uri.authority?.substringAfter('@')?.takeIf { it.isNotBlank() }
 
+    private fun isBareTreeUri(uri: Uri): Boolean {
+        if (!DocumentsContract.isTreeUri(uri)) return false
+        val segments = uri.pathSegments
+        return segments.size < 4 || segments[2] != "document"
+    }
+
     fun dispatchIncomingIntent(
         context: Context,
         incoming: Intent?,
@@ -374,10 +380,11 @@ internal object ExternalDocumentEntryGuard {
                     return ExternalDropUriDecision.Rejected(uri, "App-private share URIs cannot be dropped")
                 }
                 if (DocumentsContract.isTreeUri(uri)) {
+                    val bareTree = isBareTreeUri(uri)
                     return ExternalDropUriDecision.Rejected(
                         uri = uri,
-                        reason = "Folder drops are not supported",
-                        isFolder = true,
+                        reason = if (bareTree) "Folder drops are not supported" else "Tree-scoped document URIs cannot be dropped",
+                        isFolder = bareTree,
                     )
                 }
                 if (!dragReadPermissionGranted || !hasDirectReadUriPermission(context, uri)) {
@@ -457,7 +464,7 @@ internal object ExternalDocumentEntryGuard {
                 require(!authority.equals("${context.packageName}.share", ignoreCase = true)) {
                     "Unsupported image URI"
                 }
-                require(!DocumentsContract.isTreeUri(uri)) { "Unsupported image URI" }
+                require(!isBareTreeUri(uri)) { "Unsupported image URI" }
             }
             "file" -> {
                 openSafeRegularFileHandle(context, uri).use { }
@@ -475,7 +482,7 @@ internal object ExternalDocumentEntryGuard {
             "content" -> {
                 validatePickedMediaUri(context, uri)
                 val pfd = resolver.openFileDescriptor(uri, "r")
-                    ?: error("Image permission is unavailable")
+                    ?: throw SecurityException("Image permission is unavailable")
                 try {
                     verifyOpenedContentDescriptor(context, uri, pfd, allowGrantedShareFile = false)
                     ParcelFileDescriptor.AutoCloseInputStream(pfd)
@@ -717,7 +724,9 @@ internal object ExternalDocumentEntryGuard {
                 "Document is not a regular file"
             }
         }
-        val fdPath = resolveParcelDescriptorPath(pfd) ?: return
+        val fdPath = fileSyscalls.resolveDescriptorPath(pfd.fileDescriptor)
+            ?: resolveParcelDescriptorPath(pfd)
+            ?: return
         if (!fdPath.startsWith("/")) return
         val cleanFdPath = fdPath.removeSuffix(" (deleted)")
         if (allowGrantedShareFile && isAllowedGrantedShareFile(context, uri, cleanFdPath)) return

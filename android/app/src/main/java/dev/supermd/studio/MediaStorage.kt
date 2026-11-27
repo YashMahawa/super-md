@@ -437,28 +437,37 @@ class MediaStorage(private val context: Context) {
         val result = JSONArray()
         try {
             for (uri in uris) {
-                if (uri.scheme.equals("content", ignoreCase = true)) {
-                    ExternalDocumentEntryGuard.validatePickedMediaUri(context, uri)
-                }
-                val stream = ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
-                    context = context,
-                    resolver = context.contentResolver,
-                    uri = uri,
-                )
-                stream.use { input ->
-                    val name = resolveUriDisplayName(uri) ?: "Image"
-                    val providerMime = if (uri.scheme.equals("content", ignoreCase = true)) {
-                        runCatching { context.contentResolver.getType(uri) }.getOrNull()
-                    } else {
-                        null
+                val (name, type, bytes) = when (uri.scheme?.lowercase()) {
+                    "content" -> {
+                        ExternalDocumentEntryGuard.validatePickedMediaUri(context, uri)
+                        val resolvedName = resolveUriDisplayName(uri) ?: "Image"
+                        val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                        val resolvedType = imageMime(resolvedName, providerMime)
+                        val readBytes = ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
+                            context = context,
+                            resolver = context.contentResolver,
+                            uri = uri,
+                        ).use { input -> readLimited(input, 25_000_000) }
+                        Triple(resolvedName, resolvedType, readBytes)
                     }
-                    val type = imageMime(name, providerMime)
-                    val bytes = readLimited(input, 25_000_000)
-                    requireMediaSignature(type, bytes)
-                    total += bytes.size
-                    require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-                    result.put(store(name, type, bytes))
+                    "file" -> {
+                        ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
+                            context = context,
+                            resolver = context.contentResolver,
+                            uri = uri,
+                        ).use { input ->
+                            val resolvedName = resolveUriDisplayName(uri) ?: "Image"
+                            val resolvedType = imageMime(resolvedName, null)
+                            val readBytes = readLimited(input, 25_000_000)
+                            Triple(resolvedName, resolvedType, readBytes)
+                        }
+                    }
+                    else -> throw IllegalArgumentException("Unsupported image URI")
                 }
+                requireMediaSignature(type, bytes)
+                total += bytes.size
+                require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+                result.put(store(name, type, bytes))
             }
             return result
         } catch (error: Throwable) {
