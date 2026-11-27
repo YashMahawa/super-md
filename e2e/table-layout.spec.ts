@@ -173,21 +173,41 @@ test('extends Qt native scroll indicators to visibly overflowing table and code 
   const page = await context.newPage();
   try {
     await page.addInitScript(() => {
-      window.SuperMD = {
-        post: (id: string) => {
-          window.supermdReply?.(id, true, null);
-        },
-      };
+      const listeners: Array<(id: string, result: string, error: string) => void> = [];
+      window.qt = { webChannelTransport: {} };
+      window.QWebChannel = class {
+        constructor(
+          _transport: unknown,
+          ready: (channel: {
+            objects: {
+              studio: {
+                post: (id: string) => void;
+                replied: { connect: (cb: (id: string, result: string, error: string) => void) => void };
+              };
+            };
+          }) => void,
+        ) {
+          ready({
+            objects: {
+              studio: {
+                post: (id: string) => {
+                  queueMicrotask(() => {
+                    for (const cb of listeners) cb(id, 'null', '');
+                  });
+                },
+                replied: {
+                  connect: (cb) => {
+                    listeners.push(cb);
+                  },
+                },
+              },
+            },
+          });
+        }
+      } as unknown as Window['QWebChannel'];
     });
-    await page.goto('/android-reader.html');
+    await page.goto('/qt-reader.html');
     await page.waitForFunction(() => typeof window.supermdLoad === 'function');
-    await page.evaluate(async () => {
-      document.documentElement.dataset.host = 'qt';
-      document.documentElement.dataset.platform = 'desktop';
-      // @ts-expect-error Vite serves this source module directly during E2E runs.
-      const { installScrollIndicators } = await import('/src/scrollIndicators.ts');
-      installScrollIndicators();
-    });
 
     const compactTable = '| Key | Val |\n| --- | --- |\n| k1 | v1 |';
     const wideHeaders = Array.from({ length: 13 }, (_, i) => `Field_${i + 1}_Label`).join(' | ');

@@ -814,13 +814,14 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             if getattr(studio, "_search_pool", None) is not None:
                 studio._search_pool.shutdown(wait=False, cancel_futures=True)
         if session is not None:
-            session.writes.shutdown(wait=False)
+            session.writes.shutdown(wait=True)
         if sys.platform != "darwin":
             if window is not None:
                 try:
                     window.setProperty("intentionalShutdown", True)
                     window.setProperty("closingAllowed", True)
                     window.close()
+                    window.deleteLater()
                 except RuntimeError:
                     pass
             if engine is not None:
@@ -842,7 +843,9 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
         shutil.rmtree(session_dir, ignore_errors=True)
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(exit_code)
+        if sys.platform == "darwin":
+            os._exit(exit_code)
+    return exit_code
 
 
 class TouchpadScrollQtWebEngineTest(unittest.TestCase):
@@ -852,9 +855,10 @@ class TouchpadScrollQtWebEngineTest(unittest.TestCase):
         if not (ROOT.parent / "dist" / "qt-reader.html").is_file():
             raise unittest.SkipTest("dist/qt-reader.html not built")
         env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QUICK_BACKEND="software")
-        with tempfile.TemporaryDirectory(prefix="supermd-touchpad-probe-io-") as io_dir:
-            stdout_path = Path(io_dir) / "probe-stdout.log"
-            stderr_path = Path(io_dir) / "probe-stderr.log"
+        io_dir = Path(tempfile.mkdtemp(prefix="supermd-touchpad-probe-io-"))
+        try:
+            stdout_path = io_dir / "probe-stdout.log"
+            stderr_path = io_dir / "probe-stderr.log"
             with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
                 "w", encoding="utf-8"
             ) as stderr_file:
@@ -869,6 +873,8 @@ class TouchpadScrollQtWebEngineTest(unittest.TestCase):
                 )
             stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
             stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        finally:
+            shutil.rmtree(io_dir, ignore_errors=True)
         self.assertEqual(completed.returncode, 0, f"{stdout_text}{stderr_text}")
         result = json.loads(stdout_text.strip().splitlines()[-1])
         self.assertTrue(result.get("ok"), result)
