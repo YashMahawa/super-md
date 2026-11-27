@@ -1226,7 +1226,7 @@ class Studio(QObject):
         return studio_agent_staging.bound_agent_edits(edits)
 
     def _append_agent_edit(self, tab: dict, before: str, after: str) -> None:
-        studio_agent_staging.append_agent_edit(self, tab, before, after)
+        studio_agent_staging.append_agent_edit(self, tab, before, after, bound_agent_edits_fn=Studio._bound_agent_edits)
 
     def _activate_tab_state(self, tab: dict | None) -> None:
         studio_agent_staging.activate_tab_state(self, tab)
@@ -5102,16 +5102,16 @@ class Studio(QObject):
         return studio_agent_staging.validate_and_compute_patch_tab(self, args, bridge_revision_json=bridge_revision_json)
 
     def _build_staged_recovery_candidate(self, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool):
-        return studio_agent_staging.build_staged_recovery_candidate(self, tab_id, current_tab, previous, edited, changed)
+        return studio_agent_staging.build_staged_recovery_candidate(self, tab_id, current_tab, previous, edited, changed, snapshot_tab_state_fn=_snapshot_tab_state, bound_agent_edits_fn=Studio._bound_agent_edits)
 
     def _commit_staged_patch_tab(self, current_tab: dict, tab_id: str, edited: str, operation_results: list, changed: bool, candidate_edits: list[dict], next_seq: int) -> dict:
-        return studio_agent_staging.commit_staged_patch_tab(self, current_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq)
+        return studio_agent_staging.commit_staged_patch_tab(self, current_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq, snapshot_tab_state_fn=_snapshot_tab_state)
 
     def _make_staged_recovery_write_action(self, tab_id: str, previous: str, snapshot: list, decision_lock: threading.Lock, attempt_state: dict, rev_holder: list[int], wrote_holder: list[bool]):
-        return studio_agent_staging.make_staged_recovery_write_action(self, tab_id, previous, snapshot, decision_lock, attempt_state, rev_holder, wrote_holder)
+        return studio_agent_staging.make_staged_recovery_write_action(self, tab_id, previous, snapshot, decision_lock, attempt_state, rev_holder, wrote_holder, stage_atomic_json_fn=stage_atomic_json, atomic_json_fn=atomic_json, atomic_write_fn=atomic_write, exact_write_aborted_cls=ExactWriteAborted)
 
     def _stage_inactive_patch_tab_sync(self, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool) -> dict:
-        return studio_agent_staging.stage_inactive_patch_tab_sync(self, tab_id, previous, edited, operation_results, changed)
+        return studio_agent_staging.stage_inactive_patch_tab_sync(self, tab_id, previous, edited, operation_results, changed, stage_atomic_json_fn=stage_atomic_json, atomic_json_fn=atomic_json, atomic_write_fn=atomic_write, exact_write_aborted_cls=ExactWriteAborted, snapshot_tab_state_fn=_snapshot_tab_state, bound_agent_edits_fn=Studio._bound_agent_edits)
 
     def _stage_inactive_patch_tab_async(
         self,
@@ -5121,7 +5121,7 @@ class Studio(QObject):
         register_cancel=None,
         is_cancelled=None,
     ) -> None:
-        studio_agent_staging.stage_inactive_patch_tab_async(self, args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled)
+        studio_agent_staging.stage_inactive_patch_tab_async(self, args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled, stage_atomic_json_fn=stage_atomic_json, atomic_json_fn=atomic_json, atomic_write_fn=atomic_write, exact_write_aborted_cls=ExactWriteAborted, snapshot_tab_state_fn=_snapshot_tab_state, bound_agent_edits_fn=Studio._bound_agent_edits)
 
     def _agent_document_action(self, args):
         action = args.get("action")

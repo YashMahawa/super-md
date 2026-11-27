@@ -1,7 +1,7 @@
 """Focused unit tests for extracted desktop/studio_agent_staging.py behind the Studio facade."""
 from __future__ import annotations
 
-import hashlib, json, os, tempfile, threading, time, unittest
+import ast, contextlib, hashlib, json, os, tempfile, threading, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +42,65 @@ class StudioAgentStagingUnitTests(unittest.TestCase):
         studio.pool.shutdown(wait=True, cancel_futures=True)
         session.writes.shutdown(wait=True)
         self.app.processEvents()
+
+    def test_module_boundary_has_no_studio_lookup_sys_modules_or_import_error_and_honors_collaborator_patches(self):
+        tree = ast.parse(Path(studio_agent_staging.__file__).read_text(encoding="utf-8"), filename=studio_agent_staging.__file__)
+        self.assertFalse(hasattr(studio_agent_staging, "_studio_module"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                self.assertNotEqual(node.name, "_studio_module")
+            elif isinstance(node, ast.Name):
+                self.assertNotIn(node.id, {"_studio_module", "ImportError", "sys"})
+            elif isinstance(node, ast.Attribute):
+                self.assertNotEqual(node.attr, "_studio_module")
+                self.assertFalse(isinstance(node.value, ast.Name) and node.value.id == "sys")
+            elif isinstance(node, ast.Import):
+                self.assertTrue(all(a.name not in {"sys", "studio", "desktop.studio"} for a in node.names))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertNotIn(node.module, {"sys", "studio", "desktop.studio"})
+                self.assertTrue(all(a.name != "studio" for a in node.names))
+            elif isinstance(node, ast.ExceptHandler) and node.type is not None:
+                self.assertNotIn("ImportError", ast.unparse(node.type))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            writes = LatestWriteExecutor()
+            try:
+                calls: list[str] = []
+                real_stage, real_json, real_write = studio_module.stage_atomic_json, studio_module.atomic_json, studio_module.atomic_write
+                base = {"assets": {}, "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "agent_staged": False, "agent_unreviewed": False, "agent_edits": []}
+                bg_tab = {"id": "t-bg", "name": "Bg.md", "path": "", "content": "# v0\n", "saved": "# v0\n", **base}
+                (root / "recovery.json").write_bytes(b'[{"id":"prior"}]')
+                proxy = SimpleNamespace(data=root, window_id="w-c", tabs=[bg_tab], active="t-a", retired=False, writes=writes, session=SimpleNamespace(drafts={}), settings={}, _agent_jump_tab_id="")
+
+                @contextlib.contextmanager
+                def unintercepted_stage(_target_path, *, abort_check=None):
+                    calls.append("stage_atomic_json")
+                    yield SimpleNamespace(intercepted=False, abort_check=abort_check)
+
+                def aborting_json(path, payload):
+                    calls.append("atomic_json")
+                    Path(path).write_text(json.dumps(payload), encoding="utf-8")
+                    bg_tab["content"] = "# concurrent edit\n"
+
+                with (
+                    patch.object(studio_module, "stage_atomic_json", side_effect=unintercepted_stage),
+                    patch.object(studio_module, "atomic_json", side_effect=aborting_json),
+                    patch.object(studio_module, "atomic_write", side_effect=lambda p, d: (calls.append("atomic_write"), real_write(p, d))[1]),
+                ):
+                    with self.assertRaisesRegex(ValueError, "Live tab revision changed"):
+                        Studio._stage_inactive_patch_tab_sync(proxy, "t-bg", "# v0\n", "# v1\n", [{"index": 0}], True)
+                self.assertEqual((calls, (root / "recovery.json").read_bytes()), (["stage_atomic_json", "atomic_json", "atomic_write"], b'[{"id":"prior"}]'))
+
+                bg_tab["content"], calls[:] = "# v0\n", []
+                with (
+                    patch.object(studio_module, "stage_atomic_json", wraps=lambda *a, **kw: (calls.append("stage"), real_stage(*a, **kw))[1]),
+                    patch.object(studio_module, "atomic_json", wraps=lambda *a, **kw: (calls.append("json"), real_json(*a, **kw))[1]),
+                ):
+                    res = Studio._stage_inactive_patch_tab_sync(proxy, "t-bg", "# v0\n", "# v1\n", [{"index": 0}], True)
+                self.assertEqual((calls, res["changed"], bg_tab["content"]), (["stage", "json"], True, "# v1\n"))
+            finally:
+                writes.shutdown(wait=True)
 
     def test_bound_agent_edits_enforces_60_step_and_2mb_caps_and_append_monotonic_seq(self):
         many = [{"seq": idx, "before": f"b{idx}", "after": f"a{idx}"} for idx in range(1, 75)]
@@ -240,7 +299,11 @@ class StudioAgentStagingUnitTests(unittest.TestCase):
                 self.assertEqual((studio.active, studio._agent_jump_tab_id), (act["id"], bg2["id"]))
                 self.assertTrue(bg1["agent_staged"] and bg1["agent_unreviewed"] and bg2["agent_staged"] and bg2["agent_unreviewed"])
                 self.assertEqual((bg1_file.read_text(encoding="utf-8"), bg2_file.read_text(encoding="utf-8")), ("# Bg1 v0\n", "# Bg2 v0\n"))
-                self.assertEqual(studio_agent_staging._studio_module(), studio_module)
+                stage_spy: list[str] = []
+                real_stage = studio_module.stage_atomic_json
+                with patch.object(studio_module, "stage_atomic_json", wraps=lambda *a, **kw: (stage_spy.append("stage"), real_stage(*a, **kw))[1]):
+                    studio._stage_inactive_patch_tab_sync(bg1["id"], "# Bg1 v1\n", "# Bg1 v2\n", [{"index": 0}], True)
+                self.assertEqual((stage_spy, bg1["content"]), (["stage"], "# Bg1 v2\n"))
             finally:
                 self.dispose(session, studio)
 

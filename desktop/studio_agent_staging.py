@@ -1,8 +1,17 @@
 """Agent connection/jump chrome state and inactive-tab draft staging & recovery helpers for Studio."""
 from __future__ import annotations
 
-import concurrent.futures, hashlib, json, sys, threading, uuid
+import concurrent.futures, copy, hashlib, json, threading, uuid
 from pathlib import Path
+
+if __package__:
+    from .agent_documents import apply_patch_operations_detailed
+    from .core.latest_writes import ExactWriteAborted
+    from .documents import atomic_json, atomic_write, stage_atomic_json
+else:
+    from agent_documents import apply_patch_operations_detailed
+    from core.latest_writes import ExactWriteAborted
+    from documents import atomic_json, atomic_write, stage_atomic_json
 
 MAX_AGENT_EDIT_STEPS = 60
 MAX_AGENT_EDIT_BYTES = 2_000_000
@@ -16,29 +25,35 @@ WINDOW_CLOSED_ERROR = "The target desktop window was closed"
 TAB_CLOSED_ERROR = "The requested live tab is no longer open"
 TAB_REVISION_ERROR = "Live tab revision changed; inspect it again before editing"
 
-def _studio_module():
-    if (mod := sys.modules.get("studio") or sys.modules.get("desktop.studio")) is not None:
-        return mod
-    if __package__:
-        from . import studio as mod  # type: ignore[no-redef]
-    else:
-        import studio as mod  # type: ignore[no-redef]
-    return mod
+def _ensure_attr(obj, name: str, factory):
+    if (val := getattr(obj, name, None)) is None:
+        val = factory()
+        setattr(obj, name, val)
+    return val
 
-def _call_own_or_fn(studio_obj, method_name: str, fallback_fn, *args, **kwargs):
+def _call_own(studio_obj, method_name: str, *args, fallback_fn, **fallback_kwargs):
     fn = getattr(studio_obj, method_name, None)
-    return fn(*args, **kwargs) if callable(fn) else fallback_fn(studio_obj, *args, **kwargs)
+    return fn(*args) if callable(fn) else fallback_fn(studio_obj, *args, **fallback_kwargs)
+
+def _snapshot_tab_fallback(tab: dict, *, include_view_state: bool = True) -> dict:
+    return {
+        k: (dict(v) if k in ("assets", "saved_assets") and isinstance(v, dict) else (v if isinstance(v, (str, int, float, bool)) or v is None else copy.deepcopy(v)))
+        for k, v in tab.items() if include_view_state or k != "viewState"
+    }
 
 def _is_tab_dirty(studio_obj, tab: dict) -> bool:
-    checker = getattr(studio_obj, "_is_dirty", None)
-    return bool(checker(tab)) if callable(checker) else bool(_studio_module().Studio._is_dirty(studio_obj, tab))
+    if callable(checker := getattr(studio_obj, "_is_dirty", None)):
+        return bool(checker(tab))
+    if tab.get("content") != tab.get("saved") or tab.get("assets_dirty"):
+        return True
+    return bool(tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {}))
 
-def _window_recovery_drafts(studio_obj, tabs=None) -> list[dict]:
+def _window_recovery_drafts(studio_obj, tabs=None, *, snapshot_tab_state_fn=_snapshot_tab_fallback) -> list[dict]:
     if callable(fn := getattr(studio_obj, "_window_recovery_drafts", None)):
         return fn() if tabs is None else fn(tabs)
-    mod, source_tabs = _studio_module(), (getattr(studio_obj, "tabs", ()) if tabs is None else tabs)
+    source_tabs = getattr(studio_obj, "tabs", ()) if tabs is None else tabs
     return [
-        mod._snapshot_tab_state(t, include_view_state=False) for t in source_tabs
+        snapshot_tab_state_fn(t, include_view_state=False) for t in source_tabs
         if (_is_tab_dirty(studio_obj, t) or t.get("agent_staged") or t.get("agent_unreviewed"))
         and (t.get("path") or t.get("content", "").strip() or t.get("assets") or t.get("agent_staged") or t.get("agent_unreviewed"))
     ]
@@ -46,9 +61,15 @@ def _window_recovery_drafts(studio_obj, tabs=None) -> list[dict]:
 def _combined_recovery_drafts(studio_obj, window_drafts: list[dict]) -> list[dict]:
     if callable(fn := getattr(studio_obj, "_combined_recovery_drafts", None)):
         return fn(window_drafts)
-    if not isinstance(getattr(getattr(studio_obj, "session", None), "drafts", None), dict):
+    if not isinstance(drafts_map := getattr(getattr(studio_obj, "session", None), "drafts", None), dict):
         return list(window_drafts)
-    return _studio_module().Studio._combined_recovery_drafts(studio_obj, window_drafts)
+    wid, combined, replaced = getattr(studio_obj, "window_id", "main"), [], False
+    for k, tabs in drafts_map.items():
+        combined.extend(window_drafts if k == wid else tabs)
+        replaced = replaced or k == wid
+    if not replaced:
+        combined.extend(window_drafts)
+    return combined
 
 def _is_window_closed(studio_obj) -> bool:
     return bool(getattr(studio_obj, "retired", False) or getattr(getattr(studio_obj, "writes", None), "_shutdown", False))
@@ -98,23 +119,31 @@ def _verify_stage_target_tab(
         return None, _revision_conflict_message(tab["content"], bridge_json=bridge_revision_json)
     return tab, None
 
-def _prepare_stage_attempt(studio_obj, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool, *, on_ready=None):
-    all_drafts, candidate_edits, next_seq = _call_own_or_fn(
-        studio_obj, "_build_staged_recovery_candidate", build_staged_recovery_candidate, tab_id, current_tab, previous, edited, changed
+def _prepare_stage_attempt(
+    studio_obj, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool, *,
+    on_ready=None, stage_atomic_json_fn=stage_atomic_json, atomic_json_fn=atomic_json,
+    atomic_write_fn=atomic_write, exact_write_aborted_cls=ExactWriteAborted,
+    snapshot_tab_state_fn=_snapshot_tab_fallback, bound_agent_edits_fn=None,
+):
+    all_drafts, candidate_edits, next_seq = _call_own(
+        studio_obj, "_build_staged_recovery_candidate", tab_id, current_tab, previous, edited, changed,
+        fallback_fn=build_staged_recovery_candidate, snapshot_tab_state_fn=snapshot_tab_state_fn, bound_agent_edits_fn=bound_agent_edits_fn,
     )
     decision_lock, attempt_state, rev_holder, wrote_holder = threading.Lock(), {"decided": False, "outcome": None}, [0], [False]
     if on_ready is not None and not on_ready(decision_lock, attempt_state):
         return None
-    write_action = _call_own_or_fn(
-        studio_obj, "_make_staged_recovery_write_action", make_staged_recovery_write_action,
-        tab_id, previous, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder,
+    write_action = _call_own(
+        studio_obj, "_make_staged_recovery_write_action", tab_id, previous, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder,
+        fallback_fn=make_staged_recovery_write_action, stage_atomic_json_fn=stage_atomic_json_fn,
+        atomic_json_fn=atomic_json_fn, atomic_write_fn=atomic_write_fn, exact_write_aborted_cls=exact_write_aborted_cls,
     )
     return candidate_edits, next_seq, decision_lock, attempt_state, rev_holder, wrote_holder, write_action
 
 def _evaluate_stage_attempt_outcome(
     studio_obj, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool,
     candidate_edits: list[dict], next_seq: int, status: str, rev: int, write_error, *,
-    attempt: int, max_attempts: int, any_wrote_candidate: bool, had_recovery_timer: bool, bridge_revision_json: bool,
+    attempt: int, max_attempts: int, any_wrote_candidate: bool, had_recovery_timer: bool,
+    bridge_revision_json: bool, snapshot_tab_state_fn=_snapshot_tab_fallback,
 ) -> tuple[str, dict | str | None]:
     now_tab, target_err = _verify_stage_target_tab(
         studio_obj, tab_id, previous, any_wrote_candidate=any_wrote_candidate, bridge_revision_json=bridge_revision_json
@@ -126,15 +155,14 @@ def _evaluate_stage_attempt_outcome(
         return "write_failed", getattr(studio_obj, "_RECOVERY_ERROR_FAILED", RECOVERY_ERROR_FAILED)
     writes = studio_obj.writes
     if status == "committed" and writes.committed_revision("recovery") == rev and writes.latest_revision("recovery") == rev:
-        return "committed", _call_own_or_fn(
-            studio_obj, "_commit_staged_patch_tab", commit_staged_patch_tab,
-            now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq,
+        return "committed", _call_own(
+            studio_obj, "_commit_staged_patch_tab", now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq,
+            fallback_fn=commit_staged_patch_tab, snapshot_tab_state_fn=snapshot_tab_state_fn,
         )
     if attempt + 1 < max_attempts:
         return "retry", None
     _rollback_staged_recovery(studio_obj, any_wrote_candidate=any_wrote_candidate, had_recovery_timer=had_recovery_timer)
     return "superseded", getattr(studio_obj, "_RECOVERY_ERROR_SUPERSEDED", RECOVERY_ERROR_SUPERSEDED)
-
 
 def bound_agent_edits(edits: list[dict]) -> list[dict]:
     bounded = list(edits[-MAX_AGENT_EDIT_STEPS:])
@@ -142,13 +170,11 @@ def bound_agent_edits(edits: list[dict]) -> list[dict]:
         bounded.pop(0)
     return bounded
 
-
-def append_agent_edit(studio_obj, tab: dict, before: str, after: str) -> None:
+def append_agent_edit(studio_obj, tab: dict, before: str, after: str, *, bound_agent_edits_fn=None) -> None:
     edits = list(tab.get("agent_edits") or [])
     studio_obj._agent_edit_seq = max(getattr(studio_obj, "_agent_edit_seq", 0), max((int(item.get("seq", 0)) for item in edits), default=0)) + 1
     edits.append({"seq": studio_obj._agent_edit_seq, "before": before, "after": after})
-    tab["agent_edits"] = getattr(studio_obj, "_bound_agent_edits", bound_agent_edits)(edits)
-
+    tab["agent_edits"] = (getattr(studio_obj, "_bound_agent_edits", None) or bound_agent_edits_fn or bound_agent_edits)(edits)
 
 def activate_tab_state(studio_obj, tab: dict | None) -> None:
     if tab is None:
@@ -160,7 +186,6 @@ def activate_tab_state(studio_obj, tab: dict | None) -> None:
         if getattr(studio_obj, "settings", {}).get("autosave") and tab.get("path") and _is_tab_dirty(studio_obj, tab) and not tab.get("conflict"):
             studio_obj.autosave_timer.start(900)
 
-
 def clear_agent_staging(studio_obj, tab: dict | None) -> None:
     if tab is None:
         return
@@ -168,7 +193,6 @@ def clear_agent_staging(studio_obj, tab: dict | None) -> None:
     tab["agent_unreviewed"] = False
     if getattr(studio_obj, "_agent_jump_tab_id", "") == tab.get("id"):
         studio_obj._agent_jump_tab_id = ""
-
 
 def agent_connection_snapshot(studio_obj) -> dict:
     bridge = getattr(getattr(studio_obj, "session", None), "agent_bridge", None)
@@ -187,7 +211,6 @@ def agent_connection_snapshot(studio_obj) -> dict:
         return {"visible": True, "state": "local", "label": "AI live", "detail": getattr(studio_obj, "agentAccessStatus", "")}
     return {"visible": False, "state": "off", "label": "", "detail": ""}
 
-
 def agent_jump_snapshot(studio_obj) -> dict | None:
     jump_id = getattr(studio_obj, "_agent_jump_tab_id", "")
     if not jump_id or jump_id == getattr(studio_obj, "active", ""):
@@ -195,17 +218,15 @@ def agent_jump_snapshot(studio_obj) -> dict | None:
     target = next((t for t in getattr(studio_obj, "tabs", ()) if t["id"] == jump_id), None)
     return None if target is None else {"id": target["id"], "name": target["name"]}
 
-
 def dismiss_agent_jump(studio_obj) -> None:
     if getattr(studio_obj, "_agent_jump_tab_id", ""):
         studio_obj._agent_jump_tab_id = ""
-        studio_obj._emit(False)
+        if callable(emit_fn := getattr(studio_obj, "_emit", None)):
+            emit_fn(False)
 
-
-def validate_and_compute_patch_tab(studio_obj, args, *, bridge_revision_json: bool = False):
+def validate_and_compute_patch_tab(studio_obj, args, *, bridge_revision_json: bool = False, apply_patch_fn=apply_patch_operations_detailed):
     tab_id = args.get("tabId")
-    tab = _find_open_tab(studio_obj, tab_id)
-    if tab is None:
+    if (tab := _find_open_tab(studio_obj, tab_id)) is None:
         raise ValueError(TAB_CLOSED_ERROR)
     if (staging_tabs := getattr(studio_obj, "_staging_tabs", None)) is not None and tab_id in staging_tabs:
         raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
@@ -220,29 +241,27 @@ def validate_and_compute_patch_tab(studio_obj, args, *, bridge_revision_json: bo
         raise ValueError("operations must contain at most 100 edits")
     if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > MAX_PATCH_PAYLOAD_BYTES:
         raise ValueError("Patch operations exceed the 64 KB limit")
-    if __package__:
-        from .agent_documents import apply_patch_operations_detailed
-    else:
-        from agent_documents import apply_patch_operations_detailed
-    edited, operation_results = apply_patch_operations_detailed(previous, operations)
+    edited, operation_results = apply_patch_fn(previous, operations)
     return tab, tab_id, previous, revision, edited, operation_results, edited != previous
 
-
-def build_staged_recovery_candidate(studio_obj, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool):
+def build_staged_recovery_candidate(
+    studio_obj, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool, *,
+    snapshot_tab_state_fn=_snapshot_tab_fallback, bound_agent_edits_fn=None,
+):
     existing_edits = list(current_tab.get("agent_edits") or [])
     if changed:
         next_seq = max(getattr(studio_obj, "_agent_edit_seq", 0), max((int(it.get("seq", 0)) for it in existing_edits if isinstance(it, dict)), default=0)) + 1
-        bound_fn = getattr(_studio_module().Studio, "_bound_agent_edits", bound_agent_edits)
+        bound_fn = getattr(studio_obj, "_bound_agent_edits", None) or bound_agent_edits_fn or bound_agent_edits
         candidate_edits = bound_fn(existing_edits + [{"seq": next_seq, "before": previous, "after": edited}])
         candidate_tab = {**current_tab, "content": edited, "agent_staged": True, "agent_unreviewed": True, "agent_edits": candidate_edits}
     else:
         next_seq, candidate_edits, candidate_tab = getattr(studio_obj, "_agent_edit_seq", 0), existing_edits, dict(current_tab)
     replaced_tabs = [candidate_tab if item["id"] == tab_id else item for item in studio_obj.tabs]
-    return _combined_recovery_drafts(studio_obj, _window_recovery_drafts(studio_obj, replaced_tabs)), candidate_edits, next_seq
-
+    return _combined_recovery_drafts(studio_obj, _window_recovery_drafts(studio_obj, replaced_tabs, snapshot_tab_state_fn=snapshot_tab_state_fn)), candidate_edits, next_seq
 
 def commit_staged_patch_tab(
-    studio_obj, current_tab: dict, tab_id: str, edited: str, operation_results: list, changed: bool, candidate_edits: list[dict], next_seq: int
+    studio_obj, current_tab: dict, tab_id: str, edited: str, operation_results: list, changed: bool,
+    candidate_edits: list[dict], next_seq: int, *, snapshot_tab_state_fn=_snapshot_tab_fallback,
 ) -> dict:
     is_active = getattr(studio_obj, "active", "") == tab_id
     if changed:
@@ -265,11 +284,11 @@ def commit_staged_patch_tab(
         studio_obj.message = ""
     window_id = getattr(studio_obj, "window_id", "main")
     if (session := getattr(studio_obj, "session", None)) is not None and isinstance(getattr(session, "drafts", None), dict):
-        session.drafts[window_id] = _window_recovery_drafts(studio_obj)
+        session.drafts[window_id] = _window_recovery_drafts(studio_obj, snapshot_tab_state_fn=snapshot_tab_state_fn)
     if callable(hook := getattr(studio_obj, "_recover" if (changed and is_active) else "_submit_startup_snapshot", None)):
         hook()
     if changed and callable(emit_fn := getattr(studio_obj, "_emit", None)):
-        if isinstance(studio_obj, _studio_module().Studio):
+        if callable(getattr(studio_obj, "_submit", None)):
             emit_fn(load=is_active)
         else:
             try:
@@ -282,10 +301,11 @@ def commit_staged_patch_tab(
         "operation_results": operation_results, "isDirty": edited != current_tab["saved"],
     }
 
-
 def make_staged_recovery_write_action(
     studio_obj, tab_id: str, previous: str, snapshot: list, decision_lock: threading.Lock,
-    attempt_state: dict, rev_holder: list[int], wrote_holder: list[bool],
+    attempt_state: dict, rev_holder: list[int], wrote_holder: list[bool], *,
+    stage_atomic_json_fn=stage_atomic_json, atomic_json_fn=atomic_json,
+    atomic_write_fn=atomic_write, exact_write_aborted_cls=ExactWriteAborted,
 ):
     recovery_path = Path(studio_obj.data) / "recovery.json"
 
@@ -295,23 +315,22 @@ def make_staged_recovery_write_action(
         live_tab = _find_open_tab(studio_obj, tab_id)
         return live_tab is None or live_tab["content"] != previous
 
-    def mark_aborted_locked(mod):
+    def mark_aborted_locked():
         if not attempt_state["decided"]:
             attempt_state["decided"], attempt_state["outcome"] = True, "aborted"
-        raise mod.ExactWriteAborted()
+        raise exact_write_aborted_cls()
 
     def should_abort() -> bool:
         with decision_lock:
             return should_abort_locked()
 
     def write_action() -> None:
-        mod = _studio_module()
         with decision_lock:
             if should_abort_locked():
-                mark_aborted_locked(mod)
+                mark_aborted_locked()
         prior_bytes = recovery_path.read_bytes() if recovery_path.exists() else None
-        with mod.stage_atomic_json(recovery_path, abort_check=should_abort) as staged:
-            mod.atomic_json(recovery_path, snapshot)
+        with stage_atomic_json_fn(recovery_path, abort_check=should_abort) as staged:
+            atomic_json_fn(recovery_path, snapshot)
             with decision_lock:
                 if should_abort_locked():
                     if staged.intercepted:
@@ -320,8 +339,8 @@ def make_staged_recovery_write_action(
                         if recovery_path.exists():
                             recovery_path.unlink()
                     else:
-                        mod.atomic_write(recovery_path, prior_bytes)
-                    mark_aborted_locked(mod)
+                        atomic_write_fn(recovery_path, prior_bytes)
+                    mark_aborted_locked()
                 if staged.intercepted:
                     staged.publish(recovery_path)
                 attempt_state["decided"], attempt_state["outcome"] = True, "published"
@@ -329,16 +348,18 @@ def make_staged_recovery_write_action(
 
     return write_action
 
-
-def stage_inactive_patch_tab_sync(studio_obj, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool) -> dict:
+def stage_inactive_patch_tab_sync(
+    studio_obj, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool, *,
+    stage_atomic_json_fn=stage_atomic_json, atomic_json_fn=atomic_json,
+    atomic_write_fn=atomic_write, exact_write_aborted_cls=ExactWriteAborted,
+    snapshot_tab_state_fn=_snapshot_tab_fallback, bound_agent_edits_fn=None,
+) -> dict:
     if _is_window_closed(studio_obj):
         raise ValueError(WINDOW_CLOSED_ERROR)
     max_attempts = max(1, int(getattr(studio_obj, "_max_agent_stage_attempts", 3)))
     timeout = float(getattr(studio_obj, "_agent_stage_sync_timeout", 10.0))
     had_recovery_timer, any_wrote_candidate = _pause_recovery_timer(studio_obj, False), False
-    staging_tabs = getattr(studio_obj, "_staging_tabs", None)
-    if staging_tabs is None:
-        staging_tabs = studio_obj._staging_tabs = set()
+    staging_tabs = _ensure_attr(studio_obj, "_staging_tabs", set)
     staging_tabs.add(tab_id)
     err_failed = getattr(studio_obj, "_RECOVERY_ERROR_FAILED", RECOVERY_ERROR_FAILED)
     try:
@@ -350,7 +371,10 @@ def stage_inactive_patch_tab_sync(studio_obj, tab_id: str, previous: str, edited
                 raise ValueError(target_err or TAB_CLOSED_ERROR)
             had_recovery_timer = _pause_recovery_timer(studio_obj, had_recovery_timer)
             candidate_edits, next_seq, decision_lock, attempt_state, rev_holder, wrote_holder, write_action = _prepare_stage_attempt(
-                studio_obj, tab_id, current_tab, previous, edited, changed
+                studio_obj, tab_id, current_tab, previous, edited, changed,
+                stage_atomic_json_fn=stage_atomic_json_fn, atomic_json_fn=atomic_json_fn,
+                atomic_write_fn=atomic_write_fn, exact_write_aborted_cls=exact_write_aborted_cls,
+                snapshot_tab_state_fn=snapshot_tab_state_fn, bound_agent_edits_fn=bound_agent_edits_fn,
             )
             rev, outcome = studio_obj.writes.submit_latest_exact(
                 "recovery", write_action, on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev)
@@ -370,7 +394,8 @@ def stage_inactive_patch_tab_sync(studio_obj, tab_id: str, previous: str, edited
             verdict, payload = _evaluate_stage_attempt_outcome(
                 studio_obj, tab_id, previous, edited, operation_results, changed, candidate_edits, next_seq,
                 status, rev, write_error, attempt=attempt, max_attempts=max_attempts,
-                any_wrote_candidate=any_wrote_candidate, had_recovery_timer=had_recovery_timer, bridge_revision_json=False,
+                any_wrote_candidate=any_wrote_candidate, had_recovery_timer=had_recovery_timer,
+                bridge_revision_json=False, snapshot_tab_state_fn=snapshot_tab_state_fn,
             )
             if verdict == "committed":
                 return payload  # type: ignore[return-value]
@@ -385,20 +410,27 @@ def stage_inactive_patch_tab_sync(studio_obj, tab_id: str, previous: str, edited
     finally:
         staging_tabs.discard(tab_id)
 
-
-def stage_inactive_patch_tab_async(studio_obj, args, on_complete, *, register_cancel=None, is_cancelled=None) -> None:
-    tab, tab_id, previous, revision, edited, operation_results, changed = _call_own_or_fn(
-        studio_obj, "_validate_and_compute_patch_tab", validate_and_compute_patch_tab, args, bridge_revision_json=True
+def stage_inactive_patch_tab_async(
+    studio_obj, args, on_complete, *, register_cancel=None, is_cancelled=None,
+    stage_atomic_json_fn=stage_atomic_json, atomic_json_fn=atomic_json,
+    atomic_write_fn=atomic_write, exact_write_aborted_cls=ExactWriteAborted,
+    snapshot_tab_state_fn=_snapshot_tab_fallback, bound_agent_edits_fn=None,
+) -> None:
+    validate_fn = getattr(studio_obj, "_validate_and_compute_patch_tab", None)
+    tab, tab_id, previous, revision, edited, operation_results, changed = (
+        validate_fn(args, bridge_revision_json=True) if callable(validate_fn)
+        else validate_and_compute_patch_tab(studio_obj, args, bridge_revision_json=True)
     )
     if _is_window_closed(studio_obj):
         raise ValueError(WINDOW_CLOSED_ERROR)
-    if tab_id == studio_obj.active:
+    if tab_id == getattr(studio_obj, "active", ""):
         on_complete(studio_obj._agent_document_action(args), None)
         return
     if not changed and not (_is_tab_dirty(studio_obj, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
         on_complete({
-            "tabId": tab_id, "windowId": studio_obj.window_id, "revision": revision, "sourceLength": len(edited),
-            "changed": False, "applied": len(operation_results), "operation_results": operation_results, "isDirty": False,
+            "tabId": tab_id, "windowId": getattr(studio_obj, "window_id", "main"), "revision": revision,
+            "sourceLength": len(edited), "changed": False, "applied": len(operation_results),
+            "operation_results": operation_results, "isDirty": False,
         }, None)
         return
 
@@ -408,7 +440,10 @@ def stage_inactive_patch_tab_async(studio_obj, args, on_complete, *, register_ca
     finished_flag = active_in_queue = had_recovery_timer = any_wrote_candidate = stage_cancelled = False
     stage_lock = threading.Lock()
     current_attempt: tuple[threading.Lock, dict] | None = None
-    studio_obj._staging_tabs.add(tab_id)
+    staging_tabs = _ensure_attr(studio_obj, "_staging_tabs", set)
+    staging_tabs.add(tab_id)
+    callback_lock = _ensure_attr(studio_obj, "_write_callback_lock", threading.Lock)
+    retirements = _ensure_attr(studio_obj, "_pending_write_retirements", dict)
 
     def is_stage_cancelled_locked() -> bool:
         return stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
@@ -418,11 +453,11 @@ def stage_inactive_patch_tab_async(studio_obj, args, on_complete, *, register_ca
         if finished_flag:
             return
         finished_flag = True
-        with studio_obj._write_callback_lock:
-            studio_obj._pending_write_retirements.pop(queue_token, None)
-        studio_obj._staging_tabs.discard(tab_id)
-        if active_in_queue:
-            studio_obj.session._advance_agent_stage_queue()
+        with callback_lock:
+            retirements.pop(queue_token, None)
+        staging_tabs.discard(tab_id)
+        if active_in_queue and callable(adv_fn := getattr(getattr(studio_obj, "session", None), "_advance_agent_stage_queue", None)):
+            adv_fn()
         on_complete(result, error)
 
     def finish_cancelled_on_ui(_result=None, _error=None):
@@ -455,16 +490,19 @@ def stage_inactive_patch_tab_async(studio_obj, args, on_complete, *, register_ca
             if not published:
                 stage_cancelled = True
         if not published:
-            try:
-                studio_obj.completed.emit((finish_cancelled_on_ui, None, None, False))
-            except RuntimeError:
-                pass
+            if (completed_sig := getattr(studio_obj, "completed", None)) is not None:
+                try:
+                    completed_sig.emit((finish_cancelled_on_ui, None, None, False))
+                except RuntimeError:
+                    pass
+            else:
+                finish_cancelled_on_ui()
         return published
 
     if callable(register_cancel):
         register_cancel(cancel_stage)
-    with studio_obj._write_callback_lock:
-        studio_obj._pending_write_retirements[queue_token] = lambda: finish_stage(None, WINDOW_CLOSED_ERROR)
+    with callback_lock:
+        retirements[queue_token] = lambda: finish_stage(None, WINDOW_CLOSED_ERROR)
 
     def run_attempt(attempt: int) -> None:
         nonlocal had_recovery_timer, any_wrote_candidate
@@ -477,7 +515,12 @@ def stage_inactive_patch_tab_async(studio_obj, args, on_complete, *, register_ca
             finish_stage(None, target_err or TAB_CLOSED_ERROR)
             return
         had_recovery_timer = _pause_recovery_timer(studio_obj, had_recovery_timer)
-        prepared = _prepare_stage_attempt(studio_obj, tab_id, current_tab, previous, edited, changed, on_ready=register_attempt_ready)
+        prepared = _prepare_stage_attempt(
+            studio_obj, tab_id, current_tab, previous, edited, changed, on_ready=register_attempt_ready,
+            stage_atomic_json_fn=stage_atomic_json_fn, atomic_json_fn=atomic_json_fn,
+            atomic_write_fn=atomic_write_fn, exact_write_aborted_cls=exact_write_aborted_cls,
+            snapshot_tab_state_fn=snapshot_tab_state_fn, bound_agent_edits_fn=bound_agent_edits_fn,
+        )
         if prepared is None:
             return
         candidate_edits, next_seq, _decision_lock, _attempt_state, rev_holder, wrote_holder, write_action = prepared
@@ -493,7 +536,8 @@ def stage_inactive_patch_tab_async(studio_obj, args, on_complete, *, register_ca
             verdict, payload = _evaluate_stage_attempt_outcome(
                 studio_obj, tab_id, previous, edited, operation_results, changed, candidate_edits, next_seq,
                 status, rev, write_error, attempt=attempt, max_attempts=max_attempts,
-                any_wrote_candidate=any_wrote_candidate, had_recovery_timer=had_recovery_timer, bridge_revision_json=True,
+                any_wrote_candidate=any_wrote_candidate, had_recovery_timer=had_recovery_timer,
+                bridge_revision_json=True, snapshot_tab_state_fn=snapshot_tab_state_fn,
             )
             if verdict == "committed":
                 finish_stage(payload, None)
@@ -502,20 +546,25 @@ def stage_inactive_patch_tab_async(studio_obj, args, on_complete, *, register_ca
             else:
                 finish_stage(None, str(payload))
 
-        studio_obj._submit_exact_recovery_write(
-            write_action, on_write_done,
-            on_retired=lambda: finish_stage(None, WINDOW_CLOSED_ERROR),
-            on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev),
-        )
+        on_enqueued = lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev)
+        if callable(submit_fn := getattr(studio_obj, "_submit_exact_recovery_write", None)):
+            submit_fn(write_action, on_write_done, on_retired=lambda: finish_stage(None, WINDOW_CLOSED_ERROR), on_enqueued=on_enqueued)
+        else:
+            studio_obj.writes.submit_latest_exact(
+                "recovery", write_action, None, lambda status, rev, err: on_write_done((status, rev, err), None), on_enqueued=on_enqueued
+            )
 
     def start_queued() -> bool:
         nonlocal active_in_queue
         if finished_flag or abort_if_cancelled():
             return False
-        with studio_obj._write_callback_lock:
-            studio_obj._pending_write_retirements.pop(queue_token, None)
+        with callback_lock:
+            retirements.pop(queue_token, None)
         active_in_queue = True
         run_attempt(0)
         return not finished_flag
 
-    studio_obj.session._enqueue_agent_stage(start_queued)
+    if callable(enqueue_fn := getattr(getattr(studio_obj, "session", None), "_enqueue_agent_stage", None)):
+        enqueue_fn(start_queued)
+    else:
+        start_queued()
