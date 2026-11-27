@@ -30,16 +30,14 @@ function getParsedFrontmatter(content: string): ParsedFrontmatter | null {
   return cachedFmResult;
 }
 const isFrontmatterPropertiesContainer = (el: Element): boolean => el.hasAttribute("data-frontmatter-properties") || el.classList.contains("document-properties");
-const isAllowedFrontmatterField = (el: Element): el is HTMLElement => {
-  const field = el.getAttribute("data-frontmatter-field");
-  return field === "title" || field === "author" || field === "tag";
-};
+const isAllowedFrontmatterField = (el: Element): el is HTMLElement => ["title", "author", "tag"].includes(el.getAttribute("data-frontmatter-field") ?? "");
+export const rangeStartElement = (r: Range | null): Element | null => r ? (r.startContainer.nodeType === Node.ELEMENT_NODE ? r.startContainer as Element : r.startContainer.parentElement) : null;
 
 function hasRelevantSearchMutation(records: MutationRecord[]): boolean {
   return records.some(r => {
     if (r.type !== "attributes" || r.attributeName !== "style") return true;
-    const style = (r.target as HTMLElement).style, nowHidden = Boolean(style && (style.display === "none" || style.visibility === "hidden"));
-    return nowHidden || Boolean(r.oldValue && /(?:none|hidden)/i.test(r.oldValue));
+    const s = (r.target as HTMLElement).style;
+    return Boolean(s && (s.display === "none" || s.visibility === "hidden")) || Boolean(r.oldValue && /(?:none|hidden)/i.test(r.oldValue));
   });
 }
 
@@ -63,11 +61,14 @@ function searchOptionKey(query: string, options: SearchMatchConfig): string {
   const { caseSensitive, wholeWord, regexp } = normalizeSearchOptions(options);
   return `${query}\0${caseSensitive ? 1 : 0}${wholeWord ? 1 : 0}${regexp ? 1 : 0}`;
 }
-
-function firstSourceRangeFrom(ranges: SourceRange[], minFrom: number, end = ranges.length): number {
+export function firstSourceRangeFrom(ranges: SourceRange[], minFrom: number, end = ranges.length): number {
   let lo = 0, hi = Math.min(end, ranges.length);
   while (lo < hi) { const mid = (lo + hi) >>> 1; if (ranges[mid].from < minFrom) lo = mid + 1; else hi = mid; }
   return lo;
+}
+export function findMatchingSourceRangeIndex(ranges: SourceRange[], target: SourceRange): number {
+  for (let i = firstSourceRangeFrom(ranges, target.from); i < ranges.length && ranges[i].from === target.from; i++) if (ranges[i].to === target.to) return i;
+  return ranges.findIndex(r => r.from === target.from && r.to === target.to);
 }
 
 function isHiddenOrExcludedSearchElement(el: Element): boolean {
@@ -210,8 +211,7 @@ function sourceBounds(el: Element, content?: string): { start: number; end: numb
 
 export function openDisclosuresFor(target: Element | null, scope?: Element | null, range?: Range | null, sourceRange?: SourceRange): boolean {
   let opened = false;
-  const startEl = range ? (range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement) : null;
-  for (const anchor of [startEl, target, scope]) {
+  for (const anchor of [rangeStartElement(range ?? null), target, scope]) {
     for (let owner = anchor?.closest("details") || null; owner; owner = owner.parentElement?.closest("details") || null) if (!owner.open) { owner.open = true; opened = true; }
   }
   const container = scope ?? target;
@@ -395,7 +395,7 @@ export function resolveSourceHighlightRange(host: Element, content: string, rang
   if (!target) return null;
   const { root, version } = getSearchDomVersion(host), key = searchOptionKey(query, options), cached = sourceHighlightCache.get(host);
   if (cached && cached.root === root && cached.version === version && cached.connected === host.isConnected && cached.content === content && cached.ranges === ranges && cached.activeIndex === activeIndex && cached.key === key) return cached.range;
-  const block = knownBlock ?? findContainingBlock(host, target, content);
+  const block = knownBlock !== undefined ? knownBlock : findContainingBlock(host, target, content);
   const range = block ? mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options) : mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
   if (!Number.isNaN(version)) sourceHighlightCache.set(host, { root, version, connected: host.isConnected, content, ranges, activeIndex, key, range });
   return range;
@@ -501,6 +501,25 @@ function visibleBlockSourceIndices(block: HTMLElement, content: string, sourceRa
   return indices;
 }
 
+export function insertDomRangeInOrder(ranges: Range[], target: Range): { ranges: Range[]; index: number } {
+  let index = ranges.findIndex(m => sameDomRange(m, target));
+  if (index >= 0) return { ranges, index };
+  const augmented = [...ranges], pos = augmented.findIndex(m => m.compareBoundaryPoints(Range.START_TO_START, target) > 0);
+  index = pos < 0 ? augmented.length : pos;
+  augmented.splice(index, 0, target);
+  return { ranges: augmented, index };
+}
+function findWindowedDomMatch(liveWindowed: WindowedMatch[], domRange: Range, query: string, options: SearchMatchConfig, scope?: Element): number {
+  let cachedEl: Element | null = null, cachedRanges: Range[] = [];
+  for (let i = 0; i < liveWindowed.length; i++) {
+    const w = liveWindowed[i];
+    if (!(scope ? (w.element === scope || w.element.contains(scope) || scope.contains(w.element)) : w.element.contains(domRange.startContainer))) continue;
+    if (cachedEl !== w.element) { cachedEl = w.element; cachedRanges = readingMatches(w.element, query, options); }
+    if (cachedRanges[w.ordinal] && sameDomRange(cachedRanges[w.ordinal], domRange)) return i;
+  }
+  return -1;
+}
+
 export function translateSourceIndexToRendered(host: Element | null, content: string, sourceRanges: SourceRange[], sourceIdx: number, query: string, options: SearchMatchConfig = false, knownWindowed?: WindowedMatch[] | null, knownMatches?: Range[]): number {
   const sr = sourceIdx >= 0 && host ? sourceRanges[sourceIdx] : undefined;
   if (!sr || !host) return -1;
@@ -508,19 +527,7 @@ export function translateSourceIndexToRendered(host: Element | null, content: st
   if (!block) {
     const fmResolved = mapFrontmatterSourceRangeToDomRange(host, content, sourceRanges, sourceIdx, query, options);
     if (!fmResolved) return -1;
-    if (liveWindowed) {
-      let cachedEl: Element | null = null, cachedRanges: Range[] = [];
-      for (let i = 0; i < liveWindowed.length; i++) {
-        const w = liveWindowed[i];
-        if (w.element.contains(fmResolved.startContainer)) {
-          if (cachedEl !== w.element) { cachedEl = w.element; cachedRanges = readingMatches(w.element, query, options); }
-          const wRange = cachedRanges[w.ordinal];
-          if (wRange && sameDomRange(wRange, fmResolved)) return i;
-        }
-      }
-      return -1;
-    }
-    return (knownMatches !== undefined ? knownMatches : readingMatches(host, query, options)).findIndex(m => sameDomRange(m, fmResolved));
+    return liveWindowed ? findWindowedDomMatch(liveWindowed, fmResolved, query, options) : (knownMatches !== undefined ? knownMatches : readingMatches(host, query, options)).findIndex(m => sameDomRange(m, fmResolved));
   }
   if (liveWindowed) {
     if (!liveWindowed.length) return -1;
@@ -528,21 +535,14 @@ export function translateSourceIndexToRendered(host: Element | null, content: st
     if (!block.closest('[data-windowed-mounted="false"]')) {
       const resolved = mapSourceRangeToDomRange(block, content, sourceRanges, sourceIdx, query, options);
       if (!resolved) return -1;
-      let cachedEl: Element | null = null, cachedRanges: Range[] = [];
-      for (let i = 0; i < liveWindowed.length; i++) {
-        const w = liveWindowed[i];
-        if (w.element === wBlock || w.element === block || w.element.contains(block) || block.contains(w.element)) {
-          if (cachedEl !== w.element) { cachedEl = w.element; cachedRanges = readingMatches(w.element, query, options); }
-          const wRange = cachedRanges[w.ordinal];
-          if (wRange && sameDomRange(wRange, resolved)) return i;
-        }
-      }
+      const mountedIdx = findWindowedDomMatch(liveWindowed, resolved, query, options, block);
+      if (mountedIdx >= 0) return mountedIdx;
     }
     const owner = deepestSourceOwner(block, sr, content);
     if (owner && !isDirectVisibleMatch(owner, content, sr)) return -1;
     const targetOrdinal = visibleBlockSourceIndices(wBlock, content, sourceRanges, sourceIdx).length;
     const exactIdx = liveWindowed.findIndex(w => w.element === wBlock && w.ordinal === targetOrdinal);
-    return exactIdx >= 0 ? exactIdx : liveWindowed.findIndex(w => { const b = sourceBounds(w.element, content); return b !== null && sr.from >= b.start && sr.to <= b.end; });
+    return exactIdx >= 0 ? exactIdx : liveWindowed.findIndex(w => { const wb = sourceBounds(w.element, content); return wb !== null && sr.from >= wb.start && sr.to <= wb.end && w.ordinal === targetOrdinal; });
   }
   const liveMatches = knownMatches !== undefined ? knownMatches : readingMatches(host, query, options);
   if (!liveMatches.length) return -1;

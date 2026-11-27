@@ -5,8 +5,8 @@ import {createRoot,type Root} from "react-dom/client";
 import {getSearchQuery} from "@codemirror/search";
 import {EditorView} from "@codemirror/view";
 import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
-import ReadingSearch,{nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceBlock,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
-import {syncSearchHighlights,translateRenderedIndexToSource,translateSourceIndexToRendered} from "./readingSearchDom";
+import ReadingSearch,{foldUnicodeForSearch,isValidSeedOccurrence,nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceBlock,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
+import {findMatchingSourceRangeIndex,insertDomRangeInOrder,rangeStartElement,syncSearchHighlights,translateRenderedIndexToSource,translateSourceIndexToRendered} from "./readingSearchDom";
 import Editor,{editorFindQuery} from "./components/Editor";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -847,6 +847,103 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
     // Named capture groups replace unknown $<missing> with "" (matching String.prototype.replace), while unnamed regexes preserve literal $<missing>.
     expect(replaceSourceMatches("foo bar","(?<w>foo)","[$<w>:$<missing>]",{regexp:true})).toBe("[foo:] bar");
     expect(replaceSourceMatches("foo bar","(foo)","[$1:$<missing>]",{regexp:true})).toBe("[foo:$<missing>] bar");
+  });
+
+  it("preserves Unicode case-folding seed validation, ordered DOM range insertion, and manual host scroll cancellation across extracted modules",async()=>{
+    expect(foldUnicodeForSearch("Straße İstanbul ﬁ ﬄ")).toBe("strasse i\u0307stanbul fi ffl");
+    const unicodeDoc="📓 Intro — Straße and İstanbul with ﬁnale.";
+    const strasseStart=unicodeDoc.indexOf("Straße");
+    const istanbulStart=unicodeDoc.indexOf("İstanbul");
+    expect(isValidSeedOccurrence(unicodeDoc,{from:strasseStart,to:strasseStart+6},"strasse",false,"Straße")).toBe(true);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:strasseStart,to:strasseStart+6},"strasse",true,"Straße")).toBe(false);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:istanbulStart,to:istanbulStart+8},"i\u0307stanbul",false,"İstanbul")).toBe(true);
+    // Reject split UTF-16 surrogate pairs on astral code points (`📓` occupies UTF-16 indices 0..2).
+    expect(isValidSeedOccurrence(unicodeDoc,{from:0,to:1},"📓",false)).toBe(false);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:1,to:8},"Intro",false)).toBe(false);
+    // Reject stale matchText or out-of-bounds offsets.
+    expect(isValidSeedOccurrence(unicodeDoc,{from:strasseStart,to:strasseStart+6},"strasse",false,"Strasse")).toBe(false);
+    expect(isValidSeedOccurrence(unicodeDoc,{from:0,to:unicodeDoc.length+2},"strasse",false)).toBe(false);
+
+    // Verify findMatchingSourceRangeIndex and insertDomRangeInOrder helper contracts.
+    const sampleRanges=[{from:2,to:5},{from:10,to:14},{from:10,to:16},{from:22,to:28}];
+    expect(findMatchingSourceRangeIndex(sampleRanges,{from:10,to:16})).toBe(2);
+    expect(findMatchingSourceRangeIndex(sampleRanges,{from:10,to:15})).toBe(-1);
+
+    const container=document.createElement("p");
+    container.textContent="alpha Strasse Straße omega";
+    const textNode=container.firstChild as Text;
+    const mkRange=(s:number,e:number)=>{const r=document.createRange();r.setStart(textNode,s);r.setEnd(textNode,e);return r;};
+    const rAlpha=mkRange(0,5),rStrasse=mkRange(14,20),rOmega=mkRange(21,26);
+    expect(rangeStartElement(rStrasse)).toBe(container);
+    const inserted=insertDomRangeInOrder([rAlpha,rOmega],rStrasse);
+    expect(inserted.index).toBe(1);
+    expect(inserted.ranges.map(r=>r.toString())).toEqual(["alpha","Straße","omega"]);
+    expect(insertDomRangeInOrder(inserted.ranges,mkRange(14,20)).index).toBe(1);
+
+    // Seeded offscreen Unicode-folded match keeps custom highlight across window changes and stops settling on manual host scroll (> 2px).
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+    let scrollHeight=6000,scrollTop=0;
+    const scrollCalls:Element[]=[];
+    Element.prototype.scrollIntoView=function(){
+      scrollCalls.push(this);
+      scrollTop=2400;
+    };
+
+    const host=document.createElement("div");
+    host.className="android-reading";
+    Object.defineProperty(host,"scrollHeight",{configurable:true,get:()=>scrollHeight});
+    Object.defineProperty(host,"scrollTop",{configurable:true,get:()=>scrollTop,set:(v:number)=>{scrollTop=v;}});
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","false");
+    s0.setAttribute("data-source-start","0");
+    s0.setAttribute("data-source-end",String(unicodeDoc.length));
+    s0.innerHTML='<span aria-hidden="true"></span>';
+    s0.addEventListener("supermd-reveal-window",()=>{
+      s0.setAttribute("data-windowed-mounted","true");
+      s0.innerHTML=`<p data-source-start="0" data-source-end="${unicodeDoc.length}">${unicodeDoc}</p>`;
+    });
+    const searchRootEl=document.createElement("div");
+    host.append(s0);
+    document.body.append(searchRootEl,host);
+    const cleanup=registerWindowedText(s0,unicodeDoc);
+
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{
+        content:unicodeDoc,
+        close:()=>{},
+        seed:{query:"strasse",caseSensitive:false,sourceStart:strasseStart,sourceEnd:strasseStart+6,matchText:"Straße",nonce:1},
+      }));
+    });
+    await act(async()=>{await new Promise(resolve=>setTimeout(resolve,40));});
+    expect(s0.getAttribute("data-windowed-mounted")).toBe("true");
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Straße");
+
+    // Window-change preserves customCurrentRangeRef on Unicode-folded occurrence.
+    await act(async()=>{
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("Straße");
+
+    // Manual scroll delta > 2px cancels active settle passes immediately.
+    scrollCalls.length=0;
+    scrollTop=2450;
+    await act(async()=>{
+      host.dispatchEvent(new Event("scroll"));
+      scrollHeight=5400;
+      host.dispatchEvent(new Event("supermd-window-change"));
+      await new Promise(resolve=>setTimeout(resolve,20));
+    });
+    expect(scrollCalls).toHaveLength(0);
+
+    cleanup();
+    act(()=>root.unmount());
   });
 });
 
