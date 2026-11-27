@@ -1,4 +1,4 @@
-"""Verify desktop CI test harness watchdog budgets across platforms and workflows."""
+"""Verify desktop CI test harness watchdog budgets across macOS architectures and workflows."""
 from __future__ import annotations
 
 import re
@@ -94,6 +94,11 @@ class RunTestsWatchdogTest(unittest.TestCase):
                 ci_minutes * 60,
                 watchdog,
                 f"ci.yml timeout-minutes ({ci_minutes}m = {ci_minutes * 60}s) must exceed {label} watchdog ({watchdog}s)",
+            )
+            self.assertGreater(
+                release_minutes * 60,
+                watchdog,
+                f"release.yml timeout-minutes ({release_minutes}m = {release_minutes * 60}s) must exceed {label} watchdog ({watchdog}s)",
             )
         self.assertGreater(
             release_minutes * 60,
