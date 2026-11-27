@@ -25,6 +25,7 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
 
 import Editor, { editorFindRange, editorSelectedText } from "./Editor";
 import LiveEditor from "./LiveEditor";
+import ReadingSearch from "./ReadingSearch";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
@@ -1677,8 +1678,14 @@ it("preserves UTF-8 BOM, CRLF body offsets, and existing source selection when e
   const area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
   expect(area.value).toBe("---\ntitle: Split Header\nauthor: Emmy Noether\n---");
 
-  // Clearing YAML in Split mode preserves UTF-8 BOM, downstream .live-block identity, and existing Editor source selection.
+  // Length-changing YAML edit and subsequent clear in Split mode both preserve UTF-8 BOM, downstream .live-block identity, and existing Editor source selection.
   const yamlSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+  await act(async () => {
+    yamlSetter.call(area, "---\ntitle: Expanded Split Header With Extra Metadata\nauthor: Emmy Noether\ntags: [algebra, physics]\n---");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(editorSelectedText(sessionId)).toBe(phrase);
+
   await act(async () => {
     yamlSetter.call(area, "");
     area.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1822,5 +1829,161 @@ it("toggles only the clicked nested task checkbox and keeps slider-containing ta
 
   await act(async () => root.unmount());
   host.remove();
+});
+
+it("integrates Live frontmatter Find/Replace metadata spans (#119) with equation-aware rendering, editing, and copy (#109)", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const origScroll = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = () => {};
+
+  let doc = [
+    "\uFEFF---",
+    "tags: [symmetries, mechanics]",
+    "author: Emmy Noether",
+    'title: "Variational Symmetries"',
+    "cssclasses: [symmetries]",
+    "---",
+    "",
+    "By \\eqref{eq:euler} and inline $\\ref{eq:euler}$, stationary action yields:",
+    "",
+    "$$",
+    "\\frac{d}{dt}\\frac{\\partial L}{\\partial \\dot{q}} - \\frac{\\partial L}{\\partial q} = 0 \\tag{1}\\label{eq:euler}",
+    "$$",
+  ].join("\r\n");
+
+  const setInputValue = (el: HTMLInputElement, value: string) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
+  const flushFrame = () =>
+    act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    });
+
+  let searchOpen = true;
+  const renderLiveWithSearch = () =>
+    root.render(
+      <div className="android-document">
+        {searchOpen && (
+          <ReadingSearch
+            content={doc}
+            close={() => {
+              searchOpen = false;
+              renderLiveWithSearch();
+            }}
+            onChange={(next) => {
+              doc = next;
+              renderLiveWithSearch();
+            }}
+          />
+        )}
+        <section className="android-reading">
+          <LiveEditor
+            markdown={doc}
+            documentPath="/notes/noether.md"
+            python=""
+            dark={false}
+            onChange={(next) => {
+              doc = next;
+              renderLiveWithSearch();
+            }}
+          />
+        </section>
+      </div>,
+    );
+
+  try {
+    await act(async () => { renderLiveWithSearch(); });
+    await flushFrame();
+
+    // #109 equation references resolve in both prose and inline math inside LiveEditor without opening a block editor on link click.
+    const proseEqLink = host.querySelector<HTMLAnchorElement>('a.equation-ref[href="#smd-eq-eq_3a_euler"]')!;
+    const inlineMathEqLink = host.querySelector<HTMLAnchorElement>('.math-inline-source a[href="#smd-eq-eq_3a_euler"]')!;
+    const eqAnchor = host.querySelector<HTMLElement>('#smd-eq-eq_3a_euler[data-math-source]')!;
+    expect(proseEqLink?.textContent).toBe("(1)");
+    expect(inlineMathEqLink?.textContent).toBe("1");
+    expect(eqAnchor).not.toBeNull();
+    act(() => { proseEqLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); });
+    expect(host.querySelector("textarea")).toBeNull();
+
+    // #119 Find in Live mode matches displayed title + tag (2 matches), skipping custom YAML cssclasses: [symmetries].
+    const findInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    await act(async () => { setInputValue(findInput, "symmetries"); });
+    await flushFrame();
+    expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+
+    // Step to visual match 2 (tag "symmetries", which appears first in raw CRLF YAML) and Replace in source -> updates only the tag at canonical offset, keeping BOM, CRLF, and cssclasses intact.
+    const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    await act(async () => { nextBtn.click(); });
+    await act(async () => { nextBtn.click(); });
+    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+    await act(async () => { replaceToggle.click(); });
+    await flushFrame();
+    expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const replaceBtn = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0]!;
+    await act(async () => { setInputValue(replaceInput, "invariants"); });
+    await act(async () => { replaceBtn.click(); });
+    await flushFrame();
+    expect(doc.startsWith("\uFEFF---\r\ntags: [invariants, mechanics]\r\n")).toBe(true);
+    expect(doc).toContain('title: "Variational Symmetries"\r\ncssclasses: [symmetries]\r\n---');
+
+    // Close Find bar, then double-click the #109 tagged equation block in LiveEditor -> opens raw $$...\tag...\label...$$ source cleanly and updates rendered prose + inline math references.
+    const closeFindBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Close search"]') ?? host.querySelector<HTMLButtonElement>(".reading-search button:last-of-type");
+    if (closeFindBtn) {
+      await act(async () => { closeFindBtn.click(); });
+    } else {
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      });
+    }
+    expect(searchOpen).toBe(false);
+
+    const updatedEqAnchor = host.querySelector<HTMLElement>('#smd-eq-eq_3a_euler[data-math-source]')!;
+    const eqBlock = updatedEqAnchor.closest<HTMLElement>(".live-block")!;
+    await act(async () => { eqBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    const mathArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+    expect(mathArea.value).toContain("\\tag{1}\\label{eq:euler}");
+    await act(async () => {
+      typeInTextarea(mathArea, mathArea.value.replace("\\tag{1}", "\\tag{EL}"));
+    });
+    expect(doc).toContain("\\tag{EL}\\label{eq:euler}");
+    await act(async () => {
+      mathArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(host.querySelector("textarea")).toBeNull();
+    expect(host.querySelector('a.equation-ref[href="#smd-eq-eq_3a_euler"]')?.textContent).toBe("(EL)");
+    expect(host.querySelector('.math-inline-source a[href="#smd-eq-eq_3a_euler"]')?.textContent).toBe("EL");
+
+    // Copying across LiveDocument excludes .live-frontmatter while restoring #109 \eqref, inline $\ref$, \tag{EL}, and \label{eq:euler}.
+    const liveRoot = host.querySelector<HTMLElement>(".live-document")!;
+    const sel = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(liveRoot);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    let copied = "";
+    const copyEvt = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copyEvt, "clipboardData", {
+      value: { setData: (_t: string, v: string) => { copied = v; } },
+    });
+    act(() => { liveRoot.dispatchEvent(copyEvt); });
+    sel.removeAllRanges();
+    expect(copyEvt.defaultPrevented).toBe(true);
+    expect(copied).not.toContain("Variational Symmetries");
+    expect(copied).not.toContain("cssclasses");
+    expect(copied).toContain("By \\eqref{eq:euler} and inline $\\ref{eq:euler}$, stationary action yields:");
+    expect(copied).toContain("\\tag{EL}\\label{eq:euler}");
+  } finally {
+    Element.prototype.scrollIntoView = origScroll;
+    await act(async () => root.unmount());
+    host.remove();
+  }
 });
 
