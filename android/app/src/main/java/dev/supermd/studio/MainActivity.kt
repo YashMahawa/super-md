@@ -127,15 +127,6 @@ private suspend fun View.awaitWindowFocus() {
 }
 
 class MainActivity : ComponentActivity() {
-    private data class AgentExportArtifact(
-        val uri: android.net.Uri,
-        val filename: String,
-        val format: String,
-        val mimeType: String,
-        val bytes: Long,
-        val sha256: String,
-        val createdAtMillis: Long,
-    )
     var dismissDocument: (() -> Unit)? = null
     var saveReaderPosition: (() -> Unit)? = null
     var openReaderFind: ((Boolean) -> Unit)? = null
@@ -148,15 +139,11 @@ class MainActivity : ComponentActivity() {
     @Volatile private var agentBridgeHandler: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = null
     @Volatile private var agentUiHandler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)? = null
     @Volatile private var agentExportHandler: ((JSONObject) -> Unit)? = null
-    private val agentExportJobs = java.util.concurrent.ConcurrentHashMap<String, JSONObject>()
-    private val agentExportArtifacts = java.util.concurrent.ConcurrentHashMap<String, AgentExportArtifact>()
-    private val pendingAgentReplies = java.util.concurrent.ConcurrentHashMap<String, (Any?, String?) -> Unit>()
-    private val pendingAgentReplyTimeouts = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
-    private val agentMainHandler = Handler(Looper.getMainLooper())
-    private val agentRelayClient: AgentRelayClient by lazy { AgentRelayClient { agentRelayState = it } }
-    private var relayIdentity: String? = null
+    private val agentController = AgentWindowController(this) { agentRelayState = it }
     private var workspaceKey = "main"
     internal val agentWorkspaceKey: String get() = workspaceKey
+    @androidx.annotation.VisibleForTesting
+    internal var activityResultRegistryOverride by mutableStateOf(defaultActivityResultRegistryOwnerForTest)
     private val model: StudioViewModel by viewModels { object : androidx.lifecycle.ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T = StudioViewModel(application, workspaceKey) as T
@@ -169,7 +156,16 @@ class MainActivity : ComponentActivity() {
         // Create this task's workspace before RESUMED/lifecycle consumers can
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
-        setContent { Studio(windowModel, this) }
+        setContent {
+            val registryOverride = activityResultRegistryOverride
+            if (registryOverride != null) {
+                CompositionLocalProvider(androidx.activity.compose.LocalActivityResultRegistryOwner provides registryOverride) {
+                    Studio(windowModel, this)
+                }
+            } else {
+                Studio(windowModel, this)
+            }
+        }
         val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
         if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
             handleExternalDocumentIntent(intent, savedInstanceState, initial = true, targetModel = windowModel)
@@ -222,240 +218,27 @@ class MainActivity : ComponentActivity() {
         model.retainDocumentAccess(uri)
         model.requestOpen(uri, relative)
     }
-    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); agentRelayClient.disconnect(); relayIdentity = null; pendingAgentReplies.clear(); pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks); pendingAgentReplyTimeouts.clear(); super.onStop() }
-    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal();model.reloadCustomTheme(); refreshAgentRelay() }
-    internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentAccessState.configForWorkspace(workspaceKey)
-    internal fun localAgentTabId(value: String): String? {
-        if (value.isBlank()) return null
-        if (!value.startsWith("tab:")) return value.takeIf { ':' !in it }
-        val parts = value.split(':')
-        if (parts.size != 4) return null
-        val config = agentConfigForThisWindow() ?: return null
-        if (parts[1] != config.deviceId || parts[2] != workspaceKey) return null
-        return parts[3].takeIf { it.matches(Regex("^[A-Za-z0-9_-]{1,128}$")) }
-    }
-    internal fun setAgentRequestHandlers(
-        bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)?,
-        ui: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?,
-    ) { agentBridgeHandler = bridge; agentUiHandler = ui }
+    override fun onStop() { saveReaderPosition?.invoke(); model.flush(); agentController.onStop(); super.onStop() }
+    override fun onResume() { super.onResume(); model.refreshMetadata(); model.refreshExternal(); model.reloadCustomTheme(); refreshAgentRelay() }
+    internal fun agentConfigForThisWindow(): AgentAccessConfig? = agentController.agentConfigForThisWindow()
+    internal fun localAgentTabId(value: String): String? = agentController.localAgentTabId(value)
+    internal fun setAgentRequestHandlers(bridge: ((JSONObject, (Any?, String?) -> Unit) -> Unit)?, ui: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?) { agentBridgeHandler = bridge; agentUiHandler = ui }
     internal fun setAgentUiHandler(handler: ((JSONObject, (Any?, String?) -> Unit) -> Boolean)?) { agentUiHandler = handler }
     internal fun setAgentExportHandler(handler: ((JSONObject) -> Unit)?) { agentExportHandler = handler }
-    internal fun requestAgentExport(args: JSONObject) {
-        val jobId = args.optString("requestId").takeIf { it.matches(Regex("^[a-zA-Z0-9_-]{1,96}$")) } ?: error("Invalid export job id")
-        check(args.optString("expectedRevision").matches(Regex("^[a-fA-F0-9]{64}$"))) { "Export requires the current document revision" }
-        if (agentExportJobs.size >= 128) {
-            agentExportJobs.entries.filter { it.value.optString("phase") in setOf("completed", "failed", "cancelled") }.take(64).forEach {
-                if (agentExportJobs.remove(it.key, it.value)) agentExportArtifacts.remove(it.key)
-            }
-        }
-        check(agentExportJobs.size < 128) { "Too many export jobs are being tracked; retry after checking earlier jobs" }
-        check(agentExportJobs.putIfAbsent(jobId, JSONObject().put("jobId", jobId).put("phase", "awaiting_destination")) == null) { "That export job id has already been used" }
-        val handler = agentExportHandler ?: run { agentExportJobs.remove(jobId); error("The Android export picker is unavailable") }
-        handler(args)
-    }
-    internal fun updateAgentExportJob(jobId: String, phase: String, error: String? = null) {
-        if (jobId.isNotBlank()) agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("phase", phase).apply { if (error != null) put("error", error.take(2048)) }
-    }
-    internal fun agentExportJob(jobId: String): JSONObject? = agentExportJobs[jobId]?.let { JSONObject(it.toString()) }
-    internal suspend fun completeAgentExport(jobId: String, uri: android.net.Uri, fallbackName: String, format: String) = withContext(Dispatchers.IO) {
-        require(agentExportJobs[jobId]?.optString("phase") in setOf("preparing", "saving")) { "This export job is not active in this app" }
-        require(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
-        val (bytes, digest) = fingerprintAgentExport(uri)
-        require(bytes > 0 || format == "md") { "The completed PDF or portable export is empty" }
-        require(bytes <= MAX_AGENT_EXPORT_BYTES) { "Agent downloads are limited to 128 MiB per export" }
-        val queriedName = runCatching {
-            contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-                if (cursor.moveToFirst()) cursor.getString(0) else null
-            }
-        }.getOrNull()
-        val rawName = queriedName?.takeIf { it.isNotBlank() } ?: fallbackName
-        val filename = rawName.substringAfterLast('/').substringAfterLast('\\')
-            .replace(Regex("[\\u0000-\\u001f\\u007f]"), "").take(256)
-        require(filename.isNotBlank()) { "Android did not provide a valid export filename" }
-        val mimeType = when (format) { "pdf" -> "application/pdf"; "smd" -> "application/vnd.supermd.smd"; "mdzip" -> "application/zip"; else -> "text/markdown" }
-        val artifact = AgentExportArtifact(uri, filename, format, mimeType, bytes, digest, System.currentTimeMillis())
-        agentExportArtifacts[jobId] = artifact
-        agentExportJobs[jobId] = JSONObject().put("jobId", jobId).put("status", "completed").put("phase", "completed")
-            .put("filename", filename).put("format", format).put("mimeType", mimeType).put("bytes", bytes)
-            .put("sha256", digest).put("downloadable", true)
-    }
-    internal suspend fun readAgentExportChunk(jobId: String, offset: Long, limit: Int): JSONObject = withContext(Dispatchers.IO) {
-        require(offset >= 0) { "Export chunk offset must be non-negative" }
-        require(limit in 1..524_288) { "Export chunk limit must be between 1 and 524288 bytes" }
-        require(agentExportJobs[jobId]?.optString("phase") == "completed") { "Only a completed export from this app can be downloaded" }
-        val artifact = agentExportArtifacts[jobId] ?: error("This export artifact is unavailable in this app session")
-        require(System.currentTimeMillis() - artifact.createdAtMillis <= AGENT_EXPORT_LEASE_MILLIS) { "The export download has expired; create a new export" }
-        require(offset <= artifact.bytes) { "Export chunk offset is beyond the end of the file" }
-        val remaining = artifact.bytes - offset
-        val size = minOf(limit.toLong(), remaining).toInt()
-        val body = ByteArray(size)
-        contentResolver.openInputStream(artifact.uri)?.use { input ->
-            var skipped = 0L
-            while (skipped < offset) {
-                val amount = input.skip(offset - skipped)
-                if (amount > 0) skipped += amount else {
-                    if (input.read() < 0) error("The completed export ended before the requested offset")
-                    skipped += 1
-                }
-            }
-            var read = 0
-            while (read < size) {
-                val amount = input.read(body, read, size - read)
-                if (amount < 0) error("The completed export changed while reading a chunk")
-                read += amount
-            }
-        } ?: error("Android cannot open the completed export")
-        val next = offset + size
-        JSONObject().put("jobId", jobId).put("filename", artifact.filename).put("format", artifact.format)
-            .put("mimeType", artifact.mimeType).put("bytes", artifact.bytes).put("sha256", artifact.sha256)
-            .put("offset", offset).put("nextOffset", if (next < artifact.bytes) next else JSONObject.NULL)
-            .put("body", android.util.Base64.encodeToString(body, android.util.Base64.NO_WRAP))
-    }
-    private fun fingerprintAgentExport(uri: android.net.Uri): Pair<Long, String> {
-        val digest = MessageDigest.getInstance("SHA-256")
-        var bytes = 0L
-        contentResolver.openInputStream(uri)?.use { input ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-                val count = input.read(buffer)
-                if (count < 0) break
-                bytes = Math.addExact(bytes, count.toLong())
-                digest.update(buffer, 0, count)
-            }
-        } ?: error("Android cannot open the completed export")
-        return bytes to digest.digest().joinToString("") { "%02x".format(it) }
-    }
-    internal fun revokeAgentAccess(completion: (serverRevoked: Boolean) -> Unit) {
-        val configs = agentAccessState.allConfigs()
-        agentAccessState.setEnabled(false)
-        agentRelayClient.disconnect()
-        relayIdentity = null
-        clearPendingAgentReplies()
-        if (configs.isEmpty()) { agentAccessState.revoke(); completion(true); return }
-        val remaining = java.util.concurrent.atomic.AtomicInteger(configs.size)
-        val allRevoked = java.util.concurrent.atomic.AtomicBoolean(true)
-        configs.forEach { config -> agentRelayClient.revokeDevice(config) { revoked ->
-            if (!revoked) allRevoked.set(false)
-            if (remaining.decrementAndGet() == 0) {
-                agentAccessState.revoke()
-                clearPendingAgentReplies()
-                completion(allRevoked.get())
-            }
-        } }
-    }
-    internal fun deliverAgentReply(requestId: String, result: Any?, error: String?) {
-        pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
-        pendingAgentReplies.remove(requestId)?.invoke(result, error)
-    }
-    internal fun captureAgentReply(requestId: String, callback: (Any?, String?) -> Unit) {
-        pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
-        pendingAgentReplies[requestId] = callback
-        val timeout = Runnable {
-            pendingAgentReplyTimeouts.remove(requestId)
-            pendingAgentReplies.remove(requestId)?.invoke(null, "The live reader did not finish this request before its deadline")
-        }
-        pendingAgentReplyTimeouts[requestId] = timeout
-        agentMainHandler.postDelayed(timeout, 18_000)
-    }
-    private fun clearPendingAgentReplies() {
-        pendingAgentReplies.clear()
-        pendingAgentReplyTimeouts.values.forEach(agentMainHandler::removeCallbacks)
-        pendingAgentReplyTimeouts.clear()
-    }
-    internal fun dispatchAgentRequest(web: WebView, request: JSONObject, reply: (Any?, String?) -> Unit) {
-        val requestId = request.optString("requestId")
-        if (requestId.isBlank() || requestId.length > 96) { reply(null, "Invalid request id"); return }
-        val payload = JSONObject(request.toString()).apply { remove("deviceId") }
-        captureAgentReply(requestId, reply)
-        val script = "window.supermdAgentRequest?.($payload,(result,error)=>window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},JSON.stringify(result??null),String(error||'')));true"
-        web.evaluateJavascript(script, null)
-    }
-    internal fun dispatchAgentCompute(web: WebView, request: JSONObject, reply: (Any?, String?) -> Unit) {
-        val requestId = request.optString("requestId")
-        if (requestId.isBlank() || requestId.length > 96) { reply(null, "Invalid request id"); return }
-        captureAgentReply(requestId, reply)
-        val payload = JSONObject(request.toString())
-        val callback = "(result,error)=>window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},JSON.stringify(result??null),String(error||''))"
-        val script = "if(window.supermdAgentCompute)window.supermdAgentCompute($payload,$callback);else window.SuperMD?.agentReply?.(${JSONObject.quote(requestId)},'null','The native document computation helper is unavailable');true"
-        web.evaluateJavascript(script, null)
-    }
-    internal fun agentRevision(value: String): String = MessageDigest.getInstance("SHA-256")
-        .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
-    internal fun agentSourceLength(value: String): Int = value.codePointCount(0, value.length)
-    internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject {
-        require(imageFormat in setOf("png", "jpeg")) { "Unsupported viewport image format" }
-        check(reader.width > 0 && reader.height > 0 && reader.isAttachedToWindow) { "The live reading viewport is unavailable" }
-        val context = kotlinx.coroutines.suspendCancellableCoroutine<JSONObject> { continuation ->
-            val requestId = "snapshot_context_${java.util.UUID.randomUUID()}"
-            val request = JSONObject().put("requestId", requestId).put("action", "get_context")
-            dispatchAgentRequest(reader, request) { result, error ->
-                if (!continuation.isActive) return@dispatchAgentRequest
-                val value = result as? JSONObject
-                if (error != null) continuation.resumeWith(Result.failure(IllegalStateException(error)))
-                else if (value == null) continuation.resumeWith(Result.failure(IllegalStateException("The reader returned no snapshot context")))
-                else continuation.resume(value)
-            }
-            continuation.invokeOnCancellation {
-                pendingAgentReplyTimeouts.remove(requestId)?.let(agentMainHandler::removeCallbacks)
-                pendingAgentReplies.remove(requestId)
-            }
-        }
-        val origin = IntArray(2)
-        reader.getLocationInWindow(origin)
-        val source = Rect(origin[0], origin[1], origin[0] + reader.width, origin[1] + reader.height)
-        val targetWidth = requestedWidth.coerceIn(320, 1600).coerceAtMost(source.width())
-        val targetHeight = (source.height().toDouble() * targetWidth / source.width()).toInt().coerceAtLeast(1)
-        val bitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
-        val status = kotlinx.coroutines.suspendCancellableCoroutine<Int> { continuation ->
-            PixelCopy.request(window, source, bitmap, { result ->
-                if (continuation.isActive) continuation.resume(result)
-            }, Handler(Looper.getMainLooper()))
-            continuation.invokeOnCancellation { bitmap.recycle() }
-        }
-        check(status == PixelCopy.SUCCESS) { "Android could not capture the reading viewport (PixelCopy status $status)" }
-        var encoded: ByteArray
-        var finalBitmap = bitmap
-        try {
-            while (true) {
-                val output = ByteArrayOutputStream()
-                val format = if (imageFormat == "jpeg") Bitmap.CompressFormat.JPEG else Bitmap.CompressFormat.PNG
-                val quality = if (imageFormat == "jpeg") 90 else 100
-                check(finalBitmap.compress(format, quality, output)) { "Could not encode the viewport image" }
-                encoded = output.toByteArray()
-                if (encoded.size <= 3_500_000 || finalBitmap.width <= 480) break
-                val next = Bitmap.createScaledBitmap(finalBitmap, (finalBitmap.width * .8f).toInt().coerceAtLeast(1), (finalBitmap.height * .8f).toInt().coerceAtLeast(1), true)
-                if (next !== finalBitmap && finalBitmap !== bitmap) finalBitmap.recycle()
-                finalBitmap = next
-            }
-            check(encoded.size <= 3_500_000) { "The reading viewport image exceeds the safe transfer limit" }
-            val note = model.state.value.active
-            val revision = context.optString("revision", agentRevision(note.content))
-            val mimeType = if (imageFormat == "jpeg") "image/jpeg" else "image/png"
-            return JSONObject().put("mime_type", mimeType).put("data", android.util.Base64.encodeToString(encoded, android.util.Base64.NO_WRAP))
-                .put("width", finalBitmap.width).put("height", finalBitmap.height).put("revision", revision)
-                .put("metadata", JSONObject().put("tabId", context.optString("tabId", "tab:${agentConfigForThisWindow()?.deviceId ?: "local"}:$workspaceKey:${note.id}"))
-                    .put("mode", context.optString("mode", model.state.value.mode)).put("zoom", context.optDouble("zoom", model.state.value.zoom.toDouble()))
-                    .put("reading", context.optJSONObject("reading") ?: JSONObject()).put("selection", context.optJSONObject("selection") ?: JSONObject()))
-        } finally { if (finalBitmap !== bitmap) finalBitmap.recycle(); bitmap.recycle() }
-    }
-    internal fun refreshAgentRelay() {
-        if (!agentAccessState.enabled) {
-            agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return
-        }
-        val config = agentConfigForThisWindow()
-        if (config == null) { agentRelayClient.disconnect(); relayIdentity = null; clearPendingAgentReplies(); return }
-        val identity = "${config.groupId}:${config.deviceId}"
-        if (identity == relayIdentity && agentRelayState != AgentRelayClient.State.DISCONNECTED) return
-        relayIdentity = identity
-        agentRelayClient.connect(config) { request, reply ->
-            val ui = agentUiHandler
-            if (ui?.invoke(request, reply) != true) {
-                val bridge = agentBridgeHandler
-                if (bridge == null) reply(null, "The live reader is not ready. Keep Super MD open on a note and retry.")
-                else bridge(request, reply)
-            }
-        }
-    }
+    internal fun requestAgentExport(args: JSONObject) = agentController.requestAgentExport(args, agentExportHandler)
+    internal fun updateAgentExportJob(jobId: String, phase: String, error: String? = null) = agentController.updateAgentExportJob(jobId, phase, error)
+    internal fun agentExportJob(jobId: String): JSONObject? = agentController.agentExportJob(jobId)
+    internal suspend fun completeAgentExport(jobId: String, uri: android.net.Uri, fallbackName: String, format: String) = agentController.completeAgentExport(jobId, uri, fallbackName, format)
+    internal suspend fun readAgentExportChunk(jobId: String, offset: Long, limit: Int): JSONObject = agentController.readAgentExportChunk(jobId, offset, limit)
+    internal fun revokeAgentAccess(completion: (serverRevoked: Boolean) -> Unit) = agentController.revokeAgentAccess(completion)
+    internal fun deliverAgentReply(requestId: String, result: Any?, error: String?) = agentController.deliverAgentReply(requestId, result, error)
+    internal fun captureAgentReply(requestId: String, callback: (Any?, String?) -> Unit) = agentController.captureAgentReply(requestId, callback)
+    internal fun dispatchAgentRequest(web: WebView, request: JSONObject, reply: (Any?, String?) -> Unit) = agentController.dispatchAgentRequest(web, request, reply)
+    internal fun dispatchAgentCompute(web: WebView, request: JSONObject, reply: (Any?, String?) -> Unit) = agentController.dispatchAgentCompute(web, request, reply)
+    internal fun agentRevision(value: String): String = agentController.agentRevision(value)
+    internal fun agentSourceLength(value: String): Int = agentController.agentSourceLength(value)
+    internal suspend fun captureAgentViewport(reader: WebView, requestedWidth: Int, imageFormat: String = "png"): JSONObject = agentController.captureAgentViewport(reader, requestedWidth, imageFormat, model)
+    internal fun refreshAgentRelay() = agentController.refreshAgentRelay(agentRelayState, { agentUiHandler }, { agentBridgeHandler })
     fun handleShortcut(event: android.view.KeyEvent): Boolean {
         if (event.action == android.view.KeyEvent.ACTION_DOWN) {
             if (canFormatEditor?.invoke() == true) {
@@ -527,6 +310,9 @@ class MainActivity : ComponentActivity() {
         private const val OPEN_DISPATCHER_SESSION = "open_dispatcher_session"
         private const val MAX_AGENT_EXPORT_BYTES = 128L * 1024 * 1024
         private const val AGENT_EXPORT_LEASE_MILLIS = 10L * 60 * 1000
+        @Volatile
+        @androidx.annotation.VisibleForTesting
+        internal var defaultActivityResultRegistryOwnerForTest: androidx.activity.result.ActivityResultRegistryOwner? = null
     }
     fun newWindow() {
         model.flush()
@@ -622,6 +408,7 @@ internal class ExternalDropDragController(
 
 internal fun shouldBlockNativeDrop(
     state: StudioState,
+    readerReady: Boolean = true,
     folderSearchVisible: Boolean = false,
     accessRequestOpen: Boolean = false,
     settingsOpen: Boolean = false,
@@ -631,12 +418,14 @@ internal fun shouldBlockNativeDrop(
     contentsShown: Boolean = false,
     drawerOpen: Boolean = false,
 ): Boolean =
-    !state.welcomed ||
+    !readerReady ||
+        !state.welcomed ||
         state.busy ||
         state.readerOverlay ||
         state.error != null ||
         folderSearchVisible ||
         accessRequestOpen ||
+        state.folderAccessPrompt != null ||
         state.pendingCloseNoteId != null ||
         state.pendingSaveConflictNoteId != null ||
         settingsOpen ||
@@ -795,7 +584,20 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
             else (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlush(noteId) ?: false
         }
-        onDispose { model.readerFlushRequester = null }
+        model.readerFlushStatusRequester = { noteId ->
+            val current = web
+            if (!readerReady || current == null) {
+                if (model.readerStateIsNativeAuthoritative(noteId)) ReaderFlushStatus.ACKNOWLEDGED
+                else ReaderFlushStatus.FAILED
+            } else {
+                (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)?.requestFlushStatus(noteId)
+                    ?: ReaderFlushStatus.FAILED
+            }
+        }
+        onDispose {
+            model.readerFlushRequester = null
+            model.readerFlushStatusRequester = null
+        }
     }
     DisposableEffect(activity, model, readerReady) {
         val handler = if (readerReady) {
@@ -1151,47 +953,19 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     val save = rememberLauncherForActivityResult(NoteDestination("text/markdown", model::noteLocation)) { uri -> if (uri != null) model.save(uri) else model.cancelSaveAs() }
     val portableSaveAs = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri -> if (uri != null) model.completePortableSaveAs(uri) else model.cancelSaveAs() }
     val folder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { it?.let { uri -> model.setFolder(uri) } }
+    var workspaceFolderPickerShowing by rememberSaveable { mutableStateOf(false) }
+    val workspaceFolderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        workspaceFolderPickerShowing = false
+        if (uri != null) model.grantWorkspaceFolderForLink(uri)
+        else model.dismissWorkspaceFolderPrompt()
+    }
     val pdf = rememberLauncherForActivityResult(NoteDestination("application/pdf", model::noteLocation)) { uri ->
         if (uri != null) { readerPdfOwnsProgress = true; model.setPdfDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdExport?.(${state.pdf})", null) ?: model.fail("The reader is not ready. Open the note again.") }
     }
     val portable = rememberLauncherForActivityResult(NoteDestination("application/vnd.supermd.smd", model::noteLocation)) { uri ->
         if (uri != null) { model.setPortableDestination(uri); model.busy(true); web?.evaluateJavascript("window.supermdPortable?.(false)", null) ?: model.fail("The reader is not ready") }
     }
-    var pendingAgentExport by remember { mutableStateOf<JSONObject?>(null) }
-    DisposableEffect(activity, model, state.active.name, state.pdf) {
-        activity.setAgentExportHandler { args ->
-            check(pendingAgentExport == null) { "Finish the current export before starting another" }
-            val safeArgs = JSONObject(args.toString())
-            pendingAgentExport = safeArgs
-            val jobId = args.optString("requestId")
-            val format = args.optString("format", "pdf")
-            check(format in setOf("pdf", "smd", "md", "mdzip")) { "Unsupported export format" }
-            val requestedName = args.optString("filename").takeIf { it.isNotBlank() }
-                ?: args.optString("id").takeIf { it.isNotBlank() } ?: noteStem(state.active.name).ifBlank { "Untitled" }
-            activity.updateAgentExportJob(jobId, "preparing")
-            model.busy(true)
-            scope.launch {
-                try {
-                    val pdfOptions = JSONObject(state.pdf)
-                    val provided = safeArgs.optJSONObject("options") ?: JSONObject()
-                    val archive = format == "mdzip" || (format == "md" && (safeArgs.optBoolean("archive", false) || provided.optBoolean("archive", false)))
-                    val effectiveFormat = if (archive) "mdzip" else format
-                    listOf("pageSize", "margin", "fontSize", "lineHeight", "paragraphSpacing", "fontFamily", "pageNumbers", "themed")
-                        .forEach { key -> if (provided.has(key)) pdfOptions.put(key, provided.get(key)) }
-                    val (uri, filename) = model.writeAgentExport(
-                        safeArgs.getString("content"), safeArgs.optJSONObject("assets") ?: JSONObject(),
-                        effectiveFormat, requestedName, pdfOptions.toString(), archive = archive,
-                    )
-                    activity.completeAgentExport(jobId, uri, filename, effectiveFormat)
-                    model.busy(false)
-                } catch (error: Exception) {
-                    activity.updateAgentExportJob(jobId, "failed", error.message ?: "Export failed")
-                    model.fail("Agent export failed: ${error.message}")
-                } finally { pendingAgentExport = null }
-            }
-        }
-        onDispose { activity.setAgentExportHandler(null) }
-    }
+    BindAgentExportHandler(activity = activity, model = model, activeNoteName = state.active.name, pdfOptionsJson = state.pdf)
     DisposableEffect(activity, open, save, model) {
         activity.setAgentUiHandler { request, reply ->
             if (request.optString("action") != "document_action") false
@@ -1273,18 +1047,34 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             }
         }
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
+        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
             if (!readerReady) readerNote[0] = null
             if (readerReady && state.active.id.isNotEmpty()) {
                 val note = state.active
+                val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
                 val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("portable", note.portable).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                if (pendingHeading != null) {
+                    payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
+                }
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 if (matchingSeed != null) {
-                    payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
+                    val seededJson = JSONObject()
+                        .put("query", matchingSeed.query)
+                        .put("caseSensitive", matchingSeed.caseSensitive)
+                        .put("nonce", matchingSeed.nonce)
+                    if (matchingSeed.sourceStart != null && matchingSeed.sourceEnd != null && matchingSeed.sourceStart >= 0 && matchingSeed.sourceEnd >= matchingSeed.sourceStart) {
+                        seededJson.put("sourceStart", matchingSeed.sourceStart)
+                        seededJson.put("sourceEnd", matchingSeed.sourceEnd)
+                        if (!matchingSeed.matchText.isNullOrEmpty()) {
+                            seededJson.put("matchText", matchingSeed.matchText)
+                        }
+                    }
+                    payload.put("seededFind", seededJson)
                 }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
                 if (matchingSeed != null) {
                     model.consumeSeededFind(matchingSeed.nonce)
                 }
@@ -1362,9 +1152,11 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
+                        val activeNeedsAccess = state.writeNeedsAccess(state.active.id) || model.documentWriteNeedsAccess(state.active.id)
                         StudioTopBar(
                             noteName = state.active.name,
-                            statusLabel = if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
+                            statusLabel = if (activeNeedsAccess) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
+                            onRestoreAccess = if (activeNeedsAccess) ({ model.requestWriteAccessIfBlocked(state.active.id, explicit = true) }) else null,
                             fullscreen = state.fullscreen,
                             wide = wide,
                             actualMode = actualMode,
@@ -1422,8 +1214,9 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 // The reading surface is edge-to-edge in BOTH chrome states.
                 // Only controls receive safe insets, not the document width.
                 val handleExternalDrop = rememberUpdatedState<(WebView, android.view.DragEvent) -> Unit> { reader, event ->
-                        if (shouldBlockNativeDrop(
+                    if (shouldBlockNativeDrop(
                             model.state.value,
+                            readerReady = readerReady,
                             folderSearchVisible = model.folderSearch.value.visible,
                             accessRequestOpen = !accessPickerShowing && model.documentAccessRequests.value != null,
                             settingsOpen = settings,
@@ -1448,9 +1241,9 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                         val x = event.x / currentDensity
                         val y = event.y / currentDensity
                         reader.evaluateJavascript("window.supermdCaptureInsertion?.($x,$y)", null)
-                        val job = model.importDropped(
+                        val job = model.handleExternalDrop(
                             uris = uris,
-                            id = id,
+                            activeNoteId = id,
                             dragReadPermissionGranted = permissions != null,
                         ) { images ->
                             if (web === reader && readerReady) {
@@ -1467,7 +1260,11 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     } else {
                         runCatching { permissions?.release() }
                         if ((event.clipData?.itemCount ?: 0) > 0) {
-                            model.importDropped(emptyList(), model.state.value.active.id, dragReadPermissionGranted = false) {}
+                            model.handleExternalDrop(
+                                uris = emptyList(),
+                                activeNoteId = model.state.value.active.id,
+                                dragReadPermissionGranted = false,
+                            ) {}
                         }
                     }
                 }
@@ -1653,6 +1450,27 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             } },
             confirmButton = { TextButton(onClick = { accessPickerShowing = true; accessPicker.launch(android.net.Uri.parse(request.uri)) }) { Text(if(request.assetSource == null) "Choose original file" else "Choose linked file") } },
             dismissButton = { TextButton(onClick = model::dismissDocumentAccess) { Text("Not now") } })
+    }
+    if (!workspaceFolderPickerShowing) state.folderAccessPrompt?.let { prompt ->
+        AlertDialog(
+            onDismissRequest = model::dismissWorkspaceFolderPrompt,
+            title = { Text("Allow folder access for note links") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(prompt.noteName, style = MaterialTheme.typography.titleSmall)
+                    Text("Super MD needs permission for the folder containing this note to open linked notes like \"${prompt.target}\". Your current note and edits remain untouched.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    workspaceFolderPickerShowing = true
+                    workspaceFolderPicker.launch(prompt.initialUri)
+                }) { Text("Choose folder") }
+            },
+            dismissButton = {
+                TextButton(onClick = model::dismissWorkspaceFolderPrompt) { Text("Not now") }
+            },
+        )
     }
     if (folderSearch.visible) {
         BackHandler { model.cancelWorkspaceSearch() }
@@ -1954,13 +1772,25 @@ internal fun buildHighlightedSnippet(
     onRename: () -> Unit,
     onSettings: () -> Unit,
     onFolderSearch: () -> Unit = {},
+    onRestoreAccess: (() -> Unit)? = null,
 ) {
     val palette = MaterialTheme.colorScheme
     TopAppBar(
         windowInsets = WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
         colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
         title = {
-            Column(Modifier.fillMaxWidth()) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .then(
+                        if (onRestoreAccess != null) {
+                            Modifier.heightIn(min = 48.dp).clickable(onClick = onRestoreAccess)
+                        } else {
+                            Modifier
+                        },
+                    ),
+                verticalArrangement = Arrangement.Center,
+            ) {
                 Text(noteName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
                 Text(statusLabel, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant)
             }
@@ -1971,9 +1801,6 @@ internal fun buildHighlightedSnippet(
             }
         },
         actions = {
-            if (wide && !fullscreen) {
-                IconButton(onClick = onFolderSearch, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_search), "Search across notes (Ctrl+Shift+F)") }
-            }
             StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
             IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
@@ -1984,7 +1811,6 @@ internal fun buildHighlightedSnippet(
             Box {
                 IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
-                    DropdownMenuItem(text = { Text("Search across notes") }, onClick = { onMenuExpandedChange(false); onFolderSearch() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                     DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = canReopenClosedTab, onClick = { onMenuExpandedChange(false); onReopenClosedTab() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
                     DropdownMenuItem(text = { Text("Save as") }, enabled = !busy, onClick = { onMenuExpandedChange(false); onSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
                     HorizontalDivider()
@@ -2162,17 +1988,6 @@ internal fun buildHighlightedSnippet(
     }
 }
 private fun hex(color: Color) = "#%06x".format(color.toArgb() and 0xffffff)
-internal class NoteDestination(private val mime: String, private val preferred: () -> String): ActivityResultContracts.CreateDocument(mime) {
-    override fun createIntent(context: android.content.Context, input: String): Intent {
-        val expected = NativeExportFormat.fromMime(mime)
-        val suggested = ExportFilename.suggestedName(input, expected)
-        val location = preferred().takeIf { it.isNotBlank() }?.let { tree ->
-            val uri=android.net.Uri.parse(tree)
-            android.provider.DocumentsContract.buildDocumentUriUsingTree(uri, android.provider.DocumentsContract.getTreeDocumentId(uri))
-        } ?: android.net.Uri.parse("content://com.android.externalstorage.documents/document/primary%3ADownload")
-        return super.createIntent(context,suggested).putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,location)
-    }
-}
 
 @Composable private fun Settings(state: StudioState, model: StudioViewModel, activity:MainActivity, noteLocation: String, section: String?, onSection: (String?)->Unit, chooseNoteLocation: ()->Unit, recoverDraft:()->Unit, importTheme:()->Unit, exportTheme:()->Unit, showThemeGuide:()->Unit, themeGuideReady:Boolean, importFont: ()->Unit) {
     val update by model.updates.state.collectAsStateWithLifecycle()
@@ -2571,7 +2386,7 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     SearchableChoice(label, selectedKey, summary, choices, "Search themes", "No matching themes", topPadding = 8.dp, change = change)
 }
 
-@Composable private fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+@Composable internal fun FontChoice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
     SearchableChoice(label, value, choices.find { it.first == value }?.second ?: value, choices, "Search fonts", "No matching fonts", change = change)
 }
 
@@ -2618,75 +2433,15 @@ internal class NoteDestination(private val mime: String, private val preferred: 
     }
 }
 
-@Composable private fun Choice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
+@Composable internal fun Choice(label: String, value: String, choices: List<Pair<String,String>>, change: (String) -> Unit) {
     Text(label, style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp, bottom = 6.dp))
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) { choices.forEach { (key, name) -> FilterChip(selected = value == key, onClick = { change(key) }, label = { Text(name) }) } }
 }
 
-@Composable private fun StudySlider(value: Float, valueRange: ClosedFloatingPointRange<Float>, onCommit: (Float) -> Unit) {
+@Composable internal fun StudySlider(value: Float, valueRange: ClosedFloatingPointRange<Float>, onCommit: (Float) -> Unit) {
     val slider = rememberSliderState(value = value, trackRange = valueRange)
     LaunchedEffect(value) { slider.value = value }
     // Material's gesture state handles every drag frame locally. Persisting
     // preferences and updating the document bridge happen once on release.
     Slider(state = slider, onValueChange = { slider.value = it }, onValueChangeFinished = { onCommit(slider.value) })
-}
-
-@Composable private fun PdfOptions(options: JSONObject, fonts: List<String> = emptyList(), update: (String, Any) -> Unit) {
-    Choice("Paper", options.optString("pageSize", "a4"), listOf("a3" to "A3","a4" to "A4", "a5" to "A5","a6" to "A6","iso-b4" to "B4 (ISO)","iso-b5" to "B5 (ISO)","iso-b6" to "B6 (ISO)", "letter" to "Letter", "legal" to "Legal","tabloid" to "Tabloid","executive" to "Executive")) { update("pageSize", it) }
-    FontChoice("Document font", options.optString("fontFamily", "Manrope"), (listOf("Manrope","Roboto","Noto Sans","Noto Serif","JetBrains Mono","Libertinus Serif","New Computer Modern","DejaVu Sans Mono")+fonts).distinct().map {it to it}) { update("fontFamily", it) }
-    Text("Margins · ${options.optDouble("margin",18.0).toInt()} mm", Modifier.padding(top = 16.dp)); StudySlider(value = options.optDouble("margin",18.0).toFloat(), onCommit = { update("margin", it.toInt()) }, valueRange = 4f..60f)
-    Text("Font size · ${"%.1f".format(options.optDouble("fontSize",10.0))} pt"); StudySlider(value = options.optDouble("fontSize",10.0).toFloat(), onCommit = { update("fontSize", (it * 2).toInt() / 2.0) }, valueRange = 5f..24f)
-    Text("Line spacing · ${"%.2f".format(options.optDouble("lineHeight",1.45))}"); StudySlider(value = options.optDouble("lineHeight",1.45).toFloat(), onCommit = { update("lineHeight", it.toDouble()) }, valueRange = .9f..2.2f)
-    Text("Paragraph spacing · ${"%.1f".format(options.optDouble("paragraphSpacing",1.2))}"); StudySlider(value = options.optDouble("paragraphSpacing",1.2).toFloat(), onCommit = { update("paragraphSpacing", it.toDouble()) }, valueRange = 0f..3f)
-    Row(verticalAlignment = Alignment.CenterVertically) { Text("Page numbers", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Switch(checked = options.optBoolean("pageNumbers",true), onCheckedChange = { update("pageNumbers", it) }) }
-    Row(verticalAlignment = Alignment.CenterVertically) {Text("Light Material theme", Modifier.weight(1f)); Switch(checked = options.optBoolean("themed",false), onCheckedChange = {update("themed", it)})}
-    Text("Off uses plain paper. On uses your accent with light surfaces, even in dark mode.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-}
-
-internal fun exportPrimaryActionLabel(format: String, sharing: Boolean): String = when {
-    sharing -> "Prepare & share"
-    format == "md" -> "Export Markdown"
-    format == "mdzip" -> "Export ZIP"
-    else -> "Choose destination & export"
-}
-
-@Composable internal fun ExportSettings(raw: String, onChange: (String) -> Unit, sharing: Boolean = false, fonts:List<String> = emptyList(), noteLocation: String = "", export: (String) -> Unit) {
-    var format by rememberSaveable { mutableStateOf("pdf") }
-    var options by remember(raw) { mutableStateOf(JSONObject(raw)) }
-    fun update(key: String, value: Any) { options = JSONObject(options.toString()).put(key, value); onChange(options.toString()) }
-    val directSaveCopy = if (noteLocation.isBlank()) "Saves directly to Downloads/Super MD." else "Saves directly to your configured note folder."
-    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.TopCenter) {
-        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth()) {
-            Column(Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp)) {
-                Text(if (sharing) "Share your note" else "Export your note", style = MaterialTheme.typography.headlineSmall)
-                val formats = listOf("pdf" to "PDF", "md" to "Markdown", "smd" to "Portable SMD", "mdzip" to "ZIP")
-                Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
-                    formats.chunked(2).forEach { row ->
-                        Row(Modifier.fillMaxWidth()) {
-                            row.forEach { (key, label) ->
-                                FilterChip(selected = format == key, onClick = { format = key }, label = { Text(label) }, modifier = Modifier.weight(1f).padding(horizontal = 4.dp, vertical = 2.dp).heightIn(min = 48.dp))
-                            }
-                        }
-                    }
-                }
-                if (format == "pdf") {
-                    Text("Vector equations, plots and real pagination. Typeset locally on this device.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(bottom = 12.dp))
-                    PdfOptions(options, fonts, ::update)
-                } else if (format == "mdzip") {
-                    Text("Obsidian-ready Markdown and images in one ZIP. Sliders become static figures; diagrams and charts become linked SVG images.", style = MaterialTheme.typography.bodyMedium)
-                    if (!sharing) Text(directSaveCopy, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
-                } else if (format == "md") {
-                    Text("SVGs and diagram sources are embedded in the Markdown. Images and GIFs keep readable relative filenames.", style = MaterialTheme.typography.bodyMedium)
-                    if (!sharing) Text(directSaveCopy, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp))
-                } else {
-                    Text("Your Markdown and images in one editable file.", style = MaterialTheme.typography.titleMedium)
-                    Text("Reopen it in Super MD to edit, drop in images, or select an image to replace or remove it. Source mode shows Markdown, never image bytes.", style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 12.dp))
-                }
-            }
-            Button(onClick = { export(format) }, shapes = ButtonDefaults.shapes(), modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp).heightIn(min = 48.dp)) {
-                Icon(painterResource(if (sharing) R.drawable.symbol_share else R.drawable.symbol_export), null)
-                Text(exportPrimaryActionLabel(format, sharing), Modifier.padding(start = 8.dp))
-            }
-        }
-    }
 }

@@ -6,22 +6,30 @@ import android.content.ClipDescription
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ProviderInfo
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.system.ErrnoException
+import android.system.OsConstants
+import android.system.StructStat
 import java.io.File
+import java.io.FileDescriptor
 import java.nio.file.Files
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import org.json.JSONArray
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -31,6 +39,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowContentResolver
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -50,7 +59,7 @@ class DropSafetyTest {
         val entries = ConcurrentHashMap<String, Entry>()
 
         private fun keyFor(uri: Uri): String? =
-            runCatching { android.provider.DocumentsContract.getDocumentId(uri) }
+            runCatching { DocumentsContract.getDocumentId(uri) }
                 .getOrNull()
                 ?.substringAfterLast('/')
                 ?: uri.lastPathSegment
@@ -76,9 +85,9 @@ class DropSafetyTest {
             if (entry != null) {
                 cursor.addRow(cols.map<String, Any?> { col ->
                     when (col) {
-                        OpenableColumns.DISPLAY_NAME, android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME -> entry.name
-                        OpenableColumns.SIZE, android.provider.DocumentsContract.Document.COLUMN_SIZE -> entry.bytes.size.toLong()
-                        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE -> entry.mime
+                        OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> entry.name
+                        OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> entry.bytes.size.toLong()
+                        DocumentsContract.Document.COLUMN_MIME_TYPE -> entry.mime
                         else -> null
                     }
                 }.toTypedArray())
@@ -102,6 +111,69 @@ class DropSafetyTest {
         override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
     }
 
+    class PipeStreamDropProvider : ContentProvider() {
+        data class StreamEntry(val name: String, val mime: String, val bytes: ByteArray)
+        val entries = ConcurrentHashMap<String, StreamEntry>()
+        val openCount = AtomicInteger(0)
+
+        fun attach(context: Context, authority: String) {
+            attachInfo(
+                context,
+                ProviderInfo().apply {
+                    this.authority = authority
+                    exported = true
+                    grantUriPermissions = true
+                },
+            )
+        }
+
+        override fun onCreate(): Boolean = true
+
+        override fun getType(uri: Uri): String? = entries[uri.lastPathSegment]?.mime
+
+        override fun query(
+            uri: Uri,
+            projection: Array<out String>?,
+            selection: String?,
+            selectionArgs: Array<out String>?,
+            sortOrder: String?,
+        ): Cursor {
+            val entry = entries[uri.lastPathSegment]
+            val cols = projection ?: arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)
+            return MatrixCursor(cols).apply {
+                if (entry != null) {
+                    addRow(cols.map<String, Any?> { col ->
+                        when (col) {
+                            OpenableColumns.DISPLAY_NAME, DocumentsContract.Document.COLUMN_DISPLAY_NAME -> entry.name
+                            OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_SIZE -> entry.bytes.size.toLong()
+                            DocumentsContract.Document.COLUMN_MIME_TYPE -> entry.mime
+                            else -> null
+                        }
+                    }.toTypedArray())
+                }
+            }
+        }
+
+        override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
+            openCount.incrementAndGet()
+            val entry = entries[uri.lastPathSegment] ?: throw java.io.FileNotFoundException(uri.toString())
+            val pipe = ParcelFileDescriptor.createPipe()
+            val readEnd = pipe[0]
+            val writeEnd = pipe[1]
+            Thread {
+                ParcelFileDescriptor.AutoCloseOutputStream(writeEnd).use { out ->
+                    out.write(entry.bytes)
+                    out.flush()
+                }
+            }.apply { isDaemon = true }.start()
+            return readEnd
+        }
+
+        override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+        override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+    }
+
     class EnforcingDropTestApplication(
         base: Application,
         private val grantedUris: MutableMap<Uri, Int>,
@@ -114,8 +186,8 @@ class DropSafetyTest {
             super.grantUriPermission(toPackage, uri, modeFlags)
             if (uri != null) {
                 val accessFlags = modeFlags and (
-                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                        android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                     )
                 grantedUris[uri] = (grantedUris[uri] ?: 0) or accessFlags
             }
@@ -134,7 +206,7 @@ class DropSafetyTest {
             val held = grantedUris.entries
                 .filter { (granted, _) ->
                     granted == uri ||
-                        (android.provider.DocumentsContract.isTreeUri(granted) && uri.toString().startsWith("$granted/"))
+                        (DocumentsContract.isTreeUri(granted) && uri.toString().startsWith("$granted/"))
                 }
                 .fold(0) { acc, (_, flags) -> acc or flags }
             return if ((held and modeFlags) == modeFlags) {
@@ -156,8 +228,9 @@ class DropSafetyTest {
     }
 
     @Before fun setUp() {
+        ExternalDocumentEntryGuard.fileSyscalls = AndroidOsFileSyscalls
         rawApp = RuntimeEnvironment.getApplication()
-        grantedUris = mutableMapOf()
+        grantedUris = ConcurrentHashMap()
         app = EnforcingDropTestApplication(rawApp, grantedUris)
         tempDir = Files.createTempDirectory("drop-safety-test").toFile()
         val info = ProviderInfo().apply {
@@ -174,11 +247,12 @@ class DropSafetyTest {
 
     private fun grantRead(vararg uris: Uri) {
         for (uri in uris) {
-            app.grantUriPermission(app.packageName, uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            app.grantUriPermission(app.packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
     }
 
     @After fun tearDown() {
+        ExternalDocumentEntryGuard.fileSyscalls = AndroidOsFileSyscalls
         tempDir.deleteRecursively()
         File(app.filesDir, "attachments").listFiles()?.forEach { it.delete() }
     }
@@ -245,6 +319,7 @@ class DropSafetyTest {
             welcomed = true,
         )
         assertFalse(shouldBlockNativeDrop(baseState))
+        assertTrue(shouldBlockNativeDrop(baseState, readerReady = false))
         assertTrue(shouldBlockNativeDrop(baseState.copy(welcomed = false)))
         assertTrue(shouldBlockNativeDrop(baseState.copy(readerOverlay = true)))
         assertTrue(shouldBlockNativeDrop(baseState.copy(busy = true)))
@@ -396,11 +471,11 @@ class DropSafetyTest {
         provider.entries["picked.svg"] = FakeDropProvider.Entry("picked.svg", "image/svg+xml", VALID_SVG_BYTES)
         provider.entries["exported-picker.png"] = FakeDropProvider.Entry("exported-picker.png", "image/png", VALID_PNG_BYTES)
         provider.entries["spoofed-picker.png"] = FakeDropProvider.Entry("spoofed-picker.png", "image/png", PDF_BYTES)
-        val grantedDropUri = android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "vault/drop.png")
-        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(AUTHORITY, "vault")
-        val treePickedUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/picked.svg")
+        val grantedDropUri = DocumentsContract.buildDocumentUri(AUTHORITY, "vault/drop.png")
+        val treeUri = DocumentsContract.buildTreeDocumentUri(AUTHORITY, "vault")
+        val treePickedUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/picked.svg")
         val exportedPickerUri = Uri.parse("content://$AUTHORITY/exported-picker.png")
-        val spoofedPickerUri = android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "vault/spoofed-picker.png")
+        val spoofedPickerUri = DocumentsContract.buildDocumentUri(AUTHORITY, "vault/spoofed-picker.png")
         val publicFile = File(tempDir, "ordinary-external.png").apply { writeBytes(VALID_PNG_BYTES) }
         val publicFileUri = Uri.fromFile(publicFile)
 
@@ -432,6 +507,17 @@ class DropSafetyTest {
         assertEquals(2, pickedImages!!.length())
         assertEquals("picked", pickedImages!!.getJSONObject(0).getString("alt"))
         assertEquals("exported-picker", pickedImages!!.getJSONObject(1).getString("alt"))
+
+        // Bare SAF folder tree URIs remain rejected on the picker path.
+        var bareTreePickerDone = false
+        var bareTreePickerResult: JSONArray? = JSONArray().put("sentinel")
+        model.importPickedImages(listOf(treeUri), activeId) { images ->
+            bareTreePickerResult = images
+            bareTreePickerDone = true
+        }
+        drainMain { bareTreePickerDone }
+        assertNull(bareTreePickerResult)
+        assertTrue(model.state.value.error?.contains("Unsupported image URI") == true)
 
         // Verify the same ungranted exported URI is still rejected on untrusted external drag-and-drop before opening bytes.
         val openBeforeDrop = provider.openCount
@@ -470,18 +556,18 @@ class DropSafetyTest {
         provider.entries["ungranted.png"] = FakeDropProvider.Entry("ungranted.png", "image/png", VALID_PNG_BYTES)
         provider.entries["allowed.png"] = FakeDropProvider.Entry("allowed.png", "image/png", VALID_PNG_BYTES)
 
-        val secretDocUri = android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "vault/secret.png")
-        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(AUTHORITY, "vault")
-        val treeContainedSecretUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/secret.png")
-        val ungrantedUri = android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "vault/ungranted.png")
-        val allowedUri = android.provider.DocumentsContract.buildDocumentUri(AUTHORITY, "vault/allowed.png")
+        val secretDocUri = DocumentsContract.buildDocumentUri(AUTHORITY, "vault/secret.png")
+        val treeUri = DocumentsContract.buildTreeDocumentUri(AUTHORITY, "vault")
+        val treeContainedSecretUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/secret.png")
+        val ungrantedUri = DocumentsContract.buildDocumentUri(AUTHORITY, "vault/ungranted.png")
+        val allowedUri = DocumentsContract.buildDocumentUri(AUTHORITY, "vault/allowed.png")
 
         // App already holds BOTH a direct grant on secretDocUri AND a persisted SAF folder grant on treeUri.
-        val folderFlags = android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
-            android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        val folderFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
         app.grantUriPermission(app.packageName, secretDocUri, folderFlags)
         app.grantUriPermission(app.packageName, treeUri, folderFlags)
-        app.contentResolver.takePersistableUriPermission(treeUri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        app.contentResolver.takePersistableUriPermission(treeUri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         grantRead(allowedUri)
 
         val model = StudioViewModel(app)
@@ -569,6 +655,9 @@ class DropSafetyTest {
         }
         val publicSymlinkToPrivate = File(tempDir, "innocent-symlink.png")
         Files.createSymbolicLink(publicSymlinkToPrivate.toPath(), privateFilesImg.toPath())
+        val publicDirSymlinkToPrivate = File(tempDir, "dir-link")
+        Files.createSymbolicLink(publicDirSymlinkToPrivate.toPath(), app.filesDir.toPath())
+        val viaPublicDirSymlink = File(publicDirSymlinkToPrivate, "private-attachment.png")
         val publicDirectory = File(tempDir, "folder.png").apply { mkdirs() }
 
         // Malicious external ContentProvider that grants read access to its own URI, but redirects openFile()
@@ -594,6 +683,7 @@ class DropSafetyTest {
             Uri.fromFile(privateCacheImg),
             Uri.fromFile(privatePrefsImg),
             Uri.fromFile(publicSymlinkToPrivate),
+            Uri.fromFile(viaPublicDirSymlink),
             Uri.fromFile(publicDirectory),
             Uri.parse("file:///data/data/${app.packageName}/files/private-attachment.png"),
             Uri.parse("file:///sdcard/android/DATA/${app.packageName}/files/private-attachment.png"),
@@ -621,8 +711,8 @@ class DropSafetyTest {
         val afterAttachments = File(app.filesDir, "attachments").listFiles()?.map { it.name }?.toSet().orEmpty()
         assertEquals(beforeAttachments, afterAttachments)
 
-        // Descriptor redirection and user-prefixed share URIs are also blocked on the picker path.
-        for (forbiddenPickerUri in listOf(redirectedUri, userPrefixedShareUri)) {
+        // Descriptor redirection, intermediate directory symlinks, and user-prefixed share URIs are also blocked on the picker path.
+        for (forbiddenPickerUri in listOf(redirectedUri, userPrefixedShareUri, Uri.fromFile(viaPublicDirSymlink))) {
             var pickerDone = false
             var pickerResult: JSONArray? = JSONArray().put("sentinel")
             model.importPickedImages(listOf(forbiddenPickerUri), noteId) { images ->
@@ -637,5 +727,207 @@ class DropSafetyTest {
         privateFilesImg.delete()
         privateCacheImg.delete()
         privatePrefsImg.delete()
+    }
+
+    @Test fun fileUrisOpenOnceViaSafeRegularFileHandleAndDefinitelyRejectUnconfirmedFstatOrFifo() {
+        val model = StudioViewModel(app)
+        drainMain()
+        val noteId = model.state.value.active.id
+
+        val privateSecret = File(app.filesDir, "swap-secret.png").apply { writeBytes(PDF_BYTES) }
+        val raceDropPng = File(tempDir, "race-drop.png").apply { writeBytes(VALID_PNG_BYTES) }
+        val racePickedPng = File(tempDir, "race-picked.png").apply { writeBytes(VALID_PNG_BYTES) }
+
+        val openCounter = AtomicInteger(0)
+        val closeCounter = AtomicInteger(0)
+        val preadCounter = AtomicInteger(0)
+        val swapAfterDescriptorVerified = ConcurrentHashMap<String, () -> Unit>()
+        swapAfterDescriptorVerified[raceDropPng.absolutePath] = {
+            raceDropPng.delete()
+            Files.createSymbolicLink(raceDropPng.toPath(), privateSecret.toPath())
+        }
+        swapAfterDescriptorVerified[racePickedPng.absolutePath] = {
+            racePickedPng.delete()
+            Files.createSymbolicLink(racePickedPng.toPath(), privateSecret.toPath())
+        }
+
+        ExternalDocumentEntryGuard.fileSyscalls = object : ExternalFileSyscalls by AndroidOsFileSyscalls {
+            override fun openReadOnlyNonBlockingNoFollow(path: String): FileDescriptor {
+                openCounter.incrementAndGet()
+                return AndroidOsFileSyscalls.openReadOnlyNonBlockingNoFollow(path)
+            }
+
+            override fun resolveDescriptorPath(fd: FileDescriptor): String? {
+                val resolved = AndroidOsFileSyscalls.resolveDescriptorPath(fd)
+                if (resolved != null) {
+                    swapAfterDescriptorVerified.remove(resolved)?.invoke()
+                }
+                return resolved
+            }
+
+            override fun pread(fd: FileDescriptor, buffer: ByteArray, offset: Int, length: Int, position: Long): Int {
+                preadCounter.incrementAndGet()
+                return AndroidOsFileSyscalls.pread(fd, buffer, offset, length, position)
+            }
+
+            override fun close(fd: FileDescriptor) {
+                closeCounter.incrementAndGet()
+                AndroidOsFileSyscalls.close(fd)
+            }
+        }
+
+        // 1. Dropped file: image opens ONCE and reads via pread on the exact verified descriptor even after path swap.
+        var droppedImages: JSONArray? = null
+        var dropDone = false
+        model.importDropped(listOf(Uri.fromFile(raceDropPng)), noteId, dragReadPermissionGranted = false) {
+            droppedImages = it
+            dropDone = true
+        }
+        drainMain { dropDone }
+        assertTrue(Files.isSymbolicLink(raceDropPng.toPath()))
+        assertTrue(preadCounter.get() > 0)
+        assertEquals(1, openCounter.get())
+        assertEquals(1, closeCounter.get())
+        assertNotNull(droppedImages)
+        assertEquals(1, droppedImages!!.length())
+
+        // 2. Picked file: image opens ONCE and reads via pread on the exact verified descriptor even after path swap.
+        openCounter.set(0)
+        closeCounter.set(0)
+        preadCounter.set(0)
+        var pickedImages: JSONArray? = null
+        var pickDone = false
+        model.importPickedImages(listOf(Uri.fromFile(racePickedPng)), noteId) {
+            pickedImages = it
+            pickDone = true
+        }
+        drainMain { pickDone }
+        assertTrue(Files.isSymbolicLink(racePickedPng.toPath()))
+        assertTrue(preadCounter.get() > 0)
+        assertEquals(1, openCounter.get())
+        assertEquals(1, closeCounter.get())
+        assertNotNull(pickedImages)
+        assertEquals(1, pickedImages!!.length())
+
+        // 3. Named pipe (FIFO) via file: URI is opened non-blockingly without hanging and rejected as non-regular.
+        val fifoImg = File(tempDir, "fifo-image.png")
+        if (ProcessBuilder("mkfifo", fifoImg.absolutePath).start().waitFor() == 0) {
+            ExternalDocumentEntryGuard.fileSyscalls = AndroidOsFileSyscalls
+            var fifoDropResult: JSONArray? = JSONArray().put("sentinel")
+            var fifoDropDone = false
+            model.importDropped(listOf(Uri.fromFile(fifoImg)), noteId, dragReadPermissionGranted = false) {
+                fifoDropResult = it
+                fifoDropDone = true
+            }
+            drainMain { fifoDropDone }
+            assertNull(fifoDropResult)
+            assertThrows(IllegalArgumentException::class.java) {
+                model.media.importUris(listOf(Uri.fromFile(fifoImg)))
+            }
+        }
+
+        // 4. Unconfirmed descriptor status (null StructStat, st_mode == 0, or ErrnoException on fstat) definitely rejects.
+        val candidatePng = File(tempDir, "unconfirmed.png").apply { writeBytes(VALID_PNG_BYTES) }
+        val unconfirmedStatModes: List<(FileDescriptor) -> StructStat?> = listOf(
+            { _ -> null },
+            { _ -> StructStat(0L, 0L, 0, 0L, 0, 0, 0L, 0L, 0L, 0L, 0L, 0L, 0L) },
+            { _ -> throw ErrnoException("fstat", OsConstants.EIO) },
+        )
+
+        for ((idx, fstatBehavior) in unconfirmedStatModes.withIndex()) {
+            val caseOpens = AtomicInteger(0)
+            val caseCloses = AtomicInteger(0)
+            ExternalDocumentEntryGuard.fileSyscalls = object : ExternalFileSyscalls by AndroidOsFileSyscalls {
+                override fun openReadOnlyNonBlockingNoFollow(path: String): FileDescriptor {
+                    caseOpens.incrementAndGet()
+                    return AndroidOsFileSyscalls.openReadOnlyNonBlockingNoFollow(path)
+                }
+
+                override fun fstat(fd: FileDescriptor): StructStat? = fstatBehavior(fd)
+
+                override fun close(fd: FileDescriptor) {
+                    caseCloses.incrementAndGet()
+                    AndroidOsFileSyscalls.close(fd)
+                }
+            }
+
+            val attachmentsBefore = File(app.filesDir, "attachments").listFiles()?.size ?: 0
+            var dropImgResult: JSONArray? = JSONArray().put("sentinel")
+            var dropImgDone = false
+            model.importDropped(listOf(Uri.fromFile(candidatePng)), noteId, dragReadPermissionGranted = false) {
+                dropImgResult = it
+                dropImgDone = true
+            }
+            drainMain { dropImgDone }
+            assertNull("Unconfirmed stat case $idx must reject dropped file URI", dropImgResult)
+            assertEquals(attachmentsBefore, File(app.filesDir, "attachments").listFiles()?.size ?: 0)
+
+            assertThrows(IllegalArgumentException::class.java) {
+                model.media.importUris(listOf(Uri.fromFile(candidatePng)))
+            }
+            assertEquals(attachmentsBefore, File(app.filesDir, "attachments").listFiles()?.size ?: 0)
+
+            val intentDecision = ExternalDocumentEntryGuard.validateIncomingIntent(
+                app,
+                Intent(Intent.ACTION_VIEW, Uri.fromFile(candidatePng)),
+            )
+            assertTrue("Unconfirmed stat case $idx must reject file intent", intentDecision is ExternalDocumentDecision.Rejected)
+            assertEquals("All opened descriptors in case $idx must be closed", caseOpens.get(), caseCloses.get())
+        }
+
+        privateSecret.delete()
+    }
+
+    @Test fun separatelyGrantedStreamedContentProvidersRemainWorkingAcrossImageDropsAndPicker() {
+        val streamAuthority = "dev.supermd.studio.test.streamdrops.${System.nanoTime()}"
+        val streamProvider = PipeStreamDropProvider().apply {
+            entries["photo.png"] = PipeStreamDropProvider.StreamEntry("photo.png", "image/png", VALID_PNG_BYTES)
+            entries["vector.svg"] = PipeStreamDropProvider.StreamEntry("vector.svg", "image/svg+xml", VALID_SVG_BYTES)
+            entries["ungranted.png"] = PipeStreamDropProvider.StreamEntry("ungranted.png", "image/png", VALID_PNG_BYTES)
+            attach(rawApp, streamAuthority)
+        }
+        ShadowContentResolver.registerProviderInternal(streamAuthority, streamProvider)
+
+        val pngUri = Uri.parse("content://$streamAuthority/photo.png")
+        val svgUri = Uri.parse("content://$streamAuthority/vector.svg")
+        val ungrantedStreamUri = Uri.parse("content://$streamAuthority/ungranted.png")
+        grantRead(pngUri, svgUri)
+
+        val model = StudioViewModel(app)
+        drainMain()
+        val activeId = model.state.value.active.id
+
+        // 1. Granted pipe-streamed content:// image drops succeed (descriptor stat is S_IFIFO).
+        var droppedImages: JSONArray? = null
+        model.importDropped(listOf(pngUri, svgUri), activeId, dragReadPermissionGranted = true) {
+            droppedImages = it
+        }
+        drainMain { droppedImages != null }
+        assertEquals(2, droppedImages!!.length())
+        assertEquals("photo", droppedImages!!.getJSONObject(0).getString("alt"))
+        assertEquals("vector", droppedImages!!.getJSONObject(1).getString("alt"))
+
+        // 2. User-granted picker imports succeed on pipe-streamed content:// providers (both granted and exported picker URIs).
+        var pickedImages: JSONArray? = null
+        model.importPickedImages(listOf(pngUri, ungrantedStreamUri), activeId) {
+            pickedImages = it
+        }
+        drainMain { pickedImages != null }
+        assertEquals(2, pickedImages!!.length())
+        assertEquals("photo", pickedImages!!.getJSONObject(0).getString("alt"))
+        assertEquals("ungranted", pickedImages!!.getJSONObject(1).getString("alt"))
+
+        // 3. Ungranted external drag drop to the same streamed provider is still rejected before opening bytes.
+        val openCountBefore = streamProvider.openCount.get()
+        var ungrantedDone = false
+        var ungrantedResult: JSONArray? = JSONArray().put("sentinel")
+        model.importDropped(listOf(ungrantedStreamUri), activeId, dragReadPermissionGranted = true) {
+            ungrantedResult = it
+            ungrantedDone = true
+        }
+        drainMain { ungrantedDone }
+        assertNull(ungrantedResult)
+        assertEquals(openCountBefore, streamProvider.openCount.get())
+        assertEquals(MediaStorage.UNGRANTED_DROP_IMAGE_MESSAGE, model.state.value.message)
     }
 }

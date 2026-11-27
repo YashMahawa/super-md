@@ -63,3 +63,80 @@ ApplicationWindow {
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             engine.deleteLater()
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    def test_mode_buttons_expose_configured_shortcut_hints_and_hide_disabled_bindings(self):
+        engine = QQmlEngine()
+        palette = ModePalette()
+        engine.rootContext().setContextProperty("studio", palette)
+        component = QQmlComponent(engine)
+        component.setData(b'''
+import QtQuick
+import QtQuick.Controls
+ApplicationWindow {
+    id: window
+    width: 520; height: 120; visible: true
+    property int contextMenuCount: 0
+    property int modalDialogCount: 0
+    property var shortcutLabels: ({
+        mode_live: "Ctrl+Alt+1",
+        mode_editor: "Ctrl+Alt+2",
+        mode_reader: "Disabled",
+        mode_split: "Ctrl+Alt+4"
+    })
+    function hintWithShortcut(label, key) {
+        const raw = window.shortcutLabels[key] || ""
+        return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
+    }
+    ModeGroup {
+        id: group
+        selected: "live"
+        choices: [
+            {key:"live", label:"Live", tooltip: window.hintWithShortcut("Live mode", "mode_live")},
+            {key:"editor", label:"Source", tooltip: window.hintWithShortcut("Source mode", "mode_editor")},
+            {key:"reader", label:"Read", tooltip: window.hintWithShortcut("Read mode", "mode_reader")},
+            {key:"split", label:"Split", tooltip: window.hintWithShortcut("Split mode", "mode_split")}
+        ]
+    }
+}
+''', QUrl.fromLocalFile(str(Path(__file__).parent / "qml/mode-hints-test.qml")))
+        window = component.create()
+        self.assertIsNotNone(window, str(component.errors()))
+        try:
+            QTest.qWait(30)
+            def find_visual(root, name):
+                pending = [root]
+                while pending:
+                    current = pending.pop()
+                    if current.objectName() == name:
+                        return current
+                    pending.extend(current.childItems())
+                return None
+
+            content = window.contentItem()
+            live_btn = find_visual(content, "modeButton_live")
+            editor_btn = find_visual(content, "modeButton_editor")
+            reader_btn = find_visual(content, "modeButton_reader")
+            split_btn = find_visual(content, "modeButton_split")
+            self.assertIsNotNone(live_btn)
+            self.assertEqual(live_btn.property("text"), "Live")
+            self.assertEqual(
+                live_btn.findChild(QObject, "actionHint").property("text"),
+                "Live mode (Ctrl+Alt+1)",
+            )
+            self.assertEqual(
+                editor_btn.findChild(QObject, "actionHint").property("text"),
+                "Source mode (Ctrl+Alt+2)",
+            )
+            self.assertEqual(
+                reader_btn.findChild(QObject, "actionHint").property("text"),
+                "Read mode",
+            )
+            self.assertEqual(
+                split_btn.findChild(QObject, "actionHint").property("text"),
+                "Split mode (Ctrl+Alt+4)",
+            )
+        finally:
+            window.close(); window.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)

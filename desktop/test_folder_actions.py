@@ -268,7 +268,16 @@ class FolderActionsDesktopTest(unittest.TestCase):
 
     def test_customizable_shortcuts_and_folder_sidebar_qml_preserve_search(self):
         shortcut_ids = {item["id"] for item in DEFINITIONS}
-        for required_id in ("new_folder_note", "new_subfolder", "rename_entry", "search_folder"):
+        for required_id in (
+            "new_folder_note",
+            "new_subfolder",
+            "rename_entry",
+            "search_folder",
+            "mode_live",
+            "mode_editor",
+            "mode_reader",
+            "mode_split",
+        ):
             self.assertIn(required_id, shortcut_ids)
             self.assertTrue(len(self.studio.shortcutSequences(required_id)) >= 1)
         self.assertNotIn("trash_entry", shortcut_ids)
@@ -296,7 +305,7 @@ ApplicationWindow {
     height: 620
     visible: true
     property var viewState: JSON.parse(studio.snapshot)
-    property var shortcutLabels: JSON.parse(studio.shortcutLabelsJson || "{}")
+    property var shortcutLabels: JSON.parse(studio.shortcutLabels || "{}")
     property int contextMenuCount: 0
     property int modalDialogCount: 0
     Material.theme: viewState.dark ? Material.Dark : Material.Light
@@ -327,6 +336,41 @@ ApplicationWindow {
         self.assertTrue(self.studio.folderSearchState["open"])
         self.studio.closeFolderSearch()
         self.assertFalse(self.studio.folderSearchState["open"])
+
+        # Customized and Disabled shortcut labels update FolderSidebar tooltips and menu items cleanly.
+        host_win.setProperty(
+            "shortcutLabels",
+            {
+                "search_folder": "Disabled",
+                "new_folder_note": "Ctrl+Alt+M",
+                "new_subfolder": "Disabled",
+                "rename_entry": "F2",
+            },
+        )
+        QTest.qWait(20)
+        new_item_btn = host_win.findChild(QObject, "headerNewItemButton")
+        new_subfolder_btn = host_win.findChild(QObject, "headerNewSubfolderButton")
+        open_folder_btn = host_win.findChild(QObject, "openFolderSidebarButton")
+        new_md_item = host_win.findChild(QObject, "headerNewMarkdownItem")
+        new_sub_item = host_win.findChild(QObject, "headerNewSubfolderItem")
+        switch_folder_item = host_win.findChild(QObject, "headerSwitchFolderItem")
+        menu_new_md = host_win.findChild(QObject, "menuNewMarkdown")
+        menu_new_sub = host_win.findChild(QObject, "menuNewSubfolder")
+        rename_item = host_win.findChild(QObject, "menuRenameEntry")
+        self.assertIsNone(new_subfolder_btn, "Duplicate subfolder button next to + should be removed")
+        self.assertIsNotNone(switch_folder_item)
+        self.assertFalse(open_folder_btn.property("visible"), "Open folder button should hide once a folder is open")
+        self.assertEqual(sidebar_search_btn.findChild(QObject, "actionHint").property("text"), "Search across notes")
+        self.assertEqual(new_item_btn.findChild(QObject, "actionHint").property("text"), "New note in folder (Ctrl+Alt+M)")
+        self.assertTrue(new_md_item.property("hasShortcutHint"))
+        self.assertEqual(new_md_item.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Alt+M")
+        self.assertFalse(new_sub_item.property("hasShortcutHint"))
+        self.assertTrue(menu_new_md.property("hasShortcutHint"))
+        self.assertEqual(menu_new_md.findChild(QObject, "menuShortcutHint").property("text"), "Ctrl+Alt+M")
+        self.assertFalse(menu_new_sub.property("hasShortcutHint"))
+        self.assertTrue(rename_item.property("hasShortcutHint"))
+        self.assertEqual(rename_item.findChild(QObject, "menuShortcutHint").property("text"), "F2")
+
         self.assertTrue(QMetaObject.invokeMethod(sidebar, "triggerNewFolderNote"))
         QTest.qWait(20)
         grabbed = host_win.grabWindow()
@@ -511,12 +555,14 @@ ApplicationWindow {
             filter_field = host_win.findChild(QObject, "folderFilterField")
             empty_state = host_win.findChild(QObject, "folderEmptyState")
             empty_label = host_win.findChild(QObject, "folderEmptyLabel")
-            self.assertIsNotNone(filter_field)
+            self.assertIsNone(filter_field, "FolderSidebar must not render redundant in-folder file search")
             self.assertIsNotNone(empty_state)
+            self.assertFalse(empty_state.property("visible"))
+            self.assertEqual(empty_label.property("text"), "No notes in this folder")
 
-            # Recursive filter searches collapsed Algebra subfolder without mutating expanded state
+            # Backend subfolder filter still works cleanly without mutating expanded state
             expanded_before = set(self._norm_list(restored_win.expanded))
-            filter_field.setProperty("text", "1.2")
+            restored_win.setFolderFilter("1.2")
             self._wait_for(
                 lambda: not restored_win._folder_searching
                 and not restored_win.filter_timer.isActive()
@@ -533,19 +579,8 @@ ApplicationWindow {
                 and [item["name"] for item in restored_win.files] == ["Courses", "Algebra", "1.2 Orthonormal Basis.txt"]
             )
 
-            # Zero-match query displays empty state in FolderSidebar
-            filter_field.setProperty("text", "no-such-note-xyz")
-            self._wait_for(
-                lambda: not restored_win._folder_searching
-                and not restored_win.filter_timer.isActive()
-                and restored_win.files == []
-            )
-            QTest.qWait(30)
-            self.assertTrue(empty_state.property("visible"))
-            self.assertEqual(empty_label.property("text"), "No matching notes found")
-
             # Clearing filter restores normal tree; renaming restored Courses -> Semesters updates startup.json
-            filter_field.setProperty("text", "")
+            restored_win.setFolderFilter("")
             self._wait_for(lambda: any(item["name"] == "Courses" for item in restored_win.files))
             restored_win.renameEntry(str(self.open_root / "Courses"), "Semesters")
             semesters_dir = self.open_root / "Semesters"

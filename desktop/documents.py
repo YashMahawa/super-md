@@ -20,7 +20,25 @@ MAX_TOTAL_IMAGES = 75_000_000
 MAX_ASSETS = 512
 GZIP_MAGIC = b"\x1f\x8b"
 PORTABLE_COMPRESSLEVEL = 3
-_SAFE_ASSET_NAME = re.compile(r"assets/[A-Za-z0-9._-]{1,150}")
+_SAFE_ASSET_FILENAME = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]{1,150}")
+_SAFE_COMPAT_ASSET_FILENAME = re.compile(r"(?!\.\.?\Z)[A-Za-z0-9._-]{1,159}")
+_SAFE_ASSET_NAME = re.compile(r"assets/(?!\.\.?\Z)[A-Za-z0-9._-]{1,159}")
+
+
+def is_valid_asset_filename(filename: str) -> bool:
+    return isinstance(filename, str) and _SAFE_ASSET_FILENAME.fullmatch(filename) is not None
+
+
+def is_valid_compat_asset_filename(filename: str) -> bool:
+    return isinstance(filename, str) and _SAFE_COMPAT_ASSET_FILENAME.fullmatch(filename) is not None
+
+
+def is_valid_new_asset_key(name: str) -> bool:
+    return isinstance(name, str) and name.startswith("assets/") and is_valid_asset_filename(name[7:])
+
+
+def is_valid_asset_key(name: str) -> bool:
+    return isinstance(name, str) and name.startswith("assets/") and is_valid_compat_asset_filename(name[7:])
 _MAX_CACHED_ASSETS = 512
 _MAX_CACHED_CHARS = 110_000_000
 _VALIDATED_LOCK = threading.Lock()
@@ -256,7 +274,7 @@ def validate_envelope(value: dict) -> None:
         raise ValueError("Portable note is too large or malformed")
     total = 0
     for name, data in value["assets"].items():
-        if not isinstance(name, str) or not _SAFE_ASSET_NAME.fullmatch(name) or name.rsplit("/", 1)[1] in (".", ".."):
+        if not is_valid_asset_key(name):
             raise ValueError("Unsafe asset name")
         mime, _, estimated = _parse_image_header(data)
         if MIMES.get(name.rsplit(".", 1)[-1].lower()) != mime:
@@ -310,56 +328,81 @@ def _gzip_json_input(path: Path, raw: bytes | None = None, hasher=None) -> bytea
             raise ValueError("SMD gzip stream contains trailing or concatenated data")
     return output
 
-def _write_gzip_json(target, value: dict) -> None:
+def _write_gzip_json(target, value: dict, *, _trusted_ascii_assets: bool = False) -> None:
     """Write deterministic gzip with an empty filename and fixed timestamp."""
-    with gzip.GzipFile(fileobj=target, mode="wb", filename="", mtime=0, compresslevel=PORTABLE_COMPRESSLEVEL) as compressed:
-        length = 0
+    compressor = zlib.compressobj(PORTABLE_COMPRESSLEVEL, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    header_buf = bytearray()
+    header_written = False
+    length = 0
 
-        def write_bytes(data: bytes) -> None:
-            nonlocal length
-            length += len(data)
-            if length > MAX_FILE:
-                raise ValueError("SMD JSON exceeds 120 MB")
-            compressed.write(data)
-
-        assets = value.get("assets")
-        if (list(value.keys()) == ["format", "version", "markdown", "assets"]
-                and isinstance(value["format"], str)
-                and isinstance(value["version"], int) and not isinstance(value["version"], bool)
-                and isinstance(value["markdown"], str)
-                and isinstance(assets, dict)):
-            head = (
-                '{"format":' + json.dumps(value["format"], ensure_ascii=False, separators=(",", ":"))
-                + ',"version":' + str(value["version"])
-                + ',"markdown":' + json.dumps(value["markdown"], ensure_ascii=False, separators=(",", ":"))
-                + ',"assets":{'
-            ).encode("utf-8")
-            write_bytes(head)
-            first = True
-            for name, data in assets.items():
-                if (isinstance(name, str) and _SAFE_ASSET_NAME.fullmatch(name)
-                        and _is_cached_validated_asset(data)):
-                    write_bytes((b"" if first else b",") + b'"' + name.encode("ascii") + b'":"')
-                    for offset in range(0, len(data), _B64_DECODE_CHUNK):
-                        write_bytes(data[offset:offset + _B64_DECODE_CHUNK].encode("ascii"))
-                    write_bytes(b'"')
-                else:
-                    entry = (
-                        ("" if first else ",")
-                        + json.dumps(name, ensure_ascii=False, separators=(",", ":"))
-                        + ":"
-                        + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-                    ).encode("utf-8")
-                    write_bytes(entry)
-                first = False
-            write_bytes(b"}}")
+    def emit(raw_chunk: bytes) -> None:
+        nonlocal header_written
+        if not raw_chunk:
             return
+        if not header_written:
+            header_buf.extend(raw_chunk)
+            if len(header_buf) < 10:
+                return
+            header_written = True
+            header_buf[4:8] = b"\x00\x00\x00\x00"
+            header_buf[9] = 255
+            target.write(bytes(header_buf))
+            header_buf.clear()
+            return
+        target.write(raw_chunk)
 
-        class BoundedTextWriter:
-            def write(self, text):
-                write_bytes(text.encode("utf-8"))
-                return len(text)
-        json.dump(value, BoundedTextWriter(), ensure_ascii=False, separators=(",", ":"))
+    def write_bytes(data: bytes) -> None:
+        nonlocal length
+        length += len(data)
+        if length > MAX_FILE:
+            raise ValueError("SMD JSON exceeds 120 MB")
+        emit(compressor.compress(data))
+
+    assets = value.get("assets")
+    if (list(value.keys()) == ["format", "version", "markdown", "assets"]
+            and isinstance(value["format"], str)
+            and isinstance(value["version"], int) and not isinstance(value["version"], bool)
+            and isinstance(value["markdown"], str)
+            and isinstance(assets, dict)):
+        head = (
+            '{"format":' + json.dumps(value["format"], ensure_ascii=False, separators=(",", ":"))
+            + ',"version":' + str(value["version"])
+            + ',"markdown":' + json.dumps(value["markdown"], ensure_ascii=False, separators=(",", ":"))
+            + ',"assets":{'
+        ).encode("utf-8")
+        write_bytes(head)
+        first = True
+        ascii_chunk = 1_048_576
+        for name, data in assets.items():
+            if (type(name) is str and type(data) is str
+                    and (_trusted_ascii_assets or (is_valid_asset_key(name) and _is_cached_validated_asset(data)))):
+                write_bytes((b"" if first else b",") + b'"' + name.encode("ascii") + b'":"')
+                end = len(data)
+                if end <= ascii_chunk:
+                    write_bytes(data.encode("ascii"))
+                else:
+                    for offset in range(0, end, ascii_chunk):
+                        write_bytes(data[offset:offset + ascii_chunk].encode("ascii"))
+                write_bytes(b'"')
+            else:
+                entry = (
+                    ("" if first else ",")
+                    + json.dumps(name, ensure_ascii=False, separators=(",", ":"))
+                    + ":"
+                    + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+                ).encode("utf-8")
+                write_bytes(entry)
+            first = False
+        write_bytes(b"}}")
+        emit(compressor.flush())
+        return
+
+    class BoundedTextWriter:
+        def write(self, text):
+            write_bytes(text.encode("utf-8"))
+            return len(text)
+    json.dump(value, BoundedTextWriter(), ensure_ascii=False, separators=(",", ":"))
+    emit(compressor.flush())
 
 def compressed_bundle(
     markdown: str,
@@ -370,7 +413,7 @@ def compressed_bundle(
     value = bundle(markdown, assets, validated_assets=validated_assets)
     import io
     output = io.BytesIO()
-    _write_gzip_json(output, value)
+    _write_gzip_json(output, value, _trusted_ascii_assets=True)
     data = output.getvalue()
     if len(data) > MAX_FILE:
         raise ValueError("Compressed SMD exceeds 120 MB")
@@ -387,14 +430,17 @@ def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
         return
     import time
     deadline = time.monotonic() + 1.0
+    delay = 0.005
     while True:
         try:
             os.replace(source, target)
             return
         except PermissionError as error:
-            if getattr(error, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+            remaining = deadline - time.monotonic()
+            if getattr(error, "winerror", None) not in (5, 32) or remaining <= 0:
                 raise
-            time.sleep(0.04)
+            time.sleep(min(delay, remaining))
+            delay = min(0.04, delay * 2)
 
 def write_portable(
     path: Path,
@@ -408,9 +454,14 @@ def write_portable(
     hasher = hashlib.sha256()
     handle, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(handle, "wb") as raw:
-            if path.exists() and hasattr(os, "fchmod"):
-                os.fchmod(raw.fileno(), stat.S_IMODE(path.stat().st_mode))
+        with os.fdopen(handle, "wb", buffering=_B64_DECODE_CHUNK) as raw:
+            if os.name != "nt" and hasattr(os, "fchmod"):
+                try:
+                    st_mode = path.stat().st_mode
+                except FileNotFoundError:
+                    pass
+                else:
+                    os.fchmod(raw.fileno(), stat.S_IMODE(st_mode))
 
             class _HashingWriter:
                 def write(self, data: bytes) -> int:
@@ -420,7 +471,7 @@ def write_portable(
                 def flush(self) -> None:
                     raw.flush()
 
-            _write_gzip_json(_HashingWriter(), value)
+            _write_gzip_json(_HashingWriter(), value, _trusted_ascii_assets=True)
             if raw.tell() > MAX_FILE:
                 raise ValueError("Compressed SMD exceeds 120 MB")
             raw.flush()
@@ -649,36 +700,47 @@ def _extract_portable_markdown(chunks, max_markdown_bytes: int = MAX_SEARCH_MARK
     return markdown if fmt in _PORTABLE_FORMATS and version == 1 and isinstance(markdown, str) else None
 
 
-def read_searchable_markdown(path: Path, max_text_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
+def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
     """Read searchable Markdown from plain or portable (.smd/.fmd) notes by content without decoding images."""
+    raw_path = os.fspath(path)
     try:
-        if path.is_symlink():
-            return None
-        info = path.stat()
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
+        info = os.lstat(raw_path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
             return None
         stat_key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-        with _VALIDATED_LOCK:
-            cached = _RECENT_PORTABLE_FILES.get(stat_key)
-        if cached is not None and len(cached[1].encode("utf-8")) <= max_text_bytes:
-            return cached[1]
-        with path.open("rb") as handle:
+        if _RECENT_PORTABLE_FILES:
+            with _VALIDATED_LOCK:
+                cached = _RECENT_PORTABLE_FILES.get(stat_key)
+            if cached is not None and len(cached[1].encode("utf-8")) <= max_text_bytes:
+                return cached[1]
+        with open(raw_path, "rb") as handle:
             head = handle.read(8192)
+            if not head:
+                return ""
+            if not head.startswith(GZIP_MAGIC):
+                if b"\x00" in head:
+                    return None
+                leading = head.lstrip(b"\xef\xbb\xbf \t\r\n")
+                if leading and not leading.startswith(b"{"):
+                    if info.st_size > max_text_bytes:
+                        return None
+                    raw = head if info.st_size <= len(head) else head + handle.read(max_text_bytes + 1 - len(head))
+                    if len(raw) > max_text_bytes or (len(raw) > len(head) and b"\x00" in raw[len(head):]):
+                        return None
+                    text = raw.decode("utf-8-sig", errors="replace")
+                    return text.replace("\r\n", "\n").replace("\r", "\n") if "\r" in text else text
     except OSError:
         return None
-    if not head:
-        return ""
+    path_obj = path if isinstance(path, Path) else Path(raw_path)
     if head.startswith(GZIP_MAGIC):
         try:
-            return _extract_portable_markdown(_read_bounded_utf8_stream(path, is_gzip=True), max_text_bytes)
+            return _extract_portable_markdown(_read_bounded_utf8_stream(path_obj, is_gzip=True), max_text_bytes)
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError, zlib.error, OSError, EOFError):
             return None
-    if b"\x00" in head:
-        return None
     head_text = head.decode("utf-8-sig", errors="replace")
     if head_text.lstrip().startswith("{"):
         try:
-            extracted = _extract_portable_markdown(_read_bounded_utf8_stream(path, is_gzip=False), max_text_bytes)
+            extracted = _extract_portable_markdown(_read_bounded_utf8_stream(path_obj, is_gzip=False), max_text_bytes)
         except (ValueError, json.JSONDecodeError, UnicodeDecodeError, OSError):
             if _PORTABLE_ENVELOPE_RE.match(head_text):
                 return None
@@ -690,7 +752,8 @@ def read_searchable_markdown(path: Path, max_text_bytes: int = MAX_SEARCH_MARKDO
     if info.st_size > max_text_bytes:
         return None
     try:
-        return path.read_text(encoding="utf-8-sig", errors="replace")
+        with open(raw_path, encoding="utf-8-sig", errors="replace") as text_handle:
+            return text_handle.read()
     except OSError:
         return None
 
