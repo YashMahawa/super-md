@@ -790,13 +790,21 @@ export function Reader() {
       // The new view settles over several frames (editor mount, zoom geometry,
       // lazy math and fonts). Re-apply the source anchor until it is stable,
       // and stop as soon as the person scrolls, types or opens search/live edit.
-      let stopped=false;const stop=()=>{stopped=true;};
+      let stopped=false,applying=false;const stop=()=>{stopped=true;};
       let readingSnapshot:AnchorScrollSnapshot|null=null;
+      const commitExternalScroll=(target:HTMLElement)=>{
+        clearProgrammaticAnchorScroll(target);
+        stopped=true;
+        if(reference.current?.mode==="split"){
+          restoringSplit.current=false;
+          splitScrollTops.current.preview=target.scrollTop;
+          splitPane.current="preview";
+        }
+      };
       const onScroll=(event:Event)=>{
         const target=event.target;
-        if(target instanceof HTMLElement&&target.matches(".android-reading")&&hasExternalAnchorScroll(readingSnapshot)){
-          clearProgrammaticAnchorScroll(target);
-          stopped=true;
+        if(!applying&&target instanceof HTMLElement&&target.matches(".android-reading")&&target===readingSnapshot?.element&&hasExternalAnchorScroll(readingSnapshot)){
+          commitExternalScroll(target);
         }
       };
       const inputs=["wheel","touchstart","keydown","pointerdown","supermd-goto-offset"] as const;
@@ -804,22 +812,29 @@ export function Reader() {
       window.addEventListener("scroll",onScroll,{capture:true,passive:true});
       let firstPass=true;
       const apply=()=>{
-        if(stopped||shouldStop()||hasExternalAnchorScroll(readingSnapshot)){stopped=true;return;}
+        if(stopped)return;
+        if(readingSnapshot&&hasExternalAnchorScroll(readingSnapshot)){commitExternalScroll(readingSnapshot.element);return;}
+        if(shouldStop()){stopped=true;return;}
         const updateSelection=firstPass;
         firstPass=false;
-        runGuarded(()=>{
-          const readingRoot=document.querySelector<HTMLElement>(".android-reading");
-          applySharedAnchor({
-            id:state.id,
-            targetMode:state.mode,
-            targetZoom:zoomReference.current,
-            anchor,
-            readingRoot,
-            allowExactTop:false,
-            updateSelection,
+        applying=true;
+        try {
+          runGuarded(()=>{
+            const readingRoot=document.querySelector<HTMLElement>(".android-reading");
+            applySharedAnchor({
+              id:state.id,
+              targetMode:state.mode,
+              targetZoom:zoomReference.current,
+              anchor,
+              readingRoot,
+              allowExactTop:false,
+              updateSelection,
+            });
+            readingSnapshot=snapshotAnchorScroll(readingRoot);
           });
-          readingSnapshot=snapshotAnchorScroll(readingRoot);
-        });
+        } finally {
+          applying=false;
+        }
       };
       apply();
       let innerFrame=0;
@@ -851,14 +866,22 @@ export function Reader() {
     }else{
       primeEditorAnchor(state.id,null);
     }
-    let stopped=false;
+    let stopped=false,applying=false;
     const stop=()=>{stopped=true;};
     let readingSnapshot:AnchorScrollSnapshot|null=null;
+    const commitExternalScroll=(target:HTMLElement)=>{
+      clearProgrammaticAnchorScroll(target);
+      stopped=true;
+      if(reference.current?.mode==="split"){
+        restoringSplit.current=false;
+        splitScrollTops.current.preview=target.scrollTop;
+        splitPane.current="preview";
+      }
+    };
     const onScroll=(event:Event)=>{
       const target=event.target;
-      if(target instanceof HTMLElement&&target.matches(".android-reading")&&hasExternalAnchorScroll(readingSnapshot)){
-        clearProgrammaticAnchorScroll(target);
-        stopped=true;
+      if(!applying&&target instanceof HTMLElement&&target.matches(".android-reading")&&target===readingSnapshot?.element&&hasExternalAnchorScroll(readingSnapshot)){
+        commitExternalScroll(target);
       }
     };
     const inputs=['wheel','touchstart','pointerdown','keydown','supermd-goto-offset'] as const;
@@ -866,23 +889,30 @@ export function Reader() {
     window.addEventListener('scroll',onScroll,{capture:true,passive:true});
     let firstPass=true;
     const restore=()=>{
-      if(stopped||shouldStop()||hasExternalAnchorScroll(readingSnapshot)){stopped=true;return;}
+      if(stopped)return;
+      if(readingSnapshot&&hasExternalAnchorScroll(readingSnapshot)){commitExternalScroll(readingSnapshot.element);return;}
+      if(shouldStop()){stopped=true;return;}
       const updateSelection=firstPass;
       firstPass=false;
-      runGuarded(()=>{
-        const readingRoot=document.querySelector<HTMLElement>(".android-reading");
-        applySharedAnchor({
-          id:state.id,
-          targetMode:state.mode,
-          targetZoom:zoomReference.current,
-          anchor:resolvedAnchor,
-          readingRoot,
-          allowExactTop:true,
-          updateSelection,
+      applying=true;
+      try {
+        runGuarded(()=>{
+          const readingRoot=document.querySelector<HTMLElement>(".android-reading");
+          applySharedAnchor({
+            id:state.id,
+            targetMode:state.mode,
+            targetZoom:zoomReference.current,
+            anchor:resolvedAnchor,
+            readingRoot,
+            allowExactTop:true,
+            updateSelection,
+          });
+          const requestedReadingTop=resolvedAnchor.mode===state.mode&&Math.abs(resolvedAnchor.zoom-zoomReference.current)<1?resolvedAnchor.readingTop:undefined;
+          readingSnapshot=snapshotAnchorScroll(readingRoot,requestedReadingTop);
         });
-        const requestedReadingTop=resolvedAnchor.mode===state.mode&&Math.abs(resolvedAnchor.zoom-zoomReference.current)<1?resolvedAnchor.readingTop:undefined;
-        readingSnapshot=snapshotAnchorScroll(readingRoot,requestedReadingTop);
-      });
+      } finally {
+        applying=false;
+      }
     };
     restore();
     let innerFrame=0;

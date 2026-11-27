@@ -695,15 +695,22 @@ export default function App() {
       scrollInputVersion() !== startingInput ||
       Boolean(window.getSelection()?.toString()) ||
       Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
-    let stopped = false;
+    let stopped = false, applying = false;
     const stop = () => { stopped = true; };
     let readingSnapshot: AnchorScrollSnapshot | null = null;
+    const commitExternalScroll = (target: HTMLElement) => {
+      clearProgrammaticAnchorScroll(target);
+      restoringAnchorRef.current = false;
+      stopped = true;
+      if (view === "split") {
+        splitScrollTopsRef.current.preview = target.scrollTop;
+        splitPaneRef.current = "preview";
+      }
+    };
     const onScroll = (event: Event) => {
       const target = event.target;
-      if (target instanceof HTMLElement && target.matches(".reading-scroll") && hasExternalAnchorScroll(readingSnapshot)) {
-        clearProgrammaticAnchorScroll(target);
-        restoringAnchorRef.current = false;
-        stopped = true;
+      if (!applying && target instanceof HTMLElement && target.matches(".reading-scroll") && target === readingSnapshot?.element && hasExternalAnchorScroll(readingSnapshot)) {
+        commitExternalScroll(target);
       }
     };
     const inputs = ["wheel", "touchstart", "pointerdown", "keydown", "supermd-goto-offset"] as const;
@@ -711,7 +718,12 @@ export default function App() {
     window.addEventListener("scroll", onScroll, { capture: true, passive: true });
     let firstPass = true;
     const apply = () => {
-      if (stopped || shouldStop() || hasExternalAnchorScroll(readingSnapshot)) {
+      if (stopped) return;
+      if (readingSnapshot && hasExternalAnchorScroll(readingSnapshot)) {
+        commitExternalScroll(readingSnapshot.element);
+        return;
+      }
+      if (shouldStop()) {
         stopped = true;
         return;
       }
@@ -719,25 +731,30 @@ export default function App() {
       firstPass = false;
       const seq = ++restoringAnchorSeq.current;
       restoringAnchorRef.current = true;
-      const readingRoot = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null;
-      applySharedAnchor({
-        id: tabId,
-        targetMode,
-        targetZoom: zoomRef.current,
-        anchor,
-        readingRoot,
-        allowExactTop,
-        updateSelection,
-      });
-      const requestedReadingTop = allowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - zoomRef.current) < 1 ? anchor.readingTop : undefined;
-      readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
-      if (targetMode === "split") {
-        splitScrollTopsRef.current = {
-          editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
-          preview: readingSnapshot?.top ?? null,
-        };
-      } else {
-        splitScrollTopsRef.current = { editor: null, preview: null };
+      applying = true;
+      try {
+        const readingRoot = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null;
+        applySharedAnchor({
+          id: tabId,
+          targetMode,
+          targetZoom: zoomRef.current,
+          anchor,
+          readingRoot,
+          allowExactTop,
+          updateSelection,
+        });
+        const requestedReadingTop = allowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - zoomRef.current) < 1 ? anchor.readingTop : undefined;
+        readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
+        if (targetMode === "split") {
+          splitScrollTopsRef.current = {
+            editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
+            preview: readingSnapshot?.top ?? null,
+          };
+        } else {
+          splitScrollTopsRef.current = { editor: null, preview: null };
+        }
+      } finally {
+        applying = false;
       }
       requestAnimationFrame(() => { if (restoringAnchorSeq.current === seq) restoringAnchorRef.current = false; });
     };
