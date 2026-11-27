@@ -1,20 +1,23 @@
 // @vitest-environment jsdom
 import {act} from 'react';
 import {createRoot} from 'react-dom/client';
-import {expect,it} from 'vitest';
+import {expect,it,vi} from 'vitest';
 import {mediaAt,mediaBytes} from '../mediaExport';
 import {preparePdf} from '../preparePdf';
 import MarkdownPreview from './MarkdownPreview';
 Object.assign(globalThis,{IS_REACT_ACT_ENVIRONMENT:true});
 
-it('classifies standalone SVGs at intrinsic dimensions without classifying inline icons, mutating src, or remounting unchanged image paragraphs on an edit',()=>{
+it('classifies standalone SVGs at intrinsic dimensions in one parse without classifying inline icons, mutating src, or remounting unchanged image paragraphs on an edit',()=>{
   const portraitSvg='<svg xmlns="http://www.w3.org/2000/svg" width="140" height="300" viewBox="0 0 140 300"><rect width="140" height="300" fill="#eef3f8"/></svg>';
   const uri='data:image/svg+xml;base64,'+btoa(portraitSvg);
   const iconUri='data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><circle cx="12" cy="12" r="10"/></svg>');
   const source=`- [ ] A task\n\n![Diagram](${uri})\n\nAn inline icon ![Icon](${iconUri}) stays inline.\n`;
   const host=document.createElement('div');document.body.append(host);const root=createRoot(host);
+  const parseSpy=vi.spyOn(DOMParser.prototype,'parseFromString');
   try{
+    parseSpy.mockClear();
     act(()=>root.render(<MarkdownPreview markdown={source} documentPath={null} python="" dark={false}/>));
+    expect(parseSpy).toHaveBeenCalledTimes(2);
     const paragraph=host.querySelector('.media-paragraph')!;
     const wrapper=paragraph.querySelector<HTMLElement>('.note-image--diagram')!;
     const image=paragraph.querySelector<HTMLImageElement>('img')!;
@@ -27,12 +30,14 @@ it('classifies standalone SVGs at intrinsic dimensions without classifying inlin
     expect(wrapper.style.getPropertyValue('--svg-width')).toBe('140px');
     expect(wrapper.style.getPropertyValue('--svg-min-width')).toBe('0px');
     expect(image.getAttribute('src')).toBe(uri);
+    parseSpy.mockClear();
     act(()=>root.render(<MarkdownPreview markdown={source.replace('[ ]','[x]')} documentPath={null} python="" dark={false}/>));
+    expect(parseSpy).not.toHaveBeenCalled();
     expect(host.querySelector('.media-paragraph')).toBe(paragraph);
     expect(paragraph.querySelector('img')).toBe(image);
     expect(image.getAttribute('src')).toBe(uri);
     expect(paragraph.querySelector('[role=status]')).toBeNull();
-  }finally{act(()=>root.unmount());host.remove();}
+  }finally{parseSpy.mockRestore();act(()=>root.unmount());host.remove();}
 });
 
 it('preserves full intrinsic vector markup for media export and PDF preparation across portrait and wide SVG figures',async()=>{

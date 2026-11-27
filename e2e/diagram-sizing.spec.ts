@@ -306,3 +306,49 @@ test('diagram widths follow portrait/landscape changes without replacing the sou
   await expect.poll(()=>image.evaluate(node=>Math.abs(node.getBoundingClientRect().width-node.parentElement!.getBoundingClientRect().width))).toBeLessThan(2);
   await expect(image).toHaveAttribute('src',source!);
 });
+
+test('wide standalone SVG fences and linked SVG paragraphs pan horizontally on mobile and keep zero hover/focus layout shift in Live mode',async({page})=>{
+  const wideSvg='<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300"><rect width="1200" height="300" fill="#eef3f8"/><path d="M40 150 H1160" stroke="#3072b8" stroke-width="4"/><text x="60" y="90" font-size="22" fill="#1c2635">Left Endpoint</text><text x="980" y="90" font-size="22" fill="#1c2635">Right Endpoint</text></svg>';
+  const wideSvgUri='data:image/svg+xml;base64,'+Buffer.from(wideSvg).toString('base64');
+  await page.setViewportSize({width:412,height:915});
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+  await page.evaluate(({wideSvg,wideSvgUri})=>{
+    document.documentElement.dataset.platform='android';
+    document.documentElement.dataset.host='qt';
+    const content=['# Standalone wide SVGs','![Wide linked]('+wideSvgUri+')','```svg\n'+wideSvg+'\n```'].join('\n\n');
+    window.supermdLoad?.({id:'wide-standalone-svg',content,path:null,mode:'live',dark:false,colors:{},font:'Manrope',size:16,zoom:100,centerLock:true,restorePosition:false});
+  },{wideSvg,wideSvgUri});
+
+  const mediaPara=page.locator('.media-paragraph');
+  const svgFigure=page.locator('.svg-figure');
+  await expect(mediaPara.locator('img')).toBeVisible();
+  await expect(svgFigure.locator('img')).toBeVisible();
+  await expect.poll(()=>mediaPara.locator('img').evaluate(el=>(el as HTMLImageElement).complete&&el.getBoundingClientRect().height>0)).toBe(true);
+  await expect.poll(()=>svgFigure.locator('img').evaluate(el=>(el as HTMLImageElement).complete&&el.getBoundingClientRect().height>0)).toBe(true);
+
+  for(const region of [mediaPara,svgFigure]){
+    await region.scrollIntoViewIfNeeded();
+    expect(await region.evaluate(el=>el.scrollWidth-el.clientWidth)).toBeGreaterThan(400);
+    const box=(await region.boundingBox())!;
+    const pt={x:Math.round(box.x+box.width/2),y:Math.round(box.y+Math.min(80,box.height/2))};
+    await page.evaluate(p=>window.supermdNativeWheel?.(260,0,p,false),pt);
+    await expect.poll(()=>region.evaluate(el=>Math.round(el.scrollLeft))).toBeGreaterThanOrEqual(250);
+    expect(await page.locator('.android-reading').evaluate(el=>el.scrollLeft)).toBe(0);
+  }
+
+  // Magnified Live mode (180% zoom): hovering/focusing the standalone SVG image block must not inject top margin or shift subsequent blocks.
+  await page.setViewportSize({width:1280,height:900});
+  await page.evaluate(({wideSvg,wideSvgUri})=>{
+    document.documentElement.dataset.platform='desktop';
+    const content=['# Standalone wide SVGs','![Wide linked]('+wideSvgUri+')','```svg\n'+wideSvg+'\n```'].join('\n\n');
+    window.supermdLoad?.({id:'wide-standalone-svg',content,path:null,mode:'live',dark:false,colors:{},font:'Manrope',size:16,zoom:180,centerLock:false,restorePosition:false});
+  },{wideSvg,wideSvgUri});
+  const imageBlock=page.locator('.live-block').filter({has:mediaPara});
+  const figureBlock=page.locator('.live-block').filter({has:svgFigure});
+  await figureBlock.scrollIntoViewIfNeeded();
+  const beforeTop=await figureBlock.evaluate(el=>el.getBoundingClientRect().top);
+  await imageBlock.hover();
+  await expect(imageBlock.getByRole('button',{name:'Edit block'})).toBeVisible();
+  const hoveredTop=await figureBlock.evaluate(el=>el.getBoundingClientRect().top);
+  expect(Math.abs(hoveredTop-beforeTop)).toBeLessThan(0.5);
+});
