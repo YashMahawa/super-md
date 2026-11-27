@@ -87,8 +87,8 @@ test('package.json default test targets shipping smd-core manifest and CI preser
   assert.match(ci, /run:\s*npm run test:scripts/);
   assert.match(ci, /run:\s*npm test\b/);
   // Exact-source artifact, release, and presented-pixel gates remain intact.
+  assert.match(ci, /\n  test:\n    needs: native_frontend\n/);
   assert.match(ci, /native-frontend-artifact\.mjs create dist/);
-  assert.match(ci, /wait-native-frontend-artifacts\.mjs "\$NATIVE_FRONTEND_SOURCE_SHA"/);
   assert.match(ci, /native-frontend-artifact\.mjs verify dist/);
   assert.match(ci, /report-web-assets\.mjs dist --verify-native --public-root public/);
   assert.match(ci, /check_packaged\.py "\$binary" "\$version" --graphics software/);

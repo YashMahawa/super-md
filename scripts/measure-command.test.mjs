@@ -89,20 +89,64 @@ test('runs only the supplied child and writes its status report to the requested
   }
 });
 
+function withSyntheticProcessSignals(syntheticPid, run) {
+  const originalKill = process.kill;
+  const deliveredSignals = [];
+  let childLive = false;
+  let onLiveSignal = null;
+
+  const setLiveState = (live, signalHandler = null) => {
+    childLive = live;
+    onLiveSignal = live ? signalHandler : null;
+  };
+
+  process.kill = function interceptedProcessKill(targetPid, signal = 'SIGTERM') {
+    if (typeof targetPid === 'number' && Math.abs(targetPid) === syntheticPid) {
+      deliveredSignals.push({ pid: targetPid, signal });
+      if (!childLive) {
+        throw Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+      }
+      onLiveSignal?.(targetPid, signal);
+      return true;
+    }
+    return originalKill.call(process, targetPid, signal);
+  };
+
+  return Promise.resolve()
+    .then(() => run({ deliveredSignals, setLiveState }))
+    .finally(() => {
+      childLive = false;
+      onLiveSignal = null;
+      process.kill = originalKill;
+    });
+}
+
 test('samples Linux process-tree RSS via injected child and reports unavailable memory on non-Linux hosts', async () => {
+  const SYNTHETIC_PID = 4242;
   const directory = await mkdtemp(path.join(os.tmpdir(), 'supermd-measure-command-injected-'));
   try {
-    const createInjectedSpawn = (spawnCalls, exitCode = 7) => (command, args, options) => {
+    const createInjectedSpawn = (spawnCalls, setLiveState, { exitCode = 7, holdUntilSignal = false } = {}) => (command, args, options) => {
       spawnCalls.push({ command, args, options });
       const child = new EventEmitter();
-      child.pid = 4242;
+      child.pid = SYNTHETIC_PID;
+      let finished = false;
+      const finish = (code, signal) => {
+        if (finished) return;
+        finished = true;
+        setLiveState(false);
+        child.emit('close', code, signal);
+      };
+      setLiveState(true, (_targetPid, signal) => {
+        if (signal === 'SIGTERM' || signal === 'SIGKILL') {
+          setImmediate(() => finish(null, signal));
+        }
+      });
       setImmediate(() => {
+        if (finished) return;
         child.emit('spawn');
-        setImmediate(() => {
-          // Clear the synthetic PID before close so post-exit group cleanup never signals a host PID.
-          child.pid = undefined;
-          child.emit('close', exitCode, null);
-        });
+        if (!holdUntilSignal) {
+          setImmediate(() => finish(exitCode, null));
+        }
       });
       return child;
     };
@@ -111,25 +155,27 @@ test('samples Linux process-tree RSS via injected child and reports unavailable 
     const linuxSpawns = [];
     const linuxSampledPids = [];
     let clock = 1_000;
-    const linuxReport = await measureCommand({
-      command: '/usr/bin/node',
-      args: ['-e', 'process.exit(7)'],
-      output: linuxOutput,
-      platform: 'linux',
-      spawn: createInjectedSpawn(linuxSpawns),
-      sampler: async pid => {
-        linuxSampledPids.push(pid);
-        return { processCount: 1, rssKb: pid > 0 ? 11 : null, pssKb: pid > 0 ? 6 : null };
-      },
-      now: () => {
-        clock += 20;
-        return clock;
-      },
-    });
+    const linuxReport = await withSyntheticProcessSignals(SYNTHETIC_PID, ({ setLiveState }) =>
+      measureCommand({
+        command: '/usr/bin/node',
+        args: ['-e', 'process.exit(7)'],
+        output: linuxOutput,
+        platform: 'linux',
+        spawn: createInjectedSpawn(linuxSpawns, setLiveState),
+        sampler: async pid => {
+          linuxSampledPids.push(pid);
+          return { processCount: 1, rssKb: pid > 0 ? 11 : null, pssKb: pid > 0 ? 6 : null };
+        },
+        now: () => {
+          clock += 20;
+          return clock;
+        },
+      }),
+    );
     const linuxDiskReport = JSON.parse(await readFile(linuxOutput, 'utf8'));
     assert.equal(linuxSpawns.length, 1);
     assert.deepEqual(linuxSpawns[0].options, { stdio: 'inherit', detached: true });
-    assert.deepEqual(linuxSampledPids, [4242]);
+    assert.deepEqual(linuxSampledPids, [SYNTHETIC_PID]);
     assert.equal(linuxReport.exitCode, 7);
     assert.equal(linuxDiskReport.exitCode, 7);
     assert.equal(linuxDiskReport.command.argumentCount, 2);
@@ -143,17 +189,19 @@ test('samples Linux process-tree RSS via injected child and reports unavailable 
       const nonLinuxOutput = path.join(directory, `${nonLinuxPlatform}-result.json`);
       const nonLinuxSpawns = [];
       let nonLinuxSamples = 0;
-      const nonLinuxReport = await measureCommand({
-        command: 'node',
-        args: ['-e', 'process.exit(7)'],
-        output: nonLinuxOutput,
-        platform: nonLinuxPlatform,
-        spawn: createInjectedSpawn(nonLinuxSpawns),
-        sampler: async () => {
-          nonLinuxSamples++;
-          return { processCount: 1, rssKb: 11, pssKb: 6 };
-        },
-      });
+      const nonLinuxReport = await withSyntheticProcessSignals(SYNTHETIC_PID, ({ setLiveState }) =>
+        measureCommand({
+          command: 'node',
+          args: ['-e', 'process.exit(7)'],
+          output: nonLinuxOutput,
+          platform: nonLinuxPlatform,
+          spawn: createInjectedSpawn(nonLinuxSpawns, setLiveState),
+          sampler: async () => {
+            nonLinuxSamples++;
+            return { processCount: 1, rssKb: 11, pssKb: 6 };
+          },
+        }),
+      );
       const nonLinuxDiskReport = JSON.parse(await readFile(nonLinuxOutput, 'utf8'));
       assert.equal(nonLinuxSpawns.length, 1);
       assert.deepEqual(nonLinuxSpawns[0].options, {
@@ -170,6 +218,46 @@ test('samples Linux process-tree RSS via injected child and reports unavailable 
       assert.equal(nonLinuxDiskReport.memory.peakSampledRssKb, null);
       assert.equal(nonLinuxDiskReport.memory.peakSampledPssKb, null);
       assert.deepEqual(nonLinuxDiskReport.memory.samples, []);
+    }
+
+    const hostKill = process.kill;
+    const leakedHostSignals = [];
+    process.kill = function outerKillProbe(targetPid, signal) {
+      leakedHostSignals.push({ pid: targetPid, signal });
+      return hostKill.call(process, targetPid, signal);
+    };
+    try {
+      for (const interruptPlatform of ['linux', 'win32']) {
+        const interruptOutput = path.join(directory, `${interruptPlatform}-interrupt.json`);
+        const interruptSpawns = [];
+        await withSyntheticProcessSignals(SYNTHETIC_PID, async ({ deliveredSignals, setLiveState }) => {
+          const baseSpawn = createInjectedSpawn(interruptSpawns, setLiveState, { holdUntilSignal: true });
+          const interruptReport = await measureCommand({
+            command: 'node',
+            args: ['-e', 'setInterval(() => {}, 1000)'],
+            output: interruptOutput,
+            platform: interruptPlatform,
+            spawn: (command, args, options) => {
+              const child = baseSpawn(command, args, options);
+              child.once('spawn', () => {
+                setImmediate(() => process.emit('SIGINT'));
+              });
+              return child;
+            },
+            sampler: async pid => ({ processCount: 1, rssKb: pid > 0 ? 11 : null, pssKb: pid > 0 ? 6 : null }),
+          });
+          assert.equal(interruptReport.interrupted, true);
+          assert.equal(interruptReport.signal, 'SIGTERM');
+          assert.equal(
+            deliveredSignals[0]?.pid,
+            interruptPlatform === 'win32' ? SYNTHETIC_PID : -SYNTHETIC_PID,
+          );
+          assert.equal(deliveredSignals[0]?.signal, 'SIGTERM');
+        });
+      }
+      assert.deepEqual(leakedHostSignals, []);
+    } finally {
+      process.kill = hostKill;
     }
   } finally {
     await rm(directory, { recursive: true, force: true });
