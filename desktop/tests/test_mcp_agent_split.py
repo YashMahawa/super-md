@@ -46,9 +46,11 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
             return await task
 
         with tempfile.TemporaryDirectory() as folder:
-            base = Path(folder)
+            base = Path(folder).resolve(strict=True)
             note_dir, outside_dir, ws_root, other_ws = base / "note-folder", base / "outside-folder", base / "approved-workspace", base / "other-workspace"
-            ws_space, ws_decoy = base / "Study notes ", base / "Study notes"
+            # Win32 strips trailing spaces on directory creation; leading spaces are valid on Windows and POSIX.
+            ws_space = base / ("Study notes " if os.name != "nt" else " Study notes")
+            ws_decoy = base / "Study notes"
             for d in (note_dir, outside_dir, ws_root, other_ws, ws_space, ws_decoy):
                 d.mkdir()
             smd_path, sibling_md, ws_md = note_dir / "study.smd", note_dir / "sibling.md", ws_root / "ws-note.md"
@@ -149,14 +151,14 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue((await call_with_qt(client.call_tool("document_read", {"path": ws_target}))).is_error)
                     self.assertFalse((await call_with_qt(client.call_tool("document_read", {"path": target}))).is_error)
                     # Outer-whitespace approved root preserves exact identity and rejects stripped-name decoy.
-                    if os.path.exists(ws_space) and not os.path.samefile(ws_space, ws_decoy):
-                        studio.openFolder(str(ws_space))
-                        spaced_server, _ = build_mcp_server(studio._agent_mcp_roots(), live_client=MultiSessionLiveClient(bridge.discovery_dir))
-                        async with Client(spaced_server) as spaced_client:
-                            self.assertTrue((await call_with_qt(spaced_client.call_tool("document_attach_asset", {"path": target, "asset_path": str(decoy_svg), "expected_revision": rev, "name": "decoy.svg"}))).is_error)
-                            ok_sp = await call_with_qt(spaced_client.call_tool("document_attach_asset", {"path": target, "asset_path": str(space_svg), "expected_revision": rev, "name": "spaced.svg"}))
-                            self.assertFalse(ok_sp.is_error, ok_sp.content[0].text if ok_sp.content else "")
-                            self.assertIn("from-spaced-root", json.loads((await call_with_qt(spaced_client.call_tool("document_assets", {"path": target, "action": "extract", "asset_name": ok_sp.structured_content["asset"]["name"], "expected_revision": ok_sp.structured_content["revision"]}))).content[0].text)["source"])
+                    self.assertFalse(os.path.samefile(ws_space, ws_decoy))
+                    studio.openFolder(str(ws_space))
+                    spaced_server, _ = build_mcp_server(studio._agent_mcp_roots(), live_client=MultiSessionLiveClient(bridge.discovery_dir))
+                    async with Client(spaced_server) as spaced_client:
+                        self.assertTrue((await call_with_qt(spaced_client.call_tool("document_attach_asset", {"path": target, "asset_path": str(decoy_svg), "expected_revision": rev, "name": "decoy.svg"}))).is_error)
+                        ok_sp = await call_with_qt(spaced_client.call_tool("document_attach_asset", {"path": target, "asset_path": str(space_svg), "expected_revision": rev, "name": "spaced.svg"}))
+                        self.assertFalse(ok_sp.is_error, ok_sp.content[0].text if ok_sp.content else "")
+                        self.assertIn("from-spaced-root", json.loads((await call_with_qt(spaced_client.call_tool("document_assets", {"path": target, "action": "extract", "asset_name": ok_sp.structured_content["asset"]["name"], "expected_revision": ok_sp.structured_content["revision"]}))).content[0].text)["source"])
             finally:
                 studio.stop()
                 studio.pool.shutdown(wait=True, cancel_futures=True)
