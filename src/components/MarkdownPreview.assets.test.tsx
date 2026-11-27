@@ -7,12 +7,15 @@ const { invoke } = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("../nativeBridge", () => ({ invoke }));
 import MarkdownPreview from "./MarkdownPreview";
 import { DocumentAppearance } from "../documentAppearance";
+import { prepareFmd } from "../documentMedia";
+import { NoteRemoteImageConsentStore } from "../remoteImageConsent";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 let root: Root | null = null;
 afterEach(() => {
   if (root) { act(() => root?.unmount()); root = null; }
   document.body.innerHTML = "";
+  vi.restoreAllMocks();
   invoke.mockReset();
 });
 
@@ -146,6 +149,198 @@ describe("MarkdownPreview streamed local assets", () => {
       root?.render(<MarkdownPreview markdown="![Remote](https://images.example/a.png)" documentPath="/notes/a.md" python="" dark trustedImageHosts={["images.example"]} />);
     });
     expect(invoke).toHaveBeenCalledWith("fetch_resource", { url: "https://images.example/a.png", image: true });
+  });
+
+  it("reuses reader-loaded remote consent offline and skips unvisited nested slides on in-place portable save", async () => {
+    const localSvg = "data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=";
+    const remotePng = "data:image/png;base64,iVBORw0KGgo=";
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected global fetch"));
+    invoke.mockImplementation(async (command: string, args: any) => {
+      if (command === "load_asset") return localSvg;
+      if (command === "fetch_resource") return { body: remotePng };
+      return undefined;
+    });
+
+    const deck = {
+      title: "Nested study deck",
+      steps: [
+        {
+          label: "Step 1",
+          image: "https://once.example/slide0.png",
+          markdown: "Approved ![Inline](https://once.example/slide0-md.png)",
+        },
+        { label: "Step 2", markdown: "Unvisited ![S2](https://blocked.example/slide1-md.png)" },
+        { label: "Step 3", image: "https://blocked.example/slide2-nearby.png" },
+        { label: "Step 4", description: "Plain" },
+        {
+          label: "Step 5",
+          image: "https://blocked.example/slide4-unvisited.png",
+          markdown: "Deep unvisited ![S5](https://blocked.example/slide4-md.png)",
+        },
+      ],
+    };
+    const markdown = [
+      "![Local](images/local.svg)",
+      "",
+      "![Blocked Prose](https://blocked.example/prose.png)",
+      "",
+      "```smd-steps",
+      JSON.stringify(deck, null, 2),
+      "```",
+    ].join("\n");
+
+    const consentStore = new NoteRemoteImageConsentStore();
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const renderWithPolicy = async () => {
+      await act(async () => {
+        root?.render(
+          <MarkdownPreview
+            noteId="tab-1"
+            markdown={markdown}
+            documentPath="/notes/study.smd"
+            python=""
+            dark
+            approvedImageUrls={consentStore.approvedUrls("tab-1")}
+            onApproveImageUrl={(noteId, url) => {
+              if (noteId) consentStore.approve(noteId, url);
+            }}
+            onRemoteImageLoaded={(noteId, url, data) => {
+              if (noteId) consentStore.recordLoaded(noteId, url, data);
+            }}
+          />,
+        );
+      });
+    };
+    await renderWithPolicy();
+
+    // Unvisited Slide 5 is not even mounted; Slide 1's two remote cards are blocked until approved.
+    expect(invoke).not.toHaveBeenCalledWith("fetch_resource", expect.anything());
+    expect(host.querySelector('[data-note-image-source="https://blocked.example/slide4-unvisited.png"]')).toBeNull();
+
+    // Approve only Slide 1's figure and Slide 1's nested markdown image.
+    const approveSource = async (source: string) => {
+      const button = host.querySelector<HTMLButtonElement>(`.remote-image-card[data-note-image-source="${source}"] .remote-image-actions button`);
+      expect(button).not.toBeNull();
+      await act(async () => button?.click());
+    };
+    await approveSource("https://once.example/slide0.png");
+    await approveSource("https://once.example/slide0-md.png");
+
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "fetch_resource").map(([, args]) => args.url).sort()).toEqual([
+      "https://once.example/slide0-md.png",
+      "https://once.example/slide0.png",
+    ]);
+
+    // Simulate switching to Source mode (unmounting preview) and saving the portable note in place:
+    // approved images pack from cached reader data with zero network calls, and unapproved/unvisited URLs stay intact.
+    act(() => { root?.unmount(); root = null; });
+    invoke.mockClear();
+
+    const saved = await prepareFmd(markdown, "/notes/study.smd", consentStore.policy("tab-1", []));
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalledWith("fetch_resource", expect.anything());
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("load_asset", { documentPath: "/notes/study.smd", source: "images/local.svg" });
+
+    expect(Object.keys(saved.assets)).toHaveLength(3);
+    expect(saved.content).toContain("![Blocked Prose](https://blocked.example/prose.png)");
+    const savedDeck = JSON.parse(/```smd-steps\n([\s\S]*?)\n```/.exec(saved.content)![1]);
+    expect(savedDeck.steps[0].image).toMatch(/^assets\/image-.*\.png$/);
+    expect(savedDeck.steps[0].markdown).toMatch(/!\[Inline\]\(<assets\/image-.*\.png>\)/);
+    expect(savedDeck.steps[1].markdown).toBe("Unvisited ![S2](https://blocked.example/slide1-md.png)");
+    expect(savedDeck.steps[2].image).toBe("https://blocked.example/slide2-nearby.png");
+    expect(savedDeck.steps[4].image).toBe("https://blocked.example/slide4-unvisited.png");
+    expect(savedDeck.steps[4].markdown).toBe("Deep unvisited ![S5](https://blocked.example/slide4-md.png)");
+  });
+
+  it("attributes in-flight remote image loads and approvals to the originating note when switching notes before resolution", async () => {
+    const remotePng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a44kAAAAASUVORK5CYII=";
+    let resolveInflight!: (value: { body: string }) => void;
+    invoke.mockImplementation((command: string) => {
+      if (command === "fetch_resource") {
+        return new Promise<{ body: string }>((resolve) => {
+          resolveInflight = resolve;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const sharedUrl = "https://once.example/shared-inflight.png";
+    const noteAMarkdown = `# Note A\n\n![Shared](${sharedUrl})\n`;
+    const noteBMarkdown = `# Note B\n\n![Shared](${sharedUrl})\n`;
+    const consentStore = new NoteRemoteImageConsentStore();
+    const approvalCalls: Array<[string | undefined, string]> = [];
+    const loadedCalls: Array<[string | undefined, string, string]> = [];
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    const renderNote = async (noteId: string, markdown: string, documentPath: string) => {
+      await act(async () => {
+        root?.render(
+          <MarkdownPreview
+            noteId={noteId}
+            markdown={markdown}
+            documentPath={documentPath}
+            python=""
+            dark={false}
+            approvedImageUrls={consentStore.approvedUrls(noteId)}
+            onApproveImageUrl={(originId, url) => {
+              approvalCalls.push([originId, url]);
+              if (originId) consentStore.approve(originId, url);
+            }}
+            onRemoteImageLoaded={(originId, url, data) => {
+              loadedCalls.push([originId, url, data]);
+              if (originId) consentStore.recordLoaded(originId, url, data);
+            }}
+          />,
+        );
+      });
+    };
+
+    await renderNote("note-a", noteAMarkdown, "/notes/note-a.smd");
+    const loadButton = host.querySelector<HTMLButtonElement>('.remote-image-card[data-note-id="note-a"] .remote-image-actions button');
+    expect(loadButton).not.toBeNull();
+
+    // Start loading in Note A, then switch the preview to Note B BEFORE fetch_resource resolves.
+    await act(async () => {
+      loadButton?.click();
+    });
+    expect(approvalCalls).toEqual([["note-a", sharedUrl]]);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("fetch_resource", { url: sharedUrl, image: true });
+
+    await renderNote("note-b", noteBMarkdown, "/notes/note-b.smd");
+    // Note B must stay blocked and never inherit Note A's local allowedOnce state.
+    expect(host.querySelector('.remote-image-card[data-note-id="note-b"]')).not.toBeNull();
+    expect(host.querySelector("img")).toBeNull();
+    expect(invoke).toHaveBeenCalledTimes(1);
+
+    // Resolve the in-flight image fetch after switching to Note B.
+    await act(async () => {
+      resolveInflight({ body: remotePng });
+      await Promise.resolve();
+    });
+
+    expect(loadedCalls).toEqual([["note-a", sharedUrl, remotePng]]);
+    expect(consentStore.approvedUrls("note-a")).toEqual([sharedUrl]);
+    expect(consentStore.approvedUrls("note-b")).toEqual([]);
+    expect(host.querySelector('.remote-image-card[data-note-id="note-b"]')).not.toBeNull();
+    expect(host.querySelector("img")).toBeNull();
+
+    // Saving Note B leaves the unapproved URL untouched; saving Note A packs the resolved bytes offline.
+    invoke.mockClear();
+    const savedB = await prepareFmd(noteBMarkdown, "/notes/note-b.smd", consentStore.policy("note-b", []));
+    expect(savedB.content).toBe(noteBMarkdown);
+    expect(savedB.assets).toEqual({});
+    expect(invoke).not.toHaveBeenCalled();
+
+    const savedA = await prepareFmd(noteAMarkdown, "/notes/note-a.smd", consentStore.policy("note-a", []));
+    expect(Object.values(savedA.assets)).toEqual([remotePng]);
+    expect(savedA.content).not.toContain(sharedUrl);
+    expect(invoke).not.toHaveBeenCalled();
   });
 
   it("passes whole-document duplicate ordinals and interpreter context to runs", async () => {
