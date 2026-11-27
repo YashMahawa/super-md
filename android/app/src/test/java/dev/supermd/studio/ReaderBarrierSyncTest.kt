@@ -235,4 +235,44 @@ class ReaderBarrierSyncTest {
         assertEquals(restored, model.state.value.active.content)
         assertNull(model.state.value.message)
     }
+
+    @Test fun readerBridgePassesAllowPendingNativeLoadOnlyForBarrierFlushes() {
+        val store = ViewModelStore().also(stores::add)
+        val key = "bridge-script-${System.nanoTime()}".also(workspaceKeys::add)
+        val model = StudioViewModel(app, key)
+        store.put("model", model)
+
+        val evaluatedScripts = mutableListOf<String>()
+        val webView = object : android.webkit.WebView(app) {
+            override fun post(action: Runnable?): Boolean {
+                action?.run()
+                return true
+            }
+            override fun evaluateJavascript(script: String, resultCallback: android.webkit.ValueCallback<String>?) {
+                evaluatedScripts += script
+            }
+        }
+        val bridge = ReaderBridge(
+            web = webView,
+            model = model,
+            scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main),
+            ready = {},
+            assetCapabilities = ReaderAssetCapabilities(),
+        )
+        try {
+            val activeId = model.state.value.active.id
+            kotlinx.coroutines.runBlocking {
+                bridge.requestFlushStatus(activeId, timeoutMillis = 25, allowPendingNativeLoad = false)
+                bridge.requestFlushStatus(activeId, timeoutMillis = 25, allowPendingNativeLoad = true)
+            }
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(2, evaluatedScripts.size)
+            assertTrue(evaluatedScripts[0].contains("action:'android_flush'"))
+            assertTrue(!evaluatedScripts[0].contains("allowPendingNativeLoad"))
+            assertTrue(evaluatedScripts[1].contains("allowPendingNativeLoad:true"))
+        } finally {
+            bridge.retire()
+            webView.destroy()
+        }
+    }
 }

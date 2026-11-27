@@ -448,3 +448,133 @@ it("signals reader_ready without pre-spawning a worker and settles android_flush
     }),
   );
 });
+
+it("acknowledges allowPendingNativeLoad barrier flushes on untouched baselines while still rejecting unacknowledged local drafts", async () => {
+  let authoritativeContent = "# Initial v1\n";
+  native.mockImplementation(async (command: string, rawArgs?: unknown) => {
+    const args = (rawArgs ?? {}) as { content?: string };
+    if (command === "document_sync") {
+      return args.content === authoritativeContent
+        ? { accepted: true, revision: 0 }
+        : { accepted: false, reason: "conflict" };
+    }
+    if (command === "document_patch" || command === "document_resync") {
+      return { accepted: false, reason: "conflict" };
+    }
+    return null;
+  });
+
+  const host = document.createElement("div");
+  document.body.append(host);
+  root = readerTree.mountRoot!(host);
+  await act(async () => {
+    root?.render(readerTree.element);
+  });
+
+  await act(async () => {
+    window.supermdLoad!({
+      id: "barrier-note",
+      editProtocol: 1,
+      content: "# Initial v1\n",
+      path: null,
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+
+  // Simulate model.edit(id, v2) + model.mode("reader") on Android before Compose's next supermdLoad(v2).
+  authoritativeContent = "# Native Updated v2\n";
+  native.mockClear();
+
+  await act(async () => {
+    window.supermdFlush!({
+      action: "android_flush",
+      target: "barrier-note",
+      token: "barrier-untouched",
+      allowPendingNativeLoad: true,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(native).not.toHaveBeenCalledWith("document_sync", expect.anything());
+  expect(native).toHaveBeenCalledWith("document_flushed", {
+    id: "barrier-note",
+    token: "barrier-untouched",
+    content: "# Initial v1\n",
+  });
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+
+  // Strict flushes (allowPendingNativeLoad omitted/false) still validate baseline via document_sync.
+  native.mockClear();
+  await act(async () => {
+    window.supermdFlush!({
+      action: "android_flush",
+      target: "barrier-note",
+      token: "strict-untouched",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  expect(native).toHaveBeenCalledWith(
+    "document_flushed",
+    expect.objectContaining({
+      id: "barrier-note",
+      token: "strict-untouched",
+      error: expect.stringContaining("baseline"),
+    }),
+  );
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain("baseline");
+
+  // Once Compose loads v2, any unacknowledged local WebView edit must still fail closed even with allowPendingNativeLoad.
+  await act(async () => {
+    window.supermdLoad!({
+      id: "barrier-note",
+      editProtocol: 1,
+      content: "# Native Updated v2\n",
+      path: null,
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  expect(host.querySelector('[role="alert"]')).toBeNull();
+
+  authoritativeContent = "# Native Concurrent v3\n";
+  await act(async () => {
+    host.querySelector<HTMLElement>(".cm-scroller")!.click();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  native.mockClear();
+
+  await act(async () => {
+    window.supermdFlush!({
+      action: "android_flush",
+      target: "barrier-note",
+      token: "barrier-dirty",
+      allowPendingNativeLoad: true,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
+  expect(native).toHaveBeenCalledWith(
+    "document_flushed",
+    expect.objectContaining({
+      id: "barrier-note",
+      token: "barrier-dirty",
+      error: expect.stringContaining("outside this edit session"),
+    }),
+  );
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain("outside this edit session");
+});

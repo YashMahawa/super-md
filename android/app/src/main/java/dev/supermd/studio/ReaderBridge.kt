@@ -67,7 +67,11 @@ internal class ReaderBridge(
                 flushBarrier.cancel(request.token, request)
                 return ReaderFlushStatus.FAILED
             }
-            val script = "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}})"
+            val script = if (allowPendingNativeLoad) {
+                "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)},allowPendingNativeLoad:true})"
+            } else {
+                "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}})"
+            }
             if (!web.post {
                     if (retired.get()) flushBarrier.complete(request.token, "", null, null, "Reader retired", wellFormed = false)
                     else {

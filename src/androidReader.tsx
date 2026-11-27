@@ -74,7 +74,7 @@ interface PdfExportStatus {id:string;phase:'preparing'|'typesetting'|'publishing
 import { handoffSharedSourceAnchorOnLoad, parseImportedAnchor, snapshotOutgoingTabOrPathAnchor, useSharedSourceAnchor, type NoteView, type PendingHeadingNavigation } from "./useSharedSourceAnchor";
 interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; portable?: boolean; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:{action?:string;target?:string;token?:string;allowPendingNativeLoad?:boolean;[key:string]:unknown})=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
@@ -586,37 +586,41 @@ export function Reader() {
     window.supermdFlush = operation => {
       savePosition.current();
       const current = reference.current;
+      const target = typeof operation.target === "string" ? operation.target : "";
+      const token = typeof operation.token === "string" ? operation.token : undefined;
       if(operation.action==='android_flush'){
-        if(edits.current?.unacknowledged(operation.target)!==undefined&&current?.id!==operation.target){
-          void invoke('document_flushed',{id:operation.target,token:operation.token,error:'Reader has unacknowledged edits for this note'}).catch(()=>{});
+        if(edits.current?.unacknowledged(target)!==undefined&&current?.id!==target){
+          void invoke('document_flushed',{id:target,token,error:'Reader has unacknowledged edits for this note'}).catch(()=>{});
           return;
         }
         if(!current){
-          void invoke('document_flushed',{id:'',token:operation.token,error:'Reader has not loaded a note yet'}).catch(()=>{});
+          void invoke('document_flushed',{id:'',token,error:'Reader has not loaded a note yet'}).catch(()=>{});
           return;
         }
-        if(current.id!==operation.target){
-          void invoke('document_flushed',{id:current.id,token:operation.token,error:'The active note changed before its edit flush'}).catch(()=>{});
+        if(current.id!==target){
+          void invoke('document_flushed',{id:current.id,token,error:'The active note changed before its edit flush'}).catch(()=>{});
           return;
         }
         void (async()=>{
-          if(current.editProtocol===1)await edits.current!.flush(current.id);
+          if(current.editProtocol===1&&!(operation.allowPendingNativeLoad===true&&edits.current!.unacknowledged(current.id)===undefined)){
+            await edits.current!.flush(current.id);
+          }
           const latest=reference.current;
-          if(!latest||latest.id!==operation.target){
-            await invoke('document_flushed',{id:latest?.id??'',token:operation.token,error:'The active note changed during its edit flush'});
+          if(!latest||latest.id!==target){
+            await invoke('document_flushed',{id:latest?.id??'',token,error:'The active note changed during its edit flush'});
             return;
           }
-          await invoke('document_flushed',{id:latest.id,token:operation.token,content:latest.content});
+          await invoke('document_flushed',{id:latest.id,token,content:latest.content});
         })().catch(error=>{
           setEditError(String(error));
-          void invoke('document_flushed',{id:current.id,token:operation.token,error:String(error)}).catch(()=>{});
+          void invoke('document_flushed',{id:current.id,token,error:String(error)}).catch(()=>{});
         });
         return;
       }
       if (!current) return;
       let id = current.id;
-      if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
-      else if (operation.action === "detach_tab") id = operation.target;
+      if (operation.action === "move_tab") { try { id = JSON.parse(target).tab; } catch { return; } }
+      else if (operation.action === "detach_tab") id = target;
       const captureView = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader";
       const baseView = captureView ? {editor:exportEditorSession(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
       void (async()=>{
