@@ -1,5 +1,5 @@
 import {mediaContrast,mediaTone} from './mediaAppearance';
-import {svgImage,svgContrastBackdrop} from './svgImage';
+import {parseValidatedSvg,serializeSvgRoot,serializeValidatedSvg,type ValidatedSvg} from './svgImage';
 
 type RGB=[number,number,number];
 type Matrix=[number,number,number,number,number,number];
@@ -106,14 +106,14 @@ interface Paint {node:Element;index:number;fill:string;stroke:string;matrix:Matr
 /** Inert, display-only adaptation. Coloured nodes remain coloured; labels are
  * contrasted against their local node, not blindly recoloured against paper.
  * No DOM measurement, raster copy, Markdown reparse, scripts or source writes. */
-export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean,monochrome=false):string {
-  const safe=svgImage(source);
-  if(safe.length>1_000_000)return safe;
-  const xml=new DOMParser().parseFromString(safe,'image/svg+xml'),root=xml.documentElement;
-  const nodes=Array.from(root.querySelectorAll('*'));if(nodes.length>6000)return safe;
-  if(!flattenPaintRules(root,nodes))return safe;
+export function adaptValidatedSvg(validated:ValidatedSvg,colors:Record<string,string>,dark:boolean,monochrome=false,options?:{clone?:boolean}):string {
+  if(validated.checkSerializedLength&&serializeValidatedSvg(validated).length>1_000_000)return serializeValidatedSvg(validated);
+  if(validated.nodes.length>6000)return serializeValidatedSvg(validated);
+  const root=options?.clone===false?validated.root:(validated.root.cloneNode(true) as Element);
+  const nodes=root===validated.root?validated.nodes:Array.from(root.querySelectorAll('*'));
+  if(!flattenPaintRules(root,nodes))return serializeValidatedSvg(validated);
   const {paper,ink}=mediaTone(colors,dark);
-  const lightInk=svgContrastBackdrop(safe)==='#222026';
+  const lightInk=validated.backing==='#222026';
   const view=(root.getAttribute('viewBox')||`0 0 ${parseFloat(root.getAttribute('width')||'0')} ${parseFloat(root.getAttribute('height')||'0')}`).split(/[\s,]+/).map(Number);
   const viewArea=view[2]*view[3];let index=0;const paints:Paint[]=[];
   const hasDrawing=nodes.filter(n=>['path','rect','circle','ellipse','polygon','line','text','use'].includes(n.localName)&&!n.closest('defs')).length>1;
@@ -213,7 +213,11 @@ export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean
     }
   }
   root.setAttribute('color',ink);
-  return new XMLSerializer().serializeToString(root);
+  return serializeSvgRoot(root);
+}
+
+export function adaptSvg(source:string,colors:Record<string,string>,dark:boolean,monochrome=false):string {
+  return adaptValidatedSvg(parseValidatedSvg(source),colors,dark,monochrome,{clone:false});
 }
 
 export function decodeSvgDataUri(uri:string):string {

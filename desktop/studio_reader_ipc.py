@@ -145,6 +145,7 @@ def _handle_immediate_command(
     elif command in ("document_sync", "document_patch", "document_resync"):
         target = next((t for t in studio_obj.tabs if t["id"] == args.get("id")), None)
         def commit_edit(content):
+            if callable(mark_touched := getattr(studio_obj, "_mark_tab_touched", None)): mark_touched(target["id"])
             was_dirty = target["content"] != target["saved"]
             target["content"] = content
             if target["id"] == studio_obj.active: studio_obj._last_reader_text = (target["id"], content)
@@ -170,6 +171,7 @@ def _handle_immediate_command(
         target = next((t for t in studio_obj.tabs if t["id"] == args["id"]), None)
         studio_obj.reader_edits.clear(args["id"])
         if target:
+            if callable(mark_touched := getattr(studio_obj, "_mark_tab_touched", None)): mark_touched(target["id"])
             target["content"] = args["content"]
             if target["id"] == studio_obj.active: studio_obj._last_reader_text = (target["id"], target["content"])
         studio_obj.recovery_timer.start(800)

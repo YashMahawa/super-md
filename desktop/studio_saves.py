@@ -360,7 +360,9 @@ def autosave(studio_obj, *, is_dirty_fn=None) -> None:
             studio_obj._save_text(tab, Path(tab["path"]), automatic=True)
 
 def existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
-    if not (cleaned := folder_ops.strip_extended_length_prefix(str(raw_path or "").strip())): return None
+    raw = os.fspath(raw_path) if isinstance(raw_path, os.PathLike) else str(raw_path or "")
+    cleaned = folder_ops.strip_extended_length_prefix(raw)
+    if not cleaned or not cleaned.strip(): return None
     try:
         candidate = Path(cleaned).expanduser()
         if reject_links:
@@ -375,11 +377,12 @@ def downloads_fallback_directory(cls=None, *, writable_location_fn=_default_writ
     raw_downloads = writable_location_fn(QStandardPaths.StandardLocation.DownloadLocation)
     for candidate in (raw_downloads, Path.home()):
         if (existing := existing_fn(candidate)) is not None: return existing
-    return Path(folder_ops.strip_extended_length_prefix(str(raw_downloads or "").strip()) or str(Path.home())).expanduser()
+    raw = str(raw_downloads or "")
+    return Path(folder_ops.strip_extended_length_prefix(raw) if raw.strip() else str(Path.home())).expanduser()
 
 def default_output_directory(studio_obj, *, writable_location_fn=_default_writable_location) -> Path:
-    raw = studio_obj.settings.get("newNoteLocation") or writable_location_fn(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
-    return Path(folder_ops.strip_extended_length_prefix(str(raw or "").strip()) or str(Path.home())).expanduser()
+    raw_str = str(studio_obj.settings.get("newNoteLocation") or writable_location_fn(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home()) or "")
+    return Path(folder_ops.strip_extended_length_prefix(raw_str) if raw_str.strip() else str(Path.home())).expanduser()
 
 def note_save_directory(studio_obj, *, writable_location_fn=_default_writable_location) -> Path:
     existing_fn = getattr(studio_obj, "_existing_save_directory", existing_save_directory)
@@ -393,8 +396,8 @@ def save_as_directory(studio_obj, *, writable_location_fn=_default_writable_loca
     current_fn = getattr(studio_obj, "_current", None)
     current_tab = current_fn() if callable(current_fn) and studio_obj.tabs else (studio_obj.tabs[0] if getattr(studio_obj, "tabs", None) else {})
     if studio_obj.tabs and (current_path := current_tab.get("path")):
-        if cleaned := folder_ops.strip_extended_length_prefix(str(current_path).strip()):
-            if (parent := existing_fn(Path(cleaned).expanduser().parent)) is not None: return parent
+        cleaned = folder_ops.strip_extended_length_prefix(str(current_path))
+        if cleaned.strip() and (parent := existing_fn(Path(cleaned).expanduser().parent)) is not None: return parent
     note_dir_fn = getattr(studio_obj, "_note_save_directory", None)
     return note_dir_fn() if callable(note_dir_fn) else note_save_directory(studio_obj, writable_location_fn=writable_location_fn)
 
