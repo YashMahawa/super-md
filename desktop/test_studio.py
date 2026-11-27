@@ -2032,8 +2032,7 @@ class StudioTest(unittest.TestCase):
             self.assertNotRegex(assoc_text, r"(?i)\.(qmd|rmd)\b", f"Unexpected OS association in {assoc_rel}")
 
         import studio as studio_mod
-        if hasattr(studio_mod, "FOLDER_TREE_NOTE_SUFFIXES"):
-            self.assertEqual(studio_mod.FOLDER_TREE_NOTE_SUFFIXES, frozenset({".md", ".smd", ".txt"}))
+        self.assertEqual(studio_mod.FOLDER_TREE_NOTE_SUFFIXES, frozenset({".md", ".smd", ".txt"}))
 
         folder = self.studio.data / "quarto-rmd-workspace"
         sub = folder / "biostats"
@@ -2094,12 +2093,9 @@ class StudioTest(unittest.TestCase):
         (folder / "dataset.csv").write_text("a,b\n1,2\n", encoding="utf-8")
 
         studio = self.studio
-        hides_qmd_only_subfolder = hasattr(studio_mod, "_directory_has_visible_note") and bool(
-            studio.settings.get("hideNonNoteFolders", True)
-        )
+        self.assertTrue(studio.settings["hideNonNoteFolders"])
         expected_root_entries = [
             ("biostats", True),
-            *(() if hides_qmd_only_subfolder else (("quarto-archive", True),)),
             ("ClinicalTrial.Rmd", False),
             ("MixedCase.qMd", False),
             ("quarto-guide.qmd", False),
@@ -2107,6 +2103,15 @@ class StudioTest(unittest.TestCase):
         ]
 
         studio.openFolder(str(folder))
+        self._wait_for(lambda: [(e["name"], e["directory"]) for e in studio.files] == expected_root_entries)
+
+        # Opting out of hideNonNoteFolders reveals the .qmd-only subfolder; default True hides it again.
+        studio.setting("hideNonNoteFolders", "false")
+        self._wait_for(
+            lambda: [(e["name"], e["directory"]) for e in studio.files]
+            == [("biostats", True), ("quarto-archive", True), *expected_root_entries[1:]]
+        )
+        studio.setting("hideNonNoteFolders", "true")
         self._wait_for(lambda: [(e["name"], e["directory"]) for e in studio.files] == expected_root_entries)
 
         # Expanding an already-visible folder lists .Rmd/.rmd/.rMd alongside .md notes.
@@ -2117,7 +2122,6 @@ class StudioTest(unittest.TestCase):
             ("Overview.md", False),
             ("SurvivalModel.RMD", False),
             ("weird.rMd", False),
-            *(() if hides_qmd_only_subfolder else (("quarto-archive", True),)),
             ("ClinicalTrial.Rmd", False),
             ("MixedCase.qMd", False),
             ("quarto-guide.qmd", False),

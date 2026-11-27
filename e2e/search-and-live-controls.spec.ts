@@ -344,3 +344,475 @@ test("Desktop workspace (App.tsx) hides Replace in Read view, wraps Previous 0/N
   await imgBlock.getByRole("button", { name: "Edit block" }).click();
   await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue(`![Chart figure](${tinyPng})`);
 });
+
+test("Seeded folder-search handoff reveals exact offscreen windowed occurrences into the viewport and falls back cleanly on stale ranges", async ({ page }) => {
+  await page.addInitScript(() => {
+    window.SuperMD = { post: () => {} };
+  });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const filler = "Windowed study prose paragraph with context for offscreen scrolling.\n\n".repeat(40);
+  const content =
+    `# Seeded Handoff\n\nIntro AuroraPin occurrence one.\n\n` +
+    Array.from({ length: 50 }, (_, i) => {
+      if (i === 18) return `## Section ${i}\n\nMidway AuroraPin occurrence two.\n\n${filler}`;
+      if (i === 35) return `## Section ${i}\n\nDeep offscreen AuroraPin occurrence three.\n\n${filler}`;
+      if (i === 42) return `## Section ${i}\n\n💡 Unicode Hauptstraße offscreen target.\n\n${filler}`;
+      if (i === 46) return `## Section ${i}\n\nHidden [portal link](https://example.org/AuroraHiddenUrl) target.\n\n${filler}`;
+      return `## Section ${i}\n\n${filler}`;
+    }).join("");
+  expect(content.length).toBeGreaterThan(85_000);
+
+  const firstStart = content.indexOf("AuroraPin");
+  const secondStart = content.indexOf("AuroraPin", firstStart + 1);
+  const thirdStart = content.indexOf("AuroraPin", secondStart + 1);
+  const unicodeStart = content.indexOf("straße");
+  const hiddenStart = content.indexOf("AuroraHiddenUrl");
+
+  for (const mode of ["reader", "live"] as const) {
+    // 1. Fresh load with a #116 shared source anchor on Section 18 + seededFind to the 3rd occurrence -> seededFind wins (3 / 3 in viewport).
+    await page.evaluate(
+      ({ content, mode, secondStart, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          viewState: {
+            top: 4200,
+            anchor: { offset: secondStart, mode, zoom: 100, readingTop: 4200 },
+          },
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { content, mode, secondStart, thirdStart }
+    );
+
+    await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+    const section35 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Deep offscreen AuroraPin occurrence three." });
+    await expect(section35).toBeVisible();
+    await expect(section35).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
+
+    // 2. Unicode casefold + astral emoji UTF-16 offscreen occurrence ("strasse" -> "straße" after 💡) -> mounted & in viewport.
+    await page.evaluate(
+      ({ unicodeStart }) =>
+        window.supermdFind?.("strasse", {
+          caseSensitive: false,
+          sourceStart: unicodeStart,
+          sourceEnd: unicodeStart + "straße".length,
+          matchText: "straße",
+        }),
+      { unicodeStart }
+    );
+    const section42 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "💡 Unicode Hauptstraße offscreen target." });
+    await expect(section42).toBeVisible();
+    await expect(section42).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(true);
+
+    // 3. Offscreen hidden Markdown URL hit -> mounts & scrolls enclosing block into viewport with "In Markdown source".
+    await page.evaluate(
+      ({ hiddenStart }) =>
+        window.supermdFind?.("AuroraHiddenUrl", {
+          caseSensitive: true,
+          sourceStart: hiddenStart,
+          sourceEnd: hiddenStart + "AuroraHiddenUrl".length,
+          matchText: "AuroraHiddenUrl",
+        }),
+      { hiddenStart }
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("In Markdown source");
+    const section46 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Hidden portal link target." });
+    await expect(section46).toBeVisible();
+    await expect(section46).toBeInViewport();
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+
+    // 4. #72 pendingHeading link destination followed by same-note supermdLoad seededFind -> neither pendingHeading nor anchored() overrides seeded occurrence.
+    await page.evaluate(() => window.supermdDismiss?.());
+    await page.evaluate(
+      ({ content, mode }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          pendingHeading: { heading: "Section 18", token: `heading-${mode}-1` },
+        }),
+      { content, mode }
+    );
+    await page.evaluate(
+      ({ content, mode, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { content, mode, thirdStart }
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+    await expect(section35).toBeInViewport();
+
+    // 5. Stale result after an edit + cross-note anchor restoration:
+    //    - Scroll Note A to Section 18, switch to Note B via valid seeded occurrence (3 / 3), then switch back to Note A -> Section 18 anchor restored!
+    //    - Edit Note B's 3rd occurrence out, then switch from Note A to Note B with the stale 3rd-occurrence seed ->
+    //      Note B restores its cross-note anchor at Section 35 and shows passive "0 / 2" WITHOUT jumping to Occurrence #1!
+    const otherNoteContent =
+      `# Secondary Note\n\nIntro AuroraPin in note A.\n\n` +
+      Array.from({ length: 36 }, (_, i) =>
+        i === 18 ? `## Other Section 18\n\nAnchored paragraph in note A.\n\n${filler}` : `## Other Section ${i}\n\n${filler}`,
+      ).join("");
+    await page.evaluate(() => window.supermdDismiss?.());
+    await page.evaluate(
+      ({ otherNoteContent, mode }) =>
+        window.supermdLoad?.({
+          id: `other-note-${mode}`,
+          content: otherNoteContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+        }),
+      { otherNoteContent, mode },
+    );
+    const otherSection18Offset = otherNoteContent.indexOf("## Other Section 18");
+    await page.evaluate(
+      ({ otherNoteContent, mode, otherSection18Offset }) =>
+        window.supermdLoad?.({
+          id: `other-note-${mode}`,
+          content: otherNoteContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          pendingHeading: { heading: "Other Section 18", token: `other-heading-${mode}` },
+          viewState: { top: 0, anchor: { offset: otherSection18Offset, mode, zoom: 100 } },
+        }),
+      { otherNoteContent, mode, otherSection18Offset },
+    );
+    const otherSection18 = page.locator("p", { hasText: "Anchored paragraph in note A." });
+    await expect(otherSection18).toBeInViewport();
+    await page.evaluate(() => {
+      document.querySelector<HTMLElement>(".android-reading")?.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+
+    // Jump from Note A -> Note B's 3rd occurrence (valid cross-note seededFind).
+    await page.evaluate(
+      ({ content, mode, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { content, mode, thirdStart },
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("3 / 3");
+    await expect(section35).toBeInViewport();
+
+    // Switch back from Note B -> Note A while .reading-search remains open: Note A's cross-note anchor at Other Section 18 is preserved!
+    await page.evaluate(
+      ({ otherNoteContent, mode }) =>
+        window.supermdLoad?.({
+          id: `other-note-${mode}`,
+          content: otherNoteContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+        }),
+      { otherNoteContent, mode },
+    );
+    await expect(otherSection18).toBeInViewport();
+
+    // Edit Note B so the 3rd occurrence is removed, then open the stale 3rd-occurrence result on Note B:
+    // Note B restores its cross-note anchor at Section 35 and shows "0 / 2" WITHOUT jumping to Occurrence #1 at the top!
+    const editedContent = content.slice(0, thirdStart) + "EditedOut" + content.slice(thirdStart + "AuroraPin".length);
+    await page.evaluate(
+      ({ editedContent, mode, thirdStart }) =>
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content: editedContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+          seededFind: {
+            query: "AuroraPin",
+            caseSensitive: true,
+            sourceStart: thirdStart,
+            sourceEnd: thirdStart + "AuroraPin".length,
+            matchText: "AuroraPin",
+          },
+        }),
+      { editedContent, mode, thirdStart },
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+    const editedSection35 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Deep offscreen EditedOut occurrence three." });
+    await expect(editedSection35).toBeVisible();
+    await expect(editedSection35).toBeInViewport();
+    const introMatch = page.locator("p").filter({ hasText: "Intro AuroraPin occurrence one." });
+    await expect(introMatch).not.toBeInViewport();
+
+    // Same-note stale supermdFind after an insertion before old offsets also stays at Section 35 without jumping to Occurrence #1 or #2.
+    const shiftedContent = "Prepended edit line.\n\n" + editedContent;
+    await page.evaluate(
+      ({ shiftedContent, mode, secondStart }) => {
+        window.supermdLoad?.({
+          id: `seeded-${mode}`,
+          content: shiftedContent,
+          path: null,
+          mode,
+          dark: false,
+          fullscreen: false,
+          colors: {},
+          font: "Manrope",
+          size: 18,
+          zoom: 100,
+        });
+        window.supermdFind?.("AuroraPin", {
+          caseSensitive: true,
+          sourceStart: secondStart,
+          sourceEnd: secondStart + "AuroraPin".length,
+          matchText: "AuroraPin",
+        });
+      },
+      { shiftedContent, mode, secondStart },
+    );
+    await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+    expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+    await expect(editedSection35).toBeInViewport();
+    await expect(introMatch).not.toBeInViewport();
+  }
+});
+
+test("Replacement input disables spelling/autocorrections, ignores Enter during inactive/invalid/IME states, and advances the real viewport on Enter", async ({ page }) => {
+  const filler = "Windowed study prose paragraph with equations $x_n + y_n$ for offscreen scrolling.\n\n".repeat(36);
+  let content =
+    `# Replace Enter Spec\n\nIntro ReplaceTarget-01 at top.\n\n` +
+    Array.from({ length: 48 }, (_, i) => {
+      if (i === 22) return `## Section ${i}\n\nMidway ReplaceTarget-22 offscreen match.\n\n${filler}`;
+      if (i === 42) return `## Section ${i}\n\n> [!NOTE]- Folded tail callout\n> Deep ReplaceTarget-42 tail match.\n\n${filler}`;
+      return `## Section ${i}\n\n${filler}`;
+    }).join("");
+  expect(content.length).toBeGreaterThan(85_000);
+
+  await page.exposeFunction("onReplaceEnterChange", (_id: string, command: string, raw: string) => {
+    if (command === "document_changed") content = JSON.parse(raw).content;
+  });
+  await page.addInitScript(() => {
+    window.SuperMD = { post: (id, command, raw) => (window as any).onReplaceEnterChange(id, command, raw) };
+  });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  await page.evaluate(
+    (text) =>
+      window.supermdLoad?.({
+        id: "replace-enter-live",
+        content: text,
+        path: null,
+        mode: "live",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+        spellCheck: true,
+        grammarCheck: true,
+      }),
+    content
+  );
+  await expect(page.locator('[data-windowed-mounted="false"]')).not.toHaveCount(0);
+
+  await page.evaluate(() => window.supermdFind?.(true));
+  const searchbox = page.getByRole("searchbox", { name: "Find in note" });
+  const replaceInput = page.getByRole("textbox", { name: "Replacement text" });
+  await expect(replaceInput).toBeVisible();
+
+  // 1. Replacement input disables spelling and automatic corrections for literal Markdown text.
+  await expect(replaceInput).toHaveAttribute("type", "text");
+  await expect(replaceInput).toHaveAttribute("spellcheck", "false");
+  await expect(replaceInput).toHaveAttribute("autocorrect", "off");
+  await expect(replaceInput).toHaveAttribute("autocapitalize", "none");
+  await expect(replaceInput).toHaveAttribute("autocomplete", "off");
+  expect(await replaceInput.evaluate((el: HTMLInputElement) => el.spellcheck)).toBe(false);
+
+  // Type literal Markdown syntax via real keyboard input.
+  await replaceInput.click();
+  await page.keyboard.type("`replaced_md`");
+  await expect(replaceInput).toHaveValue("`replaced_md`");
+
+  // 2. Inactive at empty query and at passive 0 / 3: Enter in replacement input does not mutate or scroll.
+  await page.keyboard.press("Enter");
+  expect(content).toContain("ReplaceTarget-01");
+
+  await searchbox.fill("ReplaceTarget-\\d+");
+  await page.getByRole("button", { name: "Regular expression" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 3");
+  await replaceInput.focus();
+  await page.keyboard.press("Enter");
+  expect(content).toContain("ReplaceTarget-01");
+  expect(await page.evaluate(() => document.querySelector<HTMLElement>(".android-reading")!.scrollTop)).toBe(0);
+
+  // 3. Invalid regular expression: Enter in replacement input does not mutate or scroll.
+  await searchbox.fill("([unclosed");
+  await expect(page.locator(".reading-search output")).toHaveText("Invalid regular expression");
+  await replaceInput.focus();
+  await page.keyboard.press("Enter");
+  expect(content).toContain("ReplaceTarget-01");
+
+  // Restore valid regex and step to 1 / 3 at top of note.
+  await searchbox.fill("ReplaceTarget-(\\d+)");
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 3");
+  await replaceInput.fill("`item_$1`");
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 3");
+
+  const section22 = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Midway ReplaceTarget-22 offscreen match." });
+  await expect(section22).toHaveCount(0);
+
+  // 4. In-progress IME composition in the real replacement input ignores Enter until composition ends.
+  const cdp = await page.context().newCDPSession(page);
+  await replaceInput.focus();
+  await replaceInput.selectText();
+  await cdp.send("Input.imeSetComposition", {
+    text: "`item_$1`",
+    selectionStart: 9,
+    selectionEnd: 9,
+  });
+  const composingHandled = await replaceInput.evaluate((el) => {
+    const ev = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, isComposing: true });
+    el.dispatchEvent(ev);
+    return ev.defaultPrevented;
+  });
+  expect(composingHandled).toBe(false);
+  expect(content).toContain("ReplaceTarget-01");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 3");
+  await cdp.send("Input.insertText", { text: "`item_$1`" });
+  await expect(replaceInput).toHaveValue("`item_$1`");
+
+  // 5. Real Enter on valid selected match 1 / 3 replaces match 1, keeps focus in replacement input, and settles offscreen Section 22 in viewport!
+  await page.keyboard.press("Enter");
+  await expect.poll(() => content).toContain("Intro `item_01` at top.");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 2");
+  await expect(replaceInput).toBeFocused();
+  await expect(section22).toBeVisible();
+  await expect(section22).toBeInViewport();
+
+  // 6. Second consecutive Enter (without refocusing) replaces Section 22 and advances viewport + opens folded callout at Section 42!
+  await page.keyboard.press("Enter");
+  await expect.poll(() => content).toContain("Midway `item_22` offscreen match.");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 1");
+  await expect(replaceInput).toBeFocused();
+  const section42Callout = page.locator("details.callout").filter({ hasText: "Deep ReplaceTarget-42 tail match." });
+  await expect(section42Callout).toHaveAttribute("open", "");
+  await expect(section42Callout).toBeInViewport();
+
+  // 7. Source mode: Enter in replacement input replaces line 1 match and scrolls CodeMirror viewport to distant offscreen match.
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".reading-search")).toHaveCount(0);
+  const sourceNote = [
+    "SourceToken-top on line 1.",
+    ...Array.from({ length: 140 }, (_, idx) => `Line ${idx + 2} filler prose in Markdown source editor.`),
+    "SourceToken-bottom at line 142.",
+  ].join("\n");
+  await page.evaluate(
+    (text) => {
+      window.supermdLoad?.({
+        id: "replace-enter-source",
+        content: text,
+        path: null,
+        mode: "editor",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+        spellCheck: true,
+      });
+      window.supermdFind?.(true);
+    },
+    sourceNote
+  );
+  await searchbox.fill("SourceToken-\\w+");
+  await page.getByRole("button", { name: "Regular expression" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 2");
+  expect(await page.evaluate(() => document.querySelector<HTMLElement>(".cm-scroller")!.scrollTop)).toBeLessThan(80);
+
+  await replaceInput.fill("`replaced_source`");
+  await replaceInput.focus();
+  await page.keyboard.press("Enter");
+  await expect.poll(() => content).toContain("`replaced_source` on line 1.");
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 1");
+  await expect(replaceInput).toBeFocused();
+  await expect
+    .poll(() => page.evaluate(() => document.querySelector<HTMLElement>(".cm-scroller")!.scrollTop))
+    .toBeGreaterThan(500);
+  await expect(page.locator(".cm-content")).toContainText("SourceToken-bottom at line 142.");
+});

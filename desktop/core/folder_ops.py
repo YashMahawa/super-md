@@ -100,8 +100,10 @@ def _pure_path(raw: str) -> PurePath:
 
 def canonical_path_str(path: str | os.PathLike[str]) -> str:
     """Return a resolved, normalized path string without Win32 \\\\?\\ prefixes."""
-    raw = strip_extended_length_prefix(str(path or "").strip())
-    if not raw:
+    if path is None:
+        return ""
+    raw = strip_extended_length_prefix(os.fspath(path) if isinstance(path, os.PathLike) else str(path))
+    if not raw or not raw.strip():
         return ""
     try:
         return os.path.normpath(strip_extended_length_prefix(str(os.path.realpath(raw))))
@@ -163,9 +165,9 @@ def resolve_within_open_folder(
     must_exist: bool = True,
 ) -> Path:
     """Resolve *target* inside *open_root*, rejecting symlinks and paths outside the open folder."""
-    root_str = strip_extended_length_prefix(str(open_root or "").strip())
-    target_str = strip_extended_length_prefix(str(target or "").strip())
-    if not root_str or not target_str:
+    root_str = strip_extended_length_prefix(os.fspath(open_root) if isinstance(open_root, os.PathLike) else str(open_root or ""))
+    target_str = strip_extended_length_prefix(os.fspath(target) if isinstance(target, os.PathLike) else str(target or ""))
+    if not root_str.strip() or not target_str.strip():
         raise ValueError("Open a folder first.")
     raw_root = Path(root_str)
     if _is_link_or_junction(raw_root):

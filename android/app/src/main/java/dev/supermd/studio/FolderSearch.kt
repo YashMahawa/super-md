@@ -52,6 +52,9 @@ data class FolderSearchMatch(
     val matchEnd: Int,
     val dirty: Boolean,
     val isOpen: Boolean,
+    val sourceStart: Int = -1,
+    val sourceEnd: Int = -1,
+    val matchText: String = "",
 )
 
 data class FolderSearchState(
@@ -544,10 +547,12 @@ private suspend fun searchMarkdownLines(
     val limit = minOf(MAX_MATCHES_PER_NOTE, remainingBudget)
     val found = ArrayList<FolderSearchMatch>()
     var truncated = false
+    var lineStartUtf16 = 0
 
     for (lineIdx in searchLines.indices) {
         coroutineContext.ensureActive()
-        val origLine = origLines.getOrElse(lineIdx) { "" }.trimEnd('\r')
+        val rawOrigLine = origLines.getOrElse(lineIdx) { "" }
+        val origLine = rawOrigLine.trimEnd('\r')
         val searchLine = searchLines[lineIdx].trimEnd('\r')
         for (span in findLineMatchSpans(searchLine, query, foldedNeedle, caseSensitive)) {
             if (found.size >= limit) {
@@ -571,9 +576,13 @@ private suspend fun searchMarkdownLines(
                     matchEnd = slice.matchEnd,
                     dirty = dirty,
                     isOpen = isOpen,
+                    sourceStart = lineStartUtf16 + origStart,
+                    sourceEnd = lineStartUtf16 + origEnd,
+                    matchText = origLine.substring(origStart, origEnd),
                 ),
             )
         }
+        lineStartUtf16 += rawOrigLine.length + 1
         if (truncated) break
     }
     return found to truncated

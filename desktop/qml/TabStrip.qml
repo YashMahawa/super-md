@@ -7,15 +7,23 @@ ScrollView {
     id: strip
     objectName: "tabStrip"
     required property var viewState
+    property var tabs: typeof studio !== "undefined" && studio && studio.tabsSnapshot !== undefined
+        ? JSON.parse(studio.tabsSnapshot)
+        : (strip.viewState && strip.viewState.tabs ? strip.viewState.tabs : [])
+    property string activeTabId: typeof studio !== "undefined" && studio && studio.activeTabId !== undefined
+        ? String(studio.activeTabId)
+        : (strip.viewState && strip.viewState.active ? String(strip.viewState.active) : "")
     property var shortcutLabels: ({})
-    readonly property string activeTabId: strip.viewState && strip.viewState.active ? String(strip.viewState.active) : ""
-    readonly property int tabCount: strip.viewState && strip.viewState.tabs ? strip.viewState.tabs.length : 0
+    readonly property int tabCount: strip.tabs ? strip.tabs.length : 0
     readonly property int activeTabIndex: {
-        const tabs = strip.viewState && strip.viewState.tabs ? strip.viewState.tabs : []
-        for (let index = 0; index < tabs.length; index += 1) {
-            if (tabs[index].id === strip.activeTabId) return index
+        const list = strip.tabs || []
+        for (let index = 0; index < list.length; index += 1) {
+            if (list[index].id === strip.activeTabId) return index
         }
         return -1
+    }
+    ListModel {
+        id: tabModel
     }
     property bool draggingTab: false
     property bool rebuildingTabs: false
@@ -36,6 +44,61 @@ ScrollView {
         interval: 0
         repeat: false
         onTriggered: strip.revealActiveTab()
+    }
+    function syncTabModel() {
+        const list = strip.tabs || []
+        const desired = []
+        const desiredIds = {}
+        for (let index = 0; index < list.length; index += 1) {
+            const entry = list[index]
+            if (!entry || entry.id === undefined || entry.id === null) continue
+            const id = String(entry.id)
+            desiredIds[id] = true
+            desired.push({
+                tabId: id,
+                tabName: String(entry.name || ""),
+                tabPath: String(entry.path || ""),
+                tabDirty: Boolean(entry.dirty),
+                tabConflict: Boolean(entry.conflict)
+            })
+        }
+        let structureChanged = false
+        for (let index = tabModel.count - 1; index >= 0; index -= 1) {
+            if (!desiredIds[tabModel.get(index).tabId]) {
+                tabModel.remove(index, 1)
+                structureChanged = true
+            }
+        }
+        for (let index = 0; index < desired.length; index += 1) {
+            const nextEntry = desired[index]
+            let foundIndex = -1
+            for (let scan = index; scan < tabModel.count; scan += 1) {
+                if (tabModel.get(scan).tabId === nextEntry.tabId) {
+                    foundIndex = scan
+                    break
+                }
+            }
+            if (foundIndex === -1) {
+                tabModel.insert(index, nextEntry)
+                structureChanged = true
+                continue
+            }
+            if (foundIndex !== index) {
+                tabModel.move(foundIndex, index, 1)
+                structureChanged = true
+            }
+            const currentEntry = tabModel.get(index)
+            if (currentEntry.tabName !== nextEntry.tabName) tabModel.setProperty(index, "tabName", nextEntry.tabName)
+            if (currentEntry.tabPath !== nextEntry.tabPath) tabModel.setProperty(index, "tabPath", nextEntry.tabPath)
+            if (currentEntry.tabDirty !== nextEntry.tabDirty) tabModel.setProperty(index, "tabDirty", nextEntry.tabDirty)
+            if (currentEntry.tabConflict !== nextEntry.tabConflict) tabModel.setProperty(index, "tabConflict", nextEntry.tabConflict)
+        }
+        if (tabModel.count > desired.length) {
+            tabModel.remove(desired.length, tabModel.count - desired.length)
+            structureChanged = true
+        }
+        if (structureChanged) strip.rebuildingTabs = true
+        scheduleRevealActiveTab()
     }
     function noteStem(name) {
         const raw = name || ""
@@ -62,11 +125,11 @@ ScrollView {
             return
         }
         let activeItem = tabRepeater.itemAt(strip.activeTabIndex)
-        if (!activeItem || !activeItem.modelData || activeItem.modelData.id !== strip.activeTabId) {
+        if (!activeItem || activeItem.tabId !== strip.activeTabId) {
             activeItem = null
             for (let index = 0; index < tabRepeater.count; index += 1) {
                 const candidate = tabRepeater.itemAt(index)
-                if (candidate && candidate.modelData && candidate.modelData.id === strip.activeTabId) {
+                if (candidate && candidate.tabId === strip.activeTabId) {
                     activeItem = candidate
                     break
                 }
@@ -101,16 +164,13 @@ ScrollView {
         target: strip.contentItem
         function onContentWidthChanged() { Qt.callLater(strip.revealActiveTab) }
     }
-    onViewStateChanged: {
-        strip.rebuildingTabs = true
-        scheduleRevealActiveTab()
-    }
+    onTabsChanged: syncTabModel()
     onActiveTabIdChanged: scheduleRevealActiveTab()
     onActiveTabIndexChanged: scheduleRevealActiveTab()
     onTabCountChanged: scheduleRevealActiveTab()
     onWidthChanged: scheduleRevealActiveTab()
     onAvailableWidthChanged: scheduleRevealActiveTab()
-    Component.onCompleted: scheduleRevealActiveTab()
+    Component.onCompleted: syncTabModel()
     function openRename(id, name) {
         renameDialog.noteId = id
         renameField.text = name
@@ -172,12 +232,16 @@ ScrollView {
         onImplicitWidthChanged: strip.scheduleRevealActiveTab()
         Repeater {
             id: tabRepeater
-            model: strip.viewState.tabs
+            model: tabModel
             delegate: Rectangle {
                 id: tab
-                required property var modelData
                 required property int index
-                readonly property bool isActive: modelData.id === strip.activeTabId
+                required property string tabId
+                required property string tabName
+                required property string tabPath
+                required property bool tabDirty
+                required property bool tabConflict
+                readonly property bool isActive: tabId === strip.activeTabId
                 width: Math.min(260, label.implicitWidth + 64)
                 height: 40
                 y: (strip.height - height) / 2
@@ -186,19 +250,22 @@ ScrollView {
                 objectName: "noteTab"
                 radius: 18
                 antialiasing: true
-                color: modelData.id === strip.viewState.active ? strip.viewState.colors["surface-high"] : strip.viewState.colors.surface
+                color: tab.isActive ? strip.viewState.colors["surface-high"] : strip.viewState.colors.surface
                 Drag.dragType: Drag.Automatic
                 Drag.supportedActions: Qt.MoveAction
                 Drag.proposedAction: Qt.MoveAction
-                Drag.mimeData: ({"application/x-supermd-tab": JSON.stringify({window: studio.windowId, tab: modelData.id})})
-                Drag.onDragFinished: function(action) { const id = modelData.id; tab.Drag.active = false; strip.draggingTab = false; Qt.callLater(function() { studio.finishTabDrag(id, action); strip.scheduleRevealActiveTab() }) }
+                Drag.mimeData: ({"application/x-supermd-tab": JSON.stringify({window: typeof studio !== "undefined" && studio ? studio.windowId : "", tab: tab.tabId})})
+                Drag.onDragFinished: function(action) { const id = tab.tabId; tab.Drag.active = false; strip.draggingTab = false; Qt.callLater(function() { studio.finishTabDrag(id, action); strip.scheduleRevealActiveTab() }) }
                 DragHandler {
                     target: null
                     onActiveChanged: {
                         strip.draggingTab = active
-                        if (active) preview.grabToImage(function(result) {
-                            if (dragHandler.active) { tab.Drag.imageSource = result.url; tab.Drag.active = true }
-                        })
+                        if (active) {
+                            if (typeof studio !== "undefined" && studio) previewBody.text = studio.tabPreview(tab.tabId)
+                            preview.grabToImage(function(result) {
+                                if (dragHandler.active) { tab.Drag.imageSource = result.url; tab.Drag.active = true }
+                            })
+                        }
                     }
                     id: dragHandler
                 }
@@ -211,26 +278,26 @@ ScrollView {
                     color:strip.viewState.colors.surface;border.width:1;border.color:strip.viewState.colors.primary
                     Column {
                         anchors.fill:parent;anchors.margins:16;spacing:10
-                        Label {text:tab.modelData.name;font.weight:Font.DemiBold;width:parent.width;elide:Text.ElideRight}
+                        Label {text:tab.tabName;font.weight:Font.DemiBold;width:parent.width;elide:Text.ElideRight}
                         Label {text:"Release outside tabs to open a window";font.pixelSize:11;color:strip.viewState.colors.muted}
-                        Label {text:studio.tabPreview(tab.modelData.id);textFormat:Text.PlainText;width:parent.width;height:105;clip:true;wrapMode:Text.WordWrap;font.pixelSize:12;color:strip.viewState.colors.text}
+                        Label {id:previewBody;text:typeof studio !== "undefined" && studio && tab.tabId ? studio.tabPreview(tab.tabId) : "";textFormat:Text.PlainText;width:parent.width;height:105;clip:true;wrapMode:Text.WordWrap;font.pixelSize:12;color:strip.viewState.colors.text}
                     }
                 }
                 TapHandler { acceptedButtons: Qt.RightButton; onTapped: tabMenu.popup() }
                 NoteContextMenu {
                     id: tabMenu
                     objectName: "tabContextMenu"
-                    NoteMenuItem { objectName: "renameTabAction"; text: "Rename note"; shortcutText: tab.isActive ? (strip.shortcutLabels.rename_entry || "") : ""; icon.source: "../icons/Rename.svg"; onTriggered: strip.openRename(tab.modelData.id, tab.modelData.name) }
-                    NoteMenuItem { text: "Undo"; shortcutText: strip.shortcutLabels.undo || ""; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("undo") }
-                    NoteMenuItem { text: "Redo"; shortcutText: strip.shortcutLabels.redo || ""; enabled: tab.modelData.id===strip.viewState.active; onTriggered:studio.command("redo") }
+                    NoteMenuItem { objectName: "renameTabAction"; text: "Rename note"; shortcutText: tab.isActive ? (strip.shortcutLabels.rename_entry || "") : ""; icon.source: "../icons/Rename.svg"; onTriggered: strip.openRename(tab.tabId, tab.tabName) }
+                    NoteMenuItem { objectName: "undoTabAction"; text: "Undo"; shortcutText: strip.shortcutLabels.undo || ""; enabled: tab.isActive; onTriggered:studio.command("undo") }
+                    NoteMenuItem { objectName: "redoTabAction"; text: "Redo"; shortcutText: strip.shortcutLabels.redo || ""; enabled: tab.isActive; onTriggered:studio.command("redo") }
                     MenuSeparator {}
-                    NoteMenuItem { text: "Move to new window"; onTriggered: studio.detachTab(tab.modelData.id) }
+                    NoteMenuItem { objectName: "detachTabAction"; text: "Move to new window"; onTriggered: { const id = tab.tabId; Qt.callLater(function() { studio.detachTab(id) }) } }
                 }
                 RowLayout {
                     anchors.fill: parent
                     spacing: 0
-                    ActionButton { id: label; compact: true; text: (modelData.dirty ? "• " : "") + modelData.name; Layout.fillWidth: true; ToolTip.text: modelData.path || modelData.name; onClicked: studio.selectTab(modelData.id) }
-                    ActionButton { glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + modelData.name; ToolTip.text: tab.isActive ? strip.shortcutHint("Close " + modelData.name, "close_tab", "") : "Close " + modelData.name; onClicked: studio.closeTabSafely(modelData.id) }
+                    ActionButton { id: label; objectName: "noteTabLabel"; compact: true; text: (tab.tabDirty ? "• " : "") + tab.tabName; Layout.fillWidth: true; ToolTip.text: tab.tabPath || tab.tabName; onClicked: studio.selectTab(tab.tabId) }
+                    ActionButton { objectName: "noteTabCloseButton"; glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + tab.tabName; ToolTip.text: tab.isActive ? strip.shortcutHint("Close " + tab.tabName, "close_tab", "") : "Close " + tab.tabName; onClicked: { const id = tab.tabId; Qt.callLater(function() { studio.closeTabSafely(id) }) } }
                 }
                 DropArea {
                     id: dropZone
@@ -251,7 +318,7 @@ ScrollView {
             Accessible.name: "New tab"
             ToolTip.text: strip.shortcutHint("New tab", "new_note", "Ctrl+T")
             onClicked: studio.newNote()
-            DropArea { anchors.fill: parent; keys: ["application/x-supermd-tab"]; onDropped: function(drop) { strip.receive(drop, strip.viewState.tabs.length) } }
+            DropArea { anchors.fill: parent; keys: ["application/x-supermd-tab"]; onDropped: function(drop) { strip.receive(drop, strip.tabCount) } }
         }
     }
 }

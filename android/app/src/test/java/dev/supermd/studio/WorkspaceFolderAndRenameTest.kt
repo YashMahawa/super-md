@@ -101,10 +101,11 @@ class WorkspaceFolderAndRenameTest {
 
     @Test
     fun qmdAndRmdOpenFolderListSearchAndOrdinarySavePreserveFilenameAndSource() {
-        assertTrue(OPEN_NOTE_MIME_TYPES.contains("text/*"))
-        assertTrue(OPEN_NOTE_MIME_TYPES.contains("application/octet-stream"))
-        assertTrue(OPEN_NOTE_MIME_TYPES.contains("application/x-quarto"))
-        assertTrue(OPEN_NOTE_MIME_TYPES.contains("application/x-rmarkdown"))
+        val openMimes = noteOpenMimeTypes().toSet()
+        assertTrue(openMimes.contains("text/*"))
+        assertTrue(openMimes.contains("application/octet-stream"))
+        assertTrue(openMimes.contains("application/x-quarto"))
+        assertTrue(openMimes.contains("application/x-rmarkdown"))
 
         val qmdSource = "---\ntitle: \"Quarto Trial\"\n---\n\n```{python}\n#| label: fig-1\nx = [1, 2, 3]\n```\n"
         val rmdSource = "---\ntitle: \"Clinical Rmd\"\n---\n\n```{r setup, include=FALSE}\nknitr::opts_chunk\$set(echo = TRUE)\n```\n"
