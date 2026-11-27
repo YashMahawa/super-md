@@ -45,7 +45,7 @@ import MathRepairPanel from "./components/MathRepairPanel";
 import ThemeGuideDialog from "./components/ThemeGuideDialog";
 import { captureScrollAnchor,markScrollInput,scrollInputVersion } from "./scrollAnchor";
 import {rememberWindowedScrollSource} from './windowedSearch';
-import ReadingSearch, { type ReadingSearchSeed } from "./components/ReadingSearch";
+import ReadingSearch, { isValidSeedOccurrence, type ReadingSearchSeed } from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
 import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
@@ -86,14 +86,42 @@ function parseImportedAnchor(raw: unknown): SharedSourceAnchor | undefined {
     ...(typeof candidate.editorTop === "number" && Number.isFinite(candidate.editorTop) && candidate.editorTop >= 0 ? { editorTop: candidate.editorTop } : {}),
   };
 }
-interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
+interface ReaderState extends ReaderAccessibilityPreference { id: string; content: string; path: string | null; portable?: boolean; mode: "live" | "editor" | "reader" | "split"; dark: boolean; fullscreen: boolean; font: string; size: number; editProtocol?: number; latexAutofix?:boolean; typewriterScroll?:boolean; spellCheck?:boolean; grammarCheck?:boolean; width?: number; widthPercent?:number; lineHeight?:number; colors: Record<string, string>; zoom: number; motion?: boolean; python?: string; viewState?: NoteView }
 declare global { interface Window {supermdAgentRequest?:(request:Record<string,unknown>,callback?:(result:unknown,error:string)=>void)=>void;supermdAgentCompute?:(request:Record<string,unknown>,callback:(result:unknown,error:string)=>void)=>void;supermdThemeGuide?:()=>void;supermdDismiss?:()=>boolean;supermdSetZoom?:(zoom:number,requestedAt?:number)=>void;supermdHeading?:(id:string,offset?:number)=>void;supermdHistory?:(direction:"undo"|"redo")=>void;supermdFormat?:(action:string)=>boolean;supermdNativeWheel?:(dx:number,dy:number,point:Point,held:boolean,modifier?:boolean)=>void;supermdToggleTypewriter?:()=>void;} }
-declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
+declare global { interface Window { supermdLoad?: (state: Omit<ReaderState, "pendingHeading"> & { pendingHeading?: PendingHeadingNavigation | string | null }) => void; supermdExport?: (options: ExportOptions) => void; supermdExportMarkdown?: (archive?: boolean) => void; supermdFind?: (replaceOrQuery?: boolean | string, options?: { caseSensitive?: boolean; replace?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string }) => void; supermdFindStep?: (direction?: number) => void; supermdPortable?: (save: boolean) => void; supermdZoomBy?: (factor:number,focus?:Point)=>void; supermdResetZoom?: ()=>void; supermdRepairMath?: ()=>void; supermdFlush?: (operation:Record<string,string>)=>void } }
 declare global { interface Window {supermdChromeInset?:(height:number)=>void} }
 declare global { interface Window {supermdSavePosition?:()=>void;supermdBeforeNavigate?:()=>Promise<void>} }
 declare global {interface Window {supermdExportPhase?:(id:string,phase:'typesetting'|'publishing')=>void}}
 interface PendingHeadingNavigation { heading: string; token: string }
-interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean}|null }
+interface ReaderState { centerLock?:boolean; customStyle?:CustomStyle; restorePosition?:boolean; readingLocation?:ReadingLocation|null; pendingHeading?:PendingHeadingNavigation|null; imageAppearance?:MediaAppearance; svgAppearance?:MediaAppearance; imageContrast?:number; seededFind?:{query:string;caseSensitive?:boolean;sourceStart?:number;sourceEnd?:number;matchText?:string}|null }
+function normalizeSeedBounds(start?: unknown, end?: unknown, matchText?: unknown): { sourceStart?: number; sourceEnd?: number; matchText?: string } {
+  if (typeof start === "number" && typeof end === "number" && Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end >= start) {
+    return { sourceStart: start, sourceEnd: end, ...(typeof matchText === "string" && matchText ? { matchText } : {}) };
+  }
+  return {};
+}
+function willSeedNavigate(
+  content: string,
+  query: unknown,
+  caseSensitive?: boolean,
+  start?: unknown,
+  end?: unknown,
+  matchText?: unknown,
+): boolean {
+  if (typeof query !== "string" || !query) return false;
+  const trimmedQuery = query.slice(0, 200);
+  const bounds = normalizeSeedBounds(start, end, matchText);
+  if (bounds.sourceStart !== undefined && bounds.sourceEnd !== undefined) {
+    return isValidSeedOccurrence(
+      content,
+      { from: bounds.sourceStart, to: bounds.sourceEnd },
+      trimmedQuery,
+      Boolean(caseSensitive),
+      bounds.matchText,
+    );
+  }
+  return true;
+}
 type AgentDocumentBase={tabId:string;revision:string;sourceLength:number};
 function resolveAgentDiagram(content:string,revision:string,request:Record<string,unknown>,diagramOptions?:AgentDiagramOptions){
   if(request.expectedRevision!==revision)throw Error('A current expectedRevision is required to retrieve this diagram');
@@ -143,6 +171,7 @@ export function Reader() {
   const [searchReplace,setSearchReplace] = useState(false);
   const [searchSeed,setSearchSeed] = useState<ReadingSearchSeed|null>(null);
   const searchSeedNonce = useRef(0);
+  const suppressRestoreForSeed = useRef(false);
   const searchingRef = useRef(false); searchingRef.current = searching;
   const [pdfExport,setPdfExport]=useState<PdfExportStatus|null>(null);
   const exportOwner=useRef<{id:string;controller:AbortController;phase:PdfExportStatus['phase']}|null>(null);
@@ -254,10 +283,13 @@ export function Reader() {
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
       const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
-      const applyIncomingFind=()=>{
+      const applyIncomingFind=(targetContent:string)=>{
         if(seededFind&&typeof seededFind.query==='string'){
+          if(willSeedNavigate(targetContent,seededFind.query,seededFind.caseSensitive,seededFind.sourceStart,seededFind.sourceEnd,seededFind.matchText)){
+            requestAnimationFrame(()=>markScrollInput());
+          }
           searchSeedNonce.current+=1;
-          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:seededFind.query.slice(0,200),caseSensitive:seededFind.caseSensitive,...normalizeSeedBounds(seededFind.sourceStart,seededFind.sourceEnd,seededFind.matchText),nonce:searchSeedNonce.current});
           setSearchReplace(false);
           setSearching(true);
           requestAnimationFrame(()=>window.dispatchEvent(new CustomEvent("supermd-find-focus",{detail:{replace:false}})));
@@ -310,7 +342,7 @@ export function Reader() {
           }
         }
       }
-      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind();return;}
+      if(old&&[...new Set([...Object.keys(old),...Object.keys(next)])].every(key=>key==="zoom"&&old.fullscreen===next.fullscreen?true:key==="viewState"?!next.viewState:key==="colors"||key==="customStyle"||key==="pendingHeading"?JSON.stringify((old as any)[key])===JSON.stringify((next as any)[key]):(old as any)[key]===(next as any)[key])){applyIncomingFind(next.content);return;}
       if (old && old.id !== next.id) {
         savePosition.current();
         const outgoingAnchor=captureSharedAnchor({
@@ -323,6 +355,7 @@ export function Reader() {
         noteViews.current.set(old.id, {top: outgoingAnchor.readingTop ?? 0, anchor: outgoingAnchor, rendered: exportRenderedViews(old.content)});
         if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
         if (suppressedRestoreKey.current?.startsWith(`${old.id}:`)) suppressedRestoreKey.current = null;
+        if (!seededFind) setSearchSeed(null);
         modeAnchor.current=null;
         splitPane.current=null;
       }
@@ -375,9 +408,31 @@ export function Reader() {
           primeEditorAnchor(next.id, null);
         }
       }
-      const load = () => { if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false }); reference.current=loaded;setState(loaded); zoomReference.current = loaded.zoom; applyIncomingFind(); };
+      const hasActiveSeedNavigation = Boolean(
+        seededFind &&
+          willSeedNavigate(
+            loaded.content,
+            seededFind.query,
+            seededFind.caseSensitive,
+            seededFind.sourceStart,
+            seededFind.sourceEnd,
+            seededFind.matchText,
+          ),
+      );
+      const load = () => {
+        if (hasActiveSeedNavigation && (!old || old.id !== loaded.id || old.mode !== loaded.mode)) {
+          suppressRestoreForSeed.current = true;
+          modeAnchor.current = null;
+          primeEditorAnchor(loaded.id, null);
+        }
+        if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false });
+        reference.current = loaded;
+        setState(loaded);
+        zoomReference.current = loaded.zoom;
+        applyIncomingFind(loaded.content);
+      };
       const typewriterChanged = Boolean(old?.typewriterScroll) !== Boolean(loaded.typewriterScroll);
-      if (old?.id === next.id && old.mode === next.mode && !hasNewPendingHeading && !typewriterChanged) anchored(load); else load();
+      if (old?.id === next.id && old.mode === next.mode && !hasNewPendingHeading && !typewriterChanged && !hasActiveSeedNavigation) anchored(load); else load();
     };
     window.supermdHistory=direction=>{
       if(document.querySelector('.theme-guide-dialog'))return;
@@ -528,12 +583,13 @@ export function Reader() {
     };
     window.supermdFind = (replaceOrQuery, options) => {
       if(document.querySelector('.theme-guide-dialog'))return;
+      if(typeof replaceOrQuery==='string'&&willSeedNavigate(reference.current?.content??"",replaceOrQuery,options?.caseSensitive,options?.sourceStart,options?.sourceEnd,options?.matchText))markScrollInput();
       const requestedReplace=typeof replaceOrQuery==="boolean"?replaceOrQuery:Boolean(options?.replace);
       const openReplace=requestedReplace&&reference.current?.mode!=="reader";
       flushSync(()=>{
         if(typeof replaceOrQuery==='string'){
           searchSeedNonce.current+=1;
-          setSearchSeed({query:replaceOrQuery.slice(0,200),caseSensitive:options?.caseSensitive,nonce:searchSeedNonce.current});
+          setSearchSeed({query:replaceOrQuery.slice(0,200),caseSensitive:options?.caseSensitive,...normalizeSeedBounds(options?.sourceStart,options?.sourceEnd,options?.matchText),nonce:searchSeedNonce.current});
           setSearchReplace(openReplace);
         } else if(!searchingRef.current) {
           setSearchReplace(openReplace);
@@ -562,7 +618,8 @@ export function Reader() {
       const current = reference.current; if (!current) return;
       try {
         const latest = await flushExportNote(current);
-        const prepared = await prepareFmd(latest.content, latest.path, noteImageConsent.current.policy(latest.id, trustedHostsRef.current)); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
+        const consentPolicy = noteImageConsent.current.policy(latest.id, trustedHostsRef.current);
+        const prepared = await prepareFmd(latest.content, latest.path, latest.portable !== undefined ? { ...consentPolicy, portable: latest.portable } : consentPolicy); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
     window.supermdExport = async (options) => {
@@ -735,13 +792,24 @@ export function Reader() {
     }
     const startingInput=scrollInputVersion();
     const initialContent=state.content;
+    const hadSearchOverlayAtStart = Boolean(document.querySelector(".reading-search,.cm-search"));
+    const hasDocumentSelection = () => {
+      const sel = window.getSelection();
+      if (!sel || !sel.toString()) return false;
+      const active = document.activeElement;
+      if (active instanceof Element && active.closest(".reading-search,.cm-search")) return false;
+      const anchorEl = sel.anchorNode instanceof Element ? sel.anchorNode : sel.anchorNode?.parentElement;
+      if (anchorEl?.closest(".reading-search,.cm-search")) return false;
+      return true;
+    };
     const shouldStop=()=>
       reference.current?.id!==state.id||
       reference.current?.mode!==state.mode||
       reference.current?.content!==initialContent||
       scrollInputVersion()!==startingInput||
-      Boolean(window.getSelection()?.toString())||
-      Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
+      hasDocumentSelection()||
+      Boolean(document.querySelector(".live-active-block"))||
+      (!hadSearchOverlayAtStart && Boolean(document.querySelector(".reading-search,.cm-search")));
     const runGuarded=(fn:()=>void)=>{
       if(state.mode==="split"){
         const seq=++restoringSplitSeq.current;
@@ -794,6 +862,12 @@ export function Reader() {
       const timers=[120,320,700].map(delay=>window.setTimeout(apply,delay));
       return()=>{stopped=true;cancelAnimationFrame(outerFrame);cancelAnimationFrame(innerFrame);timers.forEach(window.clearTimeout);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));};
     }
+    if (suppressRestoreForSeed.current) {
+      suppressRestoreForSeed.current = false;
+      suppressedRestoreKey.current = null;
+      primeEditorAnchor(state.id, null);
+      return;
+    }
     if (suppressedRestoreKey.current === `${state.id}:${state.mode}`) return;
     suppressedRestoreKey.current = null;
     const cachedView=noteViews.current.get(state.id);
@@ -828,13 +902,17 @@ export function Reader() {
       const updateSelection=firstPass;
       firstPass=false;
       runGuarded(()=>{
+        const readingRoot=document.querySelector<HTMLElement>(".android-reading");
+        const useSourceOffsetForWindowed=
+          Boolean(readingRoot?.querySelector('[data-windowed-mounted="false"]'))&&
+          resolvedAnchor.offset>0;
         applySharedAnchor({
           id:state.id,
           targetMode:state.mode,
           targetZoom:zoomReference.current,
           anchor:resolvedAnchor,
-          readingRoot:document.querySelector<HTMLElement>(".android-reading"),
-          allowExactTop:true,
+          readingRoot,
+          allowExactTop:!useSourceOffsetForWindowed,
           updateSelection,
         });
       });
@@ -1386,7 +1464,7 @@ export function Reader() {
         const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
         const exportContent=section?.text??note.content,{section:_section,archive:_archive,...exportOptions}=suppliedOptions;
         const consentPolicy=noteImageConsent.current.policy(note.id,trustedHostsRef.current);
-        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',consentPolicy):format==='smd'?await prepareFmd(exportContent,note.path,consentPolicy):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
+        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',consentPolicy):format==='smd'?await prepareFmd(exportContent,note.path,note.portable!==undefined?{...consentPolicy,portable:note.portable}:consentPolicy):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
         const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format:archive?'mdzip':format,...(archive?{archive:true}:{}),filename:request.filename,options:exportOptions});
         return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
