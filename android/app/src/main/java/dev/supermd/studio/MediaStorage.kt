@@ -1,12 +1,7 @@
 package dev.supermd.studio
 
 import android.content.Context
-import android.content.ContentValues
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
-import android.provider.DocumentsContract
 import android.util.Base64
 import android.util.JsonReader
 import android.util.JsonWriter
@@ -61,6 +56,7 @@ class MediaStorage(private val context: Context) {
         }
     }
     data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int)
+    private val publisher = AgentDownloadPublisher(context)
     private val attachments = File(context.filesDir, "attachments").apply { mkdirs() }
     private val bundles = File(context.filesDir, "portable-assets").apply { mkdirs() }
 
@@ -272,11 +268,10 @@ class MediaStorage(private val context: Context) {
         check(File(bundles, id).mkdirs()) { "Could not prepare the portable note's local asset directory" }
         return id
     }
-    private val key = Regex("assets/[a-zA-Z0-9_.-]{1,150}")
     private fun gzip(output: java.io.OutputStream) = object : GZIPOutputStream(output, 8192) {
         init { def.setLevel(PORTABLE_GZIP_LEVEL) }
     }
-    fun validKey(source: String) = key.matches(source) && source.substringAfter('/') !in listOf(".", "..")
+    fun validKey(source: String): Boolean = isValidCompatPortableAssetKey(source)
     private fun mime(name: String) = when(name.substringAfterLast('.').lowercase()) {
         "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"; "avif" -> "image/avif"; "svg" -> "image/svg+xml"; else -> error("Choose a supported image (PNG, JPEG, GIF, WebP, AVIF or SVG)")
     }
@@ -486,142 +481,14 @@ class MediaStorage(private val context: Context) {
     }
 
     /** Save a requested browser image/diagram into Downloads or the user's configured note folder. */
-    fun saveAgentMedia(args: JSONObject, configuredLocation: String?): JSONObject {
-        val encoded = args.getString("body")
-        require(encoded.length <= 34_000_000) { "Media export exceeds 25 MB" }
-        val bytes = Base64.decode(encoded, Base64.DEFAULT)
-        require(bytes.size in 1..25_000_000) { "Media export must be at most 25 MB" }
-        val mime = args.getString("mimeType").substringBefore(';').lowercase()
-        val extension = when (mime) {
-            "image/png" -> "png"
-            "image/svg+xml" -> "svg"
-            "image/jpeg" -> "jpg"
-            "image/webp" -> "webp"
-            "image/gif" -> "gif"
-            "image/avif" -> "avif"
-            "text/plain" -> "mmd"
-            else -> error("Unsupported media type")
-        }
-        requireMediaSignature(mime, bytes)
-        val rawName = args.optString("filename", "Super MD export")
-            .substringAfterLast('/').substringAfterLast('\\')
-            .replace(Regex("[\\u0000-\\u001f\\u007f]"), "").trim().take(120)
-        val stem = rawName.substringBeforeLast('.', rawName).trim().take(100).ifBlank { "Super MD export" }
-        val requestedName = "$stem.$extension"
-        val folder = configuredLocation?.takeIf(String::isNotBlank)?.let(Uri::parse)
-        if (folder != null && DocumentsContract.isTreeUri(folder)) {
-            val parent = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, folder)
-                ?: error("Open the configured folder again to restore access")
-            val name = uniqueName(requestedName) { parent.findFile(it) != null }
-            val file = parent.createFile(mime, name) ?: error("The selected folder cannot create files")
-            try {
-                context.contentResolver.openOutputStream(file.uri, "w")?.use { it.write(bytes); it.flush() }
-                    ?: error("The selected folder cannot write files")
-            } catch (error: Exception) { runCatching { file.delete() }; throw error }
-            return JSONObject().put("filename", file.name ?: name).put("bytes", bytes.size)
-                .put("mimeType", mime).put("uri", file.uri.toString())
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            error("Choose a folder in Settings → New note location before saving media on this Android version")
-        }
-        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/Super MD"
-        val resolver = context.contentResolver
-        val name = uniqueName(requestedName) { candidate ->
-            resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Downloads._ID),
-                "${MediaStore.Downloads.DISPLAY_NAME}=? AND ${MediaStore.Downloads.RELATIVE_PATH}=?",
-                arrayOf(candidate, "$relativePath/"), null)?.use { it.moveToFirst() } == true
-        }
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, name)
-            put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, "$relativePath/")
-            put(MediaStore.Downloads.IS_PENDING, 1)
-        }
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: error("Android could not create a Downloads entry")
-        try {
-            resolver.openOutputStream(uri, "w")?.use { it.write(bytes); it.flush() }
-                ?: error("Android could not write the Downloads entry")
-            resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
-        } catch (error: Exception) { runCatching { resolver.delete(uri, null, null) }; throw error }
-        return JSONObject().put("filename", name).put("bytes", bytes.size).put("mimeType", mime).put("uri", uri.toString())
-    }
+    fun saveAgentMedia(args: JSONObject, configuredLocation: String?): JSONObject =
+        publisher.saveAgentMedia(args, configuredLocation)
 
     /** Create a new document in the configured SAF folder or the app's Downloads collection. */
-    fun writeAgentDocument(filename: String, mimeType: String, configuredLocation: String?, writer: (Uri, java.io.OutputStream) -> Unit): Pair<Uri, String> {
-        require(filename.isNotBlank() && filename.length <= 240 && filename == filename.substringAfterLast('/').substringAfterLast('\\') &&
-            !filename.contains(Regex("[\\u0000-\\u001f\\u007f]"))) { "Invalid save-as filename" }
-        val mime = mimeType.substringBefore(';').lowercase()
-        require(mime in setOf("text/markdown", "application/vnd.supermd.smd", "application/pdf", "application/zip")) { "Unsupported document format" }
-        val folder = configuredLocation?.takeIf(String::isNotBlank)?.let(Uri::parse)
-        if (folder != null) {
-            require(DocumentsContract.isTreeUri(folder)) { "The configured note location is not a folder; choose it again in Super MD settings" }
-            val parent = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, folder)
-                ?: error("Open the configured folder again to restore access")
-            val name = uniqueName(filename) { parent.findFile(it) != null }
-            val file = parent.createFile(mime, name) ?: error("The configured folder cannot create files")
-            try {
-                context.contentResolver.openOutputStream(file.uri, "w")?.use { writer(file.uri, it) } ?: error("The configured folder cannot write files")
-            } catch (error: Exception) {
-                runCatching { file.delete() }
-                throw error
-            }
-            return file.uri to (file.name ?: name)
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            error("Choose a folder in Settings → New note location before saving to Downloads on this Android version")
-        }
-        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/Super MD"
-        val resolver = context.contentResolver
-        val name = uniqueName(filename) { candidate ->
-            resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Downloads._ID),
-                "${MediaStore.Downloads.DISPLAY_NAME}=? AND ${MediaStore.Downloads.RELATIVE_PATH}=?",
-                arrayOf(candidate, "$relativePath/"), null)?.use { it.moveToFirst() } == true
-        }
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, name)
-            put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, "$relativePath/")
-            put(MediaStore.Downloads.IS_PENDING, 1)
-        }
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: error("Android could not create a Downloads entry")
-        try {
-            resolver.openOutputStream(uri, "w")?.use { writer(uri, it) } ?: error("Android could not write the Downloads entry")
-            require(resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null) > 0) { "Android could not publish the Downloads entry" }
-        } catch (error: Exception) {
-            runCatching { resolver.delete(uri, null, null) }
-            throw error
-        }
-        return uri to name
-    }
+    fun writeAgentDocument(filename: String, mimeType: String, configuredLocation: String?, writer: (Uri, java.io.OutputStream) -> Unit): Pair<Uri, String> =
+        publisher.writeAgentDocument(filename, mimeType, configuredLocation, writer)
 
-    fun deleteAgentDocument(uri: Uri) {
-        if (uri.authority == MediaStore.AUTHORITY) context.contentResolver.delete(uri, null, null)
-        else androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.delete()
-    }
-
-    private fun uniqueName(requested: String, exists: (String) -> Boolean): String {
-        val stem = requested.substringBeforeLast('.')
-        val ext = requested.substringAfterLast('.', "")
-        var index = 1
-        var candidate = requested
-        while (exists(candidate)) { index++; candidate = "$stem ($index).$ext" }
-        return candidate
-    }
-
-    private fun requireMediaSignature(mime: String, bytes: ByteArray) {
-        fun starts(vararg values: Int) = bytes.size >= values.size && values.indices.all { (bytes[it].toInt() and 0xff) == values[it] }
-        when (mime) {
-            "image/png" -> require(starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) { "PNG signature is invalid" }
-            "image/jpeg" -> require(starts(0xff, 0xd8, 0xff)) { "JPEG signature is invalid" }
-            "image/gif" -> require(bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII) in listOf("GIF87a", "GIF89a")) { "GIF signature is invalid" }
-            "image/webp" -> require(bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP") { "WebP signature is invalid" }
-            "image/avif" -> require(bytes.size >= 12 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp" && String(bytes, 8, 4, Charsets.US_ASCII) in setOf("avif", "avis")) { "AVIF signature is invalid" }
-            "image/svg+xml" -> require(String(bytes, 0, minOf(bytes.size, 4096), Charsets.UTF_8).contains(Regex("<svg(?:\\s|>|/)", RegexOption.IGNORE_CASE))) { "SVG document is invalid" }
-            "text/plain" -> require(bytes.none { it == 0.toByte() }) { "Text media contains binary data" }
-        }
-    }
+    fun deleteAgentDocument(uri: Uri) = publisher.deleteAgentDocument(uri)
     fun local(source: String, directory: String?): File? {
         if (!validKey(source)) return null
         if (directory != null && Regex("[a-f0-9-]{36}").matches(directory)) containedFile(bundles, File(bundles, "$directory/${source.substringAfter('/')}")).let { if (it != null) return it }
@@ -1128,6 +995,19 @@ class MediaStorage(private val context: Context) {
         val b = ip.address.map { it.toInt() and 255 }
         if (b.size == 4) return b[0] !in listOf(0, 127, 10, 255) && !(b[0] == 100 && b[1] in 64..127) && !(b[0] == 192 && b[1] == 168) && !(b[0] == 172 && b[1] in 16..31)
         return b[0] and 0xfe != 0xfc
+    }
+}
+
+internal fun requireMediaSignature(mime: String, bytes: ByteArray) {
+    fun starts(vararg values: Int) = bytes.size >= values.size && values.indices.all { (bytes[it].toInt() and 0xff) == values[it] }
+    when (mime) {
+        "image/png" -> require(starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) { "PNG signature is invalid" }
+        "image/jpeg" -> require(starts(0xff, 0xd8, 0xff)) { "JPEG signature is invalid" }
+        "image/gif" -> require(bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII) in listOf("GIF87a", "GIF89a")) { "GIF signature is invalid" }
+        "image/webp" -> require(bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP") { "WebP signature is invalid" }
+        "image/avif" -> require(bytes.size >= 12 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp" && String(bytes, 8, 4, Charsets.US_ASCII) in setOf("avif", "avis")) { "AVIF signature is invalid" }
+        "image/svg+xml" -> require(String(bytes, 0, minOf(bytes.size, 4096), Charsets.UTF_8).contains(Regex("<svg(?:\\s|>|/)", RegexOption.IGNORE_CASE))) { "SVG document is invalid" }
+        "text/plain" -> require(bytes.none { it == 0.toByte() }) { "Text media contains binary data" }
     }
 }
 

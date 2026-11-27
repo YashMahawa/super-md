@@ -143,6 +143,22 @@ export function windowedMatches(host:Element,query:string,options:SearchMatchCon
   const result:WindowedMatch[]=[];
   const {pattern}=compileSearchPattern(query,options,false);
   if(!pattern)return result;
+  if(!host.hasAttribute('data-windowed-block')){
+    const fmHeader=host.querySelector<HTMLElement>('[data-frontmatter-properties]')??host.querySelector<HTMLElement>('.document-properties');
+    if(fmHeader&&!fmHeader.hasAttribute('hidden')&&!fmHeader.hasAttribute('inert')&&fmHeader.getAttribute('aria-hidden')!=='true'){
+      const fields=fmHeader.querySelectorAll<HTMLElement>('[data-frontmatter-field]');
+      const parts:string[]=[];
+      for(const f of fields){
+        const kind=f.getAttribute('data-frontmatter-field');
+        if((kind==='title'||kind==='author'||kind==='tag')&&f.textContent)parts.push(f.textContent);
+      }
+      if(parts.length){
+        const fmText=parts.join('\n');
+        pattern.lastIndex=0;let fmOrdinal=0;
+        while(nextSearchMatch(pattern,fmText)){result.push({element:fmHeader,ordinal:fmOrdinal++});if(result.length>=5000)return result;}
+      }
+    }
+  }
   // Query mounted block wrappers directly in DOM tree order so Live edits never
   // require O(M log M) compareDocumentPosition sorting or misorder 5,000+ caps.
   for(const element of windowedBlocks){
