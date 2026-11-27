@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
+from core.paths import DESKTOP_DIR
 
 def install(package):
     package = package.resolve()
@@ -46,7 +47,7 @@ def install(package):
     link = cli.with_name(".smd-engine-install-" + uuid.uuid4().hex)
     link.symlink_to(destination / "_internal/resources/desktop/smd-engine")
     os.replace(link, cli)
-    templates = Path(__file__).parent / "linux"
+    templates = DESKTOP_DIR / "linux"
     desktop = local / "share/applications/dev.supermd.studio.desktop"
     desktop.parent.mkdir(parents=True, exist_ok=True)
     backup(desktop)

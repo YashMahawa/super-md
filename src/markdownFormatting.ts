@@ -169,178 +169,94 @@ function buildResultFromRangePlans(
   };
 }
 
+type SymmetricInlineAction = "bold" | "italic" | "inline_code" | "inline_math";
+
+interface SymmetricInlineDescriptor {
+  readonly delimiters: readonly string[];
+  unwrapCount(runLength: number): number;
+  unwrapInner?(inner: string, count: number): string;
+  wrap(selected: string): readonly [open: string, close: string];
+}
+
+const SYMMETRIC_INLINE_DESCRIPTORS: Record<SymmetricInlineAction, SymmetricInlineDescriptor> = {
+  bold: {
+    delimiters: ["*", "_"],
+    unwrapCount: (n) => (n >= 2 ? 2 : 0),
+    wrap: () => ["**", "**"],
+  },
+  italic: {
+    delimiters: ["*", "_"],
+    unwrapCount: (n) => (n === 1 || n === 3 ? 1 : 0),
+    wrap: () => ["*", "*"],
+  },
+  inline_code: {
+    delimiters: ["`"],
+    unwrapCount: (n) => (n === 1 || n === 2 ? n : 0),
+    unwrapInner: (inner, count) =>
+      count === 2 && inner.startsWith(" ") && inner.endsWith(" ") && inner.length >= 2
+        ? inner.slice(1, -1)
+        : inner,
+    wrap: (selected) => (selected.includes("`") ? ["`` ", " ``"] : ["`", "`"]),
+  },
+  inline_math: {
+    delimiters: ["$"],
+    unwrapCount: (n) => (n === 1 ? 1 : 0),
+    wrap: () => ["$", "$"],
+  },
+};
+
 function planSymmetricInlineToggle(
   doc: string,
   range: SelectionRange,
-  action: "bold" | "italic" | "inline_code" | "inline_math",
+  action: SymmetricInlineAction,
 ): RangePlan {
   const from = Math.min(range.anchor, range.head);
   const to = Math.max(range.anchor, range.head);
   const reversed = range.anchor > range.head;
   const selected = doc.slice(from, to);
+  const descriptor = SYMMETRIC_INLINE_DESCRIPTORS[action];
 
-  if (action === "bold") {
-    const outerStars = Math.min(countCharsLeft(doc, from, "*", 3), countCharsRight(doc, to, "*", 3));
-    const outerUnderscores = Math.min(countCharsLeft(doc, from, "_", 3), countCharsRight(doc, to, "_", 3));
-    if (outerStars >= 2 || outerUnderscores >= 2) {
+  for (const ch of descriptor.delimiters) {
+    const outerRun = Math.min(countCharsLeft(doc, from, ch, 3), countCharsRight(doc, to, ch, 3));
+    const outerUnwrap = descriptor.unwrapCount(outerRun);
+    if (outerUnwrap > 0) {
       return {
-        from: from - 2,
-        to: to + 2,
+        from: from - outerUnwrap,
+        to: to + outerUnwrap,
         insert: selected,
         selStartOffset: 0,
         selEndOffset: selected.length,
         reversed,
       };
     }
-    if (selected.length >= 4) {
-      const innerStars = Math.min(countLeadingChars(selected, "*", 3), countTrailingChars(selected, "*", 3));
-      const innerUnderscores = Math.min(countLeadingChars(selected, "_", 3), countTrailingChars(selected, "_", 3));
-      if (innerStars >= 2 || innerUnderscores >= 2) {
-        const inner = selected.slice(2, selected.length - 2);
-        return {
-          from,
-          to,
-          insert: inner,
-          selStartOffset: 0,
-          selEndOffset: inner.length,
-          reversed,
-        };
-      }
-    }
-    const wrapped = `**${selected}**`;
-    return {
-      from,
-      to,
-      insert: wrapped,
-      selStartOffset: 2,
-      selEndOffset: 2 + selected.length,
-      reversed,
-    };
   }
 
-  if (action === "italic") {
-    const outerStars = Math.min(countCharsLeft(doc, from, "*", 3), countCharsRight(doc, to, "*", 3));
-    const outerUnderscores = Math.min(countCharsLeft(doc, from, "_", 3), countCharsRight(doc, to, "_", 3));
-    if (outerStars === 1 || outerStars === 3 || outerUnderscores === 1 || outerUnderscores === 3) {
-      return {
-        from: from - 1,
-        to: to + 1,
-        insert: selected,
-        selStartOffset: 0,
-        selEndOffset: selected.length,
-        reversed,
-      };
-    }
-    if (selected.length >= 2) {
-      const innerStars = Math.min(countLeadingChars(selected, "*", 3), countTrailingChars(selected, "*", 3));
-      const innerUnderscores = Math.min(countLeadingChars(selected, "_", 3), countTrailingChars(selected, "_", 3));
-      if (innerStars === 1 || innerStars === 3 || innerUnderscores === 1 || innerUnderscores === 3) {
-        const inner = selected.slice(1, selected.length - 1);
-        return {
-          from,
-          to,
-          insert: inner,
-          selStartOffset: 0,
-          selEndOffset: inner.length,
-          reversed,
-        };
-      }
-    }
-    const wrapped = `*${selected}*`;
-    return {
-      from,
-      to,
-      insert: wrapped,
-      selStartOffset: 1,
-      selEndOffset: 1 + selected.length,
-      reversed,
-    };
-  }
-
-  if (action === "inline_code") {
-    const outerTicks = Math.min(countCharsLeft(doc, from, "`", 3), countCharsRight(doc, to, "`", 3));
-    if (outerTicks === 1 || outerTicks === 2) {
-      return {
-        from: from - outerTicks,
-        to: to + outerTicks,
-        insert: selected,
-        selStartOffset: 0,
-        selEndOffset: selected.length,
-        reversed,
-      };
-    }
-    if (selected.length >= 2) {
-      const innerTicks = Math.min(countLeadingChars(selected, "`", 3), countTrailingChars(selected, "`", 3));
-      if (innerTicks === 1 || (innerTicks === 2 && selected.length >= 4)) {
-        let inner = selected.slice(innerTicks, selected.length - innerTicks);
-        if (innerTicks === 2 && inner.startsWith(" ") && inner.endsWith(" ") && inner.length >= 2) {
-          inner = inner.slice(1, -1);
-        }
-        return {
-          from,
-          to,
-          insert: inner,
-          selStartOffset: 0,
-          selEndOffset: inner.length,
-          reversed,
-        };
-      }
-    }
-    if (selected.includes("`")) {
-      const wrapped = `\`\` ${selected} \`\``;
-      return {
-        from,
-        to,
-        insert: wrapped,
-        selStartOffset: 3,
-        selEndOffset: 3 + selected.length,
-        reversed,
-      };
-    }
-    const wrapped = `\`${selected}\``;
-    return {
-      from,
-      to,
-      insert: wrapped,
-      selStartOffset: 1,
-      selEndOffset: 1 + selected.length,
-      reversed,
-    };
-  }
-
-  // inline_math ("$")
-  const outerDollars = Math.min(countCharsLeft(doc, from, "$", 3), countCharsRight(doc, to, "$", 3));
-  if (outerDollars === 1) {
-    return {
-      from: from - 1,
-      to: to + 1,
-      insert: selected,
-      selStartOffset: 0,
-      selEndOffset: selected.length,
-      reversed,
-    };
-  }
   if (selected.length >= 2) {
-    const innerDollars = Math.min(countLeadingChars(selected, "$", 3), countTrailingChars(selected, "$", 3));
-    if (innerDollars === 1) {
-      const inner = selected.slice(1, selected.length - 1);
-      return {
-        from,
-        to,
-        insert: inner,
-        selStartOffset: 0,
-        selEndOffset: inner.length,
-        reversed,
-      };
+    for (const ch of descriptor.delimiters) {
+      const innerRun = Math.min(countLeadingChars(selected, ch, 3), countTrailingChars(selected, ch, 3));
+      const innerUnwrap = descriptor.unwrapCount(innerRun);
+      if (innerUnwrap > 0 && selected.length >= innerUnwrap * 2) {
+        const rawInner = selected.slice(innerUnwrap, selected.length - innerUnwrap);
+        const inner = descriptor.unwrapInner ? descriptor.unwrapInner(rawInner, innerUnwrap) : rawInner;
+        return {
+          from,
+          to,
+          insert: inner,
+          selStartOffset: 0,
+          selEndOffset: inner.length,
+          reversed,
+        };
+      }
     }
   }
-  const wrapped = `$${selected}$`;
+
+  const [open, close] = descriptor.wrap(selected);
   return {
     from,
     to,
-    insert: wrapped,
-    selStartOffset: 1,
-    selEndOffset: 1 + selected.length,
+    insert: `${open}${selected}${close}`,
+    selStartOffset: open.length,
+    selEndOffset: open.length + selected.length,
     reversed,
   };
 }
