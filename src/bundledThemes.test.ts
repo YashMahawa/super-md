@@ -6,6 +6,8 @@ import { BUNDLED_THEMES, parseBundledThemeHref } from './bundledThemes';
 describe('bundledThemes', () => {
   it('lists all 16 bundled theme presets with matching filenames and display names', () => {
     const dir = resolve(__dirname, '../public/themes');
+    const catalog = JSON.parse(readFileSync(resolve(dir, 'index.json'), 'utf8'));
+    expect(BUNDLED_THEMES).toEqual(catalog);
     const files = readdirSync(dir)
       .filter(file => file.endsWith('.supermd-theme.json'))
       .sort();
@@ -35,6 +37,8 @@ describe('bundledThemes', () => {
     expect(parseBundledThemeHref('../public/themes')).toEqual({ kind: 'directory' });
     expect(parseBundledThemeHref('public/themes/')).toEqual({ kind: 'directory' });
     expect(parseBundledThemeHref('themes')).toEqual({ kind: 'directory' });
+    expect(parseBundledThemeHref('themes/index.json')).toBeNull();
+    expect(parseBundledThemeHref('../public/themes/index.json')).toBeNull();
     expect(parseBundledThemeHref('../public/themes/nonexistent.supermd-theme.json')).toBeNull();
     expect(parseBundledThemeHref('#schema')).toBeNull();
     expect(parseBundledThemeHref('https://example.com/public/themes')).toBeNull();

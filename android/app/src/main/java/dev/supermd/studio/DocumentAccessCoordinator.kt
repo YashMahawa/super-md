@@ -120,7 +120,14 @@ internal class DocumentAccessCoordinator(
 
     fun resolveVerifiedWriteDestination(source: Uri): Uri {
         val candidate = documentAccess.resolve(source, writing = true)
-        if (!DocumentsContract.isTreeUri(candidate) || documentAccess.hasWriteGrant(candidate)) {
+        if (!DocumentsContract.isTreeUri(candidate) || (documentAccess.hasTreeScopedWriteGrant(candidate) && documentAccess.hasWriteGrant(candidate))) {
+            return candidate
+        }
+        if (DocumentsContract.isTreeUri(source) &&
+            documentAccess.confirmEmbeddedTreeMembershipIfWritable(candidate) &&
+            documentAccess.hasTreeScopedWriteGrant(candidate) &&
+            documentAccess.hasWriteGrant(candidate)
+        ) {
             return candidate
         }
         if (!DocumentsContract.isTreeUri(source)) {
@@ -143,6 +150,16 @@ internal class DocumentAccessCoordinator(
         val note = readState().tabs.firstOrNull { it.id == id }
         return if (isDocumentAccessFailure(error) && note?.uri != null) requestDocumentAccess(note.uri, note, writing = true)
         else { fail(fallback); fallback }
+    }
+
+    fun reportDocumentRenameFailure(id: String, error: Throwable, showGlobalError: Boolean = true): String {
+        val note = readState().tabs.firstOrNull { it.id == id }
+        if (isDocumentAccessFailure(error) && note?.uri != null) {
+            return requestDocumentAccess(note.uri, note, writing = true, explicit = true)
+        }
+        val msg = error.message ?: "Could not rename note"
+        if (showGlobalError) fail("Could not rename note: $msg")
+        return msg
     }
 
     fun restoreDocumentAccess(request: DocumentAccessRequest, chosen: Uri): Job = scope.launch {

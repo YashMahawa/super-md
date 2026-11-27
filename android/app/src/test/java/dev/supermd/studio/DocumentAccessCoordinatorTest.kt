@@ -92,6 +92,10 @@ class DocumentAccessCoordinatorTest {
         assertTrue(model.requestWriteAccessIfBlocked(id, explicit = false))
         assertNull(model.documentAccessRequests.value)
         assertTrue(model.requestWriteAccessIfBlocked(id, explicit = true))
+        model.dismissDocumentAccess()
+        assertEquals("boom", model.reportDocumentRenameFailure(id, IllegalStateException("boom"), showGlobalError = false))
+        assertNull(model.documentAccessRequests.value)
+        assertEquals(DOCUMENT_ACCESS_MESSAGE, model.reportDocumentRenameFailure(id, SecurityException("rename denied")))
         val writeRequest = model.documentAccessRequests.value!!
 
         var liveResolveObserved = false
