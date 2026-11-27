@@ -46,6 +46,7 @@ internal data class UriRemap(
     val newName: String? = null,
     val oldRelative: String? = null,
     val newRelative: String? = null,
+    val confirmedTreeTarget: Boolean = false,
 )
 
 data class Note(val id: String = UUID.randomUUID().toString(), val name: String = "Untitled.md", val uri: String? = null, val content: String = "", val saved: String = "", val relative: String? = null, val assetDirectory: String? = null, val assetsDirty: Boolean = false) {
@@ -153,12 +154,23 @@ fun reorderedNotes(notes: List<Note>, id: String, index: Int): List<Note> {
 class StudioViewModel(app: Application, val workspaceKey: String = "main") : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("studio", 0)
     private val confirmedTreeDocumentKeys = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val localRenameScopes = java.util.concurrent.CopyOnWriteArrayList<SafRenameScope>()
+    @Volatile private var loadedFilesSeq = 0L
+    @Volatile private var loadedFilesGeneration = 0L
+    @Volatile private var needsReloadAfterPreRemap = false
+    private fun hasCurrentLoadedFiles(): Boolean =
+        mutable.value.folder != null &&
+            loadedFilesSeq != 0L &&
+            loadedFilesSeq == listFolderSeq &&
+            loadedFilesGeneration == safGeneration.get() &&
+            !hasPendingRemapScopes()
     private fun isConfirmedTreeChild(treeUri: Uri, documentId: String): Boolean {
         val rootId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
         if (rootId != null && documentId == rootId) return true
         val key = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId).toString()
         return key in confirmedTreeDocumentKeys ||
-            runCatching { mutable.value.files.any { !it.directory && it.uri == key } }.getOrDefault(false)
+            (hasCurrentLoadedFiles() &&
+                runCatching { mutable.value.files.any { !it.directory && it.uri == key } }.getOrDefault(false))
     }
     internal var documentAccess = DocumentAccess(
         context = app,
@@ -170,7 +182,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }.getOrNull()
         },
         isConfirmedTreeChildProvider = ::isConfirmedTreeChild,
-        onConfirmedTreeKeys = { keys -> confirmedTreeDocumentKeys.addAll(keys) },
+        onConfirmedTreeKeys = { keys ->
+            if (!hasPendingRemapScopes()) confirmedTreeDocumentKeys.addAll(keys)
+        },
     )
     internal var workspaceLinks = WorkspaceLinkCache(ContentResolverTreeLister(app))
     private val accessRequestsMutable = MutableStateFlow<DocumentAccessRequest?>(null)
@@ -997,6 +1011,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val folderSnapshot=beforeIo.folder
             val relativeSnapshot=normalizeFolderRelative(beforeIo.folderRelative.ifEmpty { listedRelative })
             val listSeqSnapshot=listFolderSeq
+            val genSnapshot=safGeneration.get()
             val uris=(beforeIo.tabs.mapNotNull {it.uri}+recentMutable.value.map {it.uri}).distinct()
             val relativeHints=buildMap {
                 recentMutable.value.forEach {r->if(!r.relative.isNullOrEmpty())put(r.uri,r.relative)}
@@ -1004,7 +1019,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
             val confirmedSnapshot=buildSet {
                 addAll(confirmedTreeDocumentKeys)
-                beforeIo.files.forEach {entry->canonicalTreeDocumentKey(Uri.parse(entry.uri))?.let(::add)}
+                if (hasCurrentLoadedFiles()) {
+                    beforeIo.files.forEach {entry->canonicalTreeDocumentKey(Uri.parse(entry.uri))?.let(::add)}
+                }
             }
             val refreshSnapshot=withContext(Dispatchers.IO) {
                 refreshSafWorkspaceMetadata(
@@ -1015,11 +1032,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     folderUriRaw = folderSnapshot,
                     listedRelative = relativeSnapshot,
                     confirmedTreeKeys = confirmedSnapshot,
-                )
+                ).let { snap ->
+                    if (genSnapshot != safGeneration.get() || hasPendingRemapScopes()) snap.copy(confirmedTreeKeys = emptySet()) else snap
+                }
             }
             confirmedTreeDocumentKeys.addAll(refreshSnapshot.confirmedTreeKeys)
             val metadata=refreshSnapshot.metadata
             val removed=metadata.filterValues {it==null}.keys
+            if (genSnapshot != safGeneration.get() || hasPendingRemapScopes()) {
+                if (!viewModelRetired.get()) refreshMetadata()
+                return@launch
+            }
             removed.forEach { raw ->
                 val parsed = Uri.parse(raw)
                 canonicalTreeDocumentKey(parsed)?.let(confirmedTreeDocumentKeys::remove)
@@ -1046,6 +1069,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     refreshSnapshot.folderListing.fold(
                         onSuccess = {listing->
                             listedRelative=listing.effectiveRelative
+                            loadedFilesSeq=listFolderSeq
+                            loadedFilesGeneration=genSnapshot
                             if(listing.effectiveRelative!=relativeSnapshot) {
                                 windowPrefs.edit().putBoolean("folderMigrated",true).putString("folderRelative",listing.effectiveRelative).apply()
                             }
@@ -1253,10 +1278,20 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     // Do not cancel an in-flight write when another keystroke or
                     // window transition arrives. Recovery remains an independent stream.
                     withContext(kotlinx.coroutines.NonCancellable) {
-                        documentWrites.withLock {
-                        if (closingNoteIds.contains(note.id) || mutable.value.tabs.none {
-                                it.id == note.id && it.uri == note.uri && it.content == note.content && it.assetsDirty == note.assetsDirty
-                            }) return@withLock
+                        withDocumentWriteLockAfterRenames {
+                        val currentNote = mutable.value.tabs.find {
+                            it.id == note.id && it.uri != null && it.content == note.content && it.assetsDirty == note.assetsDirty
+                        }
+                        if (closingNoteIds.contains(note.id) || currentNote == null) {
+                            if (!closingNoteIds.contains(note.id) &&
+                                mutable.value.tabs.any { it.id == note.id && it.uri != null && it.dirty && it.id !in mutable.value.conflictedTabIds }
+                            ) {
+                                autosavePending.add(note.id)
+                            }
+                            return@withDocumentWriteLockAfterRenames
+                        }
+                        note = currentNote
+                        if (writeIsBlocked(note.uri!!)) return@withDocumentWriteLockAfterRenames
                         val writtenTarget = withContext(Dispatchers.IO) {
                             val target = resolveVerifiedWriteDestination(Uri.parse(note.uri))
                             if (!diskMatchesBaseline(target, note)) throw ExternalConflictDetectedException()
@@ -2376,12 +2411,18 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         relativeInOpenFolder = { uri -> relativeInOpenFolder(uri) },
         resolveOpenFolderRelativeOnIo = { uri -> resolveOpenFolderRelativeOnIo(uri) },
         rememberNote = ::remember,
+        isViewModelRetired = { viewModelRetired.get() },
+        awaitPendingRemaps = ::awaitPendingRemaps,
+        beginSafRenameMutation = ::beginSafRenameMutation,
+        markSafRenameCommittedOnDisk = ::markSafRenameCommittedOnDisk,
+        finishSafRenameScope = ::finishSafRenameScope,
         snapshotPreRenameFolderState = {
             liveStudioViewModels(this).associateWith { vm ->
                 vm.listFolderSeq to vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
             }
         },
         trackedEntriesInOpenFolder = ::trackedEntriesInOpenFolder,
+        capturePreProjectedFoldersOnIo = ::capturePreProjectedFoldersForRenameOnIo,
         applyUriRemaps = ::applyUriRemaps,
     )
     fun rename(
@@ -2787,28 +2828,28 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val staged = File(getApplication<Application>().cacheDir, "agent-portable-save-${UUID.randomUUID()}.smd.gz")
         var openedDirectory: String? = null
         try { withContext(Dispatchers.IO) {
-            documentWrites.withLock {
+            withDocumentWriteLockAfterRenames {
                 val latest = mutable.value.tabs.firstOrNull { it.id == id } ?: error("The note is no longer open")
-                require(latest == note && agentContentRevision(latest.content).equals(expectedRevision, ignoreCase = true)) {
+                require(sameSaveablePortableDraft(latest, note) && agentContentRevision(latest.content).equals(expectedRevision, ignoreCase = true)) {
                     "The note changed since the supplied revision; no changes were saved"
                 }
                 val target = resolveVerifiedWriteDestination(Uri.parse(latest.uri ?: error("This portable note has no saved destination")))
                 val backup = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot read the current portable note")
                 require(
-                    agentContentRevision(note.content).equals(expectedRevision, ignoreCase = true) &&
-                        media.portableEnvelopeMatches(backup.inputStream(), note.saved, assets),
+                    agentContentRevision(latest.content).equals(expectedRevision, ignoreCase = true) &&
+                        media.portableEnvelopeMatches(backup.inputStream(), latest.saved, assets),
                 ) {
                     "The portable note changed on disk; reopen it before saving"
                 }
-                staged.outputStream().use { media.writeFmd(it, note.content, assets, assets) }
+                staged.outputStream().use { media.writeFmd(it, latest.content, assets, assets) }
                 verifyExportHeader(staged, NativeExportFormat.PORTABLE_SMD)
                 val stagedBytes = staged.readBytes()
-                val reuseExisting = note.assetDirectory != null && media.hasExactLocalPortableAssets(note.assetDirectory, assets)
+                val reuseExisting = latest.assetDirectory != null && media.hasExactLocalPortableAssets(latest.assetDirectory, assets)
                 val nextDirectory = if (reuseExisting) {
-                    note.assetDirectory!!
+                    latest.assetDirectory!!
                 } else {
-                    media.materializePortableDirectory(assets, reuseFromDirectory = note.assetDirectory).also { openedDirectory = it }
+                    media.materializePortableDirectory(assets, reuseFromDirectory = latest.assetDirectory).also { openedDirectory = it }
                 }
                 val latestBytes = resolver.openInputStream(target)?.use { readLimited(it, 120_000_000) }
                     ?: error("Cannot recheck the portable note before saving")
@@ -2818,11 +2859,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         ?: error("Cannot save the portable note")
                     withContext(Dispatchers.Main) {
                         val current = mutable.value.tabs.firstOrNull { it.id == id }
-                        require(current == note && current?.let { agentContentRevision(it.content).equals(expectedRevision, ignoreCase = true) } == true) {
+                        require(current != null && sameSaveablePortableDraft(current, latest) && agentContentRevision(current.content).equals(expectedRevision, ignoreCase = true)) {
                             "The note changed while it was saving; the portable file was restored"
                         }
                         recordPortableBaseline(id, nextDirectory)
-                        change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = note.content, assetsDirty = false, uri = target.toString(), assetDirectory = nextDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
+                        change { state -> state.copy(tabs = state.tabs.map { if (it.id == id) it.copy(saved = latest.content, assetsDirty = false, uri = target.toString(), assetDirectory = nextDirectory) else it }, conflictedTabIds = state.conflictedTabIds - id, busy = false, message = "Portable note saved") }
                         mutable.value.tabs.firstOrNull { it.id == id }?.let(::remember)
                         openedDirectory = null
                     }
@@ -3375,27 +3416,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         busy(true)
         try {
             var shouldCloseAfterSave = false
-            documentWrites.withLock {
+            withDocumentWriteLockAfterRenames {
             val note = mutable.value.tabs.find { it.id == requestedNoteId }
             if (closingNoteIds.contains(requestedNoteId) || note == null) {
                 closeAfterSaveNoteId = null
                 mutable.value = mutable.value.copy(busy = false, message = "Save canceled because the note was closed before the write began.")
                 onComplete?.invoke("The note was closed before saving")
-                return@withLock
+                return@withDocumentWriteLockAfterRenames
             }
             if (expectedRevision != null && !java.security.MessageDigest.getInstance("SHA-256")
                     .digest(note.content.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.equals(expectedRevision, ignoreCase = true)) {
                 closeAfterSaveNoteId = null
                 mutable.value = mutable.value.copy(busy = false)
                 onComplete?.invoke("The note changed since the supplied revision; no changes were saved")
-                return@withLock
+                return@withDocumentWriteLockAfterRenames
             }
             val target = uri ?: note.uri?.let(Uri::parse)
             if (target == null) {
                 closeAfterSaveNoteId = null
                 mutable.value = mutable.value.copy(busy = false, message = "Save canceled because the note no longer has a destination.")
                 onComplete?.invoke("The note no longer has a saved destination")
-                return@withLock
+                return@withDocumentWriteLockAfterRenames
             }
             val guardDisk = uri == null && !forceOverwrite && (manualGuard || expectedRevision != null)
             val savedResult = withContext(Dispatchers.IO) {
@@ -3406,15 +3447,41 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 resolver.openOutputStream(destination, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
                 documentAccess.persist(destination)
                 val resolvedName = resolveDisplayName(destination) ?: ExportFilename.suggestedName(note.name, NativeExportFormat.MARKDOWN)
-                Triple(destination, resolvedName, resolveOpenFolderRelativeOnIo(destination))
+                val openRel = resolveOpenFolderRelativeOnIo(destination)
+                val folderSnapshot = if (openRel != null) captureOpenFolderSnapshotOnIo() else null
+                SavedMarkdownResult(destination, resolvedName, openRel, folderSnapshot)
             }
-            val (writtenTarget, savedName, openRel) = savedResult
+            val writtenTarget = savedResult.destination
+            val savedName = savedResult.resolvedName
+            val openRel = savedResult.openRel
             savedPortableAssets.remove(note.id)
             autosavePending.remove(note.id)
             clearDocumentAccessFailure(writtenTarget.toString())
-            change { s -> s.copy(busy = false, tabs = s.tabs.map { if (it.id == note.id) it.copy(uri = writtenTarget.toString(), name = savedName, saved = note.content, relative = openRel ?: it.relative, assetsDirty = false, assetDirectory = null) else it }, conflictedTabIds = s.conflictedTabIds - note.id, pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == note.id }, message = "Saved") }
+            if (uri != null && openRel != null) {
+                invalidateSharedFolderWorkspaceLinks()
+            }
+            if (openRel != null) {
+                applySavedFolderSnapshotOrReload(savedResult.folderSnapshot)
+            }
+            change { s ->
+                s.copy(
+                    busy = false,
+                    tabs = s.tabs.map {
+                        if (it.id == note.id) it.copy(
+                            uri = writtenTarget.toString(),
+                            name = savedName,
+                            saved = note.content,
+                            relative = if (uri != null) openRel else (openRel ?: it.relative),
+                            assetsDirty = false,
+                            assetDirectory = null,
+                        ) else it
+                    },
+                    conflictedTabIds = s.conflictedTabIds - note.id,
+                    pendingSaveConflictNoteId = s.pendingSaveConflictNoteId?.takeUnless { it == note.id },
+                    message = "Saved",
+                )
+            }
             mutable.value.tabs.find { it.id == note.id }?.let(::remember)
-            if (openRel != null) mutable.value.folder?.let { listFolder(Uri.parse(it), listedRelative) }
             if (closeAfterSaveNoteId == note.id) {
                 closeAfterSaveNoteId = null
                 shouldCloseAfterSave = true
@@ -3469,6 +3536,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
         }
         listFolderJob?.cancel()
+        val startGen = safGeneration.get()
+        val startedDuringPendingRemap = hasPendingRemapScopes()
         return viewModelScope.launch {
             try {
                 require(!invalidPath) { "Invalid folder path" }
@@ -3477,18 +3546,44 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val listing = withContext(Dispatchers.IO) {
                     listSafFolderListing(resolver, documentAccess, targetFolder, requestedRelative, pass)
                 }
-                confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                val endGen = safGeneration.get()
+                val generationValid = !startedDuringPendingRemap && startGen == endGen && !hasPendingRemapScopes()
+                if (generationValid) {
+                    confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                }
                 if (seq == listFolderSeq && mutable.value.folder != null) {
-                    listedRelative = listing.effectiveRelative
-                    if (listing.effectiveRelative != requestedRelative) {
-                        windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", listing.effectiveRelative).apply()
+                    if (generationValid) {
+                        listedRelative = listing.effectiveRelative
+                        loadedFilesSeq = seq
+                        loadedFilesGeneration = endGen
+                        needsReloadAfterPreRemap = false
+                        if (listing.effectiveRelative != requestedRelative) {
+                            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", listing.effectiveRelative).apply()
+                        }
+                        mutable.value = mutable.value.copy(folderRelative = listing.effectiveRelative, files = listing.entries)
+                    } else if (hasPendingRemapScopes()) {
+                        needsReloadAfterPreRemap = true
+                    } else {
+                        val currentFolder = mutable.value.folder
+                        if (currentFolder != null) {
+                            listFolder(Uri.parse(currentFolder), normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { requestedRelative }))
+                        }
                     }
-                    mutable.value = mutable.value.copy(folderRelative = listing.effectiveRelative, files = listing.entries)
                 }
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (seq == listFolderSeq) fail("Could not list folder: ${error.message}")
+                if (seq == listFolderSeq) {
+                    if (!startedDuringPendingRemap && startGen == safGeneration.get() && !hasPendingRemapScopes()) {
+                        fail("Could not list folder: ${error.message}")
+                    } else if (hasPendingRemapScopes()) {
+                        needsReloadAfterPreRemap = true
+                    } else {
+                        mutable.value.folder?.let { currentFolder ->
+                            listFolder(Uri.parse(currentFolder), normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { requestedRelative }))
+                        }
+                    }
+                }
             }
         }.also { listFolderJob = it }
     }
@@ -3508,13 +3603,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         for (vm in liveStudioViewModels(this)) {
             val vmFolder = vm.mutable.value.folder
             if (vmFolder != null && sameDocumentUri(vmFolder, treeRaw)) {
-                vm.mutable.value.files.firstOrNull { sameDocument(Uri.parse(it.uri), uri) }?.let { entry ->
-                    return normalizeRelativePath(entry.relative).takeIf { it.isNotEmpty() }
-                }
                 vm.mutable.value.tabs.firstOrNull {
                     it.uri != null && !it.relative.isNullOrBlank() && sameDocument(Uri.parse(it.uri), uri)
                 }?.relative?.let { rel ->
                     return normalizeRelativePath(rel).takeIf { it.isNotEmpty() }
+                }
+                if (vm.hasCurrentLoadedFiles()) {
+                    vm.mutable.value.files.firstOrNull { sameDocument(Uri.parse(it.uri), uri) }?.let { entry ->
+                        return normalizeRelativePath(entry.relative).takeIf { it.isNotEmpty() }
+                    }
                 }
             }
         }
@@ -3530,18 +3627,34 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         relativeInOpenFolder(uri, folderTreeRaw)?.let { return it }
         val treeRaw = folderTreeRaw?.takeIf { it.isNotBlank() } ?: return null
         val folderUri = runCatching { Uri.parse(treeRaw) }.getOrNull() ?: return null
-        val pass = SafProjectionPass(resolver)
-        val found = findRelativeInSafTree(
-            pass = pass,
+        val preferredRel = normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { listedRelative })
+        repeat(3) {
+            val genBefore = safGeneration.get()
+            val pass = SafProjectionPass(resolver)
+            val found = findRelativeInSafTree(
+                pass = pass,
+                documentAccess = documentAccess,
+                folderUri = folderUri,
+                targetUri = uri,
+                preferredDirRelative = preferredRel,
+            )
+            val genAfter = safGeneration.get()
+            if (genBefore == genAfter && !hasPendingRemapScopes()) {
+                if (pass.confirmedTreeKeys.isNotEmpty()) {
+                    confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                }
+                return found
+            }
+            relativeInOpenFolder(uri, folderTreeRaw)?.let { return it }
+        }
+        val fallbackPass = SafProjectionPass(resolver)
+        return findRelativeInSafTree(
+            pass = fallbackPass,
             documentAccess = documentAccess,
             folderUri = folderUri,
             targetUri = uri,
-            preferredDirRelative = listedRelative,
+            preferredDirRelative = preferredRel,
         )
-        if (pass.confirmedTreeKeys.isNotEmpty()) {
-            confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
-        }
-        return found
     }
 
     private fun trackedEntriesInOpenFolder(
@@ -3629,75 +3742,107 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         folderTreeRaw: String? = null,
         statusMessage: String? = null,
         preRenameFolderState: Map<StudioViewModel, Pair<Long, String>> = emptyMap(),
+        refreshedFolders: Map<Pair<String, String>, RefreshedFolderSnapshot> = emptyMap(),
+        activeRenameScope: SafRenameScope? = null,
     ) {
-        if (remaps.isEmpty() && oldFolderPrefix == null) return
-        remapPersistedMetadata(remaps)
+        try {
+            if (remaps.isEmpty() && oldFolderPrefix == null) return
+            remapPersistedMetadata(remaps)
 
-        val updatedRecents = recentMutable.value.map { item ->
-            val matched = remaps.firstOrNull { sameDocumentUri(item.uri, it.oldUri) }
-            when {
-                matched != null -> item.copy(
-                    name = matched.newName ?: item.name,
-                    uri = matched.newUri,
-                    relative = matched.newRelative ?: item.relative,
-                )
-                oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(item.relative, oldFolderPrefix) ->
-                    item.copy(relative = remapRelativePrefix(item.relative, oldFolderPrefix, newFolderPrefix))
-                else -> item
+            val updatedRecents = recentMutable.value.map { item ->
+                val matched = remaps.firstOrNull { sameDocumentUri(item.uri, it.oldUri) }
+                when {
+                    matched != null -> item.copy(
+                        name = matched.newName ?: item.name,
+                        uri = matched.newUri,
+                        relative = matched.newRelative ?: item.relative,
+                    )
+                    oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(item.relative, oldFolderPrefix) ->
+                        item.copy(relative = remapRelativePrefix(item.relative, oldFolderPrefix, newFolderPrefix))
+                    else -> item
+                }
             }
-        }
-        if (updatedRecents != recentMutable.value) {
-            storeRecent(updatedRecents)
-        }
+            if (updatedRecents != recentMutable.value) {
+                storeRecent(updatedRecents)
+            }
 
-        liveStudioViewModels(this).forEach { vm ->
-            vm.workspaceLinks.invalidate()
-            if (oldFolderPrefix != null) vm.readerFolderIndex.clear()
-            vm.change { currentState ->
-                val nextTabs = currentState.tabs.map { tab ->
-                    val tabUri = tab.uri
-                    val matched = if (tabUri != null) remaps.firstOrNull { sameDocumentUri(tabUri, it.oldUri) } else null
-                    when {
-                        matched != null -> tab.copy(
-                            name = matched.newName ?: tab.name,
-                            uri = matched.newUri,
-                            relative = matched.newRelative ?: tab.relative,
-                        )
-                        oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(tab.relative, oldFolderPrefix) ->
-                            tab.copy(relative = remapRelativePrefix(tab.relative, oldFolderPrefix, newFolderPrefix))
-                        else -> tab
+            liveStudioViewModels(this).forEach { vm ->
+                remaps.forEach { remap ->
+                    val oldParsed = runCatching { Uri.parse(remap.oldUri) }.getOrNull()
+                    val hadConfirmedOldOnVm = if (oldParsed != null) {
+                        val removedDirect = canonicalTreeDocumentKey(oldParsed)?.let(vm.confirmedTreeDocumentKeys::remove) == true
+                        val removedSame = vm.confirmedTreeDocumentKeys.removeIf { key -> sameDocument(Uri.parse(key), oldParsed) }
+                        removedDirect || removedSame
+                    } else {
+                        false
+                    }
+                    if (remap.confirmedTreeTarget || hadConfirmedOldOnVm) {
+                        runCatching { Uri.parse(remap.newUri) }.getOrNull()
+                            ?.let(::canonicalTreeDocumentKey)
+                            ?.let(vm.confirmedTreeDocumentKeys::add)
                     }
                 }
-                val nextMsg = if (vm === this && statusMessage != null) statusMessage else currentState.message
-                currentState.copy(tabs = nextTabs, message = nextMsg)
-            }
-            val vmFolder = vm.mutable.value.folder
-            if (vmFolder != null && (folderTreeRaw == null || sameDocumentUri(vmFolder, folderTreeRaw))) {
-                val preRename = preRenameFolderState[vm]
-                val currentRel = if (preRename != null && vm.listFolderSeq == preRename.first) {
-                    preRename.second
-                } else {
-                    vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+                vm.workspaceLinks.invalidate()
+                if (oldFolderPrefix != null) vm.readerFolderIndex.clear()
+                vm.change { currentState ->
+                    val nextTabs = currentState.tabs.map { tab ->
+                        val tabUri = tab.uri
+                        val matched = if (tabUri != null) remaps.firstOrNull { sameDocumentUri(tabUri, it.oldUri) } else null
+                        when {
+                            matched != null -> tab.copy(
+                                name = matched.newName ?: tab.name,
+                                uri = matched.newUri,
+                                relative = matched.newRelative ?: tab.relative,
+                            )
+                            oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(tab.relative, oldFolderPrefix) ->
+                                tab.copy(relative = remapRelativePrefix(tab.relative, oldFolderPrefix, newFolderPrefix))
+                            else -> tab
+                        }
+                    }
+                    val nextMsg = if (vm === this && statusMessage != null) statusMessage else currentState.message
+                    currentState.copy(tabs = nextTabs, message = nextMsg)
                 }
-                val nextListed = if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
-                    remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
-                } else {
-                    currentRel
+                val vmFolder = vm.mutable.value.folder
+                if (vmFolder != null && (folderTreeRaw == null || sameDocumentUri(vmFolder, folderTreeRaw))) {
+                    val preRename = preRenameFolderState[vm]
+                    val currentRel = if (preRename != null && vm.listFolderSeq == preRename.first) {
+                        preRename.second
+                    } else {
+                        vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+                    }
+                    val nextListed = normalizeFolderRelative(
+                        if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
+                            remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
+                        } else {
+                            currentRel
+                        },
+                    )
+                    val preProjected = refreshedFolders.entries.firstOrNull { (key, _) ->
+                        sameDocumentUri(key.first, vmFolder) && key.second == nextListed
+                    }?.value
+                    if (preProjected == null || !vm.commitOpenFolderSnapshot(preProjected, ignorePendingScope = activeRenameScope, matchCurrentRelative = false)) {
+                        vm.listFolder(Uri.parse(vmFolder), nextListed)
+                    }
+                } else if (vmFolder != null && vm.needsReloadAfterPreRemap) {
+                    vm.needsReloadAfterPreRemap = false
+                    vm.listFolder(Uri.parse(vmFolder), normalizeFolderRelative(vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }))
                 }
-                vm.listFolder(Uri.parse(vmFolder), nextListed)
-            }
-            vm.seededFindMutable.value?.let { seed ->
-                val seedUri = seed.targetUri
-                if (!seedUri.isNullOrBlank()) {
-                    val remappedSeed = remaps.firstOrNull { sameDocumentUri(seedUri, it.oldUri) }
-                    if (remappedSeed != null) {
-                        vm.seededFindMutable.value = seed.copy(targetUri = remappedSeed.newUri)
+                vm.seededFindMutable.value?.let { seed ->
+                    val seedUri = seed.targetUri
+                    if (!seedUri.isNullOrBlank()) {
+                        val remappedSeed = remaps.firstOrNull { sameDocumentUri(seedUri, it.oldUri) }
+                        if (remappedSeed != null) {
+                            vm.seededFindMutable.value = seed.copy(targetUri = remappedSeed.newUri)
+                        }
                     }
                 }
+                if (vm.folderSearchMutable.value.visible && vm.folderSearchMutable.value.query.isNotEmpty()) {
+                    vm.updateFolderSearch()
+                }
             }
-            if (vm.folderSearchMutable.value.visible && vm.folderSearchMutable.value.query.isNotEmpty()) {
-                vm.updateFolderSearch()
-            }
+        } finally {
+            if (activeRenameScope != null) completeSafRenameScope(activeRenameScope)
+            completeLocalSafRenameScopes()
         }
     }
 
@@ -4524,7 +4669,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     var portableOutput: Uri? = null
     suspend fun writePortable(id: String, content: String, assets: JSONObject, save: Boolean, originalContent: String) {
         var closeTargetId: String? = null
-        withContext(Dispatchers.IO) { documentWrites.withLock {
+        withContext(Dispatchers.IO) { withDocumentWriteLockAfterRenames {
             val rebindId = if (!save) portableSaveAsNoteId else null
             val effectiveId = rebindId ?: id
             val note = mutable.value.tabs.find { it.id == effectiveId } ?: error("The note is no longer open")
@@ -4537,7 +4682,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 withContext(Dispatchers.Main) {
                     change { s -> s.copy(busy = false, conflictedTabIds = s.conflictedTabIds + effectiveId, pendingSaveConflictNoteId = effectiveId) }
                 }
-                return@withLock
+                return@withDocumentWriteLockAfterRenames
             }
             val destination = if (save) target else prepareExportDestination(target, NativeExportFormat.PORTABLE_SMD, allowRename = portableDestinationIsNew)
             val staged = File(getApplication<Application>().cacheDir, "fmd-${UUID.randomUUID()}.tmp")
@@ -4565,6 +4710,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     resolveDisplayName(destination) ?: ExportFilename.suggestedName(note.name, NativeExportFormat.PORTABLE_SMD)
                 } else note.name
                 val openRel = if (rebinding) resolveOpenFolderRelativeOnIo(destination) else null
+                val folderSnapshot = if (openRel != null) captureOpenFolderSnapshotOnIo() else null
                 withContext(Dispatchers.Main) {
                     if (rebinding) {
                         portableOutput = null
@@ -4573,6 +4719,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         autosavePending.remove(effectiveId)
                         clearDocumentAccessFailure(destination.toString())
                         recordPortableBaseline(effectiveId, nextDirectory!!)
+                        if (rebindId != null && openRel != null) {
+                            invalidateSharedFolderWorkspaceLinks()
+                        }
+                        if (openRel != null) {
+                            applySavedFolderSnapshotOrReload(folderSnapshot)
+                        }
                         change { s ->
                             s.copy(
                                 tabs = s.tabs.map {
@@ -4582,7 +4734,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                                         saved = content,
                                         assetsDirty = false,
                                         uri = destination.toString(),
-                                        relative = openRel ?: it.relative,
+                                        relative = if (rebindId != null) openRel else (openRel ?: it.relative),
                                         assetDirectory = nextDirectory,
                                     ) else it
                                 },
@@ -4594,7 +4746,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         }
                         materializedDirectory = null
                         mutable.value.tabs.find { it.id == effectiveId }?.let(::remember)
-                        if (openRel != null) mutable.value.folder?.let { listFolder(Uri.parse(it), listedRelative) }
                         if (closeAfterSaveNoteId == effectiveId) {
                             closeAfterSaveNoteId = null
                             closeTargetId = effectiveId
@@ -4682,4 +4833,205 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             throw error
         } finally { staging.deleteRecursively() }
     }
+
+    private fun sameSaveablePortableDraft(left: Note, right: Note): Boolean =
+        left.id == right.id &&
+            left.portable == right.portable &&
+            left.content == right.content &&
+            left.saved == right.saved &&
+            left.assetDirectory == right.assetDirectory &&
+            left.assetsDirty == right.assetsDirty
+
+    private fun hasPendingRemapScopes(ignoreScope: SafRenameScope? = null): Boolean {
+        val app = getApplication<Application>()
+        return pendingRemapScopes.any { it !== ignoreScope && it.app === app && !it.remapsCompleted }
+    }
+
+    private fun beginSafRenameMutation() {
+        safGeneration.incrementAndGet()
+    }
+
+    private fun markSafRenameCommittedOnDisk(scope: SafRenameScope) {
+        scope.committedOnDisk = true
+        pendingRemapScopes.addIfAbsent(scope)
+        localRenameScopes.addIfAbsent(scope)
+        safGeneration.incrementAndGet()
+    }
+
+    private fun completeSafRenameScope(scope: SafRenameScope) {
+        scope.remapsCompleted = true
+        localRenameScopes.remove(scope)
+        pendingRemapScopes.remove(scope)
+        scope.remapCompleted.complete(Unit)
+    }
+
+    private fun completeLocalSafRenameScopes() {
+        val snapshot = localRenameScopes.toList()
+        snapshot.forEach(::completeSafRenameScope)
+    }
+
+    private suspend fun finishSafRenameScope(scope: SafRenameScope) {
+        if (scope.committedOnDisk && !scope.remapsCompleted) {
+            withContext(kotlinx.coroutines.NonCancellable + Dispatchers.Main.immediate) {
+                if (!scope.remapsCompleted) {
+                    scope.pendingFallbackRemap?.invoke()
+                }
+                completeSafRenameScope(scope)
+            }
+        } else {
+            completeSafRenameScope(scope)
+        }
+    }
+
+    private suspend fun awaitPendingRemaps() {
+        val app = getApplication<Application>()
+        while (true) {
+            val active = pendingRemapScopes.firstOrNull { it.app === app && !it.remapsCompleted } ?: break
+            active.remapCompleted.await()
+        }
+    }
+
+    private suspend fun <T> withDocumentWriteLockAfterRenames(block: suspend () -> T): T {
+        while (true) {
+            awaitPendingRemaps()
+            documentWrites.lock()
+            if (!hasPendingRemapScopes()) {
+                try {
+                    return block()
+                } finally {
+                    documentWrites.unlock()
+                }
+            }
+            documentWrites.unlock()
+        }
+    }
+
+    private fun captureOpenFolderSnapshotOnIo(
+        folderRaw: String? = mutable.value.folder,
+        requestedRelative: String = normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { listedRelative }),
+        ignorePendingScope: SafRenameScope? = null,
+    ): RefreshedFolderSnapshot? {
+        val raw = folderRaw?.takeIf { it.isNotBlank() } ?: return null
+        val folderUri = runCatching { Uri.parse(raw) }.getOrNull() ?: return null
+        val genBefore = safGeneration.get()
+        val pass = SafProjectionPass(resolver)
+        val listing = runCatching {
+            listSafFolderListing(resolver, documentAccess, folderUri, requestedRelative, pass)
+        }.getOrNull() ?: return null
+        val genAfter = safGeneration.get()
+        if (genBefore != genAfter || hasPendingRemapScopes(ignoreScope = ignorePendingScope)) return null
+        return RefreshedFolderSnapshot(
+            folderRaw = raw,
+            requestedRelative = requestedRelative,
+            listing = listing,
+            confirmedTreeKeys = pass.confirmedTreeKeys.toSet(),
+            generation = genAfter,
+        )
+    }
+
+    private fun commitOpenFolderSnapshot(
+        snapshot: RefreshedFolderSnapshot,
+        ignorePendingScope: SafRenameScope? = null,
+        matchCurrentRelative: Boolean = true,
+    ): Boolean {
+        val currentFolder = mutable.value.folder ?: return false
+        if (!sameDocumentUri(currentFolder, snapshot.folderRaw)) return false
+        if (matchCurrentRelative) {
+            val currentRel = normalizeFolderRelative(mutable.value.folderRelative.ifEmpty { listedRelative })
+            if (currentRel != snapshot.requestedRelative) return false
+        }
+        if (snapshot.generation != safGeneration.get() || hasPendingRemapScopes(ignoreScope = ignorePendingScope)) return false
+        listFolderJob?.cancel()
+        val seq = ++listFolderSeq
+        confirmedTreeDocumentKeys.addAll(snapshot.confirmedTreeKeys)
+        listedRelative = snapshot.listing.effectiveRelative
+        loadedFilesSeq = seq
+        loadedFilesGeneration = snapshot.generation
+        needsReloadAfterPreRemap = false
+        windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", snapshot.listing.effectiveRelative).apply()
+        mutable.value = mutable.value.copy(
+            folderRelative = snapshot.listing.effectiveRelative,
+            files = snapshot.listing.entries,
+        )
+        return true
+    }
+
+    private fun invalidateSharedFolderWorkspaceLinks() {
+        val currentFolder = mutable.value.folder ?: return
+        liveStudioViewModels(this).forEach { vm ->
+            val vmFolder = vm.mutable.value.folder
+            if (vmFolder != null && sameDocumentUri(vmFolder, currentFolder)) {
+                vm.workspaceLinks.invalidate()
+            }
+        }
+    }
+
+    private fun applySavedFolderSnapshotOrReload(snapshot: RefreshedFolderSnapshot?) {
+        val currentFolder = mutable.value.folder ?: return
+        liveStudioViewModels(this).forEach { vm ->
+            val vmFolder = vm.mutable.value.folder ?: return@forEach
+            if (!sameDocumentUri(vmFolder, currentFolder)) return@forEach
+            if (snapshot == null || !vm.commitOpenFolderSnapshot(snapshot)) {
+                vm.listFolder(Uri.parse(vmFolder), normalizeFolderRelative(vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }))
+            }
+        }
+    }
+
+    private fun capturePreProjectedFoldersForRenameOnIo(
+        folderRaw: String,
+        isDirectory: Boolean,
+        cleanRelative: String,
+        finalRelative: String,
+        preRenameFolderState: Map<StudioViewModel, Pair<Long, String>>,
+        renameScope: SafRenameScope,
+    ): Map<Pair<String, String>, RefreshedFolderSnapshot> {
+        val preProjectedFolders = LinkedHashMap<Pair<String, String>, RefreshedFolderSnapshot>()
+        liveStudioViewModels(this).forEach { vm ->
+            val vmFolder = vm.mutable.value.folder ?: return@forEach
+            if (!sameDocumentUri(vmFolder, folderRaw)) return@forEach
+            val preRename = preRenameFolderState[vm]
+            val currentRel = preRename?.second ?: vm.mutable.value.folderRelative.ifEmpty { vm.listedRelative }
+            val targetRel = normalizeFolderRelative(
+                if (isDirectory && matchesRelativePrefix(currentRel, cleanRelative)) {
+                    remapRelativePrefix(currentRel, cleanRelative, finalRelative).orEmpty()
+                } else {
+                    currentRel
+                },
+            )
+            val key = vmFolder to targetRel
+            if (key !in preProjectedFolders) {
+                captureOpenFolderSnapshotOnIo(
+                    folderRaw = vmFolder,
+                    requestedRelative = targetRel,
+                    ignorePendingScope = renameScope,
+                )?.let { preProjectedFolders[key] = it }
+            }
+        }
+        return preProjectedFolders
+    }
 }
+
+internal data class RefreshedFolderSnapshot(
+    val folderRaw: String,
+    val requestedRelative: String,
+    val listing: SafFolderListing,
+    val confirmedTreeKeys: Set<String>,
+    val generation: Long,
+)
+
+private data class SavedMarkdownResult(
+    val destination: Uri,
+    val resolvedName: String,
+    val openRel: String?,
+    val folderSnapshot: RefreshedFolderSnapshot?,
+)
+
+internal class SafRenameScope(val app: Application) {
+    @Volatile var committedOnDisk: Boolean = false
+    @Volatile var remapsCompleted: Boolean = false
+    @Volatile var pendingFallbackRemap: (() -> Unit)? = null
+    val remapCompleted = kotlinx.coroutines.CompletableDeferred<Unit>()
+}
+
+private val safGeneration = java.util.concurrent.atomic.AtomicLong(0L)
+private val pendingRemapScopes = java.util.concurrent.CopyOnWriteArrayList<SafRenameScope>()

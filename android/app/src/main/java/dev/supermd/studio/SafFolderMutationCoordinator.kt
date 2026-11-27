@@ -29,19 +29,23 @@ internal class SafFolderMutationCoordinator(
     private val performReaderBarrier: suspend (String, () -> Unit) -> Boolean,
     private val retainOpenedNote: (Note, Boolean) -> String,
     private val relativeInOpenFolder: (Uri) -> String?, private val resolveOpenFolderRelativeOnIo: (Uri) -> String?,
-    private val rememberNote: (Note) -> Unit,
+    private val rememberNote: (Note) -> Unit, private val isViewModelRetired: () -> Boolean,
+    private val awaitPendingRemaps: suspend () -> Unit, private val beginSafRenameMutation: () -> Unit,
+    private val markSafRenameCommittedOnDisk: (SafRenameScope) -> Unit, private val finishSafRenameScope: suspend (SafRenameScope) -> Unit,
     private val snapshotPreRenameFolderState: () -> Map<StudioViewModel, Pair<Long, String>>,
     private val trackedEntriesInOpenFolder: (Uri, Map<String, String>) -> Map<String, String>,
-    private val applyUriRemaps: (List<UriRemap>, String?, String?, String?, String?, Map<StudioViewModel, Pair<Long, String>>) -> Unit,
+    private val capturePreProjectedFoldersOnIo: (String, Boolean, String, String, Map<StudioViewModel, Pair<Long, String>>, SafRenameScope) -> Map<Pair<String, String>, RefreshedFolderSnapshot>,
+    private val applyUriRemaps: (List<UriRemap>, String?, String?, String?, String?, Map<StudioViewModel, Pair<Long, String>>, Map<Pair<String, String>, RefreshedFolderSnapshot>, SafRenameScope?) -> Unit,
 ) {
     fun rename(
         id: String, requested: String, showGlobalError: Boolean = true, onResult: (Boolean, String?) -> Unit = { _, _ -> },
     ): Job = scope.launch {
-        val note = readState().tabs.find { it.id == id } ?: run {
-            onResult(false, "Note is no longer open")
-            return@launch
-        }
         try {
+            awaitPendingRemaps()
+            val note = readState().tabs.find { it.id == id } ?: run {
+                onResult(false, "Note is no longer open")
+                return@launch
+            }
             val hasSavedTarget = note.uri != null
             val existingExt = noteExtension(note.name)
             val extension = when {
@@ -70,37 +74,41 @@ internal class SafFolderMutationCoordinator(
                 onResult(true, null)
                 return@launch
             }
-            val renamedUri = withContext(Dispatchers.IO) {
-                documentWrites.withLock {
-                    val target = resolveVerifiedWriteDestination(parsedUri)
-                    val rawRenamed = DocumentsContract.renameDocument(resolver, target, name)
-                        ?: error("This provider does not support renaming. Use Save as instead.")
-                    val hadConfirmedSource = listOfNotNull(
-                        canonicalTreeDocumentKey(parsedUri),
-                        canonicalTreeDocumentKey(target),
-                    ).any(confirmedTreeDocumentKeys::remove)
-                    val canScopeToTargetTree = DocumentsContract.isTreeUri(target) &&
-                        !DocumentsContract.isTreeUri(rawRenamed) &&
-                        (hadConfirmedSource || isKnownPathContainedInTree(
-                            target.authority,
-                            runCatching { DocumentsContract.getTreeDocumentId(target) }.getOrDefault(""),
-                            runCatching { DocumentsContract.getDocumentId(rawRenamed) }.getOrDefault(""),
-                        ))
-                    val effectiveRenamed = if (canScopeToTargetTree) {
-                        canonicalTreeScopedUri(target, rawRenamed)
-                    } else {
-                        rawRenamed
-                    }
-                    readDocumentAccess().persist(effectiveRenamed)
-                    if (hadConfirmedSource) {
-                        canonicalTreeDocumentKey(effectiveRenamed)?.let(confirmedTreeDocumentKeys::add)
-                    }
-                    effectiveRenamed.toString()
-                }
-            }
+            val renameScope = SafRenameScope(app)
             val newRelative = renamedRelative(note.relative, name)
-            applyUriRemaps(listOf(UriRemap(existingUri, renamedUri, name, note.relative, newRelative)), null, null, null, "Renamed to $name", emptyMap())
-            readState().tabs.find { it.id == id }?.let(rememberNote)
+            try {
+                val remap = withContext(Dispatchers.IO) {
+                    documentWrites.withLock {
+                        val target = resolveVerifiedWriteDestination(parsedUri)
+                        beginSafRenameMutation()
+                        val rawRenamed = DocumentsContract.renameDocument(resolver, target, name)
+                            ?: error("This provider does not support renaming. Use Save as instead.")
+                        val hadConfirmedSource = listOfNotNull(
+                            canonicalTreeDocumentKey(parsedUri), canonicalTreeDocumentKey(target),
+                        ).count(confirmedTreeDocumentKeys::remove) > 0
+                        val canScopeToTargetTree = DocumentsContract.isTreeUri(target) && !DocumentsContract.isTreeUri(rawRenamed) &&
+                            (hadConfirmedSource || isKnownPathContainedInTree(
+                                target.authority,
+                                runCatching { DocumentsContract.getTreeDocumentId(target) }.getOrDefault(""),
+                                runCatching { DocumentsContract.getDocumentId(rawRenamed) }.getOrDefault(""),
+                            ))
+                        val effectiveRenamed = if (canScopeToTargetTree) canonicalTreeScopedUri(target, rawRenamed) else rawRenamed
+                        val builtRemap = UriRemap(existingUri, effectiveRenamed.toString(), name, note.relative, newRelative, hadConfirmedSource)
+                        renameScope.pendingFallbackRemap = {
+                            applyUriRemaps(listOf(builtRemap), null, null, null, if (!isViewModelRetired()) "Renamed to $name" else null, emptyMap(), emptyMap(), renameScope)
+                            if (!isViewModelRetired()) readState().tabs.find { it.id == id }?.let(rememberNote)
+                        }
+                        markSafRenameCommittedOnDisk(renameScope)
+                        readDocumentAccess().persist(effectiveRenamed)
+                        if (hadConfirmedSource) canonicalTreeDocumentKey(effectiveRenamed)?.let(confirmedTreeDocumentKeys::add)
+                        builtRemap
+                    }
+                }
+                applyUriRemaps(listOf(remap), null, null, null, "Renamed to $name", emptyMap(), emptyMap(), renameScope)
+                readState().tabs.find { it.id == id }?.let(rememberNote)
+            } finally {
+                finishSafRenameScope(renameScope)
+            }
             onResult(true, null)
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -261,100 +269,123 @@ internal class SafFolderMutationCoordinator(
     suspend fun performRenameFolderEntry(
         entryUri: Uri, cleanRelative: String, isDirectory: Boolean, validatedName: String,
     ) {
+        awaitPendingRemaps()
         val folderRaw = readState().folder ?: error("No folder is open")
         val folderUri = Uri.parse(folderRaw)
         val parentRel = parentRelativePath(cleanRelative)
         val currentName = cleanRelative.substringAfterLast('/')
         val preRenameFolderState = snapshotPreRenameFolderState()
+        val renameScope = SafRenameScope(app)
 
-        val (actualNewName, actualNewRelative, remaps) = withContext(Dispatchers.IO) {
-            documentWrites.withLock {
-                val pass = SafProjectionPass(resolver)
-                val resolvedParent = resolveSafParentDirectory(readDocumentAccess(), pass, folderUri, parentRel)
-                confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
-                require(findDuplicateProjectedChild(resolvedParent.children, resolvedParent.treeUri, validatedName, ignoreUri = entryUri) == null) {
-                    "'$validatedName' already exists in this folder"
-                }
-
-                val entryDocId = runCatching { DocumentsContract.getDocumentId(entryUri) }.getOrNull()
-                val projectedTarget = resolvedParent.children.firstOrNull { child ->
-                    !child.isVirtual && child.isDirectory == isDirectory &&
-                        ((entryDocId != null && child.documentId == entryDocId) || child.displayName == currentName)
-                }
-                val confirmedEntryTreeUri = projectedTarget?.let {
-                    DocumentsContract.buildDocumentUriUsingTree(resolvedParent.treeUri, it.documentId)
-                }
-                if (confirmedEntryTreeUri != null && !isDirectory) {
-                    canonicalTreeDocumentKey(confirmedEntryTreeUri)?.let(confirmedTreeDocumentKeys::add)
-                }
-
-                val beforeSubtreeNodes = if (isDirectory && projectedTarget != null) {
-                    collectSafSubtree(pass, resolvedParent.treeUri, projectedTarget.documentId, cleanRelative)
-                } else emptyList()
-                confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
-                val beforeRelativeByDocId = beforeSubtreeNodes.associate { it.documentId to it.relativePath }
-                val trackedBefore = if (isDirectory) trackedEntriesInOpenFolder(resolvedParent.treeUri, beforeRelativeByDocId) else emptyMap()
-
-                val targetForRename = confirmedEntryTreeUri ?: resolveVerifiedWriteDestination(entryUri)
-                val rawRenamedUri = DocumentsContract.renameDocument(resolver, targetForRename, validatedName)
-                    ?: error("This storage provider does not support renaming")
-                val confirmedInOpenTree = confirmedEntryTreeUri != null ||
-                    isKnownPathContainedInTree(
-                        resolvedParent.treeUri.authority,
-                        resolvedParent.rootDocumentId,
-                        runCatching { DocumentsContract.getDocumentId(rawRenamedUri) }.getOrDefault(""),
-                    )
-                val renamedUri = if (confirmedInOpenTree) {
-                    canonicalTreeScopedUri(resolvedParent.treeUri, rawRenamedUri)
-                } else {
-                    rawRenamedUri
-                }
-                readDocumentAccess().persist(renamedUri)
-                val finalName = (querySingleDocumentMetadata(resolver, renamedUri) as? ProviderMetadata.Found)
-                    ?.name?.takeIf { it.isNotBlank() } ?: validatedName
-                val finalRelative = childRelativePath(parentRel, finalName)
-
-                if (!isDirectory) {
-                    confirmedEntryTreeUri?.let(::canonicalTreeDocumentKey)?.let(confirmedTreeDocumentKeys::remove)
-                    canonicalTreeDocumentKey(entryUri)?.let(confirmedTreeDocumentKeys::remove)
-                    if (confirmedInOpenTree) {
-                        canonicalTreeDocumentKey(renamedUri)?.let(confirmedTreeDocumentKeys::add)
+        try {
+            val (actualNewName, actualNewRelative, remaps, refreshedFolders) = withContext(Dispatchers.IO) {
+                documentWrites.withLock {
+                    val pass = SafProjectionPass(resolver)
+                    val resolvedParent = resolveSafParentDirectory(readDocumentAccess(), pass, folderUri, parentRel)
+                    confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                    require(findDuplicateProjectedChild(resolvedParent.children, resolvedParent.treeUri, validatedName, ignoreUri = entryUri) == null) {
+                        "'$validatedName' already exists in this folder"
                     }
-                    Triple(finalName, finalRelative, listOf(UriRemap(entryUri.toString(), renamedUri.toString(), finalName, cleanRelative, finalRelative)))
-                } else {
-                    beforeSubtreeNodes.filter { !it.isDirectory }.forEach { oldNode ->
-                        canonicalTreeDocumentKey(oldNode.treeDocumentUri)?.let(confirmedTreeDocumentKeys::remove)
+
+                    val entryDocId = runCatching { DocumentsContract.getDocumentId(entryUri) }.getOrNull()
+                    val projectedTarget = resolvedParent.children.firstOrNull { child ->
+                        !child.isVirtual && child.isDirectory == isDirectory &&
+                            ((entryDocId != null && child.documentId == entryDocId) || child.displayName == currentName)
                     }
-                    val afterPass = SafProjectionPass(resolver)
-                    val renamedDirDocId = runCatching { DocumentsContract.getDocumentId(renamedUri) }.getOrNull()
-                    val afterSubtreeNodes = if (renamedDirDocId != null) {
-                        collectSafSubtree(afterPass, resolvedParent.treeUri, renamedDirDocId, finalRelative)
+                    val confirmedEntryTreeUri = projectedTarget?.let {
+                        DocumentsContract.buildDocumentUriUsingTree(resolvedParent.treeUri, it.documentId)
+                    }
+                    if (confirmedEntryTreeUri != null && !isDirectory) {
+                        canonicalTreeDocumentKey(confirmedEntryTreeUri)?.let(confirmedTreeDocumentKeys::add)
+                    }
+
+                    val beforeSubtreeNodes = if (isDirectory && projectedTarget != null) {
+                        collectSafSubtree(pass, resolvedParent.treeUri, projectedTarget.documentId, cleanRelative)
+                    } else emptyList()
+                    confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                    val beforeRelativeByDocId = beforeSubtreeNodes.associate { it.documentId to it.relativePath }
+                    val trackedBefore = if (isDirectory) trackedEntriesInOpenFolder(resolvedParent.treeUri, beforeRelativeByDocId) else emptyMap()
+
+                    val targetForRename = confirmedEntryTreeUri ?: resolveVerifiedWriteDestination(entryUri)
+                    beginSafRenameMutation()
+                    val rawRenamedUri = DocumentsContract.renameDocument(resolver, targetForRename, validatedName)
+                        ?: error("This storage provider does not support renaming")
+                    val confirmedInOpenTree = confirmedEntryTreeUri != null ||
+                        isKnownPathContainedInTree(
+                            resolvedParent.treeUri.authority, resolvedParent.rootDocumentId,
+                            runCatching { DocumentsContract.getDocumentId(rawRenamedUri) }.getOrDefault(""),
+                        )
+                    val renamedUri = if (confirmedInOpenTree) canonicalTreeScopedUri(resolvedParent.treeUri, rawRenamedUri) else rawRenamedUri
+                    val provisionalRelative = childRelativePath(parentRel, validatedName)
+                    val provisionalRemaps = if (!isDirectory) {
+                        listOf(UriRemap(entryUri.toString(), renamedUri.toString(), validatedName, cleanRelative, provisionalRelative, confirmedInOpenTree))
+                    } else emptyList()
+                    renameScope.pendingFallbackRemap = {
+                        applyUriRemaps(
+                            provisionalRemaps, if (isDirectory) cleanRelative else null, if (isDirectory) provisionalRelative else null,
+                            folderRaw, if (!isViewModelRetired()) "Renamed to $validatedName" else null, preRenameFolderState, emptyMap(), renameScope,
+                        )
+                    }
+                    markSafRenameCommittedOnDisk(renameScope)
+                    readDocumentAccess().persist(renamedUri)
+                    val finalName = (querySingleDocumentMetadata(resolver, renamedUri) as? ProviderMetadata.Found)
+                        ?.name?.takeIf { it.isNotBlank() } ?: validatedName
+                    val finalRelative = childRelativePath(parentRel, finalName)
+
+                    val resolvedRemaps = if (!isDirectory) {
+                        confirmedEntryTreeUri?.let(::canonicalTreeDocumentKey)?.let(confirmedTreeDocumentKeys::remove)
+                        canonicalTreeDocumentKey(entryUri)?.let(confirmedTreeDocumentKeys::remove)
+                        if (confirmedInOpenTree) canonicalTreeDocumentKey(renamedUri)?.let(confirmedTreeDocumentKeys::add)
+                        listOf(UriRemap(entryUri.toString(), renamedUri.toString(), finalName, cleanRelative, finalRelative, confirmedInOpenTree))
                     } else {
-                        val refreshedParent = resolveSafParentDirectory(readDocumentAccess(), afterPass, resolvedParent.treeUri, parentRel)
-                        val refreshedDir = refreshedParent.children.firstOrNull { it.isDirectory && !it.isVirtual && it.displayName == finalName }
-                        if (refreshedDir != null) collectSafSubtree(afterPass, resolvedParent.treeUri, refreshedDir.documentId, finalRelative) else emptyList()
-                    }
-                    confirmedTreeDocumentKeys.addAll(afterPass.confirmedTreeKeys)
-                    val afterByRelative = afterSubtreeNodes.associateBy { it.relativePath }
-
-                    val childRemaps = trackedBefore.mapNotNull { (oldUri, oldRel) ->
-                        if (!matchesRelativePrefix(oldRel, cleanRelative)) return@mapNotNull null
-                        val updatedRel = remapRelativePrefix(oldRel, cleanRelative, finalRelative) ?: return@mapNotNull null
-                        val afterNode = afterByRelative[updatedRel] ?: return@mapNotNull null
-                        if (!afterNode.isDirectory) {
-                            readDocumentAccess().persist(afterNode.treeDocumentUri)
-                            canonicalTreeDocumentKey(afterNode.treeDocumentUri)?.let(confirmedTreeDocumentKeys::add)
+                        beforeSubtreeNodes.filter { !it.isDirectory }.forEach { oldNode ->
+                            canonicalTreeDocumentKey(oldNode.treeDocumentUri)?.let(confirmedTreeDocumentKeys::remove)
                         }
-                        UriRemap(oldUri, afterNode.treeDocumentUri.toString(), afterNode.displayName, oldRel, updatedRel)
+                        val afterPass = SafProjectionPass(resolver)
+                        val renamedDirDocId = runCatching { DocumentsContract.getDocumentId(renamedUri) }.getOrNull()
+                        val afterSubtreeNodes = if (renamedDirDocId != null) {
+                            collectSafSubtree(afterPass, resolvedParent.treeUri, renamedDirDocId, finalRelative)
+                        } else {
+                            val refreshedParent = resolveSafParentDirectory(readDocumentAccess(), afterPass, resolvedParent.treeUri, parentRel)
+                            val refreshedDir = refreshedParent.children.firstOrNull { it.isDirectory && !it.isVirtual && it.displayName == finalName }
+                            if (refreshedDir != null) collectSafSubtree(afterPass, resolvedParent.treeUri, refreshedDir.documentId, finalRelative) else emptyList()
+                        }
+                        confirmedTreeDocumentKeys.addAll(afterPass.confirmedTreeKeys)
+                        val afterByRelative = afterSubtreeNodes.associateBy { it.relativePath }
+
+                        trackedBefore.mapNotNull { (oldUri, oldRel) ->
+                            if (!matchesRelativePrefix(oldRel, cleanRelative)) return@mapNotNull null
+                            val updatedRel = remapRelativePrefix(oldRel, cleanRelative, finalRelative) ?: return@mapNotNull null
+                            val afterNode = afterByRelative[updatedRel] ?: return@mapNotNull null
+                            if (!afterNode.isDirectory) {
+                                readDocumentAccess().persist(afterNode.treeDocumentUri)
+                                canonicalTreeDocumentKey(afterNode.treeDocumentUri)?.let(confirmedTreeDocumentKeys::add)
+                            }
+                            UriRemap(oldUri, afterNode.treeDocumentUri.toString(), afterNode.displayName, oldRel, updatedRel, !afterNode.isDirectory)
+                        }
                     }
-                    Triple(finalName, finalRelative, childRemaps)
+                    val preProjectedFolders = capturePreProjectedFoldersOnIo(folderRaw, isDirectory, cleanRelative, finalRelative, preRenameFolderState, renameScope)
+                    renameScope.pendingFallbackRemap = {
+                        applyUriRemaps(
+                            resolvedRemaps, if (isDirectory) cleanRelative else null, if (isDirectory) finalRelative else null,
+                            folderRaw, if (!isViewModelRetired()) "Renamed to $finalName" else null, preRenameFolderState, preProjectedFolders, renameScope,
+                        )
+                    }
+                    FolderRenameExecutionResult(finalName, finalRelative, resolvedRemaps, preProjectedFolders)
                 }
             }
-        }
 
-        applyUriRemaps(
-            remaps, if (isDirectory) cleanRelative else null, if (isDirectory) actualNewRelative else null,
-            folderRaw, "Renamed to $actualNewName", preRenameFolderState,
-        )
+            applyUriRemaps(
+                remaps, if (isDirectory) cleanRelative else null, if (isDirectory) actualNewRelative else null,
+                folderRaw, "Renamed to $actualNewName", preRenameFolderState, refreshedFolders, renameScope,
+            )
+        } finally {
+            finishSafRenameScope(renameScope)
+        }
     }
 }
+
+private data class FolderRenameExecutionResult(
+    val actualNewName: String, val actualNewRelative: String, val remaps: List<UriRemap>,
+    val refreshedFolders: Map<Pair<String, String>, RefreshedFolderSnapshot>,
+)
