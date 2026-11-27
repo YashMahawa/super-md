@@ -7,12 +7,10 @@ from pathlib import Path
 from typing import Any
 
 _DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
-if _DESKTOP_DIR not in sys.path:
-    sys.path.insert(0, _DESKTOP_DIR)
 
-try:
+if __package__ and "." in __package__:
     from .. import agent_documents as _ad
-except ImportError:
+else:
     import agent_documents as _ad
 
 from . import mcp_live_helpers as _lh
@@ -44,6 +42,26 @@ def _require_live_tab(path: str | None, message: str) -> str:
 def _require_page(offset: int, limit: int, max_limit: int, message: str, *, max_offset: int | None = None) -> None:
     _v.require_nonneg_int(offset, field="offset", max_value=max_offset, error_cls=AgentDocumentError, message=message)
     _v.require_int_range(limit, 1, max_limit, field="limit", error_cls=AgentDocumentError, message=message)
+
+
+def _load_exporters():
+    if _DESKTOP_DIR not in sys.path:
+        sys.path.insert(0, _DESKTOP_DIR)
+    if __package__ and "." in __package__:
+        from ..agent_exports import export_pdf, export_smd
+    else:
+        from agent_exports import export_pdf, export_smd
+    return export_pdf, export_smd
+
+
+def _load_offline_renderer():
+    if _DESKTOP_DIR not in sys.path:
+        sys.path.insert(0, _DESKTOP_DIR)
+    if __package__ and "." in __package__:
+        from ..offline_view import render_offline
+    else:
+        from offline_view import render_offline
+    return render_offline
 
 
 def build_mcp_server(roots: list[str], live_client=None):
@@ -229,10 +247,7 @@ def build_mcp_server(roots: list[str], live_client=None):
                 raise AgentDocumentError("Filesystem export requires output_path inside an allowed root")
             if format != "pdf" and options:
                 raise AgentDocumentError("PDF options apply only to PDF export")
-            try:
-                from ..agent_exports import export_pdf, export_smd
-            except ImportError:
-                from agent_exports import export_pdf, export_smd
+            export_pdf, export_smd = _load_exporters()
             return export_pdf(store, path, output_path, options=options) if format == "pdf" else (export_smd(store, path, output_path) if format == "smd" else store.create(output_path, store.read_markdown(path)))
         if action == "job_status":
             _v.require_identifier(job_id, field="job_id", max_len=300, error_cls=AgentDocumentError, message="job_status requires a live jobId")
@@ -351,10 +366,7 @@ def build_mcp_server(roots: list[str], live_client=None):
             if diagram_id is not None:
                 raise AgentDocumentError("Use the background service for individual rendered frames, or extract the original asset")
             _v.require_viewport_width(width, min_width=320, max_width=1600, error_cls=AgentDocumentError, message="Offline preview width must be between 320 and 1,600 pixels")
-            try:
-                from ..offline_view import render_offline
-            except ImportError:
-                from offline_view import render_offline
+            render_offline = _load_offline_renderer()
             return [ImageContent(type="image", data=base64.b64encode(render_offline(store, path, width=width, expected_revision=expected_revision)).decode(), mimeType="image/png")]
         _v.require_viewport_width(width, min_width=64, max_width=1600, error_cls=AgentDocumentError)
         if diagram_id is not None:

@@ -7,10 +7,6 @@ import os
 import sys
 from pathlib import Path
 
-_DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
-if _DESKTOP_DIR not in sys.path:
-    sys.path.insert(0, _DESKTOP_DIR)
-
 from .mcp_tools import build_mcp_server
 
 
@@ -46,6 +42,11 @@ def _token(args) -> str:
     return token
 
 
+def _make_live_client(sessions_dir: str):
+    from .agent_live_client import MultiSessionLiveClient
+    return MultiSessionLiveClient(sessions_dir)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Super MD MCP server")
     parser.add_argument("--root", action="append", default=[], help="Explicit allowed workspace root (repeatable); optional for live-only")
@@ -58,13 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-origin", action="append", help="Exact browser Origin allowlist entry; repeatable")
     args = parser.parse_args(argv)
     try:
-        live_client = None
-        if args.live_sessions_dir:
-            try:
-                from ..agent_live_client import MultiSessionLiveClient
-            except ImportError:
-                from agent_live_client import MultiSessionLiveClient
-            live_client = MultiSessionLiveClient(args.live_sessions_dir)
+        live_client = _make_live_client(args.live_sessions_dir) if args.live_sessions_dir else None
         if not args.root and live_client is None:
             raise ValueError("Provide at least one --root or --live-sessions-dir")
         server, _ = build_mcp_server(args.root, live_client=live_client)

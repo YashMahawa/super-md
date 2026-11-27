@@ -9,14 +9,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-_DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
-if _DESKTOP_DIR not in sys.path:
-    sys.path.insert(0, _DESKTOP_DIR)
-
-try:
+if __package__ and "." in __package__:
     from .. import documents
     from ..agent_documents import AgentDocumentError, DocumentStore, RevisionConflict
-except ImportError:
+else:
     import documents
     from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict
 

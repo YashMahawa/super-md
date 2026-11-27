@@ -8,10 +8,10 @@ _DESKTOP_DIR = str(Path(__file__).resolve().parent)
 if _DESKTOP_DIR not in sys.path:
     sys.path.insert(0, _DESKTOP_DIR)
 
-try:
+if __package__:
     from .agent.mcp_http import BearerAuth, _token, main
     from .agent.mcp_tools import build_mcp_server
-except ImportError:  # python desktop/mcp_server.py
+else:
     from agent.mcp_http import BearerAuth, _token, main
     from agent.mcp_tools import build_mcp_server
 

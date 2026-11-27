@@ -4,17 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
 from typing import Any
 
-_DESKTOP_DIR = str(Path(__file__).resolve().parents[1])
-if _DESKTOP_DIR not in sys.path:
-    sys.path.insert(0, _DESKTOP_DIR)
-
-try:
-    from ..agent_stdio import configure_stdio
-except ImportError:
-    from agent_stdio import configure_stdio
+from .agent_stdio import configure_stdio
 
 MAX_CLI_OUTPUT = 64_000
 
