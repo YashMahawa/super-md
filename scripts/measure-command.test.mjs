@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -53,18 +54,123 @@ test('CLI requires an explicit report path and a command separator', () => {
 test('runs only the supplied child and writes its status report to the requested path', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'supermd-measure-command-'));
   const output = path.join(directory, 'result.json');
+  let samplerCalls = 0;
   try {
     const report = await measureCommand({
       command: process.execPath,
       args: ['-e', 'setTimeout(() => process.exit(7), 40)'],
       output,
-      sampler: async pid => ({ processCount: 1, rssKb: pid > 0 ? 11 : null, pssKb: pid > 0 ? 6 : null }),
+      sampler: async pid => {
+        samplerCalls++;
+        return { processCount: 1, rssKb: pid > 0 ? 11 : null, pssKb: pid > 0 ? 6 : null };
+      },
     });
     const diskReport = JSON.parse(await readFile(output, 'utf8'));
     assert.equal(report.exitCode, 7);
     assert.equal(diskReport.exitCode, 7);
-    assert.equal(diskReport.memory.peakSampledRssKb, 11);
+    assert.equal(diskReport.spawnErrorCode, null);
     assert.equal(diskReport.command.argumentCount, 2);
+    assert.equal(diskReport.platform, process.platform);
+    if (process.platform === 'linux') {
+      assert.ok(samplerCalls >= 1);
+      assert.equal(diskReport.memory.source, 'Linux /proc descendant process tree');
+      assert.equal(diskReport.memory.peakSampledRssKb, 11);
+      assert.equal(diskReport.memory.peakSampledPssKb, 6);
+    } else {
+      assert.equal(samplerCalls, 0);
+      assert.equal(diskReport.memory.source, 'unavailable on this platform');
+      assert.equal(diskReport.memory.peakSampledRssKb, null);
+      assert.equal(diskReport.memory.peakSampledPssKb, null);
+      assert.equal(diskReport.memory.sampleCount, 0);
+      assert.deepEqual(diskReport.memory.samples, []);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('samples Linux process-tree RSS via injected child and reports unavailable memory on non-Linux hosts', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'supermd-measure-command-injected-'));
+  try {
+    const createInjectedSpawn = (spawnCalls, exitCode = 7) => (command, args, options) => {
+      spawnCalls.push({ command, args, options });
+      const child = new EventEmitter();
+      child.pid = 4242;
+      setImmediate(() => {
+        child.emit('spawn');
+        setImmediate(() => {
+          // Clear the synthetic PID before close so post-exit group cleanup never signals a host PID.
+          child.pid = undefined;
+          child.emit('close', exitCode, null);
+        });
+      });
+      return child;
+    };
+
+    const linuxOutput = path.join(directory, 'linux-result.json');
+    const linuxSpawns = [];
+    const linuxSampledPids = [];
+    let clock = 1_000;
+    const linuxReport = await measureCommand({
+      command: '/usr/bin/node',
+      args: ['-e', 'process.exit(7)'],
+      output: linuxOutput,
+      platform: 'linux',
+      spawn: createInjectedSpawn(linuxSpawns),
+      sampler: async pid => {
+        linuxSampledPids.push(pid);
+        return { processCount: 1, rssKb: pid > 0 ? 11 : null, pssKb: pid > 0 ? 6 : null };
+      },
+      now: () => {
+        clock += 20;
+        return clock;
+      },
+    });
+    const linuxDiskReport = JSON.parse(await readFile(linuxOutput, 'utf8'));
+    assert.equal(linuxSpawns.length, 1);
+    assert.deepEqual(linuxSpawns[0].options, { stdio: 'inherit', detached: true });
+    assert.deepEqual(linuxSampledPids, [4242]);
+    assert.equal(linuxReport.exitCode, 7);
+    assert.equal(linuxDiskReport.exitCode, 7);
+    assert.equal(linuxDiskReport.command.argumentCount, 2);
+    assert.equal(linuxDiskReport.platform, 'linux');
+    assert.equal(linuxDiskReport.memory.source, 'Linux /proc descendant process tree');
+    assert.equal(linuxDiskReport.memory.sampleCount, 1);
+    assert.equal(linuxDiskReport.memory.peakSampledRssKb, 11);
+    assert.equal(linuxDiskReport.memory.peakSampledPssKb, 6);
+
+    for (const nonLinuxPlatform of ['darwin', 'win32']) {
+      const nonLinuxOutput = path.join(directory, `${nonLinuxPlatform}-result.json`);
+      const nonLinuxSpawns = [];
+      let nonLinuxSamples = 0;
+      const nonLinuxReport = await measureCommand({
+        command: 'node',
+        args: ['-e', 'process.exit(7)'],
+        output: nonLinuxOutput,
+        platform: nonLinuxPlatform,
+        spawn: createInjectedSpawn(nonLinuxSpawns),
+        sampler: async () => {
+          nonLinuxSamples++;
+          return { processCount: 1, rssKb: 11, pssKb: 6 };
+        },
+      });
+      const nonLinuxDiskReport = JSON.parse(await readFile(nonLinuxOutput, 'utf8'));
+      assert.equal(nonLinuxSpawns.length, 1);
+      assert.deepEqual(nonLinuxSpawns[0].options, {
+        stdio: 'inherit',
+        detached: nonLinuxPlatform !== 'win32',
+      });
+      assert.equal(nonLinuxSamples, 0);
+      assert.equal(nonLinuxReport.exitCode, 7);
+      assert.equal(nonLinuxDiskReport.exitCode, 7);
+      assert.equal(nonLinuxDiskReport.command.argumentCount, 2);
+      assert.equal(nonLinuxDiskReport.platform, nonLinuxPlatform);
+      assert.equal(nonLinuxDiskReport.memory.source, 'unavailable on this platform');
+      assert.equal(nonLinuxDiskReport.memory.sampleCount, 0);
+      assert.equal(nonLinuxDiskReport.memory.peakSampledRssKb, null);
+      assert.equal(nonLinuxDiskReport.memory.peakSampledPssKb, null);
+      assert.deepEqual(nonLinuxDiskReport.memory.samples, []);
+    }
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
