@@ -20,38 +20,38 @@ import kotlin.random.Random
 class AgentRelayClient(private val onState: (State) -> Unit = {}) {
     enum class State { DISCONNECTED, CONNECTING, CONNECTED }
 
+    private class SocketSession(val sessionId: Long, val config: AgentAccessConfig, val handler: (JSONObject, (Any?, String?) -> Unit) -> Unit) {
+        @Volatile var socket: WebSocket? = null; @Volatile var closing = false; val activeRequests = linkedSetOf<String>()
+    }
+
     private val main = Handler(Looper.getMainLooper())
-    private val client = OkHttpClient.Builder().connectTimeout(12, TimeUnit.SECONDS)
+    internal var client = OkHttpClient.Builder().connectTimeout(12, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(25, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true).build()
+    internal var webSocketFactory: WebSocket.Factory = client
     @Volatile private var stopped = true
-    @Volatile private var webSocket: WebSocket? = null
+    @Volatile private var sessionId = 0L
+    @Volatile private var activeSocket: SocketSession? = null
     @Volatile private var state = State.DISCONNECTED
     private var config: AgentAccessConfig? = null
     private var handler: ((JSONObject, (Any?, String?) -> Unit) -> Unit)? = null
     private var retryAttempt = 0
-    private val activeRequests = linkedSetOf<String>()
 
     /** Starts/reconnects the relay connection. The callback is always dispatched on the main thread. */
-    @Synchronized fun connect(
-        config: AgentAccessConfig,
-        handler: (request: JSONObject, reply: (result: Any?, error: String?) -> Unit) -> Unit,
-    ) {
+    @Synchronized fun connect(config: AgentAccessConfig, handler: (request: JSONObject, reply: (result: Any?, error: String?) -> Unit) -> Unit) {
         disconnect()
         require(config.serverOrigin.startsWith("https://")) { "Live Agent relay requires HTTPS" }
-        this.config = config
-        this.handler = handler
-        stopped = false
-        retryAttempt = 0
-        enroll()
+        val nextSession = ++sessionId; this.config = config; this.handler = handler
+        stopped = false; retryAttempt = 0; enroll(nextSession, config)
     }
 
     @Synchronized fun disconnect() {
-        stopped = true
-        main.removeCallbacksAndMessages(RETRY_TOKEN)
-        webSocket?.close(1000, "Live Agent access disabled")
-        webSocket = null
-        synchronized(activeRequests) { activeRequests.clear() }
+        sessionId += 1; stopped = true; main.removeCallbacksAndMessages(RETRY_TOKEN)
+        activeSocket?.let { prev ->
+            activeSocket = null
+            synchronized(prev.activeRequests) { prev.activeRequests.clear() }
+            if (!prev.closing) prev.socket?.close(1000, "Live Agent access disabled")
+        }
         setState(State.DISCONNECTED)
     }
 
@@ -63,16 +63,14 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
             .put("deviceId", config.deviceId).toString().toRequestBody(JSON_MEDIA_TYPE)
         val request = Request.Builder().url(config.serverOrigin.trimEnd('/') + "/device/revoke").post(body).build()
         client.newCall(request).apply { timeout().timeout(15, TimeUnit.SECONDS) }.enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, error: java.io.IOException) { main.post { completion(false) } }
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) { main.post { completion(false) } }
             override fun onResponse(call: okhttp3.Call, response: Response) { response.use { val success = it.isSuccessful; main.post { completion(success) } } }
         })
     }
 
     /** Pairing keys travel only in this TLS registration request, never to MCP clients. */
-    private fun enroll() {
-        if (stopped) return
-        val current = config ?: return
-        setState(State.CONNECTING)
+    private fun enroll(expectedSession: Long, current: AgentAccessConfig) {
+        synchronized(this) { if (!ownsSession(expectedSession) || config !== current || activeSocket != null) return; setState(State.CONNECTING) }
         val body = JSONObject().put("groupId", current.groupId).put("deviceId", current.deviceId)
             .put("deviceKey", current.deviceKey).put("displayName", current.displayName)
             .put("platform", current.platform).put("pairingKey", current.pairingKey)
@@ -81,10 +79,10 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         val request = Request.Builder().url(current.serverOrigin.trimEnd('/') + "/device/enroll")
             .post(body).build()
         client.newCall(request).apply { timeout().timeout(15, TimeUnit.SECONDS) }.enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, error: java.io.IOException) { if (!stopped) scheduleReconnect() }
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) = onEnrollFailed(expectedSession, current)
             override fun onResponse(call: okhttp3.Call, response: Response) {
                 response.use {
-                    if (!it.isSuccessful) { if (!stopped) scheduleReconnect(); return }
+                    if (!it.isSuccessful) { onEnrollFailed(expectedSession, current); return }
                     val returnedGroup = runCatching {
                         val stream = it.body?.byteStream() ?: error("Empty enrollment response")
                         val bytes = stream.use { body ->
@@ -101,47 +99,54 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
                         require(bytes.size <= 8 * 1024) { "Enrollment response is too large" }
                         JSONObject(bytes.toString(Charsets.UTF_8)).getString("groupId")
                     }.getOrNull()
-                    if (returnedGroup != current.groupId) { if (!stopped) scheduleReconnect(); return }
+                    if (returnedGroup != current.groupId) { onEnrollFailed(expectedSession, current); return }
                 }
-                if (!stopped) openSocket(current)
+                openSocket(expectedSession, current)
             }
         })
     }
 
-    private fun openSocket(current: AgentAccessConfig) {
-        val request = authenticatedWebSocketRequest(current)
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                if (stopped) webSocket.close(1000, "Disabled")
-            }
+    private fun ownsSession(expectedSession: Long): Boolean = !stopped && sessionId == expectedSession
+    private fun ownsSocket(slot: SocketSession, ws: WebSocket): Boolean {
+        if (slot.socket == null) slot.socket = ws
+        return !stopped && !slot.closing && sessionId == slot.sessionId && activeSocket === slot && slot.socket === ws
+    }
+    private fun closeSocket(slot: SocketSession, ws: WebSocket, code: Int, reason: String) { slot.closing = true; ws.close(code, reason) }
+    @Synchronized private fun onEnrollFailed(expectedSession: Long, current: AgentAccessConfig) { if (ownsSession(expectedSession) && config === current && activeSocket == null) scheduleReconnect(expectedSession) }
+    @Synchronized private fun onSocketTerminated(slot: SocketSession, ws: WebSocket) {
+        synchronized(slot.activeRequests) { slot.activeRequests.clear() }
+        if (activeSocket !== slot || (slot.socket != null && slot.socket !== ws)) return
+        activeSocket = null; if (ownsSession(slot.sessionId)) scheduleReconnect(slot.sessionId)
+    }
+
+    @Synchronized private fun openSocket(expectedSession: Long, current: AgentAccessConfig) {
+        val currentHandler = handler ?: return
+        if (!ownsSession(expectedSession) || config !== current || activeSocket != null) return
+        val slot = SocketSession(expectedSession, current, currentHandler)
+        activeSocket = slot
+        val created = webSocketFactory.newWebSocket(authenticatedWebSocketRequest(current), object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) { if (!ownsSocket(slot, webSocket)) webSocket.close(1000, "Disabled") }
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (stopped || text.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_BYTES) {
-                    webSocket.close(1008, "Invalid relay frame"); return
-                }
+                if (!ownsSocket(slot, webSocket)) return
+                if (text.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_BYTES) { closeSocket(slot, webSocket, 1008, "Invalid relay frame"); return }
                 try {
                     val message = JSONObject(text)
                     when (message.optString("type")) {
-                        "registered" -> {
-                            require(message.getString("groupId") == current.groupId)
-                            require(message.getString("deviceId") == current.deviceId)
-                            retryAttempt = 0
-                            setState(State.CONNECTED)
+                        "registered" -> synchronized(this@AgentRelayClient) {
+                            require(message.getString("groupId") == slot.config.groupId && message.getString("deviceId") == slot.config.deviceId)
+                            if (ownsSocket(slot, webSocket)) { retryAttempt = 0; setState(State.CONNECTED) }
                         }
-                        "request" -> acceptRequest(message, webSocket)
+                        "request" -> acceptRequest(slot, webSocket, message)
                         else -> throw IllegalArgumentException("Unexpected relay frame")
                     }
-                } catch (_: Exception) { webSocket.close(1008, "Invalid relay request") }
+                } catch (_: Exception) { if (ownsSocket(slot, webSocket)) closeSocket(slot, webSocket, 1008, "Invalid relay request") }
             }
-            override fun onMessage(webSocket: WebSocket, bytes: ByteString) { webSocket.close(1003, "Text frames only") }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (this@AgentRelayClient.webSocket === webSocket) this@AgentRelayClient.webSocket = null
-                if (!stopped) scheduleReconnect()
-            }
-            override fun onFailure(webSocket: WebSocket, error: Throwable, response: Response?) {
-                if (this@AgentRelayClient.webSocket === webSocket) this@AgentRelayClient.webSocket = null
-                if (!stopped) scheduleReconnect()
-            }
+            override fun onMessage(webSocket: WebSocket, bytes: ByteString) { if (ownsSocket(slot, webSocket)) closeSocket(slot, webSocket, 1003, "Text frames only") }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = onSocketTerminated(slot, webSocket)
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = onSocketTerminated(slot, webSocket)
         })
+        slot.socket = created
+        if (!ownsSocket(slot, created) && !slot.closing) closeSocket(slot, created, 1000, "Disabled")
     }
 
     internal fun authenticatedWebSocketRequest(current: AgentAccessConfig): Request {
@@ -156,24 +161,25 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
             .build()
     }
 
-    private fun acceptRequest(message: JSONObject, socket: WebSocket) {
+    private fun acceptRequest(slot: SocketSession, socket: WebSocket, message: JSONObject) {
+        if (!ownsSocket(slot, socket)) return
         val requestId = message.optString("requestId")
         require(REQUEST_ID.matches(requestId)) { "Invalid request id" }
         require(message.length() <= 16) { "Too many RPC fields" }
         require(message.optString("action") in ACTIONS) { "Action is not supported" }
-        require(message.optString("deviceId") == config?.deviceId) { "Request is routed to a different device" }
-        synchronized(activeRequests) {
-            require(activeRequests.size < MAX_ACTIVE_REQUESTS) { "Too many app requests are active" }
-            require(activeRequests.add(requestId)) { "Duplicate request id" }
+        require(message.optString("deviceId") == slot.config.deviceId) { "Request is routed to a different device" }
+        synchronized(slot.activeRequests) {
+            require(slot.activeRequests.size < MAX_ACTIVE_REQUESTS) { "Too many app requests are active" }
+            require(slot.activeRequests.add(requestId)) { "Duplicate request id" }
         }
-        val request = JSONObject(message.toString()).apply { remove("type"); remove("deviceId") }
-        validateRequest(request)
+        val request = try {
+            JSONObject(message.toString()).apply { remove("type"); remove("deviceId") }.also(::validateRequest)
+        } catch (error: Exception) { finish(slot, socket, requestId, null, error.message ?: "Invalid request"); return }
         main.post {
-            if (stopped || socket !== webSocket) { finish(socket, requestId, null, "The app is offline"); return@post }
-            val currentHandler = handler
-            if (currentHandler == null) { finish(socket, requestId, null, "The app's live document bridge is unavailable"); return@post }
-            try { currentHandler(request) { result, error -> finish(socket, requestId, result, error) } }
-            catch (error: Exception) { finish(socket, requestId, null, error.message ?: "The app request failed") }
+            if (!ownsSocket(slot, socket)) return@post
+            val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+            try { slot.handler(request) { result, error -> if (completed.compareAndSet(false, true)) finish(slot, socket, requestId, result, error) } }
+            catch (error: Exception) { if (completed.compareAndSet(false, true)) finish(slot, socket, requestId, null, error.message ?: "The app request failed") }
         }
     }
 
@@ -212,7 +218,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (action in setOf("outline_tab", "latex_review", "latex_apply", "get_context")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
         if (action in setOf("list_diagrams", "get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(request.optString("tabId").isNotBlank()) { "tabId is required" }
         if (action in setOf("get_diagram", "get_diagram_image", "replace_tab_asset", "asset_action")) require(REVISION.matches(request.optString("expectedRevision"))) { "A current document revision is required" }
-        if (action in setOf("get_diagram", "get_diagram_image")) require(request.optString("diagramId").startsWith("diagram:") && request.optString("diagramId").length <= 100) { "A listed diagramId is required" }
+        if (action in setOf("get_diagram", "get_diagram_image")) require(request.optString("diagramId").let { it.startsWith("diagram:") && it.length in 9..128 }) { "A listed diagramId is required" }
         if (action == "replace_tab_asset") {
             require(request.optString("assetName").isNotBlank() && request.optString("assetPath").isNotBlank()) { "Asset replacement requires assetName and assetPath" }
             require(request.get("assetPath") is String) { "Invalid assetPath" }
@@ -267,9 +273,9 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("content")) require(request.getString("content").toByteArray(Charsets.UTF_8).size <= MAX_TEXT_BYTES) { "Document content is too large" }
         if (request.has("options")) require(request.getJSONObject("options").toString().toByteArray(Charsets.UTF_8).size <= 16 * 1024) { "Document options are too large" }
         if (request.has("view")) require(request.getString("view") in setOf("source", "prose")) { "Invalid document view" }
-        if (request.has("diagramId")) require(request.getString("diagramId").length in 1..100) { "Invalid diagram id" }
-        if (request.has("jobId")) require(request.getString("jobId").length in 1..128) { "Invalid job id" }
-        if (request.has("format")) require(request.getString("format") in setOf("pdf", "smd", "md")) { "Invalid export format" }
+        if (request.has("diagramId")) require(request.get("diagramId") is String && request.getString("diagramId").let { it.startsWith("diagram:") && it.length in 9..128 }) { "Invalid diagram id" }
+        if (request.has("jobId")) require(request.get("jobId") is String && request.getString("jobId").length in 1..128) { "Invalid job id" }
+        if (request.has("format")) require(request.get("format") is String && request.getString("format") in setOf("pdf", "smd", "md", "mdzip")) { "Invalid export format" }
         if (request.has("repairIndices")) {
             val indices = request.getJSONArray("repairIndices")
             val values = (0 until indices.length()).map { indices.optInt(it, -1) }
@@ -290,6 +296,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("format")) require(request.get("format") is String) { "Invalid format" }
         if (request.has("query")) require(request.getString("query").length in 1..2048) { "Invalid query" }
         if (action == "search_tab") require(request.optString("query").length in 1..500) { "Search query must contain 1–500 characters" }
+        if (action == "search_tab" && request.has("limit")) require(request.getInt("limit") in 1..25) { "Search limit must be 1–25" }
         if (request.has("caseSensitive")) require(request.get("caseSensitive") is Boolean) { "caseSensitive must be a boolean" }
         if (request.has("wholeWord")) require(request.get("wholeWord") is Boolean) { "wholeWord must be a boolean" }
         if (request.has("regex")) require(request.get("regex") is Boolean) { "regex must be a boolean" }
@@ -308,27 +315,31 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("width")) require(request.getInt("width") >= 1) { "Invalid width" }
     }
 
-    private fun finish(socket: WebSocket, requestId: String, result: Any?, error: String?) {
-        synchronized(activeRequests) { activeRequests.remove(requestId) }
-        if (stopped || socket !== webSocket || socket.queueSize() > MAX_MESSAGE_BYTES) return
+    private fun finish(slot: SocketSession, socket: WebSocket, requestId: String, result: Any?, error: String?) {
+        if (!ownsSocket(slot, socket)) return
+        val removed = synchronized(slot.activeRequests) { slot.activeRequests.remove(requestId) }
+        if (!removed || !ownsSocket(slot, socket) || socket.queueSize() > MAX_MESSAGE_BYTES) return
         val reply = JSONObject().put("type", "reply").put("requestId", requestId)
         if (error != null) reply.put("error", error.take(MAX_ERROR_LENGTH)) else if (result != null) reply.put("result", result)
         val encoded = reply.toString()
         if (encoded.toByteArray(Charsets.UTF_8).size <= MAX_MESSAGE_BYTES) socket.send(encoded)
     }
 
-    private fun scheduleReconnect() {
-        if (stopped) return
+    @Synchronized private fun scheduleReconnect(expectedSession: Long) {
+        val current = config ?: return
+        if (!ownsSession(expectedSession)) return
         setState(State.DISCONNECTED)
         val base = min(60_000L, 1_000L shl retryAttempt.coerceAtMost(6))
         retryAttempt += 1
         val delay = (base * Random.nextDouble(0.75, 1.25)).toLong()
-        main.postAtTime({ if (!stopped) enroll() }, RETRY_TOKEN, android.os.SystemClock.uptimeMillis() + delay)
+        main.removeCallbacksAndMessages(RETRY_TOKEN)
+        main.postAtTime({ enroll(expectedSession, current) }, RETRY_TOKEN, android.os.SystemClock.uptimeMillis() + delay)
     }
 
     private fun setState(value: State) {
         state = value
-        if (Looper.myLooper() == Looper.getMainLooper()) onState(value) else main.post { onState(value) }
+        val targetSession = sessionId
+        if (Looper.myLooper() == Looper.getMainLooper()) onState(value) else main.post { if (sessionId == targetSession) onState(value) }
     }
     private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
         .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
@@ -347,7 +358,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         val TAB_DOCUMENT_ACTIONS = setOf("export", "latexfix", "latex_review", "latex_apply", "save", "snapshot", "get_context", "activate", "close", "outline")
         val DOCUMENT_ACTIONS = setOf("create", "export", "latexfix", "latex_review", "latex_apply", "open", "save", "snapshot", "job_status", "get_context", "activate", "close", "outline", "export_chunk")
         val REVISIONED_DOCUMENT_ACTIONS = setOf("save", "close", "latex_apply")
-        val BOOLEAN_OPTIONS = setOf("background", "saveAs", "discardChanges")
+        val BOOLEAN_OPTIONS = setOf("background", "saveAs", "discardChanges", "archive")
         const val MAX_ASSET_BYTES = 1024 * 1024
         const val MAX_ASSET_BASE64 = 1_400_000
         const val MAX_EXPORT_CHUNK_BYTES = 524_288
