@@ -2,13 +2,15 @@ import type {Root} from 'mdast';
 import {visit} from 'unist-util-visit';
 import {caretRangeAtPoint} from './caretPoint';
 import {analyzeDocument,type SourceDocumentAnalysis} from './documentAnalysis';
-import {translateRenderedRange,type EditingSession} from './liveBlockHistory';
+import {translateRenderedRange,type EditingSession,type SelectionDirection} from './liveBlockHistory';
+import {toggleMarkdownFormat,type FormatAction} from './markdownFormatting';
 
-export interface LiveEditingSpanContext { baseMarkdown:string; baseSplitEnd:number; }
+export interface LiveEditingSpanContext {baseMarkdown:string;baseSplitEnd:number}
 export interface LiveRenderedSelectionRange {
-  blockElement:HTMLElement; renderedBlockStart:number; renderedBlockEnd:number; renderedFrom:number; renderedTo:number;
-  blockStart:number; blockEnd:number; from:number; to:number; reversed:boolean;
+  blockElement:HTMLElement;renderedBlockStart:number;renderedBlockEnd:number;renderedFrom:number;renderedTo:number;
+  blockStart:number;blockEnd:number;from:number;to:number;reversed:boolean;
 }
+export interface PlannedLiveFormat {doc:string;nextBlockText:string;nextStart:number;nextEnd:number;nextDirection:SelectionDirection}
 
 const EXCLUDED_SELECTION_CONTAINER_SELECTOR='textarea,input,select,button,.cm-editor,.live-active-block,.live-block-edit,.code-toolbar,.cell-toolbar,.cell-output,[data-frontmatter-properties],.document-properties,.reading-search,.image-viewer,.media-dialog,.math-repair-panel,[data-windowed-mounted="false"]';
 const NON_TEXT_DOUBLE_CLICK_TARGET_SELECTOR='a,button,input,select,textarea,img,.note-image,.image-error,.remote-image-card,.image-loading,svg,hr,.live-block-edit,.code-toolbar,.cell-toolbar,.cell-output,[data-frontmatter-properties],.document-properties,[data-windowed-mounted="false"]';
@@ -28,14 +30,9 @@ interface DomRangeStream {text:string;start:DomBoundaryHit;end:DomBoundaryHit}
 type MappedRenderedSpan={kind:'caret';offset:number}|{kind:'range';from:number;to:number};
 
 const elementAt=(node:Node|null):Element|null=>!node?null:node instanceof Element?node:node.parentElement;
-const closestLeafInBlock=(el:Element,blockEl:HTMLElement):HTMLElement|null=>{
-  const leaf=el.closest<HTMLElement>(LEAF_BLOCK_SELECTOR);
-  return leaf&&blockEl.contains(leaf)?leaf:null;
-};
-
-export function translateLiveRenderedRange(start:number,end:number,editing:LiveEditingSpanContext|null,activeDoc:string):[number,number]{
-  return translateRenderedRange(start,end,editing as EditingSession|null,activeDoc);
-}
+const closestLeafInBlock=(el:Element,blockEl:HTMLElement):HTMLElement|null=>{const leaf=el.closest<HTMLElement>(LEAF_BLOCK_SELECTOR);return leaf&&blockEl.contains(leaf)?leaf:null;};
+export const translateLiveRenderedRange:(start:number,end:number,editing:LiveEditingSpanContext|null,activeDoc:string)=>[number,number]=
+  (start,end,editing,activeDoc)=>translateRenderedRange(start,end,editing as EditingSession|null,activeDoc);
 
 function isSelectionBackward(selection:Selection):boolean{
   const {anchorNode,anchorOffset,focusNode,focusOffset}=selection;
@@ -48,41 +45,27 @@ function isSelectionBackward(selection:Selection):boolean{
     return a.compareBoundaryPoints(Range.START_TO_START,f)>0;
   }catch{return false;}
 }
-
 function findPercentCommentClose(raw:string,openIndex:number):number{
   for(let i=openIndex+2;i+1<raw.length;i++)if(raw[i]==='%'&&raw[i+1]==='%'&&raw[i-1]!=='\\')return i+2;
   return -1;
 }
-
 function skipIgnoredComments(source:string,cursor:number,limitEnd:number):number{
   let pos=cursor;
   while(pos<limitEnd){
-    if(pos+1<limitEnd&&source[pos]==='%'&&source[pos+1]==='%'&&(pos===0||source[pos-1]!=='\\')){
-      const close=findPercentCommentClose(source.slice(pos,limitEnd),0);
-      if(close>0){pos+=close;continue;}
-    }
+    if(pos+1<limitEnd&&source[pos]==='%'&&source[pos+1]==='%'&&(pos===0||source[pos-1]!=='\\')){const close=findPercentCommentClose(source.slice(pos,limitEnd),0);if(close>0){pos+=close;continue;}}
     if(source.startsWith('<!--',pos)){const close=source.indexOf('-->',pos+4);if(close>=0&&close+3<=limitEnd){pos=close+3;continue;}}
     break;
   }
   return pos;
 }
-
 function consumeTextUnits(raw:string,value:string,baseOffset:number):{units:SourceUnit[];consumedRaw:number}{
   if(raw===value)return {units:Array.from(value,(char,i)=>({from:baseOffset+i,to:baseOffset+i+1,char})),consumedRaw:value.length};
-  const out:SourceUnit[]=[];
-  let r=0,v=0;
+  const out:SourceUnit[]=[];let r=0,v=0;
   while(v<value.length&&r<raw.length){
-    if(raw[r]==='%'&&raw[r+1]==='%'&&(r===0||raw[r-1]!=='\\')&&!(value[v]==='%'&&value[v+1]==='%')){
-      const end=findPercentCommentClose(raw,r);if(end>r){r=end;continue;}
-    }
-    if(raw.startsWith('<!--',r)&&!value.startsWith('<!--',v)){
-      const end=raw.indexOf('-->',r+4);if(end>=0){r=end+3;continue;}
-    }
+    if(raw[r]==='%'&&raw[r+1]==='%'&&(r===0||raw[r-1]!=='\\')&&!(value[v]==='%'&&value[v+1]==='%')){const end=findPercentCommentClose(raw,r);if(end>r){r=end;continue;}}
+    if(raw.startsWith('<!--',r)&&!value.startsWith('<!--',v)){const end=raw.indexOf('-->',r+4);if(end>=0){r=end+3;continue;}}
     const vCh=value[v],rCh=raw[r];
-    if(vCh==='\n'){
-      const nl=/^[ \t]*\r?\n[ \t>]*/.exec(raw.slice(r));
-      if(nl){out.push({from:baseOffset+r,to:baseOffset+r+nl[0].length,char:'\n'});r+=nl[0].length;v++;continue;}
-    }
+    if(vCh==='\n'){const nl=/^[ \t]*\r?\n[ \t>]*/.exec(raw.slice(r));if(nl){out.push({from:baseOffset+r,to:baseOffset+r+nl[0].length,char:'\n'});r+=nl[0].length;v++;continue;}}
     if(rCh==='\\'&&r+1<raw.length&&raw[r+1]===vCh){out.push({from:baseOffset+r,to:baseOffset+r+2,char:vCh});r+=2;v++;continue;}
     if(rCh==='&'){
       const entity=/^&(?:#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);/.exec(raw.slice(r));
@@ -97,16 +80,13 @@ function consumeTextUnits(raw:string,value:string,baseOffset:number):{units:Sour
   while(v<value.length){const clamped=baseOffset+Math.min(r,raw.length);out.push({from:clamped,to:clamped,char:value[v++]});}
   return {units:out,consumedRaw:r};
 }
-
 function inlineMathInnerBounds(source:string,start:number,end:number):[number,number]{
   const raw=source.slice(start,end);
   if((raw.startsWith('\\(')&&raw.endsWith('\\)')&&raw.length>=4)||(raw.startsWith('$$')&&raw.endsWith('$$')&&raw.length>=4))return [start+2,end-2];
   return raw.startsWith('$')&&raw.endsWith('$')&&raw.length>=2?[start+1,end-1]:[start,end];
 }
-
 function inlineCodeInnerBounds(source:string,start:number,end:number,value:string):[number,number]{
-  const raw=source.slice(start,end);
-  let ticks=0;
+  const raw=source.slice(start,end);let ticks=0;
   while(ticks<raw.length&&raw[ticks]==='`')ticks++;
   if(ticks===0||ticks*2>raw.length)return [start,end];
   const inner=raw.slice(ticks,raw.length-ticks);
@@ -115,10 +95,7 @@ function inlineCodeInnerBounds(source:string,start:number,end:number,value:strin
   const idx=raw.indexOf(value,ticks);
   return idx>=0?[start+idx,start+idx+value.length]:[start+ticks,Math.max(start+ticks,end-ticks)];
 }
-
-const flattenInlineText=(nodes:any[]):string=>
-  nodes.reduce((out,n)=>out+(typeof n?.value==='string'?n.value:Array.isArray(n?.children)?flattenInlineText(n.children):''),'');
-
+const flattenInlineText=(nodes:any[]):string=>nodes.reduce((out,n)=>out+(typeof n?.value==='string'?n.value:Array.isArray(n?.children)?flattenInlineText(n.children):''),'');
 const stripPositionsBefore=(nodes:any[],minOffset:number):any[]=>nodes.map(n=>!n||typeof n!=='object'?n:{
   ...n,position:typeof n.position?.start?.offset==='number'&&n.position.start.offset>=minOffset?n.position:undefined,
   ...(Array.isArray(n.children)?{children:stripPositionsBefore(n.children,minOffset)}:{}),
@@ -256,17 +233,14 @@ function collectMdastInlineStream(children:any[],source:string,scopeStart:number
 }
 
 function splitCalloutParagraphChildren(paragraph:any,source:string){
-  const paraStart:number|undefined=paragraph?.position?.start?.offset,paraEnd:number|undefined=paragraph?.position?.end?.offset;
-  const first=paragraph?.children?.[0];
+  const paraStart:number|undefined=paragraph?.position?.start?.offset,paraEnd:number|undefined=paragraph?.position?.end?.offset,first=paragraph?.children?.[0];
   if(typeof paraStart!=='number'||typeof paraEnd!=='number'||first?.type!=='text'||typeof first.value!=='string')return null;
   const match=/^\[!([\w-]+)\]([+-]?)[ \t]*/i.exec(first.value);
   if(!match)return null;
-
   const firstStart:number=typeof first.position?.start?.offset==='number'?first.position.start.offset:paraStart;
   const rawMatch=/^\[!([\w-]+)\]([+-]?)[ \t]*/i.exec(source.slice(firstStart,paraEnd));
   const titleStart=firstStart+(rawMatch?rawMatch[0].length:match[0].length),firstEnd:number|undefined=first.position?.end?.offset;
   const trimmedFirst={...first,value:first.value.slice(match[0].length),...(typeof firstEnd==='number'?{position:{start:{offset:titleStart},end:{offset:firstEnd}}}:{})};
-
   let computedTitleEnd=paraEnd,computedBodyStart=paraEnd;
   const splitNodes=(nodes:any[]):{title:any[];body:any[];ended:boolean}=>{
     const title:any[]=[],body:any[]=[];let ended=false;
@@ -302,31 +276,17 @@ function splitCalloutParagraphChildren(paragraph:any,source:string){
   };
 
   const split=splitNodes([trimmedFirst,...paragraph.children.slice(1)]);
-  if(computedBodyStart===paraEnd&&split.body.length>0){
-    const nlMatch=/\r?\n[ \t>]*/.exec(source.slice(titleStart,paraEnd));
-    if(nlMatch){computedTitleEnd=titleStart+nlMatch.index;computedBodyStart=titleStart+nlMatch.index+nlMatch[0].length;}
-  }
+  if(computedBodyStart===paraEnd&&split.body.length>0){const nl=/\r?\n[ \t>]*/.exec(source.slice(titleStart,paraEnd));if(nl){computedTitleEnd=titleStart+nl.index;computedBodyStart=titleStart+nl.index+nl[0].length;}}
   const hadExplicitTitle=split.title.some((child:any)=>child.type!=='text'||child.value.trim().length>0);
   return {title:split.title,body:split.body,hadExplicitTitle,titleStart,titleEnd:hadExplicitTitle?computedTitleEnd:titleStart,bodyStart:computedBodyStart,bodyEnd:paraEnd};
 }
-
 function computeContentBoundsForNode(node:any,source:string):[number,number]{
-  const start:number=node.position.start.offset,end:number=node.position.end.offset;
-  const firstChildStart:number|undefined=node.children?.[0]?.position?.start?.offset;
+  const start:number=node.position.start.offset,end:number=node.position.end.offset,firstChildStart:number|undefined=node.children?.[0]?.position?.start?.offset;
   if(typeof firstChildStart==='number')return [firstChildStart,end];
   const raw=source.slice(start,end);
-  if(node.type==='heading'){
-    const prefix=/^[ \t]{0,3}#{1,6}[ \t]*/.exec(raw),suffix=/[ \t]+#+[ \t]*$/.exec(raw),cStart=prefix?start+prefix[0].length:start;
-    return [cStart,suffix&&end-suffix[0].length>=cStart?end-suffix[0].length:end];
-  }
-  if(node.type==='tableCell'){
-    const lead=/^\|?[ \t]*/.exec(raw),trail=/[ \t]*\|?$/.exec(raw),cStart=lead?start+lead[0].length:start;
-    return [cStart,trail&&end-trail[0].length>=cStart?end-trail[0].length:end];
-  }
-  if(node.type==='paragraph'){
-    const quoteLead=/^[ \t>]+/.exec(raw);
-    if(quoteLead&&raw[quoteLead[0].length]!==undefined)return [start+quoteLead[0].length,end];
-  }
+  if(node.type==='heading'){const p=/^[ \t]{0,3}#{1,6}[ \t]*/.exec(raw),s=/[ \t]+#+[ \t]*$/.exec(raw),c=p?start+p[0].length:start;return [c,s&&end-s[0].length>=c?end-s[0].length:end];}
+  if(node.type==='tableCell'){const l=/^\|?[ \t]*/.exec(raw),t=/[ \t]*\|?$/.exec(raw),c=l?start+l[0].length:start;return [c,t&&end-t[0].length>=c?end-t[0].length:end];}
+  if(node.type==='paragraph'){const q=/^[ \t>]+/.exec(raw);if(q&&raw[q[0].length]!==undefined)return [start+q[0].length,end];}
   return [start,end];
 }
 
@@ -389,15 +349,17 @@ function resolveScopeMdastChildren(scopeEl:HTMLElement,blockEl:HTMLElement,sourc
 }
 
 function measureDomRangeInScope(scopeEl:HTMLElement,range:Range):DomRangeStream|null{
-  let stream='',mathOrdinal=0,skipTaskCheckboxSpace=false;
+  let stream='',mathOrdinal=0,skipTaskCheckboxSpace=false,hitLiBlockChild=false;
   let start:DomBoundaryHit|null=null,end:DomBoundaryHit|null=null;
+  const isLiBlockChild=(el:Element):boolean=>scopeEl.tagName==='LI'&&el!==scopeEl&&el.matches('ul,ol,blockquote,pre,details,table');
 
   const isExcludedElement=(el:Element):boolean=>{
     if(el.matches('button,input,select,textarea,script,style,svg,hr,.live-block-edit,.image-edit-tools,.katex-mathml,.math-equation-extra-anchor,[data-frontmatter-properties],.document-properties')){
       if(el.tagName==='INPUT'&&(el as HTMLInputElement).type==='checkbox')skipTaskCheckboxSpace=true;
       return true;
     }
-    return scopeEl.tagName==='LI'&&el!==scopeEl&&el.matches('ul,ol,blockquote,pre,details,table');
+    if(isLiBlockChild(el)){hitLiBlockChild=true;return true;}
+    return false;
   };
   const isAtomicImageSpan=(el:Element):boolean=>
     el.matches('[data-note-image-source],.note-image,.remote-image-card,.image-error')||
@@ -408,7 +370,8 @@ function measureDomRangeInScope(scopeEl:HTMLElement,range:Range):DomRangeStream|
     if(node.nodeType===Node.TEXT_NODE){
       const data=(node as Text).data,skipPrefix=skipTaskCheckboxSpace&&data.startsWith(' ')?1:0;
       skipTaskCheckboxSpace=false;
-      const effective=skipPrefix?data.slice(skipPrefix):data;
+      let effective=hitLiBlockChild&&node.parentNode===scopeEl?'':skipPrefix?data.slice(skipPrefix):data;
+      if(effective&&node.parentNode===scopeEl&&node.nextSibling instanceof Element&&isLiBlockChild(node.nextSibling))effective=effective.replace(/\r?\n$/,'');
       if(range.startContainer===node){
         const local=Math.max(0,Math.min(effective.length,range.startOffset-skipPrefix));
         start={unit:stream.length+local,preferPrevEnd:local>0&&local===effective.length,mathOrdinal:null};
@@ -432,7 +395,7 @@ function measureDomRangeInScope(scopeEl:HTMLElement,range:Range):DomRangeStream|
       if(atEnd)end={unit:range.collapsed?stream.length-1:stream.length,preferPrevEnd:false,mathOrdinal:ord};
       return contained;
     };
-    if(node.classList.contains('katex')||node.classList.contains('katex-error')){
+    if(node.classList.contains('katex')||node.classList.contains('katex-error')||node.hasAttribute('data-math-inline')){
       emitAtomic(true,node.contains(range.startContainer),node.contains(range.endContainer),'\uFFFC',mathOrdinal++);return;
     }
     if(node.tagName==='BR'){emitAtomic(true,range.startContainer===node,range.endContainer===node,'\n',null);return;}
@@ -454,47 +417,28 @@ function measurePlainTextOffsetInPre(preEl:HTMLElement,container:Node,offset:num
   let count=0,found:number|null=null;
   const walk=(node:Node):void=>{
     if(found!==null)return;
-    if(node.nodeType===Node.TEXT_NODE){
-      const len=(node as Text).data.length;
-      if(container===node)found=count+Math.max(0,Math.min(len,offset));else count+=len;
-      return;
-    }
-    for(let i=0;i<=node.childNodes.length;i++){
-      if(container===node&&offset===i){found=count;return;}
-      if(i<node.childNodes.length)walk(node.childNodes[i]);
-    }
+    if(node.nodeType===Node.TEXT_NODE){const len=(node as Text).data.length;if(container===node)found=count+Math.max(0,Math.min(len,offset));else count+=len;return;}
+    for(let i=0;i<=node.childNodes.length;i++){if(container===node&&offset===i){found=count;return;}if(i<node.childNodes.length)walk(node.childNodes[i]);}
   };
   walk(preEl);return found;
 }
-
 function resolvePreBodyBounds(preEl:HTMLElement,renderedSource:string,renderedBlockStart:number,renderedBlockEnd:number):[number,number]|null{
   const rawPreStart=preEl.getAttribute('data-source-start'),rawPreEnd=preEl.getAttribute('data-source-end');
-  if(rawPreStart!==null&&rawPreEnd!==null){
-    const preStart=Number(rawPreStart),preEnd=Number(rawPreEnd);
-    if(Number.isFinite(preStart)&&Number.isFinite(preEnd)&&preEnd>=preStart)return [preStart,preEnd];
-  }
+  if(rawPreStart!==null&&rawPreEnd!==null){const pStart=Number(rawPreStart),pEnd=Number(rawPreEnd);if(Number.isFinite(pStart)&&Number.isFinite(pEnd)&&pEnd>=pStart)return [pStart,pEnd];}
   const pyCell=preEl.closest<HTMLElement>('.python-cell[data-source-start][data-source-end]');
   if(pyCell&&preEl.classList.contains('python-source')){
-    const cellStart=Number(pyCell.dataset.sourceStart),cellEnd=Number(pyCell.dataset.sourceEnd);
-    if(Number.isFinite(cellStart)&&Number.isFinite(cellEnd)&&cellStart>=renderedBlockStart&&cellEnd<=renderedBlockEnd){
-      const nl=renderedSource.indexOf('\n',cellStart);
-      return [nl>=0&&nl<cellEnd?nl+1:cellStart,cellEnd];
-    }
+    const cStart=Number(pyCell.dataset.sourceStart),cEnd=Number(pyCell.dataset.sourceEnd);
+    if(Number.isFinite(cStart)&&Number.isFinite(cEnd)&&cStart>=renderedBlockStart&&cEnd<=renderedBlockEnd){const nl=renderedSource.indexOf('\n',cStart);return [nl>=0&&nl<cEnd?nl+1:cStart,cEnd];}
   }
   return null;
 }
-
 const resolveAnalysisTree=(renderedSource:string,s?:SourceDocumentAnalysis|Root):Root=>
   s&&'type' in s&&s.type==='root'?s:s&&'source' in s&&s.source===renderedSource?s.analysis.tree:analyzeDocument(renderedSource).tree;
 
-function mapScopeRangeToRenderedSource(
-  scopeEl:HTMLElement,blockEl:HTMLElement,range:Range,renderedSource:string,
-  renderedBlockStart:number,renderedBlockEnd:number,sourceAnalysisOrTree?:SourceDocumentAnalysis|Root,
-):MappedRenderedSpan|null{
+function mapScopeRangeToRenderedSource(scopeEl:HTMLElement,blockEl:HTMLElement,range:Range,renderedSource:string,renderedBlockStart:number,renderedBlockEnd:number,sourceAnalysisOrTree?:SourceDocumentAnalysis|Root):MappedRenderedSpan|null{
   if(scopeEl.tagName==='SUMMARY'&&scopeEl.closest('.code-disclosure'))return null;
   if(scopeEl.tagName==='PRE'){
-    const preBounds=resolvePreBodyBounds(scopeEl,renderedSource,renderedBlockStart,renderedBlockEnd);
-    const domFrom=preBounds?measurePlainTextOffsetInPre(scopeEl,range.startContainer,range.startOffset):null;
+    const preBounds=resolvePreBodyBounds(scopeEl,renderedSource,renderedBlockStart,renderedBlockEnd),domFrom=preBounds?measurePlainTextOffsetInPre(scopeEl,range.startContainer,range.startOffset):null;
     if(!preBounds||domFrom===null)return null;
     if(range.collapsed)return {kind:'caret',offset:Math.min(preBounds[1],preBounds[0]+domFrom)};
     const domTo=measurePlainTextOffsetInPre(scopeEl,range.endContainer,range.endOffset);
@@ -505,13 +449,11 @@ function mapScopeRangeToRenderedSource(
   if(resolvedScope.synthesizedCalloutTitle)return range.collapsed?{kind:'caret',offset:resolvedScope.scopeStart}:null;
   const domStream=measureDomRangeInScope(scopeEl,range);
   if(!domStream)return null;
-
   const units:SourceUnit[]=[],wrappers:InlineWrapperBounds[]=[],mathWrappers:InlineWrapperBounds[]=[];
   collectMdastInlineStream(resolvedScope.children,renderedSource,resolvedScope.scopeStart,resolvedScope.scopeEnd,units,wrappers,mathWrappers);
-
   if(range.collapsed){
     if(units.length!==domStream.text.length)return null;
-    if(units.length===0)return {kind:'caret',offset:resolvedScope.scopeStart};
+    if(!units.length)return {kind:'caret',offset:resolvedScope.scopeStart};
     if(domStream.start.unit<=0)return {kind:'caret',offset:units[0].from};
     if(domStream.start.unit>=units.length)return {kind:'caret',offset:units[units.length-1].to};
     return {kind:'caret',offset:domStream.start.preferPrevEnd?units[domStream.start.unit-1].to:units[domStream.start.unit].from};
@@ -529,7 +471,6 @@ function mapScopeRangeToRenderedSource(
   return {kind:'range',from:rawFrom,to:rawTo};
 }
 
-/** Formatting wrapper over the shared rendered-to-source mapper, retaining single-block and single-leaf selection guards. */
 export function mapLiveRenderedSelectionToSourceRange(
   selection:Selection|null,rootEl:HTMLElement|null,renderedSource:string,
   sourceAnalysis?:SourceDocumentAnalysis,editing:LiveEditingSpanContext|null=null,activeDoc:string=renderedSource,
@@ -539,21 +480,69 @@ export function mapLiveRenderedSelectionToSourceRange(
   if(range.collapsed)return null;
   const startEl=elementAt(range.startContainer),endEl=elementAt(range.endContainer),commonEl=elementAt(range.commonAncestorContainer);
   if(!startEl||!endEl||!commonEl||startEl.closest(EXCLUDED_SELECTION_CONTAINER_SELECTOR)||endEl.closest(EXCLUDED_SELECTION_CONTAINER_SELECTOR)||commonEl.closest(EXCLUDED_SELECTION_CONTAINER_SELECTOR))return null;
-
   const startBlock=startEl.closest<HTMLElement>('.live-block'),endBlock=endEl.closest<HTMLElement>('.live-block');
   if(!startBlock||!endBlock||startBlock!==endBlock||!rootEl.contains(startBlock))return null;
   const renderedBlockStart=Number(startBlock.dataset.sourceStart),renderedBlockEnd=Number(startBlock.dataset.sourceEnd);
   if(!Number.isFinite(renderedBlockStart)||!Number.isFinite(renderedBlockEnd)||renderedBlockStart<0||renderedBlockEnd<renderedBlockStart||renderedBlockEnd>renderedSource.length)return null;
-
   const startLeaf=closestLeafInBlock(startEl,startBlock),endLeaf=closestLeafInBlock(endEl,startBlock);
   if(startLeaf!==endLeaf)return null;
   const mapped=mapScopeRangeToRenderedSource(startLeaf??startBlock,startBlock,range,renderedSource,renderedBlockStart,renderedBlockEnd,sourceAnalysis);
   if(!mapped||mapped.kind!=='range'||mapped.from<renderedBlockStart||mapped.to>renderedBlockEnd||mapped.from>=mapped.to)return null;
-
   const [blockStart,blockEnd]=translateLiveRenderedRange(renderedBlockStart,renderedBlockEnd,editing,activeDoc);
   const [from,to]=translateLiveRenderedRange(mapped.from,mapped.to,editing,activeDoc);
-  if(from<blockStart||to>blockEnd||from>=to||blockEnd>activeDoc.length)return null;
-  return {blockElement:startBlock,renderedBlockStart,renderedBlockEnd,renderedFrom:mapped.from,renderedTo:mapped.to,blockStart,blockEnd,from,to,reversed:isSelectionBackward(selection)};
+  return from<blockStart||to>blockEnd||from>=to||blockEnd>activeDoc.length?null:{blockElement:startBlock,renderedBlockStart,renderedBlockEnd,renderedFrom:mapped.from,renderedTo:mapped.to,blockStart,blockEnd,from,to,reversed:isSelectionBackward(selection)};
+}
+
+/** Plans a Markdown format toggle bounded to `[blockStart, blockEnd]` while guarding protected code/math/image spans. */
+export function planGuardedLiveFormat(
+  doc:string,from:number,to:number,reversed:boolean,blockStart:number,blockEnd:number,action:FormatAction,sourceAnalysis?:SourceDocumentAnalysis,
+):PlannedLiveFormat|null{
+  if(blockStart<0||blockEnd<blockStart||blockEnd>doc.length||from<blockStart||to>blockEnd||from>to)return null;
+  const analysis=sourceAnalysis?.source===doc?sourceAnalysis.analysis:analyzeDocument(doc);
+  if(analysis.frontmatter&&from<analysis.frontmatter.end)return null;
+  if(analysis.tree.children.some(n=>['code','math','html','definition'].includes(n.type)&&typeof n.position?.start?.offset==='number'&&typeof n.position?.end?.offset==='number'&&n.position.start.offset>=blockStart&&n.position.end.offset<=blockEnd))return null;
+  const wrappers:InlineWrapperBounds[]=[],isLineAction=action==='heading'||action==='list'||action==='quote';
+  let blocked=false;
+  visit(analysis.tree,(node:any)=>{
+    if(blocked||!node.position)return;
+    const nStart=node.position.start.offset,nEnd=node.position.end.offset;
+    if(typeof nStart!=='number'||typeof nEnd!=='number')return;
+    const overlaps=from===to?from>=nStart&&from<=nEnd:nStart<to&&nEnd>from;
+    if(['code','math','definition'].includes(node.type)&&overlaps){blocked=true;return;}
+    if(['paragraph','heading','tableCell'].includes(node.type)&&overlaps){
+      const [sStart,sEnd]=computeContentBoundsForNode(node,doc);
+      collectMdastInlineStream(node.children??[],doc,sStart,sEnd,[],wrappers,[]);
+    }
+  });
+  if(blocked)return null;
+  let effFrom=from,effTo=to,expectedUnwrap:[number,number]|null=null;
+  if(!isLineAction){
+    for(const w of wrappers){
+      if(!(from===to?from>w.outerStart&&from<w.outerEnd:w.outerStart<to&&w.outerEnd>from))continue;
+      const enclosesWithExtra=from<=w.outerStart&&to>=w.outerEnd&&(from<w.outerStart||to>w.outerEnd);
+      if(['equationRef','footnoteReference','image','imageReference'].includes(w.kind)){
+        if(enclosesWithExtra&&action!=='inline_math'&&action!=='inline_code')continue;
+        return null;
+      }
+      if(w.kind==='inlineCode'||w.kind==='inlineMath'){
+        if((from>w.outerStart&&from<w.outerEnd&&to>w.outerEnd)||(to>w.outerStart&&to<w.outerEnd&&from<w.outerStart))return null;
+        if(enclosesWithExtra){if(action==='inline_math'||(w.kind==='inlineCode'&&action==='inline_code'))return null;continue;}
+        const matchCode=w.kind==='inlineCode'&&action==='inline_code'&&from<to&&((from===w.innerStart&&to===w.innerEnd)||(from===w.outerStart&&to===w.outerEnd));
+        const matchMath=w.kind==='inlineMath'&&action==='inline_math'&&from<to&&w.innerStart===w.outerStart+1&&w.innerEnd===w.outerEnd-1&&((from===w.innerStart&&to===w.innerEnd)||(from===w.outerStart&&to===w.outerEnd));
+        if(!matchCode&&!matchMath)return null;
+        effFrom=w.outerStart;effTo=w.outerEnd;expectedUnwrap=[w.outerStart,w.outerEnd];
+      }
+    }
+  }
+  const result=toggleMarkdownFormat(doc,[reversed?{anchor:effTo,head:effFrom}:{anchor:effFrom,head:effTo}],action,0);
+  if(!result.changes.length||result.doc===doc||!result.changes.every(ch=>ch.from>=blockStart&&ch.to<=blockEnd))return null;
+  if(expectedUnwrap&&(result.changes.length!==1||result.changes[0].from!==expectedUnwrap[0]||result.changes[0].to!==expectedUnwrap[1]))return null;
+  if(isLineAction&&wrappers.some(w=>['inlineCode','inlineMath','equationRef','image','imageReference'].includes(w.kind)&&result.changes.some(ch=>ch.from>w.outerStart&&ch.from<w.outerEnd)))return null;
+  const nextBlockText=result.doc.slice(blockStart,blockEnd+result.doc.length-doc.length),r0=result.ranges[0];
+  const nextStart=Math.max(0,Math.min(nextBlockText.length,Math.min(r0.anchor,r0.head)-blockStart));
+  const nextEnd=Math.max(nextStart,Math.min(nextBlockText.length,Math.max(r0.anchor,r0.head)-blockStart));
+  const nextDirection:SelectionDirection=r0.anchor>r0.head&&nextStart<nextEnd?'backward':nextStart<nextEnd?'forward':'none';
+  return {doc:result.doc,nextBlockText,nextStart,nextEnd,nextDirection};
 }
 
 /** Resolves a double-click inside `.live-block` to a verified collapsed DOM caret `Range`. */

@@ -15,7 +15,12 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
 import LiveEditor from "./components/LiveEditor";
 import { analyzeDocument } from "./documentAnalysis";
 import {
+  resolveDoubleClickCaretRange as reexportedDoubleClickCaretRange,
+  resolveLiveCaretOffset as reexportedLiveCaretOffset,
+} from "./liveInsertionPoint";
+import {
   mapLiveRenderedSelectionToSourceRange,
+  planGuardedLiveFormat,
   resolveDoubleClickCaretRange,
   resolveLiveCaretOffset,
   translateLiveRenderedRange,
@@ -167,11 +172,24 @@ describe("shared rendered-to-source mapping (liveSelectionRange)", () => {
     const mappedMath = mapLiveRenderedSelectionToSourceRange(selMath, liveRoot, markdown, sourceAnalysis);
     expect(markdown.slice(mappedMath!.from, mappedMath!.to)).toBe("x + 1");
 
-    // 3. Nested task list item (both formatting selection and collapsed caret)
+    // 3. Nested task list item (parent li excluding nested child ul, child li, and cross-item rejection)
     const listItems = blocks[1]!.querySelectorAll("li");
+    const mappedParentTask = mapLiveRenderedSelectionToSourceRange(selectDomTextRange(listItems[0]!, "Parent task"), liveRoot, markdown, sourceAnalysis);
+    expect(markdown.slice(mappedParentTask!.from, mappedParentTask!.to)).toBe("Parent task");
+
     const selNestedTask = selectDomTextRange(listItems[1]!, "checklist target");
     const mappedTask = mapLiveRenderedSelectionToSourceRange(selNestedTask, liveRoot, markdown, sourceAnalysis);
     expect(markdown.slice(mappedTask!.from, mappedTask!.to)).toBe("checklist target");
+
+    const parentCaret = collapsedCaretAt(listItems[0]!, "Parent task", 2);
+    const childCaret = collapsedCaretAt(listItems[1]!, "checklist target", 4);
+    const crossLiRange = document.createRange();
+    crossLiRange.setStart(parentCaret.startContainer, parentCaret.startOffset);
+    crossLiRange.setEnd(childCaret.startContainer, childCaret.startOffset);
+    const crossLiSel = window.getSelection()!;
+    crossLiSel.removeAllRanges();
+    crossLiSel.addRange(crossLiRange);
+    expect(mapLiveRenderedSelectionToSourceRange(crossLiSel, liveRoot, markdown, sourceAnalysis)).toBeNull();
 
     const lStart = Number(blocks[1]!.dataset.sourceStart);
     const lEnd = Number(blocks[1]!.dataset.sourceEnd);
@@ -316,6 +334,36 @@ describe("shared rendered-to-source mapping (liveSelectionRange)", () => {
     expect(resolveDoubleClickCaretRange(blocks[1]!, linkEl, 80, 40)).toBeNull();
     const verifiedCaret = resolveDoubleClickCaretRange(blocks[1]!, paragraphs[1]!, 80, 40);
     expect(verifiedCaret?.collapsed).toBe(true);
+
+    // Caller compatibility re-exports on liveInsertionPoint point to the exact unified helpers
+    expect(reexportedDoubleClickCaretRange).toBe(resolveDoubleClickCaretRange);
+    expect(reexportedLiveCaretOffset).toBe(resolveLiveCaretOffset);
+
+    // planGuardedLiveFormat enforces protected block, inlineCode, and inlineMath guards while allowing matching unwraps
+    expect(planGuardedLiveFormat(baseDoc, mappedPre!.from, mappedPre!.to, false, mappedPre!.blockStart, mappedPre!.blockEnd, "bold", sourceAnalysis)).toBeNull();
+    const spanDoc = "Run `flag` or `` `pad` `` and $x + 1$ or $$y + 2$$ now.";
+    const codeInnerStart = spanDoc.indexOf("flag");
+    expect(planGuardedLiveFormat(spanDoc, codeInnerStart, codeInnerStart + 4, false, 0, spanDoc.length, "bold")).toBeNull();
+    expect(planGuardedLiveFormat(spanDoc, codeInnerStart, codeInnerStart + 4, false, 0, spanDoc.length, "inline_code")?.doc).toBe(
+      "Run flag or `` `pad` `` and $x + 1$ or $$y + 2$$ now.",
+    );
+    const padInnerStart = spanDoc.indexOf("`pad`");
+    expect(planGuardedLiveFormat(spanDoc, padInnerStart, padInnerStart + 5, false, 0, spanDoc.length, "inline_code")?.doc).toBe(
+      "Run `flag` or `pad` and $x + 1$ or $$y + 2$$ now.",
+    );
+    const mathInnerStart = spanDoc.indexOf("x + 1");
+    expect(planGuardedLiveFormat(spanDoc, mathInnerStart, mathInnerStart + 5, false, 0, spanDoc.length, "bold")).toBeNull();
+    expect(planGuardedLiveFormat(spanDoc, mathInnerStart, mathInnerStart + 5, false, 0, spanDoc.length, "inline_math")?.doc).toBe(
+      "Run `flag` or `` `pad` `` and x + 1 or $$y + 2$$ now.",
+    );
+    const doubleMathStart = spanDoc.indexOf("y + 2");
+    expect(planGuardedLiveFormat(spanDoc, doubleMathStart, doubleMathStart + 5, false, 0, spanDoc.length, "inline_math")).toBeNull();
+    const outerCodeStart = spanDoc.indexOf("`flag`");
+    const padOuterEnd = spanDoc.indexOf("`` and") + 2;
+    expect(planGuardedLiveFormat(spanDoc, outerCodeStart, padOuterEnd, false, 0, spanDoc.length, "bold")?.doc).toBe(
+      "Run **`flag` or `` `pad` ``** and $x + 1$ or $$y + 2$$ now.",
+    );
+    expect(planGuardedLiveFormat(spanDoc, outerCodeStart, padOuterEnd, false, 0, spanDoc.length, "inline_code")).toBeNull();
 
     act(() => root.unmount());
     host.remove();

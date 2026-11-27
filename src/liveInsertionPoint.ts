@@ -115,3 +115,4 @@ export function useLiveInsertionPoint(
     return()=>window.removeEventListener('supermd-insertion-point',point);
   },[editorRef,latestRef,rememberSelection,rootRef,savedSelection,syncedMarkdownRef]);
 }
+export {resolveDoubleClickCaretRange,resolveLiveCaretOffset} from './liveSelectionRange';

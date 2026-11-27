@@ -327,3 +327,144 @@ test("URL paste wraps selected prose inline without dialog, pastes raw URL in ba
   });
   await expect(page.getByRole("dialog", { name: "Insert image or link" })).toHaveCount(0);
 });
+
+test("formats a rendered selection directly in Live mode, undoes in a single step, and guards protected code and multi-paragraph selections", async ({ page }) => {
+  const calls: Array<{ command: string; args: any }> = [];
+  await page.exposeFunction("bridgePost", (id: string, command: string, raw: string) => {
+    const args = JSON.parse(raw);
+    calls.push({ command, args });
+    void page.evaluate(({ id }) => window.supermdReply?.(id, true, null), { id });
+  });
+  await page.addInitScript(() => {
+    window.SuperMD = { post: (id, command, args) => (window as any).bridgePost(id, command, args) };
+  });
+  await page.setViewportSize({ width: 1100, height: 760 });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const doc = [
+    "Review **Fourier** and rendered prose selection near `cmd_flag` today.",
+    "",
+    "- Parent list item",
+    "  - Nested rendered item target",
+    "",
+    "Second paragraph stays separate.",
+    "",
+    "```python",
+    "value = 42",
+    "```",
+  ].join("\n");
+
+  await page.evaluate((content) => {
+    window.supermdLoad?.({
+      id: "live-selection-format",
+      content,
+      path: "live-selection-format",
+      mode: "live",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "sans",
+      size: 16,
+      zoom: 100,
+    });
+  }, doc);
+
+  const latestContent = () => calls.filter((c) => c.command === "document_changed").at(-1)?.args.content ?? doc;
+  const liveBox = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(page.locator(".live-block").first()).toBeVisible();
+  await expect(liveBox).toHaveCount(0);
+
+  // 1. Select rendered prose in paragraph 0 while editing === null and press Control+b
+  await page.evaluate(() => {
+    const p = document.querySelectorAll(".live-document p")[0]!;
+    const walker = document.createTreeWalker(p, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const idx = (n as Text).data.indexOf("rendered prose selection");
+      if (idx >= 0) {
+        const range = document.createRange();
+        range.setStart(n, idx);
+        range.setEnd(n, idx + "rendered prose selection".length);
+        const sel = window.getSelection()!;
+        sel.removeAllRanges();
+        sel.addRange(range);
+        break;
+      }
+    }
+  });
+
+  await page.keyboard.press("Control+b");
+  await expect(liveBox).toBeVisible();
+  await expect(liveBox).toHaveValue(
+    "Review **Fourier** and **rendered prose selection** near `cmd_flag` today.",
+  );
+  await expect.poll(latestContent).toContain("**rendered prose selection**");
+  await page.screenshot({ path: "/tmp/live-rendered-selection-format.png" });
+
+  // Single-step Undo restores exact pre-format text and selection
+  await page.keyboard.press("Control+z");
+  await expect(liveBox).toHaveValue(
+    "Review **Fourier** and rendered prose selection near `cmd_flag` today.",
+  );
+  const restoredRange = await page.evaluate(() => {
+    const area = document.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
+    return area.value.slice(area.selectionStart, area.selectionEnd);
+  });
+  expect(restoredRange).toBe("rendered prose selection");
+  await page.keyboard.press("Escape");
+  await expect(liveBox).toHaveCount(0);
+
+  // 2. Select nested list item rendered text and format via supermdFormat("italic"), then undo
+  await page.evaluate(() => {
+    const li = document.querySelectorAll(".live-document li")[1]!;
+    const textNode = li.firstChild!;
+    const idx = (textNode as Text).data.indexOf("rendered item");
+    const range = document.createRange();
+    range.setStart(textNode, idx);
+    range.setEnd(textNode, idx + "rendered item".length);
+    const sel = window.getSelection()!;
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+  expect(await page.evaluate(() => window.supermdFormat?.("italic"))).toBe(true);
+  await expect(liveBox).toHaveValue("- Parent list item\n  - Nested *rendered item* target");
+  await page.evaluate(() => window.supermdHistory?.("undo"));
+  await expect(liveBox).toHaveValue("- Parent list item\n  - Nested rendered item target");
+  await page.keyboard.press("Escape");
+  await expect(liveBox).toHaveCount(0);
+
+  // 3. Protected inline code, fenced <pre> code, and multi-paragraph selections return false without opening textarea
+  const guardedChecks = await page.evaluate(() => {
+    const sel = window.getSelection()!;
+    const codeEl = document.querySelector(".live-document p code")!;
+    const r1 = document.createRange();
+    r1.selectNodeContents(codeEl);
+    sel.removeAllRanges();
+    sel.addRange(r1);
+    const inlineCodeBlocked = window.supermdFormat?.("bold");
+
+    const preEl = document.querySelector(".live-document pre")!;
+    const r2 = document.createRange();
+    r2.selectNodeContents(preEl);
+    sel.removeAllRanges();
+    sel.addRange(r2);
+    const preBlocked = window.supermdFormat?.("bold");
+
+    const paras = document.querySelectorAll(".live-document p");
+    const r3 = document.createRange();
+    r3.setStart(paras[0]!.firstChild!, 0);
+    r3.setEnd(paras[1]!.firstChild!, 6);
+    sel.removeAllRanges();
+    sel.addRange(r3);
+    const multiParaBlocked = window.supermdFormat?.("bold");
+    sel.removeAllRanges();
+    return { inlineCodeBlocked, preBlocked, multiParaBlocked };
+  });
+  expect(guardedChecks).toEqual({
+    inlineCodeBlocked: false,
+    preBlocked: false,
+    multiParaBlocked: false,
+  });
+  await expect(liveBox).toHaveCount(0);
+  expect(latestContent()).toBe(doc);
+});

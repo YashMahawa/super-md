@@ -13,6 +13,8 @@ import {
   createBlockHistoryState,
   diffTextSpan,
   formatActiveLiveBlock,
+  pushBlockUndoSnapshot,
+  pushDiscreteSelectionStep,
   reconcileBlockKeys,
   replayActiveLiveBlockHistory,
   resolveReanchoredHistoryTarget,
@@ -26,8 +28,9 @@ import {
   type PendingBlockFocus,
   type SelectionDirection,
 } from '../liveBlockHistory';
+import {formatActionFromKeyEvent,notifyHistoryBoundary,type FormatAction} from '../markdownFormatting';
 import {useLiveInsertionPoint,type SavedLiveSelection} from '../liveInsertionPoint';
-import {resolveLiveCaretOffset} from '../liveSelectionRange';
+import {mapLiveRenderedSelectionToSourceRange,planGuardedLiveFormat,resolveLiveCaretOffset} from '../liveSelectionRange';
 import {useLiveViewportHold} from '../useLiveViewportHold';
 
 const noTrustedHosts:string[]=[];
@@ -587,7 +590,47 @@ export default function LiveEditor({noteId,markdown,onChange,onHistory,historyRe
     syncActiveCaretCenter();
   },[emitEditorChange,syncActiveCaretCenter]);
 
-  const {handleBeforeInput,handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown}=useLiveBlockEditing({
+  const commitDiscreteRef=useRef<((nextText:string,nextStart:number,nextEnd:number,nextDirection?:SelectionDirection)=>boolean)|null>(null);
+  const formatLiveAction=useCallback((action:FormatAction):boolean=>{
+    const {editing:current,draftText:currentDraft,markdown:latestMarkdown,renderedSource:currentRenderedSource,sourceAnalysis:currentSourceAnalysis}=latestRef.current;
+    const activeDoc=current?syncedMarkdownRef.current:latestMarkdown,area=editor.current;
+    const selection=typeof window!=='undefined'?window.getSelection():null;
+    const selectionInTextarea=Boolean(area&&selection?.anchorNode&&(selection.anchorNode===area||area.contains(selection.anchorNode)));
+    if(!selectionInTextarea&&selection&&!selection.isCollapsed){
+      const mapped=mapLiveRenderedSelectionToSourceRange(selection,rootRef.current,currentRenderedSource,currentSourceAnalysis,current,activeDoc);
+      if(!mapped){
+        if((selection.anchorNode&&rootRef.current?.contains(selection.anchorNode))||!current)return false;
+      }else{
+        const planned=planGuardedLiveFormat(activeDoc,mapped.from,mapped.to,mapped.reversed,mapped.blockStart,mapped.blockEnd,action,activeDoc===currentSourceAnalysis.source?currentSourceAnalysis:undefined);
+        if(!planned)return false;
+        const origBlockText=activeDoc.slice(mapped.blockStart,mapped.blockEnd);
+        const origStart=mapped.from-mapped.blockStart,origEnd=mapped.to-mapped.blockStart;
+        const origDirection:SelectionDirection=mapped.reversed&&origStart<origEnd?'backward':origStart<origEnd?'forward':'none';
+        selection.removeAllRanges();
+        openDocBlock(mapped.blockElement,mapped.blockStart,mapped.blockStart+planned.nextBlockText.length,planned.doc,{start:planned.nextStart,end:planned.nextEnd,direction:planned.nextDirection},false);
+        editSpanRef.current={baseSource:activeDoc,start:mapped.blockStart,oldEnd:mapped.blockEnd,newEnd:mapped.blockStart+planned.nextBlockText.length};
+        pushBlockUndoSnapshot(blockHistory.current,{text:origBlockText,start:origStart,end:origEnd,direction:origDirection});
+        pushDiscreteSelectionStep(blockHistory.current,{
+          beforeText:origBlockText,beforeStart:origStart,beforeEnd:origEnd,beforeDirection:origDirection,
+          afterText:planned.nextBlockText,afterStart:planned.nextStart,afterEnd:planned.nextEnd,afterDirection:planned.nextDirection,
+        });
+        savedSelection.current={from:mapped.blockStart+planned.nextStart,to:mapped.blockStart+planned.nextEnd,markdown:planned.doc};
+        syncedMarkdownRef.current=planned.doc;
+        notifyHistoryBoundary();
+        emitEditorChange(planned.doc,{isolateHistory:true});
+        notifyHistoryBoundary();
+        syncActiveCaretCenter();
+        return true;
+      }
+    }
+    if(!current||!area||current.protectedBlock||!commitDiscreteRef.current)return false;
+    const prefixLen=current.prefix.length,fullDoc=current.prefix+currentDraft+current.suffix,blockEndInDoc=fullDoc.length-current.suffix.length;
+    const start=area.selectionStart,end=area.selectionEnd,reversed=area.selectionDirection==='backward';
+    const planned=planGuardedLiveFormat(fullDoc,prefixLen+start,prefixLen+end,reversed,prefixLen,blockEndInDoc,action);
+    return !!planned&&commitDiscreteRef.current(planned.nextBlockText,planned.nextStart,planned.nextEnd,planned.nextDirection);
+  },[emitEditorChange,openDocBlock,syncActiveCaretCenter]);
+
+  const {commitDiscreteBlockEdit,handleBeforeInput,handleTextareaChange,handleSuggestionChange,handleSuggestionAction,syncTextareaCaret,paste,onEditorKeyDown}=useLiveBlockEditing({
     editing,
     editorRef:editor,
     latestRef,
@@ -603,7 +646,27 @@ export default function LiveEditor({noteId,markdown,onChange,onHistory,historyRe
     closeEditor,
     openInsertedBlock,
     openDocBlock,
+    formatLiveAction,
   });
+  commitDiscreteRef.current=commitDiscreteBlockEdit;
+
+  useEffect(()=>{
+    const onRenderedKeyDown=(event:KeyboardEvent)=>{
+      if(event.defaultPrevented||event.isComposing||event.keyCode===229||document.documentElement.dataset.host==='qt')return;
+      if(document.querySelector('.theme-guide-dialog,.image-viewer,.step-viewer,.media-dialog,.math-repair-panel'))return;
+      const target=event.target instanceof Element?event.target:null;
+      if(target?.closest('input,textarea,select,[contenteditable="true"],.cm-editor,.reading-search'))return;
+      const formatAction=formatActionFromKeyEvent(event);
+      if(!formatAction)return;
+      const {editing:current,markdown:latestMarkdown,renderedSource:currentRenderedSource,sourceAnalysis:currentSourceAnalysis}=latestRef.current;
+      const activeDoc=current?syncedMarkdownRef.current:latestMarkdown;
+      if(!mapLiveRenderedSelectionToSourceRange(window.getSelection(),rootRef.current,currentRenderedSource,currentSourceAnalysis,current,activeDoc))return;
+      event.preventDefault();event.stopPropagation();
+      formatLiveAction(formatAction);
+    };
+    document.addEventListener('keydown',onRenderedKeyDown);
+    return()=>document.removeEventListener('keydown',onRenderedKeyDown);
+  },[formatLiveAction]);
 
   const activeDraftValue=useMemo<ActiveDraftContextValue|null>(
     ()=>editing?{
