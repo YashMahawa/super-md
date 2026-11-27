@@ -614,3 +614,203 @@ fn cli_distinguishes_outside_root_from_missing_and_preserves_output_on_oversized
     }
 }
 
+#[test]
+fn pack_and_export_share_local_asset_resolution_preserving_reference_keys_and_limits() {
+    use base64::Engine;
+
+    let w = Workspace::new();
+    fs::create_dir_all(w.file("notes/DM Images")).unwrap();
+    fs::create_dir_all(w.file("notes/figures")).unwrap();
+
+    let svg_primary = br##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><rect width="32" height="24" fill="#2463b3"/></svg>"##;
+    let svg_encoded_name = br##"<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28"><circle cx="14" cy="14" r="10" fill="#386a57"/></svg>"##;
+    let plot_png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        .unwrap();
+    let outside_svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#b3261e"/></svg>"##;
+
+    fs::write(w.file("notes/diagram.svg"), svg_primary).unwrap();
+    fs::write(w.file("notes/DM Images/fig#1.svg"), svg_encoded_name).unwrap();
+    fs::write(w.file("notes/figures/plot.png"), &plot_png).unwrap();
+    fs::write(w.file("outside-root.svg"), outside_svg).unwrap();
+
+    let suffixed_note = [
+        "# Shared Local Asset Resolution",
+        "",
+        "![Query only](diagram.svg?v=1)",
+        "",
+        "![Fragment only](diagram.svg#dark)",
+        "",
+        "![Query and fragment](diagram.svg?v=1#dark)",
+        "",
+        "![Repeated identical reference key](diagram.svg?v=1#dark)",
+        "",
+        "![Fragment before query](diagram.svg#light?v=2)",
+        "",
+        "![Encoded space and hash with suffixes](DM%20Images/fig%231.svg?rev=3#panel)",
+        "",
+        "![Nested raster with suffixes](figures/plot.png?dpi=300#fig-2)",
+        "",
+    ]
+    .join("\n");
+    fs::write(w.file("notes/suffixed.md"), &suffixed_note).unwrap();
+
+    // 1. Both export and pack resolve local query/fragment suffixes while preserving original reference keys.
+    let export_out = w.run(&["export", "notes/suffixed.md", "notes/suffixed.pdf"]);
+    assert_eq!(
+        export_out.status.code(),
+        Some(0),
+        "export with query/fragment suffixes should exit 0, stderr: {}",
+        String::from_utf8_lossy(&export_out.stderr)
+    );
+    pdf(&w.file("notes/suffixed.pdf"));
+    let exported_pdf_bytes = fs::read(w.file("notes/suffixed.pdf")).unwrap();
+    let exported_pdf_latin1 = String::from_utf8_lossy(&exported_pdf_bytes);
+    assert!(
+        exported_pdf_latin1.contains("/Subtype /Image") || exported_pdf_latin1.contains("/Subtype/Image"),
+        "Raster PNG with query and fragment suffixes must be embedded in exported PDF"
+    );
+
+    let pack_out = w.run(&["pack", "notes/suffixed.md", "notes/suffixed.smd"]);
+    assert_eq!(
+        pack_out.status.code(),
+        Some(0),
+        "pack with query/fragment suffixes should exit 0, stderr: {}",
+        String::from_utf8_lossy(&pack_out.stderr)
+    );
+    let packed_doc = smd_core::portable::PortableDocument::decode_bytes(&fs::read(w.file("notes/suffixed.smd")).unwrap()).unwrap();
+    // 7 image tags, with `diagram.svg?v=1#dark` repeated twice -> 6 distinct original reference keys.
+    assert_eq!(
+        packed_doc.assets.len(),
+        6,
+        "pack must deduplicate identical reference keys while preserving distinct query/fragment reference keys"
+    );
+    assert_eq!(packed_doc.markdown.matches("assets/image-3.svg").count(), 2);
+    assert_eq!(smd_core::portable::image_bytes(&packed_doc.assets["assets/image-1.svg"]).unwrap().1, svg_primary);
+    assert_eq!(smd_core::portable::image_bytes(&packed_doc.assets["assets/image-5.svg"]).unwrap().1, svg_encoded_name);
+    assert_eq!(smd_core::portable::image_bytes(&packed_doc.assets["assets/image-6.png"]).unwrap().1, plot_png);
+
+    let export_packed = w.run(&["export", "notes/suffixed.smd", "notes/suffixed-from-smd.pdf"]);
+    assert_eq!(
+        export_packed.status.code(),
+        Some(0),
+        "export of packed .smd should exit 0, stderr: {}",
+        String::from_utf8_lossy(&export_packed.stderr)
+    );
+    pdf(&w.file("notes/suffixed-from-smd.pdf"));
+
+    // 2. Re-packing a portable note preserves embedded asset lookup by exact reference key alongside new suffixed local files.
+    let mut mixed_portable = packed_doc;
+    mixed_portable.markdown.push_str("\n![Fresh local](diagram.svg?fresh=1#callout)\n");
+    fs::create_dir_all(w.file("repack")).unwrap();
+    fs::write(w.file("repack/diagram.svg"), svg_primary).unwrap();
+    fs::write(w.file("repack/mixed.smd"), mixed_portable.encode_compressed().unwrap()).unwrap();
+    let repack_out = w.run(&["pack", "repack/mixed.smd", "repack/repacked.smd"]);
+    assert_eq!(
+        repack_out.status.code(),
+        Some(0),
+        "re-packing portable note with embedded and suffixed local assets should exit 0, stderr: {}",
+        String::from_utf8_lossy(&repack_out.stderr)
+    );
+    let repacked_doc = smd_core::portable::PortableDocument::decode_bytes(&fs::read(w.file("repack/repacked.smd")).unwrap()).unwrap();
+    assert_eq!(repacked_doc.assets.len(), 7);
+    assert_eq!(smd_core::portable::image_bytes(&repacked_doc.assets["assets/image-5.svg"]).unwrap().1, svg_encoded_name);
+
+    // 3. Matching explicit remote-download consent, root containment, and 25 MB size limits across pack and export.
+    let preexisting_pdf = b"%PDF-1.4\n% preserved export sentinel\n";
+    let preexisting_smd = b"preserved portable sentinel";
+    fs::write(w.file("keep.pdf"), preexisting_pdf).unwrap();
+    fs::write(w.file("keep.smd"), preexisting_smd).unwrap();
+
+    for (name, remote_url) in [
+        ("remote-https.md", "https://example.invalid/diagram.svg?v=1#dark"),
+        ("remote-http.md", "http://example.invalid/diagram.svg"),
+        ("remote-proto-rel.md", "//example.invalid/diagram.svg?v=1#dark"),
+    ] {
+        fs::write(w.file(&format!("notes/{name}")), format!("# Remote\n\n![Remote]({remote_url})\n")).unwrap();
+        for (subcommand, destination, sentinel) in [
+            ("export", "keep.pdf", preexisting_pdf.as_slice()),
+            ("pack", "keep.smd", preexisting_smd.as_slice()),
+        ] {
+            let out = w.run(&[subcommand, &format!("notes/{name}"), destination]);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{subcommand} {name} must exit 1");
+            assert!(
+                err.contains("Remote image requires explicit download in the app"),
+                "{subcommand} {name} must enforce explicit remote-download consent, got: {err}"
+            );
+            assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+        }
+    }
+
+    fs::write(
+        w.file("notes/outside-suffixed.md"),
+        "# Outside\n\n![Escape](../outside-root.svg?v=1#dark)\n",
+    )
+    .unwrap();
+    for (subcommand, destination, sentinel) in [
+        ("export", "keep.pdf", preexisting_pdf.as_slice()),
+        ("pack", "keep.smd", preexisting_smd.as_slice()),
+    ] {
+        let out = w.run(&[subcommand, "notes/outside-suffixed.md", destination]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{subcommand} outside-suffixed must exit 1");
+        assert!(
+            err.contains("Image is outside the note folder"),
+            "{subcommand} outside-suffixed must enforce root check, got: {err}"
+        );
+        assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(w.file("outside-root.svg"), w.file("notes/escape-link.svg")).unwrap();
+        fs::write(
+            w.file("notes/symlink-suffixed.md"),
+            "# Symlink Escape\n\n![Escape](escape-link.svg?cache=9#frag)\n",
+        )
+        .unwrap();
+        for (subcommand, destination, sentinel) in [
+            ("export", "keep.pdf", preexisting_pdf.as_slice()),
+            ("pack", "keep.smd", preexisting_smd.as_slice()),
+        ] {
+            let out = w.run(&[subcommand, "notes/symlink-suffixed.md", destination]);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{subcommand} symlink-suffixed must exit 1");
+            assert!(
+                err.contains("Image is outside the note folder"),
+                "{subcommand} symlink-suffixed must enforce root check, got: {err}"
+            );
+            assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+        }
+    }
+
+    let svg_prefix = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><!--"#;
+    let svg_suffix = br#"--><rect width="16" height="16" fill="black"/></svg>"#;
+    let target_len = smd_core::portable::MAX_IMAGE + 1;
+    let mut oversized_svg = Vec::with_capacity(target_len);
+    oversized_svg.extend_from_slice(svg_prefix);
+    oversized_svg.resize(target_len - svg_suffix.len(), b'x');
+    oversized_svg.extend_from_slice(svg_suffix);
+    fs::write(w.file("notes/oversized.svg"), &oversized_svg).unwrap();
+    fs::write(
+        w.file("notes/oversized-suffixed.md"),
+        "# Oversized\n\n![Huge](oversized.svg?cache=1#view)\n",
+    )
+    .unwrap();
+    for (subcommand, destination, sentinel) in [
+        ("export", "keep.pdf", preexisting_pdf.as_slice()),
+        ("pack", "keep.smd", preexisting_smd.as_slice()),
+    ] {
+        let out = w.run(&[subcommand, "notes/oversized-suffixed.md", destination]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{subcommand} oversized-suffixed must exit 1");
+        assert!(
+            err.contains("Image exceeds 25 MB"),
+            "{subcommand} oversized-suffixed must enforce 25 MB limit, got: {err}"
+        );
+        assert_eq!(fs::read(w.file(destination)).unwrap(), sentinel);
+    }
+}
+
+

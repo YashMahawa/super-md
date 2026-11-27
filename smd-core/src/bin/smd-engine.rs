@@ -319,6 +319,50 @@ fn unpack_note(input_path: &Path, note: &PortableDocument, output_dir: &Path) ->
     }
     Ok(md_target)
 }
+
+enum ResolvedNoteImage<'a> {
+    Embedded(&'a str),
+    InlineData(&'a str),
+    Local { path: PathBuf, bytes: Vec<u8> },
+}
+
+fn resolve_note_image<'a>(
+    root: &Path,
+    note: Option<&'a PortableDocument>,
+    source: &'a str,
+) -> Result<ResolvedNoteImage<'a>> {
+    if let Some(data) = note.and_then(|n| n.assets.get(source)) {
+        return Ok(ResolvedNoteImage::Embedded(data.as_str()));
+    }
+    if source.starts_with("data:") {
+        return Ok(ResolvedNoteImage::InlineData(source));
+    }
+    if source.contains("://") || source.starts_with("//") {
+        bail!("Remote image requires explicit download in the app: {source}");
+    }
+    let local_part = source
+        .split('#')
+        .next()
+        .unwrap_or(source)
+        .split('?')
+        .next()
+        .unwrap_or(source);
+    let file = root
+        .join(percent_encoding::percent_decode_str(local_part).decode_utf8()?.as_ref())
+        .canonicalize()?;
+    if !file.starts_with(root) {
+        bail!("Image is outside the note folder");
+    }
+    if std::fs::metadata(&file)?.len() > portable::MAX_IMAGE as u64 {
+        bail!("Image exceeds 25 MB");
+    }
+    let bytes = std::fs::read(&file)?;
+    if bytes.len() > portable::MAX_IMAGE {
+        bail!("Image exceeds 25 MB");
+    }
+    Ok(ResolvedNoteImage::Local { path: file, bytes })
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
@@ -368,15 +412,19 @@ fn run() -> Result<()> {
         "pack" => {
             let output = args.get(2).context("Expected output .smd path")?;
             let root = path.canonicalize()?.parent().context("No containing folder")?.to_path_buf();
-            let packed = portable::pack(&markdown, |source| {
-                if let Some(data) = note.as_ref().and_then(|n| n.assets.get(source)) { return Ok(data.clone()); }
-                if source.starts_with("data:") { portable::image_bytes(source)?; return Ok(source.to_owned()); }
-                if source.contains("://") { bail!("Remote image requires explicit download in the app: {source}"); }
-                let local = root.join(percent_encoding::percent_decode_str(source).decode_utf8()?.as_ref()).canonicalize()?;
-                if !local.starts_with(&root) { bail!("Image is outside the note folder"); }
-                if std::fs::metadata(&local)?.len() > portable::MAX_IMAGE as u64 { bail!("Image exceeds 25 MB"); }
-                let mime = portable::asset_mime(local.to_str().context("Invalid image path")?).context("Unsupported image type")?;
-                Ok(format!("data:{mime};base64,{}",STANDARD.encode(std::fs::read(local)?)))
+            let packed = portable::pack(&markdown, |source| match resolve_note_image(&root, note.as_ref(), source)? {
+                ResolvedNoteImage::Embedded(data) => Ok(data.to_owned()),
+                ResolvedNoteImage::InlineData(data) => {
+                    portable::image_bytes(data)?;
+                    Ok(data.to_owned())
+                }
+                ResolvedNoteImage::Local { path: local, bytes } => {
+                    let mime = portable::asset_mime(
+                        local.file_name().and_then(|n| n.to_str()).context("Invalid image path")?,
+                    )
+                    .context("Unsupported image type")?;
+                    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+                }
             })?;
             atomic_write(Path::new(output),&packed.encode_compressed()?)?;
             println!("{}",serde_json::json!({"output":output,"assets":packed.assets.len()}));
@@ -385,16 +433,14 @@ fn run() -> Result<()> {
             let output = args.get(2).context("Expected PDF output path")?; let mut assets = HashMap::new();
             let root = path.canonicalize()?.parent().context("No containing folder")?.to_path_buf();
             for source in smd_core::image_sources(&markdown) {
-                let bytes = if let Some(data) = note.as_ref().and_then(|n| n.assets.get(&source)) { portable::image_bytes(data)?.1 }
-                else if source.starts_with("data:") { portable::image_bytes(&source)?.1 }
-                else {
-                    if source.contains("://") || source.starts_with("//") { bail!("Remote image requires explicit download in the app: {source}"); }
-                    let local_part = source.split('#').next().unwrap_or(&source).split('?').next().unwrap_or(&source);
-                    let file = root.join(percent_encoding::percent_decode_str(local_part).decode_utf8()?.as_ref()).canonicalize()?;
-                    if !file.starts_with(&root) { bail!("Image is outside the note folder"); }
-                    if std::fs::metadata(&file)?.len() > portable::MAX_IMAGE as u64 { bail!("Image exceeds 25 MB"); }
-                    std::fs::read(file)?
-                }; assets.insert(source,bytes);
+                if assets.contains_key(&source) {
+                    continue;
+                }
+                let bytes = match resolve_note_image(&root, note.as_ref(), &source)? {
+                    ResolvedNoteImage::Embedded(data) | ResolvedNoteImage::InlineData(data) => portable::image_bytes(data)?.1,
+                    ResolvedNoteImage::Local { bytes, .. } => bytes,
+                };
+                assets.insert(source, bytes);
             }
             atomic_write(Path::new(output),&smd_core::export(&markdown,&PdfOptions::default(),&assets)?)?;
             println!("{}",serde_json::json!({"output":output}));
