@@ -19,6 +19,9 @@ data class PendingSeededFind(
     val nonce: Long = System.nanoTime(),
     val targetTabId: String? = null,
     val targetUri: String? = null,
+    val sourceStart: Int? = null,
+    val sourceEnd: Int? = null,
+    val matchText: String? = null,
 )
 
 internal class FolderSearchController(
@@ -183,12 +186,16 @@ internal class FolderSearchController(
             (match.tabId != null && tab.id == match.tabId) ||
                 (!match.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, match.uri))
         }
+        val hasValidRange = match.sourceStart >= 0 && match.sourceEnd >= match.sourceStart
         if (query.isNotEmpty()) {
             seededFindMutable.value = PendingSeededFind(
                 query = query,
                 caseSensitive = caseSensitive,
                 targetTabId = existing?.id ?: match.tabId,
                 targetUri = existing?.uri ?: match.uri,
+                sourceStart = if (hasValidRange) match.sourceStart else null,
+                sourceEnd = if (hasValidRange) match.sourceEnd else null,
+                matchText = if (hasValidRange) match.matchText.takeIf { it.isNotEmpty() } else null,
             )
         }
         if (existing != null) {

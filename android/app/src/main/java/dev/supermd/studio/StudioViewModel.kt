@@ -1165,70 +1165,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         super.onCleared()
     }
     val state = mutable.asStateFlow()
-    fun inspectStorage() {
-        if (mutable.value.storageScanning) return
-        mutable.value = mutable.value.copy(storageScanning = true)
-        viewModelScope.launch {
-            val report = withContext(Dispatchers.IO) {
-                runCatching {
-                    val app = getApplication<Application>()
-                    StorageInspector.inspect(app.filesDir, app.cacheDir)
-                }.getOrElse { StorageInspector.unavailableReport() }
-            }
-            mutable.value = mutable.value.copy(storageReport = report, storageScanning = false)
-        }
-    }
-    fun clearPythonStorage() {
-        if (mutable.value.storageScanning) return
-        mutable.value = mutable.value.copy(storageScanning = true)
-        viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) {
-                runCatching {
-                    val app = getApplication<Application>()
-                    val cleared = StorageInspector.clearPythonResults(app.filesDir, app.cacheDir)
-                    cleared to StorageInspector.inspect(app.filesDir, app.cacheDir)
-                }
-            }
-            val value = result.getOrNull()
-            mutable.value = mutable.value.copy(
-                storageScanning = false,
-                storageReport = value?.second ?: mutable.value.storageReport,
-                message = if (value != null) "Cleared ${value.first} temporary Python result files. Notes and recovery data were preserved." else mutable.value.message,
-                error = if (value == null) "Could not safely clear temporary results: ${result.exceptionOrNull()?.message.orEmpty()}" else null,
-            )
-        }
-    }
-    private val outlineMutable = MutableStateFlow<List<OutlineHeading>>(emptyList())
-    val headings = outlineMutable.asStateFlow()
-    private val imageMutable = MutableStateFlow(false)
-    val imageOverlay = imageMutable.asStateFlow()
-    @Volatile internal var lastOutlineNoteId: String = ""
-        private set
-    fun outline(id: String, entries: JSONArray) {
-        if (id != mutable.value.active.id) return
-        val parsed = (0 until minOf(entries.length(), 2000)).map { index ->
-            val entry = entries.getJSONObject(index)
-            OutlineHeading(entry.getString("id"), entry.getString("title"), entry.getInt("level").coerceIn(1,6), entry.getInt("offset").coerceAtLeast(0))
-        }
-        if (id != mutable.value.active.id) return
-        outlineMutable.value = parsed
-        lastOutlineNoteId = id
-        val note = mutable.value.tabs.firstOrNull { it.id == id } ?: return
-        if (note.uri == null && note.name.startsWith("Untitled") && parsed.isNotEmpty()) {
-            val title = parsed.first().title.filter { it.code >= 32 && it !in "/\\:*?\"<>|" }.trim().trim('.').take(120)
-            if (title.isNotEmpty()) {
-                change { s ->
-                    s.copy(
-                        tabs = s.tabs.map {
-                            if (it.id == id && it.uri == null && it.name.startsWith("Untitled")) {
-                                it.copy(name = title + if (it.portable) ".smd" else ".md")
-                            } else it
-                        },
-                    )
-                }
-            }
-        }
-    }
+    fun inspectStorage() = studioSettings.inspectStorage()
+    fun clearPythonStorage() = studioSettings.clearPythonStorage()
+    val headings: kotlinx.coroutines.flow.StateFlow<List<OutlineHeading>> get() = readerProtocolAndOutline.headings
+    val imageOverlay: kotlinx.coroutines.flow.StateFlow<Boolean> get() = readerProtocolAndOutline.imageOverlay
+    internal val lastOutlineNoteId: String get() = readerProtocolAndOutline.lastOutlineNoteId
+    fun outline(id: String, entries: JSONArray) = readerProtocolAndOutline.outline(id, entries)
     private fun resolveDisplayName(target: Uri): String? =
         DocumentFile.fromSingleUri(getApplication(), target)?.name?.takeIf(String::isNotBlank)
             ?: target.takeIf { it.scheme.equals("file", ignoreCase = true) }?.path?.let { File(it).name }?.takeIf(String::isNotBlank)
@@ -1465,31 +1407,29 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         return s.copy(activeId=activeId, closedTabs=closedNotesForRestore(refs,s.closedTabs,activeIds,indexResult.isSuccess),
             error=closedNoteIndexError?.let {"Closed-note recovery index could not be read; historical snapshots were left untouched. $it"} ?: s.error)
     }
-    private fun readingPreferences(s:StudioState)=s.copy(patternKind=prefs.getString("patternKind","")?:"",patternOpacity=prefs.getFloat("patternOpacity",-1f),patternSize=prefs.getFloat("patternSize",0f),patternSpacing=prefs.getFloat("patternSpacing",0f),centerLock=prefs.getBoolean("centerLock",true),restorePosition=prefs.getBoolean("restorePosition",true),fullDocumentAccessibility=prefs.getBoolean("fullDocumentAccessibility",false),startup=prefs.getString("startup","restore") ?: "restore",imageAppearance=prefs.getString("imageAppearance","original") ?: "original",svgAppearance=prefs.getString("svgAppearance","original") ?: "original",imageContrast=prefs.getFloat("imageContrast",1.25f))
-    fun readingPreference(key:String,value:String) {
-        if(key=="patternKind"&&value in listOf("","none","paws","dots","grid","diagonal","gradient"))prefs.edit().putString(key,value).apply()
-        if(key in listOf("imageAppearance","svgAppearance")&&value in listOf("original","invert-dark","auto","monochrome","contrast") || key=="startup"&&value in listOf("restore","new"))prefs.edit().putString(key,value).apply()
-    }
-    fun themeBackgroundPreference(key:String,value:Float) {
-        val range=when(key){"patternOpacity"->0f..0.25f;"patternSize"->8f..64f;"patternSpacing"->12f..192f;else->return}
-        if(value.isFinite()&&value in range)prefs.edit().putFloat(key,value).apply()
-    }
-    fun resetThemeBackground(){prefs.edit().remove("patternKind").remove("patternOpacity").remove("patternSize").remove("patternSpacing").apply()}
-    fun restorePosition(value:Boolean){prefs.edit().putBoolean("restorePosition",value).apply()}
-    fun fullDocumentAccessibility(value:Boolean){prefs.edit().putBoolean("fullDocumentAccessibility",value).apply()}
-    fun centerLock(value:Boolean){prefs.edit().putBoolean("centerLock",value).apply()}
-    fun imageContrast(value:Float){if(value.isFinite())prefs.edit().putFloat("imageContrast",value.coerceIn(1f,2f)).apply()}
-    fun readingLocation(uri:String?):JSONObject?=if(uri==null)null else runCatching {JSONObject(prefs.getString("readingPositions","{}")!!).optJSONObject(uri)}.getOrNull()
-    fun readingPosition(id:String,location:JSONObject) {
-        val note=mutable.value.tabs.find {it.id==id} ?: return
-        val uri=note.uri ?: return
-        if(!mutable.value.restorePosition)return
-        if(listOf("top","offset","zoom").any {val value=location.optDouble(it,Double.NaN);!value.isFinite()||value<0} || location.optString("mode") !in listOf("reader","live","editor","split"))return
-        val old=runCatching {JSONObject(prefs.getString("readingPositions","{}")!!)}.getOrDefault(JSONObject())
-        old.remove(uri);old.put(uri,JSONObject().put("top",location.getDouble("top")).put("offset",location.getDouble("offset")).put("zoom",location.getDouble("zoom")).put("mode",location.getString("mode")))
-        while(old.length()>200)old.remove(old.keys().next())
-        prefs.edit().putString("readingPositions",old.toString()).apply()
-    }
+    private lateinit var studioSettingsCache: StudioSettingsCoordinator
+    private val studioSettings: StudioSettingsCoordinator
+        get() = if (::studioSettingsCache.isInitialized) studioSettingsCache else synchronized(this) {
+            if (!::studioSettingsCache.isInitialized) {
+                studioSettingsCache = StudioSettingsCoordinator(
+                    app = getApplication(), prefs = prefs, scope = viewModelScope,
+                    readState = { mutable.value }, writeState = { mutable.value = it }, changeState = ::change,
+                    performReaderBarrier = ::performReaderBarrier, readerBarrierFailed = ::readerBarrierFailed,
+                    setImageOverlay = { readerProtocolAndOutline.setImageOverlay(it) },
+                )
+            }
+            studioSettingsCache
+        }
+    private fun readingPreferences(s: StudioState): StudioState = studioSettings.readingPreferences(s)
+    fun readingPreference(key: String, value: String) = studioSettings.readingPreference(key, value)
+    fun themeBackgroundPreference(key: String, value: Float) = studioSettings.themeBackgroundPreference(key, value)
+    fun resetThemeBackground() = studioSettings.resetThemeBackground()
+    fun restorePosition(value: Boolean) = studioSettings.restorePosition(value)
+    fun fullDocumentAccessibility(value: Boolean) = studioSettings.fullDocumentAccessibility(value)
+    fun centerLock(value: Boolean) = studioSettings.centerLock(value)
+    fun imageContrast(value: Float) = studioSettings.imageContrast(value)
+    fun readingLocation(uri: String?): JSONObject? = studioSettings.readingLocation(uri)
+    fun readingPosition(id: String, location: JSONObject) = studioSettings.readingPosition(id, location)
     private fun recoverySignature(state: StudioState) = RecoverySnapshotSignature(
         state.tabs, state.closedTabs, state.activeId, state.mode, state.normalZoom, state.fullscreenZoom,
     )
@@ -1500,92 +1440,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     // keystroke re-serializes the whole note on both sides and costs battery.
     val readerEcho = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val readerEditProtocol = ReaderEditProtocol()
-    internal fun clearReaderEditProtocol(id: String) { readerEditProtocol.clear(id) }
-    internal fun readerStateIsNativeAuthoritative(id: String): Boolean =
-        mutable.value.tabs.find { it.id == id }?.let { readerEditProtocol.matchesNative(id, it.content) } == true
-    /** An edit that came from the reader itself; only these may skip the echo. */
-    fun readerEdit(id: String, content: String, protocolPatch: Boolean = false) {
-        if (mutable.value.tabs.none { it.id == id }) return
-        if (!protocolPatch) readerEditProtocol.clear(id)
-        readerEcho[id] = content
-        edit(id, content)
-    }
-
-    internal fun readerSync(id: String, epoch: String, revision: Long, content: String): JSONObject {
-        val note = mutable.value.tabs.find { it.id == id }
-        return readerProtocolJson(readerEditProtocol.sync(id, epoch, revision, content, note?.content))
-    }
-
-    internal fun readerPatch(
-        id: String,
-        epoch: String,
-        baseRevision: Long,
-        revision: Long,
-        changes: List<ReaderEditChange>,
-    ): JSONObject {
-        val note = mutable.value.tabs.find { it.id == id }
-        val ack = readerEditProtocol.patch(id, epoch, baseRevision, revision, changes, note?.content) { updated ->
-            readerEdit(id, updated, protocolPatch = true)
-        }
-        return readerProtocolJson(ack)
-    }
-
-    internal fun readerResync(
-        id: String,
-        epoch: String,
-        revision: Long,
-        bases: List<String>,
-        content: String,
-    ): JSONObject {
-        val note = mutable.value.tabs.find { it.id == id }
-        val ack = readerEditProtocol.resync(id, epoch, revision, bases, content, note?.content) { updated ->
-            readerEdit(id, updated, protocolPatch = true)
-        }
-        if (!ack.accepted) preserveReaderConflictDraft(id, note?.name ?: "Reader draft", content)
-        return readerProtocolJson(ack)
-    }
-
-    /** Preserve a bounded draft from a malformed resync envelope when its text is still usable. */
-    internal fun preserveMalformedReaderResync(id: String?, content: String?) {
-        if (content == null) return
-        if (!readerConflictDraftWithinLimits(content)) {
-            fail("Reader edits conflicted with newer native content, but the incoming draft is too large for a private recovery copy. Keep the reader open and copy it before continuing.")
-            return
-        }
-        preserveReaderConflictDraft(id?.takeIf { it.isNotBlank() && it.length <= 256 } ?: "unknown-reader", "Reader draft", content)
-    }
-
-    private fun readerProtocolJson(ack: ReaderEditProtocol.Ack): JSONObject =
-        if (ack.accepted) JSONObject().put("accepted", true).put("revision", ack.revision)
-        else JSONObject().put("accepted", false).put("reason", "conflict")
-
-    /** Preserve a conflicting renderer draft without blocking the UI thread. */
-    private fun preserveReaderConflictDraft(id: String, name: String, content: String) {
-        if (!readerConflictDraftWithinLimits(content)) {
-            fail("Reader edits conflicted with newer native content, but the incoming draft is too large for a private recovery copy. Keep the reader open and copy it before continuing.")
-            return
-        }
-        viewModelScope.launch(Dispatchers.IO) {
-            var temporary: File? = null
-            val saved = runCatching {
-                val root = File(getApplication<Application>().filesDir, "reader-conflicts").apply { check(isDirectory || mkdirs()) }
-                val destination = File(root, "reader-conflict-${UUID.randomUUID()}.json")
-                val tempFile = File(root, destination.name + ".tmp")
-                temporary = tempFile
-                val output = java.io.FileOutputStream(tempFile)
-                val writer = android.util.JsonWriter(java.io.OutputStreamWriter(output, Charsets.UTF_8))
-                try {
-                    writer.beginObject().name("id").value(id).name("name").value(name).name("content").value(content).endObject()
-                    writer.flush()
-                    output.fd.sync()
-                } finally { writer.close() }
-                check(tempFile.renameTo(destination)) { "Could not replace private conflict draft" }
-            }.onFailure { temporary?.delete() }
-            withContext(Dispatchers.Main) {
-                fail(if (saved.isSuccess) "Reader edits conflicted with newer native content. A private recovery copy was saved." else "Reader edits conflicted with newer native content, and the private recovery copy could not be written. Keep the reader draft open and copy it before continuing.")
-            }
-        }
-    }
+    private val readerProtocolAndOutline = ReaderProtocolAndOutlineCoordinator(
+        app = getApplication(), scope = viewModelScope,
+        readerEcho = readerEcho, readerEditProtocol = readerEditProtocol,
+        readState = { mutable.value }, changeState = ::change, editNote = ::edit, fail = ::fail,
+    )
+    internal fun clearReaderEditProtocol(id: String) = readerProtocolAndOutline.clearReaderEditProtocol(id)
+    internal fun readerStateIsNativeAuthoritative(id: String): Boolean = readerProtocolAndOutline.readerStateIsNativeAuthoritative(id)
+    fun readerEdit(id: String, content: String, protocolPatch: Boolean = false) = readerProtocolAndOutline.readerEdit(id, content, protocolPatch)
+    internal fun readerSync(id: String, epoch: String, revision: Long, content: String): JSONObject =
+        readerProtocolAndOutline.readerSync(id, epoch, revision, content)
+    internal fun readerPatch(id: String, epoch: String, baseRevision: Long, revision: Long, changes: List<ReaderEditChange>): JSONObject =
+        readerProtocolAndOutline.readerPatch(id, epoch, baseRevision, revision, changes)
+    internal fun readerResync(id: String, epoch: String, revision: Long, bases: List<String>, content: String): JSONObject =
+        readerProtocolAndOutline.readerResync(id, epoch, revision, bases, content)
+    internal fun preserveMalformedReaderResync(id: String?, content: String?) =
+        readerProtocolAndOutline.preserveMalformedReaderResync(id, content)
 
     fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
@@ -2304,61 +2174,26 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             }
         }
     }
-    fun mode(value: String) {
-        val expectedActiveId=mutable.value.active.id
-        viewModelScope.launch {
-            val accepted=performReaderBarrier(expectedActiveId) {change {it.copy(mode=value, editorFocused=if(value=="reader") false else it.editorFocused)}}
-            if(!accepted)readerBarrierFailed()
-        }
-    }
-    fun fullscreen(value: Boolean) = change { s ->
-        if (value == s.fullscreen) s else s.copy(fullscreen = value,
-            // Fullscreen is a chrome change, not a request to load an old scale.
-            fullscreenZoom = if (value) s.normalZoom else s.fullscreenZoom)
-    }
-    // Reader gestures are acknowledgements, not a second command back to WebView.
-    // Only an explicit native control/shortcut advances the command generation.
-    fun zoom(value: Float) = change { s -> val command=maxOf(System.currentTimeMillis(),s.zoomCommand+1);if (s.fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f), zoomCommand = command) else s.copy(normalZoom = value.coerceIn(40f, 300f), zoomCommand = command) }
-    fun readerZoom(value: Float, fullscreen: Boolean) = change { s -> if (fullscreen) s.copy(fullscreenZoom = value.coerceIn(40f, 300f)) else s.copy(normalZoom = value.coerceIn(40f, 300f)) }
-    fun appearance(accent: String? = null, theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) {
-        if(size!=null && (!size.isFinite() || size !in 6f..32f))return
-        change { it.copy(accent = accent ?: it.accent, theme = theme ?: it.theme, fullscreenTheme = fullTheme ?: it.fullscreenTheme, motion = motion ?: it.motion, font = font ?: it.font, size = size ?: it.size) }
-        prefs.edit().apply { accent?.let { putString("accent", it) }; theme?.let { putString("theme", it) }; fullTheme?.let { putString("fullTheme", it) }; motion?.let { putBoolean("motion", it) }; font?.let { putString("font", it) }; size?.let { putFloat("size", it) } }.apply()
-    }
-    fun pdf(value: String) { change { it.copy(pdf = value) }; prefs.edit().putString("pdf", value).apply() }
-    fun noteLocation(): String = prefs.getString("newNoteLocation", "") ?: ""
+    fun mode(value: String) = studioSettings.mode(value)
+    fun fullscreen(value: Boolean) = studioSettings.fullscreen(value)
+    fun zoom(value: Float) = studioSettings.zoom(value)
+    fun readerZoom(value: Float, fullscreen: Boolean) = studioSettings.readerZoom(value, fullscreen)
+    fun appearance(accent: String? = null, theme: String? = null, fullTheme: String? = null, motion: Boolean? = null, font: String? = null, size: Float? = null) =
+        studioSettings.appearance(accent, theme, fullTheme, motion, font, size)
+    fun pdf(value: String) = studioSettings.pdf(value)
+    fun noteLocation(): String = studioSettings.noteLocation()
     internal suspend fun saveAgentMedia(args: JSONObject): JSONObject = withContext(Dispatchers.IO) {
         media.saveAgentMedia(args, noteLocation()).also { readerFolderIndex.clear() }
     }
-    fun noteLocation(uri: Uri) {
-        getApplication<Application>().contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        prefs.edit().putString("newNoteLocation", uri.toString()).apply()
-    }
-    fun reading(widthPercent: Float? = null, lineHeight: Float? = null, autosave: Boolean? = null) {
-        val width=widthPercent?.takeIf { it.isFinite() }?.coerceIn(50f,150f)
-        val leading=lineHeight?.takeIf { it.isFinite() }?.coerceIn(1.15f,2.2f)
-        change { it.copy(widthPercent=width ?: it.widthPercent,lineHeight=leading ?: it.lineHeight,autosave=autosave ?: it.autosave) }
-        prefs.edit().apply { width?.let { putFloat("widthPercent",it) };leading?.let { putFloat("lineHeight",it) };autosave?.let { putBoolean("autosave",it) } }.apply()
-    }
-    fun writing(spellCheck:Boolean?=null,grammarCheck:Boolean?=null) {
-        change {it.copy(spellCheck=spellCheck?:it.spellCheck,grammarCheck=grammarCheck?:it.grammarCheck)}
-        prefs.edit().apply {spellCheck?.let {putBoolean("spellCheck",it)};grammarCheck?.let {putBoolean("grammarCheck",it)}}.apply()
-    }
-    fun selectionAssistant(value:String) {
-        if(SelectionActions.assistants.none {it.first==value})return
-        change {it.copy(selectionAssistant=value)}
-        prefs.edit().putString("selectionAssistant",value).apply()
-    }
-    fun latexAutofix(enabled:Boolean) {
-        change {it.copy(latexAutofix=enabled)}
-        prefs.edit().putBoolean("latexAutofix",enabled).apply()
-    }
-    fun typewriterScroll(enabled:Boolean) {
-        change {it.copy(typewriterScroll=enabled)}
-        prefs.edit().putBoolean("typewriterScroll",enabled).apply()
-    }
-    fun overlay(open: Boolean, image: Boolean = false) { mutable.value=mutable.value.copy(readerOverlay=open); imageMutable.value=image }
-    fun editorFocus(focused: Boolean) { if (mutable.value.editorFocused != focused) mutable.value = mutable.value.copy(editorFocused = focused) }
+    fun noteLocation(uri: Uri) = studioSettings.noteLocation(uri)
+    fun reading(widthPercent: Float? = null, lineHeight: Float? = null, autosave: Boolean? = null) =
+        studioSettings.reading(widthPercent, lineHeight, autosave)
+    fun writing(spellCheck: Boolean? = null, grammarCheck: Boolean? = null) = studioSettings.writing(spellCheck, grammarCheck)
+    fun selectionAssistant(value: String) = studioSettings.selectionAssistant(value)
+    fun latexAutofix(enabled: Boolean) = studioSettings.latexAutofix(enabled)
+    fun typewriterScroll(enabled: Boolean) = studioSettings.typewriterScroll(enabled)
+    fun overlay(open: Boolean, image: Boolean = false) = studioSettings.overlay(open, image)
+    fun editorFocus(focused: Boolean) = studioSettings.editorFocus(focused)
     fun importFont(uri: Uri) = viewModelScope.launch {
         try { val family=withContext(Dispatchers.IO) {fonts.import(uri)};appearance(font=family);prefs.edit().putLong("fonts",System.currentTimeMillis()).apply();mutable.value=mutable.value.copy(customFonts=fonts.families,message="Imported $family for reading and PDF export") }
         catch(error: Exception) {fail("Could not import font: ${error.message}")}
@@ -4549,11 +4384,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             require(note.portable && note.uri != null && note.saved == note.content) { "Attaching an image requires a saved, unchanged portable .smd note" }
             val rawName = request.getString("assetName")
             val filename = rawName.removePrefix("assets/")
-            require(Regex("[A-Za-z0-9_.-]{1,150}").matches(filename) && filename !in setOf(".", "..")) { "Asset name must be a simple filename" }
+            require(isValidPortableAssetFilename(filename)) { "Asset name must be a simple filename" }
             val mime = request.getString("mimeType").substringBefore(';').lowercase()
             require(mime in setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")) { "Unsupported image type" }
             val extension = filename.substringAfterLast('.', "").lowercase()
             val normalizedName = if (extension.isEmpty()) "$filename.${when(mime) { "image/png" -> "png"; "image/jpeg" -> "jpg"; "image/gif" -> "gif"; "image/webp" -> "webp"; "image/avif" -> "avif"; else -> "svg" }}" else filename
+            require(isValidPortableAssetFilename(normalizedName)) { "Asset name must be a simple filename" }
             require(media.assetMime(normalizedName) == mime) { "Asset extension must match its image type" }
             val encoded = request.getString("body")
             require(encoded.length <= 1_400_000 && encoded.length % 4 == 0) { "Asset body must be at most 1 MiB" }

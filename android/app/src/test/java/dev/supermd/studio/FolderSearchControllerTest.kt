@@ -123,6 +123,11 @@ class FolderSearchControllerTest {
         assertNotNull(seed)
         assertEquals("StatusFlushNeedle", seed!!.query)
         assertTrue(seed.caseSensitive)
+        assertEquals("StatusFlushNeedle", seed.matchText)
+        assertEquals(
+            "StatusFlushNeedle",
+            model.state.value.active.content.substring(seed.sourceStart!!, seed.sourceEnd!!),
+        )
         assertTrue(model.activeMatchesSeedTarget(model.state.value.active, seed))
         assertFalse(model.activeMatchesSeedTarget(Note(id = "", name = "Empty.md"), seed))
         assertTrue(
@@ -135,6 +140,21 @@ class FolderSearchControllerTest {
         assertEquals(seed, model.seededFind.value)
         model.consumeSeededFind(seed.nonce)
         assertNull(model.seededFind.value)
+
+        // Synthetic match without valid source offsets clears sourceStart/sourceEnd/matchText to null.
+        model.openFolderSearch("StatusFlushNeedle")
+        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
+        val syntheticNoRangeMatch = model.folderSearch.value.matches.single().copy(
+            sourceStart = -1,
+            sourceEnd = -1,
+            matchText = "ignored",
+        )
+        model.openSearchMatch(syntheticNoRangeMatch)
+        val unindexedSeed = model.seededFind.value!!
+        assertNull(unindexedSeed.sourceStart)
+        assertNull(unindexedSeed.sourceEnd)
+        assertNull(unindexedSeed.matchText)
+        model.consumeSeededFind(unindexedSeed.nonce)
 
         val flushEntered = AtomicBoolean(false)
         val jobCancelled = AtomicBoolean(false)
