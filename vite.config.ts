@@ -144,7 +144,7 @@ function mermaidSandboxPlugin(): Plugin {
         name: "mermaid-sandbox.html",
         source: bundle.html,
       });
-      if (!isNative && !process.env.TAURI_ENV_PLATFORM) {
+      if (!isNative) {
         const scriptRefId = this.emitFile({
           type: "asset",
           name: "mermaid-sandbox.js",
@@ -172,12 +172,7 @@ export function htmlCspPlugin(): Plugin {
     },
     transformIndexHtml: {
       order: "post",
-      handler(html, ctx) {
-        if (process.env.TAURI_ENV_PLATFORM && ctx.filename.replace(/\\/g, "/").endsWith("/index.html")) {
-          // Tauri v2 injects its own authoritative CSP meta tag from tauri.conf.json
-          // (including runtime IPC script nonces and asset:/customprotocol: sources).
-          return html.replace(/\s*<meta\s+http-equiv=["']Content-Security-Policy["'][^>]*>/i, "");
-        }
+      handler(html) {
         if (!isServe) {
           return html;
         }
@@ -233,14 +228,13 @@ export default defineConfig(({mode}) => ({
         "**/test-results/**",
         "**/playwright-report/**",
         "**/*.tsbuildinfo",
-        "**/src-tauri/target/**",
         "**/smd-core/target/**",
         "**/android/**/build/**",
         "**/desktop/.venv/**",
       ],
     },
   },
-  envPrefix: ["VITE_", "TAURI_"],
+  envPrefix: ["VITE_"],
   build: {
     rollupOptions: {
       input: buildHtmlEntries(mode),
