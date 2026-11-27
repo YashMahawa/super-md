@@ -268,11 +268,10 @@ class MediaStorage(private val context: Context) {
         check(File(bundles, id).mkdirs()) { "Could not prepare the portable note's local asset directory" }
         return id
     }
-    private val key = Regex("assets/[a-zA-Z0-9_.-]{1,150}")
     private fun gzip(output: java.io.OutputStream) = object : GZIPOutputStream(output, 8192) {
         init { def.setLevel(PORTABLE_GZIP_LEVEL) }
     }
-    fun validKey(source: String) = key.matches(source) && source.substringAfter('/') !in listOf(".", "..")
+    fun validKey(source: String): Boolean = isValidCompatPortableAssetKey(source)
     private fun mime(name: String) = when(name.substringAfterLast('.').lowercase()) {
         "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"; "avif" -> "image/avif"; "svg" -> "image/svg+xml"; else -> error("Choose a supported image (PNG, JPEG, GIF, WebP, AVIF or SVG)")
     }
@@ -872,7 +871,67 @@ class MediaStorage(private val context: Context) {
         maxPlainBytes: Int = 5_000_000,
         maxPortableMarkdownBytes: Int = 20_000_000,
     ): String? {
-        val buffered = if (input.markSupported()) input else BufferedInputStream(input, 65_536)
+        val initial = ByteArray(8_192)
+        var initialLen = 0
+        while (initialLen < initial.size) {
+            val count = input.read(initial, initialLen, initial.size - initialLen)
+            if (count <= 0) break
+            initialLen += count
+        }
+        if (initialLen == 0) return ""
+        val isGzip = initialLen >= 2 && initial[0] == 0x1f.toByte() && initial[1] == 0x8b.toByte()
+        var nonWsIdx = if (initialLen >= 3 && initial[0] == 0xef.toByte() && initial[1] == 0xbb.toByte() && initial[2] == 0xbf.toByte()) 3 else 0
+        val hasUtf8Bom = nonWsIdx == 3
+        while (nonWsIdx < initialLen) {
+            val b = initial[nonWsIdx].toInt() and 0xff
+            if (b != 0x20 && b != 0x09 && b != 0x0a && b != 0x0d) break
+            nonWsIdx++
+        }
+        val mightBeJson = !isGzip && (nonWsIdx >= initialLen || initial[nonWsIdx] == '{'.code.toByte())
+        if (!isGzip && !mightBeJson) {
+            for (i in 0 until initialLen) {
+                if (initial[i] == 0.toByte()) return null
+            }
+            val nextByte = if (initialLen == initial.size) input.read() else -1
+            if (nextByte < 0) {
+                if (initialLen > maxPlainBytes) return null
+                return runCatching {
+                    val offset = if (hasUtf8Bom) 3 else 0
+                    Charsets.UTF_8.newDecoder()
+                        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                        .decode(java.nio.ByteBuffer.wrap(initial, offset, initialLen - offset))
+                        .toString()
+                }.getOrNull()
+            }
+            return runCatching {
+                val out = java.io.ByteArrayOutputStream(minOf(maxPlainBytes, 32_768))
+                out.write(initial, 0, initialLen)
+                if (nextByte == 0) return null
+                out.write(nextByte)
+                require(out.size() <= maxPlainBytes)
+                val buf = ByteArray(16_384)
+                while (true) {
+                    val count = input.read(buf)
+                    if (count <= 0) break
+                    for (i in 0 until count) {
+                        if (buf[i] == 0.toByte()) return null
+                    }
+                    require(out.size() + count <= maxPlainBytes)
+                    out.write(buf, 0, count)
+                }
+                val raw = out.toByteArray()
+                val offset = if (hasUtf8Bom) 3 else 0
+                Charsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(raw, offset, raw.size - offset))
+                    .toString()
+            }.getOrNull()
+        }
+
+        val combined = java.io.SequenceInputStream(java.io.ByteArrayInputStream(initial, 0, initialLen), input)
+        val buffered = BufferedInputStream(combined, 65_536)
         buffered.mark(65_536)
         val prefix = ByteArray(32_768)
         var prefixLen = 0
@@ -882,9 +941,7 @@ class MediaStorage(private val context: Context) {
             prefixLen += count
         }
         buffered.reset()
-        if (prefixLen == 0) return ""
         val headBytes = prefix.copyOfRange(0, prefixLen)
-        val isGzip = portableGzipHeader(headBytes)
         val headerPreview = if (!isGzip) {
             runCatching { String(headBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') }.getOrDefault("")
         } else ""

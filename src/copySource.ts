@@ -9,6 +9,181 @@ declare global {
 const elementAt = (node: Node | null): Element | null =>
   !node ? null : node instanceof Element ? node : node.parentElement;
 
+const isDetailsOpen = (el: Element): boolean => el.hasAttribute("open");
+
+const isClosedDisclosure = (el: Element): boolean =>
+  el.tagName === "DETAILS" && !el.classList.contains("code-disclosure") && !isDetailsOpen(el);
+
+const directSummaryOf = (details: Element): Element | null =>
+  Array.from(details.children).find(child => child.tagName === "SUMMARY") ?? null;
+
+function outermostClosedDisclosureHidingPoint(container: Node, offset: number, side: "start" | "end"): Element | null {
+  let hidden: Element | null = null;
+  let current = elementAt(container);
+  while (current && !current.matches(".markdown-body,.live-document")) {
+    if (isClosedDisclosure(current)) {
+      const summary = directSummaryOf(current);
+      if (container === current) {
+        if (!summary) hidden = current;
+        else {
+          const summaryEnd = Array.prototype.indexOf.call(current.childNodes, summary) + 1;
+          if (side === "start" ? offset >= summaryEnd : offset > summaryEnd) hidden = current;
+        }
+      } else if (!summary || !summary.contains(container)) {
+        hidden = current;
+      }
+    }
+    current = current.parentElement;
+  }
+  return hidden;
+}
+
+function scanQuoteLine(line: string): { quoteDepth: number; rest: string } {
+  let pos = 0, col = 0, baseCol = 0, quoteDepth = 0;
+  while (pos < line.length) {
+    let nextPos = pos, nextCol = col;
+    while (nextPos < line.length && (line[nextPos] === " " || line[nextPos] === "\t")) {
+      const step = line[nextPos] === "\t" ? 4 - (nextCol % 4) : 1;
+      if (nextCol + step - baseCol > 3) break;
+      nextCol += step;
+      nextPos++;
+    }
+    if (line[nextPos] !== ">") break;
+    quoteDepth++;
+    pos = nextPos + 1;
+    col = nextCol + 1;
+    if (line[pos] === " ") { pos++; col++; baseCol = col; }
+    else if (line[pos] === "\t") { pos++; col += 4 - (col % 4); baseCol = col; }
+    else baseCol = col;
+  }
+  return { quoteDepth, rest: line.slice(pos) };
+}
+
+function parseFenceOpen(rest: string): { char: string; length: number } | null {
+  const trimmed = rest.replace(/^[ \t]{0,3}/, "");
+  if (/^[ \t]{4,}/.test(rest)) return null;
+  const match = /^(`{3,}|~{3,})(.*)$/.exec(trimmed);
+  if (!match || (match[1][0] === "`" && match[2].includes("`"))) return null;
+  return { char: match[1][0], length: match[1].length };
+}
+
+function isBlockInterrupt(rest: string): boolean {
+  const trimmed = rest.replace(/^[ \t]{0,3}/, "");
+  if (/^[ \t]{4,}/.test(rest)) return false;
+  return Boolean(
+    parseFenceOpen(rest) ||
+    /^#{1,6}(?:[ \t]+|$)/.test(trimmed) ||
+    /^(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$/.test(trimmed) ||
+    /^([-+*]|\d+[.)])[ \t]+/.test(trimmed)
+  );
+}
+
+function stripClosedOffscreenCallouts(slice: string): string {
+  if (!/\[![\w-]+\]|:::callout\s/i.test(slice)) return slice;
+  let normalized = slice;
+  if (/:::callout\s/i.test(normalized)) {
+    const converted: string[] = [];
+    let fence: { char: string; length: number; quoteDepth: number } | null = null;
+    let portableDepth = 0;
+    for (const rawLine of normalized.split("\n")) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      const { quoteDepth, rest } = scanQuoteLine(line);
+      if (fence) {
+        if (quoteDepth < fence.quoteDepth) fence = null;
+        else {
+          const close = /^(`{3,}|~{3,})[ \t]*$/.exec(rest.replace(/^[ \t]{0,3}/, ""));
+          if (!/^[ \t]{4,}/.test(rest) && close && close[1][0] === fence.char && close[1].length >= fence.length) fence = null;
+          converted.push(portableDepth ? `${"> ".repeat(portableDepth)}${line}` : line);
+          continue;
+        }
+      }
+      const openFence = parseFenceOpen(rest);
+      if (openFence) {
+        fence = { ...openFence, quoteDepth };
+        converted.push(portableDepth ? `${"> ".repeat(portableDepth)}${line}` : line);
+        continue;
+      }
+      const start = quoteDepth === 0 ? /^:::callout\s+([\w-]+)(?:\s+(.+))?\s*$/i.exec(line) : null;
+      if (start) {
+        portableDepth++;
+        const type = start[1].toLowerCase();
+        const title = start[2]?.trim().replace(/^(['"])(.*)\1$/, "$2") || "";
+        converted.push(`${"> ".repeat(portableDepth)}[!${type}]${title ? ` ${title}` : ""}`);
+      } else if (quoteDepth === 0 && rest.trim() === ":::" && portableDepth > 0) {
+        portableDepth--;
+        if (portableDepth > 0) converted.push("> ".repeat(portableDepth).trimEnd());
+      } else if (portableDepth > 0) {
+        converted.push(line ? `${"> ".repeat(portableDepth)}${line}` : "> ".repeat(portableDepth).trimEnd());
+      } else {
+        converted.push(line);
+      }
+    }
+    normalized = converted.join("\n");
+  }
+
+  const out: string[] = [];
+  let fence: { char: string; length: number; quoteDepth: number } | null = null;
+  let closedDepth: number | null = null;
+  let inClosedParagraph = false;
+  let openQuoteDepth = 0;
+
+  for (const rawLine of normalized.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const { quoteDepth, rest } = scanQuoteLine(line);
+    if (fence) {
+      if (quoteDepth < fence.quoteDepth) {
+        fence = null;
+      } else {
+        const close = /^(`{3,}|~{3,})[ \t]*$/.exec(rest.replace(/^[ \t]{0,3}/, ""));
+        if (!/^[ \t]{4,}/.test(rest) && close && close[1][0] === fence.char && close[1].length >= fence.length) fence = null;
+        if (closedDepth === null || quoteDepth < closedDepth) out.push(line);
+        continue;
+      }
+    }
+    if (closedDepth !== null) {
+      if (quoteDepth >= closedDepth) {
+        if (rest.trim() === "") inClosedParagraph = false;
+        continue;
+      }
+      if (inClosedParagraph && rest.trim() !== "" && !isBlockInterrupt(rest)) continue;
+      closedDepth = null;
+      inClosedParagraph = false;
+    }
+    const openFence = parseFenceOpen(rest);
+    if (openFence) {
+      fence = { ...openFence, quoteDepth };
+      openQuoteDepth = quoteDepth;
+      out.push(line);
+      continue;
+    }
+    if (rest.trim() === "") {
+      openQuoteDepth = quoteDepth;
+      out.push(line);
+      continue;
+    }
+    if (quoteDepth > openQuoteDepth) {
+      const trimmed = rest.replace(/^[ \t]+/, "");
+      const match = /^\[!([\w-]+)\]([+-]?)(?:[ \t]+(.*))?$/i.exec(trimmed);
+      if (match) {
+        const type = match[1].toLowerCase();
+        const fold = match[2] || "";
+        const title = match[3]?.trim() || "";
+        const isClosed = fold === "-" || (fold !== "+" && (type === "answer" || type === "solution"));
+        if (isClosed) {
+          out.push(`${"> ".repeat(quoteDepth)}[!${type}]${fold}${title ? ` ${title}` : ""}`);
+          closedDepth = quoteDepth;
+          inClosedParagraph = true;
+          openQuoteDepth = quoteDepth - 1;
+          continue;
+        }
+      }
+      openQuoteDepth = quoteDepth;
+    }
+    out.push(line);
+  }
+  return out.join("\n").trimEnd();
+}
+
 /** Serialize the selected rendered fragment as Markdown, not KaTeX's duplicated
  * visual glyphs. Expand selection endpoints inside math to the original formula. */
 export function selectedMarkdown(selection: Selection | null, source?:string): string | null {
@@ -17,10 +192,21 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   const startElement=elementAt(range.startContainer), endElement=elementAt(range.endContainer);
   if (!startElement?.closest(".markdown-body,.live-document") || !endElement?.closest(".markdown-body,.live-document")) return null;
   if (startElement.closest("textarea,input,.cm-editor") || endElement.closest("textarea,input,.cm-editor")) return null;
-  if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties")) return "";
+  if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties,.code-disclosure > summary,.cell-toolbar")) return "";
+  const hiddenStart=outermostClosedDisclosureHidingPoint(range.startContainer,range.startOffset,"start");
+  const hiddenEnd=outermostClosedDisclosureHidingPoint(range.endContainer,range.endOffset,"end");
+  if(hiddenStart&&hiddenStart===hiddenEnd)return "";
+  if(hiddenStart)range.setStartAfter(hiddenStart);
+  if(hiddenEnd){
+    const summary=directSummaryOf(hiddenEnd);
+    if(summary&&range.comparePoint(summary,summary.childNodes.length)<=0)range.setEndAfter(summary);
+    else if(range.comparePoint(hiddenEnd,0)<=0)range.setEndBefore(hiddenEnd);
+    else return "";
+  }
+  if(range.collapsed)return hiddenStart||hiddenEnd?"":null;
   const atomicAt=(node:Node)=>{
     const el=elementAt(node);
-    return el?.closest(".katex-display") || el?.closest(".katex") || el?.closest('[data-windowed-mounted="false"]');
+    return el?.closest("[data-math-source]") || el?.closest("[data-math-inline-source]") || el?.closest("[data-source-tex]") || el?.closest(".katex-display") || el?.closest(".katex") || el?.closest('[data-windowed-mounted="false"]');
   };
   const start=atomicAt(range.startContainer), end=atomicAt(range.endContainer);
   if(start)range.setStartBefore(start);if(end)range.setEndAfter(end);
@@ -54,6 +240,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     }
     return number;
   };
+  const quoteLines=(text:string):string=>text.split("\n").map(line=>line?`> ${line}`:">").join("\n");
   const serialize=(node:Node,inTableCell=false):string=>{
     if(node.nodeType===Node.TEXT_NODE){
       const text=node.textContent||"";
@@ -62,9 +249,46 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     if(!(node instanceof Element))return Array.from(node.childNodes).map(child=>serialize(child,inTableCell)).join("");
     if(source!==undefined&&node.matches('[data-windowed-mounted="false"]')) {
       const from=Number(node.getAttribute('data-source-start')),to=Number(node.getAttribute('data-source-end'));
-      if(Number.isFinite(from)&&Number.isFinite(to)&&to>from)return source.slice(from,to)+'\n\n';
+      if(Number.isFinite(from)&&Number.isFinite(to)&&to>from){
+        const stripped=stripClosedOffscreenCallouts(source.slice(from,to));
+        return stripped?`${stripped}\n\n`:"";
+      }
     }
-    if(node.matches("button,.image-edit-tools,.katex-mathml,[data-frontmatter-properties],.document-properties"))return "";
+    if(node.matches("button,.image-edit-tools,.katex-mathml,.math-equation-extra-anchor,[data-frontmatter-properties],.document-properties,.cell-toolbar")||(node.tagName==="SUMMARY"&&node.parentElement?.classList.contains("code-disclosure")))return "";
+    if(node.classList.contains("callout")){
+      const closed=node.tagName==="DETAILS"&&!isDetailsOpen(node);
+      const type=(node.getAttribute("data-callout-type")||node.className.match(/\bcallout-([\w-]+)\b/)?.[1]||"note").toLowerCase();
+      const fold=node.getAttribute("data-callout-fold")||"";
+      const defaultTitle=node.getAttribute("data-callout-default-title")==="true";
+      const titleChild=Array.from(node.children).find(child=>child.classList.contains("callout-title")||child.tagName==="SUMMARY")??null;
+      const rawTitle=titleChild?Array.from(titleChild.childNodes).map(child=>serialize(child,false)).join("").replace(/\s*\n\s*/g," ").trim():"";
+      const headerLine=titleChild?`[!${type}]${fold}${!defaultTitle&&rawTitle?` ${rawTitle}`:""}`:"";
+      if(closed)return headerLine?`> ${headerLine}\n\n`:"";
+      const bodyEntries:Array<{node:Node;text:string}>=[];
+      for(const child of Array.from(node.childNodes)){
+        if(child===titleChild)continue;
+        const text=serialize(child,false).trim();
+        if(text)bodyEntries.push({node:child,text});
+      }
+      if(!headerLine){
+        const bodyOnly=bodyEntries.map(entry=>entry.text).join("\n\n");
+        return bodyOnly?`${quoteLines(bodyOnly)}\n\n`:"";
+      }
+      if(!bodyEntries.length)return `> ${headerLine}\n\n`;
+      const firstIsParagraph=bodyEntries[0].node instanceof Element&&bodyEntries[0].node.tagName==="P";
+      const bodyText=bodyEntries.map(entry=>entry.text).join("\n\n");
+      const combined=firstIsParagraph?`${headerLine}\n${bodyText}`:`${headerLine}\n\n${bodyText}`;
+      return `${quoteLines(combined)}\n\n`;
+    }
+    if(isClosedDisclosure(node)){
+      const summary=directSummaryOf(node);
+      if(!summary)return "";
+      const title=serialize(summary,inTableCell).trim();
+      return title?`${title}\n\n`:"";
+    }
+    if(node.hasAttribute("data-source-tex"))return node.getAttribute("data-source-tex")||"";
+    if(node.hasAttribute("data-math-inline-source"))return `$${node.getAttribute("data-math-inline-source")||""}$`;
+    if(node.hasAttribute("data-math-source"))return `\n$$\n${node.getAttribute("data-math-source")||""}\n$$\n`;
     if(node.matches(".katex-display,.katex")){const tex=node.querySelector('annotation[encoding="application/x-tex"]')?.textContent;if(tex)return node.matches(".katex-display")?`\n$$\n${tex}\n$$\n`:`$${tex}$`;}
     if(node.tagName==="TABLE"){
       const rows=Array.from(node.querySelectorAll("tr")).filter(row=>row.closest("table")===node).map(row=>Array.from(row.children).filter(cell=>/^(TH|TD)$/.test(cell.tagName)).map(cell=>Array.from(cell.childNodes).map(child=>serialize(child,true)).join("").trim().replace(/\n+/g,"<br>"))).filter(row=>row.length>0);
@@ -85,7 +309,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     switch(node.tagName.toLowerCase()){
       case "br":return "\n";
       case "hr":return "\n---\n\n";
-      case "blockquote":return `${content.trim().split("\n").map(line=>`> ${line}`).join("\n")}\n\n`;
+      case "blockquote":return `${quoteLines(content.trim())}\n\n`;
       case "input":return node.getAttribute("type")==="checkbox"?`[${(node as HTMLInputElement).checked?"x":" "}] `:"";
       case "strong":case "b":return `**${content}**`;
       case "em":case "i":return `*${content}*`;
@@ -95,9 +319,9 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
       case "sup":return /\s/.test(content)?`<sup>${content}</sup>`:`^${content}^`;
       case "kbd":return `<kbd>${content}</kbd>`;
       case "u":return `<u>${content}</u>`;
-      case "a":return `[${content}](${node.getAttribute("href")||""})`;
+      case "a":return `[${content}](${node.getAttribute("data-source-href")||node.getAttribute("href")||""})`;
       case "pre":return `\n\`\`\`${node.querySelector("code")?.className.match(/language-([\w-]+)/)?.[1]||""}\n${content.trimEnd()}\n\`\`\`\n`;
-      case "p":case "div":case "section":return `${content}\n\n`;
+      case "p":case "div":case "section":case "summary":return `${content}\n\n`;
       case "li":return `${node.parentElement?.tagName==='OL'?`${listNumber(node)}.`:'-'} ${content}\n`;
       case "h1":case "h2":case "h3":case "h4":case "h5":case "h6":return `${"#".repeat(Number(node.tagName[1]))} ${content}\n\n`;
       case "img":{const source=node.closest("[data-note-image-source]")?.getAttribute("data-note-image-source")||node.getAttribute("src")||"";return /^(data:|blob:)/.test(source)?`[${node.getAttribute("alt")||"Image"}]`:`![${node.getAttribute("alt")||""}](${source})`;}
@@ -105,9 +329,14 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     }
   };
   const fragment=range.cloneContents();
-  // cloneContents omits the common ancestor. Preserve ordered-list and table
-  // context when copying a subset of items, rows, or cells.
+  // cloneContents omits the common ancestor. Preserve ordered-list, callout,
+  // disclosure, blockquote, and table context when copying a subset of items.
   const parent=elementAt(range.commonAncestorContainer);
+  if(parent&&(parent.classList.contains("callout")||parent.classList.contains("code-disclosure")||parent.tagName==="BLOCKQUOTE"||isClosedDisclosure(parent))){
+    const wrapper=parent.cloneNode(false) as Element;
+    wrapper.append(fragment);
+    return serialize(wrapper).trim();
+  }
   if(parent?.tagName==='OL'&&Array.from(fragment.children).some(node=>node.tagName==='LI')){
     const list=parent.cloneNode(false) as Element;
     const first=Array.from(parent.children).find(node=>node.tagName==='LI'&&range.intersectsNode(node));
@@ -139,7 +368,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   // selections such as a few characters inside bold or linked text.
   let output:Node=fragment;
   let context=elementAt(range.commonAncestorContainer);
-  while(context&&!context.matches('.markdown-body,.live-document')&&!/^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|BODY|DD|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/.test(context.tagName)){
+  while(context&&!context.matches('.markdown-body,.live-document')&&!/^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|BODY|DD|DETAILS|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|SUMMARY|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/.test(context.tagName)){
     const tag=context.tagName.toLowerCase();
     if(['strong','b','em','i','del','s','mark','sub','sup','kbd','u','a','code'].includes(tag)&&!(tag==='code'&&context.parentElement?.tagName==='PRE')){
       const wrapper=context.cloneNode(false) as Element;wrapper.append(output);output=wrapper;
@@ -214,7 +443,7 @@ export function setSelectedMarkdownDrag(event: Pick<DragEvent,"target"|"dataTran
   };
   if(endpointRoot(selection.anchorNode!)!==root||endpointRoot(selection.focusNode!)!==root)return false;
   const markdown=selectedMarkdown(selection,source);
-  if(markdown===null)return false;
+  if(!markdown)return false;
   event.dataTransfer.setData("text/plain",markdown);
   // Rich text targets prefer the browser's HTML/URL payload over text/plain.
   // A source-text drag must match Copy, which provides Markdown plain text.

@@ -44,21 +44,23 @@ function scrollSourceAlive(root:HTMLElement,source:ScrollSource):boolean {
  * synchronously; never replay an earlier scrollTop or scroll gesture. */
 export function commitWindowedLayout(root:Element|Document|null,update:()=>void):void {
   const host=root instanceof HTMLElement?root:null;
+  const beforeTop=host?.scrollTop;
   const restore=host?captureWindowedScrollAnchor(host):undefined;
   flushSync(update);
   if(host)refreshDocumentExtent(host);
   restore?.();
+  if(host&&beforeTop!==undefined&&Math.abs(host.scrollTop-beforeTop)>.5)(host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=host.scrollTop;
 }
 /** Synchronous layout transaction only; never retain this across input frames. */
 export function captureWindowedScrollAnchor(root:HTMLElement,changing?:HTMLElement):()=>void {
   const source=!root.dataset.navigating?currentScrollSource(root):undefined;
   if(source){
     const top=source.range.getBoundingClientRect().top;
-    return()=>{if(root.isConnected&&!root.dataset.navigating&&scrollSourceAlive(root,source))root.scrollTop+=source.range.getBoundingClientRect().top-top;};
+    return()=>{if(root.isConnected&&!root.dataset.navigating&&scrollSourceAlive(root,source)){root.scrollTop+=source.range.getBoundingClientRect().top-top;(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;}};
   }
   const anchor=!root.dataset.navigating?windowedViewportAnchor(root,changing):undefined;
   const top=anchor?.getBoundingClientRect().top;
-  return()=>{if(root.isConnected&&!root.dataset.navigating&&anchor?.isConnected&&root.contains(anchor)&&top!==undefined)root.scrollTop+=anchor.getBoundingClientRect().top-top;};
+  return()=>{if(root.isConnected&&!root.dataset.navigating&&anchor?.isConnected&&root.contains(anchor)&&top!==undefined){root.scrollTop+=anchor.getBoundingClientRect().top-top;(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;}};
 }
 function windowedViewportAnchor(root:HTMLElement,changing?:HTMLElement):HTMLElement|undefined {
   if(root.scrollTop<1)return;
@@ -106,7 +108,7 @@ export function preserveWindowedScroll(element:HTMLElement):void {
   const rect=root.getBoundingClientRect(),x=rect.left+rect.width*.5,y=rect.top+Math.min(160,rect.height*.35);
   const anchor=document.elementFromPoint(x,y)?.closest<HTMLElement>('[data-windowed-block]');if(!anchor)return;
   const top=anchor.getBoundingClientRect().top,scroll=root.scrollTop;pendingAnchors.add(root);
-  requestAnimationFrame(()=>{pendingAnchors.delete(root);if(root.isConnected&&anchor.isConnected&&Math.abs(root.scrollTop-scroll)<1)root.scrollTop+=anchor.getBoundingClientRect().top-top;});
+  requestAnimationFrame(()=>{pendingAnchors.delete(root);if(root.isConnected&&anchor.isConnected&&Math.abs(root.scrollTop-scroll)<1){root.scrollTop+=anchor.getBoundingClientRect().top-top;(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;}});
 }
 export function registerWindowedText(element:HTMLElement,text:string):()=>void {
   blocks.set(element,text);return()=>{blocks.delete(element);};
@@ -143,6 +145,22 @@ export function windowedMatches(host:Element,query:string,options:SearchMatchCon
   const result:WindowedMatch[]=[];
   const {pattern}=compileSearchPattern(query,options,false);
   if(!pattern)return result;
+  if(!host.hasAttribute('data-windowed-block')){
+    const fmHeader=host.querySelector<HTMLElement>('[data-frontmatter-properties]')??host.querySelector<HTMLElement>('.document-properties');
+    if(fmHeader&&!fmHeader.hasAttribute('hidden')&&!fmHeader.hasAttribute('inert')&&fmHeader.getAttribute('aria-hidden')!=='true'){
+      const fields=fmHeader.querySelectorAll<HTMLElement>('[data-frontmatter-field]');
+      const parts:string[]=[];
+      for(const f of fields){
+        const kind=f.getAttribute('data-frontmatter-field');
+        if((kind==='title'||kind==='author'||kind==='tag')&&f.textContent)parts.push(f.textContent);
+      }
+      if(parts.length){
+        const fmText=parts.join('\n');
+        pattern.lastIndex=0;let fmOrdinal=0;
+        while(nextSearchMatch(pattern,fmText)){result.push({element:fmHeader,ordinal:fmOrdinal++});if(result.length>=5000)return result;}
+      }
+    }
+  }
   // Query mounted block wrappers directly in DOM tree order so Live edits never
   // require O(M log M) compareDocumentPosition sorting or misorder 5,000+ caps.
   for(const element of windowedBlocks){

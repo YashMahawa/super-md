@@ -6,8 +6,8 @@ startup and the standalone CLI do not load the MCP, ASGI, or Qt runtimes.
 from __future__ import annotations
 
 import argparse
-import hmac
 import base64
+import hmac
 import inspect
 import json
 import os
@@ -18,10 +18,20 @@ from typing import Any
 
 try:
     from . import documents
-    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, validate_patch_operations
+    from .agent_documents import (
+        AgentDocumentError,
+        DocumentStore,
+        RevisionConflict,
+        validate_patch_operations,
+    )
 except ImportError:  # python desktop/mcp_server.py
     import documents
-    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, validate_patch_operations
+    from agent_documents import (
+        AgentDocumentError,
+        DocumentStore,
+        RevisionConflict,
+        validate_patch_operations,
+    )
 
 
 class BearerAuth:
@@ -267,6 +277,9 @@ def build_mcp_server(roots: list[str], live_client=None):
             allowed = ("id", "windowId", "title", "path", "format", "isDirty", "sourceLength",
                        "revision", "outline", "outline_truncated", "assets", "asset_count")
             metadata = {key: result[key] for key in allowed if key in result}
+            live_props = _bounded_properties(result.get("properties"))
+            if live_props is not None:
+                metadata["properties"] = live_props
             headings = outline["headings"]
             metadata["outline"] = [normalize_live_heading(item) for item in headings[:80] if isinstance(item, dict)]
             metadata["outline_truncated"] = outline["truncated"] or len(headings) > 80
@@ -344,7 +357,17 @@ def build_mcp_server(roots: list[str], live_client=None):
                 if isinstance(match.get("snippet"), str):
                     match["snippet"] = match["snippet"][:1100]
             return bounded_result(result)
-        return store.search(path, query, limit=limit, context=context)
+        return store.search(
+            path,
+            query,
+            limit=limit,
+            context=context,
+            offset=offset,
+            case_sensitive=case_sensitive,
+            whole_word=whole_word,
+            regex=regex,
+            exclude_diagrams=exclude_diagrams,
+        )
 
     @server.tool()
     def document_action(action: str, path: str | None = None, content: str | None = None,
@@ -727,6 +750,35 @@ def build_mcp_server(roots: list[str], live_client=None):
     def _safe_int(value: Any) -> int | None:
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
+    def _bounded_properties(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        out: dict[str, Any] = {}
+        raw_title = _bounded_text(value.get("title"), 300)
+        if raw_title and raw_title.strip():
+            out["title"] = raw_title.strip()
+        authors = [
+            item.strip()[:200]
+            for item in (value.get("authors") if isinstance(value.get("authors"), list) else [])
+            if isinstance(item, str) and item.strip()
+        ][:20]
+        raw_author = _bounded_text(value.get("author"), 500)
+        clean_author = raw_author.strip() if raw_author else ""
+        if authors:
+            out["authors"] = authors
+            out["author"] = clean_author or ", ".join(authors)[:500]
+        elif clean_author:
+            out["author"] = clean_author
+            out["authors"] = [clean_author[:200]]
+        tags = [
+            item.strip()[:100]
+            for item in (value.get("tags") if isinstance(value.get("tags"), list) else [])
+            if isinstance(item, str) and item.strip()
+        ][:50]
+        if tags:
+            out["tags"] = tags
+        return out or None
+
     def _normalize_reading_context(context: dict[str, Any]) -> dict[str, Any]:
         source_length = _safe_int(context.get("sourceLength"))
         visible_source = context.get("visibleSource")
@@ -890,6 +942,9 @@ def build_mcp_server(roots: list[str], live_client=None):
         active_step = _bounded_active_step(source.get("activeStep", metadata.get("activeStep") if metadata else None))
         if active_step is not None:
             capture_ctx["activeStep"] = active_step
+        props = _bounded_properties(source.get("properties", metadata.get("properties") if metadata else None))
+        if props is not None:
+            capture_ctx["properties"] = props
         source_length = _safe_int(source.get("sourceLength"))
         normalized_src = source.get("visibleSource")
         if source_length is not None and source_length >= 0 and isinstance(normalized_src, dict):
@@ -910,7 +965,7 @@ def build_mcp_server(roots: list[str], live_client=None):
                 alt = normalized_src.get("totalChars") if key == "total_chars" else (
                     normalized_src.get("nextOffset") if key == "next_offset" else None
                 )
-                field = normalized_src[key] if key in normalized_src else alt
+                field = normalized_src.get(key, alt)
                 if key in ("end", "next_offset") and preview_truncated:
                     if start is not None:
                         visible_source[key] = start + len(returned_text)
@@ -1002,6 +1057,12 @@ def build_mcp_server(roots: list[str], live_client=None):
                 normalized["activeStep"] = bounded_step
             else:
                 normalized.pop("activeStep", None)
+        if "properties" in normalized:
+            bounded_props = _bounded_properties(normalized.get("properties"))
+            if bounded_props is not None:
+                normalized["properties"] = bounded_props
+            else:
+                normalized.pop("properties", None)
         if "pythonCells" in normalized:
             bounded_cells = _bounded_python_cells(normalized.get("pythonCells"))
             if bounded_cells is not None:
@@ -1062,7 +1123,12 @@ def build_mcp_server(roots: list[str], live_client=None):
             }
             capture_context, captured_reading = _viewport_contexts(image, resolved_tab, revision)
             if captured_reading is not None:
-                final_reading_context = {**captured_reading, "target": target}
+                merged_reading = (
+                    {**captured_reading, "properties": reading_context["properties"]}
+                    if "properties" in reading_context and "properties" not in captured_reading
+                    else captured_reading
+                )
+                final_reading_context = {**merged_reading, "target": target}
                 reading_context_source = "viewport_capture"
                 aligned = True
             else:
@@ -1138,8 +1204,8 @@ def main(argv: list[str] | None = None) -> int:
         if not 1 <= args.port <= 65535:
             raise ValueError("port must be between 1 and 65535")
         token = _token(args)
-        from mcp.server.transport_security import TransportSecuritySettings
         import uvicorn
+        from mcp.server.transport_security import TransportSecuritySettings
 
         kwargs = {"host": args.host, "port": args.port,
                   "streamable_http_path": "/mcp", "max_request_body_size": 2 * 1024 * 1024}

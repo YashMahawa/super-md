@@ -66,6 +66,7 @@ jobs:
           if-no-files-found: error
 
   test:
+    needs: native_frontend
     strategy:
       fail-fast: false
       matrix:
@@ -145,11 +146,6 @@ jobs:
       - run: node scripts/verify-phosphor-icons.mjs
       - name: Build the relay for cross-platform Qt/MCP integration tests
         run: npm ci --prefix agent-relay && npm run build --prefix agent-relay
-      - name: Wait for same-run frontend artifacts for this checkout
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
       - uses: actions/download-artifact@v4
         with:
           name: native-frontend-dist-${{ steps.source.outputs.sha }}
@@ -170,10 +166,9 @@ jobs:
           path: |
             ${{ runner.temp }}/reader-assets-report.json
             ${{ runner.temp }}/python-wheel-inventory.json
-      - run: node --test scripts/release-guards.test.mjs
-      - run: node --test scripts/verify-phosphor-icons.test.mjs
-      - run: npx vitest run
-      - run: npm run test:pdf
+      - name: Run standalone Node script test suites
+        run: npm run test:scripts
+      - run: npm test
       - run: cargo build --locked --release --manifest-path smd-core/Cargo.toml --bin smd-engine
       - name: Test native state, file safety, themes and actual Qt menu geometry
         timeout-minutes: 8
@@ -345,6 +340,7 @@ jobs:
         run: node scripts/verify-tsc-ts-canary.mjs "$RUNNER_TEMP/tsc-ts/node_modules/tsc-ts/bin/tsc-ts.js"
 
   android-device-tests:
+    needs: native_frontend
     strategy:
       fail-fast: false
       matrix:
@@ -399,11 +395,6 @@ jobs:
           cache-on-failure: true
       - run: npm ci
       - run: npx tsc -b --pretty false
-      - name: Wait for same-run frontend artifacts for this checkout
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: node scripts/wait-native-frontend-artifacts.mjs "$NATIVE_FRONTEND_SOURCE_SHA"
       - uses: actions/download-artifact@v4
         with:
           name: native-frontend-dist-${{ steps.source.outputs.sha }}
@@ -460,7 +451,7 @@ jobs:
   release-gate:
     name: All release tests passed
     if: always()
-    needs: [test, browser, android-release, android-device-tests]
+    needs: [native_frontend, test, browser, android-release, android-device-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Reject failures, cancellations and skipped test families
