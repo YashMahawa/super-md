@@ -6,6 +6,7 @@ import android.content.ClipDescription
 import android.content.ContentProvider
 import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ProviderInfo
 import android.database.Cursor
 import android.database.MatrixCursor
@@ -174,9 +175,11 @@ class DropSafetyTest {
             welcomed = true,
         )
         assertFalse(shouldBlockNativeDrop(baseState))
+        assertTrue(shouldBlockNativeDrop(baseState, readerReady = false))
         assertTrue(shouldBlockNativeDrop(baseState.copy(welcomed = false)))
         assertTrue(shouldBlockNativeDrop(baseState.copy(readerOverlay = true)))
         assertTrue(shouldBlockNativeDrop(baseState.copy(busy = true)))
+        assertTrue(shouldBlockNativeDrop(baseState.copy(error = "Save failed")))
         assertTrue(shouldBlockNativeDrop(baseState, folderSearchVisible = true))
         assertTrue(shouldBlockNativeDrop(baseState, accessRequestOpen = true))
         assertTrue(shouldBlockNativeDrop(baseState.copy(pendingCloseNoteId = "n1")))
@@ -184,6 +187,7 @@ class DropSafetyTest {
         assertTrue(shouldBlockNativeDrop(baseState, settingsOpen = true))
         assertTrue(shouldBlockNativeDrop(baseState, exporting = true))
         assertTrue(shouldBlockNativeDrop(baseState, renaming = true))
+        assertTrue(shouldBlockNativeDrop(baseState, folderDialogOpen = true))
         assertTrue(shouldBlockNativeDrop(baseState, contentsShown = true))
         assertTrue(shouldBlockNativeDrop(baseState, drawerOpen = true))
 
@@ -203,11 +207,18 @@ class DropSafetyTest {
         provider.entries["bmp"] = FakeDropProvider.Entry("legacy.bmp", "image/bmp", "BM123456".toByteArray())
         provider.entries["spoofed"] = FakeDropProvider.Entry("fake.png", "application/octet-stream", PDF_BYTES)
 
+        val pdfUri = Uri.parse("content://$AUTHORITY/pdf")
+        val bmpUri = Uri.parse("content://$AUTHORITY/bmp")
+        val spoofedUri = Uri.parse("content://$AUTHORITY/spoofed")
+        listOf(pdfUri, bmpUri, spoofedUri).forEach { uri ->
+            app.grantUriPermission(app.packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+
         val secretFile = File(app.filesDir, "secret.png").apply { writeBytes(VALID_PNG_BYTES) }
         val nonImageUris = listOf(
-            Uri.parse("content://$AUTHORITY/pdf"),
-            Uri.parse("content://$AUTHORITY/bmp"),
-            Uri.parse("content://$AUTHORITY/spoofed"),
+            pdfUri,
+            bmpUri,
+            spoofedUri,
             Uri.parse("https://example.com/not-a-local-image.png"),
             Uri.parse("content://${app.packageName}.share/secret.png"),
             Uri.fromFile(secretFile),
@@ -239,17 +250,20 @@ class DropSafetyTest {
         provider.entries["svg"] = FakeDropProvider.Entry("diagram.svg", "text/xml", VALID_SVG_BYTES)
         provider.entries["pdf"] = FakeDropProvider.Entry("handout.pdf", "application/pdf", PDF_BYTES)
 
+        val pngUri = Uri.parse("content://$AUTHORITY/png")
+        val pdfUri = Uri.parse("content://$AUTHORITY/pdf")
+        val svgUri = Uri.parse("content://$AUTHORITY/svg")
+        listOf(pngUri, pdfUri, svgUri).forEach { uri ->
+            app.grantUriPermission(app.packageName, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+
         val model = StudioViewModel(app)
         drainMain()
         val activeId = model.state.value.active.id
         var imported: JSONArray? = null
 
         model.importDropped(
-            listOf(
-                Uri.parse("content://$AUTHORITY/png"),
-                Uri.parse("content://$AUTHORITY/pdf"),
-                Uri.parse("content://$AUTHORITY/svg"),
-            ),
+            listOf(pngUri, pdfUri, svgUri),
             activeId,
         ) { images -> imported = images }
         drainMain { imported != null }

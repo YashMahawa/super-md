@@ -168,7 +168,7 @@ it("extracts source-aware text across rendered math, offscreen blocks, live text
   delete window.supermdSelectedText;
   vhost.remove();host.remove();
 });
-it("excludes document properties header labels and badges from copied Markdown and reader search",()=>{
+it("excludes document properties header from copied Markdown while indexing only displayed title, author, and tags in reader search",()=>{
   const markdown="---\ntitle: Hidden Header Title\nauthor: Emmy Noether\ndate: 2026-03-15\ntags: [algebra, invariants]\n...\n\n# Opening Section\n\nFirst **important** sentence.";
   const host=document.createElement("div");
   host.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={markdown} documentPath={null} python="" dark={false}/>);
@@ -201,8 +201,11 @@ it("excludes document properties header labels and badges from copied Markdown a
   expect(extractSelectedText({source:markdown})).toBe("");
   expect(hasSelectedText()).toBe(false);
 
-  expect(readingMatches(article,"Hidden Header Title")).toEqual([]);
+  expect(readingMatches(article,"Hidden Header Title").map(r=>r.toString())).toEqual(["Hidden Header Title"]);
+  expect(readingMatches(article,"Emmy Noether").map(r=>r.toString())).toEqual(["Emmy Noether"]);
+  expect(readingMatches(article,"invariants").map(r=>r.toString())).toEqual(["invariants"]);
   expect(readingMatches(article,"Author")).toEqual([]);
+  expect(readingMatches(article,"2026-03-15")).toEqual([]);
   expect(readingMatches(article,"important").map(r=>r.toString())).toEqual(["important"]);
   selection.removeAllRanges();
   host.remove();

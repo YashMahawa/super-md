@@ -1,12 +1,7 @@
 package dev.supermd.studio
 
 import android.content.Context
-import android.content.ContentValues
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
-import android.provider.DocumentsContract
 import android.util.Base64
 import android.util.JsonReader
 import android.util.JsonWriter
@@ -37,6 +32,8 @@ private const val MAX_CACHED_LOCAL_CHARS = 48_000_000L
 class MediaStorage(private val context: Context) {
     companion object {
         const val UNSUPPORTED_DROP_IMAGE_MESSAGE = "Only supported images (PNG, JPEG, GIF, WebP, AVIF, or SVG) can be dropped into a note."
+        const val UNGRANTED_DROP_IMAGE_MESSAGE = "Dropped image read access was not granted; choose the image with Insert image instead."
+        const val SWITCHED_NOTE_IMPORT_MESSAGE = "Image import cancelled because you switched notes before it finished."
         private val SUPPORTED_IMAGE_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
 
         internal fun resolveDroppedImageMime(name: String?, providerMime: String?): String? {
@@ -60,13 +57,13 @@ class MediaStorage(private val context: Context) {
             return extMime
         }
     }
-    data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int)
-    internal data class VerifiedDroppedImageCandidate(
-        val uri: Uri,
-        val intentFlags: Int,
+    data class DroppedImageBatch(val images: JSONArray, val skippedCount: Int, val missingGrantCount: Int = 0)
+    internal data class AdmittedDroppedImageCandidate(
+        val admitted: AdmittedExternalDrop,
         val name: String?,
         val resolvedMime: String,
     )
+    private val publisher = AgentDownloadPublisher(context)
     private val attachments = File(context.filesDir, "attachments").apply { mkdirs() }
     private val bundles = File(context.filesDir, "portable-assets").apply { mkdirs() }
 
@@ -278,11 +275,10 @@ class MediaStorage(private val context: Context) {
         check(File(bundles, id).mkdirs()) { "Could not prepare the portable note's local asset directory" }
         return id
     }
-    private val key = Regex("assets/[a-zA-Z0-9_.-]{1,150}")
     private fun gzip(output: java.io.OutputStream) = object : GZIPOutputStream(output, 8192) {
         init { def.setLevel(PORTABLE_GZIP_LEVEL) }
     }
-    fun validKey(source: String) = key.matches(source) && source.substringAfter('/') !in listOf(".", "..")
+    fun validKey(source: String): Boolean = isValidCompatPortableAssetKey(source)
     private fun mime(name: String) = when(name.substringAfterLast('.').lowercase()) {
         "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"; "avif" -> "image/avif"; "svg" -> "image/svg+xml"; else -> error("Choose a supported image (PNG, JPEG, GIF, WebP, AVIF or SVG)")
     }
@@ -425,102 +421,122 @@ class MediaStorage(private val context: Context) {
         return result
     }
     private fun resolveUriDisplayName(uri: Uri): String? =
-        runCatching { androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name }
-            .getOrNull()
-            ?.takeIf { it.isNotBlank() }
-            ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
-
-    private fun isSafeExternalUri(uri: Uri): Boolean {
-        return when (uri.scheme?.lowercase()) {
-            "content" -> {
-                val authority = uri.authority?.lowercase().orEmpty()
-                authority.isNotEmpty() && authority != "${context.packageName.lowercase()}.share"
-            }
-            "file" -> {
-                val rawPath = uri.path ?: return false
-                val canonical = runCatching { File(rawPath).canonicalPath }.getOrNull() ?: return false
-                val privateRoot = runCatching { context.filesDir.parentFile?.canonicalPath }.getOrNull()
-                privateRoot == null || (canonical != privateRoot && !canonical.startsWith(privateRoot + File.separator))
-            }
-            else -> false
+        if (uri.scheme.equals("file", ignoreCase = true)) {
+            uri.path?.let { File(it).name }?.takeIf { it.isNotBlank() }
+                ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+        } else {
+            runCatching { androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.name }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+                ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
         }
-    }
 
     fun importUris(uris: List<Uri>): JSONArray {
         require(uris.size in 1..32)
-        var total = 0L; val result = JSONArray()
-        for (uri in uris) {
-            require(isSafeExternalUri(uri)) { "Unsupported image URI" }
-            val name = resolveUriDisplayName(uri) ?: "Image"
-            val type = imageMime(name, context.contentResolver.getType(uri))
-            val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
-            requireMediaSignature(type, bytes)
-            total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-            result.put(store(name, type, bytes))
+        var total = 0L
+        val result = JSONArray()
+        try {
+            for (uri in uris) {
+                if (uri.scheme.equals("content", ignoreCase = true)) {
+                    ExternalDocumentEntryGuard.validatePickedMediaUri(context, uri)
+                }
+                val stream = ExternalDocumentEntryGuard.openVerifiedPickedMediaInputStream(
+                    context = context,
+                    resolver = context.contentResolver,
+                    uri = uri,
+                )
+                stream.use { input ->
+                    val name = resolveUriDisplayName(uri) ?: "Image"
+                    val providerMime = if (uri.scheme.equals("content", ignoreCase = true)) {
+                        runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                    } else {
+                        null
+                    }
+                    val type = imageMime(name, providerMime)
+                    val bytes = readLimited(input, 25_000_000)
+                    requireMediaSignature(type, bytes)
+                    total += bytes.size
+                    require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
+                    result.put(store(name, type, bytes))
+                }
+            }
+            return result
+        } catch (error: Throwable) {
+            discardImportedImages(result)
+            throw error
         }
-        return result
     }
 
-    fun importDroppedUris(uris: List<Uri>): DroppedImageBatch {
-        if (uris.isEmpty()) return DroppedImageBatch(JSONArray(), 0)
+    fun importDroppedUris(
+        uris: List<Uri>,
+        dragReadPermissionGranted: Boolean = true,
+    ): DroppedImageBatch {
+        if (uris.isEmpty()) return DroppedImageBatch(JSONArray(), 0, 0)
+        var skipped = 0
+        var missingGrants = 0
+        val candidates = mutableListOf<AdmittedDroppedImageCandidate>()
+        try {
+            for (uri in uris) {
+                when (val decision = ExternalDocumentEntryGuard.admitDroppedUri(context, uri, dragReadPermissionGranted)) {
+                    is ExternalDropUriDecision.MissingGrant -> {
+                        missingGrants++
+                    }
+                    is ExternalDropUriDecision.Rejected -> {
+                        skipped++
+                    }
+                    is ExternalDropUriDecision.Allowed -> {
+                        val name = resolveUriDisplayName(uri)
+                        val providerMime = if (uri.scheme.equals("content", ignoreCase = true)) {
+                            runCatching { context.contentResolver.getType(uri) }.getOrNull()
+                        } else {
+                            null
+                        }
+                        val resolvedMime = resolveDroppedImageMime(name, providerMime)
+                        if (resolvedMime == null) {
+                            decision.close()
+                            skipped++
+                        } else {
+                            candidates += AdmittedDroppedImageCandidate(
+                                admitted = decision.admitted,
+                                name = name,
+                                resolvedMime = resolvedMime,
+                            )
+                        }
+                    }
+                }
+            }
+            val imported = importAdmittedDroppedImages(candidates)
+            val totalMissing = missingGrants + imported.missingGrantCount
+            val nonGrantSkipped = skipped + (imported.skippedCount - imported.missingGrantCount)
+            return DroppedImageBatch(
+                images = imported.images,
+                skippedCount = nonGrantSkipped + totalMissing,
+                missingGrantCount = totalMissing,
+            )
+        } finally {
+            candidates.forEach { runCatching { it.admitted.close() } }
+        }
+    }
+
+    internal fun importAdmittedDroppedImages(
+        candidates: List<AdmittedDroppedImageCandidate>,
+    ): DroppedImageBatch {
+        if (candidates.isEmpty()) return DroppedImageBatch(JSONArray(), 0, 0)
         var total = 0L
         var skipped = 0
+        var missingGrants = 0
         val result = JSONArray()
-        for (uri in uris) {
-            if (!isSafeExternalUri(uri)) {
-                skipped++
-                continue
-            }
-            val name = resolveUriDisplayName(uri)
-            val providerMime = runCatching { context.contentResolver.getType(uri) }.getOrNull()
-            val resolvedMime = resolveDroppedImageMime(name, providerMime)
-            if (resolvedMime == null) {
-                skipped++
-                continue
-            }
-            require(result.length() < 32) { "Insert at most 32 images at a time" }
-            val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
-            val validSignature = runCatching { requireMediaSignature(resolvedMime, bytes) }.isSuccess
-            if (!validSignature) {
-                skipped++
-                continue
-            }
-            total += bytes.size
-            require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-            result.put(store(name ?: "Image", resolvedMime, bytes))
-        }
-        return DroppedImageBatch(result, skipped)
-    }
-
-    internal fun discardImportedImages(images: JSONArray) {
-        for (i in 0 until images.length()) {
-            val source = images.optJSONObject(i)?.optString("source").orEmpty()
-            if (!source.startsWith("assets/import-") || !validKey(source)) continue
-            containedFile(attachments, File(attachments, source.substringAfter('/')))?.let { file ->
-                invalidateLocalAsset(file)
-                file.delete()
-            }
-        }
-    }
-
-    internal fun importVerifiedDroppedImages(candidates: List<VerifiedDroppedImageCandidate>): DroppedImageBatch {
-        if (candidates.isEmpty()) return DroppedImageBatch(JSONArray(), 0)
-        var total = 0L
-        var skipped = 0
-        val result = JSONArray()
-        val dropCaller = ExternalIntentCaller(allowGrantedShareFile = false)
         try {
             for (candidate in candidates) {
                 require(result.length() < 32) { "Insert at most 32 images at a time" }
-                val bytes = runCatching {
-                    ExternalDocumentEntryGuard.openVerifiedExternalInputStream(
-                        context = context,
-                        resolver = context.contentResolver,
-                        uri = candidate.uri,
-                        intentFlags = candidate.intentFlags,
-                        caller = dropCaller,
-                    ).use { readLimited(it, 25_000_000) }
-                }.getOrElse { error ->
+                val bytes = try {
+                    candidate.admitted.openInputStream(context, context.contentResolver).use { input ->
+                        readLimited(input, 25_000_000)
+                    }
+                } catch (_: SecurityException) {
+                    missingGrants++
+                    continue
+                } catch (error: Exception) {
                     if (error.message?.contains("exceeds", ignoreCase = true) == true) throw error
                     skipped++
                     continue
@@ -534,150 +550,39 @@ class MediaStorage(private val context: Context) {
                 require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
                 result.put(store(candidate.name ?: "Image", candidate.resolvedMime, bytes))
             }
-            return DroppedImageBatch(result, skipped)
+            return DroppedImageBatch(
+                images = result,
+                skippedCount = skipped + missingGrants,
+                missingGrantCount = missingGrants,
+            )
         } catch (error: Throwable) {
             discardImportedImages(result)
             throw error
+        } finally {
+            candidates.forEach { runCatching { it.admitted.close() } }
+        }
+    }
+
+    internal fun discardImportedImages(images: JSONArray) {
+        for (i in 0 until images.length()) {
+            val source = images.optJSONObject(i)?.optString("source").orEmpty()
+            if (!source.startsWith("assets/import-") || !validKey(source)) continue
+            containedFile(attachments, File(attachments, source.substringAfter('/')))?.let { file ->
+                invalidateLocalAsset(file)
+                file.delete()
+            }
         }
     }
 
     /** Save a requested browser image/diagram into Downloads or the user's configured note folder. */
-    fun saveAgentMedia(args: JSONObject, configuredLocation: String?): JSONObject {
-        val encoded = args.getString("body")
-        require(encoded.length <= 34_000_000) { "Media export exceeds 25 MB" }
-        val bytes = Base64.decode(encoded, Base64.DEFAULT)
-        require(bytes.size in 1..25_000_000) { "Media export must be at most 25 MB" }
-        val mime = args.getString("mimeType").substringBefore(';').lowercase()
-        val extension = when (mime) {
-            "image/png" -> "png"
-            "image/svg+xml" -> "svg"
-            "image/jpeg" -> "jpg"
-            "image/webp" -> "webp"
-            "image/gif" -> "gif"
-            "image/avif" -> "avif"
-            "text/plain" -> "mmd"
-            else -> error("Unsupported media type")
-        }
-        requireMediaSignature(mime, bytes)
-        val rawName = args.optString("filename", "Super MD export")
-            .substringAfterLast('/').substringAfterLast('\\')
-            .replace(Regex("[\\u0000-\\u001f\\u007f]"), "").trim().take(120)
-        val stem = rawName.substringBeforeLast('.', rawName).trim().take(100).ifBlank { "Super MD export" }
-        val requestedName = "$stem.$extension"
-        val folder = configuredLocation?.takeIf(String::isNotBlank)?.let(Uri::parse)
-        if (folder != null && DocumentsContract.isTreeUri(folder)) {
-            val parent = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, folder)
-                ?: error("Open the configured folder again to restore access")
-            val name = uniqueName(requestedName) { parent.findFile(it) != null }
-            val file = parent.createFile(mime, name) ?: error("The selected folder cannot create files")
-            try {
-                context.contentResolver.openOutputStream(file.uri, "w")?.use { it.write(bytes); it.flush() }
-                    ?: error("The selected folder cannot write files")
-            } catch (error: Exception) { runCatching { file.delete() }; throw error }
-            return JSONObject().put("filename", file.name ?: name).put("bytes", bytes.size)
-                .put("mimeType", mime).put("uri", file.uri.toString())
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            error("Choose a folder in Settings → New note location before saving media on this Android version")
-        }
-        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/Super MD"
-        val resolver = context.contentResolver
-        val name = uniqueName(requestedName) { candidate ->
-            resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Downloads._ID),
-                "${MediaStore.Downloads.DISPLAY_NAME}=? AND ${MediaStore.Downloads.RELATIVE_PATH}=?",
-                arrayOf(candidate, "$relativePath/"), null)?.use { it.moveToFirst() } == true
-        }
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, name)
-            put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, "$relativePath/")
-            put(MediaStore.Downloads.IS_PENDING, 1)
-        }
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: error("Android could not create a Downloads entry")
-        try {
-            resolver.openOutputStream(uri, "w")?.use { it.write(bytes); it.flush() }
-                ?: error("Android could not write the Downloads entry")
-            resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
-        } catch (error: Exception) { runCatching { resolver.delete(uri, null, null) }; throw error }
-        return JSONObject().put("filename", name).put("bytes", bytes.size).put("mimeType", mime).put("uri", uri.toString())
-    }
+    fun saveAgentMedia(args: JSONObject, configuredLocation: String?): JSONObject =
+        publisher.saveAgentMedia(args, configuredLocation)
 
     /** Create a new document in the configured SAF folder or the app's Downloads collection. */
-    fun writeAgentDocument(filename: String, mimeType: String, configuredLocation: String?, writer: (Uri, java.io.OutputStream) -> Unit): Pair<Uri, String> {
-        require(filename.isNotBlank() && filename.length <= 240 && filename == filename.substringAfterLast('/').substringAfterLast('\\') &&
-            !filename.contains(Regex("[\\u0000-\\u001f\\u007f]"))) { "Invalid save-as filename" }
-        val mime = mimeType.substringBefore(';').lowercase()
-        require(mime in setOf("text/markdown", "application/vnd.supermd.smd", "application/pdf", "application/zip")) { "Unsupported document format" }
-        val folder = configuredLocation?.takeIf(String::isNotBlank)?.let(Uri::parse)
-        if (folder != null) {
-            require(DocumentsContract.isTreeUri(folder)) { "The configured note location is not a folder; choose it again in Super MD settings" }
-            val parent = androidx.documentfile.provider.DocumentFile.fromTreeUri(context, folder)
-                ?: error("Open the configured folder again to restore access")
-            val name = uniqueName(filename) { parent.findFile(it) != null }
-            val file = parent.createFile(mime, name) ?: error("The configured folder cannot create files")
-            try {
-                context.contentResolver.openOutputStream(file.uri, "w")?.use { writer(file.uri, it) } ?: error("The configured folder cannot write files")
-            } catch (error: Exception) {
-                runCatching { file.delete() }
-                throw error
-            }
-            return file.uri to (file.name ?: name)
-        }
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            error("Choose a folder in Settings → New note location before saving to Downloads on this Android version")
-        }
-        val relativePath = Environment.DIRECTORY_DOWNLOADS + "/Super MD"
-        val resolver = context.contentResolver
-        val name = uniqueName(filename) { candidate ->
-            resolver.query(MediaStore.Downloads.EXTERNAL_CONTENT_URI, arrayOf(MediaStore.Downloads._ID),
-                "${MediaStore.Downloads.DISPLAY_NAME}=? AND ${MediaStore.Downloads.RELATIVE_PATH}=?",
-                arrayOf(candidate, "$relativePath/"), null)?.use { it.moveToFirst() } == true
-        }
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, name)
-            put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, "$relativePath/")
-            put(MediaStore.Downloads.IS_PENDING, 1)
-        }
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: error("Android could not create a Downloads entry")
-        try {
-            resolver.openOutputStream(uri, "w")?.use { writer(uri, it) } ?: error("Android could not write the Downloads entry")
-            require(resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null) > 0) { "Android could not publish the Downloads entry" }
-        } catch (error: Exception) {
-            runCatching { resolver.delete(uri, null, null) }
-            throw error
-        }
-        return uri to name
-    }
+    fun writeAgentDocument(filename: String, mimeType: String, configuredLocation: String?, writer: (Uri, java.io.OutputStream) -> Unit): Pair<Uri, String> =
+        publisher.writeAgentDocument(filename, mimeType, configuredLocation, writer)
 
-    fun deleteAgentDocument(uri: Uri) {
-        if (uri.authority == MediaStore.AUTHORITY) context.contentResolver.delete(uri, null, null)
-        else androidx.documentfile.provider.DocumentFile.fromSingleUri(context, uri)?.delete()
-    }
-
-    private fun uniqueName(requested: String, exists: (String) -> Boolean): String {
-        val stem = requested.substringBeforeLast('.')
-        val ext = requested.substringAfterLast('.', "")
-        var index = 1
-        var candidate = requested
-        while (exists(candidate)) { index++; candidate = "$stem ($index).$ext" }
-        return candidate
-    }
-
-    private fun requireMediaSignature(mime: String, bytes: ByteArray) {
-        fun starts(vararg values: Int) = bytes.size >= values.size && values.indices.all { (bytes[it].toInt() and 0xff) == values[it] }
-        when (mime) {
-            "image/png" -> require(starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) { "PNG signature is invalid" }
-            "image/jpeg" -> require(starts(0xff, 0xd8, 0xff)) { "JPEG signature is invalid" }
-            "image/gif" -> require(bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII) in listOf("GIF87a", "GIF89a")) { "GIF signature is invalid" }
-            "image/webp" -> require(bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP") { "WebP signature is invalid" }
-            "image/avif" -> require(bytes.size >= 12 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp" && String(bytes, 8, 4, Charsets.US_ASCII) in setOf("avif", "avis")) { "AVIF signature is invalid" }
-            "image/svg+xml" -> require(String(bytes, 0, minOf(bytes.size, 4096), Charsets.UTF_8).contains(Regex("<svg(?:\\s|>|/)", RegexOption.IGNORE_CASE))) { "SVG document is invalid" }
-            "text/plain" -> require(bytes.none { it == 0.toByte() }) { "Text media contains binary data" }
-        }
-    }
+    fun deleteAgentDocument(uri: Uri) = publisher.deleteAgentDocument(uri)
     fun local(source: String, directory: String?): File? {
         if (!validKey(source)) return null
         if (directory != null && Regex("[a-f0-9-]{36}").matches(directory)) containedFile(bundles, File(bundles, "$directory/${source.substringAfter('/')}")).let { if (it != null) return it }
@@ -1060,7 +965,67 @@ class MediaStorage(private val context: Context) {
         maxPlainBytes: Int = 5_000_000,
         maxPortableMarkdownBytes: Int = 20_000_000,
     ): String? {
-        val buffered = if (input.markSupported()) input else BufferedInputStream(input, 65_536)
+        val initial = ByteArray(8_192)
+        var initialLen = 0
+        while (initialLen < initial.size) {
+            val count = input.read(initial, initialLen, initial.size - initialLen)
+            if (count <= 0) break
+            initialLen += count
+        }
+        if (initialLen == 0) return ""
+        val isGzip = initialLen >= 2 && initial[0] == 0x1f.toByte() && initial[1] == 0x8b.toByte()
+        var nonWsIdx = if (initialLen >= 3 && initial[0] == 0xef.toByte() && initial[1] == 0xbb.toByte() && initial[2] == 0xbf.toByte()) 3 else 0
+        val hasUtf8Bom = nonWsIdx == 3
+        while (nonWsIdx < initialLen) {
+            val b = initial[nonWsIdx].toInt() and 0xff
+            if (b != 0x20 && b != 0x09 && b != 0x0a && b != 0x0d) break
+            nonWsIdx++
+        }
+        val mightBeJson = !isGzip && (nonWsIdx >= initialLen || initial[nonWsIdx] == '{'.code.toByte())
+        if (!isGzip && !mightBeJson) {
+            for (i in 0 until initialLen) {
+                if (initial[i] == 0.toByte()) return null
+            }
+            val nextByte = if (initialLen == initial.size) input.read() else -1
+            if (nextByte < 0) {
+                if (initialLen > maxPlainBytes) return null
+                return runCatching {
+                    val offset = if (hasUtf8Bom) 3 else 0
+                    Charsets.UTF_8.newDecoder()
+                        .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                        .decode(java.nio.ByteBuffer.wrap(initial, offset, initialLen - offset))
+                        .toString()
+                }.getOrNull()
+            }
+            return runCatching {
+                val out = java.io.ByteArrayOutputStream(minOf(maxPlainBytes, 32_768))
+                out.write(initial, 0, initialLen)
+                if (nextByte == 0) return null
+                out.write(nextByte)
+                require(out.size() <= maxPlainBytes)
+                val buf = ByteArray(16_384)
+                while (true) {
+                    val count = input.read(buf)
+                    if (count <= 0) break
+                    for (i in 0 until count) {
+                        if (buf[i] == 0.toByte()) return null
+                    }
+                    require(out.size() + count <= maxPlainBytes)
+                    out.write(buf, 0, count)
+                }
+                val raw = out.toByteArray()
+                val offset = if (hasUtf8Bom) 3 else 0
+                Charsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(raw, offset, raw.size - offset))
+                    .toString()
+            }.getOrNull()
+        }
+
+        val combined = java.io.SequenceInputStream(java.io.ByteArrayInputStream(initial, 0, initialLen), input)
+        val buffered = BufferedInputStream(combined, 65_536)
         buffered.mark(65_536)
         val prefix = ByteArray(32_768)
         var prefixLen = 0
@@ -1070,9 +1035,7 @@ class MediaStorage(private val context: Context) {
             prefixLen += count
         }
         buffered.reset()
-        if (prefixLen == 0) return ""
         val headBytes = prefix.copyOfRange(0, prefixLen)
-        val isGzip = portableGzipHeader(headBytes)
         val headerPreview = if (!isGzip) {
             runCatching { String(headBytes, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') }.getOrDefault("")
         } else ""
@@ -1126,6 +1089,19 @@ class MediaStorage(private val context: Context) {
         val b = ip.address.map { it.toInt() and 255 }
         if (b.size == 4) return b[0] !in listOf(0, 127, 10, 255) && !(b[0] == 100 && b[1] in 64..127) && !(b[0] == 192 && b[1] == 168) && !(b[0] == 172 && b[1] in 16..31)
         return b[0] and 0xfe != 0xfc
+    }
+}
+
+internal fun requireMediaSignature(mime: String, bytes: ByteArray) {
+    fun starts(vararg values: Int) = bytes.size >= values.size && values.indices.all { (bytes[it].toInt() and 0xff) == values[it] }
+    when (mime) {
+        "image/png" -> require(starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) { "PNG signature is invalid" }
+        "image/jpeg" -> require(starts(0xff, 0xd8, 0xff)) { "JPEG signature is invalid" }
+        "image/gif" -> require(bytes.size >= 6 && String(bytes, 0, 6, Charsets.US_ASCII) in listOf("GIF87a", "GIF89a")) { "GIF signature is invalid" }
+        "image/webp" -> require(bytes.size >= 12 && String(bytes, 0, 4, Charsets.US_ASCII) == "RIFF" && String(bytes, 8, 4, Charsets.US_ASCII) == "WEBP") { "WebP signature is invalid" }
+        "image/avif" -> require(bytes.size >= 12 && String(bytes, 4, 4, Charsets.US_ASCII) == "ftyp" && String(bytes, 8, 4, Charsets.US_ASCII) in setOf("avif", "avis")) { "AVIF signature is invalid" }
+        "image/svg+xml" -> require(String(bytes, 0, minOf(bytes.size, 4096), Charsets.UTF_8).contains(Regex("<svg(?:\\s|>|/)", RegexOption.IGNORE_CASE))) { "SVG document is invalid" }
+        "text/plain" -> require(bytes.none { it == 0.toByte() }) { "Text media contains binary data" }
     }
 }
 

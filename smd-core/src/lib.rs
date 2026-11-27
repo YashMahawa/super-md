@@ -4,6 +4,7 @@ pub mod theme;
 pub mod pdf_assets;
 pub mod frontmatter;
 mod diagram;
+mod equations;
 mod math_compatibility;
 mod step_grid;
 mod study;
@@ -16,7 +17,7 @@ use math_compatibility::compatible_math;
 use anyhow::{bail, Result};
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -918,11 +919,37 @@ struct Renderer<'a> {
     footnotes: HashMap<String, String>,
     headings: HashMap<String, usize>,
     heading_counts: HashMap<String, usize>,
+    equations: HashMap<String, equations::EquationTarget>,
+    emitted_equation_anchors: HashSet<String>,
+    link_depth: usize,
 }
 fn heading_slug(value: &str) -> String {
     let value = value.to_lowercase().chars().filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '-' || *c == '_').collect::<String>();
     let slug = value.trim().chars().map(|c| if c.is_whitespace() { '-' } else { c }).collect::<String>();
     if slug.is_empty() { "section".into() } else { slug }
+}
+fn parse_braced_fence_language(raw_info: &str) -> Option<&'static str> {
+    let trimmed = raw_info.trim();
+    let inner = trimmed.strip_prefix('{')?.strip_suffix('}')?.trim();
+    let rest = inner.strip_prefix('.').unwrap_or(inner);
+    let first = rest.as_bytes().first().copied()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let ident_len = rest
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+        .count();
+    let tail = &rest[ident_len..];
+    if !tail.is_empty() && !tail.starts_with(|c: char| c.is_whitespace() || c == ',' || c == '#') {
+        return None;
+    }
+    match rest[..ident_len].to_ascii_lowercase().as_str() {
+        "python" => Some("python"),
+        "py" => Some("py"),
+        "mermaid" => Some("mermaid"),
+        _ => None,
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RenderStop<'b> {
@@ -972,13 +999,44 @@ impl<'a> Renderer<'a> {
                 Event::End(tag) if end == Some(RenderStop::Tag(tag)) => break,
                 Event::End(_) => {},
                 Event::InlineHtml(ref html) if end == Some(RenderStop::Html(html.as_ref())) => break,
-                Event::Text(value) => out.push_str(&text(&value)),
+                Event::Text(value) => out.push_str(&equations::render_prose_with_equation_refs(&value, &self.equations, self.link_depth > 0)),
                 Event::Code(value) => out.push_str(&format!("#raw({})", string(&value))),
                 Event::InlineMath(ref value) | Event::DisplayMath(ref value) => {
                     let display = matches!(&event, Event::DisplayMath(_));
-                    let math = mitex::convert_math(&value, None).map_err(|e| anyhow::anyhow!("LaTeX conversion failed for {value}: {e}"))?;
-                    let expression = format!("#eval({}, scope: smd-math-scope)", string(&format!("${}$", compatible_math(&math))));
-                    out.push_str(&if display { format!("\n#smd-fit(math.equation(block: true, [{expression}]))\n\n") } else { expression });
+                    let mut sink_map = HashMap::new();
+                    let plan = if display {
+                        equations::analyze_display_equation(value, &mut sink_map)
+                    } else {
+                        equations::DisplayEquationPlan { clean_tex: value.to_string(), tag: None, anchor_ids: Vec::new() }
+                    };
+                    let (prepared_tex, replacements) = equations::prepare_math_refs_for_mitex(&plan.clean_tex, &self.equations);
+                    let math = mitex::convert_math(&prepared_tex, None).map_err(|e| anyhow::anyhow!("LaTeX conversion failed for {value}: {e}"))?;
+                    let resolved_math = equations::apply_mitex_ref_replacements(&compatible_math(&math), &replacements);
+                    let expression = format!("#eval({}, scope: smd-math-scope)", string(&format!("${resolved_math}$")));
+                    if display {
+                        let mut unique_anchors = Vec::new();
+                        for id in plan.anchor_ids {
+                            if self.emitted_equation_anchors.insert(id.clone()) {
+                                unique_anchors.push(id);
+                            }
+                        }
+                        let primary_label = unique_anchors.first().map(|id| format!(" <{id}>")).unwrap_or_default();
+                        let extra_labels = unique_anchors.iter().skip(1).map(|id| format!("#metadata(none) <{id}>")).collect::<String>();
+                        if let Some(tag) = plan.tag {
+                            out.push_str(&format!(
+                                "\n#smd-tagged-equation([{extra_labels}{expression}], {}){primary_label}\n\n",
+                                string(&tag.display_text)
+                            ));
+                        } else if !primary_label.is_empty() {
+                            out.push_str(&format!(
+                                "\n#block(width: 100%, breakable: false)[{extra_labels}#smd-fit(math.equation(block: true, [{expression}]))]{primary_label}\n\n"
+                            ));
+                        } else {
+                            out.push_str(&format!("\n#smd-fit(math.equation(block: true, [{expression}]))\n\n"));
+                        }
+                    } else {
+                        out.push_str(&expression);
+                    }
                 },
                 Event::SoftBreak => out.push(' '),
                 Event::HardBreak => out.push_str("#linebreak()"),
@@ -1007,7 +1065,8 @@ impl<'a> Renderer<'a> {
                             let mut code = String::new();
                             while let Some(e) = self.events.next() { if e == Event::End(close) { break; } if let Event::Text(v) = e { code.push_str(&v); } }
                             let info = match kind { CodeBlockKind::Fenced(v) => v.to_string(), _ => String::new() };
-                            let lang_token = info.split_whitespace().next().unwrap_or("");
+                            let braced = parse_braced_fence_language(&info);
+                            let lang_token = braced.unwrap_or_else(|| info.split_whitespace().next().unwrap_or(""));
                             let lang = lang_token.to_ascii_lowercase();
                             if ["smd-steps", "smd-step-grid"].contains(&lang.as_str()) {
                                 out.push_str(&step_grid::render(&code, self.assets)?);
@@ -1124,7 +1183,14 @@ impl<'a> Renderer<'a> {
                                 let slug = heading_slug(&plain); let count = self.heading_counts.entry(slug.clone()).or_default();
                                 let id = if *count == 0 { slug } else { format!("{slug}-{count}") }; *count += 1; Some(id)
                             } else { None };
-                            let body = self.render(Some(close))?;
+                            if matches!(tag, Tag::Link { .. }) {
+                                self.link_depth += 1;
+                            }
+                            let body_res = self.render(Some(close));
+                            if matches!(tag, Tag::Link { .. }) {
+                                self.link_depth -= 1;
+                            }
+                            let body = body_res?;
                             match tag {
                                 Tag::Paragraph => { if body.starts_with("#strong[") && body.ends_with(']') { out.push_str(&format!("#block(sticky: true, below: .35em)[{body}]\n\n")); } else { out.push_str(&format!("{body}\n\n")); } },
                                 Tag::Heading { level, .. } => out.push_str(&format!("\n#heading(level: {})[{body}] <smd-{}>\n\n", level as u8, heading.unwrap())),
@@ -1138,18 +1204,22 @@ impl<'a> Renderer<'a> {
                                 Tag::Link { dest_url, .. } => out.push_str(&if let Some(fragment) = dest_url.strip_prefix('#') {
                                     let decoded = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
                                     let trimmed = decoded.trim();
-                                    let slug = heading_slug(trimmed);
-                                    let resolved = if self.headings.contains_key(trimmed) {
-                                        Some(trimmed.to_string())
-                                    } else if self.headings.contains_key(&slug) {
-                                        Some(slug)
-                                    } else if let Some((prefix, suffix)) = trimmed.rsplit_once('-') {
-                                        let numbered = format!("{}-{suffix}", heading_slug(prefix));
-                                        (suffix.chars().all(|c| c.is_ascii_digit()) && self.headings.contains_key(&numbered)).then_some(numbered)
+                                    if let Some(eq_target) = self.equations.get(trimmed) {
+                                        format!("#link(label({}))[{body}]", string(&eq_target.anchor_id))
                                     } else {
-                                        None
-                                    };
-                                    if let Some(id) = resolved { format!("#link(label({}))[{body}]", string(&format!("smd-{id}"))) } else { body }
+                                        let slug = heading_slug(trimmed);
+                                        let resolved = if self.headings.contains_key(trimmed) {
+                                            Some(trimmed.to_string())
+                                        } else if self.headings.contains_key(&slug) {
+                                            Some(slug)
+                                        } else if let Some((prefix, suffix)) = trimmed.rsplit_once('-') {
+                                            let numbered = format!("{}-{suffix}", heading_slug(prefix));
+                                            (suffix.chars().all(|c| c.is_ascii_digit()) && self.headings.contains_key(&numbered)).then_some(numbered)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(id) = resolved { format!("#link(label({}))[{body}]", string(&format!("smd-{id}"))) } else { body }
+                                    }
                                 } else if dest_url.starts_with("https:") || dest_url.starts_with("http:") || dest_url.starts_with("mailto:") { format!("#link({})[{body}]", string(&dest_url)) } else { body }),
                                 _ => out.push_str(&body),
                             }
@@ -1167,7 +1237,13 @@ pub(crate) fn render_fragment(markdown: &str, assets: &HashMap<String, Vec<u8>>)
     let stripped = strip_percent_comments(body);
     let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_MATH);
-    Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new() }.render(None)
+    let mut equations = HashMap::new();
+    for event in &events {
+        if let Event::DisplayMath(v) = event {
+            equations::analyze_display_equation(v, &mut equations);
+        }
+    }
+    Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings: HashMap::new(), heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 }.render(None)
 }
 
 pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec<u8>>) -> Result<String> {
@@ -1180,15 +1256,17 @@ pub fn source(markdown: &str, options: &PdfOptions, assets: &HashMap<String, Vec
     let normalized = normalize_table_math(&normalize_callouts_body(&stripped));
     let events = study::enrich_events(&normalized, Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_SUBSCRIPT | Options::ENABLE_SUPERSCRIPT | Options::ENABLE_TASKLISTS | Options::ENABLE_MATH | Options::ENABLE_FOOTNOTES);
     let mut headings = HashMap::new(); let mut current = None::<String>;
+    let mut equations = HashMap::new();
     for event in &events { match event {
         Event::Start(Tag::Heading { .. }) => current = Some(String::new()),
         Event::Text(v) | Event::Code(v) | Event::InlineMath(v) => { if let Some(text) = &mut current { text.push_str(v); } },
         Event::End(TagEnd::Heading(_)) => { if let Some(text) = current.take() { let slug = heading_slug(&text); let count = headings.get(&slug).copied().unwrap_or(0); if count > 0 { headings.insert(format!("{slug}-{count}"), 1); } headings.insert(slug, count + 1); } },
+        Event::DisplayMath(v) => { equations::analyze_display_equation(v, &mut equations); },
         _ => {}
     } }
-    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings, heading_counts: HashMap::new() };
+    let mut renderer = Renderer { events: events.into_iter().peekable(), assets, footnotes: HashMap::new(), headings, heading_counts: HashMap::new(), equations: equations.clone(), emitted_equation_anchors: HashSet::new(), link_depth: 0 };
     // References normally precede definitions, so collect definitions first.
-    let mut definitions = Renderer { events: renderer.events.clone(), assets, footnotes: HashMap::new(), headings: renderer.headings.clone(), heading_counts: HashMap::new() };
+    let mut definitions = Renderer { events: renderer.events.clone(), assets, footnotes: HashMap::new(), headings: renderer.headings.clone(), heading_counts: HashMap::new(), equations, emitted_equation_anchors: HashSet::new(), link_depth: 0 };
     while let Some(event) = definitions.events.next() {
         if let Event::Start(Tag::FootnoteDefinition(name)) = event { let value = definitions.render(Some(TagEnd::FootnoteDefinition))?; definitions.footnotes.insert(name.to_string(), value); }
     }
@@ -1560,6 +1638,9 @@ P(A\cup B\cup C)=&P(A)+P(B)+P(C)\\
             footnotes: HashMap::new(),
             headings: HashMap::new(),
             heading_counts: HashMap::new(),
+            equations: HashMap::new(),
+            emitted_equation_anchors: HashSet::new(),
+            link_depth: 0,
         }.render(None).unwrap();
         assert_eq!(raw_crlf_out.trim(), "#smd-code(\"let a = 1;\\r\\nlet b = 2;\", lang: \"rust\")");
 
