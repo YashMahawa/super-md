@@ -1,4 +1,4 @@
-"""Compatibility facade for Super MD's Qt-free desktop.agent document modules."""
+"""Compatibility facade for Qt-free desktop.agent store, patch, and source modules."""
 from __future__ import annotations
 
 import sys
