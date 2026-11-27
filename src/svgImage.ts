@@ -138,11 +138,12 @@ export function parseValidatedSvg(source: string): ValidatedSvg {
   if (Array.from(root.querySelectorAll("style")).some(style => DISALLOWED_SVG_URL.test(style.textContent || "") || /@import/i.test(style.textContent || ""))) throw new Error("External SVG styles are not allowed.");
   if (!root.hasAttribute("xmlns")) root.setAttribute("xmlns", SVG_NAMESPACE);
   const serialized = markup.length > 950_000 || markup.includes("<!ENTITY") ? serializeSvgRoot(root) : undefined;
+  const oversized = source.length > 1_000_000 || (serialized !== undefined && serialized.length > 1_000_000);
   return {
     root,
     nodes,
     backing: serialized && serialized.length > 1_000_000 ? "#fdfdfc" : contrastBackdropForRoot(root, nodes),
-    dimensions: serialized && serialized.length > 1_000_000 ? null : svgDimensionsFromRoot(root),
+    dimensions: oversized ? null : svgDimensionsFromRoot(root),
     checkSerializedLength: markup.length > 160_000 || serialized !== undefined,
     serialized,
   };
@@ -231,7 +232,7 @@ const SVG_LENGTH_UNITS: Record<string, number> = {
 };
 
 function parseSvgCssPixels(raw: string | null | undefined): number | null {
-  if (!raw) return null;
+  if (!raw || raw.length > 64) return null;
   const match = raw.trim().match(/^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)\s*(px|pt|pc|mm|cm|in|q)?$/i);
   if (!match) return null;
   const value = Number(match[1]) * SVG_LENGTH_UNITS[(match[2] || "").toLowerCase()];
@@ -239,7 +240,7 @@ function parseSvgCssPixels(raw: string | null | undefined): number | null {
 }
 
 function parseInlineStyleLength(style: string | null, property: "width" | "height"): number | null {
-  if (!style) return null;
+  if (!style || style.length > 10_000) return null;
   let found: number | null = null;
   for (const decl of style.split(";")) {
     const colon = decl.indexOf(":");
@@ -256,7 +257,7 @@ export function svgDimensionsFromRoot(root: Element): SvgDimensions | null {
   const attrWidth = parseSvgCssPixels(root.getAttribute("width")) ?? parseInlineStyleLength(style, "width");
   const attrHeight = parseSvgCssPixels(root.getAttribute("height")) ?? parseInlineStyleLength(style, "height");
   const rawBox = root.getAttribute("viewBox")?.trim();
-  const boxParts = rawBox ? rawBox.split(/[\s,]+/).map(Number) : null;
+  const boxParts = rawBox && rawBox.length <= 256 ? rawBox.split(/[\s,]+/).map(Number) : null;
   const validBox = boxParts && boxParts.length === 4 && boxParts.every(Number.isFinite) && boxParts[2] > 0 && boxParts[3] > 0
     ? { width: boxParts[2], height: boxParts[3] }
     : null;
@@ -284,29 +285,6 @@ export function svgDimensionsFromRoot(root: Element): SvgDimensions | null {
   const rawEngine = root.getAttribute("data-diagram-engine");
   const engine = rawEngine === "pele" || rawEngine === "mermaid" ? rawEngine : undefined;
   return engine ? { width, height, engine } : { width, height };
-}
-
-export function svgIntrinsicDimensions(source: string): SvgDimensions | null {
-  if (!source || source.length > 1_000_000) return null;
-  const xml = new DOMParser().parseFromString(withSvgNamespace(source), "image/svg+xml");
-  const root = xml.documentElement;
-  if (xml.querySelector("parsererror") || root.localName !== "svg" || root.namespaceURI !== SVG_NAMESPACE) return null;
-  return svgDimensionsFromRoot(root);
-}
-
-export function svgDataDimensions(uri: string): SvgDimensions | null {
-  if (!/^data:image\/svg\+xml(?:[;,]|$)/i.test(uri) || uri.length > 1_400_000) return null;
-  try {
-    const comma = uri.indexOf(",");
-    if (comma < 0) return null;
-    const header = uri.slice(0, comma), body = uri.slice(comma + 1);
-    const decoded = /;base64(?:;|$)/i.test(header)
-      ? new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(atob(body), ch => ch.charCodeAt(0)))
-      : decodeURIComponent(body);
-    return svgIntrinsicDimensions(decoded);
-  } catch {
-    return null;
-  }
 }
 
 export function svgSizingStyle(dimensions: SvgDimensions | null | undefined): Record<string, string> | undefined {

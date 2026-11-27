@@ -3,7 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
-import { parseValidatedSvg, presentSvg, svgContrastBackdrop, svgDataBackdrop, svgDataDimensions, svgDimensionsFromRoot, svgIntrinsicDimensions, svgSizingStyle } from "./svgImage";
+import { parseValidatedSvg, presentSvg, svgContrastBackdrop, svgDataBackdrop, svgDimensionsFromRoot, svgSizingStyle } from "./svgImage";
+import { decodeSvgDataUri } from "./svgTheme";
 import { remarkSvgBlocks } from "./svgBlocks";
 import { DocumentAppearance } from "./documentAppearance";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -85,61 +86,81 @@ describe("inline SVG", () => {
     }
   });
 
-  it("extracts intrinsic CSS-pixel dimensions and readable pan floors across authored SVG forms", () => {
+  it("extracts intrinsic CSS-pixel dimensions and readable pan floors from the single validated SVG document", () => {
     const parsedDoc = new DOMParser().parseFromString('<svg width="140" height="300" viewBox="0 0 140 300"/>', "image/svg+xml");
     expect(svgDimensionsFromRoot(parsedDoc.documentElement)).toEqual({ width: 140, height: 300 });
     expect(svgDimensionsFromRoot(document.createElement("div"))).toBeNull();
-    expect(parseValidatedSvg('<svg viewBox="0 0 140 300"/>').dimensions).toEqual({ width: 140, height: 300 });
 
-    // Small portrait explicit and viewBox-only SVGs keep compact dimensions and zero pan floor.
-    expect(svgIntrinsicDimensions('<svg width="140" height="300"/>')).toEqual({ width: 140, height: 300 });
-    expect(svgIntrinsicDimensions('<svg viewBox="0 0 140 300"/>')).toEqual({ width: 140, height: 300 });
-    expect(svgSizingStyle(svgIntrinsicDimensions('<svg viewBox="0 0 140 300"/>'))).toEqual({
-      "--svg-width": "140px",
-      "--svg-min-width": "0px",
-    });
+    const parseSpy = vi.spyOn(DOMParser.prototype, "parseFromString");
+    try {
+      const dims = (source: string) => {
+        parseSpy.mockClear();
+        const validated = parseValidatedSvg(source);
+        expect(parseSpy).toHaveBeenCalledTimes(1);
+        return validated.dimensions;
+      };
 
-    // Normalized tiny viewBox scales major axis < 64px up to 240px.
-    expect(svgIntrinsicDimensions('<svg viewBox="0 0 10 10"/>')).toEqual({ width: 240, height: 240 });
-    expect(svgIntrinsicDimensions('<svg viewBox="0 0 20 40"/>')).toEqual({ width: 120, height: 240 });
+      // Small portrait explicit and viewBox-only SVGs keep compact dimensions and zero pan floor.
+      expect(dims('<svg width="140" height="300"/>')).toEqual({ width: 140, height: 300 });
+      expect(dims('<svg viewBox="0 0 140 300"/>')).toEqual({ width: 140, height: 300 });
+      expect(svgSizingStyle(dims('<svg viewBox="0 0 140 300"/>'))).toEqual({
+        "--svg-width": "140px",
+        "--svg-min-width": "0px",
+      });
 
-    // Physical CSS units, inline styles, percentage/auto fallbacks, and single-axis aspect derivation.
-    expect(svgIntrinsicDimensions('<svg width="72pt" height="1in"/>')).toEqual({ width: 96, height: 96 });
-    expect(svgIntrinsicDimensions('<svg width="25.4mm" height="2.54cm"/>')).toEqual({ width: 96, height: 96 });
-    expect(svgIntrinsicDimensions('<svg style="width: 320px; height: 160px !important"/>')).toEqual({ width: 320, height: 160 });
-    expect(svgIntrinsicDimensions('<svg width="100%" height="auto" viewBox="0 0 640 240"/>')).toEqual({ width: 640, height: 240 });
-    expect(svgIntrinsicDimensions('<svg width="300" viewBox="0 0 150 75"/>')).toEqual({ width: 300, height: 150 });
-    expect(svgIntrinsicDimensions('<svg height="200" viewBox="0 0 400 100"/>')).toEqual({ width: 800, height: 200 });
+      // Normalized tiny viewBox scales major axis < 64px up to 240px.
+      expect(dims('<svg viewBox="0 0 10 10"/>')).toEqual({ width: 240, height: 240 });
+      expect(dims('<svg viewBox="0 0 20 40"/>')).toEqual({ width: 120, height: 240 });
 
-    // Wide sequence Mermaid (pele and fallback mermaid) and wide standalone SVG get readable pan floors, while 4:3 figures shrink cleanly.
-    const peleSeq = svgIntrinsicDimensions('<svg width="1284" height="463" data-diagram-engine="pele"/>');
-    expect(peleSeq).toEqual({ width: 1284, height: 463, engine: "pele" });
-    expect(svgSizingStyle(peleSeq)).toEqual({ "--svg-width": "1284px", "--svg-min-width": "1027px" });
+      // Physical CSS units, inline styles, percentage/auto fallbacks, single-axis aspect derivation, and decoded XML character references.
+      expect(dims('<svg width="72pt" height="1in"/>')).toEqual({ width: 96, height: 96 });
+      expect(dims('<svg width="25.4mm" height="2.54cm"/>')).toEqual({ width: 96, height: 96 });
+      expect(dims('<svg style="width: 320px; height: 160px !important"/>')).toEqual({ width: 320, height: 160 });
+      expect(dims('<svg width="100%" height="auto" viewBox="0 0 640 240"/>')).toEqual({ width: 640, height: 240 });
+      expect(dims('<svg width="300" viewBox="0 0 150 75"/>')).toEqual({ width: 300, height: 150 });
+      expect(dims('<svg height="200" viewBox="0 0 400 100"/>')).toEqual({ width: 800, height: 200 });
 
-    const fallbackSeq = svgIntrinsicDimensions('<svg width="1100" height="420" data-diagram-engine="mermaid"/>');
-    expect(fallbackSeq).toEqual({ width: 1100, height: 420, engine: "mermaid" });
-    expect(svgSizingStyle(fallbackSeq)).toEqual({ "--svg-width": "1100px", "--svg-min-width": "880px" });
+      parseSpy.mockClear();
+      const escapedValidated = parseValidatedSvg('<svg width="140&#x70;x" height="&#51;00"><path fill="&#x23;fff" d="M0 0h4v4z"/></svg>');
+      expect(parseSpy).toHaveBeenCalledTimes(1);
+      expect(escapedValidated.backing).toBe("#222026");
+      expect(escapedValidated.dimensions).toEqual({ width: 140, height: 300 });
 
-    expect(svgSizingStyle(svgIntrinsicDimensions('<svg width="1200" height="300"/>'))).toEqual({
-      "--svg-width": "1200px",
-      "--svg-min-width": "960px",
-    });
-    expect(svgSizingStyle(svgIntrinsicDimensions('<svg width="800" height="600"/>'))).toEqual({
-      "--svg-width": "800px",
-      "--svg-min-width": "0px",
-    });
+      // Wide sequence Mermaid (pele and fallback mermaid) and wide standalone SVG get readable pan floors, while 4:3 figures shrink cleanly.
+      const peleSeq = dims('<svg width="1284" height="463" data-diagram-engine="pele"/>');
+      expect(peleSeq).toEqual({ width: 1284, height: 463, engine: "pele" });
+      expect(svgSizingStyle(peleSeq)).toEqual({ "--svg-width": "1284px", "--svg-min-width": "1027px" });
 
-    // Data URIs (URL-encoded + UTF-8 base64) and invalid inputs.
-    const utf8Svg = '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="180"><text>αβγ</text></svg>';
-    const b64Bytes = new TextEncoder().encode(utf8Svg);
-    const b64 = btoa(String.fromCharCode(...b64Bytes));
-    expect(svgDataDimensions(`data:image/svg+xml;base64,${b64}`)).toEqual({ width: 420, height: 180 });
-    expect(svgDataDimensions(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(utf8Svg)}`)).toEqual({ width: 420, height: 180 });
-    expect(svgDataDimensions("data:image/png;base64,AAAA")).toBeNull();
-    expect(svgDataDimensions("data:image/svg+xml;base64,%%%")).toBeNull();
-    expect(svgIntrinsicDimensions('<svg xmlns="http://evil.example/ns" width="140" height="300"/>')).toBeNull();
-    expect(svgIntrinsicDimensions("<svg/>")).toBeNull();
-    expect(svgSizingStyle(null)).toBeUndefined();
+      const fallbackSeq = dims('<svg width="1100" height="420" data-diagram-engine="mermaid"/>');
+      expect(fallbackSeq).toEqual({ width: 1100, height: 420, engine: "mermaid" });
+      expect(svgSizingStyle(fallbackSeq)).toEqual({ "--svg-width": "1100px", "--svg-min-width": "880px" });
+
+      expect(svgSizingStyle(dims('<svg width="1200" height="300"/>'))).toEqual({
+        "--svg-width": "1200px",
+        "--svg-min-width": "960px",
+      });
+      expect(svgSizingStyle(dims('<svg width="800" height="600"/>'))).toEqual({
+        "--svg-width": "800px",
+        "--svg-min-width": "0px",
+      });
+
+      // Data URIs (UTF-8 base64 + URL-encoded via decodeSvgDataUri), invalid inputs, and oversized bounds.
+      const utf8Svg = '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="180"><text>αβγ</text></svg>';
+      const b64Bytes = new TextEncoder().encode(utf8Svg);
+      const b64 = btoa(String.fromCharCode(...b64Bytes));
+      expect(dims(decodeSvgDataUri(`data:image/svg+xml;base64,${b64}`))).toEqual({ width: 420, height: 180 });
+      expect(dims(decodeSvgDataUri(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(utf8Svg)}`))).toEqual({ width: 420, height: 180 });
+      expect(() => decodeSvgDataUri("data:image/svg+xml;base64,%%%")).toThrow();
+      expect(() => parseValidatedSvg('<svg xmlns="http://evil.example/ns" width="140" height="300"/>')).toThrow();
+      expect(dims("<svg/>")).toBeNull();
+      const oversized = `<svg xmlns="http://www.w3.org/2000/svg" width="140" height="300"><!--${"x".repeat(1_000_005)}--><path fill="&#x23;fff" d="M0 0h5v5z"/></svg>`;
+      const oversizedValidated = parseValidatedSvg(oversized);
+      expect(oversizedValidated.backing).toBe("#fdfdfc");
+      expect(oversizedValidated.dimensions).toBeNull();
+      expect(svgSizingStyle(null)).toBeUndefined();
+    } finally {
+      parseSpy.mockRestore();
+    }
   });
 
   it("reuses the validated SVG document across SvgDiagram and MarkdownPreview theme variants and intrinsic sizing without reparsing", async () => {
