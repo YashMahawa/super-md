@@ -19,6 +19,7 @@ import { clampPreviewZoom, previewLayoutWidth, zoomShortcut } from "./zoom";
 import MediaTools, { type InsertionPoint } from "./components/MediaTools";
 import ImageViewer from "./components/ImageViewer";
 import { imageMarkdown, prepareFmd, type ImportedImage } from "./documentMedia";
+import { NoteRemoteImageConsentStore } from "./remoteImageConsent";
 import { recordRecent } from "./recentFiles";
 import ZoomInput from "./components/ZoomInput";
 import ReadingSearch from "./components/ReadingSearch";
@@ -241,6 +242,25 @@ export default function App() {
   const [spellCheck, setSpellCheck] = useState(() => localStorage.getItem("spellCheck") === "true");
   const [grammarCheck, setGrammarCheck] = useState(() => localStorage.getItem("grammarCheck") === "true");
   const [trustedImageHosts, setTrustedImageHosts] = useState(storedImageHosts);
+  const trustedImageHostsRef = useRef(trustedImageHosts);
+  trustedImageHostsRef.current = trustedImageHosts;
+  const noteImageConsentRef = useRef(new NoteRemoteImageConsentStore());
+  const [imageConsentVersion, setImageConsentVersion] = useState(0);
+  useEffect(() => {
+    noteImageConsentRef.current.retainOnly(documents.tabs.map((tab) => tab.id));
+  }, [documents.tabs]);
+  const approveImageUrl = useCallback((noteId: string | undefined, url: string) => {
+    if (!noteId || !documentsRef.current.tabs.some((tab) => tab.id === noteId)) return;
+    if (noteImageConsentRef.current.approve(noteId, url)) setImageConsentVersion((value) => value + 1);
+  }, []);
+  const recordRemoteImageLoaded = useCallback((noteId: string | undefined, url: string, data: string) => {
+    if (!noteId || !documentsRef.current.tabs.some((tab) => tab.id === noteId)) return;
+    noteImageConsentRef.current.recordLoaded(noteId, url, data);
+  }, []);
+  const activeApprovedImageUrls = useMemo(
+    () => noteImageConsentRef.current.approvedUrls(activeTab.id),
+    [activeTab.id, imageConsentVersion],
+  );
   const [draftWindows, setDraftWindows] = useState<string[]>([]);
   const [showWelcome, setShowWelcome] = useState(firstRunSetup);
   const systemReduceMotion = useReducedMotion();
@@ -409,12 +429,13 @@ export default function App() {
     } catch (error) { if (!pickerCancelled(error)) flash(`Could not open: ${error}`); }
     finally { openingRef.current = false; }
   }, [applyDocument]);
-  const save = useCallback(async (saveAs = false) => {
-    const tab = documentsRef.current.tabs.find((item) => item.id === documentsRef.current.activeId);
+  const saveTab = useCallback(async (tabId: string, saveAs = false) => {
+    const tab = documentsRef.current.tabs.find((item) => item.id === tabId);
     if (!tab || savingRef.current.has(tab.id)) return;
     savingRef.current.add(tab.id);
     try {
-      const prepared = /\.fmd$/i.test(tab.path || "") && !saveAs ? await prepareFmd(tab.content, tab.path) : { content: tab.content, assets: {} };
+      const consentPolicy = noteImageConsentRef.current.policy(tab.id, trustedImageHostsRef.current);
+      const prepared = /\.fmd$/i.test(tab.path || "") && !saveAs ? await prepareFmd(tab.content, tab.path, consentPolicy) : { content: tab.content, assets: {} };
       const saved = android ? await (async () => {
         const target = saveAs || !tab.path ? await chooseMobileDocument({ defaultPath: tabTitle(tab), filters: [{ name: "Markdown", extensions: ["smd", "md"] }] }) : tab.path;
         if (!target) return null;
@@ -425,6 +446,7 @@ export default function App() {
     } catch (error) { if (!pickerCancelled(error)) flash(`Could not save: ${error}`); }
     finally { savingRef.current.delete(tab.id); }
   }, []);
+  const save = useCallback((saveAs = false) => saveTab(documentsRef.current.activeId, saveAs), [saveTab]);
   const toggleFullscreen = useCallback(async () => {
     if(!fullscreen) setFullscreenZoom(normalZoom);
     if (!("__TAURI_INTERNALS__" in window)) {
@@ -673,15 +695,22 @@ export default function App() {
       scrollInputVersion() !== startingInput ||
       Boolean(window.getSelection()?.toString()) ||
       Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
-    let stopped = false;
+    let stopped = false, applying = false;
     const stop = () => { stopped = true; };
     let readingSnapshot: AnchorScrollSnapshot | null = null;
+    const commitExternalScroll = (target: HTMLElement) => {
+      clearProgrammaticAnchorScroll(target);
+      restoringAnchorRef.current = false;
+      stopped = true;
+      if (view === "split") {
+        splitScrollTopsRef.current.preview = target.scrollTop;
+        splitPaneRef.current = "preview";
+      }
+    };
     const onScroll = (event: Event) => {
       const target = event.target;
-      if (target instanceof HTMLElement && target.matches(".reading-scroll") && hasExternalAnchorScroll(readingSnapshot)) {
-        clearProgrammaticAnchorScroll(target);
-        restoringAnchorRef.current = false;
-        stopped = true;
+      if (!applying && target instanceof HTMLElement && target.matches(".reading-scroll") && target === readingSnapshot?.element && hasExternalAnchorScroll(readingSnapshot)) {
+        commitExternalScroll(target);
       }
     };
     const inputs = ["wheel", "touchstart", "pointerdown", "keydown", "supermd-goto-offset"] as const;
@@ -689,7 +718,12 @@ export default function App() {
     window.addEventListener("scroll", onScroll, { capture: true, passive: true });
     let firstPass = true;
     const apply = () => {
-      if (stopped || shouldStop() || hasExternalAnchorScroll(readingSnapshot)) {
+      if (stopped) return;
+      if (readingSnapshot && hasExternalAnchorScroll(readingSnapshot)) {
+        commitExternalScroll(readingSnapshot.element);
+        return;
+      }
+      if (shouldStop()) {
         stopped = true;
         return;
       }
@@ -697,25 +731,30 @@ export default function App() {
       firstPass = false;
       const seq = ++restoringAnchorSeq.current;
       restoringAnchorRef.current = true;
-      const readingRoot = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null;
-      applySharedAnchor({
-        id: tabId,
-        targetMode,
-        targetZoom: zoomRef.current,
-        anchor,
-        readingRoot,
-        allowExactTop,
-        updateSelection,
-      });
-      const requestedReadingTop = allowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - zoomRef.current) < 1 ? anchor.readingTop : undefined;
-      readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
-      if (targetMode === "split") {
-        splitScrollTopsRef.current = {
-          editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
-          preview: readingSnapshot?.top ?? null,
-        };
-      } else {
-        splitScrollTopsRef.current = { editor: null, preview: null };
+      applying = true;
+      try {
+        const readingRoot = workspaceRef.current?.querySelector<HTMLElement>(".reading-scroll") ?? null;
+        applySharedAnchor({
+          id: tabId,
+          targetMode,
+          targetZoom: zoomRef.current,
+          anchor,
+          readingRoot,
+          allowExactTop,
+          updateSelection,
+        });
+        const requestedReadingTop = allowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - zoomRef.current) < 1 ? anchor.readingTop : undefined;
+        readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
+        if (targetMode === "split") {
+          splitScrollTopsRef.current = {
+            editor: workspaceRef.current?.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
+            preview: readingSnapshot?.top ?? null,
+          };
+        } else {
+          splitScrollTopsRef.current = { editor: null, preview: null };
+        }
+      } finally {
+        applying = false;
       }
       requestAnimationFrame(() => { if (restoringAnchorSeq.current === seq) restoringAnchorRef.current = false; });
     };
@@ -768,11 +807,19 @@ export default function App() {
     localStorage.setItem("grammarCheck", String(grammarCheck));
   }, [autosave, editorLeading, editorSize, grammarCheck, motionEnabled, readerFont, readerSize, readerWidth, reduceMotion, spellCheck]);
 
+  const hasDirtySavedTab = useMemo(
+    () => documents.tabs.some((tab) => Boolean(tab.path) && isDirty(tab)),
+    [documents.tabs],
+  );
   useEffect(() => {
-    if (!autosave || !dirty || !path) return;
-    const timer = window.setTimeout(() => save(false), 1200);
+    if (!autosave || !hasDirtySavedTab) return;
+    const timer = window.setTimeout(() => {
+      for (const tab of documentsRef.current.tabs) {
+        if (tab.path && isDirty(tab)) void saveTab(tab.id, false);
+      }
+    }, 1200);
     return () => window.clearTimeout(timer);
-  }, [autosave, content, dirty, path, save]);
+  }, [autosave, documents.tabs, hasDirtySavedTab, saveTab]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -801,11 +848,13 @@ export default function App() {
   };
   const exportPdf = async () => {
     if (exporting) return;
+    const targetTab = activeTab;
     setExporting(true); setExportError("");
     try {
+      const consentPolicy = noteImageConsentRef.current.policy(targetTab.id, trustedImageHostsRef.current);
       const output = exportFormat === "fmd"
-        ? await invoke<string | null>("export_fmd", await prepareFmd(content, path))
-        : await invoke<string | null>("export_portable_pdf", { path, ...await preparePdf(content, path, python || "embedded", { trustedImageHosts }), options: exportOptions });
+        ? await invoke<string | null>("export_fmd", await prepareFmd(targetTab.content, targetTab.path, consentPolicy))
+        : await invoke<string | null>("export_portable_pdf", { path: targetTab.path, ...await preparePdf(targetTab.content, targetTab.path, python || "embedded", consentPolicy), options: exportOptions });
       if (output) { flash(`Exported ${output}`); setShowExport(false); }
     } catch (error) { setExportError(String(error)); }
     finally { setExporting(false); }
@@ -868,8 +917,8 @@ export default function App() {
         {searching && (view === "reader" || view === "live") && <ReadingSearch content={content} close={() => setSearching(false)} onChange={view === "reader" ? undefined : (value) => setDocuments((current) => editTab(current, activeTab.id, value))} />}
         {(view === "editor" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="editor-pane" aria-label="Markdown source"><div className="pane-head"><span><PencilSimpleIcon size={15} /> Markdown</span>{view === "editor" ? <span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} aria-label="Zoom in"><PlusIcon size={14} /></button></span> : <small>{lineCount} lines</small>}</div><Editor key={activeTab.id} sessionId={activeTab.id} value={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} dark={dark} focusMode={focusMode} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} onTypewriterChange={setTypewriterScroll} /></motion.section>}
         {view === "split" && <div className="pane-resizer" role="separator" aria-label="Resize editor and preview" aria-orientation="vertical" aria-valuemin={25} aria-valuemax={75} aria-valuenow={splitPercent} tabIndex={0} onPointerDown={onResizePointerDown} onPointerMove={onResizePointerMove} onPointerUp={onResizePointerUp} onLostPointerCapture={() => setResizing(false)} onDoubleClick={() => setSplitPercent(50)} onKeyDown={(event) => { if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); setSplitPercent((current) => Math.max(25, Math.min(75, current + (event.key === "ArrowRight" ? 5 : -5)))); } }}><span /></div>}
-        {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpenIcon size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><PlusIcon size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} /></div></div></motion.section>}
-        {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><SparkleIcon size={15} /> Live preview</span><span className="preview-tools"><small>Click content to edit</small><ZoomInput value={workspaceZoom} onChange={setZoom} /></span></div><div className="reading-scroll"><LiveEditor key={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={trustImageHost} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} /></div></motion.section>}
+        {(view === "reader" || view === "split") && <motion.section layout={false} initial={false} transition={motionEnabled && !resizing && !windowResizing ? spring.surface : { duration: 0 }} className="preview-pane" aria-label="Reading preview"><div className="pane-head"><span><BookOpenIcon size={15} /> Preview</span><div className="preview-tools"><small>{wordCount} words</small><span className="zoom-controls" aria-label="Workspace zoom"><button onClick={() => zoomBy(-10)} title="Zoom out · Ctrl+-" aria-label="Zoom out"><MinusIcon size={14} /></button><ZoomInput value={workspaceZoom} onChange={setZoom} /><button onClick={() => zoomBy(10)} title="Zoom in · Ctrl++" aria-label="Zoom in"><PlusIcon size={14} /></button></span></div></div><div className="reading-scroll" ref={readingScrollRef}><div className="preview-page" style={{ width: previewLayoutWidth(previewViewportWidth, readerWidth, workspaceZoom), zoom: workspaceZoom / 100 }}><MarkdownPreview noteId={activeTab.id} markdown={content} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} approvedImageUrls={activeApprovedImageUrls} onTrustImageHost={trustImageHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} /></div></div></motion.section>}
+        {view === "live" && <motion.section layout={false} initial={false} transition={motionEnabled && !windowResizing ? spring.surface : { duration: 0 }} className="live-pane" aria-label="Live Markdown"><div className="pane-head"><span><SparkleIcon size={15} /> Live preview</span><span className="preview-tools"><small>Click content to edit</small><ZoomInput value={workspaceZoom} onChange={setZoom} /></span></div><div className="reading-scroll"><LiveEditor key={activeTab.id} noteId={activeTab.id} markdown={content} onChange={(value) => setDocuments((current) => editTab(current, activeTab.id, value))} documentPath={path} python={python} dark={dark} trustedImageHosts={trustedImageHosts} approvedImageUrls={activeApprovedImageUrls} onTrustImageHost={trustImageHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} spellCheck={spellCheck} grammarCheck={grammarCheck} typewriterScroll={typewriterScroll} /></div></motion.section>}
       </main></div>
       <AnimatePresence>{notice && <motion.div key="notice" className="snackbar" initial={motionEnabled ? { opacity: 0, y: 18, x: "-50%", scale: .94 } : false} animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }} exit={motionEnabled ? { opacity: 0, y: 12, x: "-50%", scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.surface : { duration: 0 }}>{notice}</motion.div>}</AnimatePresence>
       <AnimatePresence>{showSettings && <motion.div key="settings" className="scrim" initial={motionEnabled ? { opacity: 0 } : false} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: motionEnabled ? .24 : 0 }} onMouseDown={() => setShowSettings(false)}><motion.aside className="sheet" role="dialog" aria-modal="true" aria-label="Settings" initial={motionEnabled ? { opacity: 0, y: 40, scale: .9, borderRadius: 44 } : false} animate={{ opacity: 1, y: 0, scale: 1, borderRadius: 28 }} exit={motionEnabled ? { opacity: 0, y: 18, scale: .96 } : { opacity: 0 }} transition={motionEnabled ? spring.sheet : { duration: 0 }} onMouseDown={(event) => event.stopPropagation()}>

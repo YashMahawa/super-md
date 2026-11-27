@@ -50,21 +50,28 @@ export interface SharedSourceAnchorRefs {
   layoutNavigatedHeadingToken: RefObject<string | null>;
   suppressedRestoreToken: RefObject<string | null>;
   suppressedRestoreKey: RefObject<string | null>;
+  suppressRestoreForSeed: RefObject<boolean>;
 }
 
 export function handoffSharedSourceAnchorOnLoad(options: {
   old: SharedAnchorReaderState | null;
   next: SharedAnchorReaderState;
   zoom: number;
-  refs: Pick<SharedSourceAnchorRefs, "consumedHeadingToken" | "savePosition" | "modeAnchor" | "splitPane">;
+  hasActiveSeedNavigation?: boolean;
+  refs: Pick<SharedSourceAnchorRefs, "consumedHeadingToken" | "suppressedRestoreToken" | "savePosition" | "modeAnchor" | "splitPane">;
   onHistoryBoundary?: () => void;
 }): { hasNewPendingHeading: boolean; unconsumedOldHeadingOffset: number | null } {
-  const { old, next, zoom, refs: { consumedHeadingToken, savePosition, modeAnchor, splitPane }, onHistoryBoundary } = options;
+  const { old, next, zoom, hasActiveSeedNavigation = false, refs: { consumedHeadingToken, suppressedRestoreToken, savePosition, modeAnchor, splitPane }, onHistoryBoundary } = options;
   if (old?.id === next.id) next.readingLocation = old.readingLocation;
-  if (old?.id === next.id && !next.pendingHeading && old.pendingHeading) next.pendingHeading = old.pendingHeading;
+  if (hasActiveSeedNavigation && !next.pendingHeading && old?.id === next.id && old.pendingHeading?.token) {
+    suppressedRestoreToken.current = old.pendingHeading.token;
+    consumedHeadingToken.current = old.pendingHeading.token;
+    document.querySelectorAll(".android-reading").forEach(cancelHeadingNavigation);
+  }
+  if (old?.id === next.id && !next.pendingHeading && old.pendingHeading && !hasActiveSeedNavigation) next.pendingHeading = old.pendingHeading;
   const hasNewPendingHeading = Boolean(next.pendingHeading?.token && next.pendingHeading.token !== old?.pendingHeading?.token);
   let unconsumedOldHeadingOffset: number | null = null;
-  if (old && (old.id !== next.id || old.mode !== next.mode) && !hasNewPendingHeading && old.pendingHeading?.token && old.pendingHeading.token !== consumedHeadingToken.current) {
+  if (old && (old.id !== next.id || (old.mode !== next.mode && !hasActiveSeedNavigation)) && !hasNewPendingHeading && old.pendingHeading?.token && old.pendingHeading.token !== consumedHeadingToken.current) {
     consumedHeadingToken.current = old.pendingHeading.token;
     unconsumedOldHeadingOffset = resolveHeadingOffset(old.content, old.pendingHeading.heading);
     if (old.mode !== "editor") {
@@ -102,8 +109,9 @@ export function snapshotOutgoingTabOrPathAnchor(options: {
   zoom: number;
   unconsumedOldHeadingOffset: number | null;
   refs: Pick<SharedSourceAnchorRefs, "noteViews" | "savePosition" | "modeAnchor" | "splitPane" | "suppressedRestoreKey">;
+  onOutgoingTabSwitch?: () => void;
 }): void {
-  const { old, next, zoom, unconsumedOldHeadingOffset, refs: { noteViews, savePosition, modeAnchor, splitPane, suppressedRestoreKey } } = options;
+  const { old, next, zoom, unconsumedOldHeadingOffset, refs: { noteViews, savePosition, modeAnchor, splitPane, suppressedRestoreKey }, onOutgoingTabSwitch } = options;
   if (old && old.id !== next.id) {
     savePosition.current();
     const readingRoot = document.querySelector<HTMLElement>(".android-reading");
@@ -112,6 +120,7 @@ export function snapshotOutgoingTabOrPathAnchor(options: {
     noteViews.current.set(old.id, { top: outgoingAnchor.readingTop ?? 0, anchor: outgoingAnchor, rendered: exportRenderedViews(old.content) });
     if (noteViews.current.size > 40) noteViews.current.delete(noteViews.current.keys().next().value!);
     if (suppressedRestoreKey.current?.startsWith(`${old.id}:`)) suppressedRestoreKey.current = null;
+    onOutgoingTabSwitch?.();
     modeAnchor.current = null; splitPane.current = null;
   }
   if (old && old.id === next.id && old.path !== next.path && next.restorePosition !== false) {
@@ -139,7 +148,7 @@ export interface UseSharedSourceAnchorOptions {
 export function useSharedSourceAnchor({ state, reference, zoomReference, refs }: UseSharedSourceAnchorOptions): void {
   const {
     noteViews, savePosition, modeAnchor, splitPane, restoringSplit, restoringSplitSeq,
-    splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey,
+    splitScrollTops, consumedHeadingToken, layoutNavigatedHeadingToken, suppressedRestoreToken, suppressedRestoreKey, suppressRestoreForSeed,
   } = refs;
 
   useEffect(() => {
@@ -192,10 +201,21 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
       return;
     }
     const startingInput = scrollInputVersion(), initialContent = state.content;
+    const hadSearchOverlayAtStart = Boolean(document.querySelector(".reading-search,.cm-search"));
+    const hasDocumentSelection = () => {
+      const sel = window.getSelection();
+      if (!sel || !sel.toString()) return false;
+      const active = document.activeElement;
+      if (active instanceof Element && active.closest(".reading-search,.cm-search")) return false;
+      const anchorEl = sel.anchorNode instanceof Element ? sel.anchorNode : sel.anchorNode?.parentElement;
+      if (anchorEl?.closest(".reading-search,.cm-search")) return false;
+      return true;
+    };
     const shouldStop = () =>
       reference.current?.id !== state.id || reference.current?.mode !== state.mode || reference.current?.content !== initialContent ||
-      scrollInputVersion() !== startingInput || Boolean(window.getSelection()?.toString()) ||
-      Boolean(document.querySelector(".reading-search,.cm-search,.live-active-block"));
+      scrollInputVersion() !== startingInput || hasDocumentSelection() ||
+      Boolean(document.querySelector(".live-active-block")) ||
+      (!hadSearchOverlayAtStart && Boolean(document.querySelector(".reading-search,.cm-search")));
     const runGuarded = (fn: () => void) => {
       if (state.mode === "split") {
         const seq = ++restoringSplitSeq.current;
@@ -244,8 +264,9 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
         try {
           runGuarded(() => {
             const readingRoot = document.querySelector<HTMLElement>(".android-reading");
-            applySharedAnchor({ id: state.id, targetMode: state.mode, targetZoom: zoomReference.current, anchor, readingRoot, allowExactTop, updateSelection });
-            const requestedReadingTop = allowExactTop && anchor.mode === state.mode && Math.abs(anchor.zoom - zoomReference.current) < 1 ? anchor.readingTop : undefined;
+            const effectiveAllowExactTop = allowExactTop && !(Boolean(readingRoot?.querySelector('[data-windowed-mounted="false"]')) && anchor.offset > 0);
+            applySharedAnchor({ id: state.id, targetMode: state.mode, targetZoom: zoomReference.current, anchor, readingRoot, allowExactTop: effectiveAllowExactTop, updateSelection });
+            const requestedReadingTop = effectiveAllowExactTop && anchor.mode === state.mode && Math.abs(anchor.zoom - zoomReference.current) < 1 ? anchor.readingTop : undefined;
             readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
           });
         } finally { applying = false; }
@@ -267,6 +288,12 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
       if (state.mode === "editor" || state.mode === "split") primeEditorAnchor(state.id, { offset: anchor.offset, caretOffset: anchor.caretOffset });
       else primeEditorAnchor(state.id, null);
       return settleAnchor(anchor, false);
+    }
+    if (suppressRestoreForSeed.current) {
+      suppressRestoreForSeed.current = false;
+      suppressedRestoreKey.current = null;
+      primeEditorAnchor(state.id, null);
+      return;
     }
     if (suppressedRestoreKey.current === `${state.id}:${state.mode}`) return;
     suppressedRestoreKey.current = null;

@@ -14,6 +14,7 @@ if (typeof Range !== "undefined") {
   Range.prototype.getClientRects ??= () => ({ length: 0, item: () => null, [Symbol.iterator]: function* () {} }) as DOMRectList;
   Range.prototype.getBoundingClientRect ??= () => ({ top: 0, bottom: 0, left: 0, right: 0, width: 0, height: 0, x: 0, y: 0, toJSON: () => ({}) }) as DOMRect;
 }
+if (typeof Element !== "undefined") Element.prototype.scrollIntoView ??= () => {};
 
 const SYNC_BRIDGE_GLOBALS = [
   "supermdBeforeNavigate", "supermdChromeInset", "supermdDismiss", "supermdExport", "supermdExportMarkdown",
@@ -301,5 +302,49 @@ describe("useSharedSourceAnchor", () => {
     root = null;
     expect(window.supermdLoad).toBeUndefined();
     expect(window.supermdSavePosition).toBeUndefined();
+  });
+
+  it("prioritizes verified seededFind occurrence over saved restore while falling back to semantic/saved restore on stale seed or windowed unmounted blocks", () => {
+    vi.useFakeTimers();
+    const spy = vi.spyOn(sourceAnchor, "applySharedAnchor");
+    window.SuperMD = { post: (id, cmd) => window.supermdReply?.(id, cmd === "document_sync" ? { accepted: true, revision: 0 } : true, null) };
+    host = document.createElement("div");
+    document.body.appendChild(host);
+    root = createRoot(host);
+    act(() => { root!.render(<Reader />); });
+
+    const content = "# Intro\n\nAlpha token here.\n\n## Deep\n\nTargetMatch inside deep section.\n";
+    const matchStart = content.indexOf("TargetMatch");
+    const matchEnd = matchStart + "TargetMatch".length;
+
+    // 1. Valid seededFind occurrence suppresses saved readingLocation restoration.
+    act(() => {
+      window.supermdLoad?.({
+        ...BASE_STATE, id: "tab-seed-valid", path: "/notes/SeedValid.md", content, mode: "reader",
+        readingLocation: { top: 420, offset: 9, zoom: 100, mode: "reader" },
+        seededFind: { query: "TargetMatch", sourceStart: matchStart, sourceEnd: matchEnd, matchText: "TargetMatch" },
+      });
+    });
+    act(() => { vi.advanceTimersByTime(40); });
+    expect(spy).not.toHaveBeenCalled();
+
+    // 2. Stale seededFind range falls back to saved readingLocation across settle passes even with .reading-search open at load.
+    spy.mockClear();
+    act(() => {
+      window.supermdLoad?.({
+        ...BASE_STATE, id: "tab-seed-stale", path: "/notes/SeedStale.md", content, mode: "reader",
+        readingLocation: { top: 420, offset: 9, zoom: 100, mode: "reader" },
+        seededFind: { query: "TargetMatch", sourceStart: 9999, sourceEnd: 10010, matchText: "TargetMatch" },
+      });
+    });
+    expect(host.querySelector(".reading-search")).not.toBeNull();
+    expect(spy.mock.calls.length).toBeGreaterThanOrEqual(1);
+    const reading = host.querySelector<HTMLElement>(".android-reading")!;
+    const placeholder = document.createElement("div");
+    placeholder.dataset.windowedMounted = "false";
+    reading.appendChild(placeholder);
+    act(() => { vi.advanceTimersByTime(150); });
+    // Once an unmounted windowed block is present with anchor.offset > 0, settle passes switch allowExactTop -> false.
+    expect(spy.mock.calls.at(-1)?.[0]).toMatchObject({ allowExactTop: false });
   });
 });

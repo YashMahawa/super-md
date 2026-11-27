@@ -1,6 +1,9 @@
 """Streaming cross-note text search with source-offset-preserving case folding and UTF-16 UI spans."""
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field
 import os
 import threading
@@ -17,12 +20,19 @@ MAX_SEARCH_MATCHES = 500
 MAX_MATCHES_PER_NOTE = 50
 SNIPPET_MAX_CHARS = 140
 BATCH_SIZE = 20
+SEARCH_WORKERS = 4
+SEARCH_CHUNK_SIZE = 16
+SEARCH_WINDOW_CHUNKS = 4
+_SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=SEARCH_WORKERS, thread_name_prefix="supermd-search")
 
 
 def is_searchable_note_name(name: str) -> bool:
     if not name or name.startswith("."):
         return False
-    return Path(name).suffix.lower() in KNOWN_NOTE_SUFFIXES
+    dot = name.rfind(".")
+    if dot <= 0:
+        return False
+    return name[dot:].lower() in KNOWN_NOTE_SUFFIXES
 
 
 def canonical_note_key(path: str | Path) -> str:
@@ -43,39 +53,41 @@ def walk_folder_notes(
     if folder_root is None:
         return []
     try:
-        if folder_root.is_symlink() or not folder_root.is_dir():
+        if folder_root.is_symlink() or getattr(folder_root, "is_junction", lambda: False)() or not folder_root.is_dir():
             return []
-        root = folder_root.resolve()
+        root_str = str(folder_root.resolve())
     except OSError:
         return []
 
     results: list[dict] = []
-    stack: list[tuple[Path, int]] = [(root, 0)]
+    stack: list[tuple[str, str, int]] = [(root_str, "", 0)]
     while stack and len(results) < max_entries:
         if cancel_event is not None and cancel_event.is_set():
             return results
-        current, depth = stack.pop()
+        current_dir, rel_prefix, depth = stack.pop()
         if depth > MAX_FOLDER_DEPTH:
             continue
         try:
-            with os.scandir(current) as entries:
+            with os.scandir(current_dir) as entries:
                 dir_items = list(entries)
         except OSError:
             continue
 
-        subdirs: list[Path] = []
+        subdirs: list[tuple[str, str, str]] = []
         files: list[os.DirEntry[str]] = []
         for entry in dir_items:
             if cancel_event is not None and cancel_event.is_set():
                 return results
-            if entry.name.startswith("."):
+            ename = entry.name
+            if ename.startswith("."):
                 continue
             try:
-                if entry.is_symlink():
+                if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    subdirs.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False) and is_searchable_note_name(entry.name):
+                    sub_rel = f"{rel_prefix}/{ename}" if rel_prefix else ename
+                    subdirs.append((ename.lower(), entry.path, sub_rel))
+                elif entry.is_file(follow_symlinks=False) and is_searchable_note_name(ename):
                     files.append(entry)
             except OSError:
                 continue
@@ -84,16 +96,20 @@ def walk_folder_notes(
         for entry in files:
             if len(results) >= max_entries:
                 break
-            full = Path(entry.path)
-            try:
-                rel = full.relative_to(root).as_posix()
-            except ValueError:
-                rel = entry.name
-            results.append({"name": entry.name, "path": str(full), "relative": rel})
+            ename = entry.name
+            epath = entry.path
+            rel = f"{rel_prefix}/{ename}" if rel_prefix else ename
+            results.append({
+                "name": ename,
+                "path": epath,
+                "relative": rel,
+                "canonicalKey": os.path.normcase(epath),
+            })
 
-        subdirs.sort(key=lambda p: p.name.lower(), reverse=True)
-        for sub in subdirs:
-            stack.append((sub, depth + 1))
+        subdirs.sort(key=lambda item: item[0], reverse=True)
+        next_depth = depth + 1
+        for _, sub_path, sub_rel in subdirs:
+            stack.append((sub_path, sub_rel, next_depth))
     return results
 
 
@@ -123,6 +139,12 @@ def utf16_offset(text: str, cp_index: int) -> int:
     if text.isascii():
         return clamped
     return len(text[:clamped].encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def _utf16_len(text: str) -> int:
+    if text.isascii():
+        return len(text)
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
 
 
 def fold_with_offsets(text: str) -> tuple[str, list[int], list[int]]:
@@ -217,6 +239,16 @@ def _find_line_matches(search_line: str, query: str, *, folded_needle: str, case
     return spans
 
 
+def _might_contain_needle(markdown: str, query: str, folded_needle: str, case_sensitive: bool) -> bool:
+    if "\x00" in query or "\x00" in folded_needle:
+        return True
+    if case_sensitive:
+        return query in markdown
+    if markdown.isascii() and folded_needle.isascii():
+        return folded_needle in markdown.lower()
+    return folded_needle in markdown.casefold()
+
+
 def _scan_note_lines(
     markdown: str,
     query: str,
@@ -228,19 +260,24 @@ def _scan_note_lines(
     remaining_budget: int,
     cancel_event: threading.Event | None = None,
 ) -> tuple[list[dict], bool]:
-    if not markdown or not query:
+    if not markdown or not query or remaining_budget <= 0:
+        return [], False
+    if not _might_contain_needle(markdown, query, folded_needle, case_sensitive):
         return [], False
     searchable = mask_diagram_spans(markdown) if exclude_diagrams else markdown
-    raw_lines = markdown.splitlines()
-    search_lines = searchable.splitlines()
+    raw_lines = markdown.split("\n")
+    search_lines = searchable.split("\n")
     matches: list[dict] = []
     truncated = False
     limit = min(MAX_MATCHES_PER_NOTE, remaining_budget)
+    line_u16_start = 0
 
-    for idx, search_line in enumerate(search_lines):
+    for idx, raw_search_line in enumerate(search_lines):
         if cancel_event is not None and cancel_event.is_set():
             return matches, False
-        raw_line = raw_lines[idx] if idx < len(raw_lines) else search_line
+        raw_with_cr = raw_lines[idx] if idx < len(raw_lines) else raw_search_line
+        raw_line = raw_with_cr[:-1] if raw_with_cr.endswith("\r") else raw_with_cr
+        search_line = raw_search_line[:-1] if raw_search_line.endswith("\r") else raw_search_line
         for orig_start, orig_end in _find_line_matches(
             search_line,
             query,
@@ -251,6 +288,8 @@ def _scan_note_lines(
                 if len(matches) >= remaining_budget:
                     truncated = True
                 break
+            col_u16 = utf16_offset(raw_line, orig_start)
+            end_u16 = utf16_offset(raw_line, orig_end)
             snippet, u16_start, u16_end = _build_snippet(raw_line, orig_start, orig_end)
             matches.append({
                 "key": f"{note_meta['key']}:{idx + 1}:{orig_start}",
@@ -261,11 +300,15 @@ def _scan_note_lines(
                 "dirty": bool(note_meta.get("dirty")),
                 "isOpen": bool(note_meta.get("isOpen")),
                 "line": idx + 1,
-                "column": utf16_offset(raw_line, orig_start) + 1,
+                "column": col_u16 + 1,
                 "snippet": snippet,
                 "matchStart": u16_start,
                 "matchEnd": u16_end,
+                "sourceStart": line_u16_start + col_u16,
+                "sourceEnd": line_u16_start + end_u16,
+                "matchText": raw_line[orig_start:orig_end],
             })
+        line_u16_start += _utf16_len(raw_with_cr) + 1
         if truncated:
             break
     return matches, truncated
@@ -275,7 +318,11 @@ def _resolve_folder_root(folder_root: Path | None) -> Path | None:
     if folder_root is None:
         return None
     try:
-        if not folder_root.is_symlink() and folder_root.is_dir():
+        if (
+            not folder_root.is_symlink()
+            and not getattr(folder_root, "is_junction", lambda: False)()
+            and folder_root.is_dir()
+        ):
             return folder_root.resolve()
     except OSError:
         pass
@@ -364,27 +411,89 @@ def _iter_searchable_notes(
                     "relative": Path(rpath).name,
                 })
 
+    deduped_candidates: list[dict] = []
     for entry in disk_candidates:
         if cancel_event is not None and cancel_event.is_set():
             return
         epath = entry["path"]
-        key = canonical_note_key(epath)
+        key = entry.get("canonicalKey") or canonical_note_key(epath)
         if key in seen_paths:
             continue
         seen_paths.add(key)
-
-        markdown = documents.read_searchable_markdown(Path(epath))
-        if markdown is None:
-            continue
-        yield (
-            markdown,
+        deduped_candidates.append(
             _note_meta(
                 key=key,
                 path=epath,
                 name=entry["name"],
                 relative=entry.get("relative") or entry["name"],
-            ),
+            )
         )
+
+    if not deduped_candidates:
+        return
+    if len(deduped_candidates) == 1:
+        meta = deduped_candidates[0]
+        markdown = documents.read_searchable_markdown(meta["path"])
+        if markdown is not None:
+            yield markdown, meta
+        return
+
+    stop_workers = threading.Event()
+
+    def _read_disk_chunk(chunk: list[dict]) -> list[tuple[str | None, dict]]:
+        out: list[tuple[str | None, dict]] = []
+        for meta in chunk:
+            if stop_workers.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                break
+            out.append((documents.read_searchable_markdown(meta["path"]), meta))
+        return out
+
+    chunks: list[list[dict]] = []
+    cursor_idx = 0
+    ramp = (2, 4, 8)
+    step_idx = 0
+    total_candidates = len(deduped_candidates)
+    while cursor_idx < total_candidates:
+        step = ramp[step_idx] if step_idx < len(ramp) else SEARCH_CHUNK_SIZE
+        step_idx += 1
+        chunks.append(deduped_candidates[cursor_idx : cursor_idx + step])
+        cursor_idx += step
+
+    inflight: deque[Future[list[tuple[str | None, dict]]]] = deque()
+    next_chunk_idx = 0
+
+    def _submit_window() -> None:
+        nonlocal next_chunk_idx
+        while len(inflight) < SEARCH_WINDOW_CHUNKS and next_chunk_idx < len(chunks):
+            if stop_workers.is_set() or (cancel_event is not None and cancel_event.is_set()):
+                break
+            chunk = chunks[next_chunk_idx]
+            next_chunk_idx += 1
+            inflight.append(_SEARCH_EXECUTOR.submit(_read_disk_chunk, chunk))
+
+    try:
+        _submit_window()
+        while inflight:
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            fut = inflight.popleft()
+            _submit_window()
+            for markdown, meta in fut.result():
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if markdown is None:
+                    continue
+                yield markdown, meta
+    finally:
+        stop_workers.set()
+        for pending_fut in inflight:
+            pending_fut.cancel()
+        for pending_fut in inflight:
+            if not pending_fut.cancelled():
+                try:
+                    pending_fut.result()
+                except Exception:
+                    pass
 
 
 @dataclass
@@ -473,15 +582,18 @@ def stream_text_search(
         cancel_event=cancel_event,
         on_batch=on_batch,
     )
-    for markdown, meta in _iter_searchable_notes(
-        tabs_snapshot,
-        recent_snapshot,
-        resolved_root,
-        active_id=active_id,
-        cancel_event=cancel_event,
-    ):
-        if stream.scan_note(markdown, meta) or stream.is_cancelled():
-            break
+    with closing(
+        _iter_searchable_notes(
+            tabs_snapshot,
+            recent_snapshot,
+            resolved_root,
+            active_id=active_id,
+            cancel_event=cancel_event,
+        )
+    ) as searchable_notes:
+        for markdown, meta in searchable_notes:
+            if stream.scan_note(markdown, meta) or stream.is_cancelled():
+                break
 
     if stream.is_cancelled():
         return stream.finish(cancelled=True)
