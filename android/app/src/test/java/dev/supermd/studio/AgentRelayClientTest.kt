@@ -39,8 +39,8 @@ class AgentRelayClientTest {
     )
 
     private class RecordingWebSocket(private val initialRequest: Request) : WebSocket {
-        val sent = mutableListOf<String>()
-        var closedCode: Int? = null
+        val sent = java.util.concurrent.CopyOnWriteArrayList<String>()
+        @Volatile var closedCode: Int? = null
         override fun request(): Request = initialRequest
         override fun queueSize(): Long = 0L
         override fun send(text: String): Boolean = sent.add(text)
@@ -66,6 +66,7 @@ class AgentRelayClientTest {
         }
         relay.connect(config, handler)
         assertTrue(opened.await(5, TimeUnit.SECONDS))
+        synchronized(relay) {}
         val socket = socketRef.get()
         val listener = listenerRef.get()
         listener.onMessage(socket, JSONObject().put("type", "registered").put("groupId", config.groupId).put("deviceId", config.deviceId).toString())

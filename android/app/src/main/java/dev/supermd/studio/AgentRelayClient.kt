@@ -109,7 +109,8 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         })
     }
 
-    private fun openSocket(current: AgentAccessConfig) {
+    @Synchronized private fun openSocket(current: AgentAccessConfig) {
+        if (stopped || config !== current) return
         val request = authenticatedWebSocketRequest(current)
         webSocket = webSocketFactory.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
