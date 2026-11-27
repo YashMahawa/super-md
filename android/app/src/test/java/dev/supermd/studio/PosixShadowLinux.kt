@@ -43,11 +43,12 @@ class PosixShadowLinux : ShadowLinux() {
         private val syntheticInodeCounter = AtomicLong(1_000_000L)
         private val trackedByIdentity = ConcurrentHashMap<Int, TrackedDescriptor>()
 
-        internal fun closeTracked(fd: FileDescriptor?) {
-            if (fd == null) return
-            val removed = trackedByIdentity.remove(System.identityHashCode(fd)) ?: return
+        internal fun closeTracked(fd: FileDescriptor?): Boolean {
+            if (fd == null) return false
+            val removed = trackedByIdentity.remove(System.identityHashCode(fd)) ?: return false
             runCatching { removed.raf.close() }
             removed.backingTempFile?.delete()
+            return true
         }
 
         private fun extractInode(attrs: BasicFileAttributes): Long {
@@ -301,7 +302,12 @@ class PosixShadowLinux : ShadowLinux() {
             }
         }
         return try {
-            Files.readSymbolicLink(Paths.get(path)).toString()
+            val target = Files.readSymbolicLink(Paths.get(path)).toString()
+            if (path.startsWith("/proc/self/fd/") && target.contains("/ShadowParcelFileDescriptor/pipe-")) {
+                "pipe:[${target.hashCode().and(0x7fffffff)}]"
+            } else {
+                target
+            }
         } catch (missing: NoSuchFileException) {
             throw ErrnoException("readlink", OsConstants.ENOENT, missing)
         } catch (notLink: NotLinkException) {
@@ -316,6 +322,8 @@ class PosixShadowLinux : ShadowLinux() {
 class PosixShadowBlockGuardOs : ShadowBlockGuardOs() {
     @Implementation
     protected override fun close(fd: FileDescriptor?) {
-        PosixShadowLinux.closeTracked(fd)
+        if (!PosixShadowLinux.closeTracked(fd)) {
+            super.close(fd)
+        }
     }
 }
