@@ -18,6 +18,7 @@ internal class ReaderFlushBarrier {
         val allowPendingNativeLoad: Boolean = false,
         val result: CompletableDeferred<Boolean>,
         val status: CompletableDeferred<ReaderFlushStatus> = CompletableDeferred(),
+        @Volatile var dispatchedAtEnqueue: String? = null,
     )
     private val pending = ConcurrentHashMap<String, Request>()
 
@@ -58,7 +59,12 @@ internal class ReaderFlushBarrier {
         val request = pending.remove(token) ?: return false
         val matchesContent = nativeContent != null && (
             content == nativeContent ||
-                (request.allowPendingNativeLoad && dispatchedContent != null && content == dispatchedContent)
+                (
+                    request.allowPendingNativeLoad && (
+                        (request.dispatchedAtEnqueue != null && content == request.dispatchedAtEnqueue) ||
+                            (dispatchedContent != null && content == dispatchedContent)
+                        )
+                    )
             )
         val accepted = wellFormed && request.noteId == noteId && error == null && content != null && matchesContent
         val outcome = when {

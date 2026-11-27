@@ -812,6 +812,12 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     ?: ReaderFlushStatus.FAILED
             }
         }
+        model.readerBarrierFlushRequester = { noteId ->
+            val current = web
+            if (!readerReady || current == null) model.readerStateIsNativeAuthoritative(noteId)
+            else (current.getTag(R.id.reader_bridge_tag) as? ReaderBridge)
+                ?.requestFlush(noteId, allowPendingNativeLoad = true) ?: false
+        }
         model.readerBarrierFlushStatusRequester = { noteId ->
             val current = web
             if (!readerReady || current == null) {
@@ -1302,12 +1308,13 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             }
         }
         val readerContent=remember {arrayOfNulls<String>(1)}
-        LaunchedEffect(readerReady, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
-            if (!readerReady) {
+        LaunchedEffect(readerReady, web, state.active, state.pendingHeading, actualMode, dark, state.fullscreen, state.font, state.size, state.widthPercent,state.lineHeight,state.spellCheck,state.grammarCheck,state.latexAutofix,state.typewriterScroll,state.restorePosition,state.centerLock,state.imageAppearance,state.svgAppearance,state.imageContrast,state.fullDocumentAccessibility,state.customTheme,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing,tokens, hinge, motion, seededFind) {
+            val reader = web
+            if (!readerReady || reader == null) {
                 readerNote.set(null)
                 model.clearReaderLoads()
             }
-            if (readerReady && state.active.id.isNotEmpty()) {
+            if (readerReady && reader != null && state.active.id.isNotEmpty()) {
                 val note = state.active
                 val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
                 val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
@@ -1320,7 +1327,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 if (matchingSeed != null) {
                     payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
                 }
-                web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
+                reader.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
                 if (matchingSeed != null) {
                     model.consumeSeededFind(matchingSeed.nonce)
@@ -1329,7 +1336,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 readerContent[0] = note.content
                 model.recordReaderLoad(note.id, note.content)
                 val hingeGap = if (hinge != null && actualMode == "split") hinge!!.bounds.width() / density.density else 0f
-                web?.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
+                reader.evaluateJavascript("document.querySelector('.android-document')?.style.setProperty('gap','${hingeGap}px')", null)
             }
         }
         LaunchedEffect(readerReady, state.zoomCommand) {

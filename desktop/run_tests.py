@@ -11,9 +11,17 @@ os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Material")
 
 
 class _CleanupTestResult(unittest.TextTestResult):
-    def stopTest(self, test: unittest.TestCase) -> None:
-        super().stopTest(test)
-        gc.collect()
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._last_module: str | None = None
+
+    def startTest(self, test: unittest.TestCase) -> None:
+        module = test.__class__.__module__
+        if module != self._last_module:
+            self._last_module = module
+            if module == "test_documents":
+                gc.collect()
+        super().startTest(test)
 
 
 def suite_watchdog_seconds(platform_name: str = sys.platform, machine: str | None = None) -> int:

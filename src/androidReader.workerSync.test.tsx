@@ -422,4 +422,29 @@ it("signals reader_ready without pre-spawning a worker and settles android_flush
     token: "loaded-token",
     content: firstExternalLarge,
   });
+
+  // Switching back to small-ext before first-ext's worker finishes must still republish document_outline.
+  native.mockClear();
+  await act(async () => {
+    window.supermdLoad!({
+      id: "small-ext",
+      editProtocol: 1,
+      content: "# Small External Open\n\nImmediate synchronous body.\n",
+      path: "content://share/small.md",
+      mode: "reader",
+      dark: false,
+      fullscreen: false,
+      font: "sans",
+      size: 16,
+      colors: { primary: "#386a57" },
+      zoom: 100,
+    });
+  });
+  expect(native).toHaveBeenCalledWith(
+    "document_outline",
+    expect.objectContaining({
+      id: "small-ext",
+      headings: [expect.objectContaining({ title: "Small External Open" })],
+    }),
+  );
 });

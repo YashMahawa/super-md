@@ -165,4 +165,74 @@ class ReaderBarrierSyncTest {
         assertEquals("live", model.state.value.mode)
         assertTrue(model.state.value.message?.contains("could not confirm") == true)
     }
+
+    @Test fun sameTurnNativeEditAndModeSwitchSucceedsWhenComposeEnqueuesLoadWhileFlushInFlight() {
+        val store = ViewModelStore().also(stores::add)
+        val key = "barrier-inflight-load-${System.nanoTime()}".also(workspaceKeys::add)
+        val model = StudioViewModel(app, key)
+        store.put("model", model)
+
+        val activeId = model.state.value.active.id
+        val initialContent = model.state.value.active.content
+        val mountedId = AtomicReference<String>(activeId)
+        val webViewContent = AtomicReference<String>(initialContent)
+        model.recordReaderLoad(activeId, initialContent)
+        assertTrue(model.readerSync(activeId, "epoch-1", 0L, initialContent).getBoolean("accepted"))
+
+        val replacement = "# Restored Welcome\n\nReplacement text after large note.\n"
+        model.readerBarrierFlushStatusRequester = { noteId ->
+            val barrier = ReaderFlushBarrier()
+            val req = barrier.register("inflight-$noteId", noteId, allowPendingNativeLoad = true)
+            // Capture dispatchedAtEnqueue when supermdFlush is posted to WebView's UI-thread queue.
+            req.dispatchedAtEnqueue = model.readerDispatchedContent[noteId]
+            // Simulate Compose's next-frame LaunchedEffect queueing supermdLoad(replacement) behind
+            // supermdFlush and updating model.readerDispatchedContent before Chromium replies.
+            if (mountedId.get() == noteId) {
+                val latestNative = model.state.value.tabs.firstOrNull { it.id == noteId }?.content
+                if (latestNative != null) model.recordReaderLoad(noteId, latestNative)
+                barrier.complete(
+                    req.token,
+                    noteId,
+                    content = webViewContent.get(),
+                    nativeContent = latestNative,
+                    dispatchedContent = model.readerDispatchedContent[noteId],
+                    error = null,
+                )
+            } else {
+                barrier.complete(
+                    req.token,
+                    mountedId.get(),
+                    content = null,
+                    nativeContent = model.state.value.tabs.firstOrNull { it.id == noteId }?.content,
+                    dispatchedContent = model.readerDispatchedContent[noteId],
+                    error = "The active note changed before its edit flush",
+                )
+            }
+            req.status.await()
+        }
+
+        model.mode("reader")
+        idleUntil { model.state.value.mode == "reader" }
+        assertNull(model.state.value.message)
+
+        // Same-turn native edit + mode("live") while Chromium still replies with initialContent
+        // despite LaunchedEffect having already overwritten readerDispatchedContent[activeId].
+        model.edit(activeId, replacement)
+        model.mode("live")
+        idleUntil { model.state.value.mode == "live" }
+        assertEquals(replacement, model.state.value.active.content)
+        assertNull(model.state.value.message)
+
+        // Also verify pre-supermdLoad WRONG_ACTIVE_NOTE after native edit on a previously synced tab.
+        webViewContent.set(replacement)
+        model.recordReaderLoad(activeId, replacement)
+        assertTrue(model.readerSync(activeId, "epoch-2", 0L, replacement).getBoolean("accepted"))
+        mountedId.set("other-mounted-tab")
+        val restored = "# Restored Before Remount\n"
+        model.edit(activeId, restored)
+        model.mode("reader")
+        idleUntil { model.state.value.mode == "reader" }
+        assertEquals(restored, model.state.value.active.content)
+        assertNull(model.state.value.message)
+    }
 }
