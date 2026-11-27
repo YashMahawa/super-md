@@ -119,8 +119,13 @@ export function createSplitScrollSyncController(
     preview: null,
   };
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingSync: { tabId: string; sourcePane: SplitAnchorPane; token: number } | null = null;
+  let activePane: SplitAnchorPane | null = null;
+  let syncToken = 0;
 
   const cancelPending = () => {
+    ++syncToken;
+    pendingSync = null;
     if (settleTimer !== null) {
       clearTimeout(settleTimer);
       settleTimer = null;
@@ -132,6 +137,10 @@ export function createSplitScrollSyncController(
 
   const notePaneInteraction = (pane: SplitAnchorPane) => {
     if (getState()?.mode !== "split") return;
+    if (pendingSync && pendingSync.sourcePane !== pane) {
+      cancelPending();
+    }
+    activePane = pane;
     suppressedTargets[pane] = null;
     clearProgrammaticAnchorScroll(findPaneScroller(pane));
     onPaneSelected(pane);
@@ -139,6 +148,7 @@ export function createSplitScrollSyncController(
 
   const primeScrollTops = (tops: { editor: number | null; preview: number | null }) => {
     cancelPending();
+    activePane = null;
     recordedTops = { editor: tops.editor, preview: tops.preview };
     suppressedTargets = {
       editor: tops.editor !== null ? { top: tops.editor } : null,
@@ -149,15 +159,18 @@ export function createSplitScrollSyncController(
   const hasBlockingSplitOverlay = (): boolean =>
     Boolean(doc.querySelector(".reading-search,.cm-search,.live-active-block"));
 
-  const alignOtherPane = (scheduledTabId: string, sourcePane: SplitAnchorPane) => {
+  const alignOtherPane = (scheduledToken: number) => {
+    const pending = pendingSync;
     settleTimer = null;
+    pendingSync = null;
+    if (!pending || pending.token !== scheduledToken) return;
+    const { tabId: scheduledTabId, sourcePane } = pending;
+    if (activePane !== null && activePane !== sourcePane) return;
     const current = getState();
     if (!current || current.id !== scheduledTabId || current.mode !== "split") return;
     if (isRestoring() || isZooming() || hasBlockingSplitOverlay()) return;
     const readingRoot = doc.querySelector<HTMLElement>(".android-reading");
     if (!readingRoot || readingRoot.dataset.navigating === "true") return;
-
-    onPaneSelected(sourcePane);
 
     if (sourcePane === "editor") {
       const cmScroller = doc.querySelector<HTMLElement>(".cm-scroller");
@@ -193,8 +206,11 @@ export function createSplitScrollSyncController(
 
   const handleInput = (event: Event) => {
     if (getState()?.mode !== "split") return;
-    if (isConsumedBySplitInnerScroller(event)) return;
     const pane = detectSplitPaneFromTarget(event.target);
+    if (pane && pendingSync && pendingSync.sourcePane !== pane) {
+      cancelPending();
+    }
+    if (isConsumedBySplitInnerScroller(event)) return;
     if (pane) notePaneInteraction(pane);
   };
 
@@ -235,6 +251,7 @@ export function createSplitScrollSyncController(
     if (recorded !== null && Math.abs(scroller.scrollTop - recorded) <= 2) return;
 
     recordedTops[pane] = scroller.scrollTop;
+    activePane = pane;
     onPaneSelected(pane);
 
     if (hasBlockingSplitOverlay()) {
@@ -243,12 +260,14 @@ export function createSplitScrollSyncController(
     }
 
     cancelPending();
-    const tabId = current.id;
-    settleTimer = setTimeout(() => alignOtherPane(tabId, pane), settleDelayMs);
+    const scheduledToken = ++syncToken;
+    pendingSync = { tabId: current.id, sourcePane: pane, token: scheduledToken };
+    settleTimer = setTimeout(() => alignOtherPane(scheduledToken), settleDelayMs);
   };
 
   const dispose = () => {
     cancelPending();
+    activePane = null;
     suppressedTargets = { editor: null, preview: null };
   };
 

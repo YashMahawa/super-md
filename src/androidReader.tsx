@@ -25,7 +25,7 @@ import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
 import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, formatEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import { extractSelectedText } from "./copySource";
 import {readingOffset} from "./readingPosition";
-import {applySharedAnchor,captureSharedAnchor,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
+import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
 import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";

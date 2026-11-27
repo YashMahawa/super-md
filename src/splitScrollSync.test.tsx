@@ -196,6 +196,79 @@ describe("native Split view settled scroll alignment", () => {
     controller.dispose();
   });
 
+  it("cancels a queued source-pane sync when focus or pointer interaction selects the opposing pane before settle", () => {
+    const { cmScroller, readingRoot } = buildSplitDom();
+    const cmContent = cmScroller.querySelector<HTMLElement>(".cm-content")!;
+    let editorOffset = 0;
+    const appliedToEditor: Array<{ anchor: PendingEditorAnchor; focus?: boolean }> = [];
+
+    registerEditorAnchorAdapter("split-note", {
+      readingOffset: () => editorOffset,
+      caretOffset: () => 48,
+      scrollTop: () => cmScroller.scrollTop,
+      applyAnchor: (anchor, focus) => {
+        appliedToEditor.push({ anchor, focus });
+        cmScroller.scrollTop = anchor.offset === 0 ? 0 : Math.round(anchor.offset * 1.4);
+      },
+    });
+
+    const selectedHistory: SplitAnchorPane[] = [];
+    const controller = createSplitScrollSyncController({
+      getState: () => ({ id: "split-note", mode: "split" }),
+      isRestoring: () => false,
+      onPaneSelected: (pane) => {
+        selectedHistory.push(pane);
+      },
+    });
+    Object.defineProperty(cmScroller, "scrollTop", { value: 180, writable: true, configurable: true });
+    Object.defineProperty(readingRoot, "scrollTop", { value: 0, writable: true, configurable: true });
+    controller.primeScrollTops({ editor: 180, preview: 0 });
+
+    // 1. Real preview scroll queues Preview -> Source sync, then editor focus selects editor before settle:
+    // must NOT flip selection back to preview (preview -> editor -> preview) or move editor viewport.
+    readingRoot.scrollTop = 310;
+    controller.handleScroll({ target: readingRoot } as unknown as Event);
+    expect(selectedHistory).toEqual(["preview"]);
+
+    vi.advanceTimersByTime(SPLIT_SCROLL_SETTLE_MS - 40);
+    const focusEditor = new FocusEvent("focusin", { bubbles: true });
+    Object.defineProperty(focusEditor, "target", { value: cmContent });
+    controller.handleInput(focusEditor);
+    expect(selectedHistory).toEqual(["preview", "editor"]);
+
+    vi.advanceTimersByTime(SPLIT_SCROLL_SETTLE_MS * 3);
+    expect(selectedHistory).toEqual(["preview", "editor"]);
+    expect(appliedToEditor).toHaveLength(0);
+    expect(cmScroller.scrollTop).toBe(180);
+
+    // 2. Real editor scroll queues Source -> Preview sync, then pointerdown on preview selects preview before settle:
+    // must NOT flip selection back to editor or overwrite preview scrollTop.
+    cmScroller.scrollTop = 620;
+    editorOffset = 450;
+    controller.handleScroll({ target: cmScroller } as unknown as Event);
+    expect(selectedHistory).toEqual(["preview", "editor", "editor"]);
+
+    vi.advanceTimersByTime(SPLIT_SCROLL_SETTLE_MS - 35);
+    const pointerPreview = new Event("pointerdown", { bubbles: true });
+    Object.defineProperty(pointerPreview, "target", { value: readingRoot });
+    controller.handleInput(pointerPreview);
+    expect(selectedHistory).toEqual(["preview", "editor", "editor", "preview"]);
+
+    vi.advanceTimersByTime(SPLIT_SCROLL_SETTLE_MS * 3);
+    expect(selectedHistory).toEqual(["preview", "editor", "editor", "preview"]);
+    expect(readingRoot.scrollTop).toBe(310);
+
+    // 3. Subsequent uncancelled preview scroll still aligns editor cleanly after settle.
+    readingRoot.scrollTop = 844;
+    controller.handleScroll({ target: readingRoot } as unknown as Event);
+    vi.advanceTimersByTime(SPLIT_SCROLL_SETTLE_MS + 10);
+    expect(appliedToEditor).toHaveLength(1);
+    expect(appliedToEditor[0].anchor.offset).toBe(450);
+    expect(selectedHistory.at(-1)).toBe("preview");
+
+    controller.dispose();
+  });
+
   it("ignores independent inner scrollers (<pre>, <table>) while allowing chained root scrolling", () => {
     const { cmScroller, readingRoot } = buildSplitDom();
     const pre = readingRoot.querySelector<HTMLElement>("pre")!;
