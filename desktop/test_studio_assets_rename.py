@@ -211,6 +211,12 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         self.assertEqual(revoked, [])
 
         qt_double = MinimalQtStudio([tab], "tab-1")
+        for over_cap_name in ("a" * 147, "a" * 147 + ".png"):
+            with self.assertRaisesRegex(ValueError, "Asset name must be a simple filename"):
+                studio_portable_assets.attach_tab_asset_native(qt_double, {
+                    "tabId": "tab-1", "expectedRevision": rev,
+                    "mimeType": "image/png", "body": base64.b64encode(PNG_1X1).decode("ascii"), "assetName": over_cap_name,
+                })
         self.assertEqual(
             studio_portable_assets.extra_asset_roots(SimpleNamespace(folder=str(self.open_root), settings={"newNoteLocation": str(self.outside_root)})),
             [self.open_root, self.outside_root],

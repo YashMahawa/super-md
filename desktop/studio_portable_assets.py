@@ -1,15 +1,13 @@
 """Portable .smd asset-staging, attachment, and replacement helpers for Studio."""
 from __future__ import annotations
-import base64, hashlib, re, sys
+import base64, hashlib, sys
 from pathlib import Path
 from typing import Any, Callable
 
 if __package__:
-    from . import documents
-    from .documents import MAX_IMAGE, MIMES, decode_base64_chunked, encode_base64_chunked, image_data
+    from .documents import MAX_IMAGE, MIMES, decode_base64_chunked, encode_base64_chunked, image_data, is_valid_asset_filename
 else:
-    import documents
-    from documents import MAX_IMAGE, MIMES, decode_base64_chunked, encode_base64_chunked, image_data
+    from documents import MAX_IMAGE, MIMES, decode_base64_chunked, encode_base64_chunked, image_data, is_valid_asset_filename
 
 
 def _studio_module():
@@ -65,10 +63,8 @@ def apply_saved_tab_assets(
 
 
 def _is_valid_asset_filename(filename: str) -> bool:
-    validator = getattr(documents, "is_valid_asset_filename", None)
-    if callable(validator):
-        return bool(validator(filename))
-    return bool(re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename)) and filename not in (".", "..")
+    validator = getattr(_studio_module(), "is_valid_asset_filename", is_valid_asset_filename)
+    return bool(validator(filename))
 
 
 def _resolve_local_asset_candidate(
@@ -190,6 +186,8 @@ def prepare_attach_tab_asset(studio_obj: Any, args: dict):
             if not ext:
                 ext = next((item for item, kind in MIMES.items() if kind == mime), "")
                 filename += "." + ext
+                if not _is_valid_asset_filename(filename):
+                    raise ValueError("Asset name must be a simple filename")
             if MIMES.get(ext) != mime:
                 raise ValueError("Asset name extension must match the image type")
             asset_key = "assets/" + filename
