@@ -72,6 +72,7 @@ class StudioSessionTests(unittest.TestCase):
     def test_explicit_collaborators_and_zero_studio_module_lookups(self):
         source = inspect.getsource(studio_session)
         self.assertFalse(hasattr(studio_session, "_studio_module"))
+        self.assertEqual((studio_session.DEFAULTS, studio_session.DEFAULT_PDF), (studio_module.DEFAULTS, studio_module.DEFAULT_PDF))
         self.assertNotIn("_studio_module", source)
         self.assertNotIn("sys.modules", source)
         tree = ast.parse(source)

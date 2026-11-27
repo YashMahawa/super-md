@@ -39,7 +39,7 @@ DEFAULTS = {
     "svgAppearance": "original", "imageContrast": 1.25, "fullDocumentAccessibility": False, "patternKind": "",
     "patternOpacity": -1, "patternSize": 0, "patternSpacing": 0, "desktopIntegration": False,
     "selectionAssistant": "chatgpt", "latexAutofix": False, "typewriterScroll": False,
-    "shortcuts": default_shortcuts(), "agentAccessEnabled": False, "cloudAgentEnabled": False, "keepInBackground": False,
+    "shortcuts": default_shortcuts(), "agentAccessEnabled": False, "cloudAgentEnabled": False, "keepInBackground": False, "hideNonNoteFolders": True,
 }
 
 def _default_snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -> dict:

@@ -140,7 +140,7 @@ internal class ReaderProtocolAndOutlineCoordinator(
         scope.launch(Dispatchers.IO) {
             var temporary: File? = null
             val saved = runCatching {
-                val root = File(app.filesDir, "reader-conflicts").apply { check(isDirectory || mkdirs()) }
+                val root = File(app.filesDir, "reader-conflicts").apply { check((mkdirs() || isDirectory) && isDirectory) }
                 val destination = File(root, "reader-conflict-${UUID.randomUUID()}.json")
                 val tempFile = File(root, destination.name + ".tmp")
                 temporary = tempFile
