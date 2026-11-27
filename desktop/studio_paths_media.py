@@ -192,7 +192,7 @@ def handle_external_drop(
     if not folders and not notes:
         studio_obj.message = (
             "Drop images inside an open note to insert them." if images
-            else "Only Markdown notes (.md, .smd, .fmd, .markdown, .txt) and folders can be opened by dropping."
+            else "Only Markdown notes (.md, .smd, .fmd, .markdown, .qmd, .rmd, .txt) and folders can be opened by dropping."
         )
         studio_obj._emit(False)
         return

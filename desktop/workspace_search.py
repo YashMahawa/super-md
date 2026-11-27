@@ -13,7 +13,7 @@ from typing import Callable, Iterator
 from agent_documents import diagram_spans
 import documents
 
-KNOWN_NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
+KNOWN_NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".qmd", ".rmd", ".md", ".txt")
 MAX_WALK_ENTRIES = 10_000
 MAX_FOLDER_DEPTH = 32
 MAX_SEARCH_MATCHES = 500

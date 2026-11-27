@@ -468,7 +468,16 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     }
 }
 
-internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")
+internal fun noteOpenMimeTypes(): Array<String> = arrayOf(
+    "text/*",
+    "application/octet-stream",
+    "application/vnd.supermd.smd",
+    "application/vnd.supermd.fmd",
+    "application/x-quarto",
+    "application/x-rmarkdown",
+    "application/gzip",
+    "application/x-gzip",
+)
 
 @Composable private fun StudioContent(model: StudioViewModel, state: StudioState, activity: MainActivity, dark: Boolean, motion: Boolean) {
     val scope = rememberCoroutineScope()
@@ -1576,7 +1585,7 @@ internal fun buildHighlightedSnippet(
                     Column(Modifier.weight(1f)) {
                         Text("Search across notes", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
+                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .qmd, .rmd, .txt)"
                             else "No folder open · searching open tabs and accessible recent notes",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

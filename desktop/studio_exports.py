@@ -12,7 +12,7 @@ except ImportError:
     from agent_exports import validate_pdf_options
 
 EXPORT_SUFFIXES = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
-PAYLOAD_FORMATS = {".pdf": "pdf", ".smd": "smd", ".md": "md", ".markdown": "md", ".txt": "md", ".zip": "mdzip"}
+PAYLOAD_FORMATS = {".pdf": "pdf", ".smd": "smd", ".md": "md", ".markdown": "md", ".qmd": "md", ".rmd": "md", ".txt": "md", ".zip": "mdzip"}
 AGENT_EXPORT_EXTENSIONS = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}
 AGENT_EXPORT_COMMANDS = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native"}
 AGENT_EXPORT_MIMES = {"pdf": "application/pdf", "smd": "application/x-supermd", "md": "text/markdown"}

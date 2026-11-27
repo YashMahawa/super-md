@@ -597,6 +597,8 @@ class CompactChromeAndSheetsTest {
             "application/octet-stream",
             "application/vnd.supermd.smd",
             "application/vnd.supermd.fmd",
+            "application/x-quarto",
+            "application/x-rmarkdown",
             "application/gzip",
             "application/x-gzip",
         )

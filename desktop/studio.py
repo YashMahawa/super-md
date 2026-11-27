@@ -4892,7 +4892,7 @@ class Studio(QObject):
         requested_format = args.get("format")
         current_format = "smd" if tab.get("portable") or Path(tab.get("path") or tab["name"]).suffix.lower() == ".smd" else "md"
         filename_suffix = Path(args.get("filename", "")).suffix.lower() if isinstance(args.get("filename", ""), str) else ""
-        filename_format = "smd" if filename_suffix == ".smd" else "md" if filename_suffix in (".md", ".markdown") else None
+        filename_format = "smd" if filename_suffix == ".smd" else "md" if filename_suffix in (".md", ".markdown", ".qmd", ".rmd") else None
         fmt = requested_format or (filename_format if args.get("saveAs") or args.get("filename") else None) or current_format
         if fmt not in ("md", "smd"):
             raise ValueError("Save format must be md or smd")
@@ -5777,7 +5777,7 @@ class Studio(QObject):
             # PDF bytes in an SMD file (or overwrite a portable note with text).
             expected_suffixes = {
                 "export_pdf_native": (".pdf",),
-                "export_markdown_native": (".md", ".markdown", ".txt", ".zip"),
+                "export_markdown_native": (".md", ".markdown", ".qmd", ".rmd", ".txt", ".zip"),
                 "export_fmd_native": (".smd",),
             }
             if command in expected_suffixes and not (command == "export_fmd_native" and args.get("save")):

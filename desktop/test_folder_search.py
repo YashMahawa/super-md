@@ -1061,6 +1061,50 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertEqual(self.studio.folderSearchState["matches"][0]["line"], 3)
         self.assertTrue(self.studio.folderSearchState["matches"][0]["dirty"])
 
+    def test_qmd_and_rmd_extensions_and_case_variants_in_workspace_search(self):
+        from workspace_search import is_searchable_note_name, walk_folder_notes
+
+        for valid in (
+            "report.qmd",
+            "REPORT.QMD",
+            "Mixed.qMd",
+            "analysis.Rmd",
+            "analysis.rmd",
+            "ANALYSIS.RMD",
+            "Mixed.rMd",
+        ):
+            self.assertTrue(is_searchable_note_name(valid), valid)
+
+        for rejected in ("qmd", "rmd", "Rmd", ".hidden.qmd", ".hidden.Rmd", "table.csv"):
+            self.assertFalse(is_searchable_note_name(rejected), rejected)
+
+        sub = self.root / "epidemiology"
+        sub.mkdir(parents=True)
+        (self.root / "cohort-study.QMD").write_text(
+            "---\ntitle: Cohort\n---\n\nBiomarkerSignal appears in Quarto prose.\n",
+            encoding="utf-8",
+        )
+        (sub / "SurvivalAnalysis.Rmd").write_text(
+            "```{r}\nsummary(cars)\n```\n\nBiomarkerSignal appears in R Markdown prose.\n",
+            encoding="utf-8",
+        )
+        (self.root / "qmd").write_text("BiomarkerSignal in dotless qmd", encoding="utf-8")
+        (self.root / ".hidden.Rmd").write_text("BiomarkerSignal in hidden Rmd", encoding="utf-8")
+
+        walked = [item["relative"] for item in walk_folder_notes(self.root)]
+        self.assertEqual(walked, ["cohort-study.QMD", "epidemiology/SurvivalAnalysis.Rmd"])
+
+        result = stream_text_search(
+            "biomarkersignal",
+            [],
+            [],
+            self.root,
+            case_sensitive=False,
+            exclude_diagrams=True,
+        )
+        matched_names = [item["name"] for item in result["matches"]]
+        self.assertEqual(matched_names, ["cohort-study.QMD", "SurvivalAnalysis.Rmd"])
+
     def test_qml_and_webengine_folder_search_escape_and_seeded_reader_search(self):
         if "--webengine-probe" in sys.argv:
             raise unittest.SkipTest("probe subprocess only")
