@@ -5,8 +5,10 @@ import android.net.Uri
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 internal class TabNavigationCoordinator(
@@ -19,6 +21,7 @@ internal class TabNavigationCoordinator(
     private val readerEcho: () -> MutableMap<String, String>,
     private val readClosedNoteRefs: () -> List<ClosedNoteReference>,
     private val writeClosedNoteRefs: (List<ClosedNoteReference>) -> Unit,
+    private val saveClosedNoteIndex: (List<ClosedNoteReference>) -> Unit,
     private val readState: () -> StudioState,
     private val writeState: (StudioState) -> Unit,
     private val changeState: ((StudioState) -> StudioState) -> Unit,
@@ -112,13 +115,13 @@ internal class TabNavigationCoordinator(
             val currentRefs = withContext(Dispatchers.IO) { closedNoteStore.loadIndexStrict() }
             val next = (stillClosed.map { it.second } + currentRefs).distinctBy { it.id }
                 .filterNot { it.id in activeIds }.take(ClosedNoteStore.LIMIT)
-            withContext(Dispatchers.IO) { closedNoteStore.saveIndex(next) }
+            withContext(Dispatchers.IO) { saveClosedNoteIndex(next); writeClosedNoteRefs(next) }
             val replacements = stillClosed.associate { it.first.id to it }
             val finalRefs = next.filter { ref ->
                 val old = replacements[ref.id]?.first
                 old == null || readState().closedTabs.any { it == old }
             }
-            if (finalRefs != next) withContext(Dispatchers.IO) { closedNoteStore.saveIndex(finalRefs) }
+            if (finalRefs != next) withContext(Dispatchers.IO) { saveClosedNoteIndex(finalRefs); writeClosedNoteRefs(finalRefs) }
             writeClosedNoteRefs(finalRefs)
             changeState { state ->
                 state.copy(
@@ -146,25 +149,34 @@ internal class TabNavigationCoordinator(
                 return@launch
             }
             var updatedRefs: List<ClosedNoteReference>? = null
-            val accepted = performCurrentReaderBarrier {
-                if (readState().closedTabs.none { it.id == referenceNote.id }) return@performCurrentReaderBarrier
-                readerEcho().remove(note.id)
-                if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
-                val nextRefs = readClosedNoteRefs().filterNot { it.id == note.id }
-                writeClosedNoteRefs(nextRefs)
-                updatedRefs = nextRefs
-                changeState { state ->
-                    val existing = state.tabs.find { it.id == note.id }
-                    val tabs = if (existing == null) state.tabs + note else state.tabs
-                    state.copy(
-                        tabs = tabs,
-                        closedTabs = state.closedTabs.dropWhile { it.id == referenceNote.id }.filterNot { it.id == referenceNote.id },
-                        activeId = note.id,
-                    )
+            val accepted = closedNoteMutex.withLock {
+                performCurrentReaderBarrier {
+                    if (readState().closedTabs.none { it.id == referenceNote.id }) return@performCurrentReaderBarrier
+                    readerEcho().remove(note.id)
+                    if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
+                    val nextRefs = readClosedNoteRefs().filterNot { it.id == note.id }
+                    writeClosedNoteRefs(nextRefs)
+                    updatedRefs = nextRefs
+                    changeState { state ->
+                        val existing = state.tabs.find { it.id == note.id }
+                        val tabs = if (existing == null) state.tabs + note else state.tabs
+                        state.copy(
+                            tabs = tabs,
+                            closedTabs = state.closedTabs.dropWhile { it.id == referenceNote.id }.filterNot { it.id == referenceNote.id },
+                            activeId = note.id,
+                        )
+                    }
+                }.also { barrierAccepted ->
+                    if (barrierAccepted) {
+                        updatedRefs?.let { refs ->
+                            withContext(NonCancellable + Dispatchers.IO) {
+                                runCatching { saveClosedNoteIndex(refs) }
+                            }
+                        }
+                    }
                 }
             }
             if (!accepted) readerBarrierFailed()
-            else updatedRefs?.let { refs -> withContext(Dispatchers.IO) { runCatching { closedNoteStore.saveIndex(refs) } } }
         }
     }
 }
