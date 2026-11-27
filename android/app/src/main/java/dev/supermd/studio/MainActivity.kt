@@ -142,6 +142,8 @@ class MainActivity : ComponentActivity() {
     private val agentController = AgentWindowController(this) { agentRelayState = it }
     private var workspaceKey = "main"
     internal val agentWorkspaceKey: String get() = workspaceKey
+    @androidx.annotation.VisibleForTesting
+    internal var activityResultRegistryOverride by mutableStateOf(defaultActivityResultRegistryOwnerForTest)
     private val model: StudioViewModel by viewModels { object : androidx.lifecycle.ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : androidx.lifecycle.ViewModel> create(modelClass: Class<T>): T = StudioViewModel(application, workspaceKey) as T
@@ -154,7 +156,16 @@ class MainActivity : ComponentActivity() {
         // Create this task's workspace before RESUMED/lifecycle consumers can
         // request it. Compose's first frame may otherwise run after onResume.
         val windowModel = model
-        setContent { Studio(windowModel, this) }
+        setContent {
+            val registryOverride = activityResultRegistryOverride
+            if (registryOverride != null) {
+                CompositionLocalProvider(androidx.activity.compose.LocalActivityResultRegistryOwner provides registryOverride) {
+                    Studio(windowModel, this)
+                }
+            } else {
+                Studio(windowModel, this)
+            }
+        }
         val savedDispatcherSession = savedInstanceState?.getString(OPEN_DISPATCHER_SESSION)
         if (savedDispatcherSession != windowModel.openDispatcherSessionId) {
             handleExternalDocumentIntent(intent, savedInstanceState, initial = true, targetModel = windowModel)
@@ -299,6 +310,9 @@ class MainActivity : ComponentActivity() {
         private const val OPEN_DISPATCHER_SESSION = "open_dispatcher_session"
         private const val MAX_AGENT_EXPORT_BYTES = 128L * 1024 * 1024
         private const val AGENT_EXPORT_LEASE_MILLIS = 10L * 60 * 1000
+        @Volatile
+        @androidx.annotation.VisibleForTesting
+        internal var defaultActivityResultRegistryOwnerForTest: androidx.activity.result.ActivityResultRegistryOwner? = null
     }
     fun newWindow() {
         model.flush()
@@ -717,7 +731,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 val note = state.active
                 val pendingHeading = state.pendingHeading?.takeIf { it.noteId == note.id }
                 val matchingSeed = seededFind?.takeIf { model.activeMatchesSeedTarget(note, it) }
-                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
+                val payload = JSONObject().put("id", note.id).put("editProtocol", 1).apply { if (readerNote[0] == note.id && (readerContent[0] === note.content || model.readerEcho[note.id] === note.content)) put("contentUnchanged", true) else put("content", note.content) }.put("path", note.uri ?: note.id).put("portable", note.portable).put("mode", actualMode).put("dark", dark).put("fullscreen", state.fullscreen).put("font", state.font).put("size", state.size).put("widthPercent",state.widthPercent).put("lineHeight",state.lineHeight).put("spellCheck",state.spellCheck).put("grammarCheck",state.grammarCheck).put("latexAutofix",state.latexAutofix).put("typewriterScroll",state.typewriterScroll).put("restorePosition",state.restorePosition).put("centerLock",state.centerLock).put("imageAppearance",state.imageAppearance).put("svgAppearance",state.svgAppearance).put("imageContrast",state.imageContrast).put("fullDocumentAccessibility",state.fullDocumentAccessibility).put("colors", tokens).put("zoom", state.zoom).put("motion", motion)
                 if (pendingHeading != null) {
                     payload.put("pendingHeading", JSONObject().put("heading", pendingHeading.heading).put("token", pendingHeading.token))
                 }
@@ -805,9 +819,11 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
                         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
                         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
+                        val activeNeedsAccess = state.writeNeedsAccess(state.active.id) || model.documentWriteNeedsAccess(state.active.id)
                         StudioTopBar(
                             noteName = state.active.name,
-                            statusLabel = if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
+                            statusLabel = if (activeNeedsAccess) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
+                            onRestoreAccess = if (activeNeedsAccess) ({ model.requestWriteAccessIfBlocked(state.active.id, explicit = true) }) else null,
                             fullscreen = state.fullscreen,
                             wide = wide,
                             actualMode = actualMode,
@@ -1400,13 +1416,25 @@ internal fun buildHighlightedSnippet(
     onRename: () -> Unit,
     onSettings: () -> Unit,
     onFolderSearch: () -> Unit = {},
+    onRestoreAccess: (() -> Unit)? = null,
 ) {
     val palette = MaterialTheme.colorScheme
     TopAppBar(
         windowInsets = WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
         colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
         title = {
-            Column(Modifier.fillMaxWidth()) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .then(
+                        if (onRestoreAccess != null) {
+                            Modifier.heightIn(min = 48.dp).clickable(onClick = onRestoreAccess)
+                        } else {
+                            Modifier
+                        },
+                    ),
+                verticalArrangement = Arrangement.Center,
+            ) {
                 Text(noteName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
                 Text(statusLabel, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant)
             }
