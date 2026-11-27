@@ -1183,6 +1183,44 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertEqual(info_props["properties"], {"title": "Spec"})
         self.assertEqual([h["title"] for h in info_props["headings"]], ["Real Heading"])
 
+    def test_outer_whitespace_root_identity_blank_rejection_and_junction_guard(self):
+        from unittest.mock import patch
+
+        from agent import fs_ops
+
+        selected_root, stripped_decoy, trailing_decoy = (
+            self.root / " Study notes ", self.root / "Study notes", self.root / "Study notes ",
+        )
+        for directory in (selected_root, stripped_decoy, trailing_decoy):
+            directory.mkdir()
+        (stripped_decoy / "note.md").write_text("# Decoy\n", encoding="utf-8")
+        (trailing_decoy / "note.md").write_text("# Trailing decoy\n", encoding="utf-8")
+        for bad_root in ("", "   ", "\t\n", "bad\0root"):
+            with self.assertRaises(AgentDocumentError):
+                DocumentStore([bad_root])
+        ws = DocumentStore([str(selected_root)])
+        self.assertEqual(ws.roots, (selected_root.resolve(strict=True),))
+        for bad_target in ("", "   ", "note\0.md", str(stripped_decoy / "note.md"), str(trailing_decoy / "note.md")):
+            with self.assertRaises(AgentDocumentError):
+                ws.resolve(bad_target)
+        created = ws.create(" spaced note .md ", "# Spaced\nalpha\n")
+        self.assertTrue((selected_root / " spaced note .md ").is_file())
+        self.assertFalse((stripped_decoy / " spaced note .md ").exists())
+        patched = ws.patch(str(selected_root / " spaced note .md "), expected_revision=created["revision"],
+                           operations=[{"type": "replace", "old": "alpha", "new": "beta"}])
+        self.assertNotEqual(patched["revision"], created["revision"])
+        self.assertEqual(ws.read(" spaced note .md ", view="source")["text"], "# Spaced\nbeta\n")
+        with self.assertRaises(RevisionConflict):
+            ws.patch(" spaced note .md ", expected_revision=created["revision"],
+                     operations=[{"type": "replace", "old": "beta", "new": "gamma"}])
+        junction_dir = selected_root / "junction-sub"
+        junction_dir.mkdir()
+        (junction_dir / "inside.md").write_text("# Inside\n", encoding="utf-8")
+        with patch.object(Path, "is_junction", autospec=True, side_effect=lambda p: p.name == "junction-sub"):
+            self.assertEqual(fs_ops._symlink_component(junction_dir / "inside.md"), junction_dir)
+            with self.assertRaisesRegex(AgentDocumentError, "Symlink paths are not allowed"):
+                ws.resolve("junction-sub/inside.md")
+
 
 if __name__ == "__main__":
     unittest.main()

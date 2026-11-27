@@ -60,14 +60,26 @@ def digest_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _clean_path_input(value: str | os.PathLike[str], *, error: str) -> str:
+    raw = os.fspath(value) if isinstance(value, (str, os.PathLike)) else ""
+    if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
+        raise AgentDocumentError(error)
+    if raw.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + raw[8:]
+    return raw.removeprefix("\\\\?\\")
+
+
 def _symlink_component(path: Path) -> Path | None:
-    """Find a symlink in an absolute path without resolving through it."""
+    """Find a symlink or junction in an absolute path without resolving through it."""
     absolute = Path(os.path.abspath(path))
     current = Path(absolute.anchor)
     for component in absolute.parts[1:]:
         current /= component
         try:
             if stat.S_ISLNK(current.lstat().st_mode):
+                return current
+            is_junction = getattr(current, "is_junction", None)
+            if callable(is_junction) and is_junction():
                 return current
         except FileNotFoundError:
             break

@@ -46,8 +46,9 @@ class DocumentStore:
         normalized: list[Path] = []
         aliases: list[tuple[Path, Path]] = []
         for value in roots:
-            supplied = Path(os.path.abspath(Path(value).expanduser()))
-            root = supplied.resolve(strict=True)
+            raw_root = fs_ops._clean_path_input(value, error="At least one explicit workspace root is required")
+            supplied = Path(os.path.abspath(Path(raw_root).expanduser()))
+            root = Path(fs_ops._clean_path_input(supplied.resolve(strict=True), error="At least one explicit workspace root is required"))
             if not root.is_dir():
                 raise AgentDocumentError(f"Workspace root is not a directory: {root}")
             if root not in normalized:
@@ -63,7 +64,7 @@ class DocumentStore:
 
     def resolve(self, value: str | os.PathLike[str], *, must_exist: bool = True) -> Path:
         """Resolve a caller path under one configured root; reject symlinks and hidden entries."""
-        raw = Path(value).expanduser()
+        raw = Path(fs_ops._clean_path_input(value, error="Path is outside the configured workspace roots or does not exist")).expanduser()
         if not raw.is_absolute() and any(part not in (".", "..") and part.startswith(".") for part in raw.parts):
             raise AgentDocumentError("Hidden files and directories are not allowed")
         candidates = [raw] if raw.is_absolute() else [root / raw for root in self.roots]
