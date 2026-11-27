@@ -13,11 +13,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.test.SemanticsNodeInteractionCollection
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasContentDescription
+import androidx.compose.ui.test.hasSetTextAction
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isEnabled
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTextReplacement
 import androidx.core.app.ActivityOptionsCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
@@ -425,6 +429,180 @@ class RevocableDocumentAccessEmulatorTest {
             assertTrue("Note outside granted folder must stay write-blocked", model!!.documentWriteNeedsAccess(outsideId))
             selectAndAwait(scenario, model!!, outsideId)
             waitForNodeText("Local draft · restore file access")
+        }
+    }
+
+    @Test
+    fun renameNoteDialogRoutesRevokedAndDowngradedGrantsToRestoreAccessWithoutAutoReplay() {
+        val workspaceKey = "emu-rename-${UUID.randomUUID().toString().take(8)}".also(workspaceKeys::add)
+        val directBaseline = "# Direct Rename Baseline\n"
+        val directUri = RevocableTestDocumentsProvider.putMarkdown(app, "DirectRename.md", directBaseline)
+        RevocableTestDocumentsProvider.grantReadWrite(directUri)
+
+        val treeUri = RevocableTestDocumentsProvider.treeUri(app, "renamevault")
+        val treeBaseline = "# Vault Rename Baseline\n"
+        RevocableTestDocumentsProvider.putMarkdown(app, "renamevault/TreeRename.md", treeBaseline)
+        RevocableTestDocumentsProvider.grantReadWrite(treeUri)
+        val treeDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "renamevault/TreeRename.md")
+
+        val accessPickerResultRef = AtomicReference<((Uri?) -> Uri?)?>(null)
+        MainActivity.defaultActivityResultRegistryOwnerForTest = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry: ActivityResultRegistry = object : ActivityResultRegistry() {
+                override fun <I, O> onLaunch(
+                    requestCode: Int,
+                    contract: ActivityResultContract<I, O>,
+                    input: I,
+                    options: ActivityOptionsCompat?,
+                ) {
+                    if (contract is RestoreDocumentAccess) {
+                        val callback = accessPickerResultRef.get()
+                        val result = callback?.invoke(input as? Uri)
+                        dispatchResult(requestCode, result)
+                    } else {
+                        dispatchResult(requestCode, Activity.RESULT_CANCELED, null)
+                    }
+                }
+            }
+        }
+
+        val launchIntent = Intent(app, MainActivity::class.java)
+            .putExtra("workspace", workspaceKey)
+
+        ActivityScenario.launch<MainActivity>(launchIntent).use { scenario ->
+            var model: StudioViewModel? = null
+            scenario.onActivity { activity ->
+                model = ViewModelProvider(activity)[StudioViewModel::class.java]
+            }
+            awaitActiveReader(model!!)
+
+            // Part 1: Direct grant — ordinary provider error stays inline; downgraded/revoked grant routes to
+            // Restore file access, preserves draft without auto-replaying rename, and pre-fills target name on retry.
+            val directId = openAndAwait(scenario, model!!, directUri)
+            val directDraft = "# Direct Rename Baseline\n\nUnsaved local draft preserved across rename denial.\n"
+            editAndAwait(scenario, model!!, directId, directDraft)
+            waitForNodeText("Unsaved")
+
+            RevocableTestDocumentsProvider.setOrdinaryRenameError("DirectRename.md", true)
+            compose.onNodeWithContentDescription("More actions").performClick()
+            waitForNodeText("Rename note")
+            compose.onNodeWithText("Rename note").performClick()
+            waitForNodeText("Note name")
+            compose.onNode(hasSetTextAction()).performTextReplacement("RenamedDirect")
+            compose.onNodeWithText("Rename").performClick()
+
+            waitForNodeText("Simulated transient provider rename error for DirectRename.md")
+            assertFalse("Ordinary provider error must not mark write-blocked", model!!.documentWriteNeedsAccess(directId))
+            assertNull(model!!.documentAccessRequests.value)
+            assertEquals(directDraft, model!!.state.value.tabs.single { it.id == directId }.content)
+            RevocableTestDocumentsProvider.setOrdinaryRenameError("DirectRename.md", false)
+            compose.onNodeWithText("Cancel").performClick()
+            waitForCondition { !compose.onAllNodesWithText("Note name").hasAnyNode() }
+
+            // Downgrade direct grant to read-only right before submitting Rename note.
+            RevocableTestDocumentsProvider.revokeAll(directUri)
+            RevocableTestDocumentsProvider.grantReadOnly(directUri)
+            compose.onNodeWithContentDescription("More actions").performClick()
+            waitForNodeText("Rename note")
+            compose.onNodeWithText("Rename note").performClick()
+            waitForNodeText("Note name")
+            compose.onNode(hasSetTextAction()).performTextReplacement("RenamedDirect")
+            compose.onNodeWithText("Rename").performClick()
+
+            waitForNodeText("Restore file access")
+            assertFalse("Rename note dialog should hand off cleanly to Restore file access", compose.onAllNodesWithText("Note name").hasAnyNode())
+            assertTrue(model!!.documentWriteNeedsAccess(directId))
+            assertNull(model!!.state.value.error)
+            assertEquals("DirectRename.md", model!!.state.value.tabs.single { it.id == directId }.name)
+            assertEquals(directDraft, model!!.state.value.tabs.single { it.id == directId }.content)
+
+            val attemptsBeforeRestore = RevocableTestDocumentsProvider.renameAttempts("DirectRename.md")
+            accessPickerResultRef.set {
+                RevocableTestDocumentsProvider.grantReadWrite(directUri)
+                directUri
+            }
+            compose.onNodeWithText("Choose original file").performClick()
+            waitForCondition {
+                !model!!.documentWriteNeedsAccess(directId) &&
+                    model!!.documentAccessRequests.value == null
+            }
+            assertEquals("Restore must not auto-replay rename", attemptsBeforeRestore, RevocableTestDocumentsProvider.renameAttempts("DirectRename.md"))
+            assertEquals("DirectRename.md", model!!.state.value.tabs.single { it.id == directId }.name)
+            assertEquals(directDraft, model!!.state.value.tabs.single { it.id == directId }.content)
+            assertTrue(RevocableTestDocumentsProvider.fileForDocId(app, "DirectRename.md").exists())
+            assertFalse(RevocableTestDocumentsProvider.fileForDocId(app, "RenamedDirect.md").exists())
+
+            // Explicit user retry re-opens Rename note with the previously typed target name preserved.
+            compose.onNodeWithContentDescription("More actions").performClick()
+            waitForNodeText("Rename note")
+            compose.onNodeWithText("Rename note").performClick()
+            waitForCondition { compose.onAllNodes(hasSetTextAction() and hasText("RenamedDirect")).hasAnyNode() }
+            compose.onNodeWithText("Rename").performClick()
+            waitForCondition {
+                model!!.state.value.tabs.single { it.id == directId }.name == "RenamedDirect.md"
+            }
+            assertEquals(directDraft, model!!.state.value.tabs.single { it.id == directId }.content)
+            assertEquals(directBaseline, RevocableTestDocumentsProvider.fileForDocId(app, "RenamedDirect.md").readText(Charsets.UTF_8))
+
+            // Part 2: Containing-folder tree grant downgraded (read-only) & revoked -> Rename routes to Restore file
+            // access, preserves draft, does not auto-replay when folder RW returns, and succeeds on explicit retry.
+            scenario.onActivity { model!!.setFolder(treeUri) }
+            waitForCondition {
+                model!!.state.value.folder == treeUri.toString() &&
+                    model!!.state.value.files.any { it.name == "TreeRename.md" }
+            }
+            val treeTabId = openAndAwait(scenario, model!!, treeDocUri, relative = "TreeRename.md")
+            val treeDraft = "# Vault Rename Baseline\n\nUnsaved folder note draft.\n"
+            editAndAwait(scenario, model!!, treeTabId, treeDraft)
+
+            RevocableTestDocumentsProvider.revokeAll(treeUri)
+            RevocableTestDocumentsProvider.grantReadOnly(treeUri)
+            compose.onNodeWithContentDescription("More actions").performClick()
+            waitForNodeText("Rename note")
+            compose.onNodeWithText("Rename note").performClick()
+            waitForNodeText("Note name")
+            compose.onNode(hasSetTextAction()).performTextReplacement("RenamedVaultNote")
+            compose.onNodeWithText("Rename").performClick()
+
+            waitForNodeText("Restore file access")
+            assertTrue(model!!.documentWriteNeedsAccess(treeTabId))
+            assertNull(model!!.state.value.error)
+            assertEquals("TreeRename.md", model!!.state.value.tabs.single { it.id == treeTabId }.name)
+            assertEquals(treeDraft, model!!.state.value.tabs.single { it.id == treeTabId }.content)
+            compose.onNodeWithText("Not now").performClick()
+
+            RevocableTestDocumentsProvider.revokeAll(treeUri)
+            compose.onNodeWithContentDescription("More actions").performClick()
+            waitForNodeText("Rename note")
+            compose.onNodeWithText("Rename note").performClick()
+            waitForCondition { compose.onAllNodes(hasSetTextAction() and hasText("RenamedVaultNote")).hasAnyNode() }
+            compose.onNodeWithText("Rename").performClick()
+
+            waitForNodeText("Restore file access")
+            assertTrue(model!!.documentWriteNeedsAccess(treeTabId))
+            assertNull(model!!.state.value.error)
+            assertEquals("TreeRename.md", model!!.state.value.tabs.single { it.id == treeTabId }.name)
+            assertEquals(treeDraft, model!!.state.value.tabs.single { it.id == treeTabId }.content)
+
+            compose.onNodeWithText("Not now").performClick()
+            RevocableTestDocumentsProvider.grantReadWrite(treeUri)
+            scenario.onActivity { model!!.setFolder(treeUri) }
+            waitForCondition {
+                !model!!.documentWriteNeedsAccess(treeTabId) &&
+                    model!!.state.value.files.any { it.name == "TreeRename.md" }
+            }
+            assertEquals("Folder regrant must not auto-replay rename", "TreeRename.md", model!!.state.value.tabs.single { it.id == treeTabId }.name)
+            assertFalse(RevocableTestDocumentsProvider.fileForDocId(app, "renamevault/RenamedVaultNote.md").exists())
+
+            compose.onNodeWithContentDescription("More actions").performClick()
+            waitForNodeText("Rename note")
+            compose.onNodeWithText("Rename note").performClick()
+            waitForCondition { compose.onAllNodes(hasSetTextAction() and hasText("RenamedVaultNote")).hasAnyNode() }
+            compose.onNodeWithText("Rename").performClick()
+            waitForCondition {
+                model!!.state.value.tabs.single { it.id == treeTabId }.name == "RenamedVaultNote.md"
+            }
+            assertEquals(treeDraft, model!!.state.value.tabs.single { it.id == treeTabId }.content)
+            assertEquals(treeBaseline, RevocableTestDocumentsProvider.fileForDocId(app, "renamevault/RenamedVaultNote.md").readText(Charsets.UTF_8))
         }
     }
 

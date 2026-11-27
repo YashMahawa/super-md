@@ -244,7 +244,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private fun writeIsBlocked(uri: String) = synchronized(blockedDocumentWrites) {
         blockedDocumentWrites.any { sameDocumentUri(it, uri) }
     }
-    private fun clearDocumentAccessFailure(uri: String) {
+    internal fun clearDocumentAccessFailure(uri: String) {
         documentAccessClearSeq.incrementAndGet()
         synchronized(blockedDocumentWrites) {
             blockedDocumentWrites.removeAll { sameDocumentUri(it, uri) }
@@ -287,7 +287,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     }
     private fun resolveVerifiedWriteDestination(source: Uri): Uri {
         val candidate = documentAccess.resolve(source, writing = true)
-        if (!DocumentsContract.isTreeUri(candidate) || documentAccess.hasWriteGrant(candidate)) {
+        if (!DocumentsContract.isTreeUri(candidate) || (documentAccess.hasTreeScopedWriteGrant(candidate) && documentAccess.hasWriteGrant(candidate))) {
+            return candidate
+        }
+        if (DocumentsContract.isTreeUri(source) &&
+            documentAccess.confirmEmbeddedTreeMembershipIfWritable(candidate) &&
+            documentAccess.hasTreeScopedWriteGrant(candidate) &&
+            documentAccess.hasWriteGrant(candidate)
+        ) {
             return candidate
         }
         if (!DocumentsContract.isTreeUri(source)) {
@@ -309,6 +316,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val note = mutable.value.tabs.firstOrNull { it.id == id }
         return if (isDocumentAccessFailure(error) && note?.uri != null) requestDocumentAccess(note.uri, note, writing = true)
         else { fail(fallback); fallback }
+    }
+    internal fun reportDocumentRenameFailure(id: String, error: Throwable, showGlobalError: Boolean = true): String {
+        val note = mutable.value.tabs.firstOrNull { it.id == id }
+        if (isDocumentAccessFailure(error) && note?.uri != null) {
+            return requestDocumentAccess(note.uri, note, writing = true, explicit = true)
+        }
+        val msg = error.message ?: "Could not rename note"
+        if (showGlobalError) fail("Could not rename note: $msg")
+        return msg
     }
     fun restoreDocumentAccess(request: DocumentAccessRequest, chosen: Uri) = viewModelScope.launch {
         val wasBlockedBeforeRestore = writeIsBlocked(request.uri) || writeIsBlocked(chosen.toString())
@@ -2219,52 +2235,91 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 onResult(true, null)
                 return@launch
             }
+            val ownShareAuthority = "${getApplication<Application>().packageName}.share"
             val parsedUri = Uri.parse(existingUri)
+            if (writeIsBlocked(existingUri)) {
+                val lazilyConfirmed = DocumentsContract.isTreeUri(parsedUri) &&
+                    documentAccess.resolveReadAccess(parsedUri) is SafReadAccess.PendingTreeMembership &&
+                    withContext(Dispatchers.IO) { documentAccess.confirmEmbeddedTreeMembershipIfWritable(parsedUri) }
+                if (lazilyConfirmed) {
+                    clearDocumentAccessFailure(existingUri)
+                } else if (requestWriteAccessIfBlocked(id, explicit = true)) {
+                    onResult(false, DOCUMENT_ACCESS_MESSAGE)
+                    return@launch
+                }
+            }
+            val currentFolderRaw = mutable.value.folder
+            val currentFolderUri = currentFolderRaw?.let(Uri::parse)
+            val openFolderReadable = currentFolderUri != null &&
+                withContext(Dispatchers.IO) { documentAccess.resolveReadableTreeRoot(currentFolderUri) != null }
             val openFolderRel = note.relative
                 ?: relativeInOpenFolder(parsedUri)
-                ?: if (mutable.value.folder != null) withContext(Dispatchers.IO) { resolveOpenFolderRelativeOnIo(parsedUri) } else null
-            if (openFolderRel != null && mutable.value.folder != null) {
-                performRenameFolderEntry(parsedUri, openFolderRel, isDirectory = false, validatedName = name)
-                onResult(true, null)
-                return@launch
+                ?: if (openFolderReadable) withContext(Dispatchers.IO) { resolveOpenFolderRelativeOnIo(parsedUri) } else null
+            if (openFolderRel != null && currentFolderUri != null) {
+                if (openFolderReadable) {
+                    performRenameFolderEntry(parsedUri, openFolderRel, isDirectory = false, validatedName = name)
+                    clearDocumentAccessFailure(existingUri)
+                    mutable.value.tabs.find { it.id == id }?.uri?.let(::clearDocumentAccessFailure)
+                    onResult(true, null)
+                    return@launch
+                }
+                val hasStandaloneWrite = withContext(Dispatchers.IO) {
+                    val target = resolveVerifiedWriteDestination(parsedUri)
+                    !DocumentsContract.isTreeUri(target) &&
+                        (target.scheme != "content" || target.authority == ownShareAuthority || documentAccess.hasWriteGrant(target))
+                }
+                if (!hasStandaloneWrite) {
+                    throw SecurityException("Choose the folder again to restore access")
+                }
             }
             val renamedUri = withContext(Dispatchers.IO) {
                 documentWrites.withLock {
                     val target = resolveVerifiedWriteDestination(parsedUri)
+                    if (target.scheme == "content" && target.authority != ownShareAuthority && !documentAccess.hasWriteGrant(target)) {
+                        throw SecurityException("Android did not grant write access to this file")
+                    }
+                    val targetTreeWritable = DocumentsContract.isTreeUri(target) &&
+                        documentAccess.hasTreeScopedWriteGrant(target) &&
+                        documentAccess.hasWriteGrant(target)
                     val rawRenamed = DocumentsContract.renameDocument(resolver, target, name)
                         ?: error("This provider does not support renaming. Use Save as instead.")
                     val hadConfirmedSource = listOfNotNull(
                         canonicalTreeDocumentKey(parsedUri),
                         canonicalTreeDocumentKey(target),
                     ).any(confirmedTreeDocumentKeys::remove)
-                    val canScopeToTargetTree = DocumentsContract.isTreeUri(target) &&
-                        !DocumentsContract.isTreeUri(rawRenamed) &&
-                        (hadConfirmedSource || isKnownPathContainedInTree(
+                    val confirmedInTargetTree = targetTreeWritable && (
+                        hadConfirmedSource || isKnownPathContainedInTree(
                             target.authority,
                             runCatching { DocumentsContract.getTreeDocumentId(target) }.getOrDefault(""),
                             runCatching { DocumentsContract.getDocumentId(rawRenamed) }.getOrDefault(""),
-                        ))
-                    val effectiveRenamed = if (canScopeToTargetTree) {
+                        )
+                    )
+                    val effectiveRenamed = if (confirmedInTargetTree && !DocumentsContract.isTreeUri(rawRenamed)) {
                         canonicalTreeScopedUri(target, rawRenamed)
                     } else {
                         rawRenamed
                     }
                     documentAccess.persist(effectiveRenamed)
-                    if (hadConfirmedSource) {
+                    if (hadConfirmedSource && confirmedInTargetTree) {
                         canonicalTreeDocumentKey(effectiveRenamed)?.let(confirmedTreeDocumentKeys::add)
                     }
                     effectiveRenamed.toString()
                 }
             }
             val newRelative = renamedRelative(note.relative, name)
-            applyUriRemaps(listOf(UriRemap(existingUri, renamedUri, name, note.relative, newRelative)), statusMessage = "Renamed to $name")
+            clearDocumentAccessFailure(existingUri)
+            clearDocumentAccessFailure(renamedUri)
+            applyUriRemaps(
+                listOf(UriRemap(existingUri, renamedUri, name, note.relative, newRelative)),
+                folderTreeRaw = if (currentFolderUri != null && !openFolderReadable) "" else null,
+                statusMessage = "Renamed to $name",
+            )
             mutable.value.tabs.find { it.id == id }?.let(::remember)
             onResult(true, null)
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            val msg = error.message ?: "Could not rename note"
-            if (showGlobalError) fail("Could not rename note: $msg")
+            val msg = reportDocumentRenameFailure(id, error, showGlobalError = showGlobalError)
             onResult(false, msg)
         }
     }
@@ -3801,14 +3856,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     emptyMap()
                 }
 
-                val targetForRename = confirmedEntryTreeUri ?: resolveVerifiedWriteDestination(entryUri)
+                val ownShareAuthority = "${getApplication<Application>().packageName}.share"
+                val treeWritable = documentAccess.hasTreeScopedWriteGrant(resolvedParent.treeUri)
+                val targetForRename = confirmedEntryTreeUri
+                    ?.takeIf { treeWritable }
+                    ?: resolveVerifiedWriteDestination(entryUri)
+                if (targetForRename.scheme == "content" &&
+                    targetForRename.authority != ownShareAuthority &&
+                    !(targetForRename == confirmedEntryTreeUri && treeWritable) &&
+                    !documentAccess.hasWriteGrant(targetForRename)
+                ) {
+                    throw SecurityException("Android did not grant write access to this file")
+                }
                 val rawRenamedUri = DocumentsContract.renameDocument(resolver, targetForRename, validatedName)
                     ?: error("This storage provider does not support renaming")
-                val confirmedInOpenTree = confirmedEntryTreeUri != null ||
-                    isKnownPathContainedInTree(
-                        resolvedParent.treeUri.authority,
-                        resolvedParent.rootDocumentId,
-                        runCatching { DocumentsContract.getDocumentId(rawRenamedUri) }.getOrDefault(""),
+                val confirmedInOpenTree = treeWritable && (
+                    confirmedEntryTreeUri != null ||
+                        isKnownPathContainedInTree(
+                            resolvedParent.treeUri.authority,
+                            resolvedParent.rootDocumentId,
+                            runCatching { DocumentsContract.getDocumentId(rawRenamedUri) }.getOrDefault(""),
+                        )
                     )
                 val renamedUri = if (confirmedInOpenTree) {
                     canonicalTreeScopedUri(resolvedParent.treeUri, rawRenamedUri)
