@@ -17,8 +17,14 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
         "  Client->>Exporter: Load relative .mermaid",
         "  Exporter-->>Client: Vector SVG asset",
       ].join("\n"),
+      "figures/Flow.mmd": [
+        "flowchart TD",
+        '  Encoded["Flow%2Emmd Path"] --> Cleaned["Decoded Flow.mmd"]',
+      ].join("\n"),
       "diagrams/broken.mmd": "flowchart TD\n  A -->\n  invalid syntax ???\n",
     };
+    const pngDataUrl =
+      "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
     (window as any).__pdfCaptures = [] as Array<{ command: string; args: any }>;
 
@@ -44,7 +50,19 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
             window.supermdReply?.(id, { text: mermaidFiles[source] }, null);
             return;
           }
-          if (command === "load_asset" || command === "fetch_resource") {
+          if (command === "load_asset") {
+            const source = String(args.source || "");
+            if (
+              source === "figures/photo.png?label=flow.mmd" ||
+              source === "figures/photo.png#flow.mmd"
+            ) {
+              window.supermdReply?.(id, pngDataUrl, null);
+              return;
+            }
+            window.supermdReply?.(id, null, `Unexpected load_asset source: ${source}`);
+            return;
+          }
+          if (command === "fetch_resource") {
             window.supermdReply?.(id, null, `Unexpected ${command} call`);
             return;
           }
@@ -61,7 +79,7 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
   await page.goto("/android-reader.html");
   await page.waitForFunction(() => typeof window.supermdLoad === "function");
 
-  // 1. Valid relative .mmd and .mermaid image links render real SVG diagrams in Chromium PDF preparation.
+  // 1. Valid relative .mmd, .mermaid, and encoded Flow%2Emmd image links render real SVG diagrams while ordinary PNGs with .mmd query/fragment stay on load_asset.
   await page.evaluate(async () => {
     window.supermdLoad?.({
       id: "mermaid-pdf-ok",
@@ -74,6 +92,12 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
         "![Handshake Sequence][seq]",
         "",
         "![[diagrams/architecture.mmd|320]]",
+        "",
+        "![Encoded Flow](figures/Flow%2Emmd?label=photo.png#top)",
+        "",
+        "![Query Photo](figures/photo.png?label=flow.mmd)",
+        "",
+        "![Fragment Photo](figures/photo.png#flow.mmd)",
         "",
         "[Source file](diagrams/architecture.mmd)",
         "",
@@ -102,12 +126,15 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
   const okCaptures = await page.evaluate(() => (window as any).__pdfCaptures);
   expect(okCaptures.filter((c: any) => c.command === "export_failed")).toEqual([]);
   expect(okCaptures.filter((c: any) => c.command === "fetch_resource")).toEqual([]);
-  expect(okCaptures.filter((c: any) => c.command === "load_asset")).toEqual([]);
+  expect(
+    okCaptures.filter((c: any) => c.command === "load_asset").map((c: any) => c.args.source),
+  ).toEqual(["figures/photo.png?label=flow.mmd", "figures/photo.png#flow.mmd"]);
 
   const textLoads = okCaptures.filter((c: any) => c.command === "load_text_asset");
   expect(textLoads.map((c: any) => c.args.source)).toEqual([
     "diagrams/architecture.mmd",
     "diagrams/handshake.mermaid",
+    "figures/Flow.mmd",
   ]);
 
   const pdfExportCall = okCaptures.find((c: any) => c.command === "export_pdf_native");
@@ -120,10 +147,19 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
   expect(preparedContent).toMatch(/!\[System Architecture\]\(diagram-\d+\.svg "Architecture caption"\)/);
   expect(preparedContent).toMatch(/!\[Handshake Sequence\]\(diagram-\d+\.svg\)/);
   expect(preparedContent).toMatch(/!\[diagrams\/architecture\.mmd\]\(diagram-\d+\.svg\)\{width=320\}/);
+  expect(preparedContent).toMatch(/!\[Encoded Flow\]\(diagram-\d+\.svg\)/);
+  expect(preparedContent).toMatch(/!\[Query Photo\]\(asset-\d+\.png\)/);
+  expect(preparedContent).toMatch(/!\[Fragment Photo\]\(asset-\d+\.png\)/);
   expect(preparedContent).toContain("[Source file](diagrams/architecture.mmd)");
 
   const assetNames = Object.keys(preparedAssets);
-  expect(assetNames).toHaveLength(3);
+  expect(assetNames).toHaveLength(6);
+  const svgAssets = Object.fromEntries(
+    Object.entries(preparedAssets).filter(([name]) => name.endsWith(".svg")),
+  );
+  const pngAssets = Object.entries(preparedAssets).filter(([name]) => name.endsWith(".png"));
+  expect(Object.keys(svgAssets)).toHaveLength(4);
+  expect(pngAssets).toHaveLength(2);
 
   const verifiedSvgs = await page.evaluate((assets: Record<string, string>) => {
     return Object.entries(assets).map(([name, b64]) => {
@@ -140,7 +176,7 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
         shapeCount: root.querySelectorAll("path, rect, line, polygon, circle, g").length,
       };
     });
-  }, preparedAssets);
+  }, svgAssets);
 
   for (const svg of verifiedSvgs) {
     expect(svg.hasParserError).toBe(false);
@@ -153,6 +189,9 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
     true,
   );
   expect(verifiedSvgs.some(svg => svg.text.includes("Load relative .mermaid") && svg.text.includes("Vector SVG asset"))).toBe(
+    true,
+  );
+  expect(verifiedSvgs.some(svg => svg.text.includes("Flow%2Emmd Path") && svg.text.includes("Decoded Flow.mmd"))).toBe(
     true,
   );
 
@@ -173,8 +212,8 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
     {
       id: "rejected-traversal",
       path: "/workspace/notes/architecture.md",
-      markdown: "![Traversal](../outside.mmd)",
-      expected: /Cannot safely resolve Mermaid source \.\.\/outside\.mmd/,
+      markdown: "![Traversal](../outside%2Emmd)",
+      expected: /Cannot safely resolve Mermaid source \.\.\/outside%2Emmd/,
       expectNoIpc: true,
     },
     {
@@ -192,7 +231,7 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
     {
       id: "rejected-remote-consent",
       path: "/workspace/notes/architecture.md",
-      markdown: "![Remote Mermaid](https://evil.example/diagram.mmd)",
+      markdown: "![Remote Mermaid](https://evil.example/figures/Flow%2Emmd)",
       expected: /Remote image from evil\.example requires explicit consent in the reader before exporting PDF/,
       expectNoIpc: true,
     },

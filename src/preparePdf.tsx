@@ -12,6 +12,7 @@ import { invoke } from "./nativeBridge";
 import {
   isMermaidSourcePath,
   loadLocalMermaidSource,
+  normalizeLocalMermaidSource,
   validateLocalMermaidSourcePath,
 } from "./markdownExport";
 import {
@@ -371,35 +372,36 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
     }
     if (node.type === "image") {
       const fromHtmlImg = Boolean(node.data?.htmlImage);
-      const rawUrl = String(node.url || "").trim();
-      if (isMermaidSourcePath(rawUrl)) {
-        if (/^https?:/i.test(rawUrl) || rawUrl.startsWith("//")) {
-          if (!isRemoteImageApproved(rawUrl, trustedHosts, approvedUrls)) {
-            const host = remoteImageHost(rawUrl);
+      const sourceUrl = String(node.url || "");
+      if (isMermaidSourcePath(sourceUrl)) {
+        if (/^https?:/i.test(sourceUrl) || sourceUrl.startsWith("//")) {
+          if (!isRemoteImageApproved(sourceUrl, trustedHosts, approvedUrls)) {
+            const host = remoteImageHost(sourceUrl);
             throw new Error(
               host
                 ? `Remote image from ${host} requires explicit consent in the reader before exporting PDF.`
-                : `Remote image ${rawUrl} requires explicit consent in the reader before exporting PDF.`,
+                : `Remote image ${sourceUrl} requires explicit consent in the reader before exporting PDF.`,
             );
           }
-          throw new Error(`Mermaid source must be a local .mmd or .mermaid file: ${rawUrl}`);
+          throw new Error(`Mermaid source must be a local .mmd or .mermaid file: ${sourceUrl}`);
         }
-        validateLocalMermaidSourcePath(rawUrl);
+        const relative = validateLocalMermaidSourcePath(sourceUrl);
         if (!documentPath) {
-          throw new Error(`Save your note before exporting relative Mermaid diagram ${rawUrl}.`);
+          throw new Error(`Save your note before exporting relative Mermaid diagram ${sourceUrl}.`);
         }
+        const normalizedSource = normalizeLocalMermaidSource(relative);
         work.push(async () => {
           checkCurrent();
-          let pending = mermaidSources.get(rawUrl);
+          let pending = mermaidSources.get(normalizedSource);
           if (!pending) {
-            pending = loadLocalMermaidSource(documentPath, rawUrl);
+            pending = loadLocalMermaidSource(documentPath, sourceUrl);
             pending.catch(() => {});
-            mermaidSources.set(rawUrl, pending);
+            mermaidSources.set(normalizedSource, pending);
           }
           const mermaidText = await pending;
           checkCurrent();
           if (!mermaidText.trim()) {
-            throw new Error(`Mermaid source is empty: ${rawUrl}`);
+            throw new Error(`Mermaid source is empty: ${sourceUrl}`);
           }
           let svg: string;
           try {
@@ -407,7 +409,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
           } catch (error) {
             if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
             const detail = error instanceof Error ? error.message : String(error);
-            throw new Error(`Invalid Mermaid diagram in ${rawUrl}: ${detail}`);
+            throw new Error(`Invalid Mermaid diagram in ${sourceUrl}: ${detail}`);
           }
           checkCurrent();
           const url = await data(new Blob([svg], { type: "image/svg+xml" }));
@@ -418,6 +420,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
       } else {
         let preloadedHtmlData: string | null = null;
         if (fromHtmlImg) {
+          const rawUrl = sourceUrl.trim();
           if (/^data:/i.test(rawUrl)) {
             if (!/^data:image\//i.test(rawUrl)) throw new Error("Unsupported PDF image type.");
           } else if (/^https?:\/\//i.test(rawUrl)) {

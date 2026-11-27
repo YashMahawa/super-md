@@ -68,11 +68,11 @@ function refs(markdown: string): ImageRef[] {
           definition: { start: definition.position.start.offset, end: definition.position.end.offset } });
       }
     }
-    if (node.type === "link" && /\.(?:svg|mmd|mermaid)(?:[?#]|$)/i.test(node.url))
+    if (node.type === "link" && isCompanionLinkPath(node.url))
       result.push({ source: node.url, start: node.position.start.offset, end: node.position.end.offset, image: false });
     if (node.type === "linkReference") {
       const definition = definitions.get(node.identifier);
-      if (definition?.position && /\.(?:svg|mmd|mermaid)(?:[?#]|$)/i.test(definition.url))
+      if (definition?.position && isCompanionLinkPath(definition.url))
         result.push({ source: definition.url, start: node.position.start.offset, end: node.position.end.offset, image: false,
           definition: { start: definition.position.start.offset, end: definition.position.end.offset } });
     }
@@ -105,15 +105,54 @@ function decodeDataUrl(value: string): { mime: string; dataUrl: string; text?: s
 
 export const MERMAID_SOURCE_LIMIT = 2_000_000;
 
+function decodeSafePath(source: string, allowAuthorityPath = false): string | null {
+  if (!source || /^data:/i.test(source)) return null;
+  const withoutSuffix = source.split(/[?#]/, 1)[0];
+  if (!withoutSuffix || /%2f|%5c/i.test(withoutSuffix)) return null;
+  let rawPath = withoutSuffix;
+  const authorityMatch = /^(?:[a-z][a-z\d+.-]*:)?\/\/(.*)$/i.exec(withoutSuffix);
+  if (authorityMatch) {
+    if (!allowAuthorityPath) return null;
+    const slash = authorityMatch[1].indexOf("/");
+    if (slash < 0) return null;
+    rawPath = authorityMatch[1].slice(slash);
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(rawPath);
+  } catch {
+    return null;
+  }
+  if (!decoded || decoded.includes("\\") || decoded.includes("\0")) return null;
+  return decoded;
+}
+
+function decodedPathFilename(source: string): string | null {
+  const decoded = decodeSafePath(source, true);
+  if (!decoded) return null;
+  const parts = decoded.split("/").filter(part => part && part !== ".");
+  if (!parts.length) return null;
+  const filename = parts[parts.length - 1];
+  if (!filename || filename === ".." || /[<>:"|?*\x00-\x1f]/.test(filename) || /[. ]$/.test(filename)) {
+    return null;
+  }
+  return filename;
+}
+
+function isCompanionLinkPath(source: string): boolean {
+  const filename = decodedPathFilename(source);
+  return filename !== null && /^(?!\.+$)[^/]+\.(?:svg|mmd|mermaid)$/i.test(filename);
+}
+
 export function isMermaidSourcePath(source: string): boolean {
-  return /\.(?:mmd|mermaid)(?:[?#]|$)/i.test(source);
+  const filename = decodedPathFilename(source);
+  return filename !== null && /^(?!\.+$)[^/]+\.(?:mmd|mermaid)$/i.test(filename);
 }
 
 export function cleanRelativePath(source: string): string | null {
   if (!source || source.startsWith("/") || source.startsWith("\\") || /^[a-z][a-z\d+.-]*:/i.test(source) || source.startsWith("//")) return null;
-  let decoded: string;
-  try { decoded = decodeURIComponent(source.split(/[?#]/, 1)[0]); } catch { return null; }
-  if (decoded.includes("\\") || decoded.includes("\0")) return null;
+  const decoded = decodeSafePath(source, false);
+  if (!decoded || decoded.startsWith("/")) return null;
   const parts = decoded.split("/").filter(part => part && part !== ".");
   if (!parts.length || parts.some(part => part === ".." || /[<>:"|?*\x00-\x1f]/.test(part)
       || /[. ]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) return null;
@@ -121,20 +160,34 @@ export function cleanRelativePath(source: string): string | null {
 }
 
 export function validateLocalMermaidSourcePath(source: string): string {
-  if (/^data:/i.test(source)) throw Error("Mermaid source must be a local .mmd or .mermaid file");
+  if (/^(?:data|https?):|^\/\//i.test(source)) {
+    throw Error(`Mermaid source must be a local .mmd or .mermaid file: ${source}`);
+  }
   const relative = cleanRelativePath(source);
-  if (!relative) throw Error(`Cannot safely resolve Mermaid source ${source}`);
+  if (!relative || !isMermaidSourcePath(relative)) throw Error(`Cannot safely resolve Mermaid source ${source}`);
   return relative;
 }
 
+export function normalizeLocalMermaidSource(relativePath: string): string {
+  return encodeURI(relativePath).replace(/#/g, "%23");
+}
+
 export async function loadLocalMermaidSource(documentPath: string | null, source: string): Promise<string> {
-  validateLocalMermaidSourcePath(source);
+  const relative = validateLocalMermaidSourcePath(source);
+  const normalizedSource = normalizeLocalMermaidSource(relative);
   let loaded: string | { text: string };
   try {
-    loaded = await invoke<string | { text: string }>("load_text_asset", { documentPath: documentPath || "", source });
+    loaded = await invoke<string | { text: string }>("load_text_asset", {
+      documentPath: documentPath || "",
+      source: normalizedSource,
+    });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw Error(detail.includes(source) ? detail : `Cannot load Mermaid source ${source}: ${detail}`);
+    throw Error(
+      detail.includes(source) || detail.includes(relative) || detail.includes(normalizedSource)
+        ? detail
+        : `Cannot load Mermaid source ${source}: ${detail}`,
+    );
   }
   const text = typeof loaded === "string" ? loaded : loaded?.text;
   if (typeof text !== "string" || text.length > MERMAID_SOURCE_LIMIT) {

@@ -16,11 +16,18 @@ vi.mock("./mermaidRenderer", async importOriginal => {
   };
 });
 
-import { MERMAID_SOURCE_LIMIT } from "./markdownExport";
+import {
+  MERMAID_SOURCE_LIMIT,
+  isMermaidSourcePath,
+  loadLocalMermaidSource,
+  prepareMarkdownExport,
+} from "./markdownExport";
 import { preparePdf } from "./preparePdf";
 
 const SAMPLE_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="220" height="90" viewBox="0 0 220 90"><rect width="220" height="90" fill="#ffffff"/><text x="20" y="50">Pipeline Ready</text></svg>';
+const SAMPLE_PNG =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
 afterEach(() => {
   invoke.mockReset();
@@ -28,6 +35,49 @@ afterEach(() => {
 });
 
 describe("PDF preparation for relative .mmd and .mermaid image links", () => {
+  it("classifies Mermaid paths from the query/fragment-stripped, safely decoded path component", () => {
+    for (const nonMermaid of [
+      "figures/photo.png?label=flow.mmd",
+      "figures/photo.png#flow.mmd",
+      "figures/photo.png?label=flow.mmd#diagram.mermaid",
+      "figures/photo%2Epng?label=flow%2Emmd",
+      `${SAMPLE_PNG}#flow.mmd`,
+      "data:text/plain;base64,Z3JhcGggVEQ=#x.mmd",
+      "https://trusted.example/figures/photo.png?label=flow.mmd",
+      "https://cdn.mmd/photo.png",
+      "https://cdn.mmd?file=1",
+      "figures/photo.png%3Flabel=flow.mmd",
+      "figures/photo.png%00.mmd",
+      "figures/photo.png%2fflow.mmd",
+      "figures/photo.png%5cflow.mmd",
+      "figures/Flow%ZZ.mmd",
+      "figures/Flow.mmd ",
+      "figures/Flow.mmd%20",
+      "figures/Flow.mmd.",
+      "figures/Flow.mmd%2E",
+      "figures/.mmd",
+      ".mermaid",
+    ]) {
+      expect(isMermaidSourcePath(nonMermaid), nonMermaid).toBe(false);
+    }
+
+    for (const mermaidPath of [
+      "diagrams/flow.mmd",
+      "diagrams/sequence.mermaid",
+      "figures/Flow%2Emmd",
+      "figures/Flow%2Emermaid",
+      "figures/My%20Flow%2E%6D%6D%64?v=2#section",
+      "diagrams/flow.mmd?preview=photo.png#thumb.png",
+      "https://untrusted.example/diagram.mmd",
+      "https://trusted.example/figures/Flow%2Emmd?v=1",
+      "//untrusted.example/Flow%2Emermaid",
+      "../outside.mmd",
+      "../outside%2Emmd",
+    ]) {
+      expect(isMermaidSourcePath(mermaidPath), mermaidPath).toBe(true);
+    }
+  });
+
   it("loads relative .mmd and .mermaid image links via load_text_asset, deduplicates sources, passes text to renderMermaid, and keeps prose links untouched", async () => {
     invoke.mockImplementation(async (command: string, args: { documentPath?: string; source?: string }) => {
       if (command === "load_text_asset" && args.source === "diagrams/flow.mmd") {
@@ -112,39 +162,152 @@ describe("PDF preparation for relative .mmd and .mermaid image links", () => {
     }
   });
 
+  it("keeps ordinary PNGs with .mmd/.mermaid query or fragment suffixes on image handlers and routes encoded Mermaid paths to load_text_asset", async () => {
+    invoke.mockImplementation(
+      async (command: string, args: { documentPath?: string; source?: string; url?: string }) => {
+        if (command === "load_asset") {
+          if (
+            args.source === "figures/photo.png?label=flow.mmd" ||
+            args.source === "figures/photo.png#flow.mmd" ||
+            args.source === "figures/photo%2Epng?label=flow%2Emmd"
+          ) {
+            return SAMPLE_PNG;
+          }
+        }
+        if (command === "fetch_resource" && args.url === "https://trusted.example/photo.png?label=flow.mmd") {
+          return { body: SAMPLE_PNG };
+        }
+        if (command === "load_text_asset") {
+          if (args.source === "figures/Flow.mmd") {
+            return { text: "flowchart TD\n  Encoded --> Diagram\n" };
+          }
+          if (args.source === "figures/My%20Flow.mermaid") {
+            return "sequenceDiagram\n  Alice->>Bob: Encoded .mermaid\n";
+          }
+        }
+        throw new Error(`Unexpected native call: ${command} ${JSON.stringify(args)}`);
+      },
+    );
+    renderMermaidMock.mockResolvedValue(SAMPLE_SVG);
+
+    const markdown = [
+      "![Query PNG](figures/photo.png?label=flow.mmd)",
+      "",
+      "![Fragment PNG](figures/photo.png#flow.mmd)",
+      "",
+      '<img src="figures/photo%2Epng?label=flow%2Emmd" alt="Encoded PNG" width="180" />',
+      "",
+      `![Inline PNG](${SAMPLE_PNG}#flow.mmd)`,
+      "",
+      '<img src="https://trusted.example/photo.png?label=flow.mmd" alt="Remote PNG" width="200" />',
+      "",
+      "![Encoded Mermaid](figures/Flow%2Emmd)",
+      "",
+      "![Same Mermaid Unencoded](figures/Flow.mmd?preview=photo.png)",
+      "",
+      "![Encoded Spaced Mermaid](figures/My%20Flow%2Emermaid?theme=neutral#top)",
+      "",
+    ].join("\n");
+
+    const prepared = await preparePdf(markdown, "/notes/mixed.md", "embedded", {
+      trustedImageHosts: ["trusted.example"],
+    });
+
+    const assetCalls = invoke.mock.calls.filter(([cmd]) => cmd === "load_asset").map(([, a]) => a.source);
+    expect(assetCalls).toEqual([
+      "figures/photo.png?label=flow.mmd",
+      "figures/photo.png#flow.mmd",
+      "figures/photo%2Epng?label=flow%2Emmd",
+    ]);
+
+    const fetchCalls = invoke.mock.calls.filter(([cmd]) => cmd === "fetch_resource").map(([, a]) => a.url);
+    expect(fetchCalls).toEqual(["https://trusted.example/photo.png?label=flow.mmd"]);
+
+    // figures/Flow%2Emmd and figures/Flow.mmd?preview=photo.png share one normalized load_text_asset call.
+    const textCalls = invoke.mock.calls.filter(([cmd]) => cmd === "load_text_asset").map(([, a]) => a.source);
+    expect(textCalls).toEqual(["figures/Flow.mmd", "figures/My%20Flow.mermaid"]);
+    expect(renderMermaidMock).toHaveBeenCalledTimes(3);
+
+    expect(prepared.content).toMatch(/!\[Query PNG\]\(asset-\d+\.png\)/);
+    expect(prepared.content).toMatch(/!\[Fragment PNG\]\(asset-\d+\.png\)/);
+    expect(prepared.content).toMatch(/!\[Encoded PNG\]\(asset-\d+\.png\)\{width=180\}/);
+    expect(prepared.content).toMatch(/!\[Inline PNG\]\(asset-\d+\.png\)/);
+    expect(prepared.content).toMatch(/!\[Remote PNG\]\(asset-\d+\.png\)\{width=200\}/);
+    expect(prepared.content).toMatch(/!\[Encoded Mermaid\]\(diagram-\d+\.svg\)/);
+    expect(prepared.content).toMatch(/!\[Same Mermaid Unencoded\]\(diagram-\d+\.svg\)/);
+    expect(prepared.content).toMatch(/!\[Encoded Spaced Mermaid\]\(diagram-\d+\.svg\)/);
+
+    // Verify shared companion Markdown export also routes ordinary PNGs and encoded Mermaid paths cleanly.
+    invoke.mockClear();
+    const mdExport = await prepareMarkdownExport(
+      [
+        "![Query PNG](figures/photo.png?label=flow.mmd)",
+        "[PNG Link](figures/photo.png#flow.mmd)",
+        "![Encoded Mermaid](figures/Flow%2Emmd)",
+        "[Encoded Mermaid Link](figures/My%20Flow%2Emermaid?v=1)",
+      ].join("\n\n"),
+      "/notes/mixed.md",
+    );
+    expect(mdExport.assets).toEqual({ "figures/photo.png": SAMPLE_PNG });
+    expect(mdExport.content).toContain("![Query PNG](figures/photo.png?label=flow.mmd)");
+    expect(mdExport.content).toContain("[PNG Link](figures/photo.png#flow.mmd)");
+    expect(mdExport.content).toContain("```mermaid\nflowchart TD\n  Encoded --> Diagram\n```");
+    expect(mdExport.content).toContain("```mermaid\nsequenceDiagram\n  Alice->>Bob: Encoded .mermaid\n```");
+  });
+
   it("enforces note-relative path checks, unsaved-note guard, and remote-image consent without invoking native loaders", async () => {
     invoke.mockRejectedValue(new Error("Should never invoke native loader"));
 
-    // 1. Unsaved note cannot resolve relative .mmd / .mermaid files.
+    // 1. Unsaved note cannot resolve relative .mmd / .mermaid files (including percent-encoded extensions).
     await expect(preparePdf("![Flow](diagrams/flow.mmd)", null)).rejects.toThrow(
       /Save your note before exporting relative Mermaid diagram diagrams\/flow\.mmd/i,
     );
+    await expect(preparePdf("![Flow](figures/Flow%2Emmd)", null)).rejects.toThrow(
+      /Save your note before exporting relative Mermaid diagram figures\/Flow%2Emmd/i,
+    );
 
-    // 2. Traversal, absolute, Windows-drive, device-name, backslash, NUL, file:, and data: paths are rejected before IPC.
-    const rejectedPaths = [
+    // 2. Traversal, absolute, Windows-drive, device-name, and file: Mermaid paths are rejected before any IPC.
+    const rejectedMermaidPaths = [
       "../outside.mmd",
+      "../outside%2Emmd",
       "diagrams/../../outside.mermaid",
       "diagrams/%2e%2e/%2e%2e/outside.mmd",
       "/etc/secret.mmd",
-      "\\windows\\secret.mermaid",
-      "diagrams%5csecret.mmd",
       "file:///etc/secret.mmd",
       "C:/secret/flow.mmd",
       "CON.mmd",
+    ];
+    for (const bad of rejectedMermaidPaths) {
+      await expect(preparePdf(`![Bad](<${bad}>)`, "/notes/check.md")).rejects.toThrow(
+        /Cannot safely resolve Mermaid source/i,
+      );
+    }
+
+    // Unsafe-encoded, backslash, NUL, malformed-escape, trailing-space/dot, and data: inputs are excluded from Mermaid classification and rejected by loadLocalMermaidSource before IPC.
+    const unsafeNonMermaidInputs = [
+      "%2fetc/secret.mmd",
+      "\\windows\\secret.mermaid",
+      "diagrams%5csecret.mmd",
+      "diagrams%2fsecret.mmd",
       "diagrams/bad%00name.mmd",
+      "figures/Flow%ZZ.mmd",
+      "figures/Flow.mmd ",
       "data:text/plain;base64,Z3JhcGggVEQ=#x.mmd",
     ];
-    for (const bad of rejectedPaths) {
-      await expect(preparePdf(`![Bad](<${bad}>)`, "/notes/check.md")).rejects.toThrow(
+    for (const bad of unsafeNonMermaidInputs) {
+      expect(isMermaidSourcePath(bad), bad).toBe(false);
+      await expect(loadLocalMermaidSource("/notes/check.md", bad)).rejects.toThrow(
         /Cannot safely resolve Mermaid source|Mermaid source must be a local \.mmd or \.mermaid file/i,
       );
     }
 
-    // 3. Remote .mmd / .mermaid URLs enforce remote-image consent first, and remain local-only even on trusted image hosts.
+    // 3. Remote .mmd / .mermaid URLs (including percent-encoded extensions) enforce remote-image consent first and never enter load_text_asset.
     const unconsentedRemoteInputs = [
       "![Remote](https://untrusted.example/diagram.mmd)",
+      "![RemoteEncoded](https://untrusted.example/figures/Flow%2Emmd)",
       "![Remote](http://untrusted.example/diagram.mermaid)",
       "![ProtocolRel](//untrusted.example/diagram.mmd)",
+      "![ProtocolRelEncoded](//untrusted.example/Flow%2Emermaid)",
       '<img src="https://untrusted.example/html.mmd" width="200">',
       "![Credentialed](https://user:pass@trusted.example/diagram.mmd)",
     ];
@@ -156,14 +319,82 @@ describe("PDF preparation for relative .mmd and .mermaid image links", () => {
       ).rejects.toThrow(/requires explicit consent in the reader before exporting PDF/i);
     }
 
-    await expect(
-      preparePdf("![TrustedHost](https://trusted.example/diagram.mmd)", "/notes/check.md", "embedded", {
-        trustedImageHosts: ["trusted.example"],
-      }),
-    ).rejects.toThrow(/Mermaid source must be a local \.mmd or \.mermaid file/i);
+    for (const trustedMermaid of [
+      "https://trusted.example/diagram.mmd",
+      "https://trusted.example/figures/Flow%2Emmd?v=1",
+    ]) {
+      await expect(
+        preparePdf(`![TrustedHost](${trustedMermaid})`, "/notes/check.md", "embedded", {
+          trustedImageHosts: ["trusted.example"],
+        }),
+      ).rejects.toThrow(/Mermaid source must be a local \.mmd or \.mermaid file/i);
+      await expect(loadLocalMermaidSource("/notes/check.md", trustedMermaid)).rejects.toThrow(
+        /Mermaid source must be a local \.mmd or \.mermaid file/i,
+      );
+    }
 
     expect(invoke).not.toHaveBeenCalled();
     expect(renderMermaidMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates AbortSignal cancellation across linked Mermaid loading and rendering without stale progress", async () => {
+    const preCancelled = new AbortController();
+    preCancelled.abort();
+    await expect(
+      preparePdf("![Encoded](figures/Flow%2Emmd)", "/notes/cancel.md", "embedded", {
+        signal: preCancelled.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(invoke).not.toHaveBeenCalled();
+
+    let resolveLoad!: (value: string) => void;
+    invoke.mockImplementationOnce(
+      () =>
+        new Promise<string>(resolve => {
+          resolveLoad = resolve;
+        }),
+    );
+    const inFlight = new AbortController();
+    const onProgress = vi.fn();
+    const running = preparePdf("![Encoded](figures/Flow%2Emmd)", "/notes/cancel.md", "embedded", {
+      signal: inFlight.signal,
+      onProgress,
+    });
+    expect(invoke).toHaveBeenCalledWith("load_text_asset", {
+      documentPath: "/notes/cancel.md",
+      source: "figures/Flow.mmd",
+    });
+    inFlight.abort();
+    await expect(running).rejects.toMatchObject({ name: "AbortError" });
+    const progressCallsAtAbort = onProgress.mock.calls.length;
+    resolveLoad("flowchart LR\n  A --> B\n");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(renderMermaidMock).not.toHaveBeenCalled();
+    expect(onProgress).toHaveBeenCalledTimes(progressCallsAtAbort);
+
+    invoke.mockResolvedValueOnce("flowchart LR\n  A --> B\n");
+    let resolveRender!: (value: string) => void;
+    renderMermaidMock.mockImplementationOnce(
+      () =>
+        new Promise<string>(resolve => {
+          resolveRender = resolve;
+        }),
+    );
+    const duringRender = new AbortController();
+    const renderRun = preparePdf("![Encoded](figures/Flow%2Emmd)", "/notes/cancel.md", "embedded", {
+      signal: duringRender.signal,
+    });
+    await vi.waitFor(() =>
+      expect(renderMermaidMock).toHaveBeenCalledWith(
+        "flowchart LR\n  A --> B\n",
+        false,
+        duringRender.signal,
+      ),
+    );
+    duringRender.abort();
+    await expect(renderRun).rejects.toMatchObject({ name: "AbortError" });
+    resolveRender(SAMPLE_SVG);
   });
 
   it("surfaces readable errors for missing, rejected, oversized, empty, and invalid Mermaid source files", async () => {
