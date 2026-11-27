@@ -90,18 +90,22 @@ class StudioSnapshotsTests(unittest.TestCase):
             session.recent, session.pinned = ["/workspace/Note.md"], ["/workspace/Note.md"]
 
             sidebar_first = win.sidebarSnapshot
+            tabs_first = win.tabsSnapshot
             snap_first = json.loads(win.snapshot)
+            self.assertEqual(win.activeTabId, win.active)
             caches = (win._folder_slice_cache, win._outline_slice_cache, win._recent_slice_cache, win._pinned_slice_cache, win._tabs_slice_cache, win._colors_slice_cache)
 
             win.busy, win.message = 1, "Working"
             snap_second = json.loads(win.snapshot)
             self.assertEqual((snap_second["busy"], snap_second["message"], snap_first["outline"]), (True, "Working", snap_second["outline"]))
             self.assertIs(win.sidebarSnapshot, sidebar_first)
+            self.assertIs(win.tabsSnapshot, tabs_first)
             self.assertEqual((win._folder_slice_cache, win._outline_slice_cache, win._recent_slice_cache, win._pinned_slice_cache, win._tabs_slice_cache, win._colors_slice_cache), caches)
 
             win._current()["content"] = "# Dirty edit"
             _ = win.snapshot
             self.assertIsNot(win._tabs_slice_cache, caches[4])
+            self.assertIsNot(win.tabsSnapshot, tabs_first)
             self.assertIs(win.sidebarSnapshot, sidebar_first)
 
             win._current()["outline"] = [{"title": "Updated", "level": 1, "offset": 0}]
@@ -148,10 +152,12 @@ class StudioSnapshotsTests(unittest.TestCase):
             empty_export.write_bytes(b"")
             nonempty_export.write_bytes(b"pdf")
             win._agent_exports = {"a": {"path": str(empty_export)}, "b": {"path": str(nonempty_export)}}
+            win._opening_paths["/tmp/opening.md"] = 1
             win.position_timer.start(60000)
             win.preference_timer.start(60000)
-            retired_calls = []
-            win._pending_write_retirements["w1"] = lambda: retired_calls.append("ran")
+            retired_calls, rename_cleanups = [], []
+            win._pending_write_retirements["w1"] = lambda: retired_calls.append(win.window_id in session.windows)
+            session._pending_rename_cleanups["r1"] = lambda: rename_cleanups.append("cleaned")
 
             with patch.object(win, "_save_positions") as save_pos, patch.object(win, "_preferences") as prefs, patch.object(peer, "_recover") as peer_recover:
                 win.stop()
@@ -159,15 +165,17 @@ class StudioSnapshotsTests(unittest.TestCase):
                 prefs.assert_called_once_with(False)
 
             self.assertTrue(win.retired and storage_cancel.is_set() and folder_cancel.is_set())
-            self.assertEqual((empty_export.exists(), nonempty_export.exists(), retired_calls), (False, True, ["ran"]))
+            self.assertEqual((empty_export.exists(), nonempty_export.exists(), retired_calls, win._opening_paths, rename_cleanups), (False, True, [False], {}, []))
             self.assertEqual((win.note_watcher, win.palette_watcher, win.custom_theme_watcher), (studio._STOPPED_WATCHER,) * 3)
             self.assertFalse(win.theme_timer.isActive() or win.window_id in session.windows)
+            peer.stop()
+            self.assertEqual(rename_cleanups, ["cleaned"])
         finally:
             self._dispose(session, win, peer)
 
     def test_simple_namespace_unbound_calls_and_patched_studio_collaborators(self):
         palette_box = [{"surface": "#111111", "primary": "#3366ff"}]
-        sidebar_sig, changed_sig = _SignalSpy(), _SignalSpy()
+        sidebar_sig, tabs_sig, active_sig, changed_sig = _SignalSpy(), _SignalSpy(), _SignalSpy(), _SignalSpy()
         deleted_later = []
         fake_watcher = SimpleNamespace(files=lambda: [], directories=lambda: [], deleteLater=lambda: deleted_later.append(True))
         ns = SimpleNamespace(
@@ -176,11 +184,14 @@ class StudioSnapshotsTests(unittest.TestCase):
             files=[], recent=["/a.md"], closed_tabs=[], settings={"normalZoom": 100, "fullZoom": 110},
             mode="live", fullscreen=False, reader_overlay=False, image_overlay=False, ready=False,
             busy=0, message="", session=SimpleNamespace(pinned=["/a.md"]), note_watcher=fake_watcher,
-            sidebarChanged=sidebar_sig, changed=changed_sig, _tokens=lambda: (True, palette_box[0]),
+            sidebarChanged=sidebar_sig, tabsChanged=tabs_sig, activeTabChanged=active_sig,
+            changed=changed_sig, _tokens=lambda: (True, palette_box[0]),
         )
         Studio._emit(ns, False)
         Studio._notify_sidebar(ns)
-        self.assertEqual((len(sidebar_sig.calls), len(changed_sig.calls)), (1, 1))
+        Studio._notify_tabs(ns)
+        self.assertEqual((len(sidebar_sig.calls), len(tabs_sig.calls), len(active_sig.calls), len(changed_sig.calls)), (1, 1, 1, 1))
+        self.assertEqual((json.loads(Studio.tabsSnapshot.fget(ns))[0]["id"], Studio.activeTabId.fget(ns)), ("t1", "t1"))
         palette_box[0] = {"surface": "#222222", "primary": "#ff6633"}
         self.assertEqual(json.loads(Studio.snapshot.fget(ns))["colors"]["surface"], "#222222")
         self.assertEqual(json.loads(Studio.sidebarSnapshot.fget(ns))["pinned"], ["/a.md"])
@@ -192,7 +203,7 @@ class StudioSnapshotsTests(unittest.TestCase):
             fake_root = Path(tmp)
             (fake_root / "public").mkdir(parents=True)
             (fake_root / "public/brand-mark-fixed.svg").write_text("<svg id='patched'/>", encoding="utf-8")
-            created_timers, created_watchers, deleted_watchers, py_jobs = [], [], [], []
+            created_timers, created_watchers, deleted_watchers, py_jobs, preview_events = [], [], [], [], []
             base_session = Session(True, data=fake_root / "data")
             base_session.settings.update(welcomed=True, autosave=False, theme="dark")
 
@@ -213,6 +224,14 @@ class StudioSnapshotsTests(unittest.TestCase):
                     reg = studio_snapshots.python_runtime.PythonJobRegistry()
                     py_jobs.append(reg)
                     return reg
+
+            class FakeOfflineView:
+                @staticmethod
+                def PreviewJobRegistry():
+                    return SimpleNamespace(
+                        retain_tabs=lambda ids: preview_events.append(("retain", list(ids))),
+                        cancel_all=lambda retire=False: preview_events.append(("cancel", retire)),
+                    )
 
             class FakeCustomTheme:
                 @staticmethod
@@ -235,6 +254,7 @@ class StudioSnapshotsTests(unittest.TestCase):
                 patch("studio.QFileSystemWatcher", ProxyWatcher),
                 patch("studio.read_system_palette", return_value=("dark", {"primary": "#123456"})) as palette_mock,
                 patch("studio.python_runtime", FakePyRuntime),
+                patch("studio.offline_view", FakeOfflineView),
                 patch("studio.custom_theme", FakeCustomTheme),
                 patch("studio.shiboken6", FakeShiboken),
             ):
@@ -250,5 +270,7 @@ class StudioSnapshotsTests(unittest.TestCase):
                     self.assertEqual(loads[-1]["customStyle"], {"marker": "patched-theme"})
                     win.stop()
                     self.assertEqual(len(deleted_watchers), 3)
+                    self.assertIn(("cancel", True), preview_events)
+                    self.assertTrue(any(kind == "retain" for kind, _ in preview_events))
                 finally:
                     self._dispose(base_session, win)

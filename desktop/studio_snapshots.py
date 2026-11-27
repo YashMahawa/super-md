@@ -1,19 +1,19 @@
 """Window initialization/teardown, state emission, and memoized snapshot slice helpers for Studio."""
 from __future__ import annotations
-import concurrent.futures, json, shutil, sys, threading, uuid, weakref
+import concurrent.futures, contextlib, json, shutil, sys, threading, uuid, weakref
 from pathlib import Path
 from typing import Any
 from PySide6.QtCore import QFileSystemWatcher, QProcess, QTimer
 from PySide6.QtGui import QGuiApplication
 
 if __package__:
-    from . import custom_theme, python_runtime
+    from . import custom_theme, folder_ops, offline_view, python_runtime
     from .core.paths import DESKTOP_DIR
     from .export_jobs import ExportJobRegistry
     from .reader_edits import ReaderEdits
     from .theme import read_system_palette
 else:
-    import custom_theme, python_runtime
+    import custom_theme, folder_ops, offline_view, python_runtime
     from core.paths import DESKTOP_DIR
     from export_jobs import ExportJobRegistry
     from reader_edits import ReaderEdits
@@ -71,6 +71,7 @@ def init_studio_window(
     studio_obj, isolated: bool = False, session=None, *, root: Path = DESKTOP_DIR.parent,
     session_cls=None, sample: str = "", timer_cls=QTimer, watcher_cls=QFileSystemWatcher,
     export_jobs_cls=ExportJobRegistry, reader_edits_cls=ReaderEdits, python_runtime_mod=python_runtime,
+    offline_view_mod=offline_view, folder_ops_mod=folder_ops,
     read_system_palette_fn=read_system_palette, gui_app_cls=QGuiApplication, process_cls=QProcess,
     sys_platform: str | None = None, which_fn=shutil.which,
 ) -> None:
@@ -119,6 +120,7 @@ def init_studio_window(
     studio_obj._cloud_revocation_pending = False
     studio_obj.cloudRevocationFinished.connect(studio_obj._finish_cloud_revocation)
     studio_obj._agent_viewport_capture = None
+    studio_obj._preview_jobs = offline_view_mod.PreviewJobRegistry()
     agent_bridge = getattr(studio_obj.session, "agent_bridge", None)
     if agent_bridge is not None:
         agent_bridge.enabledChanged.connect(lambda: studio_obj._emit(False))
@@ -140,6 +142,9 @@ def init_studio_window(
     studio_obj.note_watcher.fileChanged.connect(studio_obj._external_note_changed)
     studio_obj.note_watcher.directoryChanged.connect(studio_obj._external_note_changed)
     studio_obj.external_paths, studio_obj.note_watch_paths, studio_obj.note_file_stamps, studio_obj.note_identities = set(), None, {}, {}
+    studio_obj._watch_suspensions = studio_obj.session._watch_suspensions
+    with studio_obj.session._rename_state_lock:
+        studio_obj.session._retired_persist_needed = False
     studio_obj.external_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._refresh_external_notes)
     studio_obj.active, studio_obj.folder = "", ""
     studio_obj._files: list[dict] = []
@@ -242,21 +247,29 @@ def init_studio_window(
                         studio_obj._agent_edit_seq = entry["seq"]
         tab["agent_edits"] = studio_obj._bound_agent_edits(valid_edits)
     studio_obj._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in studio_obj.tabs if tab.get("path"))
-    studio_obj.session.drafts[studio_obj.window_id] = [dict(t) for t in studio_obj.tabs]
+    with studio_obj.session._rename_state_lock:
+        studio_obj.session.drafts[studio_obj.window_id] = [dict(t) for t in studio_obj.tabs]
+    studio_obj._startup_placeholder_ids, studio_obj._touched_tab_ids = set(), set()
+    studio_obj._welcome_placeholder_id = None
+    studio_obj._opening_paths: dict[str, int] = {}
     if not studio_obj.tabs:
-        studio_obj.tabs.append(studio_obj._note("Untitled.md") if studio_obj.settings["welcomed"] else studio_obj._note("Welcome.md", sample, saved=sample))
+        if studio_obj.settings["welcomed"]:
+            placeholder = studio_obj._note("Untitled.md")
+            studio_obj.tabs.append(placeholder)
+            studio_obj._startup_placeholder_ids.add(placeholder["id"])
+        else:
+            placeholder = studio_obj._note("Welcome.md", sample, saved=sample)
+            studio_obj.tabs.append(placeholder)
+            studio_obj._welcome_placeholder_id = placeholder["id"]
     elif studio_obj.settings["startup"] == "new":
-        studio_obj.tabs.insert(0, studio_obj._note("Untitled.md"))
+        placeholder = studio_obj._note("Untitled.md")
+        studio_obj.tabs.insert(0, placeholder)
+        studio_obj._startup_placeholder_ids.add(placeholder["id"])
     studio_obj.active = studio_obj.tabs[0]["id"]
     target_active_id = win_spec["activeId"] if win_spec is not None else studio_obj.session.startup_active_id
     if restore_enabled and any(t["id"] == target_active_id for t in studio_obj.tabs):
         studio_obj.active = target_active_id
-    studio_obj._activate_tab_state(studio_obj._current())
     studio_obj._activation_generation = 0
-    studio_obj._startup_placeholder_ids = {
-        tab["id"] for tab in studio_obj.tabs
-        if tab["name"] == "Untitled.md" and not tab["path"] and not tab["content"] and not tab["saved"] and not tab["assets"]
-    }
     studio_obj._restoring_paths, studio_obj._startup_order = set(), []
     if win_spec is not None:
         studio_obj._startup_entries, studio_obj._startup_active = list(win_spec["tabs"]), win_spec["active"]
@@ -270,6 +283,13 @@ def init_studio_window(
         restore_folder, restore_expanded = studio_obj.session.startup_folder, list(studio_obj.session.startup_expanded)
         studio_obj.session.startup_entries, studio_obj.session.startup_paths = [], []
         studio_obj.session.startup_folder, studio_obj.session.startup_expanded = "", []
+    pending_active_restore = bool(
+        restore_enabled and studio_obj._startup_active
+        and not any(t["id"] == target_active_id for t in studio_obj.tabs)
+        and any(folder_ops_mod.same_path(p, studio_obj._startup_active) for p in restore_paths)
+    )
+    if not pending_active_restore:
+        studio_obj._activate_tab_state(studio_obj._current())
     if restore_enabled and restore_paths:
         studio_obj._startup_order = restore_paths
         studio_obj._restoring_paths = set(studio_obj._startup_order)
@@ -278,6 +298,8 @@ def init_studio_window(
     if restore_enabled and restore_folder:
         studio_obj._restore_workspace_folder(restore_folder, restore_expanded)
     studio_obj._emitted_sidebar_key = studio_obj._sidebar_slice_key()
+    studio_obj._emitted_tabs_key = studio_obj._tabs_slice_key()
+    studio_obj._emitted_active_tab_id = studio_obj.active if studio_obj.tabs else ""
     studio_obj._refresh_theme()
     if not isolated and len(studio_obj.session.windows) == 1 and studio_obj.settings.get("cloudAgentEnabled"):
         timer_cls.singleShot(0, studio_obj._restore_cloud_connection)
@@ -290,11 +312,28 @@ def notify_sidebar(studio_obj) -> None:
         studio_obj._emitted_sidebar_key = key
         studio_obj.sidebarChanged.emit()
 
+def notify_tabs(studio_obj) -> None:
+    if getattr(studio_obj, "retired", False):
+        return
+    tabs_key = _call_method(studio_obj, "_tabs_slice_key", tabs_slice_key)
+    if tabs_key != getattr(studio_obj, "_emitted_tabs_key", None):
+        studio_obj._emitted_tabs_key = tabs_key
+        if (tabs_sig := getattr(studio_obj, "tabsChanged", None)) is not None:
+            tabs_sig.emit()
+    active_id = studio_obj.active if studio_obj.tabs else ""
+    if active_id != getattr(studio_obj, "_emitted_active_tab_id", None):
+        studio_obj._emitted_active_tab_id = active_id
+        if (active_sig := getattr(studio_obj, "activeTabChanged", None)) is not None:
+            active_sig.emit()
+
 def emit_state(studio_obj, load: bool = True, *, custom_theme_mod=custom_theme) -> None:
     if getattr(studio_obj, "retired", False):
         return
+    if (preview_jobs := getattr(studio_obj, "_preview_jobs", None)) is not None:
+        preview_jobs.retain_tabs(tab["id"] for tab in studio_obj.tabs)
     _call_optional(studio_obj, "_watch_notes")
     _call_method(studio_obj, "_notify_sidebar", notify_sidebar)
+    _call_method(studio_obj, "_notify_tabs", notify_tabs)
     studio_obj.changed.emit()
     if load and studio_obj.ready and studio_obj.tabs:
         tab = _call_method(studio_obj, "_current", _current_tab)
@@ -355,6 +394,8 @@ def stop_window(
         export_jobs.cancel_all()
     if (python_jobs := getattr(studio_obj, "_python_jobs", None)) is not None:
         python_jobs.cancel_all(retire=True)
+    if (preview_jobs := getattr(studio_obj, "_preview_jobs", None)) is not None:
+        preview_jobs.cancel_all(retire=True)
     agent_exports = getattr(studio_obj, "_agent_exports", None)
     if agent_exports:
         for agent_export in tuple(agent_exports.values()):
@@ -365,6 +406,8 @@ def stop_window(
             except (OSError, TypeError, KeyError):
                 pass
         agent_exports.clear()
+    if (opening_paths := getattr(studio_obj, "_opening_paths", None)) is not None:
+        opening_paths.clear()
     pos_timer = getattr(studio_obj, "position_timer", None)
     if pos_timer is not None:
         if pos_timer.isActive():
@@ -412,14 +455,12 @@ def stop_window(
     if session is not None and getattr(session, "reader_assets", None) is not None:
         session.reader_assets.revoke_owner(studio_obj.window_id)
     studio_obj._retired = True
+    windows = getattr(session, "windows", None) if session is not None else None
+    if windows is not None:
+        windows.pop(getattr(studio_obj, "window_id", None), None)
     pending_retirements = getattr(studio_obj, "_pending_write_retirements", None)
     if pending_retirements is not None:
-        lock = getattr(studio_obj, "_write_callback_lock", None)
-        if lock is not None:
-            with lock:
-                retired_callbacks = list(pending_retirements.values())
-                pending_retirements.clear()
-        else:
+        with getattr(studio_obj, "_write_callback_lock", None) or contextlib.nullcontext():
             retired_callbacks = list(pending_retirements.values())
             pending_retirements.clear()
         for callback in retired_callbacks:
@@ -427,16 +468,19 @@ def stop_window(
                 callback()
             except Exception:
                 pass
-    if session is not None:
-        windows = getattr(session, "windows", None)
-        if windows is not None:
-            windows.pop(getattr(studio_obj, "window_id", None), None)
-        if windows and not _call_optional(session, "is_quitting"):
+    if windows is not None and not any(not getattr(w, "retired", False) for w in windows.values()):
+        for cleanup in list((getattr(session, "_pending_rename_cleanups", None) or {}).values()):
+            try:
+                cleanup()
+            except Exception:
+                pass
+    if session is not None and windows and not _call_optional(session, "is_quitting"):
+        with getattr(session, "_rename_state_lock", None) or contextlib.nullcontext():
             if getattr(session, "workspace", None) is not None:
                 session.workspace.pop(studio_obj.window_id, None)
             if getattr(session, "window_workspaces", None) is not None:
                 session.window_workspaces.pop(studio_obj.window_id, None)
-            _call_optional(next(iter(windows.values())), "_recover")
+        _call_optional(next(iter(windows.values())), "_recover")
     sys_prefs = getattr(studio_obj, "system_preferences", None)
     if sys_prefs is not None and sys_prefs.state() != process_cls.ProcessState.NotRunning:
         sys_prefs.terminate()
@@ -481,16 +525,26 @@ def cached_recent_slice_json(studio_obj, recent_tuple) -> str:
 def cached_pinned_slice_json(studio_obj, pinned_tuple) -> str:
     return _cached_slice(studio_obj, "_pinned_slice_cache", pinned_tuple, lambda: json.dumps(list(pinned_tuple)))
 
-def cached_tabs_slice_json(studio_obj) -> str:
+def tabs_slice_key(studio_obj):
     active_id = studio_obj.active if studio_obj.tabs else ""
-    tabs_key = tuple(
+    return tuple(
         (t["id"], t["name"], t["path"], _call_method(studio_obj, "_is_dirty", _tab_is_dirty, t), bool(t.get("conflict")), bool(t["id"] != active_id and (t.get("agent_staged") or t.get("agent_unreviewed"))))
         for t in studio_obj.tabs
     )
+
+def cached_tabs_slice_json(studio_obj, tabs_key=None) -> str:
+    if tabs_key is None:
+        tabs_key = _call_method(studio_obj, "_tabs_slice_key", tabs_slice_key)
     return _cached_slice(
         studio_obj, "_tabs_slice_cache", tabs_key,
         lambda: json.dumps([{"id": tid, "name": name, "path": path, "dirty": dirty, "conflict": conflict, "agentEdited": agent_edited} for tid, name, path, dirty, conflict, agent_edited in tabs_key]),
     )
+
+def tabs_snapshot(studio_obj) -> str:
+    return _call_method(studio_obj, "_cached_tabs_slice_json", cached_tabs_slice_json)
+
+def active_tab_id(studio_obj) -> str:
+    return studio_obj.active if studio_obj.tabs else ""
 
 def cached_colors_slice_json(studio_obj) -> tuple[bool, str]:
     dark, palette = studio_obj._tokens()
