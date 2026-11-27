@@ -25,9 +25,10 @@ import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
 import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, formatEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import { extractSelectedText } from "./copySource";
 import {readingOffset} from "./readingPosition";
-import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
+import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,hasExternalAnchorScroll,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,snapshotAnchorScroll,type AnchorScrollSnapshot,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
+import { parseFrontmatter } from "./frontmatter";
 import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
 import { invoke } from "./nativeBridge";
@@ -51,7 +52,7 @@ import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZo
 import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
-import {recordHistory,replayHistory,historySize,validHistory,type NoteHistory} from './noteHistory';
+import {recordHistory,replayHistory,transferHistory,trimHistoryCache,validHistory,type NoteHistory} from './noteHistory';
 import {cachedEditorHistory} from './components/Editor';
 import {loadReadingLocation,saveReadingLocation,type ReadingLocation} from './readingLocations';
 import {mediaFilter,mediaTone,type MediaAppearance} from './mediaAppearance';
@@ -210,7 +211,7 @@ export function Reader() {
   const pendingChange = useRef(0);
   const noteViews = useRef(new Map<string, NoteView>());
   const histories=useRef(new Map<string,NoteHistory>());
-  const trimHistories=(active:string)=>{let retained=[...histories.current.values()].reduce((size,h)=>size+historySize(h),0);for(const [id,cached] of histories.current){if(histories.current.size<=40&&retained<=4_000_000)break;if(id===active)continue;histories.current.delete(id);retained-=historySize(cached);}};
+  const trimHistories=(active:string)=>trimHistoryCache(histories.current,active);
   const replaying=useRef(false);
   const loadedFonts=useRef(new Map<string,Promise<FontFace>>());
   const cursor=useRef<Point|undefined>(undefined);
@@ -331,10 +332,13 @@ export function Reader() {
         importEditorSession(next.id, next.viewState.editor);
         importRenderedViews(next.content, next.viewState.rendered);
         const history=next.viewState.history;
-        if(validHistory(history))histories.current.set(next.id,{undo:structuredClone(history.undo),redo:structuredClone(history.redo),last:0});
+        histories.current.delete(next.id);
+        if(validHistory(history)){const imported=transferHistory(history);if(imported)histories.current.set(next.id,imported);}
         trimHistories(next.id);
         const importedAnchor=parseImportedAnchor(next.viewState.anchor);
         noteViews.current.set(next.id, {top:next.viewState.top, ...(importedAnchor?{anchor:importedAnchor}:{})});
+      } else if (old && old.id !== next.id) {
+        trimHistories(next.id);
       }
       // Native snapshots may have been queued before the latest pinch frame.
       // Within one workspace mode the reader owns its gesture scale; explicit
@@ -390,7 +394,7 @@ export function Reader() {
         const applied=replayActiveLiveBlockHistory(direction);
         if(applied&&current&&previousContent!==undefined){
           const history=histories.current.get(current.id);
-          if(history)replayHistory(history,previousContent,direction);
+          if(history){replayHistory(history,previousContent,direction);histories.current.delete(current.id);histories.current.set(current.id,history);trimHistories(current.id);}
         }
         replaying.current=false;
         if(applied)return;
@@ -519,11 +523,13 @@ export function Reader() {
       let id = current.id;
       if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
       else if (operation.action === "detach_tab") id = operation.target;
-      const view = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader" ? {editor:exportEditorSession(id),history:histories.current.get(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
+      const captureView = operation.action === "move_tab" || operation.action === "detach_tab" || operation.action === "reload_reader";
+      const baseView = captureView ? {editor:exportEditorSession(id), ...(id === current.id ? (()=>{const liveAnchor=captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot:document.querySelector<HTMLElement>(".android-reading"),preferredSplitPane:splitPane.current});return {top:liveAnchor.readingTop ?? 0,anchor:liveAnchor,rendered:exportRenderedViews(current.content)};})() : noteViews.current.get(id))} : undefined;
       void (async()=>{
         if(current.editProtocol===1)await edits.current!.flush(current.id);
         // Snapshot after the acknowledgement barrier, including edits made while waiting.
         const latest=reference.current;
+        const view=baseView?{...baseView,history:transferHistory(histories.current.get(id))}:undefined;
         await invoke("document_flushed",{id:current.id,content:latest?.id===current.id?latest.content:current.content,operation,viewId:id,viewState:view});
       })().catch(error=>setEditError(String(error)));
     };
@@ -830,6 +836,9 @@ export function Reader() {
       recordHistory(history,previous.content,content,now);
       histories.current.delete(previous.id);histories.current.set(previous.id,history);
       trimHistories(previous.id);
+    } else {
+      const history=histories.current.get(previous.id);
+      if(history){histories.current.delete(previous.id);histories.current.set(previous.id,history);trimHistories(previous.id);}
     }
     const next = { ...reference.current!, content }; setState(next); reference.current = next;
     // The bridge receives every edit immediately, so closing/rotating cannot lose
@@ -864,6 +873,22 @@ export function Reader() {
       }
       if(request.action==='get_context'){
         const analysis=readerSourceAnalysis(note.mode,note.content)?.analysis??analyzeDocument(note.content);
+        const parsedFm=parseFrontmatter(note.content);
+        const fmProps=parsedFm?.properties;
+        const visibleMetadataProps=(()=>{
+          if(!fmProps)return undefined;
+          const out:Record<string,unknown>={};
+          if(fmProps.title)out.title=fmProps.title.slice(0,300);
+          if(fmProps.authors.length){
+            const boundedAuthors=fmProps.authors.slice(0,20).map(a=>a.slice(0,200));
+            out.author=boundedAuthors.join(', ').slice(0,500);
+            out.authors=boundedAuthors;
+          }
+          if(fmProps.tags.length){
+            out.tags=fmProps.tags.slice(0,50).map(t=>t.slice(0,100));
+          }
+          return Object.keys(out).length?out:undefined;
+        })();
         const headingAtOffset=(utf16Offset:number)=>{
           let current='';
           for(const item of analysis.outline){if(item.offset<=utf16Offset)current=item.title;else break;}
@@ -897,14 +922,47 @@ export function Reader() {
             selectionText=editorSelectedText(note.id)||window.getSelection()?.toString()||'';
             visibleText=note.content.slice(offset,offset+2000).trim();
           }
-          heading=headingAtOffset(offset);
+          heading=headingAtOffset(offset)||(fmProps?.title?.slice(0,300)??'');
         }else{
           host=document.querySelector<HTMLElement>('.android-reading');
           const bounds=host?.getBoundingClientRect();
           const activeTextarea=note.mode==='live'?host?.querySelector<HTMLTextAreaElement>('.live-active-block textarea'):null;
           const visibleParts:string[]=[];
           let firstBlockHeading='';
+          let propertiesHeaderVisible=false;
           if(host&&bounds){
+            const propsEl=host.querySelector<HTMLElement>('[data-frontmatter-properties],.document-properties');
+            if(propsEl){
+              const pBox=propsEl.getBoundingClientRect();
+              if(pBox.bottom>bounds.top&&pBox.top<bounds.bottom&&pBox.height>0){
+                propertiesHeaderVisible=true;
+                const titleEl=propsEl.querySelector<HTMLElement>('[data-frontmatter-field="title"]');
+                if(titleEl){
+                  const tBox=titleEl.getBoundingClientRect();
+                  if(tBox.bottom>bounds.top&&tBox.top<bounds.bottom&&tBox.height>0){
+                    const tText=titleEl.textContent?.trim();
+                    if(tText)visibleParts.push(tText);
+                  }
+                }
+                const authorEl=propsEl.querySelector<HTMLElement>('[data-frontmatter-field="author"]');
+                if(authorEl){
+                  const aBox=authorEl.getBoundingClientRect();
+                  if(aBox.bottom>bounds.top&&aBox.top<bounds.bottom&&aBox.height>0){
+                    const aText=authorEl.textContent?.trim();
+                    if(aText)visibleParts.push(`Author: ${aText}`);
+                  }
+                }
+                const visibleTags:string[]=[];
+                for(const tagEl of propsEl.querySelectorAll<HTMLElement>('[data-frontmatter-field="tag"]')){
+                  const tagBox=tagEl.getBoundingClientRect();
+                  if(tagBox.bottom>bounds.top&&tagBox.top<bounds.bottom&&tagBox.height>0){
+                    const tagText=tagEl.textContent?.trim();
+                    if(tagText)visibleTags.push(tagText);
+                  }
+                }
+                if(visibleTags.length)visibleParts.push(`Tags: ${visibleTags.join(', ')}`);
+              }
+            }
             const candidates=Array.from(host.querySelectorAll<HTMLElement>('h1,h2,h3,h4,p,li,pre,.live-active-block textarea'));
             for(const element of candidates){
               if(element instanceof HTMLTextAreaElement){
@@ -926,6 +984,9 @@ export function Reader() {
             }
           }
           range=host?visibleSourceRange(host,note.content):null;
+          if(propertiesHeaderVisible&&parsedFm&&parsedFm.end>0){
+            range=range?{start:0,end:Math.max(range.end,parsedFm.end)}:{start:0,end:parsedFm.end};
+          }
           if(activeTextarea&&bounds){
             const taRect=activeTextarea.getBoundingClientRect();
             const taStart=Number(activeTextarea.dataset.sourceStart);
@@ -939,7 +1000,7 @@ export function Reader() {
             const taStart=Number(activeTextarea.dataset.sourceStart);
             if(Number.isInteger(taStart)&&taStart>=0)offset=Math.min(note.content.length,taStart+activeTextarea.selectionStart);
           }
-          heading=firstBlockHeading||headingAtOffset(offset);
+          heading=firstBlockHeading||headingAtOffset(offset)||(fmProps?.title?.slice(0,300)??'');
           scrollFraction=host?host.scrollTop/Math.max(1,host.scrollHeight-host.clientHeight):0;
           visibleText=visibleParts.join('\n').slice(0,2000);
           if(note.mode==='split'){
@@ -1091,6 +1152,7 @@ export function Reader() {
           ...base,
           mode:note.mode,
           zoom:zoomReference.current,
+          ...(visibleMetadataProps?{properties:visibleMetadataProps}:{}),
           reading:{offset:sourceOffset,scrollFraction,heading,visibleText},
           visibleSource,
           diagrams:filteredDiagrams.slice(0,30).map(item=>diagramMetadata(note.content,item)),
