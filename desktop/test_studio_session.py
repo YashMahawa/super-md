@@ -291,7 +291,10 @@ class StudioSessionTests(unittest.TestCase):
             direct_drafts = studio_session.window_recovery_drafts(first)
             self.assertEqual(([d["id"] for d in direct_drafts], "viewState" in direct_drafts[0]), ([clean_staged["id"], clean_unreviewed["id"]], False))
             second_dirty = second._note("Second.md", "edited", "", "", {}, True)
+            second_dirty["viewState"] = {"scroll": 9}
             second.tabs, second.active = [second_dirty], second_dirty["id"]
+            detached = second._combined_recovery_drafts([second_dirty])
+            self.assertTrue(detached[-1] is not second_dirty and "viewState" not in detached[-1])
 
             json_paths: list[Path] = []
             real_json = studio_module.atomic_json
@@ -300,6 +303,8 @@ class StudioSessionTests(unittest.TestCase):
                 second._recover()
                 session.writes.flush(timeout=2.0)
                 self._drain_posted_events()
+            self.assertEqual(session._last_recovered_window_id, second.window_id)
+            self.assertIn(session._flush_retired_persistence_sync, session.writes._drain_finalizers)
             self.assertTrue({session.data / "startup.json", session.data / "recovery.json"}.issubset(json_paths))
             startup_disk = json.loads((session.data / "startup.json").read_text(encoding="utf-8"))
             self.assertEqual({t["id"] for t in startup_disk["tabs"]}, {clean_staged["id"], clean_unreviewed["id"], blank_untitled["id"], second_dirty["id"]})

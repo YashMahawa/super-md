@@ -1,7 +1,7 @@
 """Session state/persistence and Studio background executor, startup snapshot, and recovery helpers."""
 from __future__ import annotations
 
-import copy, json, os, re, tempfile, uuid
+import copy, json, os, re, tempfile, threading, uuid
 from collections import deque
 from pathlib import Path
 from PySide6.QtCore import QStandardPaths
@@ -10,7 +10,7 @@ if __package__:
     from .closed_notes import ClosedNoteStore
     from .documents import atomic_json, atomic_write, bundle
     from .fonts import FontStore
-    from .latest_writes import ExactWriteAborted, LatestWriteExecutor
+    from .latest_writes import LatestWriteExecutor
     from .python_outputs import PythonOutputs
     from .reader_assets import ReaderAssetStore, note_file_path
     from .shortcuts import default_shortcuts, normalize_shortcuts
@@ -19,7 +19,7 @@ else:
     from closed_notes import ClosedNoteStore
     from documents import atomic_json, atomic_write, bundle
     from fonts import FontStore
-    from latest_writes import ExactWriteAborted, LatestWriteExecutor
+    from latest_writes import LatestWriteExecutor
     from python_outputs import PythonOutputs
     from reader_assets import ReaderAssetStore, note_file_path
     from shortcuts import default_shortcuts, normalize_shortcuts
@@ -58,6 +58,14 @@ def init_session(
     session, isolated=False, data=None, *, defaults=DEFAULTS, default_pdf=DEFAULT_PDF,
     mkdtemp_fn=tempfile.mkdtemp, writable_location_fn=QStandardPaths.writableLocation, atomic_write_fn=atomic_write,
 ) -> None:
+    if hasattr(session, "renameCompleted") and hasattr(session, "_on_rename_completed"):
+        session.renameCompleted.connect(session._on_rename_completed)
+    session._watch_suspension_lock = threading.Lock()
+    session._watch_suspensions = []
+    session._pending_rename_cleanups = {}
+    session._rename_state_lock = threading.RLock()
+    session._retired_persist_needed = False
+    session._last_recovered_window_id = ""
     if data is not None: raw_data = Path(data)
     elif isolated: raw_data = Path(mkdtemp_fn(prefix="supermd-test-"))
     else: raw_data = Path(writable_location_fn(QStandardPaths.StandardLocation.AppDataLocation)) / "qt-studio"
@@ -73,6 +81,8 @@ def init_session(
     except (OSError, ValueError, TypeError) as error:
         session.closed_tabs, session.closed_note_error = [], str(error)
     session.writes = LatestWriteExecutor(max_workers=1, thread_name_prefix="supermd-save")
+    if hasattr(session, "_flush_retired_persistence_sync"):
+        session.writes.add_drain_finalizer(session._flush_retired_persistence_sync)
     session.settings = copy.deepcopy(defaults)
     session.recent, session.pinned = [], []
     session.workspace, session.window_workspaces = {}, {}
@@ -379,7 +389,7 @@ def save_positions(studio_obj, *, atomic_write_fn=atomic_write, noop_done_fn=noo
     data = json.dumps(studio_obj.session.locations).encode()
     studio_obj._submit(lambda: atomic_write_fn(studio_obj.data / "reading-positions.json", data), noop_done_fn, False, studio_obj.writes)
 
-def submit_startup_snapshot(studio_obj, *, atomic_json_fn=atomic_json) -> None:
+def build_startup_snapshot_locked(studio_obj) -> dict:
     # Clean tabs need only paths, never another copy of their image bytes.
     window_tabs = [{"path": t["path"], "id": t["id"]} for t in studio_obj.tabs if t["path"] or studio_obj._is_dirty(t) or t.get("agent_staged") or t.get("agent_unreviewed")]
     studio_obj.session.workspace[studio_obj.window_id] = window_tabs
@@ -387,23 +397,28 @@ def submit_startup_snapshot(studio_obj, *, atomic_json_fn=atomic_json) -> None:
         "folder": studio_obj.folder, "expanded": sorted(studio_obj.expanded) if studio_obj.folder else [],
         "active": studio_obj._current()["path"], "activeId": studio_obj.active,
     }
-    entries = [entry for tabs in studio_obj.session.workspace.values() for entry in tabs]
+    studio_obj.session._last_recovered_window_id = studio_obj.window_id
+    entries = [dict(entry) for tabs in studio_obj.session.workspace.values() for entry in tabs]
     windows_payload = []
     for wid, w_tabs in studio_obj.session.workspace.items():
         meta = studio_obj.session.window_workspaces.get(wid, {})
         w_folder = meta.get("folder", "")
         windows_payload.append({
-            "windowId": wid, "tabs": w_tabs,
+            "windowId": wid, "tabs": [dict(t) for t in w_tabs],
             "active": meta.get("active", ""), "activeId": meta.get("activeId", ""),
-            "folder": w_folder, "expanded": meta.get("expanded", []) if w_folder else [],
+            "folder": w_folder, "expanded": list(meta.get("expanded", [])) if w_folder else [],
         })
     primary_folder = windows_payload[0]["folder"] if windows_payload else studio_obj.folder
     primary_expanded = windows_payload[0]["expanded"] if windows_payload else (sorted(studio_obj.expanded) if studio_obj.folder else [])
-    workspace = {
+    return {
         "paths": list(dict.fromkeys(t["path"] for t in entries if t["path"])),
         "tabs": entries, "active": studio_obj._current()["path"], "activeId": studio_obj.active,
         "folder": primary_folder, "expanded": primary_expanded, "windows": windows_payload,
     }
+
+def submit_startup_snapshot(studio_obj, *, atomic_json_fn=atomic_json) -> None:
+    with studio_obj.session._rename_state_lock:
+        workspace = studio_obj._build_startup_snapshot_locked()
     studio_obj.session.writes.submit_latest(
         "startup",
         lambda: atomic_json_fn(studio_obj.data / "startup.json", workspace),
@@ -419,23 +434,30 @@ def window_recovery_drafts(studio_obj, tabs=None, *, snapshot_tab_fn=_default_sn
         and (t["path"] or t["content"].strip() or t["assets"] or t.get("agent_staged") or t.get("agent_unreviewed"))
     ]
 
-def combined_recovery_drafts(studio_obj, window_drafts):
-    combined, replaced = [], False
-    for wid, tabs in studio_obj.session.drafts.items():
-        if wid == studio_obj.window_id:
-            combined.extend(window_drafts)
-            replaced = True
-        else:
-            combined.extend(tabs)
-    if not replaced: combined.extend(window_drafts)
-    return combined
+def combined_recovery_drafts(studio_obj, window_drafts, *, snapshot_tab_fn=_default_snapshot_tab_state):
+    with studio_obj.session._rename_state_lock:
+        combined, replaced = [], False
+        for wid, tabs in studio_obj.session.drafts.items():
+            if wid == studio_obj.window_id:
+                combined.extend(snapshot_tab_fn(tab, include_view_state=False) for tab in window_drafts)
+                replaced = True
+            else:
+                combined.extend(snapshot_tab_fn(tab, include_view_state=False) for tab in tabs)
+        if not replaced: combined.extend(snapshot_tab_fn(tab, include_view_state=False) for tab in window_drafts)
+        return combined
 
 def recover(studio_obj, *, atomic_json_fn=atomic_json) -> None:
-    studio_obj._submit_startup_snapshot()
-    # Snapshot only unsaved or agent-staged tabs. Asset bytes stay in recovery, never in displayed source.
-    window_drafts = studio_obj._window_recovery_drafts()
-    studio_obj.session.drafts[studio_obj.window_id] = window_drafts
-    drafts = studio_obj._combined_recovery_drafts(window_drafts)
+    with studio_obj.session._rename_state_lock:
+        workspace = studio_obj._build_startup_snapshot_locked()
+        # Snapshot only unsaved or agent-staged tabs. Asset bytes stay in recovery, never in displayed source.
+        window_drafts = studio_obj._window_recovery_drafts()
+        studio_obj.session.drafts[studio_obj.window_id] = window_drafts
+        drafts = studio_obj._combined_recovery_drafts(window_drafts)
+    studio_obj.session.writes.submit_latest(
+        "startup",
+        lambda: atomic_json_fn(studio_obj.data / "startup.json", workspace),
+        lambda error: studio_obj._notify_recovery_write("startup", error),
+    )
     studio_obj.session.writes.submit_latest(
         "recovery",
         lambda: atomic_json_fn(studio_obj.data / "recovery.json", drafts),
