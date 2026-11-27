@@ -365,4 +365,46 @@ class AgentRelayClientTest {
             relay.disconnect()
         }
     }
+
+    @Test fun enforces150CapOnAttachWhilePreserving159CompatKeysForSourceAndReplace() {
+        val maxNew = "assets/${"a".repeat(146)}.svg"
+        val compat159 = "assets/${"a".repeat(155)}.svg"
+        val over160 = "assets/${"a".repeat(156)}.svg"
+        val assetSha = "f".repeat(64)
+
+        client.validateRequest(request("attach").put("assetName", maxNew))
+        assertThrows(IllegalArgumentException::class.java) {
+            client.validateRequest(request("attach").put("assetName", compat159))
+        }
+
+        for (validExisting in listOf(maxNew, compat159, assetSha)) {
+            client.validateRequest(request("source").put("body", "").put("assetName", validExisting))
+            client.validateRequest(
+                JSONObject()
+                    .put("requestId", "replace_1")
+                    .put("action", "replace_tab_asset")
+                    .put("tabId", "tab:device:workspace:1")
+                    .put("expectedRevision", revision)
+                    .put("assetName", validExisting)
+                    .put("assetPath", "updated.svg")
+            )
+        }
+
+        for (invalid in listOf(over160, "assets/.", "assets/..", "../escape.svg")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                client.validateRequest(request("source").put("body", "").put("assetName", invalid))
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                client.validateRequest(
+                    JSONObject()
+                        .put("requestId", "replace_2")
+                        .put("action", "replace_tab_asset")
+                        .put("tabId", "tab:device:workspace:1")
+                        .put("expectedRevision", revision)
+                        .put("assetName", invalid)
+                        .put("assetPath", "updated.svg")
+                )
+            }
+        }
+    }
 }
