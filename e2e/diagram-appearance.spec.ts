@@ -20,7 +20,7 @@ test('Mermaid shares SVG appearance, isolates authored CSS, retains its geometry
   const state={id:'diagram-appearance',content:`# An unchanged note\n\n![Photo](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j4b8AAAAASUVORK5CYII=)\n\n\`\`\`mermaid\n${diagram}\n\`\`\``,path:null,mode:'reader' as const,dark:true,fullscreen:false,colors:{surface:'#191420',text:'#f3e4ed',primary:'#e3a8c7'},font:'Manrope',size:16,zoom:100,motion:false,imageAppearance:'original' as const,svgAppearance:'contrast' as const};
   await page.evaluate(state=>window.supermdLoad?.(state),state);
   const image=page.locator('.mermaid img'),photo=page.getByRole('img',{name:'Photo'});
-  await expect(image).toBeVisible({timeout:25_000});await expect.poll(()=>image.evaluate(i=>(i as HTMLImageElement).naturalWidth)).toBeGreaterThan(100);
+  await expect(image).toBeVisible();await expect.poll(()=>image.evaluate(i=>(i as HTMLImageElement).naturalWidth)).toBeGreaterThan(100);
   expect(await image.evaluate(i=>getComputedStyle(i).filter)).toBe('none');
   expect(await image.evaluate(i=>getComputedStyle(i).outlineStyle)).toBe('solid');
   expect(await page.locator('body').evaluate(i=>getComputedStyle(i).backgroundColor)).not.toBe('rgb(0, 255, 0)');
@@ -80,7 +80,7 @@ for(const [kind,source]of Object.entries({
   const roots=new Set<string>();
   for(const mode of ['original','auto','monochrome','contrast','invert-dark']as const){
     await page.evaluate(s=>window.supermdLoad?.(s),{...state,svgAppearance:mode});
-    const image=page.locator('.mermaid img');await expect(image).toBeVisible({timeout:25_000});
+    const image=page.locator('.mermaid img');await expect(image).toBeVisible();
     await expect(page.locator('.mermaid')).toHaveAttribute('data-render-dark',String(mode==='original'));
     await expect.poll(()=>image.evaluate(i=>(i as HTMLImageElement).naturalWidth)).toBeGreaterThan(50);
     await expect(page.locator('.render-error,.image-error')).toHaveCount(0);
@@ -112,7 +112,7 @@ test('plain Mermaid uses Pele without loading the legacy engine and custom confi
   expect(svg).toContain('data-diagram-engine="pele"');expect(svg).not.toContain('var(');
   expect(requested.some(url=>/\/node_modules\/(?:\.vite\/deps\/mermaid[._]|mermaid\/)/.test(url))).toBe(false);
   await page.evaluate(s=>window.supermdLoad?.({...s,content:'```mermaid\n%%{init: {"theme":"forest"}}%%\nflowchart LR\n A[Read] --> B[Understand]\n```'}),state);
-  await expect.poll(async()=>decodeURIComponent((await image.getAttribute('src'))!.split(',').slice(1).join(',')),{timeout:25_000}).toContain('data-diagram-engine="mermaid"');
+  await expect.poll(async()=>decodeURIComponent((await image.getAttribute('src'))!.split(',').slice(1).join(','))).toContain('data-diagram-engine="mermaid"');
   svg=decodeURIComponent((await image.getAttribute('src'))!.split(',').slice(1).join(','));expect(svg).toContain('Read');expect(svg).toContain('Understand');
   await expect(page.locator('.render-error')).toHaveCount(0);
 });

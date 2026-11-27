@@ -2416,6 +2416,15 @@ sys.exit(0)""",
                 try:
                     gui_after.settings["headlessServiceApproved"] = False
                     gui_studio.setting("theme", '"light"')
+                    gui_after.settings["headlessServiceApproved"] = False
+                    gui_after.settings["agentAccessEnabled"] = True
+                    gui_after.background = type("_CliBg", (), {"_cli_started_agent_access": True})()
+                    retired_settings_bytes, _, _, _ = gui_after._build_retired_persistence_payloads()
+                    retired_saved = json.loads(retired_settings_bytes.decode("utf-8"))["settings"]
+                    self.assertIs(retired_saved["headlessServiceApproved"], True)
+                    self.assertIs(retired_saved["agentAccessEnabled"], False)
+                    gui_after.background = None
+                    gui_after.settings["agentAccessEnabled"] = False
                 finally:
                     gui_studio.stop()
                     gui_studio.pool.shutdown(wait=True, cancel_futures=True)

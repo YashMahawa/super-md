@@ -88,9 +88,9 @@ test("renders complex fallback Mermaid diagrams in an opaque-origin sandbox with
   }, content);
 
   const diagrams = page.locator(".mermaid img");
-  await expect(diagrams).toHaveCount(2, { timeout: 25_000 });
+  await expect(diagrams).toHaveCount(2);
   for (let idx = 0; idx < 2; idx++) {
-    await expect(diagrams.nth(idx)).toBeVisible({ timeout: 25_000 });
+    await expect(diagrams.nth(idx)).toBeVisible();
     await expect.poll(() => diagrams.nth(idx).evaluate(i => (i as HTMLImageElement).naturalWidth)).toBeGreaterThan(80);
   }
 
@@ -201,7 +201,7 @@ test("neutralizes XSS advisories, @import stylesheets, external SVG images, and 
   }, maliciousNote);
 
   // External SVG block and malicious SVG data URI must be rejected with safe error states, while Mermaid XSS payload is sanitized.
-  await expect(page.locator(".mermaid img")).toBeVisible({ timeout: 25_000 });
+  await expect(page.locator(".mermaid img")).toBeVisible();
   await expect(page.locator(".render-error")).toContainText("External SVG resources must be embedded first.");
   await expect(page.locator(".image-error")).toBeVisible();
   expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).__xssTriggered)).toBe(false);
@@ -283,7 +283,7 @@ test("PDF export receives self-contained sanitized SVG output from the isolated 
     });
   }, note);
 
-  await expect(page.locator(".mermaid img")).toBeVisible({ timeout: 25_000 });
+  await expect(page.locator(".mermaid img")).toBeVisible();
   await page.evaluate(() => window.supermdExport?.({ paper: "a4", marginMm: 18 }));
 
   const exportedCall = await expect

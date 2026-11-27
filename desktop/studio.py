@@ -811,8 +811,13 @@ class Session(QObject):
 
     def _build_retired_persistence_payloads(self):
         with self._rename_state_lock:
+            if not self.settings.get("headlessServiceApproved") and read_persisted_headless_approval(self.data):
+                self.settings["headlessServiceApproved"] = True
+            persisted_settings = copy.deepcopy(self.settings)
+            if getattr(getattr(self, "background", None), "_cli_started_agent_access", False):
+                persisted_settings["agentAccessEnabled"] = False
             settings_bytes = json.dumps({
-                "settings": copy.deepcopy(self.settings),
+                "settings": persisted_settings,
                 "recent": list(self.recent),
                 "pinned": list(self.pinned),
             }).encode()

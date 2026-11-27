@@ -35,15 +35,8 @@ test('opening, dragging and panning note images never appends Markdown or broken
       await page.mouse.move(box.x + 30, box.y + 30); await page.mouse.down();
       await page.mouse.move(box.x + 120, box.y + 60, { steps: 12 }); await page.mouse.up();
       // Browsers may synthesize a click after a non-native drag; dismiss only
-      // the image viewer if that happened (including after Live mode's 180ms
-      // single-click deferral), never mutate or reload the note.
-      if (mode === 'live') {
-        await page.evaluate(() => new Promise<void>(resolve => window.setTimeout(() => window.setTimeout(resolve, 32), 200)));
-      }
-      if (await page.locator('.image-viewer').count()) {
-        await page.keyboard.press('Escape');
-        await expect(page.locator('.image-viewer')).toHaveCount(0);
-      }
+      // the image viewer if that happened, never mutate or reload the note.
+      if (await page.locator('.image-viewer').count()) await page.keyboard.press('Escape');
       expect(await page.evaluate(() => (window as any).mediaCommands)).toEqual([]);
       await expect(page.locator('.image-error,.render-error')).toHaveCount(0);
       await expect(page.getByText('The final paragraph must stay final.', { exact: true })).toBeVisible();
