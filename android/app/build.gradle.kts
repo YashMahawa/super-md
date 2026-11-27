@@ -1,4 +1,86 @@
+import java.util.Properties
+import org.gradle.api.DefaultTask
+import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.file.FileCollection
+import org.gradle.api.file.RegularFile
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.MapProperty
+import org.gradle.api.provider.Provider
+import org.gradle.api.tasks.Classpath
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFiles
+import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.OutputFile
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.TaskAction
+import org.gradle.process.CommandLineArgumentProvider
+import org.gradle.work.DisableCachingByDefault
+
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose"); id("com.chaquo.python") }
+val robolectricSdkVersions = listOf(
+    "8.0.0_r4-robolectric-r1-i7",
+    "9-robolectric-4913185-2-i7",
+    "13-robolectric-9030017-i7",
+    "15-robolectric-12650502-i7",
+)
+val robolectricSdkJars = files(
+    robolectricSdkVersions.map { ver ->
+        configurations.detachedConfiguration(
+            dependencies.create("org.robolectric:android-all-instrumented:$ver"),
+        ).apply { isTransitive = false }
+    },
+)
+
+@DisableCachingByDefault(because = "Writes machine-local Gradle cache paths for Robolectric")
+abstract class GenerateRobolectricDepsTask : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.ABSOLUTE)
+    abstract val sdkJars: ConfigurableFileCollection
+
+    @get:Input
+    abstract val coordinatesByFileName: MapProperty<String, String>
+
+    @get:OutputFile
+    abstract val outputFile: RegularFileProperty
+
+    @TaskAction
+    fun generate() {
+        val mapping = coordinatesByFileName.get()
+        val props = Properties()
+        for (jar in sdkJars.files) {
+            val coords = mapping[jar.name]
+                ?: error("Unmapped Robolectric SDK artifact: ${jar.name}")
+            props.setProperty(coords, jar.absolutePath)
+        }
+        check(props.size == mapping.size) {
+            "Expected ${mapping.size} Robolectric SDK JARs, resolved ${props.size}"
+        }
+        val out = outputFile.get().asFile
+        out.parentFile.mkdirs()
+        out.outputStream().use { stream -> props.store(stream, null) }
+    }
+}
+
+class RobolectricDepsJvmArgs(
+    @get:Internal val depsFile: Provider<RegularFile>,
+    @get:Classpath val sdkJars: FileCollection,
+) : CommandLineArgumentProvider {
+    override fun asArguments(): Iterable<String> = listOf(
+        "-Drobolectric-deps.properties=${depsFile.get().asFile.absolutePath}",
+    )
+}
+
+val generateRobolectricDeps = tasks.register<GenerateRobolectricDepsTask>("generateRobolectricDeps") {
+    sdkJars.from(robolectricSdkJars)
+    coordinatesByFileName.set(
+        robolectricSdkVersions.associate { ver ->
+            "android-all-instrumented-$ver.jar" to "org.robolectric:android-all-instrumented:$ver"
+        },
+    )
+    outputFile.set(layout.buildDirectory.file("generated/robolectric/robolectric-deps.properties"))
+}
+
 android {
     namespace = "dev.supermd.studio"
     compileSdk { version = release(37) }
@@ -21,7 +103,18 @@ android {
     // Android extracts them at installation, rather than inflating APK size.
     packaging { jniLibs { useLegacyPackaging = true }; resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
     lint { error += "ObsoleteSdkInt" }
-    testOptions { unitTests.isIncludeAndroidResources = true }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+        unitTests.all { testTask ->
+            testTask.dependsOn(generateRobolectricDeps)
+            testTask.jvmArgumentProviders.add(
+                RobolectricDepsJvmArgs(
+                    depsFile = generateRobolectricDeps.flatMap { it.outputFile },
+                    sdkJars = robolectricSdkJars,
+                ),
+            )
+        }
+    }
 }
 kotlin { jvmToolchain(17) }
 chaquopy { defaultConfig { version = "3.13"; System.getenv("SUPERMD_BUILD_PYTHON")?.let { buildPython(it) }; pip { install("numpy"); install("matplotlib==3.8.4") } } }
