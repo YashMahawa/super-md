@@ -1,35 +1,218 @@
 """Control the per-user application service over its private local socket."""
 import argparse,hashlib,json,os,subprocess,sys,time
 from pathlib import Path
+try:
+    from .core.paths import DESKTOP_DIR
+except ImportError:
+    from core.paths import DESKTOP_DIR
+
+def _daemon_command(*,executable=None,frozen=None,platform=None,env=None):
+    frozen=getattr(sys,'frozen',False) if frozen is None else bool(frozen)
+    platform=sys.platform if platform is None else platform
+    env=os.environ if env is None else env
+    exe=Path(os.path.abspath(Path(executable or sys.executable).expanduser()))
+    if frozen:
+        exe=exe.resolve()
+        if platform.startswith('win'):
+            gui=exe.with_name('super-md.exe')
+            if gui.is_file():exe=gui.resolve()
+        elif platform.startswith('linux'):
+            appimage,appdir=env.get('APPIMAGE',''),env.get('APPDIR','')
+            if appimage and appdir and exe.is_relative_to(Path(appdir).resolve()):
+                candidate=Path(appimage).expanduser()
+                if candidate.is_file():exe=candidate.resolve()
+        return [str(exe),'--background','--agent-access']
+    if platform.startswith('win'):
+        windowed=exe.with_name('pythonw.exe')
+        if windowed.is_file():exe=windowed
+    return [str(exe),str(DESKTOP_DIR/'main.py'),'--background','--agent-access']
 
 def main(argv):
     parser=argparse.ArgumentParser(description='Super MD background service')
     parser.add_argument('action',choices=['start','status','stop'])
     args=parser.parse_args(argv)
-    from PySide6.QtCore import QCoreApplication,QStandardPaths
+    from PySide6.QtCore import QCoreApplication,QLockFile,QStandardPaths
     from PySide6.QtNetwork import QLocalSocket
+    try:
+        from .instance import is_process_exit_clear,posix_ipc_exchange
+    except ImportError:
+        from instance import is_process_exit_clear,posix_ipc_exchange
     app=QCoreApplication.instance() or QCoreApplication(['super-md'])
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
-    root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
+    platform=sys.platform
+    is_win=platform.startswith('win')
+    root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
-    def request(action):
-        socket=QLocalSocket();socket.connectToServer(name)
-        if not socket.waitForConnected(400):return False
-        socket.write(json.dumps({'service':action}).encode()+b'\n');socket.waitForBytesWritten(500)
-        okay=socket.waitForReadyRead(1000) and bytes(socket.readAll())==b'ok\n';socket.disconnectFromServer();return okay
-    action='quit' if args.action=='stop' else args.action
-    running=request(action)
-    if args.action=='start' and not running:
-        root.mkdir(parents=True,exist_ok=True)
-        command=[sys.executable,'--background','--agent-access'] if getattr(sys,'frozen',False) else [sys.executable,str(Path(__file__).with_name('main.py')),'--background','--agent-access']
-        with (root/'background-service.log').open('ab') as log:
-            subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=os.name!='nt',creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name=='nt' else 0)
-        deadline=time.monotonic()+20
-        while time.monotonic()<deadline:
-            if request('status'):running=True;break
-            time.sleep(.2)
-        if not running:raise ValueError('Background service did not start; inspect its local log')
+    def _instance_lock_held():
+        if not root.exists():return False
+        probe=QLockFile(str(root/'native-instance.lock'));probe.setStaleLockTime(0)
+        if probe.tryLock(0):
+            probe.unlock();return False
+        return True
+    def _process_exit_clear():
+        return is_process_exit_clear(root)
+    def _probe_still_listening():
+        if not is_win:
+            connected,_,_=posix_ipc_exchange(name,b'{"service":"status"}\n',connect_timeout=.1,read_timeout=.1)
+            return connected
+        probe=QLocalSocket();probe.connectToServer(name)
+        still=probe.waitForConnected(100)
+        if still:
+            probe.write(b'{"service":"status"}\n');probe.flush();probe.waitForBytesWritten(100)
+            ack=bytes(probe.readAll())
+            while b'\n' not in ack and probe.waitForReadyRead(100):ack+=bytes(probe.readAll())
+            probe.disconnectFromServer()
+        return still
+    def request(action,*,startup_poll=False):
+        wire_action='quit' if action=='stop' else action
+        payload=json.dumps({'service':wire_action}).encode('utf-8')+b'\n'
+        read_timeout_sec=5.0 if startup_poll else 2.0
+        if not is_win:
+            connected,raw,peer_closed=posix_ipc_exchange(name,payload,connect_timeout=1.0,read_timeout=read_timeout_sec)
+            if not connected:return None
+        else:
+            socket=QLocalSocket();socket.connectToServer(name)
+            if not socket.waitForConnected(1000):return None
+            socket.write(payload);socket.flush();socket.waitForBytesWritten(1000)
+            read_timeout=int(read_timeout_sec*1000)
+            raw=bytes(socket.readAll())
+            while b'\n' not in raw and socket.waitForReadyRead(read_timeout):raw+=bytes(socket.readAll())
+            if b'\n' not in raw:raw+=bytes(socket.readAll())
+            if not raw and socket.state()==QLocalSocket.LocalSocketState.ConnectedState:
+                socket.waitForDisconnected(50)
+            peer_closed=(
+                socket.state() in (QLocalSocket.LocalSocketState.UnconnectedState,QLocalSocket.LocalSocketState.ClosingState)
+                or socket.error() in (
+                    QLocalSocket.LocalSocketError.PeerClosedError,
+                    QLocalSocket.LocalSocketError.ConnectionError,
+                    QLocalSocket.LocalSocketError.ServerNotFoundError,
+                    QLocalSocket.LocalSocketError.ConnectionRefusedError,
+                )
+            )
+            socket.disconnectFromServer()
+        if not raw:
+            if peer_closed or startup_poll:return None
+            raise ValueError('Existing Super MD instance did not respond to service request')
+        line=raw.split(b'\n',1)[0].rstrip(b'\r')
+        if line==b'ok':
+            if action=='status':return {'ok':True,'running':True}
+            if action=='stop':return {'ok':True,'running':False,'quitRequested':True}
+            return {'ok':True,'running':True,'sessionsDirectory':str(root/'qt-studio'/'agent-sessions')}
+        try:reply=json.loads(line.decode('utf-8'))
+        except (UnicodeDecodeError,ValueError) as error:raise ValueError('Invalid response from Super MD instance') from error
+        if not isinstance(reply,dict):raise ValueError('Invalid response from Super MD instance')
+        return reply
+    if args.action=='start':
+        try:reply=request('start')
+        except ValueError as error:
+            if 'Invalid response' in str(error):raise
+            if not _instance_lock_held():
+                vanish_deadline=time.monotonic()+1.5
+                still_listening=True
+                while still_listening and not _instance_lock_held() and time.monotonic()<vanish_deadline:
+                    still_listening=_probe_still_listening()
+                    if still_listening:time.sleep(.05)
+                if still_listening and not _instance_lock_held():raise
+                reply=None
+            if _instance_lock_held():
+                reply=None;init_deadline=time.monotonic()+8
+                while time.monotonic()<init_deadline:
+                    reply=request('start',startup_poll=True)
+                    if reply is not None or not _instance_lock_held():break
+                    time.sleep(.1)
+                if reply is None and _instance_lock_held():
+                    reply=request('start')
+    else:
+        reply=request(args.action)
+        if reply is None and _instance_lock_held():
+            retry_deadline=time.monotonic()+.35
+            while reply is None and _instance_lock_held() and time.monotonic()<retry_deadline:
+                time.sleep(.05)
+                reply=request(args.action)
+    if args.action=='status':
+        if reply is not None and not reply.get('ok',False):
+            if reply.get('error')=='Background service is unavailable':reply=None
+            else:raise ValueError(reply.get('error') or 'Failed to query background service status')
+        result={'running':bool(reply and reply.get('running')),'action':'status'}
+        if reply is not None and 'agentAccess' in reply:result['agentAccess']=bool(reply['agentAccess'])
+        print(json.dumps({'ok':True,'result':result}));return 0
+    if args.action=='stop':
+        if reply is not None and not reply.get('ok',False):
+            if reply.get('error')=='Background service is unavailable':reply=None
+            else:raise ValueError(reply.get('error') or 'Failed to stop background service')
+        result={'running':bool(reply and reply.get('running')),'action':'stop','quitRequested':bool(reply and reply.get('quitRequested'))}
+        print(json.dumps({'ok':True,'result':result}));return 0
+    sessions_dir=str(root/'qt-studio'/'agent-sessions')
+    if reply is not None and not reply.get('ok',False) and reply.get('error')=='Background service is unavailable':
+        wait_deadline=time.monotonic()+15
+        while time.monotonic()<wait_deadline and (reply is None or (not reply.get('ok',False) and reply.get('error')=='Background service is unavailable')):
+            time.sleep(.05);reply=request('start',startup_poll=True)
+    if reply is not None and reply.get('stopping'):
+        stop_deadline=time.monotonic()+15
+        while time.monotonic()<stop_deadline:
+            status=request('status',startup_poll=True)
+            if status is None:reply=None;break
+            if not status.get('stopping') and status.get('running'):
+                reply=request('start',startup_poll=True);break
+            time.sleep(.05)
+        if reply is not None and reply.get('stopping'):
+            raise ValueError(reply.get('error') or 'Super MD is currently quitting; finish closing it before starting the background service.')
+    if reply is not None:
+        if not reply.get('ok',False):raise ValueError(reply.get('error') or 'Super MD refused to start background agent access')
+        running=bool(reply.get('running',True))
+        if reply.get('sessionsDirectory'):sessions_dir=str(reply['sessionsDirectory'])
+    else:
+        running=False;root.mkdir(parents=True,exist_ok=True)
+        lock_probe=QLockFile(str(root/'native-instance.lock'));lock_probe.setStaleLockTime(0)
+        lock_deadline=time.monotonic()+20;lock_cleared=False
+        while time.monotonic()<lock_deadline:
+            if lock_probe.tryLock(100):
+                lock_probe.unlock()
+                if _process_exit_clear():lock_cleared=True;break
+                time.sleep(.05);continue
+            probe=request('status',startup_poll=True)
+            if probe is not None and probe.get('ok',False):
+                if probe.get('running'):
+                    running=True;break
+                if not probe.get('stopping'):
+                    started=request('start',startup_poll=True)
+                    if started is not None:
+                        if not started.get('ok',False):
+                            raise ValueError(started.get('error') or 'Super MD refused to start background agent access')
+                        running=bool(started.get('running',True))
+                        if started.get('sessionsDirectory'):sessions_dir=str(started['sessionsDirectory'])
+                        break
+        if not running and not lock_cleared:
+            raise ValueError('Background service did not start; previous instance is still shutting down')
+        proc=None;daemon_exit_code=None
+        if not running:
+            flags=(getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|getattr(subprocess,'CREATE_NO_WINDOW',0)) if is_win else 0
+            popen_session={'process_group':0} if platform=='darwin' else {'start_new_session':not is_win}
+            log_path=root/'background-service.log'
+            had_legacy_log=log_path.is_file()
+            spawn_env=None if had_legacy_log else {**os.environ,'SUPERMD_FRESH_SERVICE_LOG':'1'}
+            with log_path.open('ab') as log:
+                proc=subprocess.Popen(_daemon_command(platform=platform),stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=spawn_env,creationflags=flags,**popen_session)
+            deadline=time.monotonic()+30
+            while time.monotonic()<deadline:
+                status=request('status',startup_poll=True)
+                if status is not None:
+                    if status.get('ok',False):
+                        if status.get('running'):running=True;break
+                    elif status.get('error')!='Background service is unavailable':
+                        raise ValueError(status.get('error') or 'Background service failed to start')
+                if proc is not None:
+                    exit_code=proc.poll()
+                    if type(exit_code) is int:
+                        daemon_exit_code=exit_code
+                        status=request('status',startup_poll=True)
+                        if status is not None and status.get('ok',False) and status.get('running'):
+                            running=True
+                        break
+                time.sleep(.05)
+        if not running:
+            detail=f' (exit code {daemon_exit_code})' if daemon_exit_code is not None else ''
+            raise ValueError(f'Background service did not start{detail}; inspect its local log')
     result={'running':running,'action':args.action}
-    if args.action=='stop':result['quitRequested']=running
-    if running and args.action=='start':result['sessionsDirectory']=str(root/'qt-studio'/'agent-sessions')
+    if running:result['sessionsDirectory']=sessions_dir
     print(json.dumps({'ok':True,'result':result}));return 0
