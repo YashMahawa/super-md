@@ -103,7 +103,13 @@ function decodeDataUrl(value: string): { mime: string; dataUrl: string; text?: s
   return { mime, dataUrl, text };
 }
 
-function cleanRelativePath(source: string): string | null {
+export const MERMAID_SOURCE_LIMIT = 2_000_000;
+
+export function isMermaidSourcePath(source: string): boolean {
+  return /\.(?:mmd|mermaid)(?:[?#]|$)/i.test(source);
+}
+
+export function cleanRelativePath(source: string): string | null {
   if (!source || source.startsWith("/") || source.startsWith("\\") || /^[a-z][a-z\d+.-]*:/i.test(source) || source.startsWith("//")) return null;
   let decoded: string;
   try { decoded = decodeURIComponent(source.split(/[?#]/, 1)[0]); } catch { return null; }
@@ -112,6 +118,29 @@ function cleanRelativePath(source: string): string | null {
   if (!parts.length || parts.some(part => part === ".." || /[<>:"|?*\x00-\x1f]/.test(part)
       || /[. ]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) return null;
   return parts.join("/");
+}
+
+export function validateLocalMermaidSourcePath(source: string): string {
+  if (/^data:/i.test(source)) throw Error("Mermaid source must be a local .mmd or .mermaid file");
+  const relative = cleanRelativePath(source);
+  if (!relative) throw Error(`Cannot safely resolve Mermaid source ${source}`);
+  return relative;
+}
+
+export async function loadLocalMermaidSource(documentPath: string | null, source: string): Promise<string> {
+  validateLocalMermaidSourcePath(source);
+  let loaded: string | { text: string };
+  try {
+    loaded = await invoke<string | { text: string }>("load_text_asset", { documentPath: documentPath || "", source });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw Error(detail.includes(source) ? detail : `Cannot load Mermaid source ${source}: ${detail}`);
+  }
+  const text = typeof loaded === "string" ? loaded : loaded?.text;
+  if (typeof text !== "string" || text.length > MERMAID_SOURCE_LIMIT) {
+    throw Error(`Mermaid source is unavailable or too large: ${source}`);
+  }
+  return text;
 }
 
 function sourceFence(source: string, language: "mermaid"): string {
@@ -164,16 +193,12 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
       checkCurrent();
       if (/^https?:|^\/\//i.test(ref.source) || seenSources.has(ref.source)) continue;
       seenSources.add(ref.source);
-      if (/\.(?:mmd|mermaid)(?:[?#]|$)/i.test(ref.source)) {
-        if (ref.source.startsWith("data:")) throw Error("Mermaid source must be a local .mmd or .mermaid file");
-        const relative = cleanRelativePath(ref.source);
-        if (!relative) throw Error(`Cannot safely resolve Mermaid source ${ref.source}`);
+      if (isMermaidSourcePath(ref.source)) {
+        validateLocalMermaidSourcePath(ref.source);
         const source = ref.source;
         tasks.push(async () => {
-          const loaded = await invoke<string | { text: string }>("load_text_asset", { documentPath: documentPath || "", source });
+          const text = await loadLocalMermaidSource(documentPath, source);
           checkCurrent();
-          const text = typeof loaded === "string" ? loaded : loaded?.text;
-          if (typeof text !== "string" || text.length > 2_000_000) throw Error(`Mermaid source is unavailable or too large: ${source}`);
           resolvedBySource.set(source, { kind: "mermaid", mermaid: text });
         });
         continue;
