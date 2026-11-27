@@ -1,5 +1,6 @@
 """Filesystem note watching, watch-suspension guards, and external note reconciliation for Studio."""
 from __future__ import annotations
+import contextlib
 from pathlib import Path
 from typing import Any
 
@@ -153,17 +154,17 @@ def refresh_external_notes(studio_obj: Any) -> None:
         if getattr(studio_obj, "retired", False) or error: return
         ops, session = _studio_module().folder_ops, getattr(studio_obj, "session", None)
         current_suspensions = _call_method(studio_obj, "_active_watch_suspensions", _active_suspensions)
-        reconciled_any = False
+        emitted_location_change = False
         for old, new in result.items():
             if _any_path_suspended(studio_obj, old, new, current_suspensions) or not _call_method(studio_obj, "_has_session_path_reference", has_session_path_reference, old):
                 continue
-            reconciled_any = True
+            emitted_location_change = True
             if (loc_sig := getattr(session, "locationChanged", None)) is not None:
                 loc_sig.emit(old, new or "")
         effective = {p for p in changed if not _call_method(studio_obj, "_is_watch_target_suspended", is_watch_target_suspended, p, current_suspensions)}
         _call_method(studio_obj, "_reload_changed_content", reload_changed_content, effective)
         folder = getattr(studio_obj, "folder", "")
-        if folder and (effective or reconciled_any) and (wl := getattr(session, "workspace_links", None)) is not None:
+        if folder and (effective or emitted_location_change) and (wl := getattr(session, "workspace_links", None)) is not None:
             wl.invalidate(folder)
         if folder and effective and any(ops.same_path(d, p) for d in (folder, *getattr(studio_obj, "expanded", ())) for p in effective):
             _call_method(studio_obj, "_load_tree", None)
@@ -177,13 +178,19 @@ def location_changed(studio_obj: Any, old: str, new: str) -> None:
     if Path(old).exists() and not (new and old != new and old.casefold() == new.casefold()): return  # A temporary atomic-replace gap has healed.
     if new and not Path(new).is_file(): return
     ops, session = _studio_module().folder_ops, getattr(studio_obj, "session", None)
-    locations = getattr(session, "locations", None)
+    stamps, locations = getattr(studio_obj, "note_file_stamps", None), getattr(session, "locations", None)
+    if isinstance(stamps, dict):
+        _pop_matching_locations(stamps, old)
     if new:
         if isinstance(locations, dict) and (loc := _pop_matching_locations(locations, old)):
             locations[new] = loc
         for tab in getattr(studio_obj, "tabs", ()):
             if tab.get("path") and ops.same_path(tab["path"], old):
                 tab.update(path=new, name=Path(new).name)
+                if isinstance(stamps, dict):
+                    with contextlib.suppress(OSError):
+                        st = Path(new).stat()
+                        stamps[new] = (st.st_mtime_ns, st.st_size)
         if session is not None and hasattr(session, "pinned"):
             session.pinned = [new if ops.same_path(path, old) else path for path in session.pinned]
         if hasattr(studio_obj, "recent"):
@@ -212,8 +219,8 @@ def location_changed(studio_obj: Any, old: str, new: str) -> None:
                 tab.update(path="", name=draft["name"], conflict=False)
             _call_method(studio_obj, "_remove_tab", _fallback_remove_tab, tab["id"])
         studio_obj.message = "File deleted: " + Path(old).name + ". Its tab was closed; unsaved changes remain recoverable."
-    if (folder := getattr(studio_obj, "folder", "")) and (wl := getattr(session, "workspace_links", None)) is not None:
-        wl.invalidate(folder)
+    if (wl := getattr(session, "workspace_links", None)) is not None:
+        wl.invalidate()
     _call_method(studio_obj, "_preferences", None)
     _call_method(studio_obj, "_recover", None)
     _call_method(studio_obj, "_emit", None)

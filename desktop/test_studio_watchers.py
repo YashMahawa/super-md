@@ -70,16 +70,21 @@ class StudioWatchersUnitTests(unittest.TestCase):
     def test_location_changed_rename_and_delete_recover_dirty_draft_and_invalidate_links(self):
         old_path, new_path = self.temp_dir / "draft.md", self.temp_dir / "renamed.md"
         new_path.write_text("# Saved\n", encoding="utf-8")
-        invalidated: list[str] = []
+        invalidated: list[str | None] = []
         tab = {"id": "t1", "name": "draft.md", "path": str(old_path), "content": "# Saved\n", "saved": "# Saved\n", "conflict": False}
         session = SimpleNamespace(
             locations={str(old_path): {"top": 4}}, pinned=[str(old_path)], drafts={},
-            workspace={"w1": [{"path": str(old_path)}]}, workspace_links=SimpleNamespace(invalidate=invalidated.append),
+            workspace={"w1": [{"path": str(old_path)}]}, workspace_links=SimpleNamespace(invalidate=lambda folder=None: invalidated.append(folder)),
         )
-        double = SimpleNamespace(tabs=[tab], active="t1", recent=[str(old_path)], folder=str(self.temp_dir), session=session, message="")
+        double = SimpleNamespace(
+            tabs=[tab], active="t1", recent=[str(old_path)], folder="",
+            note_file_stamps={str(old_path): (1, 1)}, session=session, message="",
+        )
 
         studio_watchers.location_changed(double, str(old_path), str(new_path))
+        st_new = new_path.stat()
         self.assertEqual((tab["path"], tab["name"]), (str(new_path), "renamed.md"))
+        self.assertEqual(double.note_file_stamps, {str(new_path): (st_new.st_mtime_ns, st_new.st_size)})
         self.assertEqual(session.locations, {str(new_path): {"top": 4}})
         self.assertEqual((session.pinned, double.recent), ([str(new_path)], [str(new_path)]))
         self.assertEqual(session.workspace["w1"][0]["path"], str(new_path))
@@ -87,11 +92,11 @@ class StudioWatchersUnitTests(unittest.TestCase):
         tab["content"] = "# Unsaved local work\n"
         new_path.unlink()
         studio_watchers.location_changed(double, str(new_path), "")
-        self.assertEqual((double.tabs, session.locations, session.pinned, double.recent), ([], {}, [], []))
+        self.assertEqual((double.tabs, double.note_file_stamps, session.locations, session.pinned, double.recent), ([], {}, {}, [], []))
         recovered = session.drafts["deleted-notes"]
         self.assertEqual((len(recovered), recovered[0]["name"], recovered[0]["path"]), (1, "Recovered renamed.md", ""))
         self.assertEqual(recovered[0]["content"], "# Unsaved local work\n")
-        self.assertEqual(invalidated, [str(self.temp_dir), str(self.temp_dir)])
+        self.assertEqual(invalidated, [None, None])
 
     def test_reload_changed_content_clean_reload_asset_revocation_conflict_and_monkeypatches(self):
         smd = self.temp_dir / "note.smd"
