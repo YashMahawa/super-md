@@ -232,16 +232,22 @@ class StudioSavesTests(unittest.TestCase):
         self._wait_until(lambda: smd_tab["path"] == str(copy_smd) and not self.studio.saving)
         self.assertFalse(smd_tab["agent_staged"] or smd_tab["agent_unreviewed"])
 
-        # 4. resolveConflict("reload") clears staging
+        # 4. resolveConflict("reload") flushes when ready, archives dirty draft without staging flags, and clears staging
         staged_path.write_text("reloaded disk\n", encoding="utf-8")
         tab["content"] = "unsaved\n"
         tab["conflict"] = True
         self.studio.active = tab["id"]
         mark_staged(tab)
         self.studio.resolveConflict("reload")
+        self.assertEqual(self.studio.flush_operation["action"], "reload_conflict")
+        op = self.studio.flush_operation
+        self.studio.flush_operation = None
+        self.studio.flush_timer.stop()
+        self.studio._after_flush(op)
         self._wait_until(lambda: not tab["conflict"] and self.studio.busy == 0)
         self.assertEqual(tab["content"], "reloaded disk\n")
         self.assertFalse(tab["agent_staged"] or tab["agent_unreviewed"])
+        self.assertEqual(len(self.studio.closed_tabs), 1)
 
     def test_save_vs_save_as_locations_and_folder_tree_refreshes(self):
         downloads = self.root / "Downloads"

@@ -117,6 +117,8 @@ def after_flush(studio_obj, operation: dict) -> None:
             studio_obj.saveAsRequested.emit(studio_obj._current()["name"])
     elif action == "overwrite_conflict":
         studio_obj._save_current(True)
+    elif action == "reload_conflict":
+        studio_obj._reload_current_from_disk()
     elif action == "sync_for_search":
         if studio_obj._folder_search_open and studio_obj._folder_search_query.strip():
             current_sig = [(t["id"], t["content"], studio_obj._is_dirty(t)) for t in studio_obj.tabs]
@@ -167,10 +169,18 @@ def after_flush(studio_obj, operation: dict) -> None:
         studio_obj._recover()
         mod.QTimer.singleShot(0, studio_obj.allowClose.emit)
 
+def _is_hidden_cli_close(studio_obj, action: str | None) -> bool:
+    bg, host = getattr(studio_obj.session, "background", None), getattr(studio_obj, "host_window", None)
+    return bool(action == "close_window" and bg is not None and getattr(bg, "_stopping_from_cli", False)
+                and host is not None and not host.isVisible())
+
 def on_flush_timeout(studio_obj) -> None:
     if studio_obj.flush_operation and studio_obj.flush_operation.get("action") == "sync_for_search":
         studio_obj.flush_operation = None
         studio_obj.workspaceSearchChanged.emit()
+        return
+    if studio_obj.flush_operation and _is_hidden_cli_close(studio_obj, studio_obj.flush_operation.get("action")):
+        studio_obj.resolveFlush("recover_close")
         return
     studio_obj.flushFailed.emit(bool(studio_obj.flush_operation and studio_obj.flush_operation["action"] == "close_window"))
 
@@ -181,10 +191,11 @@ def flush(studio_obj, action: str, target: str = "") -> None:
     if not studio_obj.ready or not studio_obj.tabs:
         studio_obj._after_flush(operation)
         return
-    if studio_obj.flush_operation and (studio_obj.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"):
+    hidden_cli_close = _is_hidden_cli_close(studio_obj, action)
+    if studio_obj.flush_operation and not hidden_cli_close and (studio_obj.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"):
         return
     studio_obj.flush_operation = operation
-    studio_obj.flush_timer.start(5000)
+    studio_obj.flush_timer.start(250 if hidden_cli_close else 5000)
     studio_obj.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
 
 def save_safely(studio_obj) -> None: studio_obj._flush("save")
@@ -201,7 +212,10 @@ def resolve_flush(studio_obj, choice: str) -> None:
     studio_obj.flush_timer.stop()
     if not operation:
         return
-    if choice == "retry":
+    if choice == "cancel" and operation["action"] == "close_window":
+        if (service := getattr(studio_obj.session, "background", None)) is not None:
+            service.cancel_quit()
+    elif choice == "retry":
         studio_obj._flush(operation["action"], operation["target"])
     elif choice == "recover_close" and operation["action"] == "close_window":
         studio_obj._recover()
@@ -218,32 +232,81 @@ def save_as(studio_obj, value: str) -> None:
 
 def resolve_conflict(studio_obj, choice: str) -> None:
     if choice == "cancel":
-        studio_obj.pending_close = ""
+        was_window, studio_obj.pending_close = studio_obj.pending_close == "window", ""
+        if was_window and (service := getattr(studio_obj.session, "background", None)) is not None:
+            service.cancel_quit()
     elif choice == "save_as":
         studio_obj.saveAsSafely()
     elif choice == "overwrite":
         studio_obj._flush("overwrite_conflict")
-    elif choice == "reload" and (tab := studio_obj._current()).get("path"):
-        tab_id, path, mod = tab["id"], Path(tab["path"]), _studio_module()
-        def done(result, error):
-            if error or not (target := next((t for t in studio_obj.tabs if t["id"] == tab_id), None)):
-                return
-            content, assets, portable = result
-            try:
-                st = path.stat()
-                studio_obj.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
-            except OSError:
-                pass
-            studio_obj.reader_edits.clear(tab_id)
-            studio_obj.session.reader_assets.revoke_tab(studio_obj.window_id, tab_id)
-            if tab_id == studio_obj.active:
-                studio_obj._last_reader_text = None
-            target.update(content=content, saved=content, assets=assets, saved_assets=dict(assets), assets_dirty=False, portable=portable, conflict=False)
-            mod.Studio._clear_agent_staging(studio_obj, target)
-            studio_obj.message = "Reloaded note from disk"
+    elif choice == "reload":
+        studio_obj._flush("reload_conflict")
+
+def reload_current_from_disk(studio_obj) -> None:
+    if not (tab := studio_obj._current()).get("path"):
+        return
+    tab_id, path, mod = tab["id"], Path(tab["path"]), _studio_module()
+    captured = mod._snapshot_tab_state(tab)
+    archived_draft = None
+    if studio_obj._is_dirty(tab):
+        archived_assets, raw_name = dict(captured.get("assets", {})), str(captured.get("name") or "Untitled.md")
+        archived_draft = {
+            **captured, "id": uuid.uuid4().hex,
+            "name": raw_name if raw_name.startswith("Recovered ") else f"Recovered {raw_name}",
+            "path": "", "saved": "", "assets": archived_assets, "saved_assets": {},
+            "assets_dirty": bool(archived_assets), "portable": bool(captured.get("portable")),
+            "conflict": False, "agent_staged": False, "agent_unreviewed": False, "agent_edits": [],
+        }
+    def work():
+        loaded = mod.open_note(path)
+        if archived_draft is None:
+            return loaded, None
+        try:
+            return loaded, studio_obj.session.closed_note_store.save(archived_draft)
+        except Exception as failure:
+            raise RuntimeError(f"ARCHIVE_FAILED:{failure}") from failure
+    def done(outcome, error):
+        if error:
+            err_text = str(error)
+            studio_obj.message = (f"Could not archive draft before reloading: {err_text[len('ARCHIVE_FAILED:'):]}"
+                                  if err_text.startswith("ARCHIVE_FAILED:") else f"Could not reload note from disk: {error}")
             studio_obj._recover()
-            studio_obj._emit(load=tab_id == studio_obj.active)
-        studio_obj._submit(lambda: mod.open_note(path), done, True)
+            studio_obj._emit(False)
+            return
+        if not (target := next((t for t in studio_obj.tabs if t["id"] == tab_id), None)):
+            return
+        if any(target.get(k) != captured.get(k) for k in ("content", "saved", "assets", "assets_dirty", "path")):
+            studio_obj.message = "The note changed while reloading from disk. It remains open with the latest draft."
+            studio_obj._recover()
+            studio_obj._emit(False)
+            return
+        (content, assets, portable), reference = outcome
+        if reference is not None:
+            next_refs = ([reference] + studio_obj.closed_tabs)[:mod.ClosedNoteStore.LIMIT]
+            try:
+                studio_obj.session.closed_note_store.save_index(next_refs)
+            except Exception as failure:
+                studio_obj.message = f"Could not update closed-note recovery before reloading: {failure}"
+                studio_obj._recover()
+                studio_obj._emit(False)
+                return
+            studio_obj.closed_tabs[:] = next_refs
+        try:
+            st = path.stat()
+            studio_obj.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            pass
+        studio_obj.reader_edits.clear(tab_id)
+        studio_obj.session.reader_assets.revoke_tab(studio_obj.window_id, tab_id)
+        if tab_id == studio_obj.active:
+            studio_obj._last_reader_text = None
+        target.update(content=content, saved=content, assets=assets, saved_assets=dict(assets),
+                      assets_dirty=False, portable=portable, conflict=False)
+        mod.Studio._clear_agent_staging(studio_obj, target)
+        studio_obj.message = "Reloaded note from disk"
+        studio_obj._recover()
+        studio_obj._emit(load=tab_id == studio_obj.active)
+    studio_obj._submit(work, done, True, studio_obj.writes)
 
 def save_text(studio_obj, tab: dict, path: Path, automatic: bool = False, force_overwrite: bool = False, force_portable: bool = False) -> None:
     tab_id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
