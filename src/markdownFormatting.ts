@@ -163,215 +163,100 @@ function buildResultFromRangePlans(
   out += doc.slice(cursor);
   return {
     doc: out,
-    changes: changes.filter((c) => c.insert !== doc.slice(c.from, c.to)),
+    changes: changes.filter((c) => c.from !== c.to || c.insert.length > 0),
     ranges: nextRanges,
     mainIndex: Math.min(Math.max(0, mainIndex), Math.max(0, nextRanges.length - 1)),
   };
 }
 
-function maxConsecutiveChars(text: string, ch: string): number {
-  let max = 0;
-  let run = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === ch) {
-      run++;
-      if (run > max) max = run;
-    } else {
-      run = 0;
-    }
-  }
-  return max;
+type SymmetricInlineAction = "bold" | "italic" | "inline_code" | "inline_math";
+
+interface SymmetricInlineDescriptor {
+  readonly delimiters: readonly string[];
+  unwrapCount(runLength: number): number;
+  unwrapInner?(inner: string, count: number): string;
+  wrap(selected: string): readonly [open: string, close: string];
 }
 
-function noopRangePlan(doc: string, range: SelectionRange): RangePlan {
-  const from = Math.min(range.anchor, range.head);
-  const to = Math.max(range.anchor, range.head);
-  const reversed = range.anchor > range.head;
-  const selected = doc.slice(from, to);
-  return {
-    from,
-    to,
-    insert: selected,
-    selStartOffset: 0,
-    selEndOffset: selected.length,
-    reversed,
-  };
-}
+const SYMMETRIC_INLINE_DESCRIPTORS: Record<SymmetricInlineAction, SymmetricInlineDescriptor> = {
+  bold: {
+    delimiters: ["*", "_"],
+    unwrapCount: (n) => (n >= 2 ? 2 : 0),
+    wrap: () => ["**", "**"],
+  },
+  italic: {
+    delimiters: ["*", "_"],
+    unwrapCount: (n) => (n === 1 || n === 3 ? 1 : 0),
+    wrap: () => ["*", "*"],
+  },
+  inline_code: {
+    delimiters: ["`"],
+    unwrapCount: (n) => (n === 1 || n === 2 ? n : 0),
+    unwrapInner: (inner, count) =>
+      count === 2 && inner.startsWith(" ") && inner.endsWith(" ") && inner.length >= 2
+        ? inner.slice(1, -1)
+        : inner,
+    wrap: (selected) => (selected.includes("`") ? ["`` ", " ``"] : ["`", "`"]),
+  },
+  inline_math: {
+    delimiters: ["$"],
+    unwrapCount: (n) => (n === 1 ? 1 : 0),
+    wrap: () => ["$", "$"],
+  },
+};
 
 function planSymmetricInlineToggle(
   doc: string,
   range: SelectionRange,
-  action: "bold" | "italic" | "inline_code" | "inline_math",
+  action: SymmetricInlineAction,
 ): RangePlan {
   const from = Math.min(range.anchor, range.head);
   const to = Math.max(range.anchor, range.head);
   const reversed = range.anchor > range.head;
   const selected = doc.slice(from, to);
+  const descriptor = SYMMETRIC_INLINE_DESCRIPTORS[action];
 
-  if (action === "bold") {
-    const outerStars = Math.min(countCharsLeft(doc, from, "*", 3), countCharsRight(doc, to, "*", 3));
-    const outerUnderscores = Math.min(countCharsLeft(doc, from, "_", 3), countCharsRight(doc, to, "_", 3));
-    if (outerStars >= 2 || outerUnderscores >= 2) {
+  for (const ch of descriptor.delimiters) {
+    const outerRun = Math.min(countCharsLeft(doc, from, ch, 3), countCharsRight(doc, to, ch, 3));
+    const outerUnwrap = descriptor.unwrapCount(outerRun);
+    if (outerUnwrap > 0) {
       return {
-        from: from - 2,
-        to: to + 2,
+        from: from - outerUnwrap,
+        to: to + outerUnwrap,
         insert: selected,
         selStartOffset: 0,
         selEndOffset: selected.length,
         reversed,
       };
     }
-    if (selected.length >= 4) {
-      const innerStars = Math.min(countLeadingChars(selected, "*", 3), countTrailingChars(selected, "*", 3));
-      const innerUnderscores = Math.min(countLeadingChars(selected, "_", 3), countTrailingChars(selected, "_", 3));
-      if (innerStars >= 2 || innerUnderscores >= 2) {
-        const inner = selected.slice(2, selected.length - 2);
-        return {
-          from,
-          to,
-          insert: inner,
-          selStartOffset: 0,
-          selEndOffset: inner.length,
-          reversed,
-        };
-      }
-    }
-    const wrapped = `**${selected}**`;
-    return {
-      from,
-      to,
-      insert: wrapped,
-      selStartOffset: 2,
-      selEndOffset: 2 + selected.length,
-      reversed,
-    };
   }
 
-  if (action === "italic") {
-    const outerStars = Math.min(countCharsLeft(doc, from, "*", 3), countCharsRight(doc, to, "*", 3));
-    const outerUnderscores = Math.min(countCharsLeft(doc, from, "_", 3), countCharsRight(doc, to, "_", 3));
-    if (outerStars === 1 || outerStars === 3 || outerUnderscores === 1 || outerUnderscores === 3) {
-      return {
-        from: from - 1,
-        to: to + 1,
-        insert: selected,
-        selStartOffset: 0,
-        selEndOffset: selected.length,
-        reversed,
-      };
-    }
-    if (selected.length >= 2) {
-      const innerStars = Math.min(countLeadingChars(selected, "*", 3), countTrailingChars(selected, "*", 3));
-      const innerUnderscores = Math.min(countLeadingChars(selected, "_", 3), countTrailingChars(selected, "_", 3));
-      if (innerStars === 1 || innerStars === 3 || innerUnderscores === 1 || innerUnderscores === 3) {
-        const inner = selected.slice(1, selected.length - 1);
-        return {
-          from,
-          to,
-          insert: inner,
-          selStartOffset: 0,
-          selEndOffset: inner.length,
-          reversed,
-        };
-      }
-    }
-    const wrapped = `*${selected}*`;
-    return {
-      from,
-      to,
-      insert: wrapped,
-      selStartOffset: 1,
-      selEndOffset: 1 + selected.length,
-      reversed,
-    };
-  }
-
-  if (action === "inline_code") {
-    const outerTicks = Math.min(countCharsLeft(doc, from, "`", 6), countCharsRight(doc, to, "`", 6));
-    if (outerTicks >= 1) {
-      return {
-        from: from - outerTicks,
-        to: to + outerTicks,
-        insert: selected,
-        selStartOffset: 0,
-        selEndOffset: selected.length,
-        reversed,
-      };
-    }
-    if (selected.length >= 2) {
-      const innerTicks = Math.min(countLeadingChars(selected, "`", 6), countTrailingChars(selected, "`", 6));
-      if (innerTicks >= 1 && selected.length >= innerTicks * 2) {
-        let inner = selected.slice(innerTicks, selected.length - innerTicks);
-        if (innerTicks >= 2 && inner.startsWith(" ") && inner.endsWith(" ") && inner.length >= 2) {
-          inner = inner.slice(1, -1);
-        }
-        return {
-          from,
-          to,
-          insert: inner,
-          selStartOffset: 0,
-          selEndOffset: inner.length,
-          reversed,
-        };
-      }
-    }
-    if (selected.includes("`")) {
-      const fence = "`".repeat(maxConsecutiveChars(selected, "`") + 1);
-      const wrapped = `${fence} ${selected} ${fence}`;
-      const padLen = fence.length + 1;
-      return {
-        from,
-        to,
-        insert: wrapped,
-        selStartOffset: padLen,
-        selEndOffset: padLen + selected.length,
-        reversed,
-      };
-    }
-    const wrapped = `\`${selected}\``;
-    return {
-      from,
-      to,
-      insert: wrapped,
-      selStartOffset: 1,
-      selEndOffset: 1 + selected.length,
-      reversed,
-    };
-  }
-
-  // inline_math ("$")
-  const outerDollars = Math.min(countCharsLeft(doc, from, "$", 3), countCharsRight(doc, to, "$", 3));
-  if (outerDollars === 1) {
-    return {
-      from: from - 1,
-      to: to + 1,
-      insert: selected,
-      selStartOffset: 0,
-      selEndOffset: selected.length,
-      reversed,
-    };
-  }
   if (selected.length >= 2) {
-    const innerDollars = Math.min(countLeadingChars(selected, "$", 3), countTrailingChars(selected, "$", 3));
-    if (innerDollars === 1) {
-      const inner = selected.slice(1, selected.length - 1);
-      return {
-        from,
-        to,
-        insert: inner,
-        selStartOffset: 0,
-        selEndOffset: inner.length,
-        reversed,
-      };
+    for (const ch of descriptor.delimiters) {
+      const innerRun = Math.min(countLeadingChars(selected, ch, 3), countTrailingChars(selected, ch, 3));
+      const innerUnwrap = descriptor.unwrapCount(innerRun);
+      if (innerUnwrap > 0 && selected.length >= innerUnwrap * 2) {
+        const rawInner = selected.slice(innerUnwrap, selected.length - innerUnwrap);
+        const inner = descriptor.unwrapInner ? descriptor.unwrapInner(rawInner, innerUnwrap) : rawInner;
+        return {
+          from,
+          to,
+          insert: inner,
+          selStartOffset: 0,
+          selEndOffset: inner.length,
+          reversed,
+        };
+      }
     }
   }
-  const wrapped = `$${selected}$`;
+
+  const [open, close] = descriptor.wrap(selected);
   return {
     from,
     to,
-    insert: wrapped,
-    selStartOffset: 1,
-    selEndOffset: 1 + selected.length,
+    insert: `${open}${selected}${close}`,
+    selStartOffset: open.length,
+    selEndOffset: open.length + selected.length,
     reversed,
   };
 }
@@ -577,43 +462,18 @@ function mapOffsetThroughChanges(pos: number, changes: TextChangeSpec[]): number
   return pos + delta;
 }
 
-function getTopOfFileFrontmatterEnd(doc: string): number {
-  const parsed = parseFrontmatter(doc);
-  if (parsed && parsed.end > 0) return parsed.end;
-  const opener = /^(?:\uFEFF)?---[ \t]*\r?\n/.exec(doc);
-  if (!opener) return 0;
-  let lineStart = opener[0].length;
-  let sawMappingKey = false;
-  while (lineStart <= doc.length && lineStart <= 65_536) {
-    const nl = doc.indexOf("\n", lineStart);
-    const lineEnd = nl === -1 ? doc.length : nl;
-    const contentEnd = lineEnd > lineStart && doc[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
-    const line = doc.slice(lineStart, contentEnd);
-    if (/^(?:---|\.\.\.)[ \t]*$/.test(line)) {
-      return sawMappingKey ? (nl === -1 ? doc.length : nl + 1) : 0;
-    }
-    if (line.trim() === "") return 0;
-    if (/^[A-Za-z0-9_.-]+\s*:/.test(line)) sawMappingKey = true;
-    if (nl === -1) break;
-    lineStart = nl + 1;
-  }
-  return sawMappingKey ? doc.length : 0;
-}
-
 function toggleBlockFormat(
   doc: string,
   ranges: ReadonlyArray<SelectionRange>,
   action: "heading" | "list" | "quote",
   mainIndex: number,
 ): MarkdownEditResult {
-  const frontmatterEnd = getTopOfFileFrontmatterEnd(doc);
   const lines = splitLinesWithOffsets(doc);
   const touchedIndices = new Set<number>();
 
   for (const range of ranges) {
     const from = Math.min(range.anchor, range.head);
     const to = Math.max(range.anchor, range.head);
-    if (frontmatterEnd > 0 && from < frontmatterEnd) continue;
     const startLine = lineIndexAt(lines, from);
     const effectiveEnd = to > from && doc[to - 1] === "\n" ? to - 1 : to;
     const endLine = Math.max(startLine, lineIndexAt(lines, effectiveEnd));
@@ -664,690 +524,6 @@ function toggleBlockFormat(
   };
 }
 
-type InlineSpanKind =
-  | "strong"
-  | "emphasis"
-  | "delete"
-  | "inlineCode"
-  | "inlineMath"
-  | "link"
-  | "linkReference"
-  | "wikilink"
-  | "autolink"
-  | "image"
-  | "imageReference"
-  | "html"
-  | "highlight"
-  | "subscript"
-  | "superscript";
-
-interface InlineSpanBounds {
-  kind: InlineSpanKind;
-  outerStart: number;
-  innerStart: number;
-  innerEnd: number;
-  outerEnd: number;
-  linkDest?: string;
-}
-
-interface InlineFormattingContext {
-  inProtectedBlock: boolean;
-  crossesBlocks: boolean;
-  inUnclosedConstruct: boolean;
-  spans: InlineSpanBounds[];
-}
-
-function computeInlineCodeBounds(doc: string, outerStart: number, outerEnd: number, value: string): [number, number] {
-  const raw = doc.slice(outerStart, outerEnd);
-  let ticks = 0;
-  while (ticks < raw.length && raw[ticks] === "`") ticks++;
-  if (ticks === 0 || ticks * 2 > raw.length) return [outerStart, outerEnd];
-  const innerRaw = raw.slice(ticks, raw.length - ticks);
-  if (
-    innerRaw.length === value.length + 2 &&
-    innerRaw.startsWith(" ") &&
-    innerRaw.endsWith(" ") &&
-    innerRaw.slice(1, -1) === value
-  ) {
-    return [outerStart + ticks + 1, outerEnd - ticks - 1];
-  }
-  if (innerRaw.length === value.length) {
-    return [outerStart + ticks, outerEnd - ticks];
-  }
-  const idx = raw.indexOf(value, ticks);
-  if (idx >= 0) return [outerStart + idx, outerStart + idx + value.length];
-  return [outerStart + ticks, Math.max(outerStart + ticks, outerEnd - ticks)];
-}
-
-function computeInlineMathBounds(doc: string, outerStart: number, outerEnd: number): [number, number] {
-  const raw = doc.slice(outerStart, outerEnd);
-  if ((raw.startsWith("\\(") && raw.endsWith("\\)")) || (raw.startsWith("$$") && raw.endsWith("$$"))) {
-    return raw.length >= 4 ? [outerStart + 2, outerEnd - 2] : [outerStart, outerEnd];
-  }
-  if (raw.startsWith("$") && raw.endsWith("$") && raw.length >= 2) {
-    return [outerStart + 1, outerEnd - 1];
-  }
-  return [outerStart, outerEnd];
-}
-
-function advanceTextOffset(raw: string, value: string): number {
-  if (raw.startsWith(value)) return value.length;
-  let r = 0;
-  let v = 0;
-  while (v < value.length && r < raw.length) {
-    const vCh = value[v];
-    const rCh = raw[r];
-    if (vCh === "\n" && (rCh === "\r" || rCh === "\n")) {
-      if (raw[r] === "\r" && raw[r + 1] === "\n") r += 2;
-      else r += 1;
-      const nextValueChar = v + 1 < value.length ? value[v + 1] : "";
-      while (r < raw.length && (raw[r] === " " || raw[r] === "\t" || raw[r] === ">")) {
-        if (nextValueChar && raw[r] === nextValueChar && raw.slice(r, r + 4) === value.slice(v + 1, v + 5)) {
-          break;
-        }
-        r++;
-      }
-      v++;
-      continue;
-    }
-    if (rCh === "\\" && r + 1 < raw.length && raw[r + 1] === vCh) {
-      r += 2;
-      v++;
-      continue;
-    }
-    if (rCh === "&") {
-      const entity = /^&(?:#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);/.exec(raw.slice(r));
-      if (entity && rCh !== vCh) {
-        const cp = value.codePointAt(v) ?? 0;
-        r += entity[0].length;
-        v += cp > 0xffff ? 2 : 1;
-        continue;
-      }
-    }
-    r++;
-    v++;
-  }
-  return r;
-}
-
-function collectContainerInlineSpans(
-  containerNode: any,
-  doc: string,
-  windowOffset: number,
-  spans: InlineSpanBounds[],
-): void {
-  const cStart = windowOffset + containerNode.position.start.offset;
-  const cEnd = windowOffset + containerNode.position.end.offset;
-  let cursor = cStart;
-  if (typeof containerNode.children?.[0]?.position?.start?.offset === "number") {
-    cursor = windowOffset + containerNode.children[0].position.start.offset;
-  } else {
-    const raw = doc.slice(cStart, cEnd);
-    if (containerNode.type === "heading") {
-      const prefix = /^[ \t]{0,3}#{1,6}[ \t]+/.exec(raw);
-      if (prefix) cursor = cStart + prefix[0].length;
-    } else if (containerNode.type === "tableCell") {
-      const lead = /^\|?[ \t]*/.exec(raw);
-      if (lead) cursor = cStart + lead[0].length;
-    } else if (containerNode.type === "paragraph") {
-      const quoteLead = /^[ \t>]+/.exec(raw);
-      if (quoteLead) cursor = cStart + quoteLead[0].length;
-    }
-  }
-
-  const openHtmlStack: Array<{ tag: string; outerStart: number; innerStart: number }> = [];
-
-  const walk = (nodes: any[], limitEnd: number) => {
-    for (const node of nodes) {
-      if (!node) continue;
-      const start = typeof node.position?.start?.offset === "number" ? windowOffset + node.position.start.offset : undefined;
-      const end = typeof node.position?.end?.offset === "number" ? windowOffset + node.position.end.offset : undefined;
-
-      if (node.type === "text" && typeof node.value === "string") {
-        if (typeof start === "number" && typeof end === "number") {
-          cursor = end;
-        } else {
-          cursor += advanceTextOffset(doc.slice(cursor, limitEnd), node.value);
-        }
-        continue;
-      }
-
-      if (node.type === "inlineCode" && typeof node.value === "string" && typeof start === "number" && typeof end === "number") {
-        const [innerStart, innerEnd] = computeInlineCodeBounds(doc, start, end, node.value);
-        spans.push({ kind: "inlineCode", outerStart: start, innerStart, innerEnd, outerEnd: end });
-        cursor = end;
-        continue;
-      }
-
-      if (node.type === "inlineMath" && typeof start === "number" && typeof end === "number") {
-        const [innerStart, innerEnd] = computeInlineMathBounds(doc, start, end);
-        spans.push({ kind: "inlineMath", outerStart: start, innerStart, innerEnd, outerEnd: end });
-        cursor = end;
-        continue;
-      }
-
-      if ((node.type === "image" || node.type === "imageReference") && typeof start === "number" && typeof end === "number") {
-        spans.push({ kind: node.type, outerStart: start, innerStart: start, innerEnd: end, outerEnd: end });
-        cursor = end;
-        continue;
-      }
-
-      if (node.type === "html" && typeof node.value === "string" && typeof start === "number" && typeof end === "number") {
-        spans.push({ kind: "html", outerStart: start, innerStart: start, innerEnd: end, outerEnd: end });
-        const trimmed = node.value.trim();
-        const closeMatch = /^<\/\s*([A-Za-z][A-Za-z0-9-]*)\s*>$/.exec(trimmed);
-        if (closeMatch) {
-          const tag = closeMatch[1].toLowerCase();
-          for (let i = openHtmlStack.length - 1; i >= 0; i--) {
-            if (openHtmlStack[i].tag === tag) {
-              const open = openHtmlStack.splice(i)[0];
-              spans.push({
-                kind: "html",
-                outerStart: open.outerStart,
-                innerStart: open.innerStart,
-                innerEnd: start,
-                outerEnd: end,
-              });
-              break;
-            }
-          }
-        } else {
-          const openMatch = /^<\s*([A-Za-z][A-Za-z0-9-]*)(?:\s[\s\S]*?)?>$/.exec(trimmed);
-          if (openMatch && !trimmed.endsWith("/>")) {
-            const tag = openMatch[1].toLowerCase();
-            if (!VOID_HTML_TAGS.has(tag)) {
-              openHtmlStack.push({ tag, outerStart: start, innerStart: end });
-            }
-          }
-        }
-        cursor = end;
-        continue;
-      }
-
-      if (node.type === "link" && typeof start === "number" && typeof end === "number") {
-        const raw = doc.slice(start, end);
-        if (raw.startsWith("[[") && raw.endsWith("]]") && raw.length >= 4) {
-          spans.push({ kind: "wikilink", outerStart: start, innerStart: start + 2, innerEnd: end - 2, outerEnd: end });
-          cursor = end;
-          continue;
-        }
-        if (raw.startsWith("<") && raw.endsWith(">")) {
-          spans.push({ kind: "autolink", outerStart: start, innerStart: start + 1, innerEnd: end - 1, outerEnd: end });
-          cursor = end;
-          continue;
-        }
-        const innerStart = start + 1;
-        let lastChildEnd = innerStart;
-        if (Array.isArray(node.children)) {
-          cursor = innerStart;
-          walk(node.children, end);
-          lastChildEnd = Math.max(innerStart, cursor);
-        }
-        const closeBracket = doc.indexOf("](", lastChildEnd);
-        const innerEnd = closeBracket >= innerStart && closeBracket < end ? closeBracket : Math.max(innerStart, end - 3);
-        const destSlice = closeBracket >= innerStart && end > closeBracket + 2 ? doc.slice(closeBracket + 2, end - 1) : "";
-        spans.push({
-          kind: "link",
-          outerStart: start,
-          innerStart,
-          innerEnd,
-          outerEnd: end,
-          linkDest: destSlice,
-        });
-        cursor = end;
-        continue;
-      }
-
-      if (node.type === "linkReference" && typeof start === "number" && typeof end === "number") {
-        const innerStart = start + 1;
-        if (Array.isArray(node.children)) {
-          cursor = innerStart;
-          walk(node.children, end);
-        }
-        const closeBracket = doc.indexOf("]", Math.max(innerStart, cursor));
-        const innerEnd = closeBracket >= innerStart && closeBracket < end ? closeBracket : end - 1;
-        spans.push({ kind: "linkReference", outerStart: start, innerStart, innerEnd, outerEnd: end });
-        cursor = end;
-        continue;
-      }
-
-      if ((node.type === "highlight" || node.type === "subscript" || node.type === "superscript") && Array.isArray(node.children)) {
-        const delim = node.type === "highlight" ? "==" : node.type === "subscript" ? "~" : "^";
-        if (!doc.startsWith(delim, cursor)) {
-          const found = doc.indexOf(delim, cursor);
-          if (found >= cursor && found < limitEnd) cursor = found;
-        }
-        const outerStart = cursor;
-        const innerStart = doc.startsWith(delim, cursor) ? cursor + delim.length : cursor;
-        cursor = innerStart;
-        walk(node.children, limitEnd);
-        const innerEnd = cursor;
-        const outerEnd = doc.startsWith(delim, innerEnd) ? innerEnd + delim.length : innerEnd;
-        cursor = outerEnd;
-        spans.push({ kind: node.type, outerStart, innerStart, innerEnd, outerEnd });
-        continue;
-      }
-
-      if ((node.type === "strong" || node.type === "emphasis" || node.type === "delete") && typeof start === "number" && typeof end === "number") {
-        const raw = doc.slice(start, end);
-        let delimLen = 1;
-        if (node.type === "strong") delimLen = 2;
-        else if (node.type === "delete") {
-          delimLen = 0;
-          while (delimLen < raw.length && raw[delimLen] === "~") delimLen++;
-          if (delimLen === 0) delimLen = 2;
-        }
-        const innerStart = start + delimLen;
-        const innerEnd = Math.max(innerStart, end - delimLen);
-        cursor = innerStart;
-        if (Array.isArray(node.children)) {
-          walk(node.children, innerEnd);
-        }
-        spans.push({ kind: node.type, outerStart: start, innerStart, innerEnd, outerEnd: end });
-        cursor = end;
-        continue;
-      }
-
-      if (Array.isArray(node.children)) {
-        walk(node.children, typeof end === "number" ? end : limitEnd);
-        if (typeof end === "number") cursor = end;
-      }
-    }
-  };
-
-  if (Array.isArray(containerNode.children)) {
-    walk(containerNode.children, cEnd);
-  }
-}
-
-function inspectInlineFormattingContext(doc: string, from: number, to: number): InlineFormattingContext {
-  const radius = 16_384;
-  let windowStart = Math.max(0, from - radius);
-  const windowEnd = Math.min(doc.length, to + radius);
-
-  if (windowStart > 0 && windowEnd <= 500_000) {
-    // Align windowStart to a line outside any earlier fenced/indented code block so slice never starts mid-fence.
-    const maskedPrefix = maskCode(doc.slice(0, windowEnd));
-    let scan = windowStart;
-    let foundUnmaskedLine = false;
-    while (scan <= from) {
-      const nl = doc.indexOf("\n", scan);
-      const end = nl === -1 ? windowEnd : nl;
-      if (maskedPrefix.slice(scan, end).replace(/[>\s]/g, "").length > 0) {
-        windowStart = scan;
-        foundUnmaskedLine = true;
-        break;
-      }
-      if (nl === -1) break;
-      scan = nl + 1;
-    }
-    if (!foundUnmaskedLine) {
-      // Every line in [windowStart, from] was blank or masked as code; check if `from` is inside a multi-16KB code block.
-      const fullAnalysis = analyzeDocument(doc.slice(0, windowEnd));
-      let insideLargeCode = false;
-      visit(fullAnalysis.tree, "code", (node: any) => {
-        if (insideLargeCode || !node.position) return;
-        const start = node.position.start.offset;
-        const end = node.position.end.offset;
-        if (from === to ? from >= start && from <= end : start < to && end > from) {
-          insideLargeCode = true;
-        }
-      });
-      if (insideLargeCode) {
-        return { inProtectedBlock: true, crossesBlocks: false, inUnclosedConstruct: false, spans: [] };
-      }
-    }
-  }
-
-  const slice = doc.slice(windowStart, windowEnd);
-  const maskedSlice = maskCode(slice);
-  const localFrom = from - windowStart;
-  const localTo = to - windowStart;
-
-  const isEmptyInlineMathPair =
-    localFrom === localTo &&
-    countCharsLeft(slice, localFrom, "$", 3) === 1 &&
-    countCharsRight(slice, localTo, "$", 3) === 1;
-
-  const analysis = analyzeDocument(slice);
-  if (windowStart === 0 && analysis.frontmatter && localFrom < analysis.frontmatter.end) {
-    return { inProtectedBlock: true, crossesBlocks: false, inUnclosedConstruct: false, spans: [] };
-  }
-
-  let inProtectedBlock = false;
-  const overlappingContainers: any[] = [];
-  visit(analysis.tree, (node: any) => {
-    if (inProtectedBlock || !node.position) return;
-    const start = node.position.start.offset;
-    const end = node.position.end.offset;
-    if (typeof start !== "number" || typeof end !== "number") return;
-    if (node.type === "code" || node.type === "definition") {
-      if (localFrom === localTo ? localFrom >= start && localFrom <= end : start < localTo && end > localFrom) {
-        inProtectedBlock = true;
-        return;
-      }
-    }
-    if (node.type === "math") {
-      if (isEmptyInlineMathPair && end - start === 2 && start === localFrom - 1 && end === localTo + 1) {
-        return;
-      }
-      if (localFrom === localTo ? localFrom >= start && localFrom <= end : start < localTo && end > localFrom) {
-        inProtectedBlock = true;
-        return;
-      }
-    }
-    if (node.type === "paragraph" || node.type === "heading" || node.type === "tableCell") {
-      const overlaps = localFrom === localTo ? localFrom >= start && localFrom <= end : start < localTo && end > localFrom;
-      if (overlaps) overlappingContainers.push(node);
-    }
-  });
-
-  if (inProtectedBlock) {
-    return { inProtectedBlock: true, crossesBlocks: false, inUnclosedConstruct: false, spans: [] };
-  }
-
-  // Top-level raw HTML blocks
-  for (const child of analysis.tree.children as any[]) {
-    if (child?.type === "html" && child.position) {
-      const start = child.position.start.offset;
-      const end = child.position.end.offset;
-      if (localFrom === localTo ? localFrom >= start && localFrom <= end : start < localTo && end > localFrom) {
-        return { inProtectedBlock: true, crossesBlocks: false, inUnclosedConstruct: false, spans: [] };
-      }
-    }
-  }
-
-  if (localFrom < localTo) {
-    if (overlappingContainers.length > 1) {
-      return { inProtectedBlock: false, crossesBlocks: true, inUnclosedConstruct: false, spans: [] };
-    }
-    if (overlappingContainers.length === 1) {
-      const c = overlappingContainers[0];
-      const cStart = c.position.start.offset;
-      const cEnd = c.position.end.offset;
-      if (localFrom < cStart || localTo > cEnd) {
-        return { inProtectedBlock: false, crossesBlocks: true, inUnclosedConstruct: false, spans: [] };
-      }
-    } else if (/[\r\n]/.test(slice.slice(localFrom, localTo))) {
-      return { inProtectedBlock: false, crossesBlocks: true, inUnclosedConstruct: false, spans: [] };
-    }
-  }
-
-  const spans: InlineSpanBounds[] = [];
-  for (const container of overlappingContainers) {
-    collectContainerInlineSpans(container, doc, windowStart, spans);
-  }
-
-  const maskedBefore = maskedSlice.slice(0, localFrom);
-  if (((maskedBefore.match(/(?<![\\$])\$\$(?!\$)/g)?.length ?? 0) % 2) === 1) {
-    return { inProtectedBlock: true, crossesBlocks: false, inUnclosedConstruct: false, spans };
-  }
-  if (maskedBefore.lastIndexOf("\\[") > maskedBefore.lastIndexOf("\\]")) {
-    return { inProtectedBlock: true, crossesBlocks: false, inUnclosedConstruct: false, spans };
-  }
-
-  const before = slice.slice(0, localFrom);
-  const lineStart = before.lastIndexOf("\n") + 1;
-  const lineBefore = before.slice(lineStart);
-  const after = slice.slice(localTo);
-  const nextNl = after.indexOf("\n");
-  const lineAfter = nextNl === -1 ? after : after.slice(0, nextNl);
-
-  let inUnclosedConstruct = false;
-  if (before.lastIndexOf("\\(") > before.lastIndexOf("\\)")) {
-    inUnclosedConstruct = true;
-  } else if (
-    lineBefore.lastIndexOf("<") > lineBefore.lastIndexOf(">") &&
-    /^<[A-Za-z!/]/.test(lineBefore.slice(lineBefore.lastIndexOf("<")))
-  ) {
-    inUnclosedConstruct = true;
-  } else if (/!\[[^[\]\r\n]*$/.test(lineBefore)) {
-    inUnclosedConstruct = true;
-  } else if (/!?\[[^[\]\r\n]*\]\([^)\r\n]*$/.test(lineBefore) && !/^[^)\r\n]*\)/.test(lineAfter)) {
-    inUnclosedConstruct = true;
-  } else if (lineBefore.lastIndexOf("[[") > lineBefore.lastIndexOf("]]") && !/^[^[\]\r\n]*\]\]/.test(lineAfter)) {
-    inUnclosedConstruct = true;
-  } else {
-    // Check unclosed inline backticks or single `$` when not just an empty `|` or `$|$` placeholder
-    const oddTicksBefore = ((lineBefore.match(/`/g)?.length ?? 0) % 2) === 1;
-    if (oddTicksBefore && !(localFrom === localTo && lineBefore.endsWith("`") && lineAfter.startsWith("`") && !spans.some((s) => s.kind === "inlineCode" && s.outerStart < from && from < s.outerEnd))) {
-      if (!spans.some((s) => s.kind === "inlineCode" && s.outerStart <= from && to <= s.outerEnd)) {
-        inUnclosedConstruct = true;
-      }
-    }
-    const oddDollarsBefore = ((lineBefore.match(/(?<![\\$])\$(?!\$)/g)?.length ?? 0) % 2) === 1;
-    if (oddDollarsBefore && !(localFrom === localTo && lineBefore.endsWith("$") && lineAfter.startsWith("$") && !spans.some((s) => s.kind === "inlineMath" && s.outerStart < from && from < s.outerEnd))) {
-      if (!spans.some((s) => s.kind === "inlineMath" && s.outerStart <= from && to <= s.outerEnd)) {
-        inUnclosedConstruct = true;
-      }
-    }
-  }
-
-  return { inProtectedBlock: false, crossesBlocks: false, inUnclosedConstruct, spans };
-}
-
-function unwrapSpanPlan(
-  doc: string,
-  span: InlineSpanBounds,
-  from: number,
-  to: number,
-  reversed: boolean,
-): RangePlan {
-  const inner = doc.slice(span.innerStart, span.innerEnd);
-  const fullSelected =
-    (from === span.outerStart && to === span.outerEnd) ||
-    (from === span.innerStart && to === span.innerEnd);
-  if (fullSelected) {
-    return {
-      from: span.outerStart,
-      to: span.outerEnd,
-      insert: inner,
-      selStartOffset: 0,
-      selEndOffset: inner.length,
-      reversed,
-    };
-  }
-  const relStart = Math.max(0, Math.min(inner.length, from - span.innerStart));
-  const relEnd = Math.max(relStart, Math.min(inner.length, to - span.innerStart));
-  return {
-    from: span.outerStart,
-    to: span.outerEnd,
-    insert: inner,
-    selStartOffset: relStart,
-    selEndOffset: relEnd,
-    reversed,
-  };
-}
-
-function planInlineFormatToggle(
-  doc: string,
-  range: SelectionRange,
-  action: "bold" | "italic" | "inline_code" | "inline_math" | "link",
-): RangePlan {
-  const from = Math.min(range.anchor, range.head);
-  const to = Math.max(range.anchor, range.head);
-  const reversed = range.anchor > range.head;
-  const selected = doc.slice(from, to);
-
-  if (from < 0 || to > doc.length) {
-    return noopRangePlan(doc, range);
-  }
-
-  const frontmatterEnd = getTopOfFileFrontmatterEnd(doc);
-  if (frontmatterEnd > 0 && from < frontmatterEnd) {
-    return noopRangePlan(doc, range);
-  }
-
-  if (from < to && /\r?\n[ \t]*\r?\n/.test(selected)) {
-    return noopRangePlan(doc, range);
-  }
-
-  const ctx = inspectInlineFormattingContext(doc, from, to);
-  if (ctx.inProtectedBlock || ctx.crossesBlocks) {
-    return noopRangePlan(doc, range);
-  }
-  if (
-    action !== "inline_math" &&
-    from === to &&
-    countCharsLeft(doc, from, "$", 3) === 1 &&
-    countCharsRight(doc, to, "$", 3) === 1
-  ) {
-    return noopRangePlan(doc, range);
-  }
-
-  const enclosing = ctx.spans
-    .filter((s) => (from === to ? s.outerStart < from && from < s.outerEnd : s.outerStart <= from && to <= s.outerEnd))
-    .sort((a, b) => (a.outerEnd - a.outerStart) - (b.outerEnd - b.outerStart));
-
-  for (const span of enclosing) {
-    if (span.kind === "inlineCode") {
-      return action === "inline_code" ? unwrapSpanPlan(doc, span, from, to, reversed) : noopRangePlan(doc, range);
-    }
-    if (span.kind === "inlineMath") {
-      const isSingleDollar =
-        span.innerStart - span.outerStart === 1 &&
-        doc[span.outerStart] === "$" &&
-        doc[span.outerEnd - 1] === "$";
-      return action === "inline_math" && isSingleDollar
-        ? unwrapSpanPlan(doc, span, from, to, reversed)
-        : noopRangePlan(doc, range);
-    }
-    if (
-      span.kind === "html" ||
-      span.kind === "image" ||
-      span.kind === "imageReference" ||
-      span.kind === "wikilink" ||
-      span.kind === "autolink"
-    ) {
-      return noopRangePlan(doc, range);
-    }
-    if (span.kind === "link") {
-      if (action === "link") {
-        const label = doc.slice(span.innerStart, span.innerEnd);
-        const dest = span.linkDest ?? "";
-        const restored = label.length > 0 ? label : dest;
-        if (
-          label.length > 0 &&
-          span.innerStart <= from &&
-          to <= span.innerEnd &&
-          !(from === span.innerStart && to === span.innerEnd)
-        ) {
-          return {
-            from: span.outerStart,
-            to: span.outerEnd,
-            insert: restored,
-            selStartOffset: from - span.innerStart,
-            selEndOffset: to - span.innerStart,
-            reversed,
-          };
-        }
-        return {
-          from: span.outerStart,
-          to: span.outerEnd,
-          insert: restored,
-          selStartOffset: 0,
-          selEndOffset: restored.length,
-          reversed: from === span.outerStart && to === span.outerEnd ? reversed : false,
-        };
-      }
-      if (!(span.innerStart <= from && to <= span.innerEnd) || from === to) {
-        return noopRangePlan(doc, range);
-      }
-    }
-  }
-
-  if (action === "bold") {
-    const targetStrong = enclosing.find((s) => s.kind === "strong");
-    if (targetStrong) {
-      return unwrapSpanPlan(doc, targetStrong, from, to, reversed);
-    }
-  }
-  if (action === "italic") {
-    const targetEmphasis = enclosing.find((s) => s.kind === "emphasis");
-    if (targetEmphasis) {
-      return unwrapSpanPlan(doc, targetEmphasis, from, to, reversed);
-    }
-  }
-
-  if (from === to && enclosing.length > 0) {
-    // Bare caret inside an already-formatted span (e.g. `**hel|lo**` + italic): never split the span.
-    return noopRangePlan(doc, range);
-  }
-
-  if (ctx.inUnclosedConstruct) {
-    return noopRangePlan(doc, range);
-  }
-
-  if (from < to) {
-    for (const span of ctx.spans) {
-      if (from >= span.outerEnd || to <= span.outerStart) continue;
-      if (span.outerStart <= from && to <= span.outerEnd) {
-        if (!(span.innerStart <= from && to <= span.innerEnd)) {
-          return noopRangePlan(doc, range);
-        }
-        continue;
-      }
-      if (!(from <= span.outerStart && span.outerEnd <= to)) {
-        // Selection partially straddles a formatted or protected span boundary.
-        return noopRangePlan(doc, range);
-      }
-      if (
-        (action === "bold" && span.kind === "strong") ||
-        (action === "italic" && span.kind === "emphasis") ||
-        (action === "inline_code" && span.kind === "inlineCode") ||
-        (action === "inline_math" && (span.kind === "inlineMath" || span.kind === "inlineCode")) ||
-        (action === "link" &&
-          (span.kind === "link" ||
-            span.kind === "linkReference" ||
-            span.kind === "wikilink" ||
-            span.kind === "autolink" ||
-            span.kind === "image" ||
-            span.kind === "imageReference"))
-      ) {
-        return noopRangePlan(doc, range);
-      }
-    }
-  } else {
-    // Prevent bare-caret delimiter insertion right against an existing delimiter run of the same marker family.
-    if (action === "bold" || action === "italic") {
-      const outerStars = Math.min(countCharsLeft(doc, from, "*", 3), countCharsRight(doc, to, "*", 3));
-      const outerUnderscores = Math.min(countCharsLeft(doc, from, "_", 3), countCharsRight(doc, to, "_", 3));
-      const unwrappingEmptyMarker =
-        action === "bold"
-          ? outerStars >= 2 || outerUnderscores >= 2
-          : outerStars === 1 || outerStars === 3 || outerUnderscores === 1 || outerUnderscores === 3;
-      if (
-        !unwrappingEmptyMarker &&
-        ctx.spans.some(
-          (s) => (s.kind === "strong" || s.kind === "emphasis") && (s.outerStart === from || s.outerEnd === from),
-        )
-      ) {
-        return noopRangePlan(doc, range);
-      }
-    } else if (action === "inline_code") {
-      const outerTicks = Math.min(countCharsLeft(doc, from, "`", 6), countCharsRight(doc, to, "`", 6));
-      if (
-        outerTicks === 0 &&
-        ctx.spans.some((s) => s.kind === "inlineCode" && (s.outerStart === from || s.outerEnd === from))
-      ) {
-        return noopRangePlan(doc, range);
-      }
-    } else if (action === "inline_math") {
-      const outerDollars = Math.min(countCharsLeft(doc, from, "$", 3), countCharsRight(doc, to, "$", 3));
-      if (
-        outerDollars !== 1 &&
-        ctx.spans.some((s) => s.kind === "inlineMath" && (s.outerStart === from || s.outerEnd === from))
-      ) {
-        return noopRangePlan(doc, range);
-      }
-    }
-  }
-
-  return action === "link"
-    ? planLinkToggle(doc, range)
-    : planSymmetricInlineToggle(doc, range, action);
-}
-
 export function toggleMarkdownFormat(
   doc: string,
   ranges: ReadonlyArray<SelectionRange>,
@@ -1358,7 +534,11 @@ export function toggleMarkdownFormat(
   if (action === "heading" || action === "list" || action === "quote") {
     return toggleBlockFormat(doc, safeRanges, action, mainIndex);
   }
-  const plans = safeRanges.map((range) => planInlineFormatToggle(doc, range, action));
+  const plans = safeRanges.map((range) =>
+    action === "link"
+      ? planLinkToggle(doc, range)
+      : planSymmetricInlineToggle(doc, range, action),
+  );
   return buildResultFromRangePlans(doc, plans, mainIndex);
 }
 

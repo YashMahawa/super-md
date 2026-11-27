@@ -328,7 +328,7 @@ test("URL paste wraps selected prose inline without dialog, pastes raw URL in ba
   await expect(page.getByRole("dialog", { name: "Insert image or link" })).toHaveCount(0);
 });
 
-test("maps selected rendered Live ranges to source, unwraps caret inside bold text without splitting, and keeps protected code/YAML and multi-paragraph selections untouched", async ({ page }) => {
+test("maps single-block Live rendered selections across rich inline syntax, nested lists, inline code/math, and partial formatting while preserving direction, undo, and protected blocks", async ({ page }) => {
   const calls: Array<{ command: string; args: any }> = [];
   await page.exposeFunction("bridgePost", (id: string, command: string, raw: string) => {
     const args = JSON.parse(raw);
@@ -347,7 +347,10 @@ test("maps selected rendered Live ranges to source, unwraps caret inside bold te
     "title: Guarded Note",
     "---",
     "",
-    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd`.",
+    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd` and $x + 1$.",
+    "",
+    "- Parent list item",
+    "  - Nested list target",
     "",
     "Second paragraph stays separate.",
     "",
@@ -373,6 +376,41 @@ test("maps selected rendered Live ranges to source, unwraps caret inside bold te
     });
   }, doc);
 
+  const selectRenderedSubstring = async (selector: string, target: string, reversed = false) => {
+    await page.evaluate(
+      ({ selector, target, reversed }) => {
+        const container = document.querySelector(selector)!;
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        const nodes: Array<{ node: Text; start: number; end: number }> = [];
+        let full = "";
+        let n: Node | null;
+        while ((n = walker.nextNode())) {
+          const t = n as Text;
+          if (t.parentElement?.closest(".katex-mathml")) continue;
+          const start = full.length;
+          full += t.data;
+          nodes.push({ node: t, start, end: full.length });
+        }
+        const idx = full.indexOf(target);
+        if (idx < 0) throw new Error(`Missing "${target}" in "${full}"`);
+        const endIdx = idx + target.length;
+        const startEntry = nodes.find((e) => idx >= e.start && idx <= e.end)!;
+        const endEntry = nodes.find((e) => endIdx >= e.start && endIdx <= e.end)!;
+        const sel = window.getSelection()!;
+        sel.removeAllRanges();
+        if (reversed) {
+          sel.setBaseAndExtent(endEntry.node, endIdx - endEntry.start, startEntry.node, idx - startEntry.start);
+        } else {
+          const range = document.createRange();
+          range.setStart(startEntry.node, idx - startEntry.start);
+          range.setEnd(endEntry.node, endIdx - endEntry.start);
+          sel.addRange(range);
+        }
+      },
+      { selector, target, reversed },
+    );
+  };
+
   // 1. Multi-paragraph rendered selection in Live mode is kept separate (no mutation)
   await page.evaluate(() => {
     const paras = document.querySelectorAll(".live-document p");
@@ -387,109 +425,77 @@ test("maps selected rendered Live ranges to source, unwraps caret inside bold te
   expect(latestContent()).toBe(doc);
   await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveCount(0);
 
-  // 2. Rendered selection inside protected inline code (`inline_cmd`) is guarded against bold splitting
+  // 2. Rendered inline code, inline math, fenced code, and boundary-straddling partial selection are guarded from invalid formatting
+  await selectRenderedSubstring(".live-document p code", "inline_cmd");
+  await page.keyboard.press("Control+b");
+  expect(latestContent()).toBe(doc);
+
   await page.evaluate(() => {
-    const codeEl = document.querySelector(".live-document p code")!;
+    const katexEl = document.querySelector(".live-document p .katex")!;
     const range = document.createRange();
-    range.setStart(codeEl.firstChild!, 0);
-    range.setEnd(codeEl.firstChild!, 6);
+    range.selectNode(katexEl);
     const sel = window.getSelection()!;
     sel.removeAllRanges();
     sel.addRange(range);
   });
+  await page.keyboard.press("Control+b");
+  expect(latestContent()).toBe(doc);
+
+  await selectRenderedSubstring(".live-document pre", "protected_value");
+  await page.keyboard.press("Control+b");
+  expect(latestContent()).toBe(doc);
+
+  await selectRenderedSubstring(".live-document p", "rier guide");
   await page.keyboard.press("Control+b");
   expect(latestContent()).toBe(doc);
   await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveCount(0);
 
-  // 3. Selected rendered range in Live mode maps across bold + link to exact source offsets, formats, toggles, and undoes cleanly
-  await page.evaluate(() => {
-    const para = document.querySelector(".live-document p")!;
-    const walker = document.createTreeWalker(para, NodeFilter.SHOW_TEXT);
-    let targetNode: Text | null = null;
-    let offset = -1;
-    let n: Node | null;
-    while ((n = walker.nextNode())) {
-      const idx = (n as Text).data.indexOf("selected rendered range");
-      if (idx >= 0) {
-        targetNode = n as Text;
-        offset = idx;
-        break;
-      }
-    }
-    const range = document.createRange();
-    range.setStart(targetNode!, offset);
-    range.setEnd(targetNode!, offset + "selected rendered range".length);
-    const sel = window.getSelection()!;
-    sel.removeAllRanges();
-    sel.addRange(range);
-  });
+  // 3. Backward rendered selection in Live mode maps across bold + link to exact source offsets, preserves backward direction, and undoes in one step
+  await selectRenderedSubstring(".live-document p", "selected rendered range", true);
   await page.keyboard.press("Control+b");
   const liveBox = page.getByRole("textbox", { name: "Edit Markdown block" });
   await expect(liveBox).toBeVisible();
   await expect(liveBox).toHaveValue(
-    "Observe **Fourier** [guide](https://example.com) and **selected rendered range** with `inline_cmd`.",
+    "Observe **Fourier** [guide](https://example.com) and **selected rendered range** with `inline_cmd` and $x + 1$.",
   );
-  await expect.poll(latestContent).toContain("and **selected rendered range** with `inline_cmd`.");
+  await expect.poll(latestContent).toContain("and **selected rendered range** with `inline_cmd` and $x + 1$.");
+  const formattedDir = await page.evaluate(
+    () => document.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!.selectionDirection,
+  );
+  expect(formattedDir).toBe("backward");
   await page.screenshot({ path: "/tmp/live-selected-rendered-range.png" });
 
-  // Single-step Undo restores unbolded text and selection
+  // Single-step Undo restores unbolded text, exact selection, and backward direction
   await page.keyboard.press("Control+z");
   await expect(liveBox).toHaveValue(
-    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd`.",
+    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd` and $x + 1$.",
   );
   await expect.poll(latestContent).toBe(doc);
-
-  // 4. Caret inside bold text (`**Fou|rier**`) in Live mode: Control+i does NOT split `**Fourier**`; Control+b unwraps cleanly preserving caret
-  await page.evaluate(() => {
+  const restoredSel = await page.evaluate(() => {
     const area = document.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
-    area.focus();
-    const caret = area.value.indexOf("Fourier") + 3;
-    area.setSelectionRange(caret, caret);
+    return {
+      selected: area.value.slice(area.selectionStart, area.selectionEnd),
+      direction: area.selectionDirection,
+    };
   });
-  await page.keyboard.press("Control+i");
-  await expect(liveBox).toHaveValue(
-    "Observe **Fourier** [guide](https://example.com) and selected rendered range with `inline_cmd`.",
-  );
-  await page.keyboard.press("Control+b");
-  await expect(liveBox).toHaveValue(
-    "Observe Fourier [guide](https://example.com) and selected rendered range with `inline_cmd`.",
-  );
-  const unwrappedCaret = await page.evaluate(() => {
-    const area = document.querySelector<HTMLTextAreaElement>(".live-active-block textarea")!;
-    return [area.selectionStart, area.selectionEnd];
-  });
-  expect(unwrappedCaret).toEqual(["Observe Fou".length, "Observe Fou".length]);
+  expect(restoredSel).toEqual({ selected: "selected rendered range", direction: "backward" });
+  await page.keyboard.press("Escape");
+  await expect(liveBox).toHaveCount(0);
 
-  // 5. Source mode: YAML frontmatter and caret inside bold text remain protected from splitting
-  calls.length = 0;
-  await page.evaluate((content) => {
-    window.supermdLoad?.({
-      id: "selection-guard-note",
-      content,
-      path: "selection-guard-note",
-      mode: "editor",
-      dark: false,
-      fullscreen: false,
-      colors: {},
-      font: "sans",
-      size: 16,
-      zoom: 100,
-    });
-  }, doc);
-  await page.locator(".cm-content").click();
-  // Place caret inside YAML frontmatter `Guarded` and press Control+b -> unchanged
-  const yamlPos = doc.indexOf("Guarded") + 3;
-  await page.keyboard.press("Control+Home");
-  for (let i = 0; i < yamlPos; i++) await page.keyboard.press("ArrowRight");
+  // 4. Existing formatted text (partial substring inside **Fourier**) unwraps cleanly without splitting, and nested list item formats cleanly
+  await selectRenderedSubstring(".live-document p", "rier");
   await page.keyboard.press("Control+b");
-  expect(latestContent()).toBe(doc);
+  await expect(liveBox).toHaveValue(
+    "Observe Fourier [guide](https://example.com) and selected rendered range with `inline_cmd` and $x + 1$.",
+  );
+  await page.keyboard.press("Control+z");
+  await page.keyboard.press("Escape");
+  await expect.poll(latestContent).toBe(doc);
 
-  // Move caret inside `**Fou|rier**` in Source mode -> Control+i is a safe no-op, Control+b unwraps `**Fourier**`
-  const boldCaretPos = doc.indexOf("Fourier") + 3;
-  await page.keyboard.press("Control+Home");
-  for (let i = 0; i < boldCaretPos; i++) await page.keyboard.press("ArrowRight");
+  await selectRenderedSubstring(".live-document ul ul li", "Nested list target");
   await page.keyboard.press("Control+i");
-  expect(latestContent()).toBe(doc);
-  await page.keyboard.press("Control+b");
-  await expect.poll(latestContent).toContain("Observe Fourier [guide](https://example.com)");
+  await expect(liveBox).toBeVisible();
+  await expect(liveBox).toHaveValue("- Parent list item\n  - *Nested list target*");
+  await page.keyboard.press("Control+z");
+  await expect.poll(latestContent).toBe(doc);
 });

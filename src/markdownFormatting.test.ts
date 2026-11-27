@@ -78,6 +78,49 @@ describe("toggleMarkdownFormat", () => {
     });
   });
 
+  it("handles inline_code double-backtick wrapping and space unwrapping, display-math $$ boundaries, underscores, and reversed selections", () => {
+    const withTick = toggleMarkdownFormat("a`b", [{ anchor: 3, head: 0 }], "inline_code");
+    expect(withTick).toMatchObject({
+      doc: "`` a`b ``",
+      ranges: [{ anchor: 6, head: 3 }],
+    });
+
+    expect(toggleMarkdownFormat("`` a`b ``", [{ anchor: 9, head: 0 }], "inline_code")).toMatchObject({
+      doc: "a`b",
+      ranges: [{ anchor: 3, head: 0 }],
+    });
+    expect(toggleMarkdownFormat("``code``", [{ anchor: 2, head: 6 }], "inline_code")).toMatchObject({
+      doc: "code",
+      ranges: [{ anchor: 0, head: 4 }],
+    });
+    expect(toggleMarkdownFormat("`` ``", [{ anchor: 0, head: 5 }], "inline_code")).toMatchObject({
+      doc: " ",
+      ranges: [{ anchor: 0, head: 1 }],
+    });
+
+    expect(toggleMarkdownFormat("$$x$$", [{ anchor: 2, head: 3 }], "inline_math")).toMatchObject({
+      doc: "$$$x$$$",
+      ranges: [{ anchor: 3, head: 4 }],
+    });
+    expect(toggleMarkdownFormat("$$x$$", [{ anchor: 0, head: 5 }], "inline_math")).toMatchObject({
+      doc: "$$$x$$$",
+      ranges: [{ anchor: 1, head: 6 }],
+    });
+    expect(toggleMarkdownFormat("$x$", [{ anchor: 0, head: 3 }], "inline_math")).toMatchObject({
+      doc: "x",
+      ranges: [{ anchor: 0, head: 1 }],
+    });
+
+    expect(toggleMarkdownFormat("__word__", [{ anchor: 2, head: 6 }], "bold")).toMatchObject({
+      doc: "word",
+      ranges: [{ anchor: 0, head: 4 }],
+    });
+    expect(toggleMarkdownFormat("___word___", [{ anchor: 3, head: 7 }], "italic")).toMatchObject({
+      doc: "__word__",
+      ranges: [{ anchor: 2, head: 6 }],
+    });
+  });
+
   it("toggles multiple cursors simultaneously in Source mode", () => {
     const initial = "alpha and beta";
     const ranges = [
@@ -112,149 +155,6 @@ describe("toggleMarkdownFormat", () => {
     const stripped = toggleMarkdownFormat(h3, [{ anchor: 4, head: 11 }], "heading");
     expect(stripped.doc).toBe("Section title");
     expect(stripped.ranges).toEqual([{ anchor: 0, head: 7 }]);
-  });
-
-  it("unwraps a caret inside bold text on bold and prevents other inline formats from splitting it", () => {
-    const doc = "Observe **Fourier** series";
-    const caretInBold = doc.indexOf("Fourier") + 3; // "Observe **Fou|rier** series"
-
-    // Different inline formats at a bare caret inside bold must not split `**Fourier**`
-    for (const other of ["italic", "inline_code", "inline_math", "link"] as const) {
-      const guarded = toggleMarkdownFormat(doc, [{ anchor: caretInBold, head: caretInBold }], other);
-      expect(guarded.doc).toBe(doc);
-      expect(guarded.changes).toEqual([]);
-      expect(guarded.ranges).toEqual([{ anchor: caretInBold, head: caretInBold }]);
-    }
-
-    // Same-format `bold` with a caret inside `**Fou|rier**` unwraps cleanly and preserves the caret offset
-    const unwrapped = toggleMarkdownFormat(doc, [{ anchor: caretInBold, head: caretInBold }], "bold");
-    expect(unwrapped.doc).toBe("Observe Fourier series");
-    const expectedCaret = "Observe Fou".length;
-    expect(unwrapped.ranges).toEqual([{ anchor: expectedCaret, head: expectedCaret }]);
-
-    // Nested bold+italic (`***Fou|rier***`): bold unwraps strong leaving `*Fou|rier*`, italic unwraps emphasis leaving `**Fou|rier**`
-    const boldItalicDoc = "***Fourier***";
-    const nestedCaret = 6; // `***Fou|rier***`
-    const afterUnbold = toggleMarkdownFormat(boldItalicDoc, [{ anchor: nestedCaret, head: nestedCaret }], "bold");
-    expect(afterUnbold.doc).toBe("*Fourier*");
-    expect(afterUnbold.ranges).toEqual([{ anchor: 4, head: 4 }]);
-
-    const afterUnitalic = toggleMarkdownFormat(boldItalicDoc, [{ anchor: nestedCaret, head: nestedCaret }], "italic");
-    expect(afterUnitalic.doc).toBe("**Fourier**");
-    expect(afterUnitalic.ranges).toEqual([{ anchor: 5, head: 5 }]);
-
-    // Bare caret immediately touching `**Fourier**|` does not merge delimiter runs into `**Fourier******`
-    const afterClosingStars = doc.indexOf("** series") + 2;
-    expect(toggleMarkdownFormat(doc, [{ anchor: afterClosingStars, head: afterClosingStars }], "bold").doc).toBe(doc);
-    expect(toggleMarkdownFormat(doc, [{ anchor: afterClosingStars, head: afterClosingStars }], "italic").doc).toBe(doc);
-  });
-
-  it("prevents inline formatting from splitting already-formatted spans on partial or straddling selections", () => {
-    // Substring inside bold + bold -> unwraps enclosing bold while keeping the substring selected (never `**hel**lo wo**rld**`)
-    const boldSentence = "Start **hello world** end";
-    const subFrom = boldSentence.indexOf("lo wo");
-    const subTo = subFrom + "lo wo".length;
-    const unboldedSub = toggleMarkdownFormat(boldSentence, [{ anchor: subFrom, head: subTo }], "bold");
-    expect(unboldedSub.doc).toBe("Start hello world end");
-    const expectedSubFrom = unboldedSub.doc.indexOf("lo wo");
-    expect(unboldedSub.ranges).toEqual([{ anchor: expectedSubFrom, head: expectedSubFrom + "lo wo".length }]);
-
-    // Selection partially straddling a formatted boundary (`Start **hel[lo world** end]`) -> safe no-op
-    const straddleFrom = boldSentence.indexOf("lo world");
-    const straddleTo = boldSentence.length;
-    for (const action of ["bold", "italic", "inline_code", "inline_math", "link"] as const) {
-      const res = toggleMarkdownFormat(boldSentence, [{ anchor: straddleFrom, head: straddleTo }], action);
-      expect(res.doc).toBe(boldSentence);
-      expect(res.changes).toEqual([]);
-    }
-
-    // Selection enclosing an already-bolded word (`[Start **hello world** end]` + bold) -> safe no-op instead of splitting
-    const fullOuter = toggleMarkdownFormat(boldSentence, [{ anchor: 0, head: boldSentence.length }], "bold");
-    expect(fullOuter.doc).toBe(boldSentence);
-    expect(fullOuter.changes).toEqual([]);
-
-    // Caret inside link label: `link` unwraps preserving caret; `bold` does not split
-    const linkDoc = "Visit [Super MD](https://example.com) today";
-    const linkCaret = linkDoc.indexOf("Super") + 3;
-    expect(toggleMarkdownFormat(linkDoc, [{ anchor: linkCaret, head: linkCaret }], "bold").doc).toBe(linkDoc);
-    const unwrappedLink = toggleMarkdownFormat(linkDoc, [{ anchor: linkCaret, head: linkCaret }], "link");
-    expect(unwrappedLink.doc).toBe("Visit Super MD today");
-    expect(unwrappedLink.ranges).toEqual([{ anchor: "Visit Sup".length, head: "Visit Sup".length }]);
-  });
-
-  it("prevents inline formatting from splitting protected code or YAML frontmatter while keeping same-span code/math unwrap", () => {
-    // YAML frontmatter (caret inside, selection inside, straddling boundary, and block formatting)
-    const yamlDoc = "---\ntitle: Protected YAML\ntags: [notes]\n---\n\nBody target text";
-    const yamlSelStart = yamlDoc.indexOf("Protected");
-    const yamlSelEnd = yamlSelStart + "Protected".length;
-    for (const action of FORMAT_ACTIONS) {
-      expect(toggleMarkdownFormat(yamlDoc, [{ anchor: yamlSelStart, head: yamlSelEnd }], action).doc).toBe(yamlDoc);
-      expect(toggleMarkdownFormat(yamlDoc, [{ anchor: yamlSelStart, head: yamlSelStart }], action).doc).toBe(yamlDoc);
-    }
-    // Selection straddling YAML frontmatter into body prose -> safe no-op
-    const bodyStart = yamlDoc.indexOf("Body");
-    expect(toggleMarkdownFormat(yamlDoc, [{ anchor: yamlSelStart, head: bodyStart + 4 }], "bold").doc).toBe(yamlDoc);
-    // Body prose formats normally
-    expect(toggleMarkdownFormat(yamlDoc, [{ anchor: bodyStart, head: bodyStart + 4 }], "bold").doc).toContain(
-      "**Body** target text",
-    );
-
-    // Fenced code block (including bare caret, selection, >20KB fence, and unclosed fence)
-    const fenced = "```ts\nconst value = 42;\n\n```";
-    const valIdx = fenced.indexOf("value");
-    const blankInFence = fenced.indexOf("\n\n") + 1;
-    for (const action of ["bold", "italic", "inline_code", "inline_math", "link"] as const) {
-      expect(toggleMarkdownFormat(fenced, [{ anchor: valIdx, head: valIdx + 5 }], action).doc).toBe(fenced);
-      expect(toggleMarkdownFormat(fenced, [{ anchor: valIdx + 2, head: valIdx + 2 }], action).doc).toBe(fenced);
-      expect(toggleMarkdownFormat(fenced, [{ anchor: blankInFence, head: blankInFence }], action).doc).toBe(fenced);
-    }
-    const largeFence = `\`\`\`python\n${"x = 1\n".repeat(3500)}target_var = 2\n\`\`\``;
-    const largeIdx = largeFence.indexOf("target_var");
-    expect(toggleMarkdownFormat(largeFence, [{ anchor: largeIdx, head: largeIdx + 10 }], "bold").doc).toBe(largeFence);
-
-    // Inline code: blocks bold/italic/link/math, while inline_code unwraps cleanly preserving caret
-    const inlineCodeDoc = "Run `cargo test` now";
-    const codeCaret = inlineCodeDoc.indexOf("cargo") + 3;
-    for (const other of ["bold", "italic", "inline_math", "link"] as const) {
-      expect(toggleMarkdownFormat(inlineCodeDoc, [{ anchor: codeCaret, head: codeCaret }], other).doc).toBe(
-        inlineCodeDoc,
-      );
-      expect(toggleMarkdownFormat(inlineCodeDoc, [{ anchor: codeCaret - 3, head: codeCaret + 2 }], other).doc).toBe(
-        inlineCodeDoc,
-      );
-    }
-    const unwrappedCode = toggleMarkdownFormat(inlineCodeDoc, [{ anchor: codeCaret, head: codeCaret }], "inline_code");
-    expect(unwrappedCode.doc).toBe("Run cargo test now");
-    expect(unwrappedCode.ranges).toEqual([{ anchor: "Run car".length, head: "Run car".length }]);
-
-    // Inline math: blocks bold/italic/link/code, while inline_math unwraps cleanly preserving caret
-    const inlineMathDoc = "Given $alpha + 1$ in prose";
-    const mathCaret = inlineMathDoc.indexOf("alpha") + 2;
-    expect(toggleMarkdownFormat(inlineMathDoc, [{ anchor: mathCaret, head: mathCaret }], "bold").doc).toBe(
-      inlineMathDoc,
-    );
-    const unwrappedMath = toggleMarkdownFormat(inlineMathDoc, [{ anchor: mathCaret, head: mathCaret }], "inline_math");
-    expect(unwrappedMath.doc).toBe("Given alpha + 1 in prose");
-    expect(unwrappedMath.ranges).toEqual([{ anchor: "Given al".length, head: "Given al".length }]);
-  });
-
-  it("keeps multi-paragraph and cross-block selections separate from inline formatting", () => {
-    const twoParas = "First paragraph.\n\nSecond paragraph.";
-    for (const action of ["bold", "italic", "inline_code", "inline_math", "link"] as const) {
-      const res = toggleMarkdownFormat(twoParas, [{ anchor: 6, head: 24 }], action);
-      expect(res.doc).toBe(twoParas);
-      expect(res.changes).toEqual([]);
-    }
-
-    const twoListItems = "- First item\n- Second item";
-    expect(toggleMarkdownFormat(twoListItems, [{ anchor: 2, head: 21 }], "bold").doc).toBe(twoListItems);
-
-    const acrossTableCells = "| Left | Right |\n| --- | --- |\n| alpha | beta |";
-    const alphaIdx = acrossTableCells.indexOf("alpha");
-    const betaEnd = acrossTableCells.indexOf("beta") + 4;
-    expect(toggleMarkdownFormat(acrossTableCells, [{ anchor: alphaIdx, head: betaEnd }], "bold").doc).toBe(
-      acrossTableCells,
-    );
   });
 });
 

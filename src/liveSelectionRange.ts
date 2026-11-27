@@ -1,10 +1,49 @@
 import { visit } from "unist-util-visit";
+import { remarkCallouts } from "./components/MarkdownPreview";
 import { analyzeDocument, type SourceDocumentAnalysis } from "./documentAnalysis";
+import { toggleMarkdownFormat, type FormatAction, type MarkdownEditResult } from "./markdownFormatting";
+import { normalizeMarkdownSource } from "./markdownSource";
+import { parseOriginalWikilinkSlice } from "./workspaceLinks";
 
 export interface LiveEditingSpanContext {
   baseMarkdown: string;
   baseSplitEnd: number;
 }
+
+export type InlineSpanKind =
+  | "strong"
+  | "emphasis"
+  | "delete"
+  | "inlineCode"
+  | "inlineMath"
+  | "link"
+  | "linkReference"
+  | "wikilink"
+  | "autolink"
+  | "image"
+  | "imageReference"
+  | "html"
+  | "highlight"
+  | "subscript"
+  | "superscript"
+  | "inline";
+
+export interface InlineSpanBounds {
+  kind: InlineSpanKind;
+  outerStart: number;
+  innerStart: number;
+  innerEnd: number;
+  outerEnd: number;
+}
+
+export type LiveRenderedScopeKind =
+  | "paragraph"
+  | "heading"
+  | "listItem"
+  | "tableCell"
+  | "calloutTitle"
+  | "calloutBody"
+  | "pre";
 
 export interface LiveRenderedSelectionRange {
   blockElement: HTMLElement;
@@ -17,12 +56,18 @@ export interface LiveRenderedSelectionRange {
   from: number;
   to: number;
   reversed: boolean;
+  protectedBlock: boolean;
+  scopeKind: LiveRenderedScopeKind;
+  spans: InlineSpanBounds[];
 }
 
 const EXCLUDED_SELECTION_CONTAINER_SELECTOR =
   "textarea,input,select,button,.cm-editor,.live-active-block,.live-block-edit,.code-toolbar,.cell-toolbar,.cell-output,[data-frontmatter-properties],.document-properties,.reading-search,.image-viewer,.media-dialog,.math-repair-panel,[data-windowed-mounted=\"false\"]";
 
 const LEAF_BLOCK_SELECTOR = "p,h1,h2,h3,h4,h5,h6,li,summary,td,th,pre";
+
+const NESTED_LI_BLOCK_SELECTOR =
+  "ul,ol,blockquote,pre,details,table,.code-container,.python-cell,.katex-display,section.step-cards";
 
 const RAW_HTML_TOKEN =
   /(<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>)/gi;
@@ -45,6 +90,42 @@ export function translateLiveRenderedRange(
   if (!editing || end <= editing.baseSplitEnd) return [start, end];
   const delta = activeDoc.length - editing.baseMarkdown.length;
   return [start >= editing.baseSplitEnd ? start + delta : start, end + delta];
+}
+
+export function inlineMathInnerBounds(source: string, start: number, end: number): [number, number] {
+  const raw = source.slice(start, end);
+  if (raw.startsWith("\\(") && raw.endsWith("\\)") && raw.length >= 4) {
+    return [start + 2, end - 2];
+  }
+  if (raw.startsWith("$$") && raw.endsWith("$$") && raw.length >= 4) {
+    return [start + 2, end - 2];
+  }
+  if (raw.startsWith("$") && raw.endsWith("$") && raw.length >= 2) {
+    return [start + 1, end - 1];
+  }
+  return [start, end];
+}
+
+export function inlineCodeInnerBounds(source: string, start: number, end: number, value: string): [number, number] {
+  const raw = source.slice(start, end);
+  let ticks = 0;
+  while (ticks < raw.length && raw[ticks] === "`") ticks++;
+  if (ticks === 0 || ticks * 2 > raw.length) return [start, end];
+  const innerRaw = raw.slice(ticks, raw.length - ticks);
+  if (
+    innerRaw.length === value.length + 2 &&
+    innerRaw.startsWith(" ") &&
+    innerRaw.endsWith(" ") &&
+    innerRaw.slice(1, -1) === value
+  ) {
+    return [start + ticks + 1, end - ticks - 1];
+  }
+  if (innerRaw.length === value.length) {
+    return [start + ticks, end - ticks];
+  }
+  const idx = raw.indexOf(value, ticks);
+  if (idx >= 0) return [start + idx, start + idx + value.length];
+  return [start + ticks, Math.max(start + ticks, end - ticks)];
 }
 
 function isSelectionBackward(selection: Selection): boolean {
@@ -71,21 +152,34 @@ interface SourceUnit {
   char: string;
 }
 
-interface InlineWrapperBounds {
-  kind: string;
-  outerStart: number;
-  innerStart: number;
-  innerEnd: number;
-  outerEnd: number;
+/**
+ * Reuses `normalizeMarkdownSource` to strip unmasked `%%...%%` comments while
+ * preserving exact UTF-16 character offsets back into `raw`.
+ */
+function stripCommentsWithSourceMap(raw: string): { value: string; origIndex: (idx: number) => number } {
+  if (!raw.includes("%%")) {
+    return { value: raw, origIndex: (idx) => idx };
+  }
+  const safeInput = "\n" + raw.replace(/\[\[/g, "\0\0").replace(/:::callout/gi, "\0\0\0callout");
+  const normalized = normalizeMarkdownSource(safeInput);
+  const len = Math.max(0, normalized.value.length - 1);
+  const origIndices = new Array<number>(len);
+  let stripped = "";
+  for (let k = 0; k < len; k++) {
+    const orig = normalized.originalOffset(k + 1) - 1;
+    origIndices[k] = orig;
+    stripped += raw[orig] ?? "";
+  }
+  return {
+    value: stripped,
+    origIndex: (idx) => (idx < len ? origIndices[idx] : raw.length),
+  };
 }
 
-function findPercentCommentClose(raw: string, openIndex: number): number {
-  for (let i = openIndex + 2; i + 1 < raw.length; i++) {
-    if (raw[i] === "%" && raw[i + 1] === "%" && raw[i - 1] !== "\\") {
-      return i + 2;
-    }
-  }
-  return -1;
+function skipLeadingIgnoredComments(source: string, cursor: number, limitEnd: number): number {
+  if (cursor >= limitEnd || !source.startsWith("%%", cursor)) return cursor;
+  const slice = source.slice(cursor, limitEnd);
+  return cursor + stripCommentsWithSourceMap(slice).origIndex(0);
 }
 
 function consumeTextUnits(
@@ -101,58 +195,57 @@ function consumeTextUnits(
     return { units: out, consumedRaw: value.length };
   }
 
+  const { value: cleanRaw, origIndex } = stripCommentsWithSourceMap(raw);
   const out: SourceUnit[] = [];
   let r = 0;
   let v = 0;
-  while (v < value.length && r < raw.length) {
-    if (
-      raw[r] === "%" &&
-      raw[r + 1] === "%" &&
-      (r === 0 || raw[r - 1] !== "\\") &&
-      !(value[v] === "%" && value[v + 1] === "%")
-    ) {
-      const commentEnd = findPercentCommentClose(raw, r);
-      if (commentEnd > r) {
-        r = commentEnd;
-        continue;
-      }
-    }
 
+  while (v < value.length && r < cleanRaw.length) {
     const vCh = value[v];
-    const rCh = raw[r];
+    const rCh = cleanRaw[r];
 
     if (vCh === "\n" && (rCh === "\r" || rCh === "\n")) {
-      const nlStart = r;
-      if (raw[r] === "\r" && raw[r + 1] === "\n") r += 2;
+      const nlStart = origIndex(r);
+      if (cleanRaw[r] === "\r" && cleanRaw[r + 1] === "\n") r += 2;
       else r += 1;
       const nextValueChar = v + 1 < value.length ? value[v + 1] : "";
-      while (r < raw.length && (raw[r] === " " || raw[r] === "\t" || raw[r] === ">")) {
-        if (nextValueChar && raw[r] === nextValueChar && raw.slice(r, r + 4) === value.slice(v + 1, v + 5)) {
+      while (r < cleanRaw.length && (cleanRaw[r] === " " || cleanRaw[r] === "\t" || cleanRaw[r] === ">")) {
+        if (nextValueChar && cleanRaw[r] === nextValueChar && cleanRaw.slice(r, r + 4) === value.slice(v + 1, v + 5)) {
           break;
         }
         r++;
       }
-      out.push({ from: baseOffset + nlStart, to: baseOffset + r, char: "\n" });
+      const nlEnd = origIndex(r - 1) + 1;
+      out.push({ from: baseOffset + nlStart, to: baseOffset + nlEnd, char: "\n" });
       v++;
       continue;
     }
 
-    if (rCh === "\\" && r + 1 < raw.length && raw[r + 1] === vCh) {
-      out.push({ from: baseOffset + r, to: baseOffset + r + 2, char: vCh });
+    if (rCh === "\\" && r + 1 < cleanRaw.length && cleanRaw[r + 1] === vCh) {
+      out.push({
+        from: baseOffset + origIndex(r),
+        to: baseOffset + origIndex(r + 1) + 1,
+        char: vCh,
+      });
       r += 2;
       v++;
       continue;
     }
 
     if (rCh === "&") {
-      const entity = /^&(?:#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);/.exec(raw.slice(r));
-      if (entity && (rCh !== vCh || !raw.slice(r, r + value.length - v).startsWith(value.slice(v, v + entity[0].length)))) {
+      const entity = /^&(?:#x[0-9a-fA-F]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);/.exec(cleanRaw.slice(r));
+      if (
+        entity &&
+        (rCh !== vCh || !cleanRaw.slice(r, r + value.length - v).startsWith(value.slice(v, v + entity[0].length)))
+      ) {
+        const entStart = origIndex(r);
+        const entEnd = origIndex(r + entity[0].length - 1) + 1;
         const cp = value.codePointAt(v) ?? 0;
         const unitLen = cp > 0xffff ? 2 : 1;
         for (let k = 0; k < unitLen && v + k < value.length; k++) {
           out.push({
-            from: baseOffset + (k === 0 ? r : r + entity[0].length),
-            to: baseOffset + r + entity[0].length,
+            from: baseOffset + (k === 0 ? entStart : entEnd),
+            to: baseOffset + entEnd,
             char: value[v + k],
           });
         }
@@ -162,58 +255,24 @@ function consumeTextUnits(
       }
     }
 
-    out.push({ from: baseOffset + r, to: baseOffset + r + 1, char: vCh });
+    const chStart = origIndex(r);
+    out.push({ from: baseOffset + chStart, to: baseOffset + chStart + 1, char: vCh });
     r++;
     v++;
   }
 
+  const consumedRaw = r > 0 ? origIndex(r - 1) + 1 : 0;
   while (v < value.length) {
-    const clamped = baseOffset + Math.min(r, raw.length);
+    const clamped = baseOffset + Math.min(consumedRaw, raw.length);
     out.push({ from: clamped, to: clamped, char: value[v] });
     v++;
   }
 
-  return { units: out, consumedRaw: r };
+  return { units: out, consumedRaw };
 }
 
 function mapTextNodeUnits(raw: string, value: string, baseOffset: number): SourceUnit[] {
   return consumeTextUnits(raw, value, baseOffset).units;
-}
-
-function inlineMathInnerBounds(source: string, start: number, end: number): [number, number] {
-  const raw = source.slice(start, end);
-  if (raw.startsWith("\\(") && raw.endsWith("\\)") && raw.length >= 4) {
-    return [start + 2, end - 2];
-  }
-  if (raw.startsWith("$$") && raw.endsWith("$$") && raw.length >= 4) {
-    return [start + 2, end - 2];
-  }
-  if (raw.startsWith("$") && raw.endsWith("$") && raw.length >= 2) {
-    return [start + 1, end - 1];
-  }
-  return [start, end];
-}
-
-function inlineCodeInnerBounds(source: string, start: number, end: number, value: string): [number, number] {
-  const raw = source.slice(start, end);
-  let ticks = 0;
-  while (ticks < raw.length && raw[ticks] === "`") ticks++;
-  if (ticks === 0 || ticks * 2 > raw.length) return [start, end];
-  const innerRaw = raw.slice(ticks, raw.length - ticks);
-  if (
-    innerRaw.length === value.length + 2 &&
-    innerRaw.startsWith(" ") &&
-    innerRaw.endsWith(" ") &&
-    innerRaw.slice(1, -1) === value
-  ) {
-    return [start + ticks + 1, end - ticks - 1];
-  }
-  if (innerRaw.length === value.length) {
-    return [start + ticks, end - ticks];
-  }
-  const idx = raw.indexOf(value, ticks);
-  if (idx >= 0) return [start + idx, start + idx + value.length];
-  return [start + ticks, Math.max(start + ticks, end - ticks)];
 }
 
 function flattenInlineText(nodes: any[]): string {
@@ -226,21 +285,26 @@ function flattenInlineText(nodes: any[]): string {
   return out;
 }
 
-function studyDelimiterForType(type: string): string | null {
-  if (type === "highlight") return "==";
-  if (type === "subscript") return "~";
-  if (type === "superscript") return "^";
+function studyDelimiterForType(type: string): { delim: string; kind: InlineSpanKind } | null {
+  if (type === "highlight") return { delim: "==", kind: "highlight" };
+  if (type === "subscript") return { delim: "~", kind: "subscript" };
+  if (type === "superscript") return { delim: "^", kind: "superscript" };
   return null;
 }
 
-function skipLeadingIgnoredComments(source: string, cursor: number, limitEnd: number): number {
-  let pos = cursor;
-  while (pos + 1 < limitEnd && source[pos] === "%" && source[pos + 1] === "%" && (pos === 0 || source[pos - 1] !== "\\")) {
-    const close = findPercentCommentClose(source.slice(pos, limitEnd), 0);
-    if (close < 0) break;
-    pos += close;
+function normalizeContainerSpanKind(type: string, rawNode: string): InlineSpanKind {
+  if (type === "strong") return "strong";
+  if (type === "emphasis") return "emphasis";
+  if (type === "delete") return "delete";
+  if (type === "link") {
+    if (rawNode.startsWith("<") && rawNode.endsWith(">")) return "autolink";
+    return "link";
   }
-  return pos;
+  if (type === "linkReference") return "linkReference";
+  if (type === "highlight") return "highlight";
+  if (type === "subscript") return "subscript";
+  if (type === "superscript") return "superscript";
+  return "inline";
 }
 
 function collectMdastInlineStream(
@@ -249,8 +313,8 @@ function collectMdastInlineStream(
   scopeStart: number,
   scopeEnd: number,
   units: SourceUnit[],
-  wrappers: InlineWrapperBounds[],
-  mathWrappers: InlineWrapperBounds[],
+  spans: InlineSpanBounds[],
+  mathSpans: InlineSpanBounds[],
 ): void {
   const htmlStack: Array<{ tag: string; outerStart: number; innerStartUnit: number }> = [];
   let cursor = scopeStart;
@@ -293,7 +357,7 @@ function collectMdastInlineStream(
 
       if (node.type === "inlineCode" && typeof node.value === "string" && typeof start === "number" && typeof end === "number") {
         const [innerStart, innerEnd] = inlineCodeInnerBounds(source, start, end, node.value);
-        wrappers.push({ kind: "inlineCode", outerStart: start, innerStart, innerEnd, outerEnd: end });
+        spans.push({ kind: "inlineCode", outerStart: start, innerStart, innerEnd, outerEnd: end });
         for (let i = 0; i < node.value.length; i++) {
           const pos = Math.min(innerEnd, innerStart + i);
           units.push({ from: pos, to: Math.min(innerEnd, pos + 1), char: node.value[i] });
@@ -304,9 +368,9 @@ function collectMdastInlineStream(
 
       if (node.type === "inlineMath" && typeof start === "number" && typeof end === "number") {
         const [innerStart, innerEnd] = inlineMathInnerBounds(source, start, end);
-        const entry: InlineWrapperBounds = { kind: "inlineMath", outerStart: start, innerStart, innerEnd, outerEnd: end };
-        wrappers.push(entry);
-        mathWrappers.push(entry);
+        const entry: InlineSpanBounds = { kind: "inlineMath", outerStart: start, innerStart, innerEnd, outerEnd: end };
+        spans.push(entry);
+        mathSpans.push(entry);
         units.push({ from: start, to: end, char: "\uFFFC" });
         cursor = end;
         continue;
@@ -319,7 +383,7 @@ function collectMdastInlineStream(
       }
 
       if ((node.type === "image" || node.type === "imageReference") && typeof start === "number" && typeof end === "number") {
-        wrappers.push({ kind: node.type, outerStart: start, innerStart: start, innerEnd: end, outerEnd: end });
+        spans.push({ kind: node.type, outerStart: start, innerStart: start, innerEnd: end, outerEnd: end });
         units.push({ from: start, to: end, char: "\uFFFC" });
         cursor = end;
         prevWasImage = true;
@@ -359,7 +423,7 @@ function collectMdastInlineStream(
               const paired = htmlStack.splice(matchIdx)[0];
               const innerStart = units[paired.innerStartUnit]?.from ?? partStart;
               const innerEnd = units.length > paired.innerStartUnit ? units[units.length - 1].to : innerStart;
-              wrappers.push({
+              spans.push({
                 kind: "html",
                 outerStart: paired.outerStart,
                 innerStart,
@@ -379,19 +443,29 @@ function collectMdastInlineStream(
 
       if (node.type === "link" && typeof start === "number" && typeof end === "number") {
         const rawLink = source.slice(start, end);
-        if (rawLink.startsWith("[[") && rawLink.endsWith("]]") && rawLink.length >= 4) {
+        const parsedWiki = parseOriginalWikilinkSlice(rawLink);
+        if (parsedWiki) {
           const innerSlice = rawLink.slice(2, -2);
           const pipeIdx = innerSlice.indexOf("|");
           let innerStart = start + 2;
-          const innerEnd = end - 2;
-          if (pipeIdx >= 0) {
-            innerStart = start + 2 + pipeIdx + 1;
-          } else if (innerSlice.startsWith("#")) {
-            innerStart = start + 3;
+          let innerEnd = end - 2;
+          if (pipeIdx >= 0 && innerSlice.slice(pipeIdx + 1).trim().length > 0) {
+            const aliasSlice = innerSlice.slice(pipeIdx + 1);
+            const leadWs = aliasSlice.length - aliasSlice.trimStart().length;
+            const trailWs = aliasSlice.length - aliasSlice.trimEnd().length;
+            innerStart = start + 2 + pipeIdx + 1 + leadWs;
+            innerEnd = Math.max(innerStart, end - 2 - trailWs);
+          } else if (parsedWiki.sameNote) {
+            const hashIdx = innerSlice.indexOf("#");
+            const afterHash = hashIdx >= 0 ? innerSlice.slice(hashIdx + 1) : innerSlice;
+            const leadWs = afterHash.length - afterHash.trimStart().length;
+            const trailWs = afterHash.length - afterHash.trimEnd().length;
+            innerStart = start + 2 + (hashIdx >= 0 ? hashIdx + 1 : 0) + leadWs;
+            innerEnd = Math.max(innerStart, end - 2 - trailWs);
           }
           const visible = flattenInlineText(node.children ?? []);
           units.push(...mapTextNodeUnits(source.slice(innerStart, innerEnd), visible, innerStart));
-          wrappers.push({
+          spans.push({
             kind: "wikilink",
             outerStart: start,
             innerStart,
@@ -403,17 +477,17 @@ function collectMdastInlineStream(
         }
       }
 
-      const studyDelim = studyDelimiterForType(String(node.type || ""));
-      if (studyDelim && Array.isArray(node.children) && (typeof start !== "number" || typeof end !== "number")) {
+      const studySpec = studyDelimiterForType(String(node.type || ""));
+      if (studySpec && Array.isArray(node.children) && (typeof start !== "number" || typeof end !== "number")) {
         cursor = skipLeadingIgnoredComments(source, cursor, limitEnd);
-        if (!source.startsWith(studyDelim, cursor)) {
-          const nextDelim = source.indexOf(studyDelim, cursor);
+        if (!source.startsWith(studySpec.delim, cursor)) {
+          const nextDelim = source.indexOf(studySpec.delim, cursor);
           if (nextDelim >= cursor && nextDelim < limitEnd) {
             cursor = nextDelim;
           }
         }
         const outerStart = cursor;
-        const innerStart = source.startsWith(studyDelim, cursor) ? cursor + studyDelim.length : cursor;
+        const innerStart = source.startsWith(studySpec.delim, cursor) ? cursor + studySpec.delim.length : cursor;
         cursor = innerStart;
         const beforeUnit = units.length;
         walkList(node.children, limitEnd);
@@ -421,10 +495,10 @@ function collectMdastInlineStream(
         cursor = skipLeadingIgnoredComments(source, cursor, limitEnd);
         const resolvedInnerEnd = afterUnit > beforeUnit ? units[afterUnit - 1].to : cursor;
         const closePos = Math.max(cursor, resolvedInnerEnd);
-        const outerEnd = source.startsWith(studyDelim, closePos) ? closePos + studyDelim.length : closePos;
+        const outerEnd = source.startsWith(studySpec.delim, closePos) ? closePos + studySpec.delim.length : closePos;
         cursor = outerEnd;
-        wrappers.push({
-          kind: String(node.type),
+        spans.push({
+          kind: studySpec.kind,
           outerStart,
           innerStart: afterUnit > beforeUnit ? units[beforeUnit].from : innerStart,
           innerEnd: resolvedInnerEnd,
@@ -435,14 +509,15 @@ function collectMdastInlineStream(
 
       if (Array.isArray(node.children)) {
         const beforeUnit = units.length;
+        const rawNode =
+          typeof start === "number" ? source.slice(start, typeof end === "number" ? end : limitEnd) : "";
         if (typeof start === "number") {
-          const rawNode = source.slice(start, typeof end === "number" ? end : limitEnd);
           let childLead = 0;
           if (node.type === "strong" && (rawNode.startsWith("**") || rawNode.startsWith("__"))) childLead = 2;
           else if (node.type === "emphasis" && (rawNode.startsWith("*") || rawNode.startsWith("_"))) childLead = 1;
           else if (node.type === "delete") {
             while (childLead < rawNode.length && rawNode[childLead] === "~") childLead++;
-          } else if (node.type === "link" && rawNode.startsWith("[")) {
+          } else if ((node.type === "link" || node.type === "linkReference") && rawNode.startsWith("[")) {
             childLead = 1;
           }
           cursor = start + childLead;
@@ -453,8 +528,8 @@ function collectMdastInlineStream(
           if (afterUnit > beforeUnit) {
             const innerStart = units[beforeUnit].from;
             const innerEnd = units[afterUnit - 1].to;
-            wrappers.push({
-              kind: String(node.type || "inline"),
+            spans.push({
+              kind: normalizeContainerSpanKind(String(node.type || ""), rawNode),
               outerStart: start,
               innerStart,
               innerEnd,
@@ -470,139 +545,199 @@ function collectMdastInlineStream(
   walkList(children, scopeEnd);
 }
 
-function splitCalloutParagraphChildren(
-  paragraph: any,
-  source: string,
-): {
-  title: any[];
-  body: any[];
-  hadExplicitTitle: boolean;
-  titleStart: number;
-  titleEnd: number;
-  bodyStart: number;
-  bodyEnd: number;
-} | null {
-  const paraStart: number | undefined = paragraph?.position?.start?.offset;
-  const paraEnd: number | undefined = paragraph?.position?.end?.offset;
-  if (typeof paraStart !== "number" || typeof paraEnd !== "number") return null;
-
-  const first = paragraph?.children?.[0];
-  if (first?.type !== "text" || typeof first.value !== "string") return null;
-  const match = /^\[!([\w-]+)\]([+-]?)[ \t]*/i.exec(first.value);
-  if (!match) return null;
-
-  const firstStart: number = typeof first.position?.start?.offset === "number" ? first.position.start.offset : paraStart;
-  const rawFromFirst = source.slice(firstStart, paraEnd);
-  const rawMatch = /^\[!([\w-]+)\]([+-]?)[ \t]*/i.exec(rawFromFirst);
-  const rawPrefixLen = rawMatch ? rawMatch[0].length : match[0].length;
-  const titleStart = firstStart + rawPrefixLen;
-
-  const firstEnd: number | undefined = first.position?.end?.offset;
-  const trimmedFirst = {
-    ...first,
-    value: first.value.slice(match[0].length),
-    ...(typeof firstEnd === "number"
-      ? {
-          position: {
-            start: { offset: titleStart },
-            end: { offset: firstEnd },
-          },
-        }
-      : {}),
-  };
-  const inputChildren = [trimmedFirst, ...paragraph.children.slice(1)];
-
-  let computedTitleEnd = paraEnd;
-  let computedBodyStart = paraEnd;
-
-  const splitNodes = (nodes: any[]): { title: any[]; body: any[]; ended: boolean } => {
-    const title: any[] = [];
-    const body: any[] = [];
-    let ended = false;
-    for (const child of nodes) {
-      if (ended) {
-        body.push(child);
-        continue;
-      }
-      if (child.type === "break") {
-        if (typeof child.position?.start?.offset === "number") computedTitleEnd = child.position.start.offset;
-        if (typeof child.position?.end?.offset === "number") computedBodyStart = child.position.end.offset;
-        ended = true;
-        continue;
-      }
-      if (child.type === "text" && typeof child.value === "string") {
-        const at = child.value.indexOf("\n");
-        if (at >= 0) {
-          const cStart: number | undefined = child.position?.start?.offset;
-          const cEnd: number | undefined = child.position?.end?.offset;
-          let titleEndOffset: number | undefined;
-          let bodyStartOffset: number | undefined;
-          if (typeof cStart === "number" && typeof cEnd === "number") {
-            const units = mapTextNodeUnits(source.slice(cStart, cEnd), child.value, cStart);
-            titleEndOffset = at > 0 ? units[at - 1].to : cStart;
-            bodyStartOffset = units[at]?.to ?? cEnd;
-            computedTitleEnd = titleEndOffset;
-            computedBodyStart = bodyStartOffset;
-          }
-          if (at > 0) {
-            title.push({
-              ...child,
-              value: child.value.slice(0, at),
-              ...(typeof cStart === "number" && typeof titleEndOffset === "number"
-                ? { position: { start: { offset: cStart }, end: { offset: titleEndOffset } } }
-                : { position: undefined }),
-            });
-          }
-          if (child.value.length > at + 1) {
-            body.push({
-              ...child,
-              value: child.value.slice(at + 1),
-              ...(typeof bodyStartOffset === "number" && typeof cEnd === "number"
-                ? { position: { start: { offset: bodyStartOffset }, end: { offset: cEnd } } }
-                : { position: undefined }),
-            });
-          }
-          ended = true;
-        } else if (child.value.length > 0) {
-          title.push(child);
-        }
-      } else if (Array.isArray(child.children)) {
-        const parts = splitNodes(child.children);
-        if (parts.title.length) title.push({ ...child, children: parts.title });
-        if (parts.body.length) body.push({ ...child, children: parts.body });
-        ended = parts.ended;
-      } else {
-        title.push(child);
-      }
-    }
-    return { title, body, ended };
-  };
-
-  const split = splitNodes(inputChildren);
-  if (computedBodyStart === paraEnd && split.body.length > 0) {
-    const rawAfterTitle = source.slice(titleStart, paraEnd);
-    const nlMatch = /\r?\n[ \t>]*/.exec(rawAfterTitle);
-    if (nlMatch) {
-      computedTitleEnd = titleStart + nlMatch.index;
-      computedBodyStart = titleStart + nlMatch.index + nlMatch[0].length;
-    }
-  }
-  const hadExplicitTitle = split.title.some((child: any) => child.type !== "text" || child.value.trim().length > 0);
-  return {
-    title: split.title,
-    body: split.body,
-    hadExplicitTitle,
-    titleStart,
-    titleEnd: computedTitleEnd,
-    bodyStart: computedBodyStart,
-    bodyEnd: paraEnd,
-  };
-}
-
 interface ResolvedScopeStream {
   children: any[];
   scopeStart: number;
   scopeEnd: number;
+  scopeKind: LiveRenderedScopeKind;
+}
+
+function stripAstPositions(nodes: any[]): void {
+  for (const node of nodes) {
+    if (!node) continue;
+    delete node.position;
+    if (Array.isArray(node.children)) {
+      stripAstPositions(node.children);
+    }
+  }
+}
+
+function clampSplitTextOffsets(nodes: any[], minOff: number, maxOff: number): void {
+  for (const node of nodes) {
+    if (!node) continue;
+    if (!Array.isArray(node.children)) {
+      const s = node.position?.start?.offset;
+      const e = node.position?.end?.offset;
+      if (typeof s === "number" && typeof e === "number") {
+        const cs = Math.max(minOff, Math.min(maxOff, s));
+        const ce = Math.max(cs, Math.min(maxOff, e));
+        node.position = {
+          start: { ...node.position.start, offset: cs },
+          end: { ...node.position.end, offset: ce },
+        };
+      }
+    } else {
+      clampSplitTextOffsets(node.children, minOff, maxOff);
+    }
+  }
+}
+
+function hasExplicitCalloutTitleInAst(firstParaChildren: any[], markerLen: number): boolean {
+  if (!firstParaChildren.length) return false;
+  const first = firstParaChildren[0];
+  const trimmedFirst = { ...first, value: String(first.value ?? "").slice(markerLen) };
+  const check = (nodes: any[]): { found: boolean; ended: boolean } => {
+    for (const child of nodes) {
+      if (!child) continue;
+      if (child.type === "break") return { found: false, ended: true };
+      if (child.type === "text" && typeof child.value === "string") {
+        const nl = child.value.indexOf("\n");
+        if (nl >= 0) {
+          return { found: child.value.slice(0, nl).trim().length > 0, ended: true };
+        }
+        if (child.value.trim().length > 0) return { found: true, ended: false };
+      } else if (Array.isArray(child.children)) {
+        const inner = check(child.children);
+        if (inner.found) return { found: true, ended: inner.ended };
+        if (inner.ended) return { found: false, ended: true };
+      } else {
+        return { found: true, ended: false };
+      }
+    }
+    return { found: false, ended: false };
+  };
+  return check([trimmedFirst, ...firstParaChildren.slice(1)]).found;
+}
+
+function resolveCalloutScopeStream(
+  scopeEl: HTMLElement,
+  calloutEl: HTMLElement,
+  blockEl: HTMLElement,
+  source: string,
+  tree: any,
+): ResolvedScopeStream | "fallthrough" | null {
+  const cStartAttr = calloutEl.getAttribute("data-source-start");
+  const cEndAttr = calloutEl.getAttribute("data-source-end");
+  const targetStart = cStartAttr !== null ? Number(cStartAttr) : Number(blockEl.dataset.sourceStart);
+  const targetEnd = cEndAttr !== null ? Number(cEndAttr) : Number(blockEl.dataset.sourceEnd);
+
+  let blockquoteNode: any = null;
+  visit(tree, "blockquote", (node: any) => {
+    if (!node.position) return;
+    const nStart = node.position.start.offset;
+    const nEnd = node.position.end.offset;
+    if (cStartAttr !== null && cEndAttr !== null) {
+      if (nStart === targetStart && nEnd === targetEnd) blockquoteNode = node;
+    } else if (!blockquoteNode && nStart >= targetStart && nEnd <= targetEnd) {
+      blockquoteNode = node;
+    }
+  });
+
+  const firstPara = blockquoteNode?.children?.[0];
+  const firstText = firstPara?.children?.[0];
+  const paraStart: number | undefined = firstPara?.position?.start?.offset;
+  const paraEnd: number | undefined = firstPara?.position?.end?.offset;
+  if (
+    firstPara?.type !== "paragraph" ||
+    firstText?.type !== "text" ||
+    typeof firstText.value !== "string" ||
+    typeof paraStart !== "number" ||
+    typeof paraEnd !== "number"
+  ) {
+    return "fallthrough";
+  }
+
+  const markerMatch = /^\[!([\w-]+)\]([+-]?)[ \t]*/i.exec(firstText.value);
+  if (!markerMatch) return "fallthrough";
+
+  const isTitle = scopeEl.classList.contains("callout-title");
+  const isSplitBodyPara =
+    !isTitle &&
+    Number(scopeEl.dataset.sourceStart) === paraStart &&
+    Number(scopeEl.dataset.sourceEnd) === paraEnd;
+
+  if (!isTitle && !isSplitBodyPara) {
+    return "fallthrough";
+  }
+
+  const line1Start = source.lastIndexOf("\n", Math.max(0, paraStart - 1)) + 1;
+  const rawFromLine1 = source.slice(line1Start, paraEnd);
+  const nlMatch = /\r?\n/.exec(rawFromLine1);
+  const line1EndInRaw = nlMatch ? nlMatch.index : rawFromLine1.length;
+  const rawLine1 = rawFromLine1.slice(0, line1EndInRaw);
+
+  let titleStart = line1Start;
+  let titleEnd = line1Start + line1EndInRaw;
+  let hadExplicitTitle = hasExplicitCalloutTitleInAst(firstPara.children, markerMatch[0].length);
+
+  const rawQuotePrefix = /^[ \t>]*\[!([\w-]+)\]([+-]?)[ \t]*/i.exec(rawLine1);
+  const rawDirectivePrefix = /^[ \t]*:::callout[ \t]+[\w-]+([ \t]*)/i.exec(rawLine1);
+  if (rawQuotePrefix) {
+    titleStart = line1Start + rawQuotePrefix[0].length;
+  } else if (rawDirectivePrefix) {
+    const rest = rawLine1.slice(rawDirectivePrefix[0].length);
+    if (!rest.trim()) {
+      hadExplicitTitle = false;
+    }
+    let leadQuote = 0;
+    let trailQuote = 0;
+    if (
+      (rest.startsWith('"') && rest.endsWith('"') && rest.length >= 2) ||
+      (rest.startsWith("'") && rest.endsWith("'") && rest.length >= 2)
+    ) {
+      leadQuote = 1;
+      trailQuote = 1;
+    }
+    titleStart = line1Start + rawDirectivePrefix[0].length + leadQuote;
+    titleEnd = Math.max(titleStart, titleEnd - trailQuote);
+  }
+
+  if (titleEnd > titleStart && source[titleEnd - 1] === "\\") {
+    titleEnd -= 1;
+  }
+
+  let bodyStart = paraEnd;
+  let bodyEnd = paraEnd;
+  if (nlMatch) {
+    let afterNl = nlMatch.index + nlMatch[0].length;
+    const contLead = /^[ \t>]*/.exec(rawFromLine1.slice(afterNl));
+    if (contLead) afterNl += contLead[0].length;
+    bodyStart = Math.min(paraEnd, line1Start + afterNl);
+    const closingDirective = /\r?\n[ \t]*:::[ \t]*$/.exec(source.slice(bodyStart, paraEnd));
+    if (closingDirective) {
+      bodyEnd = bodyStart + closingDirective.index;
+    }
+  }
+
+  const cloned: any = structuredClone(blockquoteNode);
+  remarkCallouts()({ type: "root", children: [cloned] });
+
+  if (isTitle) {
+    if (!hadExplicitTitle) return null;
+    const titleNode = cloned.children?.[0];
+    if (!titleNode || !Array.isArray(titleNode.children)) return null;
+    if (rawDirectivePrefix) {
+      stripAstPositions(titleNode.children);
+    } else {
+      clampSplitTextOffsets(titleNode.children, titleStart, titleEnd);
+    }
+    return {
+      children: titleNode.children,
+      scopeStart: titleStart,
+      scopeEnd: titleEnd,
+      scopeKind: "calloutTitle",
+    };
+  }
+
+  const bodyNode = cloned.children?.[1];
+  if (!bodyNode || bodyNode.type !== "paragraph" || !Array.isArray(bodyNode.children)) return null;
+  clampSplitTextOffsets(bodyNode.children, bodyStart, bodyEnd);
+  return {
+    children: bodyNode.children,
+    scopeStart: bodyStart,
+    scopeEnd: bodyEnd,
+    scopeKind: "calloutBody",
+  };
 }
 
 function computeContentBoundsForNode(node: any, source: string): [number, number] {
@@ -644,36 +779,8 @@ function resolveScopeMdastChildren(
 ): ResolvedScopeStream | null {
   const calloutEl = scopeEl.closest<HTMLElement>("details.callout,aside.callout");
   if (calloutEl && blockEl.contains(calloutEl)) {
-    const bStart = Number(blockEl.dataset.sourceStart);
-    const bEnd = Number(blockEl.dataset.sourceEnd);
-    let blockquoteNode: any = null;
-    visit(tree, "blockquote", (node: any) => {
-      if (blockquoteNode || !node.position) return;
-      const nStart = node.position.start.offset;
-      const nEnd = node.position.end.offset;
-      if (nStart >= bStart && nEnd <= bEnd) {
-        blockquoteNode = node;
-      }
-    });
-    const firstPara = blockquoteNode?.children?.[0];
-    if (firstPara?.type === "paragraph") {
-      const split = splitCalloutParagraphChildren(firstPara, source);
-      if (split) {
-        if (scopeEl.classList.contains("callout-title")) {
-          return split.hadExplicitTitle
-            ? { children: split.title, scopeStart: split.titleStart, scopeEnd: split.titleEnd }
-            : null;
-        }
-        const scopeStart = Number(scopeEl.dataset.sourceStart);
-        const scopeEnd = Number(scopeEl.dataset.sourceEnd);
-        if (
-          scopeStart === firstPara.position?.start?.offset &&
-          scopeEnd === firstPara.position?.end?.offset
-        ) {
-          return { children: split.body, scopeStart: split.bodyStart, scopeEnd: split.bodyEnd };
-        }
-      }
-    }
+    const calloutResolved = resolveCalloutScopeStream(scopeEl, calloutEl, blockEl, source, tree);
+    if (calloutResolved !== "fallthrough") return calloutResolved;
   }
 
   const rawStart = scopeEl.getAttribute("data-source-start");
@@ -702,10 +809,18 @@ function resolveScopeMdastChildren(
     const directPara = matched.children.find((child: any) => child.type === "paragraph");
     if (!directPara?.position) return null;
     const [scopeStart, scopeEnd] = computeContentBoundsForNode(directPara, source);
-    return { children: directPara.children, scopeStart, scopeEnd };
+    return { children: directPara.children, scopeStart, scopeEnd, scopeKind: "listItem" };
   }
   const [scopeStart, scopeEnd] = computeContentBoundsForNode(matched, source);
-  return { children: matched.children, scopeStart, scopeEnd };
+  const scopeKind: LiveRenderedScopeKind =
+    matched.type === "heading"
+      ? "heading"
+      : matched.type === "tableCell"
+        ? "tableCell"
+        : scopeEl.closest("li")
+          ? "listItem"
+          : "paragraph";
+  return { children: matched.children, scopeStart, scopeEnd, scopeKind };
 }
 
 interface DomStreamMapping {
@@ -720,13 +835,24 @@ function measureDomSelectionUnits(scopeEl: HTMLElement, range: Range): DomStream
   let stream = "";
   let mathOrdinal = 0;
   let skipTaskCheckboxSpace = false;
+  let sawNestedLiBlock = false;
+  let invalid = false;
 
   let startUnit: number | null = null;
   let endUnit: number | null = null;
   let startMathOrdinal: number | null = null;
   let endMathOrdinal: number | null = null;
 
-  const isExcludedElement = (el: Element): boolean => {
+  const isDirectTextBeforeNestedLiBlock = (textNode: Node): boolean => {
+    if (scopeEl.tagName !== "LI" || textNode.parentNode !== scopeEl) return false;
+    let sib = textNode.nextSibling;
+    while (sib && sib.nodeType === Node.TEXT_NODE && (sib as Text).data.length === 0) {
+      sib = sib.nextSibling;
+    }
+    return sib instanceof Element && sib.matches(NESTED_LI_BLOCK_SELECTOR);
+  };
+
+  const isExcludedElement = (el: Element): "ui" | "nestedBlock" | false => {
     if (
       el.matches(
         "button,input,select,textarea,script,style,.live-block-edit,.katex-mathml,[data-frontmatter-properties],.document-properties",
@@ -735,10 +861,10 @@ function measureDomSelectionUnits(scopeEl: HTMLElement, range: Range): DomStream
       if (el.tagName === "INPUT" && (el as HTMLInputElement).type === "checkbox") {
         skipTaskCheckboxSpace = true;
       }
-      return true;
+      return "ui";
     }
-    if (scopeEl.tagName === "LI" && el !== scopeEl && el.matches("ul,ol,blockquote,pre,details,table")) {
-      return true;
+    if (scopeEl.tagName === "LI" && el !== scopeEl && el.matches(NESTED_LI_BLOCK_SELECTOR)) {
+      return "nestedBlock";
     }
     return false;
   };
@@ -748,6 +874,8 @@ function measureDomSelectionUnits(scopeEl: HTMLElement, range: Range): DomStream
     (el.classList.contains("image-loading") && !el.closest("[data-note-image-source]"));
 
   const walk = (node: Node): void => {
+    if (invalid) return;
+
     if (node.nodeType === Node.TEXT_NODE) {
       const data = (node as Text).data;
       let skipPrefix = 0;
@@ -755,7 +883,14 @@ function measureDomSelectionUnits(scopeEl: HTMLElement, range: Range): DomStream
         skipTaskCheckboxSpace = false;
         if (data.startsWith(" ")) skipPrefix = 1;
       }
-      const effective = skipPrefix ? data.slice(skipPrefix) : data;
+      let effective = skipPrefix ? data.slice(skipPrefix) : data;
+      if (scopeEl.tagName === "LI" && node.parentNode === scopeEl) {
+        if (sawNestedLiBlock && /^[\r\n]+$/.test(effective)) {
+          effective = "";
+        } else if (isDirectTextBeforeNestedLiBlock(node)) {
+          effective = effective.replace(/\r?\n$/, "");
+        }
+      }
       if (range.startContainer === node) {
         startUnit = stream.length + Math.max(0, Math.min(effective.length, range.startOffset - skipPrefix));
       }
@@ -767,7 +902,19 @@ function measureDomSelectionUnits(scopeEl: HTMLElement, range: Range): DomStream
     }
 
     if (!(node instanceof Element)) return;
-    if (isExcludedElement(node)) {
+    const excluded = isExcludedElement(node);
+    if (excluded) {
+      if (excluded === "nestedBlock") {
+        sawNestedLiBlock = true;
+        if (
+          node.contains(range.startContainer) ||
+          node.contains(range.endContainer) ||
+          (startUnit !== null && endUnit === null)
+        ) {
+          invalid = true;
+        }
+        return;
+      }
       if (node.contains(range.startContainer) && startUnit === null) startUnit = stream.length;
       if (node.contains(range.endContainer) && endUnit === null) endUnit = stream.length;
       return;
@@ -815,13 +962,14 @@ function measureDomSelectionUnits(scopeEl: HTMLElement, range: Range): DomStream
       }
       if (i < children.length) {
         walk(children[i]);
+        if (invalid) return;
       }
     }
   };
 
   walk(scopeEl);
 
-  if (startUnit === null || endUnit === null || startUnit >= endUnit) return null;
+  if (invalid || startUnit === null || endUnit === null || startUnit >= endUnit) return null;
   return { text: stream, startUnit, endUnit, startMathOrdinal, endMathOrdinal };
 }
 
@@ -891,9 +1039,9 @@ function resolvePreBodyBounds(
 }
 
 /**
- * Maps a rendered DOM selection inside `.live-document` to its current source
- * range. Multi-block and multi-paragraph selections return `null` so
- * multi-paragraph transformations stay separate.
+ * Maps a single-block rendered DOM selection inside `.live-document` to its
+ * current source range and inline span bounds. Multi-block, cross-list-item,
+ * cross-cell, and multi-paragraph selections return `null`.
  */
 export function mapLiveRenderedSelectionToSourceRange(
   selection: Selection | null,
@@ -952,12 +1100,30 @@ export function mapLiveRenderedSelectionToSourceRange(
     return null;
   }
 
+  const analysis =
+    sourceAnalysis?.source === renderedSource ? sourceAnalysis.analysis : analyzeDocument(renderedSource);
+  const topLevelProtected = analysis.tree.children.some(
+    (node: any) =>
+      ["code", "math", "html", "definition"].includes(node.type) &&
+      (node.position?.start?.offset ?? -1) >= renderedBlockStart &&
+      (node.position?.end?.offset ?? Infinity) <= renderedBlockEnd,
+  );
+  const inProtectedContainer = Boolean(
+    scopeEl.tagName === "PRE" ||
+      startEl.closest(".code-container,.python-cell,.katex-display") ||
+      endEl.closest(".code-container,.python-cell,.katex-display"),
+  );
+  const protectedBlock = topLevelProtected || inProtectedContainer;
+
   const reversed = isSelectionBackward(selection);
 
   let renderedFrom: number | null = null;
   let renderedTo: number | null = null;
+  let scopeKind: LiveRenderedScopeKind = "paragraph";
+  const renderedSpans: InlineSpanBounds[] = [];
 
   if (scopeEl.tagName === "PRE") {
+    scopeKind = "pre";
     const preBounds = resolvePreBodyBounds(scopeEl, renderedSource, renderedBlockStart, renderedBlockEnd);
     if (preBounds) {
       const [preStart, preEnd] = preBounds;
@@ -969,48 +1135,55 @@ export function mapLiveRenderedSelectionToSourceRange(
       }
     }
   } else {
-    const analysis =
-      sourceAnalysis?.source === renderedSource ? sourceAnalysis.analysis : analyzeDocument(renderedSource);
     const resolvedScope = resolveScopeMdastChildren(scopeEl, startBlock, renderedSource, analysis.tree);
     const domStream = measureDomSelectionUnits(scopeEl, range);
 
     if (resolvedScope && domStream) {
+      scopeKind = resolvedScope.scopeKind;
       const units: SourceUnit[] = [];
-      const wrappers: InlineWrapperBounds[] = [];
-      const mathWrappers: InlineWrapperBounds[] = [];
+      const mathSpans: InlineSpanBounds[] = [];
       collectMdastInlineStream(
         resolvedScope.children,
         renderedSource,
         resolvedScope.scopeStart,
         resolvedScope.scopeEnd,
         units,
-        wrappers,
-        mathWrappers,
+        renderedSpans,
+        mathSpans,
       );
 
       if (
         domStream.startMathOrdinal !== null &&
         domStream.startMathOrdinal === domStream.endMathOrdinal &&
-        mathWrappers[domStream.startMathOrdinal]
+        mathSpans[domStream.startMathOrdinal]
       ) {
-        const targetMath = mathWrappers[domStream.startMathOrdinal];
+        const targetMath = mathSpans[domStream.startMathOrdinal];
         renderedFrom = targetMath.innerStart;
         renderedTo = targetMath.innerEnd;
       } else if (units.length === domStream.text.length && domStream.endUnit <= units.length) {
-        let rawFrom = units[domStream.startUnit].from;
-        let rawTo = units[domStream.endUnit - 1].to;
+        const singleUnit = domStream.endUnit === domStream.startUnit + 1 ? units[domStream.startUnit] : null;
+        const singleMath = singleUnit
+          ? mathSpans.find((m) => m.outerStart === singleUnit.from && m.outerEnd === singleUnit.to)
+          : undefined;
+        if (singleMath) {
+          renderedFrom = singleMath.innerStart;
+          renderedTo = singleMath.innerEnd;
+        } else {
+          let rawFrom = units[domStream.startUnit].from;
+          let rawTo = units[domStream.endUnit - 1].to;
 
-        for (const wrapper of wrappers) {
-          if (rawFrom === wrapper.innerStart && rawTo > wrapper.outerEnd) {
-            rawFrom = Math.min(rawFrom, wrapper.outerStart);
+          for (const span of renderedSpans) {
+            if (rawFrom >= span.outerStart && rawFrom <= span.innerStart && rawTo > span.outerEnd) {
+              rawFrom = Math.min(rawFrom, span.outerStart);
+            }
+            if (rawTo <= span.outerEnd && rawTo >= span.innerEnd && rawFrom < span.outerStart) {
+              rawTo = Math.max(rawTo, span.outerEnd);
+            }
           }
-          if (rawTo === wrapper.innerEnd && rawFrom < wrapper.outerStart) {
-            rawTo = Math.max(rawTo, wrapper.outerEnd);
-          }
+
+          renderedFrom = rawFrom;
+          renderedTo = rawTo;
         }
-
-        renderedFrom = rawFrom;
-        renderedTo = rawTo;
       }
     }
   }
@@ -1031,6 +1204,12 @@ export function mapLiveRenderedSelectionToSourceRange(
     return null;
   }
 
+  const spans: InlineSpanBounds[] = renderedSpans.map((span) => {
+    const [outerStart, outerEnd] = translateLiveRenderedRange(span.outerStart, span.outerEnd, editing, activeDoc);
+    const [innerStart, innerEnd] = translateLiveRenderedRange(span.innerStart, span.innerEnd, editing, activeDoc);
+    return { kind: span.kind, outerStart, innerStart, innerEnd, outerEnd };
+  });
+
   return {
     blockElement: startBlock,
     renderedBlockStart,
@@ -1042,5 +1221,185 @@ export function mapLiveRenderedSelectionToSourceRange(
     from,
     to,
     reversed,
+    protectedBlock,
+    scopeKind,
+    spans,
   };
+}
+
+function buildPreservedSubrangeResult(
+  result: MarkdownEditResult,
+  relStart: number,
+  relEnd: number,
+  reversed: boolean,
+): MarkdownEditResult {
+  const baseRange = result.ranges[0];
+  const unwrappedStart = Math.min(baseRange.anchor, baseRange.head);
+  const unwrappedEnd = Math.max(baseRange.anchor, baseRange.head);
+  const selStart = Math.min(unwrappedEnd, unwrappedStart + Math.max(0, relStart));
+  const selEnd = Math.min(unwrappedEnd, Math.max(selStart, unwrappedStart + Math.max(0, relEnd)));
+  return {
+    ...result,
+    ranges: [reversed ? { anchor: selEnd, head: selStart } : { anchor: selStart, head: selEnd }],
+  };
+}
+
+/**
+ * Resolves a single-block Markdown format edit for a mapped Live rendered
+ * selection, delegating symmetric/link/block edits to `toggleMarkdownFormat`
+ * while guarding protected blocks, inline code/math, and partial spans.
+ */
+export function resolveLiveRenderedFormatEdit(
+  activeDoc: string,
+  mapped: LiveRenderedSelectionRange,
+  action: FormatAction,
+): MarkdownEditResult | null {
+  if (mapped.protectedBlock) return null;
+
+  const { from, to, reversed, blockStart, blockEnd, scopeKind, spans } = mapped;
+  if (from < blockStart || to > blockEnd || from >= to) return null;
+
+  const docRange = reversed ? { anchor: to, head: from } : { anchor: from, head: to };
+
+  const validateResult = (res: MarkdownEditResult): MarkdownEditResult | null => {
+    if (
+      res.changes.length === 0 ||
+      res.doc === activeDoc ||
+      !res.changes.every((ch) => ch.from >= blockStart && ch.to <= blockEnd)
+    ) {
+      return null;
+    }
+    return res;
+  };
+
+  if (action === "heading" || action === "list" || action === "quote") {
+    if (scopeKind === "tableCell") return null;
+    return validateResult(toggleMarkdownFormat(activeDoc, [docRange], action, 0));
+  }
+
+  const enclosing = spans
+    .filter((s) => s.outerStart <= from && to <= s.outerEnd)
+    .sort((a, b) => a.outerEnd - a.outerStart - (b.outerEnd - b.outerStart));
+
+  for (const span of enclosing) {
+    if (span.kind === "inlineCode") {
+      if (action !== "inline_code") return null;
+      const relStart = from <= span.innerStart && to >= span.innerEnd ? 0 : Math.max(0, from - span.innerStart);
+      const relEnd =
+        from <= span.innerStart && to >= span.innerEnd
+          ? span.innerEnd - span.innerStart
+          : Math.max(relStart, to - span.innerStart);
+      const outerRange = reversed
+        ? { anchor: span.outerEnd, head: span.outerStart }
+        : { anchor: span.outerStart, head: span.outerEnd };
+      let unwrapped = toggleMarkdownFormat(activeDoc, [outerRange], "inline_code", 0);
+      if (unwrapped.doc.length >= activeDoc.length) {
+        const inner = activeDoc.slice(span.innerStart, span.innerEnd);
+        const nextDoc = activeDoc.slice(0, span.outerStart) + inner + activeDoc.slice(span.outerEnd);
+        unwrapped = {
+          doc: nextDoc,
+          changes: [{ from: span.outerStart, to: span.outerEnd, insert: inner }],
+          ranges: [{ anchor: span.outerStart, head: span.outerStart + inner.length }],
+          mainIndex: 0,
+        };
+      }
+      const checked = validateResult(unwrapped);
+      return checked ? buildPreservedSubrangeResult(checked, relStart, relEnd, reversed) : null;
+    }
+
+    if (span.kind === "inlineMath") {
+      if (action !== "inline_math") return null;
+      const isSingleDollar =
+        span.innerStart === span.outerStart + 1 &&
+        span.outerEnd === span.innerEnd + 1 &&
+        activeDoc[span.outerStart] === "$" &&
+        activeDoc[span.outerEnd - 1] === "$";
+      if (!isSingleDollar) return null;
+      const relStart = from <= span.innerStart && to >= span.innerEnd ? 0 : Math.max(0, from - span.innerStart);
+      const relEnd =
+        from <= span.innerStart && to >= span.innerEnd
+          ? span.innerEnd - span.innerStart
+          : Math.max(relStart, to - span.innerStart);
+      const innerRange = reversed
+        ? { anchor: span.innerEnd, head: span.innerStart }
+        : { anchor: span.innerStart, head: span.innerEnd };
+      const unwrapped = toggleMarkdownFormat(activeDoc, [innerRange], "inline_math", 0);
+      if (unwrapped.doc.length >= activeDoc.length) return null;
+      const checked = validateResult(unwrapped);
+      return checked ? buildPreservedSubrangeResult(checked, relStart, relEnd, reversed) : null;
+    }
+
+    if (
+      span.kind === "html" ||
+      span.kind === "image" ||
+      span.kind === "imageReference" ||
+      span.kind === "wikilink" ||
+      span.kind === "autolink" ||
+      span.kind === "linkReference"
+    ) {
+      return null;
+    }
+
+    if (span.kind === "link") {
+      if (action === "link") {
+        const relStart = from <= span.innerStart && to >= span.innerEnd ? 0 : Math.max(0, from - span.innerStart);
+        const relEnd =
+          from <= span.innerStart && to >= span.innerEnd
+            ? span.innerEnd - span.innerStart
+            : Math.max(relStart, to - span.innerStart);
+        const innerRange = reversed
+          ? { anchor: span.innerEnd, head: span.innerStart }
+          : { anchor: span.innerStart, head: span.innerEnd };
+        const unwrapped = toggleMarkdownFormat(activeDoc, [innerRange], "link", 0);
+        if (unwrapped.doc.length >= activeDoc.length) return null;
+        const checked = validateResult(unwrapped);
+        return checked ? buildPreservedSubrangeResult(checked, relStart, relEnd, reversed) : null;
+      }
+      if (from < span.innerStart || to > span.innerEnd) return null;
+    }
+  }
+
+  const sameFormatSpan = enclosing.find(
+    (s) => (action === "bold" && s.kind === "strong") || (action === "italic" && s.kind === "emphasis"),
+  );
+  if (sameFormatSpan) {
+    const relStart =
+      from <= sameFormatSpan.innerStart && to >= sameFormatSpan.innerEnd
+        ? 0
+        : Math.max(0, from - sameFormatSpan.innerStart);
+    const relEnd =
+      from <= sameFormatSpan.innerStart && to >= sameFormatSpan.innerEnd
+        ? sameFormatSpan.innerEnd - sameFormatSpan.innerStart
+        : Math.max(relStart, to - sameFormatSpan.innerStart);
+    const innerRange = reversed
+      ? { anchor: sameFormatSpan.innerEnd, head: sameFormatSpan.innerStart }
+      : { anchor: sameFormatSpan.innerStart, head: sameFormatSpan.innerEnd };
+    const unwrapped = toggleMarkdownFormat(activeDoc, [innerRange], action, 0);
+    if (unwrapped.doc.length >= activeDoc.length) return null;
+    const checked = validateResult(unwrapped);
+    return checked ? buildPreservedSubrangeResult(checked, relStart, relEnd, reversed) : null;
+  }
+
+  for (const span of spans) {
+    if (from >= span.outerEnd || to <= span.outerStart) continue;
+    if (span.outerStart <= from && to <= span.outerEnd) {
+      if (from < span.innerStart || to > span.innerEnd) return null;
+      continue;
+    }
+    if (!(from <= span.outerStart && span.outerEnd <= to)) {
+      return null;
+    }
+    if (
+      (action === "bold" && span.kind === "strong") ||
+      (action === "italic" && span.kind === "emphasis") ||
+      (action === "inline_code" && span.kind === "inlineCode") ||
+      (action === "inline_math" && (span.kind === "inlineMath" || span.kind === "inlineCode")) ||
+      (action === "link" &&
+        ["link", "linkReference", "wikilink", "autolink", "image", "imageReference"].includes(span.kind))
+    ) {
+      return null;
+    }
+  }
+
+  return validateResult(toggleMarkdownFormat(activeDoc, [docRange], action, 0));
 }

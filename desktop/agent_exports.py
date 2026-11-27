@@ -14,13 +14,15 @@ import urllib.parse
 from pathlib import Path
 from typing import Any
 
+from core.paths import DESKTOP_DIR, SOURCE_ROOT, resource_root
+
 try:
     from . import documents
-    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component
+    from .agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _scan_read_only, _symlink_component
     from .frontmatter import strip_frontmatter
 except ImportError:
     import documents
-    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _symlink_component
+    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _scan_read_only, _symlink_component
     from frontmatter import strip_frontmatter
 
 DEFAULT_PDF_OPTIONS = {
@@ -164,10 +166,9 @@ def find_engine(explicit: str | os.PathLike[str] | None = None) -> Path:
             return candidate
         raise AgentDocumentError("Native export engine is not a file")
     executable = "smd-engine.exe" if os.name == "nt" else "smd-engine"
-    desktop_dir = Path(__file__).resolve().parent
-    packaged = (Path(sys._MEIPASS) / "resources" / "desktop" / executable,) if getattr(sys, "frozen", False) else ()
-    candidates = (*packaged, desktop_dir / executable, desktop_dir.parent / "smd-core" / "target" / "release" / executable,
-                  desktop_dir.parent / "smd-core" / "target" / "debug" / executable)
+    packaged = (resource_root() / "desktop" / executable,) if getattr(sys, "frozen", False) else ()
+    candidates = (*packaged, DESKTOP_DIR / executable, SOURCE_ROOT / "smd-core" / "target" / "release" / executable,
+                  SOURCE_ROOT / "smd-core" / "target" / "debug" / executable)
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
@@ -245,22 +246,8 @@ def _image_destinations(markdown: str) -> list[str]:
 
 
 def _contains_unsupported_diagrams(markdown: str) -> bool:
-    markdown = strip_frontmatter(markdown)
-    fence_char = None
-    fence_size = 0
-    for line in markdown.splitlines():
-        match = _FENCE.match(line)
-        if not match:
-            continue
-        marker = match.group(1)
-        if fence_char is None:
-            info = line[match.end():].strip().split(None, 1)
-            if info and info[0].casefold() in ("mermaid", "smd-chart"):
-                return True
-            fence_char, fence_size = marker[0], len(marker)
-        elif marker[0] == fence_char and len(marker) >= fence_size:
-            fence_char = None
-    return False
+    _, fences = _scan_read_only(strip_frontmatter(markdown), collect_fences=True)
+    return any(span.language in ("mermaid", "smd-chart") for span in fences)
 
 
 def _resolve_image_assets(store: DocumentStore, note: Path, markdown: str,

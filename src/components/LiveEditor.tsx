@@ -21,7 +21,11 @@ import {
 } from '../markdownFormatting';
 import {editableBlockSpans,indentMarkdownSelection,isFirstLineCursor,isLastLineCursor} from '../liveBlockFlow';
 import {handleLiveEditorKey} from '../liveEditorKeys';
-import {mapLiveRenderedSelectionToSourceRange,translateLiveRenderedRange} from '../liveSelectionRange';
+import {
+  mapLiveRenderedSelectionToSourceRange,
+  resolveLiveRenderedFormatEdit,
+  translateLiveRenderedRange,
+} from '../liveSelectionRange';
 import {liveEditorCenterDelta,useTypewriterScroll} from '../typewriterScroll';
 const noTrustedHosts:string[]=[];
 const CARET_KEYS=new Set(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End']);
@@ -49,10 +53,11 @@ export function replayActiveLiveBlockHistory(direction: "undo" | "redo"): boolea
 }
 
 interface Props extends WritingOptions,ReaderAccessibilityPreference {
+  noteId?:string;
   latexAutofix?:boolean;
   typewriterScroll?:boolean;
-  markdown:string;onChange:(value:string)=>void;documentPath:string|null;python:string;dark:boolean;
-  trustedImageHosts?:string[];onTrustImageHost?:(host:string)=>void;
+  markdown:string;onChange:(value:string)=>void;documentPath:string|null;savedDocumentPath?:string|null;python:string;dark:boolean;
+  trustedImageHosts?:string[];approvedImageUrls?:readonly string[];onTrustImageHost?:(host:string)=>void;onApproveImageUrl?:(noteId:string|undefined,url:string)=>void;onRemoteImageLoaded?:(noteId:string|undefined,url:string,data:string)=>void;onNotice?:(message:string)=>void;
 }
 interface EditingSession {
   session:number;
@@ -212,7 +217,7 @@ interface LiveEditorState {
 
 /** One document render preserves references, footnote numbering, duplicate
  * heading IDs and loose lists. Substitute one original-source editing block. */
-export default function LiveEditor({markdown,onChange,documentPath,python,dark,trustedImageHosts=noTrustedHosts,onTrustImageHost,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
+export default function LiveEditor({noteId,markdown,onChange,documentPath,savedDocumentPath,python,dark,trustedImageHosts=noTrustedHosts,approvedImageUrls,onTrustImageHost,onApproveImageUrl,onRemoteImageLoaded,onNotice,spellCheck=false,grammarCheck=false,latexAutofix=false,typewriterScroll,fullDocumentAccessibility=false}:Props){
   const [editing,setEditing]=useState<EditingSession|null>(null);
   const [draftText,setDraftText]=useState('');
   const [caret,setCaret]=useState(0);
@@ -373,7 +378,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     lastSelection.current={start:selection?.start??0,end:selection?.end??0,direction:selection?.direction??"none"};
     pendingSelection.current=selection??null;
     const text=resolvedDoc.slice(start,end);
-    const protectedBlock=protectedHint??(resolvedDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(resolvedDoc)).tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
+    const protectedBlock=Boolean(protectedHint)||(resolvedDoc===latestAnalysis.source?latestAnalysis.analysis:analyzeDocument(resolvedDoc)).tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=start&&(node.position?.end.offset??Infinity)<=end);
     const nextSession:EditingSession={session,prefix:resolvedDoc.slice(0,start),suffix:resolvedDoc.slice(end),baseMarkdown:resolvedDoc,baseSplitEnd:end,protectedBlock};
     syncedMarkdownRef.current=resolvedDoc;
     latestRef.current.editing=nextSession;
@@ -892,17 +897,8 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       )
       :null;
     if(mapped){
-      const docRange=mapped.reversed
-        ?{anchor:mapped.to,head:mapped.from}
-        :{anchor:mapped.from,head:mapped.to};
-      const result=toggleMarkdownFormat(activeDoc,[docRange],action,0);
-      if(
-        result.changes.length===0||
-        result.doc===activeDoc||
-        !result.changes.every(ch=>ch.from>=mapped.blockStart&&ch.to<=mapped.blockEnd)
-      ){
-        return false;
-      }
+      const result=resolveLiveRenderedFormatEdit(activeDoc,mapped,action);
+      if(!result)return false;
       const origBlockText=activeDoc.slice(mapped.blockStart,mapped.blockEnd);
       const origStart=mapped.from-mapped.blockStart;
       const origEnd=mapped.to-mapped.blockStart;
@@ -927,15 +923,13 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
       };
       lastSelection.current={start:nextStart,end:nextEnd,direction:nextDirection};
       pendingSelection.current={start:nextStart,end:nextEnd,direction:nextDirection};
-      const protectedBlock=(activeDoc===currentSourceAnalysis.source?currentSourceAnalysis.analysis:analyzeDocument(activeDoc))
-        .tree.children.some(node=>['code','math','html','definition'].includes(node.type)&&(node.position?.start.offset??-1)>=mapped.blockStart&&(node.position?.end.offset??Infinity)<=mapped.blockEnd);
       const nextSession:EditingSession={
         session,
         prefix:activeDoc.slice(0,mapped.blockStart),
         suffix:activeDoc.slice(mapped.blockEnd),
         baseMarkdown:activeDoc,
         baseSplitEnd:mapped.blockEnd,
-        protectedBlock,
+        protectedBlock:mapped.protectedBlock,
       };
       editSpanRef.current={
         baseSource:activeDoc,
@@ -964,28 +958,16 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const area=editor.current;
     if(!current||!area||current.protectedBlock)return false;
     const start=area.selectionStart,end=area.selectionEnd,reversed=area.selectionDirection==="backward";
-    const prefixLen=current.prefix.length;
-    const fullDoc=current.prefix+currentDraft+current.suffix;
-    const blockEndInDoc=fullDoc.length-current.suffix.length;
-    const docRange=reversed
-      ?{anchor:prefixLen+end,head:prefixLen+start}
-      :{anchor:prefixLen+start,head:prefixLen+end};
-    const result=toggleMarkdownFormat(fullDoc,[docRange],action,0);
-    if(
-      result.changes.length===0||
-      result.doc===fullDoc||
-      !result.changes.every(ch=>ch.from>=prefixLen&&ch.to<=blockEndInDoc)
-    ){
+    const range=reversed?{anchor:end,head:start}:{anchor:start,head:end};
+    const result=toggleMarkdownFormat(currentDraft,[range],action,0);
+    if(result.changes.length===0&&result.doc===currentDraft&&result.ranges[0].anchor===range.anchor&&result.ranges[0].head===range.head){
       return false;
     }
-    const nextBlockText=result.doc.slice(prefixLen,result.doc.length-current.suffix.length);
     const nextRange=result.ranges[0];
-    const localAnchor=Math.max(0,Math.min(nextBlockText.length,nextRange.anchor-prefixLen));
-    const localHead=Math.max(0,Math.min(nextBlockText.length,nextRange.head-prefixLen));
-    const nextStart=Math.min(localAnchor,localHead);
-    const nextEnd=Math.max(localAnchor,localHead);
-    const nextDirection:"forward"|"backward"|"none"=localAnchor>localHead?"backward":nextStart<nextEnd?"forward":"none";
-    return commitDiscreteBlockEdit(nextBlockText,nextStart,nextEnd,nextDirection);
+    const nextStart=Math.min(nextRange.anchor,nextRange.head);
+    const nextEnd=Math.max(nextRange.anchor,nextRange.head);
+    const nextDirection:"forward"|"backward"|"none"=nextRange.anchor>nextRange.head?"backward":nextStart<nextEnd?"forward":"none";
+    return commitDiscreteBlockEdit(result.doc,nextStart,nextEnd,nextDirection);
   },[commitDiscreteBlockEdit,resetOutsidePress,syncActiveCaretCenter]);
 
   const replayBlockHistory=useCallback((direction:"undo"|"redo"):boolean=>{
@@ -1338,7 +1320,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
     const active=!!editing&&editing.insertAfter===undefined&&block.start===editing.prefix.length;
     const insertedBelow=!!editing&&editing.insertAfter===block.start;
     const blockKey=blockKeys.get(block.start)??`block-${entry.key}`;
-    const protectedHint=['code','math','html','definition'].includes(entry.node.type);
+    const protectedHint=entry.node.tagName==='pre'||['code','math','html','definition'].includes(entry.node.type);
     return (
       <Fragment key={blockKey}>
         <LiveBlockShell windowed={entry.windowed} estimate={entry.estimate} text={entry.text} headings={entry.headings} start={start} end={end} blockIndex={low} active={active} protectedHint={protectedHint} onOpen={openRenderedBlock}>
@@ -1370,7 +1352,7 @@ export default function LiveEditor({markdown,onChange,documentPath,python,dark,t
   return <ActiveDraftContext.Provider value={activeDraftValue}>
     <div ref={rootRef} className="live-document" onCopy={copy} onDragStart={dragStart}>
       {!frontmatter&&!renderedSource.trim()?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={0} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,0,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):<>
-        <MarkdownPreview markdown={renderedSource} onChange={previewChange} documentPath={documentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} onTrustImageHost={onTrustImageHost} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
+        <MarkdownPreview noteId={noteId} markdown={renderedSource} onChange={previewChange} documentPath={documentPath} savedDocumentPath={savedDocumentPath} python={python} dark={dark} trustedImageHosts={trustedImageHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={onTrustImageHost} onApproveImageUrl={onApproveImageUrl} onRemoteImageLoaded={onRemoteImageLoaded} onNotice={onNotice} renderBlock={renderBlock} fullDocumentAccessibility={fullDocumentAccessibility} sourceAnalysis={sourceAnalysis}/>
         {!hasBodyNodes?(editing?<ActiveBlockEditor/>:<section className="live-block" data-source-start={blocks[0].start} data-source-end={markdown.length} tabIndex={0} role="group" aria-label="Editable block 1" onClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onDoubleClick={event=>openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false)} onKeyDown={event=>{if(event.key==='Enter'||event.key==='F2'){event.preventDefault();openDocBlock(event.currentTarget,blocks[0].start,latestRef.current.markdown.length,latestRef.current.markdown,undefined,false);}}}/> ):editing?.insertAfter==='end'&&<section className="live-block" role="group" aria-label="New Markdown block"><ActiveBlockEditor/></section>}
       </>}
     </div>
