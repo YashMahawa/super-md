@@ -126,11 +126,20 @@ describe("installScrollIndicators", () => {
     });
 
     // Scroll events on overflowing table and code regions toggle .scroll-indicator-active independently.
+    wideTable.scrollLeft = 110;
     wideTable.dispatchEvent(new Event("scroll"));
+    widePre.scrollLeft = 110;
     widePre.dispatchEvent(new Event("scroll"));
+    pySource.scrollLeft = 45;
+    pySource.scrollTop = 65;
     pySource.dispatchEvent(new Event("scroll"));
+    pyOut.scrollLeft = 85;
     pyOut.dispatchEvent(new Event("scroll"));
 
+    expect(wideTable.scrollLeft).toBe(110);
+    expect(widePre.scrollLeft).toBe(110);
+    expect(pySource.scrollTop).toBe(65);
+    expect(pyOut.scrollLeft).toBe(85);
     expect(wideTable.classList.contains("scroll-indicator-active")).toBe(true);
     expect(widePre.classList.contains("scroll-indicator-active")).toBe(true);
     expect(pySource.classList.contains("scroll-indicator-active")).toBe(true);
@@ -155,6 +164,12 @@ describe("installScrollIndicators", () => {
     // Right vertical lane on tall Python source hovers Python source, not outer reading pane.
     dispatchPointerMove(pyCode, 830, 380);
     expect(pySource.classList.contains("scroll-indicator-hover")).toBe(true);
+    expect(reading.classList.contains("scroll-indicator-hover")).toBe(false);
+
+    // Bottom horizontal lane on overflowing Python output hovers .cell-output pre independently.
+    dispatchPointerMove(pyOut, 300, 594);
+    expect(pyOut.classList.contains("scroll-indicator-hover")).toBe(true);
+    expect(pySource.classList.contains("scroll-indicator-hover")).toBe(false);
     expect(reading.classList.contains("scroll-indicator-hover")).toBe(false);
   });
 

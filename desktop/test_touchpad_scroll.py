@@ -497,7 +497,14 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             min_left=40,
             min_top=50,
         )
-        if not py_mid["liveActive"] or not py_mid["activeOnScroll"] or py_mid["compactActive"] or py_mid["rdTop"] != 0:
+        if (
+            py_mid["left"] < 40
+            or py_mid["top"] < 50
+            or not py_mid["liveActive"]
+            or not py_mid["activeOnScroll"]
+            or py_mid["compactActive"]
+            or py_mid["rdTop"] != 0
+        ):
             raise AssertionError(f"Expected inner python scroll + immediate active indicator without outer scroll: {py_mid}")
 
         send_touchpad(py_mid["x"], py_mid["y"], 0, -(int(py_mid["maxTop"]) + 180), wait_steps=4)
@@ -520,7 +527,8 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             scroll_into_view=True,
         )
         if (
-            not pre_after["liveActive"]
+            pre_after["left"] < 80
+            or not pre_after["liveActive"]
             or not pre_after["activeOnScroll"]
             or pre_after["compactActive"]
             or pre_after["rdTop"] <= pre_after["rdTopBefore"] + 45
@@ -539,7 +547,8 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             scroll_into_view=True,
         )
         if (
-            not tb_after["liveActive"]
+            tb_after["left"] < 90
+            or not tb_after["liveActive"]
             or not tb_after["activeOnScroll"]
             or tb_after["compactActive"]
             or tb_after["rdTop"] <= tb_after["rdTopBefore"] + 50
@@ -625,7 +634,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
                 0,
                 min_left=70,
             )
-            if not mode_tb["liveActive"] or not mode_tb["activeOnScroll"] or mode_tb["compactActive"]:
+            if mode_tb["left"] < 70 or not mode_tb["liveActive"] or not mode_tb["activeOnScroll"] or mode_tb["compactActive"]:
                 raise AssertionError(f"Expected wide table scroll + immediate active indicator in {mode_name}: {mode_tb}")
 
             mode_pre = arm_and_scroll_target(
@@ -636,7 +645,7 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
                 0,
                 min_left=70,
             )
-            if not mode_pre["liveActive"] or not mode_pre["activeOnScroll"] or mode_pre["compactActive"]:
+            if mode_pre["left"] < 70 or not mode_pre["liveActive"] or not mode_pre["activeOnScroll"] or mode_pre["compactActive"]:
                 raise AssertionError(f"Expected fenced pre scroll + immediate active indicator in {mode_name}: {mode_pre}")
 
             mode_py = arm_and_scroll_target(
@@ -648,14 +657,28 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
                 min_left=35,
                 min_top=40,
             )
-            if not mode_py["liveActive"] or not mode_py["activeOnScroll"] or mode_py["compactActive"]:
+            if (
+                mode_py["left"] < 35
+                or mode_py["top"] < 40
+                or not mode_py["liveActive"]
+                or not mode_py["activeOnScroll"]
+                or mode_py["compactActive"]
+            ):
                 raise AssertionError(f"Expected python source scroll + immediate active indicator in {mode_name}: {mode_py}")
 
             verify_presented_frame(mode_name, f"qt-{mode_name}-table-width-and-scroll-indicators.png")
             mode_results[mode_name] = {
                 "tbLeft": mode_tb["left"],
+                "tbLiveActive": mode_tb["liveActive"],
+                "tbActiveOnScroll": mode_tb["activeOnScroll"],
                 "preLeft": mode_pre["left"],
+                "preLiveActive": mode_pre["liveActive"],
+                "preActiveOnScroll": mode_pre["activeOnScroll"],
+                "pyLeft": mode_py["left"],
                 "pyTop": mode_py["top"],
+                "pyLiveActive": mode_py["liveActive"],
+                "pyActiveOnScroll": mode_py["activeOnScroll"],
+                "compactActive": mode_tb["compactActive"] or mode_pre["compactActive"] or mode_py["compactActive"],
             }
 
         print(
@@ -699,6 +722,27 @@ class TouchpadScrollQtWebEngineTest(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, f"{completed.stdout}{completed.stderr}")
         result = json.loads(completed.stdout.strip().splitlines()[-1])
         self.assertTrue(result.get("ok"), result)
+        self.assertGreaterEqual(result["tbAfter"]["left"], 90, result)
+        self.assertTrue(result["tbAfter"]["liveActive"] and result["tbAfter"]["activeOnScroll"], result)
+        self.assertFalse(result["tbAfter"]["compactActive"], result)
+        self.assertGreaterEqual(result["preAfter"]["left"], 80, result)
+        self.assertTrue(result["preAfter"]["liveActive"] and result["preAfter"]["activeOnScroll"], result)
+        self.assertFalse(result["preAfter"]["compactActive"], result)
+        self.assertGreaterEqual(result["pyMid"]["left"], 40, result)
+        self.assertGreaterEqual(result["pyMid"]["top"], 50, result)
+        self.assertTrue(result["pyMid"]["liveActive"] and result["pyMid"]["activeOnScroll"], result)
+        self.assertFalse(result["pyMid"]["compactActive"], result)
+        self.assertGreater(result["zoomScale"], 1.15, result)
+        for mode_name in ("live", "split"):
+            mode_data = result["modes"][mode_name]
+            self.assertGreaterEqual(mode_data["tbLeft"], 70, (mode_name, mode_data))
+            self.assertTrue(mode_data["tbLiveActive"] and mode_data["tbActiveOnScroll"], (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["preLeft"], 70, (mode_name, mode_data))
+            self.assertTrue(mode_data["preLiveActive"] and mode_data["preActiveOnScroll"], (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyLeft"], 35, (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyTop"], 40, (mode_name, mode_data))
+            self.assertTrue(mode_data["pyLiveActive"] and mode_data["pyActiveOnScroll"], (mode_name, mode_data))
+            self.assertFalse(mode_data["compactActive"], (mode_name, mode_data))
 
 
 if __name__ == "__main__" and "--probe" in sys.argv:
