@@ -183,33 +183,46 @@ class StudioRuntimeTest(unittest.TestCase):
             done(None, str(ctx.exception))
             self.assertIn("no longer matches", self.studio.updateStatus)
 
+        self.session.background = SimpleNamespace(enabled=True, quitting=False)
+        self.assertTrue(self.studio.backgroundEnabled)
         cases = (
-            ("Super-MD_9.9.9_amd64.AppImage", "appimage", True, "Close and reopen"),
-            ("Super-MD_9.9.9_x64-setup.exe", "windows", (True, 4321), "Installer opened"),
-            ("Super-MD_9.9.9_x64-setup.exe", "windows", (False, 0), "Could not open"),
-            ("Super-MD_9.9.9_amd64.deb", "deb", True, "Package installer opened"),
-            ("Super-MD-9.9.9-1.x86_64.rpm", "rpm", True, "Package installer opened"),
-            ("Super-MD_9.9.9_aarch64.dmg", "macos", True, "Disk image opened"),
+            ("Super-MD_9.9.9_amd64.AppImage", "appimage", True, True, "Close and reopen"),
+            ("Super-MD_9.9.9_x64-setup.exe", "windows", (True, 4321), True, "Installer opened"),
+            ("Super-MD_9.9.9_x64-setup.exe", "windows", (False, 0), False, "Could not open"),
+            ("Super-MD_9.9.9_amd64.deb", "deb", True, True, "Package installer opened"),
+            ("Super-MD-9.9.9-1.x86_64.rpm", "rpm", True, True, "Package installer opened"),
+            ("Super-MD_9.9.9_aarch64.dmg", "macos", True, True, "Disk image opened"),
         )
-        for name, kind, open_ret, expected in cases:
-            self.studio.update_path = "/verified/" + name
-            self.studio.update_info = _asset(name)
-            saved = {"path": self.studio.update_path, "release": self.studio.update_info}
-            with self.subTest(name=name, open_ret=open_ret), submit_patch, \
-                 patch("app_integration.available", return_value=True), patch("updates.load_ready", return_value=saved), \
-                 patch("app_integration.install_appimage", return_value="/opt/app") as app_inst, \
-                 patch("studio.QProcess.startDetached", return_value=open_ret) as start_proc, \
-                 patch("studio.QDesktopServices.openUrl", return_value=open_ret) as open_url:
-                self.studio.installUpdate()
-                action, done = jobs.pop()
-                done(action(), None)
-                self.assertIn(expected, self.studio.updateStatus)
-                if kind == "appimage":
-                    app_inst.assert_called_once()
-                elif kind == "windows":
-                    start_proc.assert_called_once_with(self.studio.update_path, [])
-                else:
-                    open_url.assert_called_once_with(QUrl.fromLocalFile(self.studio.update_path))
+        session_events = []
+        on_changed = lambda: session_events.append(True)
+        self.session.changed.connect(on_changed)
+        try:
+            for name, kind, open_ret, marks_installed, expected in cases:
+                session_events.clear()
+                self.session.update_installed = False
+                self.studio.update_path = "/verified/" + name
+                self.studio.update_info = _asset(name)
+                saved = {"path": self.studio.update_path, "release": self.studio.update_info}
+                with self.subTest(name=name, open_ret=open_ret), submit_patch, \
+                     patch("app_integration.available", return_value=True), patch("updates.load_ready", return_value=saved), \
+                     patch("app_integration.install_appimage", return_value="/opt/app") as app_inst, \
+                     patch("studio.QProcess.startDetached", return_value=open_ret) as start_proc, \
+                     patch("studio.QDesktopServices.openUrl", return_value=open_ret) as open_url:
+                    self.studio.installUpdate()
+                    action, done = jobs.pop()
+                    done(action(), None)
+                    self.assertIn(expected, self.studio.updateStatus)
+                    self.assertEqual(self.session.update_installed, marks_installed)
+                    self.assertEqual(self.studio.backgroundEnabled, not marks_installed)
+                    self.assertEqual(bool(session_events), marks_installed)
+                    if kind == "appimage":
+                        app_inst.assert_called_once()
+                    elif kind == "windows":
+                        start_proc.assert_called_once_with(self.studio.update_path, [])
+                    else:
+                        open_url.assert_called_once_with(QUrl.fromLocalFile(self.studio.update_path))
+        finally:
+            self.session.changed.disconnect(on_changed)
 
     def test_python_folders_default_refresh_install_setup_and_shutdown_guards(self):
         self.studio.folder = "/workspace/notes"

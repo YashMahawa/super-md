@@ -217,6 +217,8 @@ def check_updates(studio_obj, automatic: bool = False) -> None:
     studio_obj._submit(check, lambda result, error: done(*(result or (None, error))), False)
 
 def background_enabled(studio_obj) -> bool:
+    if getattr(studio_obj.session, "update_installed", False):
+        return False
     service = getattr(studio_obj.session, "background", None)
     return bool(service and service.enabled and not service.quitting)
 
@@ -297,17 +299,23 @@ def install_update(studio_obj) -> None:
         m = _studio_module()
         path, prepared_kind = prepared
         if prepared_kind == "appimage":
+            studio_obj.session.update_installed = True
+            studio_obj.session.changed.emit()
             studio_obj.update_status = "Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept."
-            return
-        opened = m.QProcess.startDetached(path, []) if prepared_kind == "windows" else m.QDesktopServices.openUrl(m.QUrl.fromLocalFile(path))
-        if isinstance(opened, tuple):
-            opened = opened[0]
-        if not opened:
-            studio_obj.update_status = "Could not open the verified installer. It is still available in Downloads."
-        elif prepared_kind in ("deb", "rpm"):
-            studio_obj.update_status = "Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically."
-        elif prepared_kind == "macos":
-            studio_obj.update_status = "Disk image opened. Drag Super MD into Applications and confirm replacement to update."
         else:
-            studio_obj.update_status = "Installer opened. Follow its instructions; the download is kept in Downloads."
+            opened = m.QProcess.startDetached(path, []) if prepared_kind == "windows" else m.QDesktopServices.openUrl(m.QUrl.fromLocalFile(path))
+            if isinstance(opened, tuple):
+                opened = opened[0]
+            if not opened:
+                studio_obj.update_status = "Could not open the verified installer. It is still available in Downloads."
+            else:
+                studio_obj.session.update_installed = True
+                studio_obj.session.changed.emit()
+                if prepared_kind in ("deb", "rpm"):
+                    studio_obj.update_status = "Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically."
+                elif prepared_kind == "macos":
+                    studio_obj.update_status = "Disk image opened. Drag Super MD into Applications and confirm replacement to update."
+                else:
+                    studio_obj.update_status = "Installer opened. Follow its instructions; the download is kept in Downloads."
+        studio_obj._emit(False)
     _submit_update_task(studio_obj, "Verifying and preparing installation…", prepare, on_success, "Update installation failed: ")
