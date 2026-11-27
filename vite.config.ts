@@ -92,7 +92,10 @@ function mermaidSandboxPlugin(): Plugin {
         });
         const script = bundled.outputFiles[0]?.text ?? "";
         return { script, html: renderSandboxDocument(script) };
-      })();
+      })().catch((error) => {
+        cachedBundlePromise = null;
+        throw error;
+      });
     }
     return cachedBundlePromise;
   };
@@ -108,6 +111,14 @@ function mermaidSandboxPlugin(): Plugin {
       return null;
     },
     configureServer(server) {
+      const invalidateSandboxBundle = (filePath: string) => {
+        if (filePath.replace(/\\/g, "/").includes("/src/mermaidSandbox")) {
+          cachedBundlePromise = null;
+        }
+      };
+      server.watcher.on("change", invalidateSandboxBundle);
+      server.watcher.on("add", invalidateSandboxBundle);
+      server.watcher.on("unlink", invalidateSandboxBundle);
       server.middlewares.use(async (req, res, next) => {
         const requestPath = req.url?.split("?", 1)[0];
         if (
@@ -118,7 +129,6 @@ function mermaidSandboxPlugin(): Plugin {
           return;
         }
         try {
-          cachedBundlePromise = null;
           const bundle = await getSandboxBundle();
           const isScript = requestPath === devScriptRoute;
           res.statusCode = 200;
