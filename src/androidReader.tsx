@@ -38,6 +38,7 @@ import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
 import { dismissReaderOverlay, hasReaderOverlay } from "./readerOverlays";
 import { prepareFmd } from "./documentMedia";
+import { NoteRemoteImageConsentStore } from "./remoteImageConsent";
 import { prepareMarkdownExport } from "./markdownExport";
 import ImageViewer from "./components/ImageViewer";
 import MathRepairPanel from "./components/MathRepairPanel";
@@ -163,9 +164,14 @@ export function Reader() {
   },[]);
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
   const trustedHostsRef = useRef(trustedHosts); trustedHostsRef.current = trustedHosts;
+  const noteImageConsent = useRef(new NoteRemoteImageConsentStore());
+  const [imageConsentVersion, setImageConsentVersion] = useState(0);
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
   const reference = useRef(state); reference.current = state;
+  const approveImageUrl = useCallback((noteId:string|undefined,url:string)=>{if(noteId&&noteImageConsent.current.approve(noteId,url))setImageConsentVersion(value=>value+1);},[]);
+  const recordRemoteImageLoaded = useCallback((noteId:string|undefined,url:string,data:string)=>{if(noteId)noteImageConsent.current.recordLoaded(noteId,url,data);},[]);
+  const approvedImageUrls = useMemo(()=>noteImageConsent.current.approvedUrls(state?.id),[state?.id,imageConsentVersion]);
   const consumedHeadingToken = useRef<string | null>(null);
   const suppressedRestoreToken = useRef<string | null>(null);
   const suppressedRestoreKey = useRef<string | null>(null);
@@ -480,13 +486,27 @@ export function Reader() {
     };
     window.supermdFlush = operation => {
       savePosition.current();
-      const current = reference.current; if (!current) return;
+      const current = reference.current;
       if(operation.action==='android_flush'){
+        if(edits.current?.unacknowledged(operation.target)!==undefined&&current?.id!==operation.target){
+          void invoke('document_flushed',{id:operation.target,token:operation.token,error:'Reader has unacknowledged edits for this note'}).catch(()=>{});
+          return;
+        }
+        if(!current){
+          void invoke('document_flushed',{id:'',token:operation.token,error:'Reader has not loaded a note yet'}).catch(()=>{});
+          return;
+        }
+        if(current.id!==operation.target){
+          void invoke('document_flushed',{id:current.id,token:operation.token,error:'The active note changed before its edit flush'}).catch(()=>{});
+          return;
+        }
         void (async()=>{
-          if(current.id!==operation.target)throw new Error('The active note changed before its edit flush');
           if(current.editProtocol===1)await edits.current!.flush(current.id);
           const latest=reference.current;
-          if(!latest||latest.id!==operation.target)throw new Error('The active note changed during its edit flush');
+          if(!latest||latest.id!==operation.target){
+            await invoke('document_flushed',{id:latest?.id??'',token:operation.token,error:'The active note changed during its edit flush'});
+            return;
+          }
           await invoke('document_flushed',{id:latest.id,token:operation.token,content:latest.content});
         })().catch(error=>{
           setEditError(String(error));
@@ -494,6 +514,7 @@ export function Reader() {
         });
         return;
       }
+      if (!current) return;
       let id = current.id;
       if (operation.action === "move_tab") { try { id = JSON.parse(operation.target).tab; } catch { return; } }
       else if (operation.action === "detach_tab") id = operation.target;
@@ -541,7 +562,7 @@ export function Reader() {
       const current = reference.current; if (!current) return;
       try {
         const latest = await flushExportNote(current);
-        const prepared = await prepareFmd(latest.content, latest.path); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
+        const prepared = await prepareFmd(latest.content, latest.path, noteImageConsent.current.policy(latest.id, trustedHostsRef.current)); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
     window.supermdExport = async (options) => {
@@ -551,7 +572,7 @@ export function Reader() {
       exportOwner.current=owner;setPdfExport({id:owner.id,phase:'preparing',completed:0,total:0});
       try {
         const latest = await flushExportNote(current);
-        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,trustedImageHosts:trustedHostsRef.current,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
+        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,...noteImageConsent.current.policy(latest.id, trustedHostsRef.current),onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
         owner.controller.signal.throwIfAborted();
         owner.phase='typesetting';setPdfExport({id:owner.id,phase:'typesetting',completed:0,total:0});
         await invoke("export_pdf_native", { ...prepared, options: {...options, themeAccent: latest.colors.primary}, id: latest.id,jobId:owner.id }); }
@@ -1364,7 +1385,8 @@ export function Reader() {
         const archive=format==='mdzip'||rawArchive===true;
         const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
         const exportContent=section?.text??note.content,{section:_section,archive:_archive,...exportOptions}=suppliedOptions;
-        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
+        const consentPolicy=noteImageConsent.current.policy(note.id,trustedHostsRef.current);
+        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',consentPolicy):format==='smd'?await prepareFmd(exportContent,note.path,consentPolicy):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
         const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format:archive?'mdzip':format,...(archive?{archive:true}:{}),filename:request.filename,options:exportOptions});
         return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
@@ -1425,8 +1447,8 @@ export function Reader() {
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const current = reference.current; if (!current || current.id !== state.id) return; const content = current.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source"><SourceEditor key={state.id} sessionId={state.id} documentPath={state.path === state.id ? null : state.path} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} onTypewriterChange={changeTypewriter} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
-    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
+    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} noteId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview noteId={state.id} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
 const rootElement = document.getElementById("root");
