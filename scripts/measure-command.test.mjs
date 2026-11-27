@@ -227,7 +227,7 @@ test('samples Linux process-tree RSS via injected child and reports unavailable 
       return hostKill.call(process, targetPid, signal);
     };
     try {
-      for (const interruptPlatform of ['linux', 'win32']) {
+      for (const interruptPlatform of ['linux', 'darwin', 'win32']) {
         const interruptOutput = path.join(directory, `${interruptPlatform}-interrupt.json`);
         const interruptSpawns = [];
         await withSyntheticProcessSignals(SYNTHETIC_PID, async ({ deliveredSignals, setLiveState }) => {
