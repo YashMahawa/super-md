@@ -126,7 +126,7 @@ def after_flush(studio_obj, operation: dict) -> None:
     elif action == "open_search_match":
         request = json.loads(operation["target"])
         tab_id, path, query = request.get("tabId") or "", request.get("path") or "", request.get("query") or ""
-        case_sensitive = bool(request.get("caseSensitive", False))
+        find_opts = {"caseSensitive": bool(request.get("caseSensitive", False)), **getattr(studio_obj, "_seeded_find_bounds", mod.Studio._seeded_find_bounds)(request)}
         existing = next((t for t in studio_obj.tabs if tab_id and t["id"] == tab_id), None)
         if existing is None and path:
             resolved = os.path.normcase(str(Path(path).resolve(strict=False)))
@@ -136,14 +136,14 @@ def after_flush(studio_obj, operation: dict) -> None:
             if existing["id"] == studio_obj.active and studio_obj.ready:
                 studio_obj._pending_seeded_find = None
                 if query:
-                    studio_obj.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps({'caseSensitive': case_sensitive})})")
+                    studio_obj.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps(find_opts)})")
             else:
-                studio_obj._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive} if query else None
+                studio_obj._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, **find_opts} if query else None
                 studio_obj.selectTab(existing["id"])
             studio_obj._focus_open_target(studio_obj._activation_generation)
         elif path:
             local = str(mod.local_path(path))
-            studio_obj._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive} if query else None
+            studio_obj._pending_seeded_find = {"tabId": "", "path": local, "query": query, **find_opts} if query else None
             def opened(_note, error):
                 if error and studio_obj._pending_seeded_find and studio_obj._pending_seeded_find.get("path") == local:
                     studio_obj._pending_seeded_find = None
