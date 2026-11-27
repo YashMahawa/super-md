@@ -81,6 +81,8 @@ class RevocableDocumentAccessEmulatorTest {
             File(app.filesDir, "deleted-drafts/$key").deleteRecursively()
             app.getSharedPreferences("studio-$key", Context.MODE_PRIVATE).edit().clear().commit()
             app.getSharedPreferences("studio-window-$key", Context.MODE_PRIVATE).edit().clear().commit()
+            app.deleteSharedPreferences("studio-$key")
+            app.deleteSharedPreferences("studio-window-$key")
         }
         val prefsEditor = app.getSharedPreferences("studio", Context.MODE_PRIVATE).edit().clear()
         for ((key, value) in savedPrefsSnapshot) {
@@ -434,7 +436,7 @@ class RevocableDocumentAccessEmulatorTest {
 
     @Test
     fun renameNoteDialogRoutesRevokedAndDowngradedGrantsToRestoreAccessWithoutAutoReplay() {
-        val workspaceKey = "emu-rename-${UUID.randomUUID().toString().take(8)}".also(workspaceKeys::add)
+        val workspaceKey = UUID.randomUUID().toString().also(workspaceKeys::add)
         val directBaseline = "# Direct Rename Baseline\n"
         val directUri = RevocableTestDocumentsProvider.putMarkdown(app, "DirectRename.md", directBaseline)
         RevocableTestDocumentsProvider.grantReadWrite(directUri)
@@ -457,7 +459,11 @@ class RevocableDocumentAccessEmulatorTest {
                     if (contract is RestoreDocumentAccess) {
                         val callback = accessPickerResultRef.get()
                         val result = callback?.invoke(input as? Uri)
-                        dispatchResult(requestCode, result)
+                        if (result != null) {
+                            dispatchResult(requestCode, Activity.RESULT_OK, Intent().setData(result))
+                        } else {
+                            dispatchResult(requestCode, Activity.RESULT_CANCELED, null)
+                        }
                     } else {
                         dispatchResult(requestCode, Activity.RESULT_CANCELED, null)
                     }
@@ -472,7 +478,9 @@ class RevocableDocumentAccessEmulatorTest {
             var model: StudioViewModel? = null
             scenario.onActivity { activity ->
                 model = ViewModelProvider(activity)[StudioViewModel::class.java]
+                model!!.reading(autosave = false)
             }
+            assertEquals("Rename test must run in an isolated UUID workspace", workspaceKey, model!!.workspaceKey)
             awaitActiveReader(model!!)
 
             // Part 1: Direct grant — ordinary provider error stays inline; downgraded/revoked grant routes to
@@ -480,7 +488,7 @@ class RevocableDocumentAccessEmulatorTest {
             val directId = openAndAwait(scenario, model!!, directUri)
             val directDraft = "# Direct Rename Baseline\n\nUnsaved local draft preserved across rename denial.\n"
             editAndAwait(scenario, model!!, directId, directDraft)
-            waitForNodeText("Unsaved")
+            waitForNodeText("Draft recovered automatically")
 
             RevocableTestDocumentsProvider.setOrdinaryRenameError("DirectRename.md", true)
             compose.onNodeWithContentDescription("More actions").performClick()
@@ -603,6 +611,7 @@ class RevocableDocumentAccessEmulatorTest {
             }
             assertEquals(treeDraft, model!!.state.value.tabs.single { it.id == treeTabId }.content)
             assertEquals(treeBaseline, RevocableTestDocumentsProvider.fileForDocId(app, "renamevault/RenamedVaultNote.md").readText(Charsets.UTF_8))
+            assertTrue(flushRecoveryPumpingCompose(model!!))
         }
     }
 
