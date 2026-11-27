@@ -106,6 +106,8 @@ ApplicationWindow {{
     visible: true
     color: viewState.colors.surface
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var shortcutBindings: JSON.parse(studio.shortcutBindings)
     property var shortcutLabels: JSON.parse(studio.shortcutLabels)
@@ -143,6 +145,8 @@ ApplicationWindow {{
         TabStrip {{
             width: parent.width
             viewState: window.viewState
+            tabs: window.tabsState
+            activeTabId: window.activeTabId
             shortcutLabels: window.shortcutLabels
         }}
         Rectangle {{ width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }}

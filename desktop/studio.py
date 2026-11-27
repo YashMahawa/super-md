@@ -818,6 +818,8 @@ class Session(QObject):
 class Studio(QObject):
     changed = Signal()
     sidebarChanged = Signal()
+    tabsChanged = Signal()
+    activeTabChanged = Signal()
     shortcutsChanged = Signal()
     workspaceSearchChanged = Signal()
     workspaceSearchBatch = Signal(int, object, int, bool, bool)
@@ -1085,6 +1087,8 @@ class Studio(QObject):
         if restore_enabled and restore_folder:
             self._restore_workspace_folder(restore_folder, restore_expanded)
         self._emitted_sidebar_key = self._sidebar_slice_key()
+        self._emitted_tabs_key = self._tabs_slice_key()
+        self._emitted_active_tab_id = self.active if self.tabs else ""
         self._refresh_theme()
         # Only the first real desktop window may restore the user's opted-in
         # cloud connection. The cloud client handles network retry/backoff.
@@ -1197,10 +1201,23 @@ class Studio(QObject):
             self._emitted_sidebar_key = key
             self.sidebarChanged.emit()
 
+    def _notify_tabs(self):
+        if self.retired:
+            return
+        tabs_key = self._tabs_slice_key()
+        if tabs_key != getattr(self, "_emitted_tabs_key", None):
+            self._emitted_tabs_key = tabs_key
+            self.tabsChanged.emit()
+        active_id = self.active if self.tabs else ""
+        if active_id != getattr(self, "_emitted_active_tab_id", None):
+            self._emitted_active_tab_id = active_id
+            self.activeTabChanged.emit()
+
     def _emit(self, load=True):
         if self.retired: return
         self._watch_notes()
         self._notify_sidebar()
+        self._notify_tabs()
         self.changed.emit()
         if load and self.ready and self.tabs:
             tab = self._current()
@@ -1637,11 +1654,15 @@ class Studio(QObject):
         self._pinned_slice_cache = (pinned_tuple, encoded)
         return encoded
 
-    def _cached_tabs_slice_json(self):
-        tabs_key = tuple(
+    def _tabs_slice_key(self):
+        return tuple(
             (t["id"], t["name"], t["path"], self._is_dirty(t), bool(t.get("conflict")))
             for t in self.tabs
         )
+
+    def _cached_tabs_slice_json(self, tabs_key=None):
+        if tabs_key is None:
+            tabs_key = self._tabs_slice_key()
         cached = getattr(self, "_tabs_slice_cache", None)
         if cached is not None and cached[0] == tabs_key:
             return cached[1]
@@ -1651,6 +1672,14 @@ class Studio(QObject):
         ])
         self._tabs_slice_cache = (tabs_key, encoded)
         return encoded
+
+    @Property(str, notify=tabsChanged)
+    def tabsSnapshot(self):
+        return self._cached_tabs_slice_json()
+
+    @Property(str, notify=activeTabChanged)
+    def activeTabId(self):
+        return self.active if self.tabs else ""
 
     def _cached_colors_slice_json(self):
         dark, palette = self._tokens()
