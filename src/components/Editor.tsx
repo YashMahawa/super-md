@@ -17,8 +17,9 @@ import { forEachDiagnostic, forceLinting, linter, setDiagnostics, type Action, t
 import {checkWriting,type WritingOptions} from "../proofreading";
 import {PROOFREADING_MAX_CHARS,computeWindowBounds} from "../proofreadingCore";
 import {addPersonalWord,hasPersonalWord,normalizeDictionaryWord,subscribePersonalDictionary} from "../personalDictionary";
-import { search, searchKeymap, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
+import { closeSearchPanel, search, searchKeymap, searchPanelOpen, highlightSelectionMatches, openSearchPanel, SearchQuery, setSearchQuery } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
+import { getActiveReaderNoteId, registerEditorSearchDismisser, setReaderDismissible } from "../readerOverlays";
 import type {SourceChange} from '../readerEdits';
 import {navigateExternalLink,navigateWorkspaceLink,resolveHeadingOffset} from '../documentNavigation';
 import {findSourceLinkAtOffset} from '../workspaceLinks';
@@ -75,6 +76,30 @@ const rangeHandlers = new Map<string, (range: { from: number; to: number }) => v
 const typewriterHandlers = new Map<string, ((enabled: boolean) => void) | undefined>();
 const typewriterStates = new Map<string, boolean>();
 const visibleEditors = new Map<string, EditorView>();
+const visibleEditorNotes = new Map<string, string | null>();
+function syncEditorSearchDismissible(noteId: string | null = getActiveReaderNoteId()) {
+  let open = false;
+  for (const [id, editor] of visibleEditors) {
+    if ((visibleEditorNotes.get(id) ?? null) === noteId && searchPanelOpen(editor.state)) {
+      open = true;
+      break;
+    }
+  }
+  setReaderDismissible("cm-search", open, noteId);
+}
+export function dismissEditorSearch(): boolean {
+  const activeNoteId = getActiveReaderNoteId();
+  let closed = false;
+  for (const [id, editor] of visibleEditors) {
+    if (activeNoteId !== null && (visibleEditorNotes.get(id) ?? null) !== activeNoteId) continue;
+    if (searchPanelOpen(editor.state) && closeSearchPanel(editor)) {
+      closed = true;
+    }
+  }
+  if (closed) syncEditorSearchDismissible(activeNoteId);
+  return closed;
+}
+registerEditorSearchDismisser(dismissEditorSearch);
 const externalValueSync = Annotation.define<boolean>();
 interface SelectionTransition {
   beforeDoc: string;
@@ -373,6 +398,7 @@ export default function Editor({ sessionId = "default", documentPath = null, val
   typewriterHandlers.set(sessionId,onTypewriterChange);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
+  const ownerNoteId = useRef<string | null>(getActiveReaderNoteId());
   const documentPathRef = useRef(documentPath);
   documentPathRef.current = documentPath;
   const changeHandler = useRef(onChange);
@@ -599,6 +625,9 @@ export default function Editor({ sessionId = "default", documentPath = null, val
             if (update.docChanged || update.selectionSet) statusHandlers.get(sessionId)?.(update.state);
             if (update.state.doc.length > PROOFREADING_MAX_CHARS) rangeHandlers.get(sessionId)?.(sourceProofreadingRange(update.view));
           }
+          if (searchPanelOpen(update.startState) !== searchPanelOpen(update.state)) {
+            syncEditorSearchDismissible(visibleEditorNotes.get(sessionId) ?? null);
+          }
         }),
         appearance.current.of(editorTheme())
       ]
@@ -612,7 +641,11 @@ export default function Editor({ sessionId = "default", documentPath = null, val
     }
     const mountedView = new EditorView({ state, parent: host.current });
     view.current = mountedView;
+    const noteId = getActiveReaderNoteId();
+    ownerNoteId.current = noteId;
     visibleEditors.set(sessionId, mountedView);
+    visibleEditorNotes.set(sessionId, noteId);
+    syncEditorSearchDismissible(noteId);
     registerEditorAnchorAdapter(sessionId, {
       readingOffset: () => editorReadingOffset(sessionId),
       caretOffset: () => editorCaretOffset(sessionId),
@@ -648,7 +681,10 @@ export default function Editor({ sessionId = "default", documentPath = null, val
     return () => {
       clearTimeout(scrollTimer);
       view.current?.scrollDOM.removeEventListener("scroll", onScroll);
+      const cleanupNoteId = visibleEditorNotes.get(sessionId) ?? ownerNoteId.current;
       visibleEditors.delete(sessionId);
+      visibleEditorNotes.delete(sessionId);
+      syncEditorSearchDismissible(cleanupNoteId);
       registerEditorAnchorAdapter(sessionId, null, view.current?.scrollDOM.scrollTop);
       if (view.current) { sessions.delete(sessionId); sessions.set(sessionId, { state: view.current.state, top: view.current.scrollDOM.scrollTop, appearance: appearance.current, wrapping: wrapping.current,proofing:proofing.current, typewriter: typewriter.current, wrapped: wrapReference.current, typewriterActive: typewriterReference.current }); trimEditorSessions(); view.current.destroy(); }
     };

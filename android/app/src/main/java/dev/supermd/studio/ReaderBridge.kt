@@ -98,6 +98,7 @@ internal class ReaderBridge(
                         true
                     }
                     "reader_overlay_changed" -> { model.overlay(args.optBoolean("open"), args.optBoolean("image")); true }
+                    "reader_dismissible_changed" -> { model.readerDismissible(args.optBoolean("open"), args.optString("id").takeIf { it.isNotEmpty() }); true }
                     "editor_focus_changed" -> { model.editorFocus(args.optBoolean("focused")); true }
                     "copy_image_native" -> {
                         val uri = withContext(Dispatchers.IO) {

@@ -37,7 +37,7 @@ import { preparePdf } from "./preparePdf";
 import type { ExportOptions,ReaderAccessibilityPreference } from "./types";
 import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
-import { dismissReaderOverlay, hasReaderOverlay } from "./readerOverlays";
+import { dismissReaderOverlay, flushActiveLiveEdit, hasReaderOverlay, setActiveReaderNoteId } from "./readerOverlays";
 import { prepareFmd } from "./documentMedia";
 import { NoteRemoteImageConsentStore } from "./remoteImageConsent";
 import { prepareMarkdownExport } from "./markdownExport";
@@ -259,6 +259,22 @@ export function Reader() {
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{document.querySelector<HTMLElement>(".android-source")?.style.setProperty("--workspace-scale",String(zoomReference.current/100));document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));};
   const anchored = (update:()=>void) => { const restore = anchors(); update(); requestAnimationFrame(()=>restore.forEach(callback=>callback())); };
+  const editorFocusReported=useRef<boolean|null>(null);
+  const syncEditorFocus=useCallback(()=>{
+    const current=reference.current;
+    let focused=false;
+    if(current&&current.mode!=="reader"&&!hasReaderOverlay()){
+      const active=document.activeElement;
+      if(active instanceof HTMLElement&&!active.closest(".cm-panels,.cm-search")){
+        if(current.mode==="live")focused=active.matches(".live-active-block textarea");
+        else if(current.mode==="editor"||current.mode==="split")focused=!!active.closest(".cm-editor .cm-content");
+      }
+    }
+    if(editorFocusReported.current!==focused){
+      editorFocusReported.current=focused;
+      if(document.documentElement.dataset.host!=="qt")void invoke("editor_focus_changed",{focused}).catch(()=>{});
+    }
+  },[]);
   useLayoutEffect(() => {
     const nativeScroll=new FrameScrollQueue((scroller,dx,dy)=>{
       applyChainedNativeScroll(scroller,dx,dy,{
@@ -280,8 +296,11 @@ export function Reader() {
       requestAnimationFrame(()=>{restore.forEach(callback=>callback());applyZoomStyle();settleSelection();});
     };
     window.supermdThemeGuide=()=>setThemeGuide(true);
-    window.supermdDismiss=dismissReaderOverlay;
+    window.supermdDismiss=()=>{const dismissed=flushSync(()=>dismissReaderOverlay());syncEditorFocus();return dismissed;};
     window.supermdLoad = (incoming) => {
+      if (reference.current && reference.current.id !== (incoming as ReaderState).id) {
+        flushActiveLiveEdit();
+      }
       const old = reference.current;
       // Native omits content it received from this reader, unchanged since.
       const {contentUnchanged,seededFind,...rest}=incoming as ReaderState&{contentUnchanged?:boolean};
@@ -455,6 +474,7 @@ export function Reader() {
           primeEditorAnchor(loaded.id, null);
         }
         if (typeof loaded.typewriterScroll === "boolean") setTypewriterScroll(loaded.typewriterScroll, { persist: false });
+        setActiveReaderNoteId(loaded.id);
         reference.current = loaded;
         setState(loaded);
         zoomReference.current = loaded.zoom;
@@ -537,6 +557,7 @@ export function Reader() {
       if(root)navigateToHeading(root,id);
     };
     window.supermdBeforeNavigate=async()=>{
+      flushActiveLiveEdit();
       savePosition.current();
       const current=reference.current;
       if(!current)return;
@@ -569,6 +590,7 @@ export function Reader() {
       if(scroller){noteSplitWheelTarget(scroller);nativeScroll.scroll(scroller,dx,dy);}
     };
     window.supermdFlush = operation => {
+      flushActiveLiveEdit();
       savePosition.current();
       const current = reference.current;
       if(operation.action==='android_flush'){
@@ -677,7 +699,7 @@ export function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; delete window.supermdFindStep; };
+    return () => {setActiveReaderNoteId(null);nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; delete window.supermdFindStep; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -1123,22 +1145,6 @@ export function Reader() {
     window.addEventListener("supermd-history-boundary",historyBoundary);
     return()=>{document.removeEventListener("keydown",find,true);document.removeEventListener("keydown",history,true);document.removeEventListener("keydown",typewriterKey);window.removeEventListener("supermd-history-boundary",historyBoundary);};
   },[changeTypewriter]);
-  const editorFocusReported=useRef<boolean|null>(null);
-  const syncEditorFocus=useCallback(()=>{
-    const current=reference.current;
-    let focused=false;
-    if(current&&current.mode!=="reader"&&!hasReaderOverlay()){
-      const active=document.activeElement;
-      if(active instanceof HTMLElement&&!active.closest(".cm-panels,.cm-search")){
-        if(current.mode==="live")focused=active.matches(".live-active-block textarea");
-        else if(current.mode==="editor"||current.mode==="split")focused=!!active.closest(".cm-editor .cm-content");
-      }
-    }
-    if(editorFocusReported.current!==focused){
-      editorFocusReported.current=focused;
-      if(document.documentElement.dataset.host!=="qt")void invoke("editor_focus_changed",{focused}).catch(()=>{});
-    }
-  },[]);
   useEffect(()=>{
     let timer=0;
     const onFocusIn=()=>{window.clearTimeout(timer);syncEditorFocus();};

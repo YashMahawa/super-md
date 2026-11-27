@@ -261,7 +261,7 @@ class MainActivity : ComponentActivity() {
                     model.cancelWorkspaceSearch()
                     return true
                 }
-                if (model.state.value.fullscreen || model.state.value.readerOverlay) {
+                if (model.state.value.fullscreen || model.state.value.readerOverlay || model.state.value.readerDismissible) {
                     dismissDocument?.invoke() ?: model.fullscreen(false)
                     return true
                 }
@@ -379,6 +379,67 @@ private object NoMotionScheme : MotionScheme {
     override fun <T> defaultEffectsSpec(): FiniteAnimationSpec<T> = snap()
     override fun <T> fastEffectsSpec(): FiniteAnimationSpec<T> = snap()
     override fun <T> slowEffectsSpec(): FiniteAnimationSpec<T> = snap()
+}
+
+internal const val READER_DISMISS_SCRIPT =
+    "(() => { const d = document.documentElement.dataset; const id = d.readerNoteId || ''; const dismissed = Boolean(window.supermdDismiss?.()); return JSON.stringify({ id, dismissed, overlay: d.readerOverlay === 'true', image: d.readerImageOverlay === 'true', dismissible: d.readerDismissible === 'true' }); })()"
+
+internal fun shouldInterceptStudioBack(
+    contentsShown: Boolean,
+    fullscreen: Boolean,
+    drawerOpen: Boolean,
+    readerOverlay: Boolean,
+    readerDismissible: Boolean,
+): Boolean = contentsShown || fullscreen || drawerOpen || readerOverlay || readerDismissible
+
+internal fun applyReaderDismissResult(model: StudioViewModel, rawResult: String?, expectedNoteId: String? = null) {
+    val targetExpected = expectedNoteId?.takeIf { it.isNotEmpty() }
+    if (targetExpected != null && model.state.value.active.id != targetExpected) {
+        model.readerDismissible(false, targetExpected)
+        return
+    }
+    val parsed = rawResult?.let { raw ->
+        runCatching {
+            val jsonText = if (raw.startsWith("\"")) org.json.JSONArray("[$raw]").getString(0) else raw
+            JSONObject(jsonText)
+        }.getOrNull()
+    }
+    if (parsed != null) {
+        val resultNoteId = parsed.optString("id").takeIf { it.isNotEmpty() }
+        if (resultNoteId != null && resultNoteId != model.state.value.active.id) {
+            model.readerDismissible(false, resultNoteId)
+            if (!parsed.optBoolean("dismissed", false) && !model.state.value.readerOverlay && !model.state.value.readerDismissible && model.state.value.fullscreen) {
+                model.fullscreen(false)
+            }
+            return
+        }
+        model.overlay(parsed.optBoolean("overlay", false), parsed.optBoolean("image", false))
+        model.readerDismissible(parsed.optBoolean("dismissible", false), resultNoteId ?: targetExpected)
+        if (!parsed.optBoolean("dismissed", false) && model.state.value.fullscreen) {
+            model.fullscreen(false)
+        }
+        return
+    }
+    val dismissed = rawResult == "true"
+    if (!dismissed) {
+        model.overlay(false, false)
+        model.readerDismissible(false, targetExpected)
+        if (model.state.value.fullscreen) model.fullscreen(false)
+    }
+}
+
+private fun dismissReaderOrFullscreen(web: WebView?, model: StudioViewModel) {
+    val reader = web
+    val expectedNoteId = model.state.value.active.id
+    if (reader == null) {
+        model.overlay(false, false)
+        model.readerDismissible(false, expectedNoteId)
+        if (model.state.value.fullscreen) model.fullscreen(false)
+        return
+    }
+    reader.evaluateJavascript(READER_DISMISS_SCRIPT) { rawResult ->
+        applyReaderDismissResult(model, rawResult, expectedNoteId)
+    }
 }
 
 internal fun shouldAcceptExternalDrag(localState: Any?, description: android.content.ClipDescription?): Boolean {
@@ -558,7 +619,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         model.assetAccessRestored = { document, source ->
             web?.evaluateJavascript("window.dispatchEvent(new CustomEvent('supermd-asset-access-restored',{detail:{documentPath:${JSONObject.quote(document)},source:${JSONObject.quote(source)}}}))", null)
         }
-        activity.dismissDocument = { web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) } ?: model.fullscreen(false) }
+        activity.dismissDocument = { dismissReaderOrFullscreen(web, model) }
         activity.saveReaderPosition={web?.evaluateJavascript("window.supermdSavePosition?.()",null)}
         activity.openReaderFind = { replace ->
             menu = false
@@ -971,7 +1032,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     LaunchedEffect(immersive, dark) {
         WindowCompat.getInsetsController(activity.window, activity.window.decorView).apply { isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark; systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE; if (immersive) hide(WindowInsetsCompat.Type.systemBars()) else show(WindowInsetsCompat.Type.systemBars()) }
     }
-    BackHandler(contentsShown || state.fullscreen || drawer.isOpen || state.readerOverlay) {
+    BackHandler(shouldInterceptStudioBack(contentsShown, state.fullscreen, drawer.isOpen, state.readerOverlay, state.readerDismissible)) {
         if (contentsShown) {
             contentsShown = false
         } else if (drawer.isOpen) {
@@ -981,7 +1042,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                 scope.launch { drawer.close() }
             }
         } else {
-            web?.evaluateJavascript("window.supermdDismiss?.() || false") { dismissed -> if (dismissed != "true") model.fullscreen(false) }
+            dismissReaderOrFullscreen(web, model)
         }
     }
     val palette = MaterialTheme.colorScheme
@@ -1232,6 +1293,8 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                 if (wasCurrent) {
                                     readerReady = false
                                     readerPdfOwnsProgress = false
+                                    model.overlay(false, false)
+                                    model.readerDismissible(false)
                                     model.editorFocus(false)
                                     readerNote[0] = null
                                     readerGeneration++
@@ -1301,7 +1364,13 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                     } }, modifier = Modifier.fillMaxSize().clipToBounds(), onRelease = { frame ->
                         val released = frame.getChildAt(0) as? WebView
                         if (released != null) {
-                            if (web === released) { web = null; readerReady = false; model.editorFocus(false) }
+                            if (web === released) {
+                                web = null
+                                readerReady = false
+                                model.overlay(false, false)
+                                model.readerDismissible(false)
+                                model.editorFocus(false)
+                            }
                             retireAndDestroyReader(released)
                         }
                         frame.removeAllViews()

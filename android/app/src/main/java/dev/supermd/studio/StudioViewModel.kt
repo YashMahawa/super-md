@@ -80,8 +80,9 @@ private fun renamedRelative(relative:String?,name:String)=relative?.let {val par
 data class FileEntry(val name: String, val uri: String, val directory: Boolean, val relative: String)
 data class OutlineHeading(val id: String, val title: String, val level: Int, val offset: Int)
 private val EMPTY_NOTE = Note(id = "", name = "Super MD", content = "", saved = "")
-data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
+data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val readerDismissibleNoteId: String? = null, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
+    val readerDismissible get() = active.id.isNotEmpty() && readerDismissibleNoteId == active.id
     val zoom get() = if (fullscreen) fullscreenZoom else normalZoom
     val activeConflicted get() = active.id.isNotEmpty() && active.id in conflictedTabIds
     val pendingCloseNote get() = pendingCloseNoteId?.let { id -> tabs.find { it.id == id } }
@@ -1013,7 +1014,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 if(archived.isFailure){fail("Could not preserve a deleted note's edits. Its draft is still open; save it to another file.");return@launch}
                 if(mutable.value!==s){refreshMetadata();return@launch} // Never overwrite edits made during archive I/O.
             }
-            discarded.forEach {readerEcho.remove(it.id)}
+            discarded.forEach { readerEcho.remove(it.id); clearReaderEditProtocol(it.id) }
             val kept=s.tabs.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
             if(discarded.isNotEmpty()||kept!=s.tabs) change {it.copy(tabs=kept.ifEmpty {listOf(Note())},closedTabs=(recovered+it.closedTabs).take(12),message=if(discarded.isNotEmpty())"File deleted. Its tab was closed; unsaved edits remain recoverable in Settings." else "Updated renamed note")}
             val recents=recentMutable.value.filter {it.uri !in removed}.map {note->metadata[note.uri]?.takeIf {it.isNotBlank()}?.let {note.copy(name=it,relative=renamedRelative(note.relative,it))} ?: note}
@@ -1361,7 +1362,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
 
     private fun change(block: (StudioState) -> StudioState) {
         val previous = mutable.value
-        val next = block(previous)
+        val rawNext = block(previous)
+        val next = if (rawNext.readerDismissibleNoteId != null && (previous.active.id != rawNext.active.id || rawNext.tabs.none { it.id == rawNext.readerDismissibleNoteId })) {
+            rawNext.copy(readerDismissibleNoteId = null)
+        } else {
+            rawNext
+        }
         mutable.value = next
         syncNoteAssetScopes(previous, next)
         observeActive()
@@ -1429,7 +1435,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private val readerProtocolAndOutline = ReaderProtocolAndOutlineCoordinator(
         app = getApplication(), scope = viewModelScope,
         readerEcho = readerEcho, readerEditProtocol = readerEditProtocol,
-        readState = { mutable.value }, changeState = ::change, editNote = ::edit, fail = ::fail,
+        readState = { mutable.value }, changeState = ::change,
+        editNote = { id, content -> edit(id, content, fromReader = true) },
+        fail = ::fail,
     )
     internal fun clearReaderEditProtocol(id: String) = readerProtocolAndOutline.clearReaderEditProtocol(id)
     internal fun readerStateIsNativeAuthoritative(id: String): Boolean = readerProtocolAndOutline.readerStateIsNativeAuthoritative(id)
@@ -1443,7 +1451,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     internal fun preserveMalformedReaderResync(id: String?, content: String?) =
         readerProtocolAndOutline.preserveMalformedReaderResync(id, content)
 
-    fun edit(id: String, content: String) { change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }; scheduleAutosave(id) }
+    fun edit(id: String, content: String) = edit(id, content, fromReader = false)
+    private fun edit(id: String, content: String, fromReader: Boolean) {
+        if (!fromReader) {
+            readerEcho.remove(id)
+            clearReaderEditProtocol(id)
+        }
+        change { s -> s.copy(tabs = s.tabs.map { if (it.id == id) it.copy(content = content) else it }) }
+        scheduleAutosave(id)
+    }
     /** Commit an inactive-note patch computed from an immutable reader snapshot. */
     internal suspend fun commitAgentSnapshotPatch(id: String, expectedRevision: String, patchedContent: String, patchedRevision: String) = documentWrites.withLock {
         require(patchedContent.toByteArray(Charsets.UTF_8).size <= MAX_AGENT_SNAPSHOT_BYTES) { "The patched document exceeds Android's 2 MiB relay snapshot limit" }
@@ -1807,6 +1823,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 performCurrentReaderBarrier {
                     if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performCurrentReaderBarrier
                     readerEcho.remove(note.id)
+                    clearReaderEditProtocol(note.id)
                     if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
                     closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                     updatedRefs = closedNoteRefs
@@ -1842,6 +1859,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val restored=if(ref!=null)withContext(Dispatchers.IO){closedNoteStore.loadForRecovery(ref,note)}
                     else legacy?.takeIf {it.content.isNotEmpty() || it.saved.isNotEmpty() || it.assetDirectory!=null} ?: note
                 val accepted=performReaderBarrier(expectedActiveId) {
+                    readerEcho.remove(note.id)
+                    clearReaderEditProtocol(note.id)
                     closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
                     change {s->
                         if(s.tabs.any {it.id==note.id})s.copy(activeId=note.id,closedTabs=s.closedTabs.filter {it.id!=note.id})
@@ -1871,6 +1890,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     fun latexAutofix(enabled: Boolean) = studioSettings.latexAutofix(enabled)
     fun typewriterScroll(enabled: Boolean) = studioSettings.typewriterScroll(enabled)
     fun overlay(open: Boolean, image: Boolean = false) = studioSettings.overlay(open, image)
+    fun readerDismissible(open: Boolean, noteId: String? = null) {
+        val current = mutable.value
+        val activeId = current.active.id
+        val targetId = noteId?.takeIf { it.isNotEmpty() }
+        val nextNoteId = if (open) {
+            val resolvedId = targetId ?: activeId
+            if (resolvedId.isEmpty() || resolvedId != activeId) return
+            resolvedId
+        } else {
+            if (targetId != null && current.readerDismissibleNoteId != targetId) return
+            null
+        }
+        if (current.readerDismissibleNoteId != nextNoteId) {
+            mutable.value = current.copy(readerDismissibleNoteId = nextNoteId)
+        }
+    }
     fun editorFocus(focused: Boolean) = studioSettings.editorFocus(focused)
     fun importFont(uri: Uri) = viewModelScope.launch {
         try { val family=withContext(Dispatchers.IO) {fonts.import(uri)};appearance(font=family);prefs.edit().putLong("fonts",System.currentTimeMillis()).apply();mutable.value=mutable.value.copy(customFonts=fonts.families,message="Imported $family for reading and PDF export") }
