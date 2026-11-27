@@ -1259,6 +1259,145 @@ class FolderActionsTest {
             assertEquals(secDirtyLecture, File(opaqueRoot, "Sem1/PureMath/Lecture 1.md").readText())
             assertTrue(mainWindow.recent.value.any { it.uri == rotatedLectureUri.toString() && it.pinned })
             assertEquals(emptyList<String>(), providerInstance.unknownIdQueries)
+
+            // Part C: Cold-restored window whose initialFolderLoadJob is interrupted by another live window's
+            // pre-commit canceled rename still awaits the restarted opaque folder projection in seedRestoredDocumentAccess,
+            // keeping confirmed folder-backed plain notes writable while marking revoked outside plain notes write-blocked.
+            File(opaqueRoot, "RootNote.md").writeText("# Root Note\n\nConfirmed via root projection.\n")
+            mainWindow.listFolder(opaqueTreeUri, "")
+            await {
+                mainWindow.state.value.folderRelative == "" &&
+                    mainWindow.state.value.files.any { it.name == "RootNote.md" }
+            }
+            val rootEntry = mainWindow.state.value.files.single { it.name == "RootNote.md" }
+            val rootDocId = DocumentsContract.getDocumentId(Uri.parse(rootEntry.uri))
+            val rootPlainUri = DocumentsContract.buildDocumentUri(opaqueAuthority, rootDocId)
+
+            val restoredKey = "folder-actions-cold-${UUID.randomUUID()}".also(workspaceKeys::add)
+            providerInstance.rejectPlainDocumentUris = false
+            app.grantUriPermission(app.packageName, rootPlainUri, rwFlags)
+            TestAuthorityGrants.grant(rootPlainUri, rwFlags, persistable = true)
+            app.grantUriPermission(app.packageName, renamedOutsideUri, rwFlags)
+            TestAuthorityGrants.grant(renamedOutsideUri, rwFlags, persistable = true)
+
+            val setupStore = ViewModelStore()
+            val setupWindow = StudioViewModel(app, restoredKey).also {
+                it.readerFlushRequester = { true }
+                setupStore.put("setup", it)
+            }
+            setupWindow.setFolder(opaqueTreeUri)
+            await { setupWindow.state.value.folder == opaqueTreeUri.toString() }
+            setupWindow.open(rootPlainUri, "RootNote.md")
+            await { setupWindow.state.value.active.uri == rootPlainUri.toString() }
+            val restoredRootTabId = setupWindow.state.value.active.id
+            setupWindow.open(renamedOutsideUri)
+            await { setupWindow.state.value.active.uri == renamedOutsideUri.toString() }
+            val restoredOutsideTabId = setupWindow.state.value.active.id
+            setupWindow.listFolder(opaqueTreeUri, "Sem1/PureMath")
+            await {
+                setupWindow.state.value.folderRelative == "Sem1/PureMath" &&
+                    setupWindow.state.value.files.any { it.name == "Lecture 1.md" }
+            }
+            assertTrue(kotlinx.coroutines.runBlocking { setupWindow.flushRecoveryAndAwait() })
+            setupStore.clear()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            // Revoke direct plain grants so cold restore must rely on opaqueTreeUri + confirmedTreeDocumentKeys.
+            TestAuthorityGrants.revoke(rootPlainUri)
+            TestAuthorityGrants.revoke(renamedOutsideUri)
+            providerInstance.rejectPlainDocumentUris = true
+
+            mainWindow.listFolder(opaqueTreeUri, "Sem1")
+            await {
+                mainWindow.state.value.folderRelative == "Sem1" &&
+                    mainWindow.state.value.files.any { it.directory && it.name == "PureMath" }
+            }
+            val pureMathUri = Uri.parse(mainWindow.state.value.files.single { it.directory && it.name == "PureMath" }.uri)
+
+            val blockFirstRootQuery = java.util.concurrent.atomic.AtomicBoolean(true)
+            val coldInitEntered = java.util.concurrent.CountDownLatch(1)
+            val releaseColdInit = java.util.concurrent.CountDownLatch(1)
+            val coldInitExited = java.util.concurrent.CountDownLatch(1)
+            val joinSearchEntered = java.util.concurrent.CountDownLatch(1)
+            val joinSearchHold = java.util.concurrent.CountDownLatch(1)
+            providerInstance.onChildrenQuery = { parentDocId ->
+                if (parentDocId == OpaqueFolderDocumentsProvider.ROOT_ID && blockFirstRootQuery.getAndSet(false)) {
+                    coldInitEntered.countDown()
+                    try {
+                        releaseColdInit.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                    } finally {
+                        coldInitExited.countDown()
+                    }
+                } else if (parentDocId != OpaqueFolderDocumentsProvider.ROOT_ID && joinSearchHold.count > 0L) {
+                    joinSearchEntered.countDown()
+                    joinSearchHold.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                }
+            }
+
+            try {
+                val restoredWindow = newModel(restoredKey)
+                assertTrue("Expected cold-restore initialFolderLoadJob to enter IO", coldInitEntered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+                assertTrue(restoredWindow.isStartupAccessSeedActive())
+
+                secondWindow.updateFolderSearch("ClosedNeedle")
+                assertTrue(joinSearchEntered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+                val preJoinRenameJob = mainWindow.renameFolderEntry(
+                    pureMathUri,
+                    "Sem1/PureMath",
+                    isDirectory = true,
+                    requested = "AppliedMath",
+                )
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
+                // Release restoredWindow's canceled initialFolderLoadJob while secondWindow's search join is still held,
+                // verifying seedRestoredDocumentAccess stays active awaiting pendingInitialFolderReload before cancel.
+                releaseColdInit.countDown()
+                assertTrue(coldInitExited.await(2, java.util.concurrent.TimeUnit.SECONDS))
+                shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
+                assertTrue(
+                    "seedRestoredDocumentAccess must wait for the restarted initial folder projection rather than running early",
+                    restoredWindow.isStartupAccessSeedActive(),
+                )
+                preJoinRenameJob.cancel()
+                providerInstance.onChildrenQuery = null
+                joinSearchHold.countDown()
+
+                await(debugInfo = {
+                    "partC: seedActive=${restoredWindow.isStartupAccessSeedActive()} " +
+                        "rel=${restoredWindow.state.value.folderRelative} files=${restoredWindow.state.value.files.map { it.relative }} " +
+                        "rootBlocked=${restoredWindow.documentWriteNeedsAccess(restoredRootTabId)} " +
+                        "outsideBlocked=${restoredWindow.documentWriteNeedsAccess(restoredOutsideTabId)}"
+                }) {
+                    preJoinRenameJob.isCancelled &&
+                        !restoredWindow.isStartupAccessSeedActive() &&
+                        restoredWindow.state.value.folderRelative == "Sem1/PureMath" &&
+                        restoredWindow.state.value.files.any { it.relative == "Sem1/PureMath/Lecture 1.md" } &&
+                        !secondWindow.folderSearch.value.scanning
+                }
+                assertFalse(
+                    "Confirmed folder-backed restored note must remain writable after restarted initialFolderLoadJob",
+                    restoredWindow.documentWriteNeedsAccess(restoredRootTabId),
+                )
+                assertTrue(
+                    "Revoked outside plain note must still be marked write-blocked by seedRestoredDocumentAccess",
+                    restoredWindow.documentWriteNeedsAccess(restoredOutsideTabId),
+                )
+                val restoredRootUpdated = "# Root Note\n\nSaved after cold-restore interrupted rename.\n"
+                restoredWindow.select(restoredRootTabId)
+                await { restoredWindow.state.value.active.id == restoredRootTabId }
+                restoredWindow.edit(restoredRootTabId, restoredRootUpdated)
+                restoredWindow.save(noteId = restoredRootTabId)
+                await {
+                    !restoredWindow.state.value.tabs.single { it.id == restoredRootTabId }.dirty &&
+                        restoredWindow.documentAccessRequests.value == null
+                }
+                assertEquals(restoredRootUpdated, File(opaqueRoot, "RootNote.md").readText())
+                assertEquals(emptyList<String>(), providerInstance.unknownIdQueries)
+            } finally {
+                providerInstance.onChildrenQuery = null
+                releaseColdInit.countDown()
+                joinSearchHold.countDown()
+            }
         } finally {
             opaqueProvider?.onChildrenQuery = null
             opaqueProvider?.onRenameDocument = null

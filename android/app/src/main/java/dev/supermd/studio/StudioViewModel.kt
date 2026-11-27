@@ -10,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -1093,6 +1094,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     private var folderSearchSeq = 0L
     private var folderSearchJob: Job? = null
     private var initialFolderLoadJob: Job? = null
+    private var initialFolderLoadCompleted = false
+    private var pendingInitialFolderReload: CompletableDeferred<Job?>? = null
     private var startupAccessSeedJob: Job? = null
 
     init {
@@ -1106,6 +1109,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         migrateLegacyClosedNotes()
         val initialFolderJob = mutable.value.folder?.let { listFolder(Uri.parse(it), mutable.value.folderRelative) }
         initialFolderLoadJob = initialFolderJob
+        if (initialFolderJob == null) {
+            initialFolderLoadCompleted = true
+        }
         if (restoredFromSnapshot) {
             startupAccessSeedJob = seedRestoredDocumentAccess(initialFolderJob)
         }
@@ -1121,6 +1127,29 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     @androidx.annotation.VisibleForTesting
     internal fun isStartupAccessSeedActive(): Boolean = startupAccessSeedJob?.isActive == true
 
+    private suspend fun awaitInitialOpaqueFolderLoadIfNeeded(initialJob: Job? = initialFolderLoadJob) {
+        var folderJobToAwait = initialJob
+        while (
+            (folderJobToAwait != null || pendingInitialFolderReload != null) &&
+            mutable.value.folder?.let { !isKnownPathDocumentProvider(Uri.parse(it).authority) } == true
+        ) {
+            if (folderJobToAwait != null) {
+                runCatching { folderJobToAwait.join() }
+            }
+            val pendingReload = pendingInitialFolderReload
+            val replacement = if (pendingReload != null) {
+                runCatching { pendingReload.await() }.getOrNull()
+            } else {
+                initialFolderLoadJob
+            }
+            if (replacement != null && replacement !== folderJobToAwait) {
+                folderJobToAwait = replacement
+            } else {
+                break
+            }
+        }
+    }
+
     private fun seedRestoredDocumentAccess(initialFolderJob: Job?): Job? {
         val candidateUris = mutable.value.tabs
             .mapNotNull { it.uri }
@@ -1128,22 +1157,17 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             .distinct()
         if (candidateUris.isEmpty()) return null
         return viewModelScope.launch {
-            var folderJobToAwait = initialFolderJob
-            while (
-                folderJobToAwait != null &&
-                mutable.value.folder?.let { !isKnownPathDocumentProvider(Uri.parse(it).authority) } == true
-            ) {
-                runCatching { folderJobToAwait.join() }
-                val replacement = initialFolderLoadJob
-                if (replacement != null && replacement !== folderJobToAwait && replacement.isActive) {
-                    folderJobToAwait = replacement
-                } else {
-                    break
-                }
-            }
+            awaitInitialOpaqueFolderLoadIfNeeded(initialFolderJob)
+            val urisToEvaluate = (
+                candidateUris +
+                    mutable.value.tabs
+                        .filter { it.id !in closingNoteIds }
+                        .mapNotNull { it.uri }
+                        .filter { raw -> runCatching { Uri.parse(raw).scheme.equals("content", ignoreCase = true) }.getOrDefault(false) }
+                ).distinct()
             val deniedUris = withContext(Dispatchers.IO) {
                 buildMap<String, Long> {
-                    for (raw in candidateUris) {
+                    for (raw in urisToEvaluate) {
                         if (coroutineContext[Job]?.isActive == false) break
                         documentWrites.withLock {
                             val stillOpen = mutable.value.tabs.any { tab ->
@@ -1184,7 +1208,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         metadataJob?.cancel()
         listFolderSeq++
         listFolderJob?.cancel()
+        initialFolderLoadCompleted = true
         initialFolderLoadJob?.cancel()
+        pendingInitialFolderReload?.complete(null)
+        pendingInitialFolderReload = null
         startupAccessSeedJob?.cancel()
         refreshJob?.cancel()
         folderSearchSeq++
@@ -1673,11 +1700,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         refreshJob = viewModelScope.launch {
             if (!immediate) delay(200)
             val startupFolderJob = initialFolderLoadJob
-            if (
-                startupFolderJob?.isActive == true &&
-                mutable.value.folder?.let { !isKnownPathDocumentProvider(Uri.parse(it).authority) } == true
-            ) {
-                runCatching { startupFolderJob.join() }
+            if (startupFolderJob?.isActive == true || pendingInitialFolderReload != null) {
+                awaitInitialOpaqueFolderLoadIfNeeded(startupFolderJob)
             }
             val (snapshotGen, checkAll, requestedUris) = synchronized(pendingRefreshLock) {
                 Triple(refreshGeneration, refreshAllGeneration > 0L, pendingRefreshUris.keys.toSet())
@@ -2292,7 +2316,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         val hadConfirmedSource = listOfNotNull(
                             canonicalTreeDocumentKey(parsedUri),
                             canonicalTreeDocumentKey(target),
-                        ).distinct().map(confirmedTreeDocumentKeys::remove).any { it }
+                        ).distinct().any { key ->
+                            val removedFromConfirmed = confirmedTreeDocumentKeys.remove(key)
+                            val listedInCurrentFiles = runCatching {
+                                mutable.value.files.any { !it.directory && it.uri == key }
+                            }.getOrDefault(false)
+                            removedFromConfirmed || listedInCurrentFiles
+                        }
                         val canScopeToTargetTree = DocumentsContract.isTreeUri(target) &&
                             !DocumentsContract.isTreeUri(rawRenamed) &&
                             (hadConfirmedSource || isKnownPathContainedInTree(
@@ -2412,6 +2442,11 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             else it.copy(folder = uri.toString(), folderRelative = "")
         }
         val listJob = listFolder(uri, "")
+        pendingInitialFolderReload?.let { deferred ->
+            initialFolderLoadJob = listJob
+            pendingInitialFolderReload = null
+            deferred.complete(listJob)
+        }
         startupAccessSeedJob?.let { seedJob ->
             if (seedJob.isActive) runCatching { seedJob.join() }
         }
@@ -3434,6 +3469,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         workspaceLinks.invalidate()
         listFolderSeq++
         listFolderJob?.cancel()
+        initialFolderLoadCompleted = true
+        pendingInitialFolderReload?.complete(null)
+        pendingInitialFolderReload = null
         listedRelative = ""
         requestedFolderRelative = ""
         requestedFolderRelativeSeq = 0L
@@ -3471,6 +3509,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     listSafFolderListing(resolver, documentAccess, targetFolder, requestedRelative, pass)
                 }
                 confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                if (mutable.value.folder != null) {
+                    initialFolderLoadCompleted = true
+                }
                 if (seq == listFolderSeq && mutable.value.folder != null) {
                     listedRelative = listing.effectiveRelative
                     if (listing.effectiveRelative != requestedRelative) {
@@ -3483,7 +3524,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             } catch (error: Exception) {
                 if (seq == listFolderSeq) fail("Could not list folder: ${error.message}")
             }
-        }.also { listFolderJob = it }
+        }.also { job ->
+            listFolderJob = job
+            if (!initialFolderLoadCompleted) {
+                initialFolderLoadJob = job
+                pendingInitialFolderReload?.let { deferred ->
+                    pendingInitialFolderReload = null
+                    deferred.complete(job)
+                }
+            }
+        }
     }
 
     internal fun relativeInOpenFolder(uri: Uri, folderTreeRaw: String? = mutable.value.folder): String? {
@@ -3648,14 +3698,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         liveVms.forEach { vm ->
             remaps.forEach { remap ->
                 val oldParsed = runCatching { Uri.parse(remap.oldUri) }.getOrNull()
+                val newParsed = runCatching { Uri.parse(remap.newUri) }.getOrNull()
                 if (oldParsed != null) {
                     canonicalTreeDocumentKey(oldParsed)?.let(vm.confirmedTreeDocumentKeys::remove)
                     vm.confirmedTreeDocumentKeys.removeIf { key -> sameDocument(Uri.parse(key), oldParsed) }
                 }
-                if (remap.confirmedInTree) {
-                    runCatching { Uri.parse(remap.newUri) }.getOrNull()
-                        ?.let(::canonicalTreeDocumentKey)
-                        ?.let(vm.confirmedTreeDocumentKeys::add)
+                if (remap.confirmedInTree && newParsed != null) {
+                    canonicalTreeDocumentKey(newParsed)?.let(vm.confirmedTreeDocumentKeys::add)
+                }
+                if (vm.writeIsBlocked(remap.oldUri)) {
+                    if (newParsed != null && vm.documentAccess.hasWriteGrant(newParsed)) {
+                        vm.clearDocumentAccessFailure(remap.oldUri)
+                        vm.clearDocumentAccessFailure(remap.newUri)
+                    } else {
+                        synchronized(vm.blockedDocumentWrites) {
+                            vm.blockedDocumentWrites.removeAll { vm.sameDocumentUri(it, remap.oldUri) }
+                            if (vm.blockedDocumentWrites.none { vm.sameDocumentUri(it, remap.newUri) }) {
+                                vm.blockedDocumentWrites.add(remap.newUri)
+                            }
+                        }
+                        vm.syncBlockedWriteState()
+                    }
                 }
             }
             vm.metadataSeq++
@@ -3698,7 +3761,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 } else {
                     currentRel
                 }
-                syncJobs += vm.listFolder(Uri.parse(vmFolder), nextListed)
+                val listedJob = vm.listFolder(Uri.parse(vmFolder), nextListed)
+                vm.pendingInitialFolderReload?.let { deferred ->
+                    vm.initialFolderLoadJob = listedJob
+                    vm.pendingInitialFolderReload = null
+                    deferred.complete(listedJob)
+                }
+                syncJobs += listedJob
             }
             vm.seededFindMutable.value?.let { seed ->
                 val seedUri = seed.targetUri
@@ -3913,7 +3982,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         val currentName = cleanRelative.substringAfterLast('/')
         val canceledMetadataVms = LinkedHashSet<StudioViewModel>()
         val canceledListingVms = LinkedHashSet<StudioViewModel>()
-        val canceledInitialFolderVms = LinkedHashSet<StudioViewModel>()
+        val canceledInitialFolderVms = LinkedHashMap<StudioViewModel, CompletableDeferred<Job?>>()
         val canceledSearchVms = LinkedHashSet<StudioViewModel>()
         val preRenameJobs = mutableListOf<Job>()
         val preRenameFolderState = LinkedHashMap<StudioViewModel, Pair<Long, String>>()
@@ -3934,8 +4003,10 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     val activeListJob = vm.listFolderJob
                     if (activeListJob?.isActive == true) {
                         canceledListingVms += vm
-                        if (activeListJob === vm.initialFolderLoadJob) {
-                            canceledInitialFolderVms += vm
+                        if (!vm.initialFolderLoadCompleted && (activeListJob === vm.initialFolderLoadJob || vm.pendingInitialFolderReload != null)) {
+                            val deferred = vm.pendingInitialFolderReload
+                                ?: CompletableDeferred<Job?>().also { vm.pendingInitialFolderReload = it }
+                            canceledInitialFolderVms[vm] = deferred
                         }
                         val pinnedSeq = ++vm.listFolderSeq
                         preRenameFolderState[vm] = pinnedSeq to savedRel
@@ -4131,8 +4202,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                         val vmFolder = vm.mutable.value.folder
                         if (preRename != null && vmFolder != null && vm.listFolderSeq == preRename.first) {
                             val restartedJob = vm.listFolder(Uri.parse(vmFolder), preRename.second)
-                            if (vm in canceledInitialFolderVms) {
+                            canceledInitialFolderVms.remove(vm)?.let { deferred ->
                                 vm.initialFolderLoadJob = restartedJob
+                                if (vm.pendingInitialFolderReload === deferred) {
+                                    vm.pendingInitialFolderReload = null
+                                }
+                                deferred.complete(restartedJob)
                             }
                         }
                     }
@@ -4149,6 +4224,15 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                             vm.refreshMetadata()
                         }
                     }
+                }
+                canceledInitialFolderVms.forEach { (vm, deferred) ->
+                    if (vm.pendingInitialFolderReload === deferred) {
+                        vm.pendingInitialFolderReload = null
+                    }
+                    deferred.complete(
+                        vm.listFolderJob?.takeIf { it.isActive }
+                            ?: vm.initialFolderLoadJob?.takeIf { it.isActive },
+                    )
                 }
             }
         }
