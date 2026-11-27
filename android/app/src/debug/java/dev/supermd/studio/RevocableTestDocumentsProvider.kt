@@ -7,6 +7,7 @@ import android.content.Intent
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -85,6 +86,50 @@ internal class RevocableTestDocumentsProvider : ContentProvider() {
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
 
+    override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
+        if (method == "android:renameDocument") {
+            val ctx = checkNotNull(context)
+            initializeRoot(ctx)
+            val inExtras = checkNotNull(extras) { "Missing extras for $method" }
+            @Suppress("DEPRECATION")
+            val docUri = checkNotNull(inExtras.getParcelable<Uri>("uri")) { "Missing document uri for $method" }
+            val displayName = checkNotNull(inExtras.getString(DocumentsContract.Document.COLUMN_DISPLAY_NAME)) {
+                "Missing display name for $method"
+            }
+            enforceAccess(docUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            val docId = DocumentsContract.getDocumentId(docUri)
+            renameCallAttempts.computeIfAbsent(docId) { AtomicInteger(0) }.incrementAndGet()
+            if (docId in ordinaryRenameErrorDocIds) {
+                throw IllegalStateException("Simulated transient provider rename error for $docId")
+            }
+            val sourceFile = fileForDocId(ctx, docId)
+            if (!sourceFile.exists()) {
+                throw FileNotFoundException("Missing document for rename: $docId")
+            }
+            val parentRel = docId.substringBeforeLast('/', missingDelimiterValue = "")
+            val newDocId = if (parentRel.isEmpty() || docId == ROOT_DOC_ID) displayName else "$parentRel/$displayName"
+            val targetFile = fileForDocId(ctx, newDocId)
+            targetFile.parentFile?.mkdirs()
+            if (sourceFile.canonicalPath != targetFile.canonicalPath && !sourceFile.renameTo(targetFile)) {
+                sourceFile.copyTo(targetFile, overwrite = true)
+                sourceFile.delete()
+            }
+            val auth = docUri.authority ?: authority(ctx)
+            val outUri = if (DocumentsContract.isTreeUri(docUri)) {
+                val treeRoot = DocumentsContract.getTreeDocumentId(docUri)
+                DocumentsContract.buildDocumentUriUsingTree(
+                    DocumentsContract.buildTreeDocumentUri(auth, treeRoot),
+                    newDocId,
+                )
+            } else {
+                DocumentsContract.buildDocumentUri(auth, newDocId)
+            }
+            TestAuthorityGrants.transferDirectGrant(docUri, outUri)
+            return Bundle().apply { putParcelable("uri", outUri) }
+        }
+        return super.call(method, arg, extras)
+    }
+
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
         val ctx = checkNotNull(context)
         initializeRoot(ctx)
@@ -156,7 +201,9 @@ internal class RevocableTestDocumentsProvider : ContentProvider() {
         const val ROOT_DOC_ID = "root"
         private val ordinaryReadIoErrorDocIds = ConcurrentHashMap.newKeySet<String>()
         private val ordinaryQueryErrorDocIds = ConcurrentHashMap.newKeySet<String>()
+        private val ordinaryRenameErrorDocIds = ConcurrentHashMap.newKeySet<String>()
         private val readOpenAttempts = ConcurrentHashMap<String, AtomicInteger>()
+        private val renameCallAttempts = ConcurrentHashMap<String, AtomicInteger>()
         @Volatile private var rootDir: File? = null
 
         fun authority(context: Context): String = "${context.packageName}.testdocs"
@@ -174,13 +221,17 @@ internal class RevocableTestDocumentsProvider : ContentProvider() {
             TestAuthorityGrants.registerAuthority(auth)
             ordinaryReadIoErrorDocIds.clear()
             ordinaryQueryErrorDocIds.clear()
+            ordinaryRenameErrorDocIds.clear()
             readOpenAttempts.clear()
+            renameCallAttempts.clear()
             val dir = initializeRoot(context)
             dir.deleteRecursively()
             dir.mkdirs()
         }
 
         fun openReadAttempts(docId: String): Int = readOpenAttempts[docId]?.get() ?: 0
+
+        fun renameAttempts(docId: String): Int = renameCallAttempts[docId]?.get() ?: 0
 
         fun fileForDocId(context: Context, docId: String): File {
             val base = initializeRoot(context)
@@ -225,6 +276,10 @@ internal class RevocableTestDocumentsProvider : ContentProvider() {
 
         fun setOrdinaryReadIoError(docId: String, enabled: Boolean) {
             if (enabled) ordinaryReadIoErrorDocIds.add(docId) else ordinaryReadIoErrorDocIds.remove(docId)
+        }
+
+        fun setOrdinaryRenameError(docId: String, enabled: Boolean) {
+            if (enabled) ordinaryRenameErrorDocIds.add(docId) else ordinaryRenameErrorDocIds.remove(docId)
         }
     }
 }
