@@ -4,6 +4,7 @@ const {invoke} = vi.hoisted(()=>({invoke:vi.fn()}));
 vi.mock("./nativeBridge",()=>({invoke}));
 import {registerMedia} from "./mediaExport";
 import {preparePdf} from "./preparePdf";
+import {NoteRemoteImageConsentStore} from "./remoteImageConsent";
 afterEach(()=>{invoke.mockReset();document.body.innerHTML="";});
 
 it("exports every image in a sequence, preserving labels, captions and surrounding blocks",async()=>{
@@ -239,4 +240,40 @@ it("blocks untrusted remote HTML img URLs without ever invoking fetch_resource w
   expect(invoke).toHaveBeenCalledTimes(1);
   expect(invoke).toHaveBeenCalledWith('fetch_resource',{url:'https://images.example/approved.svg',image:true});
   expect(trustedPrepared.content).toContain('![Trusted Diagram](asset-1.svg){width=240}');
+
+  // 6. Scoped note consent: loaded DOM media or cached bytes for note-a never bypass policy or leak into note-b's PDF export.
+  invoke.mockClear();
+  const consentStore=new NoteRemoteImageConsentStore();
+  consentStore.approve('note-a','https://once.example/owned-by-a.png');
+  const noteASpan=document.createElement('span');
+  noteASpan.className='note-image';
+  noteASpan.dataset.noteId='note-a';
+  noteASpan.dataset.noteImageSource='https://once.example/owned-by-a.png';
+  const noteAImg=document.createElement('img');
+  noteASpan.append(noteAImg);
+  document.body.append(noteASpan);
+  const unregisterNoteA=registerMedia(noteAImg,{label:'Note A Image',uri:()=>png});
+  try{
+    await expect(
+      preparePdf(
+        '<img alt="Foreign" src="https://once.example/owned-by-a.png" width="200">',
+        '/notes/note-b.md',
+        'embedded',
+        consentStore.policy('note-b',[]),
+      ),
+    ).rejects.toThrow(/consent/i);
+    expect(invoke).not.toHaveBeenCalled();
+
+    const noteAPrepared=await preparePdf(
+      '<img alt="Owned" src="https://once.example/owned-by-a.png" width="200">\n\n```smd-steps\n'+JSON.stringify({title:'Owned Step',steps:[{label:'One',markdown:'<img alt="StepOwned" src="https://once.example/owned-by-a.png" width="120">'},{label:'Two',description:'Next'}]})+'\n```',
+      '/notes/note-a.md',
+      'embedded',
+      consentStore.policy('note-a',[]),
+    );
+    expect(invoke).not.toHaveBeenCalled();
+    expect(Object.keys(noteAPrepared.assets)).toHaveLength(2);
+  }finally{
+    unregisterNoteA();
+    noteASpan.remove();
+  }
 });
