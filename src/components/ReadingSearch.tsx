@@ -12,7 +12,8 @@ export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
 const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
 const MANUAL_SCROLL_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "]);
-const SEARCH_SETTLE_WINDOW_MS = 800;
+const SEARCH_SETTLE_WINDOW_MS = 1600;
+const SEARCH_SETTLE_MAX_MS = 3200;
 type HighlightRegistry = Map<string, unknown>;
 type SourceRange = { from: number; to: number };
 const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
@@ -68,8 +69,18 @@ export function nextSearchIndex(index: number, direction: number, count: number)
 
 function revealMountedBlock(element: Element): void {
   if (!(element instanceof HTMLElement)) return;
-  if (element.closest('[data-windowed-mounted="false"]')) flushSync(() => revealWindowed(element));
-  else revealWindowed(element);
+  if (!element.closest('[data-windowed-mounted="false"]')) {
+    revealWindowed(element);
+    return;
+  }
+  const root = element.closest<HTMLElement>(".android-reading");
+  const hadNavigating = Boolean(root?.dataset.navigating);
+  if (root && !hadNavigating) root.dataset.navigating = "true";
+  try {
+    flushSync(() => revealWindowed(element));
+  } finally {
+    if (root && !hadNavigating) delete root.dataset.navigating;
+  }
 }
 
 function expandRegexReplacement(replacement: string, match: RegExpExecArray, source: string): string {
@@ -641,8 +652,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!eventHost) return;
     let active = true;
     let frame = 0;
+    let timer = 0;
     let remainingFrames = 4;
     let layoutMutating = false;
+    let mutatingQueued = false;
+    const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+    const startedAt = nowMs();
     let recordedScrollTop = scroller?.scrollTop ?? 0;
     let recordedScrollHeight = scroller?.scrollHeight ?? 0;
     const recordScrollerState = () => {
@@ -672,6 +687,16 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         recordSettleScrollerRef.current = null;
       }
     };
+    const armStopTimer = () => {
+      if (!active) return;
+      window.clearTimeout(timer);
+      const remainingCap = Math.max(0, SEARCH_SETTLE_MAX_MS - (nowMs() - startedAt));
+      if (remainingCap <= 0) {
+        stop();
+        return;
+      }
+      timer = window.setTimeout(stop, Math.min(SEARCH_SETTLE_WINDOW_MS, remainingCap));
+    };
     const runPass = () => {
       frame = 0;
       if (!active) return;
@@ -698,16 +723,22 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const onWindowChange = () => {
       if (!active) return;
       layoutMutating = true;
-      queueMicrotask(() => {
-        layoutMutating = false;
-        if (active) recordScrollerState();
-      });
+      if (!mutatingQueued) {
+        mutatingQueued = true;
+        queueMicrotask(() => {
+          mutatingQueued = false;
+          layoutMutating = false;
+          if (active) recordScrollerState();
+        });
+      }
+      armStopTimer();
       schedulePass();
     };
     const onScroll = () => {
       if (!active || !scroller || layoutMutating) return;
       if (scroller.scrollHeight !== recordedScrollHeight) {
         recordScrollerState();
+        armStopTimer();
         schedulePass();
         return;
       }
@@ -715,14 +746,22 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     };
     const page = scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body")
       ?? (eventHost instanceof HTMLElement ? eventHost : null);
-    let lastPageHeight = page?.getBoundingClientRect().height ?? 0;
+    const readPageHeight = (entry?: ResizeObserverEntry) =>
+      entry?.borderBoxSize?.[0]?.blockSize
+      ?? entry?.contentRect.height
+      ?? page?.offsetHeight
+      ?? page?.getBoundingClientRect().height
+      ?? 0;
+    let lastPageHeight = readPageHeight();
     const observer = page && typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(entries => {
           if (!active) return;
-          const nextHeight = entries[0]?.borderBoxSize?.[0]?.blockSize ?? entries[0]?.contentRect.height ?? page.getBoundingClientRect().height;
-          if (Math.abs(nextHeight - lastPageHeight) <= 0.5) return;
+          const nextHeight = readPageHeight(entries[0]);
+          const scrollerHeightChanged = Boolean(scroller && scroller.scrollHeight !== recordedScrollHeight);
+          if (Math.abs(nextHeight - lastPageHeight) <= 0.5 && !scrollerHeightChanged) return;
           lastPageHeight = nextHeight;
-          if (scroller && scroller.scrollHeight !== recordedScrollHeight) recordScrollerState();
+          if (scrollerHeightChanged) recordScrollerState();
+          armStopTimer();
           schedulePass();
         })
       : undefined;
@@ -735,7 +774,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     window.addEventListener("pointerdown", onUserGesture, { capture: true, passive: true });
     window.addEventListener("keydown", onKeyDown, { capture: true, passive: true });
     window.addEventListener("supermd-goto-offset", stop);
-    const timer = window.setTimeout(stop, SEARCH_SETTLE_WINDOW_MS);
+    armStopTimer();
     settleCleanup.current = stop;
     recordSettleScrollerRef.current = recordScrollerState;
     remainingFrames--;

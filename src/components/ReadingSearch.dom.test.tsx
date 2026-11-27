@@ -954,4 +954,159 @@ describe("ReadingSearch DOM behavior", () => {
       host.remove();
     }
   });
+
+  it("keeps rendered Range inside .reading-scroll unobstructed viewport when adjacent WindowedBlocks shrink after initial frames", async () => {
+    const { default: WindowedBlock } = await import("./WindowedBlock");
+    class TestIntersectionObserver {
+      static instances: TestIntersectionObserver[] = [];
+      constructor(readonly callback: IntersectionObserverCallback) { TestIntersectionObserver.instances.push(this); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      emitBatch(entries: Array<{ target: Element; isIntersecting: boolean }>) {
+        this.callback(entries as unknown as IntersectionObserverEntry[], this as unknown as IntersectionObserver);
+      }
+    }
+    class NoopResizeObserver {
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+    vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const blocks = Array.from({ length: 12 }, (_, idx) =>
+      idx === 0
+        ? "## Intro\n\ntoken-01 intro."
+        : idx === 8
+          ? "## Section 25\n\ntoken-25 target."
+          : idx === 11
+            ? "## Section 45\n\ntoken-45 tail."
+            : `## Filler ${idx}\n\nParagraph ${idx}.`,
+    );
+    const content = blocks.join("\n\n");
+    const offsets: Array<{ start: number; end: number }> = [];
+    let cursor = 0;
+    for (const chunk of blocks) {
+      offsets.push({ start: cursor, end: cursor + chunk.length });
+      cursor += chunk.length + 2;
+    }
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+
+    try {
+      await act(async () => {
+        root.render(
+          <div className="workspace">
+            <ReadingSearch content={content} close={() => {}} initialReplace onChange={() => {}} />
+            <div className="reading-scroll">
+              <div className="live-document">
+                <div className="markdown-body">
+                  {blocks.map((chunk, idx) => (
+                    <WindowedBlock
+                      key={idx}
+                      enabled
+                      estimate={120}
+                      text={chunk}
+                      data-source-start={offsets[idx].start}
+                      data-source-end={offsets[idx].end}
+                    >
+                      <p>{chunk.split("\n\n")[1]}</p>
+                    </WindowedBlock>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>,
+        );
+      });
+
+      const scroller = host.querySelector<HTMLElement>(".reading-scroll")!;
+      const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+      const getBlocks = () => Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      const blockHeight = (el: HTMLElement) => (el.getAttribute("data-windowed-mounted") === "true" ? 44 : 120);
+      const blockTopDoc = (targetIdx: number) => {
+        const list = getBlocks();
+        let y = 0;
+        for (let i = 0; i < targetIdx; i++) y += blockHeight(list[i]);
+        return y;
+      };
+      const totalDocHeight = () => getBlocks().reduce((sum, el) => sum + blockHeight(el), 0);
+
+      let simulatedScrollTop = 0;
+      Object.defineProperty(scroller, "scrollTop", {
+        configurable: true,
+        get: () => simulatedScrollTop,
+        set: (v: number) => { simulatedScrollTop = Math.max(0, v); },
+      });
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => totalDocHeight() });
+      searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 88);
+      scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+      getBlocks().forEach((el, idx) => {
+        el.getBoundingClientRect = () => {
+          const top = blockTopDoc(idx) - scroller.scrollTop;
+          return new DOMRect(40, top, 680, blockHeight(el));
+        };
+      });
+
+      const computeRangeRect = (range: Range): DOMRect => {
+        const list = getBlocks();
+        const ownerIdx = list.findIndex((el) => el.contains(range.startContainer));
+        const top = (ownerIdx >= 0 ? blockTopDoc(ownerIdx) : 0) + 12 - scroller.scrollTop;
+        return new DOMRect(48, top, 100, 20);
+      };
+      Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+      Range.prototype.getClientRects = function () {
+        const r = computeRangeRect(this);
+        return Object.assign([r], { item: (i: number) => (i === 0 ? r : null) }) as unknown as DOMRectList;
+      };
+
+      // Mount block 0 initially.
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch([{ target: getBlocks()[0], isIntersecting: true }]);
+      });
+
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => regexBtn.click());
+      act(() => setInputValue(searchInput, "token-\\d+"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+
+      // Step to 1 / 3 (token-01), then 2 / 3 (offscreen token-25 in block 8).
+      act(() => nextBtn.click());
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      expect(getBlocks()[8].getAttribute("data-windowed-mounted")).toBe("true");
+
+      // Drain initial 4 rAF passes while blocks 1..7 above block 8 are still 120px placeholders.
+      for (let i = 0; i < 6; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+
+      // Now IntersectionObserver mounts blocks 1..7 in .reading-scroll, shrinking height above block 8 by 7 * 76 = 532px
+      // (which would pull token-25 above the viewport without .reading-scroll supermd-window-change settling).
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(1, 8).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      const settledTop = blockTopDoc(8) + 12 - scroller.scrollTop;
+      expect(settledTop).toBeGreaterThanOrEqual(12 + 88 + 12);
+      expect(settledTop + 20).toBeLessThanOrEqual(600 - 16);
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      vi.unstubAllGlobals();
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 });

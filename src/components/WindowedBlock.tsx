@@ -55,7 +55,7 @@ export default function WindowedBlock({enabled,estimate=120,text="",headings=[],
     const observer=new ResizeObserver(entries=>{const measured=entries[0].borderBoxSize?.[0]?.blockSize??entries[0].contentRect.height;if(measured>0)height.current=measured;});observer.observe(node);
     const headingsInBlock=node.querySelectorAll<HTMLElement>('[data-heading-key]');
     headings.forEach((heading,i)=>{if(headingsInBlock[i])headingsInBlock[i].id=heading.id;});
-    node.closest('.android-reading')?.dispatchEvent(new Event('supermd-window-change'));
+    node.closest('.android-reading,.reading-scroll')?.dispatchEvent(new Event('supermd-window-change'));
     return()=>observer.disconnect();
   },[active,shown,headings]);
   if(!active)return <section {...props} ref={setNodeRef}>{children}</section>;
