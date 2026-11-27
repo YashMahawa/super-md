@@ -452,6 +452,8 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     var findRequest by remember { mutableIntStateOf(0) }
     var findReplace by remember { mutableStateOf(false) }
     var renaming by rememberSaveable {mutableStateOf(false)}
+    var pendingRenameKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingRenameInput by rememberSaveable { mutableStateOf<String?>(null) }
     var contentsShown by remember {mutableStateOf(false)}
     var readingChromeVisible by remember {mutableStateOf(true)}
     LaunchedEffect(state.busy) { if (!state.busy) readerPdfOwnsProgress = false }
@@ -1335,14 +1337,29 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
     )
     // Long forms must not strand their primary action below a half-open sheet.
     if (renaming) {
-        val initialStem = remember(state.active.id, state.active.name) {
-            if (noteExtension(state.active.name).isNotEmpty()) noteStem(state.active.name) else state.active.name
+        val activeRenameKey = "${state.active.id}\n${state.active.name}"
+        val initialStem = remember(state.active.id, state.active.name, pendingRenameKey, pendingRenameInput) {
+            if (pendingRenameKey == activeRenameKey && pendingRenameInput != null) {
+                pendingRenameInput!!
+            } else if (noteExtension(state.active.name).isNotEmpty()) {
+                noteStem(state.active.name)
+            } else {
+                state.active.name
+            }
         }
-        var name by rememberSaveable(state.active.id, state.active.name) { mutableStateOf(initialStem) }
+        var name by rememberSaveable(state.active.id, state.active.name, pendingRenameInput) { mutableStateOf(initialStem) }
         var renameError by remember(state.active.id, state.active.name) { mutableStateOf<String?>(null) }
         var renameBusy by remember(state.active.id, state.active.name) { mutableStateOf(false) }
         AlertDialog(
-            onDismissRequest = { if (!renameBusy) renaming = false },
+            onDismissRequest = {
+                if (!renameBusy) {
+                    if (pendingRenameKey == activeRenameKey) {
+                        pendingRenameKey = null
+                        pendingRenameInput = null
+                    }
+                    renaming = false
+                }
+            },
             title = { Text("Rename note") },
             text = {
                 OutlinedTextField(
@@ -1358,17 +1375,42 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
             confirmButton = {
                 TextButton(
                     onClick = {
+                        val targetId = state.active.id
+                        val submittedName = name
                         renameBusy = true
                         renameError = null
-                        model.rename(state.active.id, name, showGlobalError = false) { ok, err ->
+                        model.rename(targetId, submittedName, showGlobalError = false) { ok, err ->
                             renameBusy = false
-                            if (ok) renaming = false else renameError = err
+                            if (ok) {
+                                if (pendingRenameKey == activeRenameKey) {
+                                    pendingRenameKey = null
+                                    pendingRenameInput = null
+                                }
+                                renaming = false
+                            } else if (err == DOCUMENT_ACCESS_MESSAGE || model.documentAccessRequests.value?.noteId == targetId) {
+                                pendingRenameKey = activeRenameKey
+                                pendingRenameInput = submittedName
+                                renaming = false
+                            } else {
+                                renameError = err
+                            }
                         }
                     },
                     enabled = !renameBusy && name.isNotBlank(),
                 ) { Text("Rename") }
             },
-            dismissButton = { TextButton(enabled = !renameBusy, onClick = { renaming = false }) { Text("Cancel") } },
+            dismissButton = {
+                TextButton(
+                    enabled = !renameBusy,
+                    onClick = {
+                        if (pendingRenameKey == activeRenameKey) {
+                            pendingRenameKey = null
+                            pendingRenameInput = null
+                        }
+                        renaming = false
+                    },
+                ) { Text("Cancel") }
+            },
         )
     }
     if (exporting) ModalBottomSheet(onDismissRequest = { exporting = false }, sheetState = rememberBottomSheetState(initialValue = SheetValue.Hidden, enabledValues = setOf(SheetValue.Hidden, SheetValue.Expanded))) { ExportSettings(state.pdf, model::pdf, sharing = sharing, fonts = state.customFonts, noteLocation = noteLocation) { format ->
