@@ -9,6 +9,7 @@ if str(DESKTOP_DIR) not in sys.path:
     sys.path.insert(0, str(DESKTOP_DIR))
 
 import agent_documents  # noqa: E402
+from agent import source_ops  # noqa: E402
 from agent_documents import DocumentStore, _headings, resolve_heading  # noqa: E402
 
 FIXTURE_PATH = DESKTOP_DIR.parent / "test-fixtures" / "heading-slug-conformance.json"
@@ -16,6 +17,7 @@ FIXTURE_PATH = DESKTOP_DIR.parent / "test-fixtures" / "heading-slug-conformance.
 
 class HeadingSlugConformanceTest(unittest.TestCase):
     def test_agent_heading_slug_matches_shared_conformance_corpus(self):
+        self.assertIs(agent_documents._heading_slug, source_ops._heading_slug)
         suite = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
         self.assertEqual(suite["version"], 1)
         self.assertTrue(24 <= len(suite["cases"]) <= 30)
