@@ -97,7 +97,7 @@ class StudioSessionTests(unittest.TestCase):
 
         restored = Session(True, data=restore_dir)
         try:
-            self.assertEqual((restored.settings["widthPercent"], restored.settings["agentAccessEnabled"], restored.settings["cloudAgentEnabled"]), (90, False, True))
+            self.assertEqual((restored.settings["widthPercent"], restored.settings["agentAccessEnabled"], restored.settings["cloudAgentEnabled"], restored.settings["keepInBackground"], restored.update_installed), (90, False, True, True, False))
             self.assertEqual((restored.recent, len(restored.locations), len(restored.startup_windows)), (["/a.md", "/b.md"], 200, 1))
             self.assertTrue(restored.has_pending_startup_windows())
             restored.settings["startup"] = "empty"
@@ -227,12 +227,15 @@ class StudioSessionTests(unittest.TestCase):
             session.changed.connect(lambda: changed_hits.append(1))
             written: list[Path] = []
             real_write = studio_module.atomic_write
+            first.settings["agentAccessEnabled"] = True
+            session.background = SimpleNamespace(_cli_started_agent_access=True)
             with patch("studio.atomic_write", side_effect=lambda p, d: (written.append(Path(p)), real_write(p, d))[1]):
                 first._preferences(notify=True)
                 session.locations["/doc.md"] = 42
                 first._save_positions()
                 session.writes.flush(timeout=2.0)
             self.assertEqual(len(changed_hits), 1)
+            self.assertFalse(json.loads((session.data / "settings.json").read_text(encoding="utf-8"))["settings"]["agentAccessEnabled"])
             self.assertTrue({session.data / "settings.json", session.data / "reading-positions.json"}.issubset(written))
 
             clean_staged = first._note("Staged.md", "clean", "", "clean", {}, True)

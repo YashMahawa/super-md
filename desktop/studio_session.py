@@ -47,7 +47,7 @@ def init_session(session, isolated=False, data=None) -> None:
     session.startup_paths, session.startup_entries = [], []
     session.startup_expanded, session.startup_windows, session._pending_startup_windows = [], [], []
     session.startup_active = session.startup_active_id = session.startup_folder = ""
-    session.quitting = False
+    session.quitting = session.update_installed = False
     session.locations, session.drafts, session.windows = {}, {}, {}
     session._agent_stage_queue = deque()
     session._agent_staging_active = False
@@ -59,8 +59,14 @@ def init_session(session, isolated=False, data=None) -> None:
     session.theme_restored = False
     session._load_theme_library()
     session.initial_recovery = []
+    settings_path = session.data / "settings.json"
+    stored_settings = None
+    can_persist_migration = not settings_path.exists()
     try:
-        stored = json.loads((session.data / "settings.json").read_text(encoding="utf-8"))
+        stored = json.loads(settings_path.read_text(encoding="utf-8"))
+        if isinstance(stored, dict) and isinstance(stored.get("settings"), dict):
+            stored_settings = stored["settings"]
+            can_persist_migration = True
         session.settings.update({k: v for k, v in stored["settings"].items() if k in mod.DEFAULTS})
         if not stored["settings"].get("widthMigrated") and stored["settings"].get("widthPercent") == 80:
             session.settings["widthPercent"] = 90  # 80% was the old default, not a choice.
@@ -69,12 +75,37 @@ def init_session(session, isolated=False, data=None) -> None:
         session.recent = list(dict.fromkeys(session.pinned + [p for p in stored.get("recent", []) if isinstance(p, str)]))[:10]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
+    had_explicit_keep_in_background = isinstance(stored_settings, dict) and "keepInBackground" in stored_settings
+    fresh_service_log = mod.os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
+    migrated_keep_in_background = not had_explicit_keep_in_background and (
+        (isinstance(stored_settings, dict) and any(
+            stored_settings.get(key) is True
+            for key in ("agentAccessEnabled", "cloudAgentEnabled", "background", "backgroundEnabled")
+        ))
+        or (session.data / "agent-sessions").is_dir()
+        or (session.data / "agent-cloud.json").is_file()
+        or (not fresh_service_log and (
+            (session.data / "background-service.log").is_file()
+            or (session.data.name == "qt-studio" and (session.data.parent / "background-service.log").is_file())
+        ))
+    )
     # Local MCP access and cloud relay reconnection are explicit, persisted
     # opt-ins; each desktop launch mints a fresh temporary loopback token.
     session.settings["agentAccessEnabled"] = session.settings.get("agentAccessEnabled") is True
     session.settings["cloudAgentEnabled"] = session.settings.get("cloudAgentEnabled") is True
+    session.settings["keepInBackground"] = (
+        stored_settings.get("keepInBackground") is True if had_explicit_keep_in_background else bool(migrated_keep_in_background)
+    )
     shortcuts, _ = mod.normalize_shortcuts(session.settings.get("shortcuts"))
     session.settings["shortcuts"] = shortcuts or mod.default_shortcuts()
+    if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
+        try:
+            mod.atomic_write(
+                settings_path,
+                json.dumps({"settings": session.settings, "recent": session.recent, "pinned": session.pinned}, ensure_ascii=False).encode("utf-8"),
+            )
+        except OSError:
+            pass
     try:
         workspace = json.loads((session.data / "startup.json").read_text(encoding="utf-8"))
         session.startup_paths = list(dict.fromkeys(p for p in workspace.get("paths", []) if isinstance(p, str)))[:100]
@@ -350,7 +381,10 @@ def preferences(studio_obj, notify=True) -> None:
     if studio_obj.retired or getattr(studio_obj.writes, "_shutdown", False):
         return
     mod = _studio_module()
-    data = json.dumps({"settings": studio_obj.settings, "recent": studio_obj.recent, "pinned": studio_obj.session.pinned}).encode()
+    persisted_settings = dict(studio_obj.settings)
+    if getattr(getattr(studio_obj.session, "background", None), "_cli_started_agent_access", False):
+        persisted_settings["agentAccessEnabled"] = False
+    data = json.dumps({"settings": persisted_settings, "recent": studio_obj.recent, "pinned": studio_obj.session.pinned}).encode()
     studio_obj._submit(lambda: _studio_module().atomic_write(studio_obj.data / "settings.json", data), mod._noop_done, False, studio_obj.writes)
     if notify:
         studio_obj.session.changed.emit()
