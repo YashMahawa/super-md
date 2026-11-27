@@ -4343,7 +4343,8 @@ class Studio(QObject):
     def save(self): studio_saves.save(self)
 
     def _save_current(self, force_overwrite: bool = False): studio_saves.save_current(self, force_overwrite)
-    def _after_flush(self, operation): studio_saves.after_flush(self, operation)
+    def _after_flush(self, operation):
+        studio_saves.after_flush(self, operation, local_path_fn=local_path, single_shot_fn=QTimer.singleShot, seeded_find_bounds_fn=getattr(self, "_seeded_find_bounds", Studio._seeded_find_bounds), is_dirty_fn=getattr(self, "_is_dirty", None))
     def _on_flush_timeout(self): studio_saves.on_flush_timeout(self)
     def _flush(self, action, target=""): studio_saves.flush(self, action, target)
 
@@ -4374,17 +4375,18 @@ class Studio(QObject):
     def resolveFlush(self, choice): studio_saves.resolve_flush(self, choice)
 
     @Slot(str)
-    def saveAs(self, value): studio_saves.save_as(self, value)
+    def saveAs(self, value): studio_saves.save_as(self, value, local_path_fn=local_path)
 
     @Slot(str)
     def resolveConflict(self, choice): studio_saves.resolve_conflict(self, choice)
 
-    def _reload_current_from_disk(self): studio_saves.reload_current_from_disk(self)
+    def _reload_current_from_disk(self):
+        studio_saves.reload_current_from_disk(self, open_note_fn=open_note, snapshot_tab_state_fn=_snapshot_tab_state, clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None), is_dirty_fn=getattr(self, "_is_dirty", None))
 
     def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
-        studio_saves.save_text(self, tab, path, automatic=automatic, force_overwrite=force_overwrite, force_portable=force_portable)
+        studio_saves.save_text(self, tab, path, automatic=automatic, force_overwrite=force_overwrite, force_portable=force_portable, open_note_fn=open_note, write_portable_fn=write_portable, materialize_assets_fn=materialize_assets, atomic_write_fn=atomic_write, clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None), is_dirty_fn=getattr(self, "_is_dirty", None), refresh_open_folder_trees_fn=getattr(self, "_refresh_open_folder_trees", None))
 
-    def _autosave(self): studio_saves.autosave(self)
+    def _autosave(self): studio_saves.autosave(self, is_dirty_fn=getattr(self, "_is_dirty", None))
 
     def _sync_path_change(self, old_path: str, new_path: str, *, is_dir: bool, message: str = ""):
         for win in list(self.session.windows.values()):
@@ -4718,23 +4720,27 @@ class Studio(QObject):
         return studio_saves.existing_save_directory(raw_path, reject_links=reject_links)
 
     @classmethod
-    def _downloads_fallback_directory(cls) -> Path: return studio_saves.downloads_fallback_directory(cls)
+    def _downloads_fallback_directory(cls) -> Path:
+        return studio_saves.downloads_fallback_directory(cls, writable_location_fn=QStandardPaths.writableLocation)
 
-    def _default_output_directory(self) -> Path: return studio_saves.default_output_directory(self)
-    def _note_save_directory(self) -> Path: return studio_saves.note_save_directory(self)
-    def _save_as_directory(self) -> Path: return studio_saves.save_as_directory(self)
-
-    @Slot(result=QUrl)
-    def defaultSaveFolder(self): return studio_saves.default_save_folder(self)
-
-    @Slot(str, result=QUrl)
-    def defaultSaveLocation(self, name): return studio_saves.default_save_location(self, name)
+    def _default_output_directory(self) -> Path:
+        return studio_saves.default_output_directory(self, writable_location_fn=QStandardPaths.writableLocation)
+    def _note_save_directory(self) -> Path:
+        return studio_saves.note_save_directory(self, writable_location_fn=QStandardPaths.writableLocation)
+    def _save_as_directory(self) -> Path:
+        return studio_saves.save_as_directory(self, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(result=QUrl)
-    def defaultSaveAsFolder(self): return studio_saves.default_save_as_folder(self)
+    def defaultSaveFolder(self): return studio_saves.default_save_folder(self, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(str, result=QUrl)
-    def defaultSaveAsLocation(self, name): return studio_saves.default_save_as_location(self, name)
+    def defaultSaveLocation(self, name): return studio_saves.default_save_location(self, name, writable_location_fn=QStandardPaths.writableLocation)
+
+    @Slot(result=QUrl)
+    def defaultSaveAsFolder(self): return studio_saves.default_save_as_folder(self, writable_location_fn=QStandardPaths.writableLocation)
+
+    @Slot(str, result=QUrl)
+    def defaultSaveAsLocation(self, name): return studio_saves.default_save_as_location(self, name, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
@@ -5613,10 +5619,20 @@ class Studio(QObject):
 
     def _agent_document_action_async(self, args, on_complete, *, register_cancel=None, is_cancelled=None):
         studio_saves.agent_document_action_async(
-            self, args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled
+            self, args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled,
+            prepare_save_document_fn=Studio._prepare_save_document,
+            prepare_replace_tab_asset_fn=Studio._prepare_replace_tab_asset,
+            prepare_attach_tab_asset_fn=Studio._prepare_attach_tab_asset,
         )
 
-    def _prepare_save_document(self, args): return studio_saves.prepare_save_document(self, args)
+    def _prepare_save_document(self, args):
+        return studio_saves.prepare_save_document(
+            self, args, open_note_fn=open_note, write_portable_fn=write_portable,
+            materialize_assets_fn=materialize_assets, atomic_write_fn=atomic_write,
+            clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None),
+            is_dirty_fn=getattr(self, "_is_dirty", None),
+            refresh_open_folder_trees_fn=getattr(self, "_refresh_open_folder_trees", None),
+        )
 
     def _extra_asset_roots(self) -> list[Path]:
         roots: list[Path] = []
@@ -6540,7 +6556,8 @@ class Studio(QObject):
                     return studio_exports.execute_export_smd_native(output, args, export_result)
                 if command == "export_fmd_native":
                     return studio_saves.execute_portable_tab_save(
-                        output, args, captured, force_portable_overwrite=force_portable_overwrite, export_result=export_result
+                        output, args, captured, force_portable_overwrite=force_portable_overwrite,
+                        export_result=export_result, open_note_fn=open_note, write_portable_fn=write_portable,
                     )
                 if command == "export_pdf_native":
                     return studio_exports.execute_export_pdf_native(self, output, args, export_job, export_result)
@@ -6576,7 +6593,11 @@ class Studio(QObject):
                     self._emit(False)
                 if command == "export_fmd_native" and ((args.get("save") and target) or save_as):
                     studio_saves.finalize_portable_tab_save(
-                        self, args, captured, target, save_as=save_as, save_as_tab=save_as_tab
+                        self, args, captured, target, save_as=save_as, save_as_tab=save_as_tab,
+                        preserve_unchanged_assets_fn=_preserve_unchanged_assets,
+                        clear_agent_staging_fn=getattr(self, "_clear_agent_staging", None),
+                        is_dirty_fn=getattr(self, "_is_dirty", None),
+                        refresh_open_folder_trees_fn=getattr(self, "_refresh_open_folder_trees", None),
                     )
                 elif command.startswith("export_"):
                     studio_exports.finalize_standalone_export(self, result["path"])
