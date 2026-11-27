@@ -1003,6 +1003,272 @@ class FolderActionsTest {
         }
     }
 
+    @Test
+    fun interruptedOpaqueFolderRenamePreservesConfirmedMembershipAndRejectsUnconfirmedOutsidePromotion() {
+        val opaqueRoot = Files.createTempDirectory("android-opaque-interrupted-root").toFile()
+        val outsideDir = Files.createTempDirectory("android-opaque-interrupted-outside").toFile()
+        val opaqueAuthority = "dev.supermd.test.opaque.interrupted.${UUID.randomUUID()}"
+        val releaseSecondPreIo = java.util.concurrent.CountDownLatch(1)
+        var opaqueProvider: OpaqueFolderDocumentsProvider? = null
+        try {
+            val mathDir = File(opaqueRoot, "Sem1/Math").apply { mkdirs() }
+            val subDir = File(mathDir, "Sub").apply { mkdirs() }
+            val originalLecture = "# Lecture 1\n\nSeededNeedle appears here.\n"
+            File(mathDir, "Lecture 1.md").writeText(originalLecture)
+            File(subDir, "Topic.md").writeText("# Topic\n\nClosedNeedle appears in subfolder note.\n")
+            val outsideSecret = File(outsideDir, "outside-secret.md").apply {
+                writeText("# Outside\n\nStandalone baseline.\n")
+            }
+
+            val providerInstance = OpaqueFolderDocumentsProvider(app, opaqueRoot, outsideSecret).also {
+                it.attach(app, opaqueAuthority)
+            }
+            opaqueProvider = providerInstance
+            ShadowContentResolver.registerProviderInternal(opaqueAuthority, providerInstance)
+            TestAuthorityGrants.registerAuthority(opaqueAuthority)
+
+            val rwFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            val opaqueTreeUri = DocumentsContract.buildTreeDocumentUri(
+                opaqueAuthority,
+                OpaqueFolderDocumentsProvider.ROOT_ID,
+            )
+            app.grantUriPermission(
+                app.packageName,
+                opaqueTreeUri,
+                rwFlags or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+            )
+            TestAuthorityGrants.grant(opaqueTreeUri, rwFlags, persistable = true)
+            TestAuthorityGrants.takePersistable(opaqueTreeUri, rwFlags)
+
+            val mainWindow = newModel()
+            val secondWindow = newModel()
+            mainWindow.setFolder(opaqueTreeUri)
+            secondWindow.setFolder(opaqueTreeUri)
+            await {
+                mainWindow.state.value.folder == opaqueTreeUri.toString() &&
+                    secondWindow.state.value.folder == opaqueTreeUri.toString() &&
+                    mainWindow.state.value.files.any { it.directory && it.name == "Sem1" } &&
+                    secondWindow.state.value.files.any { it.directory && it.name == "Sem1" }
+            }
+
+            // Part A: Interrupted standalone rename of an unconfirmed outside plain document must remap
+            // tabs across live windows without promoting the renamed ID into confirmedTreeDocumentKeys.
+            val outsidePlainUri = DocumentsContract.buildDocumentUri(
+                opaqueAuthority,
+                OpaqueFolderDocumentsProvider.UNLISTED_PREFIXED_ID,
+            )
+            app.grantUriPermission(app.packageName, outsidePlainUri, rwFlags)
+            TestAuthorityGrants.grant(outsidePlainUri, rwFlags, persistable = true)
+
+            mainWindow.open(outsidePlainUri)
+            secondWindow.open(outsidePlainUri)
+            await {
+                mainWindow.state.value.active.uri == outsidePlainUri.toString() &&
+                    secondWindow.state.value.active.uri == outsidePlainUri.toString()
+            }
+            val outsideTab1Id = mainWindow.state.value.active.id
+            val outsideTab2Id = secondWindow.state.value.active.id
+            val outsideDraft = "# Outside\n\nUnsaved standalone draft.\n"
+            secondWindow.edit(outsideTab2Id, outsideDraft)
+
+            val forgedBeforeRenameTreeUri = DocumentsContract.buildDocumentUriUsingTree(
+                opaqueTreeUri,
+                OpaqueFolderDocumentsProvider.UNLISTED_PREFIXED_ID,
+            )
+            assertFalse(mainWindow.documentAccess.hasWriteGrant(forgedBeforeRenameTreeUri))
+            assertFalse(secondWindow.documentAccess.hasWriteGrant(forgedBeforeRenameTreeUri))
+
+            val standaloneJobRef = java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job>()
+            val standaloneJobPublished = java.util.concurrent.CountDownLatch(1)
+            val standaloneCanceled = java.util.concurrent.atomic.AtomicBoolean(false)
+            providerInstance.onRenameDocument = { oldDocId, newDisplayName ->
+                if (oldDocId == OpaqueFolderDocumentsProvider.UNLISTED_PREFIXED_ID && newDisplayName == "outside-renamed.md") {
+                    assertTrue(File(outsideDir, "outside-renamed.md").isFile)
+                    assertTrue(standaloneJobPublished.await(2, java.util.concurrent.TimeUnit.SECONDS))
+                    standaloneJobRef.get()!!.cancel()
+                    standaloneCanceled.set(true)
+                }
+            }
+
+            val standaloneRenameJob = mainWindow.rename(outsideTab1Id, "outside-renamed")
+            standaloneJobRef.set(standaloneRenameJob)
+            standaloneJobPublished.countDown()
+
+            await(debugInfo = {
+                "partA: cancelled=${standaloneRenameJob.isCancelled} completed=${standaloneRenameJob.isCompleted} " +
+                    "mainUri=${mainWindow.state.value.active.uri} secUri=${secondWindow.state.value.active.uri}"
+            }) {
+                standaloneCanceled.get() &&
+                    standaloneRenameJob.isCompleted &&
+                    standaloneRenameJob.isCancelled &&
+                    mainWindow.state.value.active.name == "outside-renamed.md" &&
+                    secondWindow.state.value.active.name == "outside-renamed.md"
+            }
+            providerInstance.onRenameDocument = null
+
+            val renamedOutsideUri = Uri.parse(mainWindow.state.value.active.uri!!)
+            assertFalse("Standalone outside rename must stay a plain document URI", DocumentsContract.isTreeUri(renamedOutsideUri))
+            assertEquals(renamedOutsideUri.toString(), secondWindow.state.value.active.uri)
+            assertTrue(secondWindow.state.value.active.dirty)
+            assertEquals(outsideDraft, secondWindow.state.value.active.content)
+
+            val renamedOutsideDocId = DocumentsContract.getDocumentId(renamedOutsideUri)
+            val forgedRenamedTreeUri = DocumentsContract.buildDocumentUriUsingTree(opaqueTreeUri, renamedOutsideDocId)
+            assertFalse(
+                "Interrupted standalone rename must not manufacture confirmed tree membership in mainWindow",
+                mainWindow.documentAccess.hasWriteGrant(forgedRenamedTreeUri),
+            )
+            assertFalse(
+                "Interrupted standalone rename must not manufacture confirmed tree membership in secondWindow",
+                secondWindow.documentAccess.hasWriteGrant(forgedRenamedTreeUri),
+            )
+
+            // Revoke direct grant on the renamed outside plain URI and enforce tree-only grants:
+            // saving the outside draft must prompt for access rather than silently escalating via opaqueTreeUri.
+            TestAuthorityGrants.revoke(renamedOutsideUri)
+            providerInstance.rejectPlainDocumentUris = true
+            secondWindow.save(noteId = outsideTab2Id)
+            await {
+                secondWindow.documentAccessRequests.value != null &&
+                    secondWindow.documentWriteNeedsAccess(outsideTab2Id)
+            }
+            secondWindow.dismissDocumentAccess()
+
+            // Part B: Interrupted opaque directory rename rotates child IDs, updates confirmedTreeDocumentKeys
+            // across both live windows, restarts secondWindow's canceled listing/search, and allows dirty saves
+            // under rejectPlainDocumentUris = true.
+            mainWindow.listFolder(opaqueTreeUri, "Sem1/Math")
+            await {
+                mainWindow.state.value.folderRelative == "Sem1/Math" &&
+                    mainWindow.state.value.files.any { it.name == "Lecture 1.md" }
+            }
+            val lectureEntry = mainWindow.state.value.files.single { it.name == "Lecture 1.md" }
+            val lectureTreeUri = Uri.parse(lectureEntry.uri)
+
+            mainWindow.open(lectureTreeUri, "Sem1/Math/Lecture 1.md")
+            secondWindow.open(lectureTreeUri, "Sem1/Math/Lecture 1.md")
+            await {
+                mainWindow.state.value.active.uri == lectureTreeUri.toString() &&
+                    secondWindow.state.value.active.uri == lectureTreeUri.toString()
+            }
+            val mainLectureId = mainWindow.state.value.active.id
+            val secLectureId = secondWindow.state.value.active.id
+            val mainDirtyLecture = "# Lecture 1\n\nMain window opaque draft.\n"
+            val secDirtyLecture = "# Lecture 1\n\nSecond window opaque draft with ClosedNeedle.\n"
+            mainWindow.edit(mainLectureId, mainDirtyLecture)
+            secondWindow.edit(secLectureId, secDirtyLecture)
+            mainWindow.pinRecent(lectureTreeUri.toString())
+
+            secondWindow.openFolderSearch("ClosedNeedle")
+            await {
+                !secondWindow.folderSearch.value.scanning &&
+                    secondWindow.folderSearch.value.matches.any { it.relative == "Sem1/Math/Lecture 1.md" } &&
+                    secondWindow.folderSearch.value.matches.any { it.relative == "Sem1/Math/Sub/Topic.md" }
+            }
+
+            mainWindow.listFolder(opaqueTreeUri, "Sem1")
+            await {
+                mainWindow.state.value.folderRelative == "Sem1" &&
+                    mainWindow.state.value.files.any { it.directory && it.name == "Math" }
+            }
+            val mathEntry = mainWindow.state.value.files.single { it.directory && it.name == "Math" }
+            val mathUri = Uri.parse(mathEntry.uri)
+            val mathDocId = DocumentsContract.getDocumentId(mathUri)
+            mainWindow.listFolder(opaqueTreeUri, "Sem1/Math")
+            await {
+                mainWindow.state.value.folderRelative == "Sem1/Math" &&
+                    mainWindow.state.value.files.any { it.name == "Lecture 1.md" }
+            }
+
+            val secondPreIoEntered = java.util.concurrent.CountDownLatch(1)
+            val dirRenameJobRef = java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job>()
+            val dirRenameJobPublished = java.util.concurrent.CountDownLatch(1)
+            val dirCanceledAfterCommit = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            providerInstance.onChildrenQuery = { parentDocId ->
+                if (parentDocId == OpaqueFolderDocumentsProvider.ROOT_ID && releaseSecondPreIo.count > 0L) {
+                    secondPreIoEntered.countDown()
+                    releaseSecondPreIo.await(2, java.util.concurrent.TimeUnit.SECONDS)
+                }
+            }
+            providerInstance.onRenameDocument = { oldDocId, newDisplayName ->
+                if (oldDocId == mathDocId && newDisplayName == "PureMath") {
+                    assertTrue(File(opaqueRoot, "Sem1/PureMath/Lecture 1.md").isFile)
+                    assertTrue(dirRenameJobPublished.await(2, java.util.concurrent.TimeUnit.SECONDS))
+                    dirRenameJobRef.get()!!.cancel()
+                    dirCanceledAfterCommit.set(true)
+                }
+            }
+
+            secondWindow.listFolder(opaqueTreeUri, "Sem1/Math/Sub")
+            secondWindow.updateFolderSearch("ClosedNeedle")
+            assertTrue(secondPreIoEntered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+            val dirRenameJob = mainWindow.renameFolderEntry(
+                mathUri,
+                "Sem1/Math",
+                isDirectory = true,
+                requested = "PureMath",
+            )
+            dirRenameJobRef.set(dirRenameJob)
+            dirRenameJobPublished.countDown()
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
+            providerInstance.onChildrenQuery = null
+            releaseSecondPreIo.countDown()
+
+            await(debugInfo = {
+                "partB: cancelled=${dirRenameJob.isCancelled} completed=${dirRenameJob.isCompleted} " +
+                    "mainRel=${mainWindow.state.value.folderRelative} secRel=${secondWindow.state.value.folderRelative} " +
+                    "mainAct=${mainWindow.state.value.active.relative} secAct=${secondWindow.state.value.active.relative} " +
+                    "secScanning=${secondWindow.folderSearch.value.scanning} " +
+                    "secMatches=${secondWindow.folderSearch.value.matches.map { it.relative }}"
+            }) {
+                dirCanceledAfterCommit.get() &&
+                    dirRenameJob.isCompleted &&
+                    dirRenameJob.isCancelled &&
+                    mainWindow.state.value.folderRelative == "Sem1/PureMath" &&
+                    mainWindow.state.value.files.any { it.relative == "Sem1/PureMath/Lecture 1.md" } &&
+                    secondWindow.state.value.folderRelative == "Sem1/PureMath/Sub" &&
+                    secondWindow.state.value.files.any { it.relative == "Sem1/PureMath/Sub/Topic.md" } &&
+                    mainWindow.state.value.active.relative == "Sem1/PureMath/Lecture 1.md" &&
+                    secondWindow.state.value.active.relative == "Sem1/PureMath/Lecture 1.md" &&
+                    !secondWindow.folderSearch.value.scanning &&
+                    secondWindow.folderSearch.value.matches.any { it.relative == "Sem1/PureMath/Lecture 1.md" } &&
+                    secondWindow.folderSearch.value.matches.any { it.relative == "Sem1/PureMath/Sub/Topic.md" } &&
+                    secondWindow.folderSearch.value.matches.none { it.relative.startsWith("Sem1/Math/") }
+            }
+
+            val rotatedLectureUri = Uri.parse(mainWindow.state.value.active.uri!!)
+            assertFalse(lectureTreeUri == rotatedLectureUri)
+            assertEquals(rotatedLectureUri.toString(), secondWindow.state.value.active.uri)
+            assertFalse(mainWindow.documentAccess.hasWriteGrant(lectureTreeUri))
+            assertFalse(secondWindow.documentAccess.hasWriteGrant(lectureTreeUri))
+            assertTrue(mainWindow.documentAccess.hasWriteGrant(rotatedLectureUri))
+            assertTrue(secondWindow.documentAccess.hasWriteGrant(rotatedLectureUri))
+            assertFalse(secondWindow.documentWriteNeedsAccess(secLectureId))
+
+            assertTrue(secondWindow.state.value.active.dirty)
+            assertEquals(secDirtyLecture, secondWindow.state.value.active.content)
+            secondWindow.save(noteId = secLectureId)
+            await(debugInfo = {
+                "partBSave: dirty=${secondWindow.state.value.active.dirty} req=${secondWindow.documentAccessRequests.value} err=${secondWindow.state.value.error}"
+            }) {
+                !secondWindow.state.value.active.dirty &&
+                    secondWindow.documentAccessRequests.value == null
+            }
+            assertEquals(secDirtyLecture, File(opaqueRoot, "Sem1/PureMath/Lecture 1.md").readText())
+            assertTrue(mainWindow.recent.value.any { it.uri == rotatedLectureUri.toString() && it.pinned })
+            assertEquals(emptyList<String>(), providerInstance.unknownIdQueries)
+        } finally {
+            opaqueProvider?.onChildrenQuery = null
+            opaqueProvider?.onRenameDocument = null
+            releaseSecondPreIo.countDown()
+            TestAuthorityGrants.unregisterAuthority(opaqueAuthority)
+            opaqueRoot.deleteRecursively()
+            outsideDir.deleteRecursively()
+        }
+    }
+
     private fun newModel(explicitKey: String? = null): StudioViewModel {
         val store = ViewModelStore().also(viewModels::add)
         val key = explicitKey ?: "folder-actions-${UUID.randomUUID()}".also(workspaceKeys::add)
@@ -1251,8 +1517,10 @@ private class OpaqueFolderDocumentsProvider(
     private var nextSeq = 1
     private val idToPath = linkedMapOf<String, String>()
     private val pathToId = linkedMapOf<String, String>()
-    val unknownIdQueries = mutableListOf<String>()
-    var rejectPlainDocumentUris: Boolean = false
+    @Volatile var onChildrenQuery: ((String) -> Unit)? = null
+    @Volatile var onRenameDocument: ((String, String) -> Unit)? = null
+    val unknownIdQueries: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
+    @Volatile var rejectPlainDocumentUris: Boolean = false
 
     init {
         idToPath[ROOT_ID] = rootDir.canonicalPath
@@ -1380,6 +1648,7 @@ private class OpaqueFolderDocumentsProvider(
         val segments = uri.pathSegments
         if (segments.lastOrNull() == "children" && segments.size >= 2) {
             val parentDocId = Uri.decode(segments[segments.size - 2])
+            onChildrenQuery?.invoke(parentDocId)
             val parent = fileForId(parentDocId)
             if (!parent.isDirectory) throw FileNotFoundException(parentDocId)
             return MatrixCursor(cols).also { cursor ->
@@ -1444,9 +1713,14 @@ private class OpaqueFolderDocumentsProvider(
                         idForFile(dest)
                     }
                 }
-                val outUri = treeUriForDocId(newId)
+                val outUri = if (DocumentsContract.isTreeUri(requireNotNull(docUri))) {
+                    treeUriForDocId(newId)
+                } else {
+                    DocumentsContract.buildDocumentUri(attachedAuthority, newId)
+                }
                 grantPermissions(outUri)
                 out.putParcelable("uri", outUri)
+                onRenameDocument?.invoke(docId, displayName)
             }
             "android:deleteDocument" -> {
                 val docId = DocumentsContract.getDocumentId(requireNotNull(docUri))
@@ -1479,13 +1753,15 @@ private class OpaqueFolderDocumentsProvider(
     }
 
     private fun grantPermissions(docUri: Uri) {
+        val rwFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
         appContext.grantUriPermission(
             appContext.packageName,
             docUri,
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+            rwFlags or Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
         )
+        if (TestAuthorityGrants.isRegistered(docUri.authority)) {
+            TestAuthorityGrants.grant(docUri, rwFlags, persistable = true)
+        }
     }
 
     companion object {

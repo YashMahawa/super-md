@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QUICK_BACKEND", "software")
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QGuiApplication
 import agent_live
+import agent_live_cli
 
 PNG=base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lS8AAAAASUVORK5CYII=")
 
@@ -305,5 +306,183 @@ class LiveCLISubprocessTests(unittest.TestCase):
         stale=self.run_cli("attach",row["id"],asset,"--revision",row["revision"],"--name","stale.png")
         self.assertNotEqual(stale[0],0)
         self.assertEqual(set(note["assets"]),{"assets/local.png"})
+
+
+def _build_export_chunks(
+    payload: bytes,
+    split_offsets: list[int],
+    *,
+    job_id: str = "job-export-1",
+    filename: str = "lecture-notes.pdf",
+    fmt: str = "pdf",
+    mime_type: str = "application/pdf",
+    sha256: str | None = None,
+) -> list[dict[str, object]]:
+    expected_hash = hashlib.sha256(payload).hexdigest() if sha256 is None else sha256
+    boundaries = [0, *split_offsets, len(payload)]
+    chunks: list[dict[str, object]] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        part = payload[start:end]
+        chunks.append({
+            "jobId": job_id,
+            "filename": filename,
+            "format": fmt,
+            "mimeType": mime_type,
+            "bytes": len(payload),
+            "sha256": expected_hash,
+            "offset": start,
+            "nextOffset": end if end < len(payload) else None,
+            "body": base64.b64encode(part).decode("ascii"),
+        })
+    return chunks
+
+
+class _FakeExportChunkClient:
+    def __init__(self, chunks: list[dict[str, object]], on_request=None):
+        self._chunks = [dict(chunk) for chunk in chunks]
+        self._on_request = on_request
+        self.calls: list[dict[str, object]] = []
+
+    def document_action(self, tab: str, action: str, **kwargs):
+        call_index = len(self.calls)
+        record = {"tab": tab, "action": action, **kwargs}
+        self.calls.append(record)
+        if self._on_request is not None:
+            self._on_request(call_index, record)
+        if call_index >= len(self._chunks):
+            raise AssertionError(f"Unexpected export_chunk request #{call_index}: {record!r}")
+        return dict(self._chunks[call_index])
+
+
+class ExportDownloadHelperTests(unittest.TestCase):
+    def _sample_multi_chunk_payload(self) -> tuple[bytes, list[int]]:
+        chunk_0 = b"%PDF-1.7\r\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<< /Type /Catalog >>\r\nendobj\x00" * 9
+        chunk_1 = b"\nstream\r\n\x00\x01\x02\x7f\x80\xfe\xffbinary-diagram-bytes\r\nendstream\n" * 17
+        chunk_2 = b"xref\r\n0 2\r\ntrailer << /Root 1 0 R >>\nstartxref\n984\n%%EOF\n"
+        payload = chunk_0 + chunk_1 + chunk_2
+        return payload, [len(chunk_0), len(chunk_0) + len(chunk_1)]
+
+    def test_download_export_reassembles_multi_chunk_payload_byte_for_byte_and_verifies_checksum(self):
+        payload, splits = self._sample_multi_chunk_payload()
+        expected_sha = hashlib.sha256(payload).hexdigest()
+        chunks = _build_export_chunks(payload, splits, job_id="job-multi-ok", filename="study-pack.pdf")
+        self.assertEqual(len(chunks), 3)
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            dest = temp_root / "downloaded study-pack.pdf"
+            client = _FakeExportChunkClient(chunks)
+
+            result = agent_live_cli._download_export(client, "job-multi-ok", str(dest))
+
+            self.assertEqual(
+                client.calls,
+                [
+                    {"tab": "", "action": "export_chunk", "job_id": "job-multi-ok", "offset": 0, "limit": 262_144},
+                    {"tab": "", "action": "export_chunk", "job_id": "job-multi-ok", "offset": splits[0], "limit": 262_144},
+                    {"tab": "", "action": "export_chunk", "job_id": "job-multi-ok", "offset": splits[1], "limit": 262_144},
+                ],
+            )
+            self.assertTrue(dest.is_file())
+            self.assertEqual(dest.read_bytes(), payload)
+            self.assertEqual(Path(result["path"]), dest.resolve())
+            self.assertEqual(result["filename"], "study-pack.pdf")
+            self.assertEqual(result["format"], "pdf")
+            self.assertEqual(result["mimeType"], "application/pdf")
+            self.assertEqual(result["bytes"], len(payload))
+            self.assertEqual(result["sha256"], expected_sha)
+            self.assertEqual([entry.name for entry in temp_root.iterdir()], [dest.name])
+
+    def test_download_export_cleans_up_partial_file_on_inconsistent_metadata_after_first_write(self):
+        payload, splits = self._sample_multi_chunk_payload()
+        first_chunk = payload[:splits[0]]
+        cases: list[tuple[str, dict[str, object], str]] = [
+            ("changed_sha256", {"sha256": "0" * 64}, "Export metadata changed during download"),
+            ("changed_bytes", {"bytes": len(payload) + 128}, "Export metadata changed during download"),
+            ("changed_filename", {"filename": "other-name.pdf"}, "Export metadata changed during download"),
+            ("changed_format", {"format": "smd"}, "Export metadata changed during download"),
+            ("changed_mime", {"mimeType": "application/octet-stream"}, "Export metadata changed during download"),
+            ("mismatched_offset", {"offset": 0}, "Desktop returned invalid export chunk metadata"),
+            ("premature_eof_cursor", {"nextOffset": None}, "Desktop returned an invalid export chunk cursor"),
+        ]
+
+        for label, mutation, expected_error in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                temp_root = Path(directory)
+                dest = temp_root / "partial-metadata.pdf"
+                chunks = _build_export_chunks(payload, splits, job_id="job-meta-mismatch")
+                chunks[1].update(mutation)
+                observed_after_first_write: list[bytes] = []
+
+                def observe_partial(call_index: int, _record: dict[str, object]) -> None:
+                    if call_index == 1:
+                        self.assertTrue(dest.is_file())
+                        observed_after_first_write.append(dest.read_bytes())
+
+                client = _FakeExportChunkClient(chunks, on_request=observe_partial)
+                with self.assertRaisesRegex(agent_live_cli._CLIError, expected_error):
+                    agent_live_cli._download_export(client, "job-meta-mismatch", str(dest))
+
+                self.assertEqual(observed_after_first_write, [first_chunk])
+                self.assertEqual(len(client.calls), 2)
+                self.assertFalse(dest.exists())
+                self.assertEqual(list(temp_root.iterdir()), [])
+
+    def test_download_export_cleans_up_partial_file_on_incorrect_checksum_after_first_write(self):
+        payload, splits = self._sample_multi_chunk_payload()
+        first_chunk = payload[:splits[0]]
+        first_two_chunks = payload[:splits[1]]
+        corrupted_tail = bytearray(payload[splits[1]:])
+        corrupted_tail[0] ^= 0xFF
+
+        with tempfile.TemporaryDirectory() as directory:
+            temp_root = Path(directory)
+            dest = temp_root / "corrupted-checksum.pdf"
+            chunks = _build_export_chunks(payload, splits, job_id="job-bad-checksum")
+            chunks[2]["body"] = base64.b64encode(bytes(corrupted_tail)).decode("ascii")
+            observed_writes: dict[int, bytes] = {}
+
+            def observe_progress(call_index: int, _record: dict[str, object]) -> None:
+                if call_index in (1, 2):
+                    self.assertTrue(dest.is_file())
+                    observed_writes[call_index] = dest.read_bytes()
+
+            client = _FakeExportChunkClient(chunks, on_request=observe_progress)
+            with self.assertRaisesRegex(
+                agent_live_cli._CLIError,
+                "Downloaded export did not match its SHA-256 checksum",
+            ):
+                agent_live_cli._download_export(client, "job-bad-checksum", str(dest))
+
+            self.assertEqual(observed_writes, {1: first_chunk, 2: first_two_chunks})
+            self.assertEqual(len(client.calls), 3)
+            self.assertFalse(dest.exists())
+            self.assertEqual(list(temp_root.iterdir()), [])
+
+    def test_download_export_preserves_existing_destination_by_exclusive_creation(self):
+        payload, splits = self._sample_multi_chunk_payload()
+        sentinel = b"existing-export-must-survive\x00\r\n\xff"
+
+        for bad_checksum in (False, True):
+            with self.subTest(bad_checksum=bad_checksum), tempfile.TemporaryDirectory() as directory:
+                temp_root = Path(directory)
+                dest = temp_root / "already-exists.pdf"
+                dest.write_bytes(sentinel)
+                chunks = _build_export_chunks(
+                    payload,
+                    splits,
+                    job_id="job-exclusive",
+                    sha256=("f" * 64) if bad_checksum else None,
+                )
+                client = _FakeExportChunkClient(chunks)
+
+                with self.assertRaises(FileExistsError):
+                    agent_live_cli._download_export(client, "job-exclusive", str(dest))
+
+                self.assertEqual(len(client.calls), 1)
+                self.assertTrue(dest.is_file())
+                self.assertEqual(dest.read_bytes(), sentinel)
+                self.assertEqual([entry.name for entry in temp_root.iterdir()], [dest.name])
+
 
 if __name__=="__main__": unittest.main()

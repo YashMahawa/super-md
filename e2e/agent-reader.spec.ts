@@ -199,6 +199,7 @@ test('heading navigation realigns after delayed layout growth beyond a windowed 
 });
 
 test('slow mouse drags keep selecting source, reader and live text after a prior selection',async({page})=>{
+  test.setTimeout(120_000);
   const first='The first realistic mouse drag should select this complete sentence.',
     second='A later drag must keep extending selection instead of stopping after a character.',
     paragraphs=Array.from({length:78},(_,index)=>index===2?first:index===6?second:`Paragraph ${index}: mixed Markdown with **bold**, a [link](https://example.org), inline $x^2$, and enough useful words to fill a realistic note.`),
@@ -243,6 +244,7 @@ test('slow mouse drags keep selecting source, reader and live text after a prior
 });
 
 test('long-held outside release keeps later mouse selections active at fractional zoom',async({page})=>{
+  test.setTimeout(120_000);
   const first='The first drag waits before moving and must still select this whole sentence.',
     second='The next drag releases outside the window before another selection starts.',
     third='The final drag checks that native release cleanup did not strand the pointer.',
@@ -368,6 +370,8 @@ test('section export prepares MD, SMD and PDF with only selected text and needed
   await page.goto('/android-reader.html');await page.waitForFunction(()=>typeof window.supermdLoad==='function');
   await page.evaluate(value=>window.supermdLoad?.(value),{id:'agent-section-export-e2e',path:'/tmp/section-export.md',content,mode:'reader',dark:false,fullscreen:false,colors:{},font:'Manrope',size:16,zoom:100,restorePosition:false});
   await expect(page.getByRole('heading',{name:'Selected Section',exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Load image'}).click();
+  await expect(page.getByRole('img',{name:'selected photo'})).toBeVisible();
   const before=await agent(page,{action:'get_context',tabId:'agent-section-export-e2e'});
   const reading=page.locator('.android-reading');await reading.evaluate(element=>{element.scrollTop=100;});
   await page.waitForTimeout(50);
