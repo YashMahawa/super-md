@@ -4006,6 +4006,7 @@ class Studio(QObject):
             if self.tabs:
                 self.saveAsRequested.emit(self._current()["name"])
         elif operation["action"] == "overwrite_conflict": self._save_current(True)
+        elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
                 current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
@@ -4168,40 +4169,103 @@ class Studio(QObject):
             self._flush("overwrite_conflict")
             return
         if choice == "reload":
-            tab = self._current()
-            if not tab.get("path"):
-                return
-            tab_id = tab["id"]
-            path = Path(tab["path"])
-            def done(result, error):
-                if error:
-                    return
-                target = next((t for t in self.tabs if t["id"] == tab_id), None)
-                if not target:
-                    return
-                content, assets, portable = result
+            self._flush("reload_conflict")
+            return
+
+    def _reload_current_from_disk(self):
+        tab = self._current()
+        if not tab.get("path"):
+            return
+        tab_id = tab["id"]
+        path = Path(tab["path"])
+        was_dirty = self._is_dirty(tab)
+        captured = _snapshot_tab_state(tab)
+        archived_draft = None
+        if was_dirty:
+            archived_assets = dict(captured.get("assets", {}))
+            raw_name = str(captured.get("name") or "Untitled.md")
+            archived_draft = dict(captured)
+            archived_draft.update(
+                id=uuid.uuid4().hex,
+                name=raw_name if raw_name.startswith("Recovered ") else f"Recovered {raw_name}",
+                path="",
+                saved="",
+                assets=archived_assets,
+                saved_assets={},
+                assets_dirty=bool(archived_assets),
+                portable=bool(captured.get("portable")),
+                conflict=False,
+            )
+
+        def work():
+            loaded = open_note(path)
+            reference = None
+            if archived_draft is not None:
                 try:
-                    st = path.stat()
-                    self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
-                except OSError:
-                    pass
-                self.reader_edits.clear(tab_id)
-                self.session.reader_assets.revoke_tab(self.window_id, tab_id)
-                if tab_id == self.active:
-                    self._last_reader_text = None
-                target.update(
-                    content=content,
-                    saved=content,
-                    assets=assets,
-                    saved_assets=dict(assets),
-                    assets_dirty=False,
-                    portable=portable,
-                    conflict=False,
-                )
-                self.message = "Reloaded note from disk"
+                    reference = self.session.closed_note_store.save(archived_draft)
+                except Exception as failure:
+                    raise RuntimeError(f"ARCHIVE_FAILED:{failure}") from failure
+            return loaded, reference
+
+        def done(outcome, error):
+            if error:
+                if str(error).startswith("ARCHIVE_FAILED:"):
+                    detail = str(error)[len("ARCHIVE_FAILED:"):]
+                    self.message = f"Could not archive draft before reloading: {detail}"
+                else:
+                    self.message = f"Could not reload note from disk: {error}"
                 self._recover()
-                self._emit(load=tab_id == self.active)
-            self._submit(lambda: open_note(path), done, True)
+                self._emit(False)
+                return
+            target = next((t for t in self.tabs if t["id"] == tab_id), None)
+            if not target:
+                return
+            if (
+                target.get("content") != captured.get("content")
+                or target.get("saved") != captured.get("saved")
+                or target.get("assets") != captured.get("assets")
+                or target.get("assets_dirty") != captured.get("assets_dirty")
+                or target.get("path") != captured.get("path")
+            ):
+                self.message = "The note changed while reloading from disk. It remains open with the latest draft."
+                self._recover()
+                self._emit(False)
+                return
+            loaded, reference = outcome
+            if reference is not None:
+                next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
+                try:
+                    self.session.closed_note_store.save_index(next_refs)
+                except Exception as failure:
+                    self.message = f"Could not update closed-note recovery before reloading: {failure}"
+                    self._recover()
+                    self._emit(False)
+                    return
+                self.closed_tabs[:] = next_refs
+            content, assets, portable = loaded
+            try:
+                st = path.stat()
+                self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+            self.reader_edits.clear(tab_id)
+            self.session.reader_assets.revoke_tab(self.window_id, tab_id)
+            if tab_id == self.active:
+                self._last_reader_text = None
+            target.update(
+                content=content,
+                saved=content,
+                assets=assets,
+                saved_assets=dict(assets),
+                assets_dirty=False,
+                portable=portable,
+                conflict=False,
+            )
+            self.message = "Reloaded note from disk"
+            self._recover()
+            self._emit(load=tab_id == self.active)
+
+        self._submit(work, done, True, self.writes)
 
     def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
