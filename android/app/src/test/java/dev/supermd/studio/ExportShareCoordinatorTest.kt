@@ -97,7 +97,14 @@ class ExportShareCoordinatorTest {
         awaitSuspend { model.shareMarkdown(noteId, "# Lecture\n\n![Plot](assets/plot.svg)\n", assets, archive = true) }
         assertEquals(Intent.ACTION_SEND, intents[1].action)
         assertEquals("application/zip", intents[1].type)
-        assertEquals("${app.packageName}.share", intents[1].clipData?.getItemAt(0)?.uri?.authority)
+        val zipUri = intents[1].clipData?.getItemAt(0)?.uri!!
+        assertEquals("${app.packageName}.share", zipUri.authority)
+        val entries = mutableSetOf<String>()
+        java.util.zip.ZipInputStream(app.contentResolver.openInputStream(zipUri)!!).use { zip ->
+            while (true) { val entry = zip.nextEntry ?: break; entries += entry.name }
+        }
+        val expectedMd = ExportFilename.suggestedName(model.state.value.active.name, NativeExportFormat.MARKDOWN)
+        assertEquals(setOf(expectedMd, "assets/plot.svg"), entries)
     }
 
     @Test fun failClearsPendingShareFileSoSubsequentExportDoesNotTriggerFinishShare() {
@@ -107,9 +114,11 @@ class ExportShareCoordinatorTest {
         model.shareReady = { shareCalls++ }
         assertTrue(model.prepareShare("smd"))
         assertNotNull(model.portableOutput)
+        val exportedSmd = java.io.File(model.portableOutput!!.path!!)
         model.fail("Simulated reader failure")
         awaitSuspend { model.writePortable(noteId, "# Clean\n", JSONObject(), save = false, originalContent = "# Clean\n") }
         assertEquals(0, shareCalls)
         assertEquals("Portable .smd exported", model.state.value.message)
+        assertTrue(ExportFilename.hasExpectedHeader(exportedSmd.readBytes().let { it.copyOf(minOf(it.size, 64)) }, NativeExportFormat.PORTABLE_SMD))
     }
 }

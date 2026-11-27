@@ -36,6 +36,7 @@ internal class ExportShareCoordinator(
     private val readPortableForceOverwrite: () -> Boolean, private val writePortableForceOverwrite: (Boolean) -> Unit,
     private val readCloseAfterSaveNoteId: () -> String?, private val writeCloseAfterSaveNoteId: (String?) -> Unit,
     private val readListedRelative: () -> String,
+    private val resolveVerifiedWriteDestination: (Uri) -> Uri, private val clearDocumentAccessFailure: (String) -> Unit,
     private val diskMatchesBaseline: (Uri, Note) -> Boolean, private val recordPortableBaseline: (String, String?) -> Unit,
     private val resolveDisplayName: (Uri) -> String?, private val resolveOpenFolderRelativeOnIo: (Uri) -> String?,
     private val rememberNote: (Note) -> Unit, private val listFolder: (Uri, String) -> Job,
@@ -213,7 +214,7 @@ internal class ExportShareCoordinator(
             val rebindId = if (!save) readPortableSaveAsNoteId() else null
             val effectiveId = rebindId ?: id
             val note = readState().tabs.find { it.id == effectiveId } ?: error("The note is no longer open")
-            val target = if (save) note.uri?.let { documentAccess.resolve(Uri.parse(it), writing = true) } else portableOutput
+            val target = if (save) note.uri?.let { resolveVerifiedWriteDestination(Uri.parse(it)) } else portableOutput
             require(target != null) { "Choose a portable file destination" }
             val force = readPortableForceOverwrite()
             writePortableForceOverwrite(false)
@@ -247,6 +248,7 @@ internal class ExportShareCoordinator(
                     if (rebinding) {
                         portableOutput = null; portableDestinationIsNew = false; writePortableSaveAsNoteId(null)
                         autosavePending.remove(effectiveId)
+                        clearDocumentAccessFailure(destination.toString())
                         recordPortableBaseline(effectiveId, nextDirectory!!)
                         changeState { s ->
                             s.copy(
