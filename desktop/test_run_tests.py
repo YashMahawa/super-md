@@ -63,7 +63,7 @@ def _workflow_desktop_test_timeout_minutes(workflow_path: Path) -> int:
 
 
 class RunTestsWatchdogTest(unittest.TestCase):
-    def test_ci_and_release_platforms_receive_calibrated_suite_watchdog(self) -> None:
+    def test_macos_arm64_and_x86_64_both_receive_extended_suite_watchdog(self) -> None:
         arm64_timeout, arm64_exit = _captured_watchdog_timeout("darwin", "arm64")
         x64_timeout, x64_exit = _captured_watchdog_timeout("darwin", "x86_64")
         linux_timeout, linux_exit = _captured_watchdog_timeout("linux", "x86_64")
@@ -85,11 +85,20 @@ class RunTestsWatchdogTest(unittest.TestCase):
         win_watchdog, _ = _captured_watchdog_timeout("win32", "AMD64")
         ci_minutes = _workflow_desktop_test_timeout_minutes(REPO_ROOT / ".github" / "workflows" / "ci.yml")
         release_minutes = _workflow_desktop_test_timeout_minutes(REPO_ROOT / ".github" / "workflows" / "release.yml")
-        for label, watchdog in (("arm64", arm64_watchdog), ("linux", linux_watchdog), ("win32", win_watchdog)):
+        for label, watchdog in (
+            ("arm64", arm64_watchdog),
+            ("linux", linux_watchdog),
+            ("windows", win_watchdog),
+        ):
             self.assertGreater(
                 ci_minutes * 60,
                 watchdog,
                 f"ci.yml timeout-minutes ({ci_minutes}m = {ci_minutes * 60}s) must exceed {label} watchdog ({watchdog}s)",
+            )
+            self.assertGreater(
+                release_minutes * 60,
+                watchdog,
+                f"release.yml timeout-minutes ({release_minutes}m = {release_minutes * 60}s) must exceed {label} watchdog ({watchdog}s)",
             )
         self.assertGreater(
             release_minutes * 60,
