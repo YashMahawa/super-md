@@ -44,6 +44,10 @@ from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
+try:
+    from . import studio_exports
+except ImportError:
+    import studio_exports
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
@@ -507,35 +511,7 @@ class WorkspaceDropFilter(QObject):
         return True
 
 def export_destination(value: str, format: str) -> Path:
-    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
-    # These are known payload extensions, not merely dotted stem names.  In
-    # particular, .fmd is an older portable format and must not be silently
-    # rewritten as .fmd.pdf/.fmd.smd.
-    payload_formats = {
-        ".pdf": "pdf",
-        ".smd": "smd",
-        ".md": "md",
-        ".markdown": "md",
-        ".txt": "md",
-        ".zip": "mdzip",
-    }
-    if format not in suffixes:
-        raise ValueError("Unsupported export format")
-    destination = local_path(value)
-    if not destination.name or destination.is_dir():
-        raise ValueError("Choose a file destination for the export")
-    expected = suffixes[format]
-    existing_suffix = destination.suffix.casefold()
-    if existing_suffix == ".fmd":
-        raise ValueError("Legacy .fmd files are not a supported export destination; choose .smd or a new filename")
-    if existing_suffix in payload_formats:
-        if payload_formats[existing_suffix] != format:
-            raise ValueError(f"Choose a filename ending in {expected} for this export")
-        return destination
-    target = destination.with_name(destination.name + expected)
-    if target.exists():
-        raise ValueError(f"The {expected} destination already exists; choose its full filename to confirm replacement")
-    return target
+    return studio_exports.export_destination(value, format)
 
 def _same_closed_revision(current: dict, captured: dict) -> bool:
     """Compare content-bearing fields after a background close snapshot."""
@@ -3631,6 +3607,7 @@ class Studio(QObject):
             if self.tabs:
                 self.saveAsRequested.emit(self._current()["name"])
         elif operation["action"] == "overwrite_conflict": self._save_current(True)
+        elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
                 current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
@@ -3793,40 +3770,103 @@ class Studio(QObject):
             self._flush("overwrite_conflict")
             return
         if choice == "reload":
-            tab = self._current()
-            if not tab.get("path"):
-                return
-            tab_id = tab["id"]
-            path = Path(tab["path"])
-            def done(result, error):
-                if error:
-                    return
-                target = next((t for t in self.tabs if t["id"] == tab_id), None)
-                if not target:
-                    return
-                content, assets, portable = result
+            self._flush("reload_conflict")
+            return
+
+    def _reload_current_from_disk(self):
+        tab = self._current()
+        if not tab.get("path"):
+            return
+        tab_id = tab["id"]
+        path = Path(tab["path"])
+        was_dirty = self._is_dirty(tab)
+        captured = _snapshot_tab_state(tab)
+        archived_draft = None
+        if was_dirty:
+            archived_assets = dict(captured.get("assets", {}))
+            raw_name = str(captured.get("name") or "Untitled.md")
+            archived_draft = dict(captured)
+            archived_draft.update(
+                id=uuid.uuid4().hex,
+                name=raw_name if raw_name.startswith("Recovered ") else f"Recovered {raw_name}",
+                path="",
+                saved="",
+                assets=archived_assets,
+                saved_assets={},
+                assets_dirty=bool(archived_assets),
+                portable=bool(captured.get("portable")),
+                conflict=False,
+            )
+
+        def work():
+            loaded = open_note(path)
+            reference = None
+            if archived_draft is not None:
                 try:
-                    st = path.stat()
-                    self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
-                except OSError:
-                    pass
-                self.reader_edits.clear(tab_id)
-                self.session.reader_assets.revoke_tab(self.window_id, tab_id)
-                if tab_id == self.active:
-                    self._last_reader_text = None
-                target.update(
-                    content=content,
-                    saved=content,
-                    assets=assets,
-                    saved_assets=dict(assets),
-                    assets_dirty=False,
-                    portable=portable,
-                    conflict=False,
-                )
-                self.message = "Reloaded note from disk"
+                    reference = self.session.closed_note_store.save(archived_draft)
+                except Exception as failure:
+                    raise RuntimeError(f"ARCHIVE_FAILED:{failure}") from failure
+            return loaded, reference
+
+        def done(outcome, error):
+            if error:
+                if str(error).startswith("ARCHIVE_FAILED:"):
+                    detail = str(error)[len("ARCHIVE_FAILED:"):]
+                    self.message = f"Could not archive draft before reloading: {detail}"
+                else:
+                    self.message = f"Could not reload note from disk: {error}"
                 self._recover()
-                self._emit(load=tab_id == self.active)
-            self._submit(lambda: open_note(path), done, True)
+                self._emit(False)
+                return
+            target = next((t for t in self.tabs if t["id"] == tab_id), None)
+            if not target:
+                return
+            if (
+                target.get("content") != captured.get("content")
+                or target.get("saved") != captured.get("saved")
+                or target.get("assets") != captured.get("assets")
+                or target.get("assets_dirty") != captured.get("assets_dirty")
+                or target.get("path") != captured.get("path")
+            ):
+                self.message = "The note changed while reloading from disk. It remains open with the latest draft."
+                self._recover()
+                self._emit(False)
+                return
+            loaded, reference = outcome
+            if reference is not None:
+                next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
+                try:
+                    self.session.closed_note_store.save_index(next_refs)
+                except Exception as failure:
+                    self.message = f"Could not update closed-note recovery before reloading: {failure}"
+                    self._recover()
+                    self._emit(False)
+                    return
+                self.closed_tabs[:] = next_refs
+            content, assets, portable = loaded
+            try:
+                st = path.stat()
+                self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+            self.reader_edits.clear(tab_id)
+            self.session.reader_assets.revoke_tab(self.window_id, tab_id)
+            if tab_id == self.active:
+                self._last_reader_text = None
+            target.update(
+                content=content,
+                saved=content,
+                assets=assets,
+                saved_assets=dict(assets),
+                assets_dirty=False,
+                portable=portable,
+                conflict=False,
+            )
+            self.message = "Reloaded note from disk"
+            self._recover()
+            self._emit(load=tab_id == self.active)
+
+        self._submit(work, done, True, self.writes)
 
     def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
@@ -4311,9 +4351,7 @@ class Studio(QObject):
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
-        suffix = "zip" if format == "mdzip" else format
-        filename = (folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix
-        return QUrl.fromLocalFile(str(self._default_output_directory() / folder_ops._pure_path(filename).name))
+        return studio_exports.default_export_location(self, format)
 
     @Slot(str, result=QUrl)
     def defaultThemeExportLocation(self, name): return studio_chrome.default_theme_export_location(self, name)
@@ -4441,21 +4479,7 @@ class Studio(QObject):
 
     @Slot(str, str)
     def exportTo(self, value, format):
-        if self.pending_export:
-            self.message = "An export is already in progress; finish or cancel it before choosing another destination"
-            self._emit(False)
-            return
-        self.pending_save_as = ""
-        self.pending_export = ""
-        try:
-            self.pending_export = str(export_destination(value, format))
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-        if format in ("md", "mdzip"): self.readerCall.emit(f"window.supermdExportMarkdown?.({str(format == 'mdzip').lower()})")
-        elif format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
-        else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")
+        studio_exports.export_to(self, value, format)
 
     @Slot(str)
     def command(self, action):
@@ -4505,159 +4529,16 @@ class Studio(QObject):
 
     @staticmethod
     def _agent_export_metadata(path: Path, format: str) -> dict:
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as source:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                digest.update(chunk)
-        return {"path": str(path), "filename": path.name, "format": format,
-                "bytes": size, "sha256": digest.hexdigest()}
+        return studio_exports.agent_export_metadata(path, format)
 
     def _agent_export_native(self, request_id: str, args: dict):
-        tab_id = args.get("id")
-        target = next((tab for tab in self.tabs if tab["id"] == tab_id), None)
-        if target is None or target["id"] != self.active:
-            raise ValueError("Export the currently active live tab")
-        fmt = args.get("format")
-        if fmt not in ("pdf", "smd", "md"):
-            raise ValueError("Export format must be PDF, SMD or Markdown")
-        expected = args.get("expectedRevision")
-        current = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
-        if not isinstance(expected, str) or expected != current:
-            raise ValueError("Live tab revision changed; inspect it again before exporting")
-        if self.pending_export or self.pending_save_as:
-            raise ValueError("Finish the current save or export before starting another one")
-        content, assets = args.get("content"), args.get("assets", {})
-        if not isinstance(content, str) or len(content.encode("utf-8")) > 20_000_000:
-            raise ValueError("Prepared export content must be a string under 20 MB")
-        if not isinstance(assets, dict) or len(assets) > 512 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in assets.items()):
-            raise ValueError("Prepared export assets are invalid")
-        if sum(len(value) for value in assets.values()) > 110_000_000:
-            raise ValueError("Prepared export assets exceed the bounded total size")
-        options = args.get("options", {})
-        if fmt == "pdf":
-            from agent_exports import validate_pdf_options
-            if not isinstance(options, dict):
-                raise ValueError("PDF options must be an object")
-            supplied = dict(options)
-            options = {**DEFAULT_PDF, **self.settings.get("pdf", {}), **supplied}
-            options["themeAccent"] = supplied.get("themeAccent") or self._colors().get("primary", "#386a57")
-            options = validate_pdf_options(options)
-        output = self._agent_export_path(args.get("filename", ""), fmt, target)
-        self.pending_export = str(output)
-        job_id = uuid.uuid4().hex
-        while len(self._agent_job_records) >= 20:
-            removable = next((key for key, value in self._agent_job_records.items()
-                              if value.get("status") in ("completed", "failed", "cancelled")), None)
-            if removable is None:
-                self.pending_export = ""
-                output.unlink(missing_ok=True)
-                raise ValueError("The desktop already has 20 active agent export jobs")
-            self._agent_job_records.pop(removable, None)
-        self._agent_exports[request_id] = {"path": str(output), "format": fmt, "jobId": job_id}
-        self._agent_job_records[job_id] = {"jobId": job_id, "action": "export_document", "status": "running", "filename": output.name,
-                                           "format": fmt, "path": str(output), "bytes": 0}
-        command = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native"}[fmt]
-        forwarded = {"id": tab_id, "content": content, "assets": assets, "options": options,
-                     "expectedRevision": expected, "save": False, "jobId": job_id}
-        try:
-            self.post(request_id, command, json.dumps(forwarded, ensure_ascii=False, separators=(",", ":")))
-            self.replied.emit(request_id, json.dumps({"jobId": job_id, "status": "running",
-                                                     "filename": output.name, "format": fmt}), "")
-        except Exception:
-            self._agent_exports.pop(request_id, None)
-            self.pending_export = ""
-            try:
-                output.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        studio_exports.agent_export_native(self, request_id, args)
 
     def _agent_job_status(self, job_id):
-        if not isinstance(job_id, str) or not job_id:
-            raise ValueError("jobId is required")
-        record = self._agent_job_records.get(job_id)
-        if not record:
-            raise ValueError("Export job is unavailable or expired")
-        result = {key: value for key, value in record.items() if key != "path" and not key.startswith("_")}
-        if record.get("status") == "completed":
-            if record.get("path"):
-                result["path"] = record["path"]
-            if record.get("action") == "export_document" and isinstance(record.get("_fingerprint"), dict):
-                result["downloadable"] = True
-        return result
+        return studio_exports.agent_job_status(self, job_id)
 
     def _agent_export_chunk(self, job_id, offset=0, limit=262_144):
-        """Read one bounded segment from a completed, registered export artifact."""
-        if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
-            raise ValueError("jobId is required")
-        record = self._agent_job_records.get(job_id)
-        if not isinstance(record, dict) or record.get("action") != "export_document":
-            raise ValueError("Export artifact job is unavailable or is not an export")
-        if record.get("status") != "completed":
-            raise ValueError("Export artifact is not completed")
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise ValueError("offset must be a nonnegative byte offset")
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 524_288:
-            raise ValueError("limit must be between 1 and 524,288 bytes")
-        total = record.get("bytes")
-        fingerprint = record.get("_fingerprint")
-        expected_hash = record.get("sha256")
-        file_path = record.get("path")
-        fmt = record.get("format")
-        filename = record.get("filename")
-        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-            raise ValueError("Export artifact metadata is invalid or incomplete")
-        if offset > total:
-            raise ValueError("offset must be between 0 and the artifact byte count")
-        if (not isinstance(fingerprint, dict) or fmt not in ("pdf", "smd", "md")
-                or not isinstance(filename, str) or not filename
-                or not isinstance(file_path, str) or not isinstance(expected_hash, str)
-                or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)):
-            raise ValueError("Export artifact metadata is invalid or incomplete")
-        path = Path(file_path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            path_stat = path.stat(follow_symlinks=False)
-            registered_identity = (fingerprint.get("device"), fingerprint.get("inode"),
-                                   fingerprint.get("size"), fingerprint.get("mtimeNs"))
-            if (path.is_symlink() or not stat.S_ISREG(path_stat.st_mode)
-                    or (path_stat.st_dev, path_stat.st_ino, path_stat.st_size, path_stat.st_mtime_ns) != registered_identity):
-                raise ValueError("Export artifact changed after completion")
-            fd = os.open(path, flags)
-        except (OSError, ValueError) as error:
-            raise ValueError("Export artifact changed after completion") from error
-        try:
-            before = os.fstat(fd)
-            expected_identity = (fingerprint.get("device"), fingerprint.get("inode"),
-                                 fingerprint.get("size"), fingerprint.get("mtimeNs"))
-            actual_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            if not stat.S_ISREG(before.st_mode) or actual_identity != expected_identity:
-                raise ValueError("Export artifact changed after completion")
-            with os.fdopen(fd, "rb") as stream:
-                fd = -1
-                stream.seek(offset)
-                body = stream.read(min(limit, total - offset))
-                after = os.fstat(stream.fileno())
-                if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != actual_identity
-                        or len(body) != min(limit, total - offset)):
-                    raise ValueError("Export artifact changed during retrieval")
-        except OSError as error:
-            raise ValueError("Export artifact could not be read") from error
-        finally:
-            if fd >= 0:
-                os.close(fd)
-        mime = {"pdf": "application/pdf", "smd": "application/x-supermd",
-                "md": "text/markdown"}[fmt]
-        next_offset = offset + len(body)
-        return {"jobId": job_id, "filename": filename, "format": fmt, "mimeType": mime,
-                "bytes": total, "sha256": expected_hash, "offset": offset,
-                "nextOffset": next_offset if next_offset < total else None,
-                "body": base64.b64encode(body).decode("ascii")}
+        return studio_exports.agent_export_chunk(self, job_id, offset, limit)
 
     def _agent_document_action(self, args):
         action = args.get("action")
@@ -5929,13 +5810,9 @@ class Studio(QObject):
                             return {**result,"provenance":{"verified":False,"unsaved":True,"reason":f"Could not save execution output: {error}"}}
                     return result
                 if command == "export_markdown_native":
-                    if not output: raise ValueError("Choose a Markdown destination")
-                    if not isinstance(args.get("archive", False), bool): raise ValueError("archive must be a boolean")
-                    if captured.get("path") and Path(output).resolve() == Path(captured["path"]).resolve():
-                        raise ValueError("Markdown export must not overwrite the original note")
-                    if args.get("archive", False): write_markdown_zip(Path(output), args.get("content"), args.get("assets", {}))
-                    else: write_markdown_export(Path(output), args.get("content"), args.get("assets", {}))
-                    return export_result(output)
+                    return studio_exports.execute_export_markdown_native(output, args, captured, export_result)
+                if command == "export_fmd_native" and not args.get("save") and not save_as:
+                    return studio_exports.execute_export_smd_native(output, args, export_result)
                 if command == "export_fmd_native":
                     target_path = Path(captured["path"]) if args.get("save") else Path(output)
                     if args.get("save") and not force_portable_overwrite and target_path.exists():
@@ -5954,65 +5831,7 @@ class Studio(QObject):
                         pass
                     return result_data
                 if command == "export_pdf_native":
-                    job = export_job
-                    assert job is not None
-                    destination = Path(output)
-                    stage = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.stage.pdf")
-                    process = None
-                    rust_temp = None
-                    try:
-                        job.check()
-                        if not destination.parent.is_dir(): raise ValueError("The PDF destination folder is unavailable")
-                        engine = self._engine()
-                        args["assets"].update(self.session.font_store.pdf_assets(args["options"]["fontFamily"]))
-                        job.check()
-                        with tempfile.TemporaryFile() as request_file, tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-                            request_size = 0
-                            for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(args):
-                                encoded = chunk.encode("utf-8")
-                                request_size += len(encoded)
-                                request_file.write(encoded)
-                            request_file.flush()
-                            request_file.seek(0)
-                            job.check()
-                            process = subprocess.Popen(
-                                [str(engine), "export-json", str(stage)],
-                                stdin=request_file, stdout=stdout_file, stderr=stderr_file,
-                            )
-                            rust_temp = stage.with_name(f".{stage.name}.{process.pid}.tmp")
-                            job.attach_process(process)
-                            deadline=time.monotonic()+120
-                            while True:
-                                try:
-                                    process.wait(timeout=.1)
-                                    break
-                                except subprocess.TimeoutExpired:
-                                    if not job.cancelled.is_set() and time.monotonic()<deadline:continue
-                                    job.stop_process()
-                                    try: process.wait(timeout=2)
-                                    except subprocess.TimeoutExpired:
-                                        try: process.kill()
-                                        except OSError: pass
-                                        process.wait()
-                                    job.check()
-                                    raise ValueError("PDF export timed out")
-                            job.check()
-                            stderr_file.seek(0)
-                            error_text = stderr_file.read(64 * 1024).decode("utf-8", errors="replace").strip()
-                        if process.returncode:
-                            raise ValueError(error_text or "PDF export failed")
-                        if not stage.is_file() or stage.stat().st_size < 5:
-                            raise ValueError("PDF export produced an incomplete file")
-                        with stage.open("rb") as generated:
-                            if generated.read(5) != b"%PDF-": raise ValueError("PDF export produced an invalid file")
-                        job.promote(stage, destination,lambda:self.readerCall.emit("window.supermdExportPhase?.("+json.dumps(job.job_id)+",'publishing')"))
-                        return export_result(output)
-                    finally:
-                        for owned in (stage, rust_temp):
-                            if owned is not None:
-                                try: owned.unlink(missing_ok=True)
-                                except OSError: pass
-                        self._export_jobs.discard(job.job_id, job)
+                    return studio_exports.execute_export_pdf_native(self, output, args, export_job, export_result)
                 raise ValueError(f"Unsupported command: {command}")
             def finished(result,error):
                 if is_portable_tab_save:
@@ -6023,16 +5842,7 @@ class Studio(QObject):
                     self.pending_save_as_tab = ""
                 if error:
                     if agent_export_info:
-                        record = self._agent_job_records.get(agent_export_info.get("jobId"))
-                        if record:
-                            record.update(status="failed", error=str(error)[:1000])
-                        try:
-                            reserved = Path(agent_export_info["path"])
-                            if reserved.exists() and reserved.stat().st_size == 0:
-                                reserved.unlink()
-                        except OSError:
-                            pass
-                        self._agent_exports.pop(id, None)
+                        studio_exports.fail_agent_export(self, id, agent_export_info, error)
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
@@ -6112,35 +5922,9 @@ class Studio(QObject):
                     self.pending_save_as = ""
                     self.pending_save_as_tab = ""
                 elif command.startswith("export_"):
-                    exported_path = result["path"]
-                    self.message = f"Exported {Path(exported_path).name}"
-                    if is_searchable_note_name(Path(exported_path).name):
-                        self._refresh_open_folder_trees(exported_path)
+                    studio_exports.finalize_standalone_export(self, result["path"])
                 if agent_export_info:
-                    record = self._agent_job_records.get(agent_export_info.get("jobId"))
-                    if record:
-                        artifact_path = Path(result.get("path", ""))
-                        try:
-                            artifact_stat = artifact_path.stat(follow_symlinks=False)
-                            artifact_bytes = result.get("bytes")
-                            artifact_hash = result.get("sha256")
-                            if (artifact_path.is_symlink() or not stat.S_ISREG(artifact_stat.st_mode)
-                                    or not isinstance(artifact_bytes, int) or isinstance(artifact_bytes, bool)
-                                    or artifact_bytes != artifact_stat.st_size
-                                    or not isinstance(artifact_hash, str)
-                                    or not re.fullmatch(r"[0-9a-f]{64}", artifact_hash)):
-                                raise ValueError("Export artifact metadata does not match the completed file")
-                            record.update(status="completed", bytes=artifact_bytes, sha256=artifact_hash,
-                                          path=str(artifact_path), filename=artifact_path.name,
-                                          _fingerprint={"device": artifact_stat.st_dev,
-                                                        "inode": artifact_stat.st_ino,
-                                                        "size": artifact_stat.st_size,
-                                                        "mtimeNs": artifact_stat.st_mtime_ns})
-                        except (OSError, ValueError) as failure:
-                            record.update(status="failed", error=str(failure)[:500])
-                    if result.get("path"):
-                        self._agent_owned_files.add(str(Path(result["path"]).resolve()))
-                    self._agent_exports.pop(id, None)
+                    studio_exports.complete_agent_export(self, id, agent_export_info, result)
                 if not agent_export_info:
                     self.replied.emit(id,json.dumps(result),"")
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
@@ -6153,16 +5937,7 @@ class Studio(QObject):
         except Exception as error:
             if python_job is not None:
                 self._python_jobs.discard(python_job)
-            agent_export = self._agent_exports.pop(id, None)
-            if agent_export:
-                if self.pending_export == agent_export.get("path"):
-                    self.pending_export = ""
-                try:
-                    reserved = Path(agent_export["path"])
-                    if reserved.exists() and reserved.stat().st_size == 0:
-                        reserved.unlink()
-                except (OSError, TypeError, KeyError):
-                    pass
+            studio_exports.cleanup_failed_post_agent_export(self, id)
             self.replied.emit(id,"null",str(error))
 
     @Slot()
