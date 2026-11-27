@@ -64,26 +64,8 @@ function randomToken(): string {
 }
 
 async function defaultResolveSandboxAssets(): Promise<ResolvedSandboxAssets> {
-  let lastError: unknown;
-  const delaysMs = [80, 240];
-  for (let attempt = 0; attempt <= delaysMs.length; attempt++) {
-    try {
-      const mod = await import("virtual:mermaid-sandbox-url");
-      return { url: mod.default, scriptUrl: mod.sandboxScriptUrl };
-    } catch (error) {
-      lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      const transient =
-        /Failed to fetch dynamically imported module|error loading dynamically imported module|Importing a module script failed/i.test(
-          message,
-        );
-      if (attempt >= delaysMs.length || !transient) {
-        throw error;
-      }
-      await new Promise(resolve => setTimeout(resolve, delaysMs[attempt]));
-    }
-  }
-  throw lastError;
+  const mod = await import("virtual:mermaid-sandbox-url");
+  return { url: mod.default, scriptUrl: mod.sandboxScriptUrl };
 }
 
 function createVitestJsdomBridge(
