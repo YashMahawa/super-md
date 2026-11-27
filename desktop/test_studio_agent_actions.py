@@ -201,7 +201,7 @@ class StudioAgentActionsTests(unittest.TestCase):
             opened = self.studio._agent_document_action({"action": "open_document", "filename": str(queued_file), "background": True})
         self.assertEqual((opened["status"], len(self.studio._agent_job_records)), ("opening", 20))
         self.assertNotIn("j0", self.studio._agent_job_records)
-        open_mock.assert_called_once()
+        self.assertEqual((open_mock.call_count, open_mock.call_args.kwargs.get("explicit"), open_mock.call_args.kwargs.get("background")), (1, False, True))
 
         cur = self.studio._current()
         patched_active = self.studio._agent_document_action({

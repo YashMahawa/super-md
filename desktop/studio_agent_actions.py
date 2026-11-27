@@ -222,7 +222,7 @@ def agent_document_action(studio_obj: Any, args: dict) -> dict:
             else:
                 record.update(status="completed", **studio_obj._agent_tab_result(result))
 
-        studio_obj._open_note(resolved, explicit=not background, completion_callback=opened)
+        studio_obj._open_note(resolved, explicit=not background, background=background, completion_callback=opened)
         return {"status": "opening", "jobId": job_id, "path": resolved, "windowId": studio_obj.window_id,
                 "active": not background, "format": fmt}
     raise ValueError("Unsupported native document action")
