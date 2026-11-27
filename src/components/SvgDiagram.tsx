@@ -1,8 +1,8 @@
 import { useEffect,useMemo,useRef,useState } from "react";
 import {registerMedia,type ExportableMedia} from '../mediaExport';
-import { presentSvg,svgImage,svgContrastBackdrop } from "../svgImage";
+import { parseValidatedSvg,presentValidatedSvg,serializeValidatedSvg } from "../svgImage";
 import type {MediaAppearance} from '../mediaAppearance';
-import {adaptSvg} from '../svgTheme';
+import {adaptValidatedSvg} from '../svgTheme';
 import {commitMediaLayout} from '../mediaLayout';
 
 const inkColor = () => typeof document === "undefined" ? "#1c2635" : getComputedStyle(document.documentElement).getPropertyValue("--text").trim() || "#1c2635";
@@ -11,12 +11,20 @@ export default function SvgDiagram({ source, appearance, ink, colors, dark=false
   const element=useRef<HTMLImageElement>(null),[sized,setSized]=useState(false);
   const [failed,setFailed]=useState('');
   const raw=preserveOriginal||!!appearance&&appearance!=='original',visualInk=raw?undefined:ink||inkColor();
+  const adapts=appearance==='auto'||appearance==='monochrome';
   // Only mounted diagrams create display variants when the palette changes;
   // the Markdown tree and offscreen diagrams remain cached/windowed.
-  const rendered = useMemo(() => { try { return { ...(raw?{svg:svgImage(source),mode:'color' as const}:presentSvg(source, visualInk!)), error: "" }; } catch (error) { return { svg: "", mode: "color" as const, error: String(error) }; } }, [source, raw, visualInk]);
-  const backing=useMemo(()=>svgContrastBackdrop(source),[source]);
-  const adapts=appearance==='auto'||appearance==='monochrome';
-  const adapted=useMemo(()=>adapts&&!rendered.error?adaptSvg(rendered.svg,colors??{primary:ink??inkColor()},dark,appearance==='monochrome'):rendered.svg,[rendered.svg,rendered.error,appearance,adapts,colors,dark,ink]);
+  const validated=useMemo(()=>{try{return {svg:parseValidatedSvg(source),error:''};}catch(error){return {svg:null,error:String(error)};}},[source]);
+  const backing=validated.svg?.backing??'#fdfdfc';
+  const rendered=useMemo(()=>{
+    if(!validated.svg)return {svg:'',mode:'color' as const,error:validated.error};
+    try{
+      if(adapts)return {svg:adaptValidatedSvg(validated.svg,colors??{primary:ink??inkColor()},dark,appearance==='monochrome'),mode:'color' as const,error:''};
+      if(raw)return {svg:serializeValidatedSvg(validated.svg),mode:'color' as const,error:''};
+      return {...presentValidatedSvg(validated.svg,visualInk!),error:''};
+    }catch(error){return {svg:'',mode:'color' as const,error:String(error)};}
+  },[validated,adapts,raw,visualInk,appearance,colors,dark,ink]);
+  const adapted=rendered.svg;
   const backdrop=appearance==='contrast'?backing:undefined;
   useEffect(()=>registerMedia(element.current,exportMedia??{label,svg:()=>source}),[source,label,exportMedia,rendered.error,failed]);
   if (rendered.error || failed===adapted) return <p className="render-error" role="alert">{rendered.error || 'The drawing could not be decoded or loaded.'}</p>;

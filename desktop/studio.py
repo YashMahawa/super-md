@@ -42,6 +42,7 @@ from documents import (
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
+import offline_view
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
@@ -1054,6 +1055,7 @@ class Studio(QObject):
         self._cloud_revocation_pending = False
         self.cloudRevocationFinished.connect(self._finish_cloud_revocation)
         self._agent_viewport_capture = None
+        self._preview_jobs = offline_view.PreviewJobRegistry()
         agent_bridge = getattr(self.session, "agent_bridge", None)
         if agent_bridge is not None:
             agent_bridge.enabledChanged.connect(lambda: self._emit(False))
@@ -1459,6 +1461,7 @@ class Studio(QObject):
 
     def _emit(self, load=True):
         if self.retired: return
+        self._preview_jobs.retain_tabs(tab["id"] for tab in self.tabs)
         self._watch_notes()
         self._notify_sidebar()
         self._notify_tabs()
@@ -1851,6 +1854,7 @@ class Studio(QObject):
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
         self._python_jobs.cancel_all(retire=True)
+        self._preview_jobs.cancel_all(retire=True)
         for agent_export in tuple(self._agent_exports.values()):
             try:
                 reserved = Path(agent_export["path"])
@@ -2847,6 +2851,7 @@ class Studio(QObject):
         if not note: return False
         old = self.tabs.index(note)
         self.tabs.remove(note)
+        self._preview_jobs.cancel_tab(tab_id)
         self.session.reader_assets.revoke_tab(self.window_id, tab_id)
         target.tabs.insert(max(0, min(len(target.tabs), index)), note)
         target.active = tab_id
@@ -4828,6 +4833,7 @@ class Studio(QObject):
         if removed["content"].strip() or removed["path"] or removed.get("assets"):
             if id in self._closing_tabs:return
             self._closing_tabs.add(id)
+            self._preview_jobs.cancel_tab(id)
             self._python_jobs.cancel_tab(id)
             # Strings and encoded assets are immutable; snapshot small mutable
             # metadata/asset mappings without walking large base64 strings.
@@ -4855,6 +4861,7 @@ class Studio(QObject):
         self._finish_remove_tab(id)
 
     def _finish_remove_tab(self,id):
+        self._preview_jobs.cancel_tab(id)
         self._python_jobs.cancel_tab(id)
         self.reader_edits.clear(id)
         current_index=next((i for i,tab in enumerate(self.tabs) if tab["id"]==id),None)
@@ -5683,23 +5690,44 @@ class Studio(QObject):
         QTimer.singleShot(200, lambda rid=request_id: self._agent_viewport_fallback(rid))
 
     def _capture_background_preview(self, request_id, tab_id, revision, context, args):
-        from offline_view import render_live_snapshot
-        tab=next(t for t in self.tabs if t["id"]==tab_id)
+        bridge=getattr(self.session,"agent_bridge",None)
+        tab=next((t for t in self.tabs if t["id"]==tab_id),None)
+        if self.retired or tab is None or tab_id in self._closing_tabs:
+            if bridge is not None:bridge.complete(request_id,None,"The note for this preview is no longer open",window_id=self.window_id)
+            return
         content,assets,path=tab["content"],dict(tab.get("assets",{})),tab.get("path","")
         width=max(320,min(1600,int(args.get("width",1200))))
         heading=context.get("reading",{}).get("heading") or None
         view={"dark":self._dark(),"colors":self._colors(),"font":self.settings["font"],"size":self.settings["size"],"svgAppearance":self.settings["svgAppearance"],"lineHeight":self.settings["lineHeight"]}
+        preview_job=self._preview_jobs.register(tab_id)
+        def work():
+            try:
+                return offline_view.render_live_snapshot(content,assets,path,width=width,heading=heading,view=view,job=preview_job)
+            except offline_view.PreviewCancelled:
+                return None
+            finally:
+                self._preview_jobs.discard(preview_job)
         def done(body,error):
             bridge=getattr(self.session,"agent_bridge",None)
             if bridge is None:return
+            if body is None and not error:
+                bridge.complete(request_id,None,"Background preview cancelled",window_id=self.window_id);return
             if error:bridge.complete(request_id,None,str(error),window_id=self.window_id);return
-            if self._agent_viewport_revision(tab_id)!=revision:
+            try:
+                current_revision=self._agent_viewport_revision(tab_id)
+            except ValueError as rev_error:
+                bridge.complete(request_id,None,str(rev_error),window_id=self.window_id);return
+            if current_revision!=revision:
                 bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
             image=QImage.fromData(body,"PNG")
             mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
             encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
             bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
-        self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
+        if self.retired or getattr(self.pool,"_shutdown",False):
+            self._preview_jobs.discard(preview_job)
+            if bridge is not None:bridge.complete(request_id,None,"Background preview cancelled",window_id=self.window_id)
+            return
+        self._submit(work,done,False)
 
     def _clear_agent_viewport_capture(self, pending):
         if self._agent_viewport_capture is not pending:
