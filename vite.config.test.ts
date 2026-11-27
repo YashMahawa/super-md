@@ -446,10 +446,193 @@ it('keeps cached build B and recorded watch inputs when an invalidated in-flight
     builds[2].resolve({ script: 'window.__sandboxGen = "fresh";', inputs: ['/repo/src/freshDep.ts'] });
     expect(await pendingFresh).toBe('window.__sandboxGen = "fresh";');
 
+    // When obsolete build 1 rejects later, the in-flight request whose build was invalidated
+    // recovers onto cached build 2 without starting a fourth build or evicting build 2.
     builds[1].reject(new Error('obsolete sync-invalidated build failed'));
-    await expect(pendingSyncInvalidated).rejects.toThrow('obsolete sync-invalidated build failed');
+    expect(await pendingSyncInvalidated).toBe('window.__sandboxGen = "fresh";');
 
     expect(await requestRoute('/@mermaid-sandbox.js')).toBe('window.__sandboxGen = "fresh";');
     expect(builds).toHaveLength(3);
   }
+
+  // Case 4: In-flight request awaiting build A when source invalidates receives build B even if obsolete A resolves stale or rejects.
+  {
+    const { builds, emitChange, requestRoute } = setupHarness();
+    const pendingBeforeInvalidate = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(1);
+
+    emitChange('/repo/src/mermaidSandboxWorker.ts');
+    builds[0].resolve({ script: 'window.__sandboxGen = "stale-A";', inputs: ['/repo/src/staleDep.ts'] });
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Middleware automatically starts build B instead of serving stale build A.
+    expect(builds).toHaveLength(2);
+    builds[1].resolve({ script: 'window.__sandboxGen = "fresh-B";', inputs: ['/repo/src/freshDepB.ts'] });
+    expect(await pendingBeforeInvalidate).toBe('window.__sandboxGen = "fresh-B";');
+    expect(builds).toHaveLength(2);
+  }
+});
+
+it('isolates middleware responses across concurrent HTML/JS/HEAD requests, pass-through routes, aborted responses, and separate dev servers', async () => {
+  type BuildResult = { script: string; inputs?: string[] };
+  let resolveShared!: (value: BuildResult) => void;
+  let buildCalls = 0;
+  const plugin = mermaidSandboxPlugin(() => {
+    buildCalls += 1;
+    if (buildCalls === 1) {
+      return new Promise<BuildResult>((res) => {
+        resolveShared = res;
+      });
+    }
+    return Promise.resolve({ script: `window.__sandboxGen = ${buildCalls};` });
+  });
+
+  const attachServer = () => {
+    const watcherHandlers = new Map<string, Array<(filePath: string) => void>>();
+    let middleware:
+      | ((
+          req: { url?: string; method?: string },
+          res: Record<string, unknown>,
+          next: (err?: unknown) => void,
+        ) => Promise<void>)
+      | null = null;
+    const configureServer =
+      typeof plugin.configureServer === 'function' ? plugin.configureServer : plugin.configureServer?.handler;
+    configureServer?.call(
+      {} as never,
+      {
+        watcher: {
+          on(event: string, cb: (filePath: string) => void) {
+            watcherHandlers.set(event, [...(watcherHandlers.get(event) ?? []), cb]);
+          },
+        },
+        middlewares: {
+          use(fn: typeof middleware) {
+            middleware = fn;
+          },
+        },
+      } as never,
+    );
+    return {
+      middleware: middleware!,
+      emitChange(filePath: string) {
+        for (const cb of watcherHandlers.get('change') ?? []) {
+          cb(filePath);
+        }
+      },
+    };
+  };
+
+  const server1 = attachServer();
+  expect(buildCalls).toBe(1);
+
+  // Pass-through route and unsupported method do not touch response state or start extra builds.
+  for (const req of [
+    { url: '/index.html', method: 'GET' },
+    { url: '/@mermaid-sandbox.js', method: 'POST' },
+  ]) {
+    let nextCalled = false;
+    let nextErr: unknown;
+    let touched = false;
+    await server1.middleware(
+      req,
+      {
+        statusCode: 204,
+        setHeader() {
+          touched = true;
+        },
+        end() {
+          touched = true;
+        },
+      },
+      (err) => {
+        nextCalled = true;
+        nextErr = err;
+      },
+    );
+    expect(nextCalled).toBe(true);
+    expect(nextErr).toBeUndefined();
+    expect(touched).toBe(false);
+  }
+  expect(buildCalls).toBe(1);
+
+  const invoke = (
+    mw: typeof server1.middleware,
+    url: string,
+    method: string,
+    extraRes: Record<string, unknown> = {},
+  ) => {
+    const headers = new Map<string, string>();
+    let body: string | undefined;
+    let ended = false;
+    let nextArgs: unknown[] | null = null;
+    const res: Record<string, unknown> = {
+      statusCode: 0,
+      headersSent: false,
+      writableEnded: false,
+      destroyed: false,
+      setHeader(k: string, v: string) {
+        headers.set(k, v);
+      },
+      end(chunk?: string) {
+        ended = true;
+        body = chunk;
+        res.writableEnded = true;
+      },
+      ...extraRes,
+    };
+    const done = mw({ url, method }, res, (...args: unknown[]) => {
+      nextArgs = args;
+    }).then(() => ({ statusCode: res.statusCode, headers, body, ended, nextArgs }));
+    return { res, done };
+  };
+
+  // Concurrent HTML, JS, HEAD, and an already-ended client share the single in-flight build without cross-talk.
+  const htmlReq = invoke(server1.middleware, '/@mermaid-sandbox.html?t=1', 'GET');
+  const jsReq = invoke(server1.middleware, '/@mermaid-sandbox.js?t=1', 'GET');
+  const headReq = invoke(server1.middleware, '/@mermaid-sandbox.html', 'HEAD');
+  const abortedReq = invoke(server1.middleware, '/@mermaid-sandbox.js', 'GET');
+  abortedReq.res.writableEnded = true;
+
+  resolveShared({ script: 'window.__isolated = 1;' });
+  const [htmlRes, jsRes, headRes, abortedRes] = await Promise.all([
+    htmlReq.done,
+    jsReq.done,
+    headReq.done,
+    abortedReq.done,
+  ]);
+  expect(buildCalls).toBe(1);
+
+  expect(htmlRes.statusCode).toBe(200);
+  expect(htmlRes.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
+  expect(htmlRes.headers.get('Cache-Control')).toBe('no-store');
+  expect(htmlRes.body).toContain('<script>window.__isolated = 1;</script>');
+  expect(htmlRes.nextArgs).toBeNull();
+
+  expect(jsRes.statusCode).toBe(200);
+  expect(jsRes.headers.get('Content-Type')).toBe('application/javascript; charset=utf-8');
+  expect(jsRes.headers.get('Cache-Control')).toBe('no-store');
+  expect(jsRes.body).toBe('window.__isolated = 1;');
+  expect(jsRes.nextArgs).toBeNull();
+
+  expect(headRes.statusCode).toBe(200);
+  expect(headRes.headers.get('Content-Type')).toBe('text/html; charset=utf-8');
+  expect(headRes.headers.get('Cache-Control')).toBe('no-store');
+  expect(headRes.ended).toBe(true);
+  expect(headRes.body).toBeUndefined();
+
+  // Aborted/ended response is untouched and does not invoke next(error).
+  expect(abortedRes.statusCode).toBe(0);
+  expect(abortedRes.headers.size).toBe(0);
+  expect(abortedRes.ended).toBe(false);
+  expect(abortedRes.nextArgs).toBeNull();
+
+  // A second dev server attached to the same plugin has its own scoped dev cache.
+  const server2 = attachServer();
+  expect(buildCalls).toBe(2);
+  const server2Res = await invoke(server2.middleware, '/@mermaid-sandbox.js', 'GET').done;
+  expect(server2Res.body).toBe('window.__sandboxGen = 2;');
+  const server1Cached = await invoke(server1.middleware, '/@mermaid-sandbox.js', 'GET').done;
+  expect(server1Cached.body).toBe('window.__isolated = 1;');
+  expect(buildCalls).toBe(2);
 });

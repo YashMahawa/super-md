@@ -78,9 +78,6 @@ export function mermaidSandboxPlugin(
   const devScriptRoute = "/@mermaid-sandbox.js";
   let isServe = false;
   let isNative = false;
-  let cachedBundlePromise: Promise<{ script: string; html: string }> | null = null;
-  let latestBuildId = 0;
-  let watchedInputs = new Set<string>();
 
   const normalizeWatchPath = (filePath: string) => {
     const resolved = path.resolve(repoRoot, filePath);
@@ -113,33 +110,17 @@ export function mermaidSandboxPlugin(
     };
   };
 
-  const getSandboxBundle = () => {
-    if (!cachedBundlePromise) {
-      const buildId = ++latestBuildId;
-      let buildPromise: Promise<{ script: string; html: string }> | null = null;
-      buildPromise = (async () => {
-        const built = buildSandboxScript
-          ? await buildSandboxScript()
-          : await runDefaultBuild();
-        const script = typeof built === "string" ? built : built.script;
-        const inputs = typeof built === "string" ? undefined : built.inputs;
-        const html = renderSandboxDocument(script);
-        if (buildId === latestBuildId && cachedBundlePromise === buildPromise) {
-          watchedInputs = inputs ? new Set(Array.from(inputs, normalizeWatchPath)) : new Set();
-        }
-        return { script, html };
-      })().catch((error) => {
-        if (buildId === latestBuildId && cachedBundlePromise === buildPromise) {
-          cachedBundlePromise = null;
-        }
-        throw error;
-      });
-      if (buildId === latestBuildId) {
-        cachedBundlePromise = buildPromise;
-      }
-      return buildPromise;
-    }
-    return cachedBundlePromise;
+  const buildSandboxBundle = async () => {
+    const built = buildSandboxScript
+      ? await buildSandboxScript()
+      : await runDefaultBuild();
+    const script = typeof built === "string" ? built : built.script;
+    const inputs = typeof built === "string" ? undefined : built.inputs;
+    return {
+      script,
+      html: renderSandboxDocument(script),
+      inputs,
+    };
   };
 
   return {
@@ -153,19 +134,74 @@ export function mermaidSandboxPlugin(
       return null;
     },
     configureServer(server) {
+      type CachedBundleEntry = {
+        buildId: number;
+        promise: Promise<{ script: string; html: string }>;
+      };
+      let cachedBundleEntry: CachedBundleEntry | null = null;
+      let latestBuildId = 0;
+      let watchedInputs = new Set<string>();
+
+      const isCurrentBuild = (
+        buildId: number,
+        buildPromise: Promise<{ script: string; html: string }> | null,
+      ) => buildId === latestBuildId && cachedBundleEntry !== null && cachedBundleEntry.promise === buildPromise;
+
+      const getDevSandboxBundle = (): CachedBundleEntry => {
+        if (!cachedBundleEntry) {
+          const buildId = ++latestBuildId;
+          let buildPromise: Promise<{ script: string; html: string }> | null = null;
+          buildPromise = (async () => {
+            const { script, html, inputs } = await buildSandboxBundle();
+            if (isCurrentBuild(buildId, buildPromise)) {
+              watchedInputs = inputs ? new Set(Array.from(inputs, normalizeWatchPath)) : new Set();
+            }
+            return { script, html };
+          })().catch((error) => {
+            if (isCurrentBuild(buildId, buildPromise)) {
+              cachedBundleEntry = null;
+            }
+            throw error;
+          });
+          const entry: CachedBundleEntry = { buildId, promise: buildPromise };
+          if (buildId === latestBuildId) {
+            cachedBundleEntry = entry;
+          }
+          return entry;
+        }
+        return cachedBundleEntry;
+      };
+
+      const getLatestDevSandboxBundle = async () => {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const entry = getDevSandboxBundle();
+          try {
+            const bundle = await entry.promise;
+            if (entry.buildId === latestBuildId || attempt === 3) {
+              return bundle;
+            }
+          } catch (error) {
+            if (entry.buildId === latestBuildId || attempt === 3) {
+              throw error;
+            }
+          }
+        }
+        return getDevSandboxBundle().promise;
+      };
+
       const invalidateIfSandboxSource = (filePath: string) => {
         if (
           /[\\/]mermaidSandbox/i.test(filePath) ||
           watchedInputs.has(normalizeWatchPath(filePath))
         ) {
           latestBuildId += 1;
-          cachedBundlePromise = null;
+          cachedBundleEntry = null;
         }
       };
       server.watcher?.on("change", invalidateIfSandboxSource);
       server.watcher?.on("add", invalidateIfSandboxSource);
       server.watcher?.on("unlink", invalidateIfSandboxSource);
-      void getSandboxBundle().catch(() => {});
+      void getDevSandboxBundle().promise.catch(() => {});
 
       server.middlewares.use(async (req, res, next) => {
         const requestPath = req.url?.split("?", 1)[0];
@@ -176,18 +212,29 @@ export function mermaidSandboxPlugin(
           next();
           return;
         }
+        let bundle: { script: string; html: string };
         try {
-          const bundle = await getSandboxBundle();
-          const isScript = requestPath === devScriptRoute;
-          res.statusCode = 200;
-          res.setHeader(
-            "Content-Type",
-            isScript ? "application/javascript; charset=utf-8" : "text/html; charset=utf-8",
-          );
-          res.setHeader("Cache-Control", "no-store");
-          res.end(req.method === "HEAD" ? undefined : isScript ? bundle.script : bundle.html);
+          bundle = await getLatestDevSandboxBundle();
         } catch (error) {
-          next(error);
+          if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+            next(error);
+          }
+          return;
+        }
+        if (res.headersSent || res.writableEnded || res.destroyed) {
+          return;
+        }
+        const isScript = requestPath === devScriptRoute;
+        res.statusCode = 200;
+        res.setHeader(
+          "Content-Type",
+          isScript ? "application/javascript; charset=utf-8" : "text/html; charset=utf-8",
+        );
+        res.setHeader("Cache-Control", "no-store");
+        if (req.method === "HEAD") {
+          res.end();
+        } else {
+          res.end(isScript ? bundle.script : bundle.html);
         }
       });
     },
@@ -196,7 +243,7 @@ export function mermaidSandboxPlugin(
       if (isServe) {
         return `export const sandboxScriptUrl = ${JSON.stringify(devScriptRoute)}; export default ${JSON.stringify(devRoute)};`;
       }
-      const bundle = await getSandboxBundle();
+      const bundle = await buildSandboxBundle();
       const refId = this.emitFile({
         type: "asset",
         name: "mermaid-sandbox.html",

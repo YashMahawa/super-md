@@ -1,8 +1,11 @@
+import { readFileSync } from 'node:fs';
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  formatRateLimitDiagnostics,
   frontendArtifactNames,
   inspectFrontendArtifactReadiness,
+  sanitizeRateLimitHeaders,
   waitForNativeFrontendArtifacts,
 } from './wait-native-frontend-artifacts.mjs';
 
@@ -112,38 +115,126 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
   }), /Timed out waiting/);
 });
 
-it('backs off on HTTP 403 rate-limit responses while still failing closed on permission errors', async () => {
-  let clock = 1_700_000_000_000;
-  const sleeps = [];
-  let calls = 0;
+it('does not burn active artifact timeout while the producer job is queued for a runner', async () => {
+  let clock = 0;
+  const fetchImpl = async input => {
+    const url = new URL(input);
+    const jobs = clock < 50_000
+      ? []
+      : clock < 800_000
+        ? [{ name: 'native_frontend', status: 'queued', conclusion: null }]
+        : clock < 870_000
+          ? [{ name: 'native_frontend', status: 'in_progress', conclusion: null }]
+          : [{ name: 'native_frontend', status: 'completed', conclusion: 'success' }];
+    const artifacts = clock >= 870_000
+      ? [{ name: names.dist }, { name: names.manifest }]
+      : [];
+    const body = url.pathname.endsWith('/jobs')
+      ? { total_count: jobs.length, jobs }
+      : url.pathname.endsWith('/artifacts')
+        ? { total_count: artifacts.length, artifacts }
+        : { ...run, status: clock >= 870_000 ? 'in_progress' : 'queued' };
+    return { ok: true, status: 200, json: async () => body };
+  };
   const result = await waitForNativeFrontendArtifacts({
     repository,
     runId,
     sourceSha,
     token: 'test-token',
+    fetchImpl,
+    sleep: async ms => { clock += ms; },
     now: () => clock,
-    sleep: async ms => {
-      sleeps.push(ms);
-      clock += ms;
-    },
-    timeoutMs: 120_000,
-    pollIntervalMs: 5_000,
+    pollIntervalMs: 50_000,
+  });
+  assert.deepEqual(result, names);
+  assert.equal(clock, 900_000);
+});
+
+it('still fails closed when the producer stays queued past queueTimeoutMs or stalls after starting', async () => {
+  let queuedClock = 0;
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
     fetchImpl: async input => {
-      calls++;
+      const url = new URL(input);
+      const body = url.pathname.endsWith('/jobs')
+        ? { total_count: 1, jobs: [{ name: 'native_frontend', status: 'queued', conclusion: null }] }
+        : url.pathname.endsWith('/artifacts')
+          ? { total_count: 0, artifacts: [] }
+          : { ...run, status: 'queued' };
+      return { ok: true, status: 200, json: async () => body };
+    },
+    sleep: async ms => { queuedClock += ms; },
+    now: () => queuedClock,
+    timeoutMs: 40,
+    queueTimeoutMs: 120,
+    pollIntervalMs: 20,
+  }), /Timed out waiting.*producer job is queued/);
+  assert.equal(queuedClock, 120);
+
+  let stalledClock = 0;
+  await assert.rejects(waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: 'test-token',
+    fetchImpl: async input => {
+      const url = new URL(input);
+      const status = stalledClock < 60 ? 'queued' : 'in_progress';
+      const body = url.pathname.endsWith('/jobs')
+        ? { total_count: 1, jobs: [{ name: 'native_frontend', status, conclusion: null }] }
+        : url.pathname.endsWith('/artifacts')
+          ? { total_count: 0, artifacts: [] }
+          : { ...run, status: 'in_progress' };
+      return { ok: true, status: 200, json: async () => body };
+    },
+    sleep: async ms => { stalledClock += ms; },
+    now: () => stalledClock,
+    timeoutMs: 40,
+    queueTimeoutMs: 200,
+    pollIntervalMs: 20,
+  }), /Timed out waiting.*producer job is in_progress/);
+  assert.equal(stalledClock, 100);
+});
+
+it('backs off on rate-limited HTTP 403/429 responses and distinguishes non-rate-limit HTTP 403', async () => {
+  let clock = 1_700_000_000_000;
+  const sleeps = [];
+  let calls = 0;
+  const secretToken = 'ghs_super_secret_token_value';
+  const result = await waitForNativeFrontendArtifacts({
+    repository,
+    runId,
+    sourceSha,
+    token: secretToken,
+    fetchImpl: async input => {
+      calls += 1;
       if (calls === 1) {
-        return new Response(JSON.stringify({ message: 'API rate limit exceeded for installation ID 1.' }), {
+        return {
+          ok: false,
           status: 403,
-          headers: {
+          headers: new Headers({
+            'x-ratelimit-limit': '1000',
             'x-ratelimit-remaining': '0',
-            'x-ratelimit-reset': String(Math.floor(clock / 1000) + 30),
-          },
-        });
+            'x-ratelimit-used': '1000',
+            'x-ratelimit-reset': String(Math.floor((clock + 12_000) / 1_000)),
+            'x-ratelimit-resource': 'core',
+          }),
+          json: async () => ({ message: 'API rate limit exceeded' }),
+        };
       }
       if (calls === 2) {
-        return new Response(JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }), {
-          status: 403,
-          headers: { 'retry-after': '12' },
-        });
+        return {
+          ok: false,
+          status: 429,
+          headers: new Headers({
+            'retry-after': '20',
+            'x-ratelimit-resource': 'core',
+          }),
+          json: async () => ({ message: 'Secondary rate limit' }),
+        };
       }
       const url = new URL(input);
       const body = url.pathname.endsWith('/jobs')
@@ -151,20 +242,73 @@ it('backs off on HTTP 403 rate-limit responses while still failing closed on per
         : url.pathname.endsWith('/artifacts')
           ? { total_count: 2, artifacts: [{ name: names.dist }, { name: names.manifest }] }
           : run;
-      return new Response(JSON.stringify(body), { status: 200 });
+      return { ok: true, status: 200, headers: new Headers(), json: async () => body };
     },
+    sleep: async ms => {
+      sleeps.push(ms);
+      clock += ms;
+    },
+    now: () => clock,
+    timeoutMs: 120_000,
+    pollIntervalMs: 5_000,
+    maxBackoffMs: 30_000,
   });
   assert.deepEqual(result, names);
-  assert.deepEqual(sleeps, [31_000, 12_000]);
+  assert.deepEqual(sleeps, [12_000, 20_000]);
 
-  await assert.rejects(waitForNativeFrontendArtifacts({
-    repository,
-    runId,
-    sourceSha,
-    token: 'test-token',
-    fetchImpl: async () => new Response(JSON.stringify({ message: 'Resource not accessible by integration' }), {
-      status: 403,
-      headers: { 'x-ratelimit-remaining': '999' },
-    }),
-  }), /HTTP 403/);
+  await assert.rejects(
+    async () => {
+      try {
+        await waitForNativeFrontendArtifacts({
+          repository,
+          runId,
+          sourceSha,
+          token: secretToken,
+          fetchImpl: async () => ({
+            ok: false,
+            status: 403,
+            headers: new Headers({
+              'x-ratelimit-limit': '1000',
+              'x-ratelimit-remaining': '994',
+              'x-ratelimit-used': '6',
+              'x-ratelimit-resource': 'core',
+              authorization: `Bearer ${secretToken}`,
+            }),
+            json: async () => ({ message: `Resource not accessible by integration ${secretToken}` }),
+          }),
+          sleep: async () => { throw new Error('must not retry non-rate-limited 403'); },
+          now: () => 0,
+          timeoutMs: 60_000,
+        });
+      } catch (error) {
+        assert.equal(error.message.includes(secretToken), false);
+        throw error;
+      }
+    },
+    /forbidden with HTTP 403 \(not rate-limited; remaining=994, limit=1000, used=6, resource=core\)/,
+  );
+
+  const sanitized = sanitizeRateLimitHeaders({
+    'x-ratelimit-limit': '1000',
+    'x-ratelimit-remaining': '0',
+    'x-ratelimit-resource': 'core; secret=bad',
+    authorization: `Bearer ${secretToken}`,
+  });
+  assert.equal(sanitized.resource, null);
+  assert.equal(formatRateLimitDiagnostics(sanitized), 'remaining=0, limit=1000');
+});
+
+it('wires explicit native_frontend job dependencies while keeping source-SHA and manifest checks and release-gate failure', () => {
+  const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assert.match(ciWorkflow, /\n  test:\n    needs: native_frontend\n/);
+  assert.match(ciWorkflow, /\n  android-device-tests:\n    needs: native_frontend\n/);
+  assert.match(ciWorkflow, /\n  release-gate:\n    name: All release tests passed\n    if: always\(\)\n    needs: \[native_frontend, test, browser, android-release, android-device-tests\]\n/);
+  assert.equal((ciWorkflow.match(/native-frontend-artifact\.mjs verify dist/g) || []).length, 2);
+  assert.equal(ciWorkflow.includes('node scripts/wait-native-frontend-artifacts.mjs'), false);
+
+  const releaseWorkflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  assert.match(releaseWorkflow, /\n  desktop:\n    needs: \[prepare, native_frontend\]\n/);
+  assert.match(releaseWorkflow, /\n  publish:\n    needs: \[prepare, native_frontend, desktop, android\]\n/);
+  assert.equal((releaseWorkflow.match(/native-frontend-artifact\.mjs verify dist/g) || []).length, 1);
+  assert.equal(releaseWorkflow.includes('node scripts/wait-native-frontend-artifacts.mjs'), false);
 });
