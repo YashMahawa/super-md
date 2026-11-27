@@ -397,8 +397,9 @@ def refresh_open_folder_trees(studio_obj, *candidates, is_within_fn=None, folder
     windows = tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (studio_obj,)
     for window in windows:
         if not getattr(window, "retired", False) and hasattr(window, "_load_tree"):
-            win_within = getattr(window, "_is_within_open_folder", None) or is_within_fn
-            if any((win_within(c) if callable(win_within) else is_within_open_folder(window, c, folder_ops_mod=fops)) for c in candidates if c):
+            win_within = getattr(window, "_is_within_open_folder", None)
+            check = win_within if callable(win_within) else ((lambda c, w=window: is_within_fn(w, c)) if callable(is_within_fn) else (lambda c, w=window: is_within_open_folder(w, c, folder_ops_mod=fops)))
+            if any(check(c) for c in candidates if c):
                 window._load_tree()
 
 def load_tree(

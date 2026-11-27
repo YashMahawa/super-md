@@ -14,7 +14,12 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
-import folder_ops, studio as studio_mod, studio_workspace
+_DESKTOP_DIR = str(Path(__file__).resolve().parent)
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
+
+import studio as studio_mod, studio_workspace
+import folder_ops
 from studio import Session, Studio
 from test_studio import QuietStudio
 
@@ -66,27 +71,37 @@ class StudioWorkspaceTest(unittest.TestCase):
         cls.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         shutil.rmtree(cls.session.data, ignore_errors=True)
 
+    def _drain_studio(self) -> None:
+        s = self.studio
+        s.pool.submit(lambda: None).result(timeout=5)
+        s._search_pool.submit(lambda: None).result(timeout=5)
+        self.session.writes.flush(timeout=5)
+        self.app.processEvents()
+
     def _reset_studio(self) -> None:
         s = self.studio
         s._cancel_folder_search(close=True)
         s._folder_search_query, s._folder_tree_scan_budget, s.flush_operation, s.message = "", None, None, ""
         s._folder_search_case_sensitive = s._folder_search_include_diagrams = s.ready = False
-        s.flush_timer.stop(); s.external_timer.stop(); s.external_paths.clear()
+        s.flush_timer.stop(); s.external_timer.stop(); s.filter_timer.stop(); s.recovery_timer.stop()
+        s.external_paths.clear()
+        with self.session._watch_suspension_lock:
+            self.session._watch_suspensions.clear()
         s.settings["hideNonNoteFolders"], s.settings["welcomed"] = True, False
         tab = s._note("Untitled.md")
         s.tabs, s.active, s._pending_seeded_find = [tab], tab["id"], None
         s.note_identities.clear(); s._agent_open_paths.clear(); s._agent_owned_files.clear()
         self.session.recent.clear(); self.session.pinned.clear()
         s.closeFolder()
+        self._drain_studio()
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="supermd-studio-workspace-")
-        self.root = Path(folder_ops.canonical_path_str(self.temp.name))
+        self.root = Path(folder_ops.canonical_path_str(tempfile.mkdtemp(prefix="supermd-studio-workspace-")))
         self._reset_studio()
 
     def tearDown(self):
         self._reset_studio()
-        self.temp.cleanup()
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def test_module_boundary_pure_leaf_imports_and_line_budget(self):
         src = Path(studio_workspace.__file__).read_text(encoding="utf-8")
@@ -121,13 +136,13 @@ class StudioWorkspaceTest(unittest.TestCase):
             (vault / "symlink_dir").symlink_to(outside, target_is_directory=True)
         except OSError:
             pass
-        orig_is_link, junction_str = folder_ops._is_link_or_junction, str((vault / "junction_dir").resolve())
+        orig_is_link, junction_dir = folder_ops._is_link_or_junction, vault / "junction_dir"
         sidebar_signals: list[int] = []
         on_sidebar = lambda: sidebar_signals.append(1)
         self.studio.sidebarChanged.connect(on_sidebar)
         try:
             with (
-                patch.object(studio_mod.folder_ops, "_is_link_or_junction", side_effect=lambda p: str(Path(p).resolve(strict=False)) == junction_str or orig_is_link(Path(p))),
+                patch.object(studio_mod.folder_ops, "_is_link_or_junction", side_effect=lambda p: (Path(p).name == "junction_dir" and folder_ops.same_path(p, junction_dir)) or orig_is_link(Path(p))),
                 patch.object(self.session.workspace_links, "invalidate", wraps=self.session.workspace_links.invalidate) as spy_inv,
             ):
                 rev_before = self.studio._files_revision
@@ -328,6 +343,12 @@ class StudioWorkspaceTest(unittest.TestCase):
         self.assertFalse(Studio._is_within_open_folder(win_a, dir_b / "other.md"))
         Studio._refresh_open_folder_trees(owner, dir_a / "sub" / "doc.md")
         self.assertEqual(refreshed, ["a"])
+        self.session.windows["proxy_b"] = win_b
+        try:
+            self.studio._refresh_open_folder_trees(dir_b / "doc.md")
+            self.assertEqual(refreshed, ["a", "b"])
+        finally:
+            self.session.windows.pop("proxy_b", None)
 
         flushed: list[tuple[str, str]] = []
         standalone = SimpleNamespace(
@@ -393,6 +414,7 @@ class StudioWorkspaceTest(unittest.TestCase):
             self.assertEqual(self.studio.folder, "")
         self.studio._restore_workspace_folder(ws_canon, restored_expanded)
         self.assertEqual((self.studio.folder, self.studio.expanded), (ws_canon, {ws_canon, sub_canon}))
+        self.assertTrue(_wait_until(lambda: any(e["name"] == "Nested.md" for e in self.studio.files)))
 
     def test_watcher_suspension_holds_across_tree_loads_and_reconciles_after_release(self):
         vault = self.root / "vault"
@@ -413,7 +435,17 @@ class StudioWorkspaceTest(unittest.TestCase):
             watched_mid = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
             for suspended in (vault, sub, note):
                 self.assertNotIn(folder_ops.canonical_path_str(suspended), watched_mid)
-            sub.rename(renamed_sub)
+            orig_rename, attempts = Path.rename, []
+            def flaky_win_rename(self_path, target):
+                attempts.append(1)
+                if len(attempts) == 1:
+                    err = PermissionError(13, "Sharing violation during watcher teardown")
+                    err.winerror = 32
+                    raise err
+                return orig_rename(self_path, target)
+            with patch.object(studio_mod, "_is_windows", return_value=True), patch.object(Path, "rename", flaky_win_rename):
+                studio_mod._rename_path_with_windows_retry(sub, renamed_sub)
+            self.assertEqual(len(attempts), 2)
             self.studio._load_tree()
             self.assertTrue(_wait_until(lambda: any(e["name"] == "RenamedTopics" for e in self.studio.files)))
             watched_after = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
@@ -427,6 +459,7 @@ class StudioWorkspaceTest(unittest.TestCase):
             self.studio._sync_path_change(str(sub), str(renamed_sub), is_dir=True, on_rebound=resume.set)
 
         rebound_note = str(renamed_sub / "Lecture.md")
+        self.assertTrue(_wait_until(lambda: any(e["name"] == "Lecture.md" and folder_ops.same_path(e["path"], rebound_note) for e in self.studio.files)))
         self.assertTrue(any(folder_ops.same_path(t["path"], rebound_note) for t in self.studio.tabs))
         watched_rebound = {folder_ops.canonical_path_str(p) for p in (self.studio.note_watcher.files() + self.studio.note_watcher.directories())}
         for expected in (vault, renamed_sub, rebound_note):

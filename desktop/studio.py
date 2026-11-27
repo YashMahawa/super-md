@@ -943,8 +943,11 @@ class Session(QObject):
                 if canonical_note_location is not None
                 else folder_ops.strip_extended_length_prefix(raw_note_location)
             )
-        shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
-        self.settings["shortcuts"] = shortcuts or default_shortcuts()
+        if isinstance(stored_settings, dict) and "shortcuts" in stored_settings:
+            shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
+            self.settings["shortcuts"] = shortcuts or default_shortcuts()
+        else:
+            self.settings["shortcuts"] = default_shortcuts()
         if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
             try:
                 atomic_write(
@@ -4157,7 +4160,7 @@ class Studio(QObject):
         studio_workspace.open_folder(self, value, raw_local_path_fn=_raw_local_path, canonical_approved_dir_fn=_canonical_approved_directory, folder_ops_mod=folder_ops)
     def _is_within_open_folder(self, candidate) -> bool: return studio_workspace.is_within_open_folder(self, candidate, folder_ops_mod=folder_ops)
     def _refresh_open_folder_trees(self, *candidates) -> None:
-        studio_workspace.refresh_open_folder_trees(self, *candidates, is_within_fn=getattr(self, "_is_within_open_folder", None), folder_ops_mod=folder_ops)
+        studio_workspace.refresh_open_folder_trees(self, *candidates, is_within_fn=Studio._is_within_open_folder, folder_ops_mod=folder_ops)
     def _load_tree(self):
         studio_workspace.load_tree(self, folder_ops_mod=folder_ops, is_searchable_fn=is_searchable_note_name, scandir_fn=os.scandir, has_visible_note_fn=_directory_has_visible_note, max_depth=MAX_FOLDER_DEPTH, default_scan_budget=FOLDER_TREE_SCAN_BUDGET)
     @Slot(str)
