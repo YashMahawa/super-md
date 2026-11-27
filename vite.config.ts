@@ -92,7 +92,10 @@ function mermaidSandboxPlugin(): Plugin {
         });
         const script = bundled.outputFiles[0]?.text ?? "";
         return { script, html: renderSandboxDocument(script) };
-      })();
+      })().catch((error) => {
+        cachedBundlePromise = null;
+        throw error;
+      });
     }
     return cachedBundlePromise;
   };
@@ -108,6 +111,19 @@ function mermaidSandboxPlugin(): Plugin {
       return null;
     },
     configureServer(server) {
+      const srcRoot = fileURLToPath(new URL("./src/", import.meta.url)).replace(/\\/g, "/");
+      const invalidateSandboxBundle = (changedPath: string) => {
+        const normalized = changedPath.replace(/\\/g, "/");
+        if (normalized.startsWith(srcRoot) || /\/package(?:-lock)?\.json$/.test(normalized)) {
+          cachedBundlePromise = null;
+        }
+      };
+      server.watcher.on("change", invalidateSandboxBundle);
+      server.watcher.on("add", invalidateSandboxBundle);
+      server.watcher.on("unlink", invalidateSandboxBundle);
+      server.httpServer?.once("listening", () => {
+        void getSandboxBundle().catch(() => {});
+      });
       server.middlewares.use(async (req, res, next) => {
         const requestPath = req.url?.split("?", 1)[0];
         if (
@@ -118,7 +134,6 @@ function mermaidSandboxPlugin(): Plugin {
           return;
         }
         try {
-          cachedBundlePromise = null;
           const bundle = await getSandboxBundle();
           const isScript = requestPath === devScriptRoute;
           res.statusCode = 200;
@@ -227,9 +242,29 @@ export default defineConfig(({mode}) => ({
     port: 1420,
     strictPort: true,
     watch: {
-      ignored: ["**/dist/**", "**/src-tauri/target/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
+      ignored: [
+        "**/dist/**",
+        "**/coverage/**",
+        "**/test-results/**",
+        "**/playwright-report/**",
+        "**/*.tsbuildinfo",
+        "**/src-tauri/target/**",
+        "**/smd-core/target/**",
+        "**/android/**/build/**",
+        "**/desktop/.venv/**",
+      ],
     },
   },
-  envPrefix: ["VITE_", "TAURI_"]
-  ,build: { rollupOptions: { input: buildHtmlEntries(mode) } }
+  envPrefix: ["VITE_", "TAURI_"],
+  build: {
+    rollupOptions: {
+      input: buildHtmlEntries(mode),
+      output: {
+        manualChunks(id) {
+          if (/[\\/]node_modules[\\/]pele[\\/]/.test(id)) return "pele";
+          return undefined;
+        },
+      },
+    },
+  },
 }));

@@ -56,15 +56,41 @@ function subscribe(job:RenderJob,signal?:AbortSignal):Promise<string> {
   });
 }
 
+function isTransientDynamicImportError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Failed to fetch dynamically imported module|error loading dynamically imported module|Importing a module script failed/i.test(
+    message,
+  );
+}
+
+export async function importModuleWithRetry<T>(
+  loader: () => Promise<T>,
+  delaysMs: readonly number[] = [80, 240],
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= delaysMs.length; attempt++) {
+    try {
+      return await loader();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= delaysMs.length || !isTransientDynamicImportError(error)) {
+        throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, delaysMs[attempt]));
+    }
+  }
+  throw lastError;
+}
+
 async function renderDiagram(source:string,dark:boolean,key:string):Promise<string> {
   let output:string|undefined;
   if(canUsePele(source))try{
-    const {renderAsync}=await import('pele/lazy');
+    const {renderAsync}=await importModuleWithRetry(()=>import('pele/lazy'));
     const result=await renderAsync(source,{fontFamily:'Arial, sans-serif',autoDirection:false,links:false,images:false,outputLimit:1_000_000,maxEdges:2000,idPrefix:`smd-pele-${serial+1}-`});
     output=svgImage(resolvePeleSvg(sanitizeDiagram(result.svg),dark,`smd-diagram-${++serial}`));
   }catch{/* Keep Mermaid compatibility, including after a fast-path error. */}
   if(!output){
-    const {renderInMermaidSandbox}=await import('./mermaidSandboxHost');
+    const {renderInMermaidSandbox}=await importModuleWithRetry(()=>import('./mermaidSandboxHost'));
     const rawSvg=await renderInMermaidSandbox(`smd-diagram-${++serial}`,source,dark);
     const safe=sanitizeDiagram(rawSvg);
     const xml=new DOMParser().parseFromString(safe,'image/svg+xml'),root=xml.documentElement;
