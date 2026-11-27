@@ -1,11 +1,6 @@
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
-import { maskFrontmatter } from "./frontmatter";
-import { remarkObsidianMath } from "./obsidianMath";
+import { parseMaskedMarkdown } from "./markdownExportParser";
 import {
   isRemoteImageApproved,
   isRemoteOrExplicitScheme,
@@ -17,12 +12,19 @@ import {
 
 export interface ImportedImage { source: string; alt: string }
 export interface LinkDetails { url: string; title: string; thumbnail?: string }
-export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source);
+export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source) && source.length <= 7 + 150;
+const compatPortableAssetSource = (source: string, ext: string) => {
+  if (!source.startsWith("assets/")) return false;
+  const name = source.slice(7);
+  if (!name || name.length > 159 || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name)) return false;
+  const actualExt = name.split(".").pop()?.toLowerCase();
+  return ext === "jpg" ? actualExt === "jpg" || actualExt === "jpeg" : actualExt === ext;
+};
 export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&").replace(/[\r\n]+/g, " ");
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
 export function imageRanges(markdown: string): ImageRange[] {
-  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
+  const { tree } = parseMaskedMarkdown(markdown);
   const definitions = new Map<string, string>(); const result: ImageRange[] = [];
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
   visit(tree, (node: any) => {
@@ -92,7 +94,7 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
 }
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
-export type PrepareFmdOptions = RemoteImageConsentPolicy;
+export type PrepareFmdOptions = RemoteImageConsentPolicy & { portable?: boolean };
 
 interface NormalizedFmdConsent {
   noteId?: string;
@@ -104,12 +106,12 @@ interface NormalizedFmdConsent {
 async function prepareFmdInternal(
   markdown: string,
   documentPath: string | null,
+  portableDoc: boolean,
   consent: NormalizedFmdConsent,
   shared: Map<string, Promise<string | null>>,
   assets: Record<string, string>,
 ): Promise<string> {
-  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
-  const tree = processor.parse(maskFrontmatter(markdown));
+  const { tree } = parseMaskedMarkdown(markdown);
   const work: Promise<void>[] = [];
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const definitions = new Map<string, any>(); const usedDefinitions = new Set<string>();
@@ -140,7 +142,8 @@ async function prepareFmdInternal(
       }
       const type = data.match(/^data:image\/([^;]+);base64,/i)?.[1]?.toLowerCase();
       if (!type) throw new Error(`Unsupported image ${source}`);
-      const name = attachmentSource(source) ? source : `assets/image-${crypto.randomUUID()}.${type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type}`;
+      const ext = type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type;
+      const name = attachmentSource(source) || (portableDoc && compatPortableAssetSource(source, ext)) ? source : `assets/image-${crypto.randomUUID()}.${ext}`;
       assets[name] = data;
       return name;
     })());
@@ -180,7 +183,7 @@ async function prepareFmdInternal(
     for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
     for(const step of deck.steps) if(typeof step.markdown==='string') {
       const originalMarkdown = step.markdown;
-      work.push(prepareFmdInternal(originalMarkdown, documentPath, consent, shared, assets).then(prepared => {
+      work.push(prepareFmdInternal(originalMarkdown, documentPath, portableDoc, consent, shared, assets).then(prepared => {
         if (prepared !== originalMarkdown) {
           step.markdown = prepared;
           markdownChanged = true;
@@ -209,6 +212,7 @@ async function prepareFmdInternal(
 }
 
 export async function prepareFmd(markdown: string, documentPath: string | null, options: PrepareFmdOptions = {}) {
+  const portableDoc = options.portable ?? /\.(?:smd|fmd)$/i.test(documentPath || "");
   const assets: Record<string, string> = {};
   const shared = new Map<string, Promise<string | null>>();
   const consent: NormalizedFmdConsent = {
@@ -217,6 +221,6 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
     approvedUrls: normalizeApprovedImageUrls(options.approvedImageUrls),
     loadedImageData: options.loadedImageData,
   };
-  const content = await prepareFmdInternal(markdown, documentPath, consent, shared, assets);
+  const content = await prepareFmdInternal(markdown, documentPath, portableDoc, consent, shared, assets);
   return { content, assets };
 }

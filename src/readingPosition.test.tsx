@@ -6,7 +6,10 @@ import MarkdownPreview from "./components/MarkdownPreview";
 import LiveEditor from "./components/LiveEditor";
 import {readingCaretOffset,readingOffset,revealReadingOffset} from "./readingPosition";
 import {applyDocumentZoom} from "./documentZoom";
-import {applySharedAnchor,captureSharedAnchor,detectSplitPaneFromTarget} from "./sourceAnchor";
+import {commitMediaLayout} from "./mediaLayout";
+import {applySharedAnchor,captureSharedAnchor,detectSplitPaneFromTarget,hasExternalAnchorScroll,markProgrammaticAnchorScroll,snapshotAnchorScroll} from "./sourceAnchor";
+import {commitWindowedLayout} from "./windowedSearch";
+import {Reader} from "./androidReader";
 
 (globalThis as unknown as {IS_REACT_ACT_ENVIRONMENT?:boolean}).IS_REACT_ACT_ENVIRONMENT=true;
 
@@ -314,5 +317,282 @@ describe("readingPosition on deep nested checklists",()=>{
       allowExactTop:true,
     });
     expect(host.scrollTop).toBe(0);
+  });
+
+  it("detects external viewport scrolls within the programmatic window without mistaking layout adjustments or clamps",()=>{
+    host=document.createElement("div");
+    let internalTop=0;
+    let scrollHeight=11320;
+    const clientHeight=820;
+    Object.defineProperty(host,"clientHeight",{value:clientHeight,configurable:true});
+    Object.defineProperty(host,"scrollHeight",{get:()=>scrollHeight,configurable:true});
+    Object.defineProperty(host,"scrollTop",{
+      get:()=>internalTop,
+      set:(next:number)=>{
+        const maxTop=Math.max(0,scrollHeight-clientHeight);
+        internalTop=Math.max(0,Math.min(next,maxTop));
+      },
+      configurable:true,
+    });
+    document.body.appendChild(host);
+
+    markProgrammaticAnchorScroll(host);
+    host.scrollTop=6928;
+    const snap=snapshotAnchorScroll(host);
+    expect(hasExternalAnchorScroll(snap)).toBe(false);
+
+    // Layout-recorded scroll preservation does not count as external scroll.
+    host.scrollTop=6960;
+    (host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=6960;
+    expect(hasExternalAnchorScroll(snap)).toBe(false);
+
+    // Temporary maxScrollTop clamping when layout shrinks does not count as external scroll.
+    delete (host as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop;
+    scrollHeight=5820;
+    host.scrollTop=5000;
+    expect(hasExternalAnchorScroll(snap)).toBe(false);
+
+    // Programmatic/native scrollIntoView to Appendix 20 (9913 px) is detected immediately as external scroll.
+    scrollHeight=11320;
+    host.scrollTop=9913;
+    expect(hasExternalAnchorScroll(snap)).toBe(true);
+
+    // Directional clamped anchor checks: prior top/max = 800 px with requestedTop = 2500 px.
+    scrollHeight=1620; // maxTop = 800
+    host.scrollTop=2500;
+    expect(host.scrollTop).toBe(800);
+    const clampedSnap=snapshotAnchorScroll(host,2500);
+    expect(hasExternalAnchorScroll(clampedSnap)).toBe(false);
+
+    // 1. Independent upward movement to 500 px while clamped is external.
+    host.scrollTop=500;
+    expect(hasExternalAnchorScroll(clampedSnap)).toBe(true);
+
+    // 2. Genuine growth clamping along Math.min(requestedTop, currentMaxTop) is internal.
+    host.scrollTop=800;
+    const growthSnap=snapshotAnchorScroll(host,2500);
+    scrollHeight=2220; // maxTop grows 800 -> 1400
+    host.scrollTop=1400;
+    expect(hasExternalAnchorScroll(growthSnap)).toBe(false);
+    scrollHeight=3820; // maxTop grows 1400 -> 3000, clamped target reaches 2500
+    host.scrollTop=2500;
+    expect(hasExternalAnchorScroll(growthSnap)).toBe(false);
+
+    // 3. Movement that stops below a newly grown limit (e.g. 1100 < 1400) is external.
+    scrollHeight=1620;
+    host.scrollTop=800;
+    const partialGrowthSnap=snapshotAnchorScroll(host,2500);
+    scrollHeight=2220; // maxTop = 1400
+    host.scrollTop=1100;
+    expect(hasExternalAnchorScroll(partialGrowthSnap)).toBe(true);
+
+    // 4. Genuine shrinkage clamping (maxTop 800 -> 600) is internal, while further upward movement is external.
+    scrollHeight=1620;
+    host.scrollTop=800;
+    const shrinkSnap=snapshotAnchorScroll(host,2500);
+    scrollHeight=1420; // maxTop = 600
+    host.scrollTop=800; // clamped to 600
+    expect(host.scrollTop).toBe(600);
+    expect(hasExternalAnchorScroll(shrinkSnap)).toBe(false);
+    host.scrollTop=420;
+    expect(hasExternalAnchorScroll(shrinkSnap)).toBe(true);
+
+    // 5. Synchronous layout clamp-then-expand during heading navigation remains internal unless externally moved.
+    host.className="android-reading";
+    host.dataset.navigating="true";
+    scrollHeight=4973+clientHeight;
+    host.scrollTop=4973;
+    const navSnap=snapshotAnchorScroll(host);
+    commitWindowedLayout(host,()=>{
+      scrollHeight=3888+clientHeight;
+      host!.scrollTop=host!.scrollTop;
+    });
+    expect(host.scrollTop).toBe(3888);
+    commitMediaLayout(host,()=>{scrollHeight=4405+clientHeight;});
+    expect(hasExternalAnchorScroll(navSnap)).toBe(false);
+    host.scrollTop=3500;
+    expect(hasExternalAnchorScroll(navSnap)).toBe(true);
+  });
+
+  it("stops post-transition settle timers after scrollIntoView or upward scroll while clamped and preserves outgoing ReadingLocation across tab switch",()=>{
+    vi.useFakeTimers();
+    try {
+      const lecture="# Lecture 2\n\n## Bayes\n\nPosterior.\n\n## Appendix 20\n\nDerivation.\n";
+      const savedPositions:Record<string,{top:number;offset:number;zoom:number;mode:string}>={};
+      (window as unknown as {SuperMD?:unknown}).SuperMD={
+        post(id:string,command:string,raw:string){
+          const args=JSON.parse(raw);
+          if(command==="reading_position")savedPositions[args.id]=args.location;
+          window.supermdReply?.(id,command==="document_sync"?{accepted:true,revision:0}:true,null);
+        },
+      };
+      host=document.createElement("div");
+      document.body.appendChild(host);
+      root=createRoot(host);
+      act(()=>{root!.render(<Reader/>);});
+
+      const baseState={
+        dark:false,
+        fullscreen:false,
+        colors:{},
+        font:"Manrope",
+        size:16,
+        zoom:100,
+        motion:false,
+        editProtocol:1,
+        restorePosition:true,
+      };
+
+      const installClampedScroller=(el:HTMLElement,getScrollHeight:()=>number)=>{
+        let internalTop=el.scrollTop;
+        Object.defineProperty(el,"clientHeight",{value:820,configurable:true});
+        Object.defineProperty(el,"scrollHeight",{get:getScrollHeight,configurable:true});
+        Object.defineProperty(el,"scrollTop",{
+          get:()=>internalTop,
+          set:(next:number)=>{
+            const maxTop=Math.max(0,getScrollHeight()-820);
+            internalTop=Math.max(0,Math.min(next,maxTop));
+          },
+          configurable:true,
+        });
+      };
+
+      // A. Trace-timed mode-settle window: Live transition -> 130 ms -> Appendix scrollIntoView (9913) -> 29 ms -> Index -> 40 ms -> Lecture 2 -> 700 ms settle.
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-lecture-2",
+          path:"/notes/Lecture 2.md",
+          content:lecture,
+          mode:"editor",
+          pendingHeading:{heading:"Bayes",token:"h-1"},
+        });
+      });
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-lecture-2",
+          path:"/notes/Lecture 2.md",
+          content:lecture,
+          mode:"live",
+        });
+      });
+
+      const reading=host.querySelector<HTMLElement>(".android-reading")!;
+      expect(reading).toBeTruthy();
+      let liveScrollHeight=11320;
+      installClampedScroller(reading,()=>liveScrollHeight);
+
+      // Advance ~130 ms (past the 120 ms mode-settle pass, inside the 320/700 ms settle window), then scroll to Appendix 20 (9913 px).
+      act(()=>{vi.advanceTimersByTime(130);});
+      reading.scrollTop=9913;
+      const reachedScrollTop=reading.scrollTop;
+      expect(reachedScrollTop).toBe(9913);
+      act(()=>{
+        reading.dispatchEvent(new Event("scroll",{bubbles:true}));
+        vi.advanceTimersByTime(29);
+      });
+      expect(reading.scrollTop).toBe(9913);
+
+      // Switch to Index.md 29 ms after scroll notification and capture outgoing snapshot.
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-index",
+          path:"/notes/Index.md",
+          content:"# Course Index\n",
+          mode:"live",
+        });
+      });
+      const outgoingSnapshot=savedPositions["tab-lecture-2"];
+      expect(outgoingSnapshot?.top).toBe(9913);
+
+      // Reopen Lecture 2 40 ms later and verify restored scrollTop holds through the last delayed 700 ms settle pass.
+      act(()=>{vi.advanceTimersByTime(40);});
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-lecture-2",
+          path:"/notes/Lecture 2.md",
+          content:lecture,
+          mode:"live",
+          readingLocation:outgoingSnapshot as never,
+        });
+      });
+      const reopenedReading=host.querySelector<HTMLElement>(".android-reading")!;
+      installClampedScroller(reopenedReading,()=>liveScrollHeight);
+      expect(reopenedReading.scrollTop).toBe(9913);
+      act(()=>{vi.advanceTimersByTime(750);});
+      expect(reopenedReading.scrollTop).toBe(9913);
+
+      // B. Legitimate clamped layout growth (800 -> 1400 -> 2500) settles to requestedTop = 2500 across [120, 320, 700] ms.
+      liveScrollHeight=1620; // maxTop = 800
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-clamp-grow",
+          path:"/notes/Grow.md",
+          content:"# Grow\n\nBody.\n",
+          mode:"live",
+          readingLocation:{top:2500,offset:0,zoom:100,mode:"live"},
+        });
+      });
+      expect(reopenedReading.scrollTop).toBe(800);
+      act(()=>{vi.advanceTimersByTime(40);});
+      expect(reopenedReading.scrollTop).toBe(800);
+      liveScrollHeight=2220; // maxTop = 1400 at 120 ms
+      act(()=>{vi.advanceTimersByTime(100);});
+      expect(reopenedReading.scrollTop).toBe(1400);
+      liveScrollHeight=3820; // maxTop = 3000 across 320 ms & 700 ms -> settles at 2500
+      act(()=>{vi.advanceTimersByTime(650);});
+      expect(reopenedReading.scrollTop).toBe(2500);
+
+      // C. Independent upward scroll while clamped (800 -> 500 with requestedTop = 2500) cancels settle and survives 700 ms + tab roundtrip.
+      liveScrollHeight=1620; // maxTop = 800
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-clamp-upward",
+          path:"/notes/Upward.md",
+          content:"# Upward\n\nBody.\n",
+          mode:"live",
+          readingLocation:{top:2500,offset:0,zoom:100,mode:"live"},
+        });
+      });
+      expect(reopenedReading.scrollTop).toBe(800);
+      act(()=>{vi.advanceTimersByTime(40);});
+      expect(reopenedReading.scrollTop).toBe(800);
+      reopenedReading.scrollTop=500;
+      act(()=>{reopenedReading.dispatchEvent(new Event("scroll",{bubbles:true}));});
+      liveScrollHeight=3820; // Even when layout grows to maxTop = 3000, settle timers must not overwrite 500!
+      act(()=>{vi.advanceTimersByTime(750);});
+      expect(reopenedReading.scrollTop).toBe(500);
+
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-index",
+          path:"/notes/Index.md",
+          content:"# Course Index\n",
+          mode:"live",
+        });
+      });
+      expect(savedPositions["tab-clamp-upward"]?.top).toBe(500);
+      act(()=>{
+        window.supermdLoad?.({
+          ...baseState,
+          id:"tab-clamp-upward",
+          path:"/notes/Upward.md",
+          content:"# Upward\n\nBody.\n",
+          mode:"live",
+          readingLocation:savedPositions["tab-clamp-upward"] as never,
+        });
+      });
+      act(()=>{vi.advanceTimersByTime(750);});
+      expect(reopenedReading.scrollTop).toBe(500);
+    } finally {
+      delete (window as unknown as {SuperMD?:unknown}).SuperMD;
+      vi.useRealTimers();
+    }
   });
 });

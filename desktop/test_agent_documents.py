@@ -317,6 +317,11 @@ class AgentDocumentsTest(unittest.TestCase):
         attached = self.store.attach_asset("portable.smd", "图形 with space.svg", expected_revision=revision)
         self.assertRegex(attached["asset"]["name"], r"^assets/[A-Za-z0-9._-]+\.svg$")
         revision = attached["revision"]
+        for bad_name in ("a" * 147 + ".png", "a" * 155 + ".png", "a" * 147, ".", ".."):
+            with self.assertRaisesRegex(AgentDocumentError, "simple filename"):
+                self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name=bad_name)
+        max_attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name="a" * 146 + ".png")
+        revision = max_attached["revision"]
         attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision)
         output = self.root / "extracted.png"
         extracted = self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
@@ -326,6 +331,66 @@ class AgentDocumentsTest(unittest.TestCase):
         with self.assertRaises(RevisionConflict):
             self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
                                      expected_revision=attached["revision"])
+
+    def test_existing_151_to_159_char_bundle_opens_exports_and_resaves_without_losing_asset_or_reference(self):
+        from agent_exports import export_pdf, export_smd, find_engine
+        from markdown_export import write_markdown_export, write_markdown_zip
+        import zipfile
+
+        svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><rect width='32' height='16' fill='#386a57'/></svg>"
+        svg_url = "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
+        compat_key = "assets/" + ("a" * 155) + ".svg"
+        self.assertEqual(len(compat_key.removeprefix("assets/")), 159)
+        markdown = f"# Legacy Bundle\n\n![Diagram](<{compat_key}>)\n"
+        legacy_path = self.root / "legacy.smd"
+        legacy_path.write_bytes(compressed_bundle(markdown, {compat_key: svg_url}))
+
+        # 1. Open and inspect existing bundle with 159-char basename.
+        info = self.store.inspect("legacy.smd")
+        self.assertEqual(info["asset_count"], 1)
+        read_res = self.store.read("legacy.smd", view="source")
+        self.assertEqual(read_res["text"], markdown)
+        asset_res = self.store.read_asset("legacy.smd", compat_key, expected_revision=info["revision"])
+        self.assertEqual(asset_res["data"], svg_bytes)
+
+        # 2. Export existing bundle to portable .smd, Markdown + companion folder, Markdown ZIP, and PDF.
+        export_smd(self.store, "legacy.smd", "exported-copy.smd")
+        exported_md, exported_assets, exported_portable = self.store._load(self.root / "exported-copy.smd")[:3]
+        self.assertTrue(exported_portable)
+        self.assertEqual(exported_md, markdown)
+        self.assertEqual(exported_assets, {compat_key: svg_url})
+
+        md_dir = self.root / "md-export"
+        md_dir.mkdir()
+        write_markdown_export(md_dir / "legacy.md", markdown, {compat_key: svg_url})
+        self.assertEqual((md_dir / "legacy.md").read_text(encoding="utf-8"), markdown)
+        self.assertEqual((md_dir / compat_key).read_bytes(), svg_bytes)
+
+        zip_path = self.root / "legacy-export.zip"
+        write_markdown_zip(zip_path, markdown, {compat_key: svg_url})
+        with zipfile.ZipFile(zip_path) as archive:
+            self.assertEqual(archive.read("legacy-export.md").decode("utf-8"), markdown)
+            self.assertEqual(archive.read(compat_key), svg_bytes)
+
+        try:
+            engine = find_engine()
+        except AgentDocumentError:
+            engine = None
+        if engine is not None:
+            export_pdf(self.store, "legacy.smd", "legacy.pdf", engine=engine)
+            self.assertTrue((self.root / "legacy.pdf").read_bytes().startswith(b"%PDF-"))
+
+        # 3. Edit and re-save existing bundle without losing its 159-char asset or Markdown reference.
+        patched = self.store.patch(
+            "legacy.smd",
+            expected_revision=info["revision"],
+            operations=[{"type": "replace", "old": "# Legacy Bundle", "new": "# Legacy Bundle\n\nRe-saved note body."}],
+        )
+        reopened_text = self.store.read("legacy.smd", view="source")["text"]
+        self.assertIn(f"![Diagram](<{compat_key}>)", reopened_text)
+        self.assertIn("Re-saved note body.", reopened_text)
+        reopened_asset = self.store.read_asset("legacy.smd", compat_key, expected_revision=patched["revision"])
+        self.assertEqual(reopened_asset["data"], svg_bytes)
 
     def test_explicit_asset_read_returns_exact_bytes_only_for_current_revision(self):
         payload = "<svg xmlns='http://www.w3.org/2000/svg'><text>Σ</text></svg>".encode("utf-8")
@@ -918,6 +983,158 @@ class AgentDocumentsTest(unittest.TestCase):
             diagram_spans(unclosed_braced_py, include_inline_svg=True),
             [{"start": unclosed_braced_py.index("<svg/>"), "end": unclosed_braced_py.index("<svg/>") + len("<svg/>")}],
         )
+
+    def test_frontmatter_single_parse_visible_metadata_canonical_offsets_and_fence_scan_integration(self):
+        import agent_documents
+        import frontmatter
+        from unittest.mock import patch
+
+        source = (
+            "\ufeff---\n"
+            'title: "Path Integrals & Symmetries"\n'
+            "subtitle: Graduate Notes\n"
+            "# Not a Markdown heading inside YAML\n"
+            "description: |\n"
+            "  ```mermaid\n"
+            "  graph TD; Hidden --> Diagram\n"
+            "  ```\n"
+            "author:\n"
+            "  - name: Richard Feynman\n"
+            "  - given: Emmy\n"
+            "    family: Noether\n"
+            "date: 2026-03-15\n"
+            "tags: [quantum, physics]\n"
+            "keywords: physics, qft\n"
+            "aliases: [QFT I]\n"
+            "custom_secret: top-secret\n"
+            "---\n"
+            "\n"
+            "# Introduction\n"
+            "Body paragraph with 🧭 canonical offset.\n"
+            "```mermaid\n"
+            "graph LR; Real --> Body\n"
+            "```\n"
+        )
+        note = self.root / "frontmatter-note.md"
+        note.write_bytes(source.encode("utf-8"))
+        canonical = source.removeprefix("\ufeff")
+
+        with (
+            patch("frontmatter._parse_yaml_mapping", wraps=frontmatter._parse_yaml_mapping) as yaml_spy,
+            patch("agent_documents._step_fence_boundary", wraps=agent_documents._step_fence_boundary) as step_spy,
+        ):
+            info = self.store.inspect("frontmatter-note.md")
+            self.assertEqual(yaml_spy.call_count, 1, "DocumentStore.inspect must validate and extract YAML frontmatter in one single parse")
+            body_line_count = len(canonical[frontmatter.frontmatter_end(canonical):].splitlines(keepends=True))
+            self.assertEqual(step_spy.call_count, body_line_count, "_scan_read_only must skip frontmatter lines and scan body fences once")
+
+        self.assertEqual(info["properties"], {
+            "title": "Path Integrals & Symmetries",
+            "author": "Richard Feynman, Emmy Noether",
+            "authors": ["Richard Feynman", "Emmy Noether"],
+            "tags": ["quantum", "physics", "qft"],
+        })
+        for redacted_key in ("subtitle", "date", "description", "aliases", "custom_secret"):
+            self.assertNotIn(redacted_key, info["properties"])
+
+        # Fenced diagram inside YAML description is skipped, while real body diagram is preserved.
+        diags = diagram_spans(canonical)
+        self.assertEqual(len(diags), 1)
+        self.assertEqual(canonical[diags[0]["start"]:diags[0]["end"]], "graph LR; Real --> Body\n")
+
+        self.assertEqual([h["title"] for h in info["headings"]], ["Introduction"])
+        intro_offset = canonical.index("# Introduction")
+        intro_line = canonical[:intro_offset].count("\n") + 1
+        self.assertEqual(info["headings"][0]["start"], intro_offset)
+        self.assertEqual(info["headings"][0]["line"], intro_line)
+
+        section = self.store.read("frontmatter-note.md", heading="Introduction", view="source")
+        self.assertEqual(section["start"], intro_offset)
+        self.assertEqual(section["text"], canonical[intro_offset:])
+
+        matches = self.store.search("frontmatter-note.md", "Noether", context=0)
+        self.assertEqual(matches["totalMatches"], 1)
+        self.assertEqual(matches["matches"][0]["matchOffset"], canonical.index("Noether"))
+
+        self.store.patch(
+            "frontmatter-note.md",
+            expected_revision=info["revision"],
+            operations=[{"type": "lines", "start_line": intro_line + 1, "end_line": intro_line + 1,
+                         "text": "Updated body paragraph.\n"}],
+        )
+        self.assertEqual(
+            self.store.read("frontmatter-note.md", view="source")["text"],
+            canonical.replace("Body paragraph with 🧭 canonical offset.", "Updated body paragraph."),
+        )
+        self.assertEqual(self.store.inspect("frontmatter-note.md")["properties"], info["properties"])
+
+        # Portable .smd envelopes preserve leading \ufeff verbatim in markdown.
+        smd_note = self.root / "frontmatter-bom.smd"
+        smd_note.write_bytes(compressed_bundle(source, {}))
+        smd_info = self.store.inspect("frontmatter-bom.smd")
+        self.assertEqual(smd_info["properties"], info["properties"])
+        self.assertEqual(smd_info["headings"][0]["start"], source.index("# Introduction"))
+
+    def test_frontmatter_quoted_folded_flow_duplicate_redaction_and_malformed_fallback(self):
+        import frontmatter
+
+        complex_note = (
+            "---\n"
+            "title: Overwritten Initial\n"
+            "title: >-\n"
+            "  Folded Alpha\n"
+            "  Study\n"
+            "subtitle: Hidden Subtitle\n"
+            "description: |\n"
+            "  Hidden literal description\n"
+            "date: '2026-04-01'\n"
+            "aliases: [HiddenAlias, 'Second Alias']\n"
+            "secret_token: should-not-leak\n"
+            "author: 'Ada ''Alpha'' Lovelace'\n"
+            "authors:\n"
+            "  - \"Ada 'Alpha' Lovelace\"\n"
+            "  - { given: \"Grace\", family: 'Hopper', role: 'Rear Admiral' }\n"
+            "tags: [\n"
+            "  'flow-one',\n"
+            "  \"flow-two\",\n"
+            "  flow-one\n"
+            "]\n"
+            "keywords: >-\n"
+            "  flow-two, folded-three,\n"
+            "  folded-four\n"
+            "...\n"
+            "# Heading After Dots\n"
+        )
+        (self.root / "complex-fm.md").write_text(complex_note, encoding="utf-8")
+        info = self.store.inspect("complex-fm.md")
+        self.assertEqual(info["properties"], {
+            "title": "Folded Alpha Study",
+            "author": "Ada 'Alpha' Lovelace, Grace Hopper",
+            "authors": ["Ada 'Alpha' Lovelace", "Grace Hopper"],
+            "tags": ["flow-one", "flow-two", "folded-three", "folded-four"],
+        })
+        self.assertEqual([h["title"] for h in info["headings"]], ["Heading After Dots"])
+
+        # Hidden-only recognized or custom keys produce no properties entry.
+        hidden_only = "---\nsubtitle: Only Subtitle\ndate: 2026-04-01\ndescription: Hidden\naliases: [a]\ncssclasses: [wide]\n---\n# Plain\n"
+        (self.root / "hidden-only.md").write_text(hidden_only, encoding="utf-8")
+        self.assertNotIn("properties", self.store.inspect("hidden-only.md"))
+
+        # Malformed or unclosed YAML headers fall back cleanly (fm_end == 0, properties is None, body headings preserved).
+        malformed_samples = [
+            "---\ntitle: \"Unclosed quote\n# Preserved Heading\n---\n",
+            "---\ntags: [unclosed, flow\n# Preserved Heading\n---\n",
+            "---\n\ttitle: Leading Tab\n# Preserved Heading\n---\n",
+            "---\n- root_list_not_mapping\n# Preserved Heading\n---\n",
+            "---\ntitle: Unclosed Frontmatter\n# Preserved Heading\n",
+        ]
+        for idx, sample in enumerate(malformed_samples):
+            self.assertEqual(frontmatter.parse_frontmatter(sample), (0, None), sample)
+            name = f"malformed-{idx}.md"
+            (self.root / name).write_text(sample, encoding="utf-8")
+            inspected = self.store.inspect(name)
+            self.assertNotIn("properties", inspected)
+            self.assertEqual([h["title"] for h in inspected["headings"]], ["Preserved Heading"])
 
 
 if __name__ == "__main__":

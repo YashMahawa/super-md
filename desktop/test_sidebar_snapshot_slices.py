@@ -106,6 +106,8 @@ ApplicationWindow {{
     visible: true
     color: viewState.colors.surface
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var shortcutBindings: JSON.parse(studio.shortcutBindings)
     property var shortcutLabels: JSON.parse(studio.shortcutLabels)
@@ -143,6 +145,8 @@ ApplicationWindow {{
         TabStrip {{
             width: parent.width
             viewState: window.viewState
+            tabs: window.tabsState
+            activeTabId: window.activeTabId
             shortcutLabels: window.shortcutLabels
         }}
         Rectangle {{ width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }}
@@ -652,10 +656,10 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             [("Coursework", True), ("Week 1.md", False), ("Overview.md", False), ("Reading.md", False)],
         )
 
-        # Subfolder filter search and empty state.
-        filter_field = self.named("folderFilterField")
+        # Subfolder filter search and empty state (FolderSidebar omits duplicate in-folder search input).
+        self.assertIsNone(self.named("folderFilterField"))
         empty_state = self.named("folderEmptyState")
-        filter_field.setProperty("text", "week")
+        self.studio.setFolderFilter("week")
         self.wait_until(
             lambda: not self.studio._folder_searching
             and not self.studio.filter_timer.isActive()
@@ -664,7 +668,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self._polish()
         self.assertFalse(empty_state.property("visible"))
 
-        filter_field.setProperty("text", "nonexistent-note-xyz")
+        self.studio.setFolderFilter("nonexistent-note-xyz")
         self.wait_until(
             lambda: not self.studio._folder_searching
             and not self.studio.filter_timer.isActive()
@@ -674,7 +678,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.assertTrue(empty_state.property("visible"))
 
         # Clearing filter restores expanded tree.
-        filter_field.setProperty("text", "")
+        self.studio.setFolderFilter("")
         self.wait_until(lambda: len(self._qml_dict("sidebarState")["files"]) == 4)
         self._polish()
         self.assertFalse(empty_state.property("visible"))
@@ -736,7 +740,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
 
         folder_sidebar = self.named("folderSidebar")
         files_view = self.named("folderFilesView")
-        filter_field = self.named("folderFilterField")
+        self.assertIsNone(self.named("folderFilterField"))
         outline_list = self.named("sidebarOutlineList")
         popup_outline = self.named("popupOutlineList")
         recent_notes = self.named("sidebarRecentNotes")
@@ -815,7 +819,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
         self.assertIs(self.studio._outline_slice_cache, outline_cache_before_rename)
 
         # Filter in FolderSidebar, then rename the parent subfolder and verify filtered FolderSidebar delegates & pinned Recent remap.
-        filter_field.setProperty("text", "systems")
+        self.studio.setFolderFilter("systems")
         self.wait_until(
             lambda: not self.studio._folder_searching
             and not self.studio.filter_timer.isActive()
@@ -919,8 +923,7 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
             self._retire_window(second_studio)
 
         # 4. Saving a new note via saveAs inside an unexpanded subfolder refreshes active folderFilter results immediately.
-        filter_field = self.named("folderFilterField")
-        filter_field.setProperty("text", "week")
+        self.studio.setFolderFilter("week")
         self.wait_until(
             lambda: not self.studio._folder_searching
             and not self.studio.filter_timer.isActive()
@@ -1015,13 +1018,15 @@ class SidebarSnapshotSlicesTest(unittest.TestCase):
 
         header_new_btn = self.named("headerNewItemButton")
         header_sub_btn = self.named("headerNewSubfolderButton")
+        sidebar_search_btn = self.named("sidebarFolderSearchButton")
         new_win_btn = self.named("newWindowButton")
         header_md_item = self.named("headerNewMarkdownItem")
         header_sub_item = self.named("headerNewSubfolderItem")
         menu_md_item = self.named("menuNewMarkdown")
         menu_sub_item = self.named("menuNewSubfolder")
+        self.assertIsNone(header_sub_btn)
+        self.assertIsNotNone(sidebar_search_btn)
         self.assertIn("M", header_new_btn.findChild(QObject, "actionHint").property("text"))
-        self.assertEqual(header_sub_btn.findChild(QObject, "actionHint").property("text"), "New subfolder")
         self.assertEqual(new_win_btn.findChild(QObject, "actionHint").property("text"), "New window")
         self.assertIn("M", header_md_item.property("shortcutText"))
         self.assertTrue(bool(header_md_item.property("hasShortcutHint")))
