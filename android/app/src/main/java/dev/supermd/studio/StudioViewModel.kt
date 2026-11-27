@@ -359,121 +359,32 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     ) = openIntentDispatcher.request(
         OpenDocumentTarget(uri, externalIntentFlags = intentFlags, externalCaller = caller),
     )
-    internal fun requestInitialExternalOpen(
-        uri: Uri,
-        intentFlags: Int,
-        caller: ExternalIntentCaller = ExternalIntentCaller(),
-    ) {
-        val key = uri.toString()
-        if (initialOpenIntentUri == key) return
-        initialOpenIntentUri = key
-        requestExternalOpen(uri, intentFlags, caller)
-    }
-    internal fun handleExpiredExternalOpenGrant(uri: Uri, initial: Boolean) {
-        if (initial) {
-            val key = uri.toString()
-            if (initialOpenIntentUri == key) return
-            initialOpenIntentUri = key
+    private lateinit var readerBarrierCoordinatorCache: ReaderBarrierCoordinator
+    private val readerBarrierCoordinator: ReaderBarrierCoordinator
+        get() = if (::readerBarrierCoordinatorCache.isInitialized) readerBarrierCoordinatorCache else synchronized(this) {
+            if (!::readerBarrierCoordinatorCache.isInitialized) {
+                readerBarrierCoordinatorCache = ReaderBarrierCoordinator(
+                    readState = { mutable.value },
+                    readInitialOpenIntentUri = { initialOpenIntentUri }, writeInitialOpenIntentUri = { initialOpenIntentUri = it },
+                    requestExternalOpen = ::requestExternalOpen,
+                    requestDocumentAccess = { rawUri, existingNote, writing, explicit -> requestDocumentAccess(rawUri, existingNote, writing, explicit) },
+                    fail = ::fail, readerActionMutex = readerActionMutex,
+                    readFlushRequester = { readerFlushRequester }, readFlushStatusRequester = { readerFlushStatusRequester },
+                    readerStateIsNativeAuthoritative = ::readerStateIsNativeAuthoritative,
+                )
+            }
+            readerBarrierCoordinatorCache
         }
-        val existing = mutable.value.tabs.firstOrNull { it.uri?.let { raw -> sameDocumentUri(raw, uri.toString()) } == true }
-        requestDocumentAccess(uri.toString(), existing, writing = false, explicit = true)
-    }
-    internal fun rejectExternalOpen(uri: Uri, reason: String, initial: Boolean) {
-        if (initial) {
-            val key = uri.toString()
-            if (initialOpenIntentUri == key) return
-            initialOpenIntentUri = key
-        }
-        fail("Could not open note: $reason")
-    }
+    internal fun requestInitialExternalOpen(uri: Uri, intentFlags: Int, caller: ExternalIntentCaller = ExternalIntentCaller()) =
+        readerBarrierCoordinator.requestInitialExternalOpen(uri, intentFlags, caller)
+    internal fun handleExpiredExternalOpenGrant(uri: Uri, initial: Boolean) = readerBarrierCoordinator.handleExpiredExternalOpenGrant(uri, initial)
+    internal fun rejectExternalOpen(uri: Uri, reason: String, initial: Boolean) = readerBarrierCoordinator.rejectExternalOpen(uri, reason, initial)
     internal fun attachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>?) = openIntentDispatcher.attach(handler)
     internal fun detachReaderOpenHandler(handler: OpenIntentDispatcher.Handler<OpenDocumentTarget>) = openIntentDispatcher.detach(handler)
-    private suspend fun flushActiveNoteLocked(expectedActiveId: String): Boolean {
-        if (mutable.value.tabs.isEmpty() && expectedActiveId.isEmpty()) return true
-        if (mutable.value.active.id != expectedActiveId) return false
-        val statusRequester = readerFlushStatusRequester
-        if (statusRequester != null) {
-            val status = try {
-                statusRequester.invoke(expectedActiveId)
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                ReaderFlushStatus.FAILED
-            }
-            return when (status) {
-                ReaderFlushStatus.ACKNOWLEDGED -> mutable.value.active.id == expectedActiveId
-                ReaderFlushStatus.WRONG_ACTIVE_NOTE ->
-                    // Compose delivers supermdLoad asynchronously after native switches
-                    // activeId. When the live reader confirms a different note is still
-                    // mounted (with no unacknowledged draft for expectedActiveId) and
-                    // native remains authoritative for expectedActiveId, there are no
-                    // pending reader edits on expectedActiveId to flush.
-                    mutable.value.active.id == expectedActiveId &&
-                        readerStateIsNativeAuthoritative(expectedActiveId)
-                ReaderFlushStatus.FAILED -> false
-            }
-        }
-        // A missing bridge is not an implicit flush acknowledgement. Only
-        // proceed when the native snapshot is already the last acknowledged
-        // reader state (for example, before the reader has ever attached).
-        val accepted = try {
-            readerFlushRequester?.invoke(expectedActiveId)
-                ?: readerStateIsNativeAuthoritative(expectedActiveId)
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            false
-        }
-        return accepted && mutable.value.active.id == expectedActiveId
-    }
-    private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerActionMutex.withLock {
-        if (!flushActiveNoteLocked(expectedActiveId)) return@withLock false
-        action()
-        true
-    }
-    private suspend fun performCurrentReaderBarrier(action: (String) -> Unit): Boolean = readerActionMutex.withLock {
-        val currentActiveId = mutable.value.active.id
-        if (!flushActiveNoteLocked(currentActiveId)) return@withLock false
-        action(currentActiveId)
-        true
-    }
-    /** Waits until the reader reflects an already-selected native tab. This is
-     * a read/flush acknowledgement only; it never changes focus or retries a
-     * document write. */
-    internal suspend fun awaitReaderSnapshot(noteId: String, timeoutMillis: Long = 8_000): Boolean =
-        kotlinx.coroutines.withTimeoutOrNull(timeoutMillis) {
-            while (true) {
-                val current = mutable.value
-                if (current.activeId != noteId || current.active.id != noteId) return@withTimeoutOrNull false
-                val statusRequester = readerFlushStatusRequester
-                if (statusRequester != null) {
-                    val status = try {
-                        statusRequester.invoke(noteId)
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        ReaderFlushStatus.FAILED
-                    }
-                    when (status) {
-                        ReaderFlushStatus.ACKNOWLEDGED -> return@withTimeoutOrNull true
-                        ReaderFlushStatus.FAILED -> return@withTimeoutOrNull false
-                        ReaderFlushStatus.WRONG_ACTIVE_NOTE -> kotlinx.coroutines.delay(40)
-                    }
-                } else {
-                    val acknowledged = try {
-                        readerFlushRequester?.invoke(noteId) ?: readerStateIsNativeAuthoritative(noteId)
-                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        false
-                    }
-                    if (acknowledged) return@withTimeoutOrNull true
-                    kotlinx.coroutines.delay(40)
-                }
-            }
-            @Suppress("UNREACHABLE_CODE")
-            false
-        } == true
+    private suspend fun flushActiveNoteLocked(expectedActiveId: String): Boolean = readerBarrierCoordinator.flushActiveNoteLocked(expectedActiveId)
+    private suspend fun performReaderBarrier(expectedActiveId: String, action: () -> Unit): Boolean = readerBarrierCoordinator.performReaderBarrier(expectedActiveId, action)
+    private suspend fun performCurrentReaderBarrier(action: (String) -> Unit): Boolean = readerBarrierCoordinator.performCurrentReaderBarrier(action)
+    internal suspend fun awaitReaderSnapshot(noteId: String, timeoutMillis: Long = 8_000): Boolean = readerBarrierCoordinator.awaitReaderSnapshot(noteId, timeoutMillis)
     private fun readerBarrierFailed() {
         mutable.value = mutable.value.copy(message = "The reader could not confirm its latest edits. The action was canceled; keep the note open and try again.")
     }
@@ -1397,56 +1308,27 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             scheduleAutosave(id)
         }
     }
-    fun newNote(titleHint: String? = null, content: String? = null, background: Boolean = false, format: String = "md", onCreated: ((Note?) -> Unit)? = null) {
-        if (format !in setOf("md", "smd")) { onCreated?.invoke(null); return }
-        openRequests.invalidate()
-        viewModelScope.launch {
-            val nativeFormat = if (format == "smd") NativeExportFormat.PORTABLE_SMD else NativeExportFormat.MARKDOWN
-            val title = ExportFilename.suggestedName(titleHint ?: "Untitled", nativeFormat)
-            val assets = if (format == "smd") media.createEmptyPortableDirectory() else null
-            val note = Note(name = title, content = content ?: "", assetDirectory = assets)
-            val accepted = performCurrentReaderBarrier {
-                    change { state ->
-                        val preservedId = state.tabs.firstOrNull { it.id == state.activeId }?.id ?: state.tabs.firstOrNull()?.id ?: note.id
-                        state.copy(tabs = state.tabs + note, activeId = if (background) preservedId else note.id)
-                    }
-                }
-            if (!accepted) {
-                assets?.let { File(getApplication<Application>().filesDir, "portable-assets/$it").deleteRecursively() }
-                readerBarrierFailed()
+    private lateinit var tabNavigationCoordinatorCache: TabNavigationCoordinator
+    private val tabNavigationCoordinator: TabNavigationCoordinator
+        get() = if (::tabNavigationCoordinatorCache.isInitialized) tabNavigationCoordinatorCache else synchronized(this) {
+            if (!::tabNavigationCoordinatorCache.isInitialized) {
+                tabNavigationCoordinatorCache = TabNavigationCoordinator(
+                    app = getApplication(), scope = viewModelScope, media = media, openRequests = openRequests,
+                    closedNoteMutex = closedNoteMutex, closedNoteStore = closedNoteStore, readerEcho = { readerEcho },
+                    readClosedNoteRefs = { closedNoteRefs }, writeClosedNoteRefs = { closedNoteRefs = it },
+                    readState = { mutable.value }, writeState = { mutable.value = it }, changeState = ::change,
+                    performReaderBarrier = ::performReaderBarrier, performCurrentReaderBarrier = ::performCurrentReaderBarrier,
+                    readerBarrierFailed = ::readerBarrierFailed, refreshExternalImmediate = { refreshExternal(it, immediate = true) },
+                    recordPortableBaseline = ::recordPortableBaseline,
+                )
             }
-            onCreated?.invoke(note.takeIf { accepted })
+            tabNavigationCoordinatorCache
         }
-    }
-    fun select(id: String) = selectExpected(mutable.value.active.id, id)
-    fun cycle(direction:Int) {
-        val state=mutable.value
-        if(state.tabs.isEmpty())return
-        val index=state.tabs.indexOfFirst{it.id==state.active.id}
-        selectExpected(state.active.id,state.tabs[Math.floorMod(index+direction,state.tabs.size)].id)
-    }
-    fun tabNumber(number:Int) {
-        val state=mutable.value
-        val index=if(number==9)state.tabs.lastIndex else number-1
-        state.tabs.getOrNull(index)?.let{selectExpected(state.active.id,it.id)}
-    }
-    private fun selectExpected(expectedActiveId:String,targetId:String) {
-        // A later explicit tab choice must not be overwritten by a file load
-        // that began earlier and is still waiting on I/O or the reader flush.
-        openRequests.invalidate()
-        viewModelScope.launch {
-            var switchedUri: Uri? = null
-            val accepted=performReaderBarrier(expectedActiveId) {
-                val target = mutable.value.tabs.find { it.id == targetId }
-                if(target != null) {
-                    change {it.copy(activeId=targetId)}
-                    if (target.id !in mutable.value.conflictedTabIds) switchedUri = target.uri?.let(Uri::parse)
-                }
-            }
-            if(!accepted)readerBarrierFailed()
-            else if(switchedUri != null)refreshExternal(switchedUri, immediate = true)
-        }
-    }
+    fun newNote(titleHint: String? = null, content: String? = null, background: Boolean = false, format: String = "md", onCreated: ((Note?) -> Unit)? = null) =
+        tabNavigationCoordinator.newNote(titleHint, content, background, format, onCreated)
+    fun select(id: String) = tabNavigationCoordinator.select(id)
+    fun cycle(direction: Int) = tabNavigationCoordinator.cycle(direction)
+    fun tabNumber(number: Int) = tabNavigationCoordinator.tabNumber(number)
     private data class RefreshTabSnapshot(
         val note: Note,
         val preIoBaselineAssets: JSONObject?,
@@ -1702,39 +1584,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             cleanupPortableDirectories(pendingPortableDirs + obsoletePortableDirs)
         }
     }
-    fun reorder(id: String, index: Int) = change { it.copy(tabs = reorderedNotes(it.tabs, id, index)) }
-    private fun migrateLegacyClosedNotes() = viewModelScope.launch {
-        var locked=false
-        try {
-            closedNoteMutex.lock();locked=true
-            val existingIds=closedNoteRefs.map {it.id}.toSet()
-            val legacy=mutable.value.closedTabs.filter {it.id !in existingIds}
-            if(legacy.isEmpty())return@launch
-            val migrated=runCatching { withContext(Dispatchers.IO) { legacy.map { it to closedNoteStore.save(it) } } }.getOrElse {
-                mutable.value=mutable.value.copy(message="Some older closed notes could not be moved to disk; they remain available in memory.")
-                return@launch
-            }
-            val stillClosed=migrated.filter { (old,_) -> mutable.value.closedTabs.any {it==old} }
-            if(stillClosed.isEmpty())return@launch
-            val activeIds=mutable.value.tabs.map {it.id}.toSet()
-            val currentRefs=withContext(Dispatchers.IO){closedNoteStore.loadIndexStrict()}
-            val next=(stillClosed.map {it.second}+currentRefs).distinctBy {it.id}
-                .filterNot {it.id in activeIds}.take(ClosedNoteStore.LIMIT)
-            withContext(Dispatchers.IO){closedNoteStore.saveIndex(next)}
-            val replacements=stillClosed.associate {it.first.id to it}
-            val finalRefs=next.filter {ref ->
-                val old=replacements[ref.id]?.first
-                old==null || mutable.value.closedTabs.any {it==old}
-            }
-            if(finalRefs!=next)withContext(Dispatchers.IO){closedNoteStore.saveIndex(finalRefs)}
-            closedNoteRefs=finalRefs
-            change { state -> state.copy(closedTabs=state.closedTabs.map {old ->
-                replacements[old.id]?.takeIf {it.first==old}?.second?.placeholder() ?: old
-            }.take(ClosedNoteStore.LIMIT)) }
-        } catch(error:Exception) {
-            mutable.value=mutable.value.copy(message="Older closed-note recovery could not be updated; the notes remain available. ${error.message}")
-        } finally {if(locked)closedNoteMutex.unlock()}
-    }
+    fun reorder(id: String, index: Int) = tabNavigationCoordinator.reorder(id, index)
+    private fun migrateLegacyClosedNotes() = tabNavigationCoordinator.migrateLegacyClosedNotes()
     fun requestClose(id: String) {
         openRequests.invalidate()
         viewModelScope.launch { executeClose(id, confirmIfRequired = true) }
@@ -1917,30 +1768,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             if (locked) closedNoteMutex.unlock()
         }
     }
-    fun reopen() {
-        openRequests.invalidate()
-        val referenceNote=mutable.value.closedTabs.firstOrNull() ?: return
-        val reference=closedNoteRefs.firstOrNull {it.id==referenceNote.id}
-        viewModelScope.launch {
-            val note=try {if(reference==null)referenceNote else withContext(Dispatchers.IO){closedNoteStore.load(reference)}}
-                catch(error:Exception) {mutable.value=mutable.value.copy(message="Could not reopen the closed note: ${error.message}");return@launch}
-            var updatedRefs: List<ClosedNoteReference>? = null
-            val accepted = performCurrentReaderBarrier {
-                if(mutable.value.closedTabs.none {it.id==referenceNote.id})return@performCurrentReaderBarrier
-                readerEcho.remove(note.id)
-                if (note.portable && note.uri != null && !note.assetsDirty) recordPortableBaseline(note.id, note.assetDirectory)
-                closedNoteRefs=closedNoteRefs.filterNot {it.id==note.id}
-                updatedRefs = closedNoteRefs
-                change { state ->
-                    val existing=state.tabs.find {it.id==note.id}
-                    val tabs=if(existing==null)state.tabs+note else state.tabs
-                    state.copy(tabs=tabs,closedTabs=state.closedTabs.dropWhile {it.id==referenceNote.id}.filterNot {it.id==referenceNote.id},activeId=note.id)
-                }
-            }
-            if(!accepted)readerBarrierFailed()
-            else updatedRefs?.let { refs -> withContext(Dispatchers.IO) { runCatching { closedNoteStore.saveIndex(refs) } } }
-        }
-    }
+    fun reopen() = tabNavigationCoordinator.reopen()
     fun recoverDeletedDraft() {
         openRequests.invalidate()
         val expectedActiveId = mutable.value.active.id
