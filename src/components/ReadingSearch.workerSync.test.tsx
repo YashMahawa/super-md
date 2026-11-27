@@ -141,4 +141,95 @@ describe("ReadingSearch background worker revision synchronization", () => {
       root.unmount();
     });
   });
+
+  it("retains seeded exact occurrence bounds while renderedRevision is null and selects 2 / 2 once worker DOM commits", async () => {
+    const onClose = vi.fn();
+    const root = createRoot(searchContainer);
+    const flushFrame = async () => {
+      await act(async () => {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+      });
+    };
+
+    const noteSource = "First AuroraSignal paragraph\n\nSecond AuroraSignal paragraph";
+    const secondStart = noteSource.lastIndexOf("AuroraSignal");
+    const seed: ReadingSearchSeed = {
+      query: "AuroraSignal",
+      caseSensitive: true,
+      sourceStart: secondStart,
+      sourceEnd: secondStart + "AuroraSignal".length,
+      matchText: "AuroraSignal",
+      nonce: 2,
+    };
+
+    await act(async () => {
+      root.render(<ReadingSearch content={noteSource} renderedRevision={null} close={onClose} seed={seed} />);
+    });
+    await flushFrame();
+
+    const host = document.createElement("section");
+    host.className = "android-reading";
+    host.innerHTML = "<p data-source-start=\"0\" data-source-end=\"28\">First AuroraSignal paragraph</p><p data-source-start=\"30\" data-source-end=\"59\">Second AuroraSignal paragraph</p>";
+    document.body.prepend(host);
+
+    await act(async () => {
+      root.render(<ReadingSearch content={noteSource} renderedRevision={noteSource} close={onClose} seed={seed} />);
+    });
+    await flushFrame();
+
+    const status = searchContainer.querySelector("output");
+    expect(status?.textContent).toBe("2 / 2");
+    expect(highlights.get("smd-search")?.ranges).toHaveLength(2);
+    expect(highlights.get("smd-search-current")?.ranges).toHaveLength(1);
+    const currentParent = highlights.get("smd-search-current")?.ranges[0]?.startContainer.parentElement;
+    expect(currentParent?.textContent).toBe("Second AuroraSignal paragraph");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("keeps stale seeded occurrence passive (0 / 2) across delayed worker renderedRevision commit", async () => {
+    const onClose = vi.fn();
+    const root = createRoot(searchContainer);
+    const flushFrame = async () => {
+      await act(async () => {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+      });
+    };
+
+    const noteSource = "Prepended edit.\n\nFirst AuroraSignal paragraph\n\nSecond AuroraSignal paragraph";
+    const staleSeed: ReadingSearchSeed = {
+      query: "AuroraSignal",
+      caseSensitive: true,
+      sourceStart: 6,
+      sourceEnd: 6 + "AuroraSignal".length,
+      matchText: "AuroraSignal",
+      nonce: 3,
+    };
+
+    await act(async () => {
+      root.render(<ReadingSearch content={noteSource} renderedRevision={null} close={onClose} seed={staleSeed} />);
+    });
+    await flushFrame();
+
+    const host = document.createElement("section");
+    host.className = "android-reading";
+    host.innerHTML = "<p data-source-start=\"0\" data-source-end=\"15\">Prepended edit.</p><p data-source-start=\"17\" data-source-end=\"45\">First AuroraSignal paragraph</p><p data-source-start=\"47\" data-source-end=\"76\">Second AuroraSignal paragraph</p>";
+    document.body.prepend(host);
+
+    await act(async () => {
+      root.render(<ReadingSearch content={noteSource} renderedRevision={noteSource} close={onClose} seed={staleSeed} />);
+    });
+    await flushFrame();
+
+    const status = searchContainer.querySelector("output");
+    expect(status?.textContent).toBe("0 / 2");
+    expect(highlights.get("smd-search")?.ranges).toHaveLength(2);
+    expect(highlights.has("smd-search-current")).toBe(false);
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
 });
