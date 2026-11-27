@@ -909,10 +909,13 @@ def _qt_bridge_class():
                         parent["completed"] = 0
                         parent["fallback"] = {}
                     for studio in candidates:
+                        checker = getattr(studio, "_is_tab_live_authorized", None)
                         host_window = getattr(studio, "host_window", None)
                         window_visible = host_window is None or host_window.isVisible()
                         tab_rows = []
                         for tab in studio.tabs:
+                            if callable(checker) and not checker(tab):
+                                continue
                             source = tab["content"]
                             tab_rows.append({"id": tab["id"], "windowId": studio.window_id,
                                              "title": tab["name"], "path": tab["path"],
@@ -991,6 +994,10 @@ def _qt_bridge_class():
                                   and any(tab["id"] == tab_id for tab in window.tabs)), None)
                     if owner is None:
                         raise ValueError("The requested live tab is no longer open")
+                    target_tab = next((tab for tab in owner.tabs if tab["id"] == tab_id), None)
+                    checker = getattr(owner, "_is_tab_live_authorized", None)
+                    if target_tab is not None and callable(checker) and not checker(target_tab) and action != "close_document":
+                        raise ValueError("The file is outside the approved agent note roots")
                     if tab_id != owner.active and action in ("render_tab", "get_context", "get_diagram_image", "latex_review", "latex_apply", "export_document"):
                         raise ValueError("This action needs the active reader view; activate the target tab explicitly first")
                     studio = owner
@@ -1365,7 +1372,7 @@ def _qt_bridge_class():
                 merged_rows = []
                 if isinstance(rows, list):
                     for row in rows:
-                        if not isinstance(row, dict):
+                        if not isinstance(row, dict) or row.get("id") not in fallback_by_id:
                             continue
                         merged = dict(fallback_by_id.get(row.get("id"), {}))
                         merged.update({key: row[key] for key in (

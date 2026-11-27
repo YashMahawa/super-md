@@ -85,6 +85,21 @@ def _is_link_or_junction(path: Path) -> bool:
     return bool(callable(is_junction) and is_junction())
 
 
+def is_hidden_name(name: str) -> bool:
+    """Return True when a filesystem entry basename is hidden (dot-prefixed)."""
+    return bool(name and name not in (".", "..") and name.startswith("."))
+
+
+def has_hidden_relative_segment(path: Path, root: Path) -> bool:
+    """Return True if any path segment of *path* relative to *root* is dot-prefixed."""
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel = normalized_relpath(path, root)
+        rel_parts = () if rel == "." else PurePosixPath(rel).parts
+    return any(is_hidden_name(part) for part in rel_parts)
+
+
 def strip_extended_length_prefix(raw: str) -> str:
     """Strip Win32 extended-length path prefixes (\\\\?\\) while preserving standard paths."""
     if raw.startswith("\\\\?\\UNC\\"):
@@ -100,8 +115,10 @@ def _pure_path(raw: str) -> PurePath:
 
 def canonical_path_str(path: str | os.PathLike[str]) -> str:
     """Return a resolved, normalized path string without Win32 \\\\?\\ prefixes."""
-    raw = strip_extended_length_prefix(str(path or "").strip())
-    if not raw:
+    if path is None:
+        return ""
+    raw = strip_extended_length_prefix(os.fspath(path) if isinstance(path, os.PathLike) else str(path))
+    if not raw or not raw.strip():
         return ""
     try:
         return os.path.normpath(strip_extended_length_prefix(str(os.path.realpath(raw))))
@@ -163,9 +180,9 @@ def resolve_within_open_folder(
     must_exist: bool = True,
 ) -> Path:
     """Resolve *target* inside *open_root*, rejecting symlinks and paths outside the open folder."""
-    root_str = strip_extended_length_prefix(str(open_root or "").strip())
-    target_str = strip_extended_length_prefix(str(target or "").strip())
-    if not root_str or not target_str:
+    root_str = strip_extended_length_prefix(os.fspath(open_root) if isinstance(open_root, os.PathLike) else str(open_root or ""))
+    target_str = strip_extended_length_prefix(os.fspath(target) if isinstance(target, os.PathLike) else str(target or ""))
+    if not root_str.strip() or not target_str.strip():
         raise ValueError("Open a folder first.")
     raw_root = Path(root_str)
     if _is_link_or_junction(raw_root):
