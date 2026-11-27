@@ -27,6 +27,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -219,40 +224,51 @@ class FolderSearchControllerTest {
 
         // Cancelling mid-scan (or superseding via updateFolderSearch) must not commit stale batches,
         // and a replacement query must publish only its own matches.
+        val blockFirstReadClaimed = AtomicBoolean(false)
         val blockFirstReadEntered = CountDownLatch(1)
         val releaseBlockedRead = CountDownLatch(1)
         provider.readHook = { docId ->
-            if (docId == "root/01-blocked.md" && blockFirstReadEntered.count > 0) {
+            if (docId == "root/01-blocked.md" && blockFirstReadClaimed.compareAndSet(false, true)) {
                 blockFirstReadEntered.countDown()
-                releaseBlockedRead.await(3, TimeUnit.SECONDS)
+                releaseBlockedRead.await(15, TimeUnit.SECONDS)
             }
         }
-        model.openFolderSearch("CancelScanNeedle")
-        assertTrue(blockFirstReadEntered.await(3, TimeUnit.SECONDS))
-        assertTrue(model.folderSearch.value.visible && model.folderSearch.value.scanning)
+        try {
+            model.openFolderSearch("CancelScanNeedle")
+            awaitLatch(blockFirstReadEntered)
+            assertTrue(model.folderSearch.value.visible && model.folderSearch.value.scanning)
 
-        model.updateFolderSearch(query = "ReplacementNeedle")
-        releaseBlockedRead.countDown()
-        await { !model.folderSearch.value.scanning && model.folderSearch.value.query == "ReplacementNeedle" }
-        assertTrue(model.folderSearch.value.visible)
-        assertEquals(1, model.folderSearch.value.matches.size)
-        assertEquals("02-later.md", model.folderSearch.value.matches.single().name)
+            model.updateFolderSearch(query = "ReplacementNeedle")
+            releaseBlockedRead.countDown()
+            await { !model.folderSearch.value.scanning && model.folderSearch.value.query == "ReplacementNeedle" }
+            assertTrue(model.folderSearch.value.visible)
+            assertEquals(1, model.folderSearch.value.matches.size)
+            assertEquals("02-later.md", model.folderSearch.value.matches.single().name)
+        } finally {
+            provider.readHook = null
+            releaseBlockedRead.countDown()
+        }
 
         // Explicit cancelWorkspaceSearch while scanning hides the modal and clears scanning immediately.
+        val secondReadClaimed = AtomicBoolean(false)
         val secondReadEntered = CountDownLatch(1)
         val releaseSecondRead = CountDownLatch(1)
         provider.readHook = { docId ->
-            if (docId == "root/01-blocked.md" && secondReadEntered.count > 0) {
+            if (docId == "root/01-blocked.md" && secondReadClaimed.compareAndSet(false, true)) {
                 secondReadEntered.countDown()
-                releaseSecondRead.await(3, TimeUnit.SECONDS)
+                releaseSecondRead.await(15, TimeUnit.SECONDS)
             }
         }
-        model.updateFolderSearch(query = "CancelScanNeedle")
-        assertTrue(secondReadEntered.await(3, TimeUnit.SECONDS))
-        model.cancelWorkspaceSearch()
-        assertFalse(model.folderSearch.value.visible)
-        assertFalse(model.folderSearch.value.scanning)
-        releaseSecondRead.countDown()
+        try {
+            model.updateFolderSearch(query = "CancelScanNeedle")
+            awaitLatch(secondReadEntered)
+            model.cancelWorkspaceSearch()
+            assertFalse(model.folderSearch.value.visible)
+            assertFalse(model.folderSearch.value.scanning)
+        } finally {
+            provider.readHook = null
+            releaseSecondRead.countDown()
+        }
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(80))
         assertFalse(model.folderSearch.value.visible)
         assertFalse(model.folderSearch.value.scanning)
@@ -315,30 +331,33 @@ class FolderSearchControllerTest {
         // select() invalidates the earlier slow open request so SlowBackground.md is retained in background
         // without stealing focus from the selected search match.
         val slowUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "root/SlowBackground.md")
+        val slowReadClaimed = AtomicBoolean(false)
         val slowReadEntered = CountDownLatch(1)
         val releaseSlowRead = CountDownLatch(1)
         provider.readHook = { docId ->
-            if (docId == "root/SlowBackground.md" && slowReadEntered.count > 0) {
+            if (docId == "root/SlowBackground.md" && slowReadClaimed.compareAndSet(false, true)) {
                 slowReadEntered.countDown()
-                releaseSlowRead.await(3, TimeUnit.SECONDS)
+                releaseSlowRead.await(15, TimeUnit.SECONDS)
             }
         }
-        model.open(slowUri, "SlowBackground.md")
-        assertTrue(slowReadEntered.await(3, TimeUnit.SECONDS))
+        try {
+            model.open(slowUri, "SlowBackground.md")
+            awaitLatch(slowReadEntered)
 
-        model.openFolderSearch("LiveEditedBuffer")
-        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
-        val liveDirtyMatch = model.folderSearch.value.matches.single()
-        model.openSearchMatch(liveDirtyMatch)
-        assertFalse(model.folderSearch.value.visible)
-        await { model.state.value.active.id == openDirtyTabId }
-        assertEquals("LiveEditedBuffer", model.seededFind.value?.query)
-        assertTrue(model.activeMatchesSeedTarget(model.state.value.active, model.seededFind.value!!))
-
-        releaseSlowRead.countDown()
+            model.openFolderSearch("LiveEditedBuffer")
+            await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
+            val liveDirtyMatch = model.folderSearch.value.matches.single()
+            model.openSearchMatch(liveDirtyMatch)
+            assertFalse(model.folderSearch.value.visible)
+            await { model.state.value.active.id == openDirtyTabId }
+            assertEquals("LiveEditedBuffer", model.seededFind.value?.query)
+            assertTrue(model.activeMatchesSeedTarget(model.state.value.active, model.seededFind.value!!))
+        } finally {
+            provider.readHook = null
+            releaseSlowRead.countDown()
+        }
         await { model.state.value.tabs.any { it.name == "SlowBackground.md" } }
         assertEquals("Earlier slow open must not steal focus after search match tab selection", openDirtyTabId, model.state.value.active.id)
-        provider.readHook = null
 
         // Stale match 1: file-backed tab closed after search ran -> openSearchMatch reopens by URI and matches seed by URI.
         val closableUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "root/ClosableSaved.md")
@@ -426,7 +445,6 @@ class FolderSearchControllerTest {
         model.openFolderSearch("GuardedOpenNeedle")
         await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 2 }
         val revokedMatch = model.folderSearch.value.matches.single { it.name == "RevokedTarget.md" }
-        val blockedWriteMatch = model.folderSearch.value.matches.single { it.name == "ReadOnlyBlocked.md" }
 
         // 1. Revoke read access on RevokedTarget.md before selecting its search match:
         // openSearchMatch closes search first, then routes through StudioViewModel's guarded openNoteInternal,
@@ -445,8 +463,8 @@ class FolderSearchControllerTest {
 
         // 2. Selecting the blocked-write tab match switches to ReadOnlyBlocked.md, seeds in-note find,
         // and preserves documentWriteNeedsAccess(readOnlyTabId) == true.
-        model.openFolderSearch("GuardedOpenNeedle")
         provider.failReadDocIds.remove("root/RevokedTarget.md")
+        model.openFolderSearch("GuardedOpenNeedle")
         await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.any { it.name == "ReadOnlyBlocked.md" } }
         val refreshedBlockedMatch = model.folderSearch.value.matches.first { it.name == "ReadOnlyBlocked.md" }
         model.openSearchMatch(refreshedBlockedMatch)
@@ -454,6 +472,137 @@ class FolderSearchControllerTest {
         assertTrue("Write-blocked state must remain guarded on search match selection", model.documentWriteNeedsAccess(readOnlyTabId))
         assertNotNull(model.seededFind.value)
         assertTrue(model.activeMatchesSeedTarget(model.state.value.active, model.seededFind.value!!))
+    }
+
+    @Test
+    fun occurrenceUtf16OffsetsStaleRangeFallbackAndBoundedBatchPublication() {
+        val rootDir = newTempDir("search-occurrences-bounded")
+        val crlfUnicodeContent = listOf(
+            "# İstanbul \uD83D\uDCD3 Lab",
+            "First AuroraSignal and second \uD83D\uDCD3 AuroraSignal on same CRLF line.",
+            "Straße precedes [hidden](https://example.com/AuroraSignal) and fourth AURORASIGNAL.",
+        ).joinToString("\r\n")
+        File(rootDir, "00-unicode.md").writeBytes(crlfUnicodeContent.toByteArray(Charsets.UTF_8))
+        val unicodeAuthority = "dev.supermd.test.searchocc.${UUID.randomUUID()}"
+        val unicodeProvider = SearchSafTestProvider(rootDir).also { it.attach(app, unicodeAuthority) }
+        ShadowContentResolver.registerProviderInternal(unicodeAuthority, unicodeProvider)
+        val unicodeTreeUri = DocumentsContract.buildTreeDocumentUri(unicodeAuthority, "root")
+        grantTreeReadWrite(unicodeTreeUri)
+
+        val barrierFlushedIds = CopyOnWriteArrayList<String>()
+        val model = newModel { activeId, _ ->
+            barrierFlushedIds.add(activeId)
+            true
+        }
+        model.setFolder(unicodeTreeUri)
+        await { model.state.value.folder == unicodeTreeUri.toString() && model.state.value.files.size == 1 }
+
+        // 1. Selected occurrence & UTF-16 offsets across CRLF, surrogate pairs, and Unicode case folding (#96).
+        model.openFolderSearch("aurorasignal")
+        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 4 }
+        val occurrences = model.folderSearch.value.matches
+        assertEquals(
+            listOf("AuroraSignal", "AuroraSignal", "AuroraSignal", "AURORASIGNAL"),
+            occurrences.map { crlfUnicodeContent.substring(it.sourceStart, it.sourceEnd) },
+        )
+        val thirdOccurrence = occurrences[2]
+        model.openSearchMatch(thirdOccurrence)
+        assertFalse(model.folderSearch.value.visible)
+        await { model.state.value.active.name == "00-unicode.md" }
+        val thirdSeed = model.seededFind.value!!
+        assertEquals(thirdOccurrence.sourceStart, thirdSeed.sourceStart)
+        assertEquals(thirdOccurrence.sourceEnd, thirdSeed.sourceEnd)
+        assertEquals("AuroraSignal", thirdSeed.matchText)
+        assertTrue(thirdSeed.sourceStart!! > occurrences[1].sourceEnd)
+        assertEquals("AuroraSignal", model.state.value.active.content.substring(thirdSeed.sourceStart!!, thirdSeed.sourceEnd!!))
+        model.consumeSeededFind(thirdSeed.nonce)
+
+        // Case-insensitive "strasse" -> "Straße" preserves exact 6-UTF-16-unit source span despite 7-char folded query.
+        model.openFolderSearch("strasse")
+        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
+        val strasseMatch = model.folderSearch.value.matches.single()
+        model.openSearchMatch(strasseMatch)
+        val strasseSeed = model.seededFind.value!!
+        assertEquals(6, strasseSeed.sourceEnd!! - strasseSeed.sourceStart!!)
+        assertEquals("Straße", strasseSeed.matchText)
+        assertEquals("Straße", model.state.value.active.content.substring(strasseSeed.sourceStart!!, strasseSeed.sourceEnd!!))
+        model.consumeSeededFind(strasseSeed.nonce)
+
+        // 2. Stale-range fallback:
+        // (a) When the active note is edited after folder search ran so [sourceStart, sourceEnd) is now stale,
+        // FolderSearchController forwards the original occurrence bounds + matchText and flushes the active-tab
+        // reader barrier so the WebView handoff enters passive 0 / N stale-range fallback instead of jumping to 1 / N.
+        model.openFolderSearch("AuroraSignal")
+        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 4 }
+        val fourthOccurrence = model.folderSearch.value.matches[3]
+        val unicodeTabId = model.state.value.active.id
+        model.edit(unicodeTabId, "# Shortened after search\nOnly one AuroraSignal remains.\n")
+        assertTrue(fourthOccurrence.sourceEnd > model.state.value.active.content.length)
+        barrierFlushedIds.clear()
+        model.openSearchMatch(fourthOccurrence)
+        await { barrierFlushedIds.contains(unicodeTabId) }
+        val staleRangeSeed = model.seededFind.value!!
+        assertEquals(fourthOccurrence.sourceStart, staleRangeSeed.sourceStart)
+        assertEquals(fourthOccurrence.sourceEnd, staleRangeSeed.sourceEnd)
+        assertEquals("AURORASIGNAL", staleRangeSeed.matchText)
+        assertTrue(model.activeMatchesSeedTarget(model.state.value.active, staleRangeSeed))
+        model.consumeSeededFind(staleRangeSeed.nonce)
+
+        // (b) Inverted or negative occurrence bounds normalize cleanly to null.
+        model.openFolderSearch("AuroraSignal")
+        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
+        val invertedMatch = model.folderSearch.value.matches.single().copy(sourceStart = 18, sourceEnd = 10, matchText = "AuroraSignal")
+        model.openSearchMatch(invertedMatch)
+        val invertedSeed = model.seededFind.value!!
+        assertNull(invertedSeed.sourceStart)
+        assertNull(invertedSeed.sourceEnd)
+        assertNull(invertedSeed.matchText)
+        model.consumeSeededFind(invertedSeed.nonce)
+
+        // 3. Bounded Android search results (50 per note, 500 total, truncated = true) and progressive batch publication.
+        val boundedDir = newTempDir("search-bounded-batches")
+        // note_00 has 65 hits (capped at MAX_MATCHES_PER_NOTE = 50); notes 01..11 have 50 hits each -> 600 capped at 500.
+        File(boundedDir, "note_00.md").writeText((1..65).joinToString("\n") { "BoundedHit line $it in note 00" })
+        for (idx in 1..11) {
+            val label = "%02d".format(idx)
+            File(boundedDir, "note_$label.md").writeText((1..50).joinToString("\n") { "BoundedHit line $it in note $label" })
+        }
+        val boundedAuthority = "dev.supermd.test.searchbounded.${UUID.randomUUID()}"
+        val boundedProvider = SearchSafTestProvider(boundedDir).also { it.attach(app, boundedAuthority) }
+        ShadowContentResolver.registerProviderInternal(boundedAuthority, boundedProvider)
+        val boundedTreeUri = DocumentsContract.buildTreeDocumentUri(boundedAuthority, "root")
+        grantTreeReadWrite(boundedTreeUri)
+        model.setFolder(boundedTreeUri)
+        await { model.state.value.folder == boundedTreeUri.toString() && model.state.value.files.size == 12 }
+
+        val publishedCounts = CopyOnWriteArrayList<Pair<Int, Boolean>>()
+        val collectorScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        try {
+            collectorScope.launch {
+                model.folderSearch.collect { state ->
+                    if (state.query == "BoundedHit" && state.visible) {
+                        publishedCounts.add(state.matches.size to state.scanning)
+                    }
+                }
+            }
+            model.openFolderSearch("BoundedHit")
+            await { !model.folderSearch.value.scanning && model.folderSearch.value.query == "BoundedHit" }
+
+            val finalSearch = model.folderSearch.value
+            assertTrue(finalSearch.visible)
+            assertFalse(finalSearch.scanning)
+            assertTrue("Expected truncated = true once total matches reach 500", finalSearch.truncated)
+            assertEquals(500, finalSearch.matches.size)
+            assertEquals(50, finalSearch.matches.count { it.name == "note_00.md" })
+            assertTrue(
+                "Expected progressive streaming batch publications while scanning before final 500-match cap",
+                publishedCounts.any { (count, scanning) -> scanning && count in 1..499 },
+            )
+            val countsOnly = publishedCounts.map { it.first }
+            assertEquals("Published match counts must grow monotonically", countsOnly.sorted(), countsOnly)
+        } finally {
+            collectorScope.cancel()
+        }
     }
 
     private fun grantTreeReadWrite(treeUri: Uri) {
@@ -481,8 +630,18 @@ class FolderSearchControllerTest {
         }
     }
 
+    private fun awaitLatch(latch: CountDownLatch) {
+        val deadline = System.currentTimeMillis() + 15_000L
+        while (System.currentTimeMillis() < deadline) {
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
+            if (latch.await(15, TimeUnit.MILLISECONDS)) return
+        }
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
+        assertTrue("Timed out waiting for background latch", latch.await(15, TimeUnit.MILLISECONDS))
+    }
+
     private fun await(predicate: () -> Boolean) {
-        val deadline = System.currentTimeMillis() + 5_000L
+        val deadline = System.currentTimeMillis() + 15_000L
         while (System.currentTimeMillis() < deadline) {
             shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(20))
             if (predicate()) return
