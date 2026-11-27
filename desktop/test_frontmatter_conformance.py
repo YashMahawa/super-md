@@ -10,7 +10,7 @@ _DESKTOP_DIR = Path(__file__).resolve().parent
 if str(_DESKTOP_DIR) not in sys.path:
     sys.path.insert(0, str(_DESKTOP_DIR))
 
-from frontmatter import (  # noqa: E402
+from frontmatter import (
     _parse_frontmatter_entries,
     extract_visible_metadata,
     frontmatter_end,
