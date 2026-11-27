@@ -780,20 +780,189 @@ print("cell-{i}-done")
         self.assertIn("Independent cell finished: 99", report["cell1FinalOutput"])
         self.assertEqual(report["window2Stdout"], "window2-ok\n")
 
+    def test_real_reader_stop_probe_teardown_allows_close_and_skips_darwin_webengine_gc(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        global _PROBE_DARWIN_TEARDOWN_DONE
+        events: list[object] = []
+
+        def _make_fakes():
+            events.clear()
+            _PROBE_DARWIN_EXIT_ANCHOR.clear()
+            fake_app = MagicMock()
+            fake_app.sendPostedEvents.side_effect = lambda *_a: events.append("deferred_delete")
+            fake_studio = MagicMock()
+            fake_studio._python_pool = MagicMock()
+            fake_studio.stop.side_effect = lambda: events.append("studio_stop")
+            fake_window2 = MagicMock()
+            fake_window2._python_pool = None
+            fake_window2.stop.side_effect = lambda: events.append("window2_stop")
+            fake_session = SimpleNamespace(
+                writes=MagicMock(shutdown=lambda wait=True: events.append(("writes_shutdown", wait)))
+            )
+            props: dict[str, object] = {"closingAllowed": False, "intentionalShutdown": False}
+            fake_loader = MagicMock()
+            fake_window = MagicMock()
+            fake_window.setProperty.side_effect = lambda k, v: props.__setitem__(k, v)
+            fake_window.findChild.return_value = fake_loader
+            fake_window.close.side_effect = lambda: events.append(
+                ("window_close", props["closingAllowed"], props["intentionalShutdown"])
+            )
+            fake_engine = MagicMock()
+            fake_engine.deleteLater.side_effect = lambda: events.append("engine_delete")
+            fake_handler = MagicMock()
+            fake_handler.deleteLater.side_effect = lambda: events.append("handler_delete")
+            return fake_app, fake_session, (fake_window2, fake_studio), fake_engine, fake_window, fake_handler
+
+        # Non-Darwin: must set intentionalShutdown + closingAllowed BEFORE window.close() and remove scheme handler.
+        app_l, sess_l, studios_l, eng_l, win_l, handler_l = _make_fakes()
+        mock_profile_l = MagicMock()
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch("PySide6.QtWebEngineCore.QWebEngineProfile.defaultProfile", return_value=mock_profile_l),
+        ):
+            _teardown_real_reader_stop_probe(
+                app=app_l,
+                session=sess_l,
+                studios=studios_l,
+                engine=eng_l,
+                window=win_l,
+                bundle_handler=handler_l,
+            )
+            self.assertIn(("window_close", True, True), events)
+            mock_profile_l.removeUrlSchemeHandler.assert_called_once_with(handler_l)
+            self.assertTrue(_PROBE_DARWIN_TEARDOWN_DONE)
+            with self.assertRaises(SystemExit) as cm:
+                _exit_probe_process(0)
+            self.assertEqual(cm.exception.code, 0)
+
+        # Darwin: must flush studios/writes, anchor Qt/WebEngine wrappers without touching WebEngine destructors, and os._exit.
+        app_d, sess_d, studios_d, eng_d, win_d, handler_d = _make_fakes()
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch("PySide6.QtWebEngineCore.QWebEngineProfile.defaultProfile") as mock_profile_d,
+            patch("os._exit", side_effect=SystemExit(0)) as mock_os_exit,
+        ):
+            _teardown_real_reader_stop_probe(
+                app=app_d,
+                session=sess_d,
+                studios=studios_d,
+                engine=eng_d,
+                window=win_d,
+                bundle_handler=handler_d,
+            )
+            self.assertEqual(
+                events,
+                ["window2_stop", "studio_stop", ("writes_shutdown", True)],
+            )
+            self.assertFalse(mock_profile_d.called)
+            self.assertFalse(win_d.close.called)
+            self.assertTrue(_PROBE_DARWIN_EXIT_ANCHOR)
+            self.assertTrue(_PROBE_DARWIN_TEARDOWN_DONE)
+            with self.assertRaises(SystemExit):
+                _exit_probe_process(0)
+            mock_os_exit.assert_called_once_with(0)
+        _PROBE_DARWIN_EXIT_ANCHOR.clear()
+        _PROBE_DARWIN_TEARDOWN_DONE = False
+
+
+_PROBE_DARWIN_EXIT_ANCHOR: list[object] = []
+_PROBE_DARWIN_TEARDOWN_DONE = False
+
+
+def _exit_probe_process(status: int) -> None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if sys.platform == "darwin" and _PROBE_DARWIN_TEARDOWN_DONE:
+        os._exit(int(status))
+    raise SystemExit(int(status))
+
+
+def _teardown_real_reader_stop_probe(
+    *,
+    app,
+    session,
+    studios: tuple,
+    engine,
+    window,
+    bundle_handler,
+    child_pid: int = 0,
+) -> None:
+    global _PROBE_DARWIN_TEARDOWN_DONE
+    if child_pid:
+        _best_effort_kill(child_pid)
+    for w in studios:
+        if w is None:
+            continue
+        w.stop()
+        w.pool.shutdown(wait=True, cancel_futures=True)
+        w._search_pool.shutdown(wait=True, cancel_futures=True)
+        if w._python_pool is not None:
+            w._python_pool.shutdown(wait=True, cancel_futures=True)
+    if session is not None:
+        session.writes.shutdown(wait=True)
+    if sys.platform == "darwin":
+        # Match desktop/main.py: destroying QQuickWebEngineView / WebEngineContext
+        # during headless macOS exit can block indefinitely waiting on a mid-spawn
+        # QtWebEngineProcess Mach port. Flush all Python/disk state first, anchor
+        # Qt/WebEngine wrappers against GC, and terminate via os._exit.
+        _PROBE_DARWIN_EXIT_ANCHOR[:] = [
+            app,
+            session,
+            list(studios),
+            engine,
+            window,
+            bundle_handler,
+        ]
+        _PROBE_DARWIN_TEARDOWN_DONE = True
+        return
+    from PySide6.QtCore import QEvent, QObject
+    from PySide6.QtWebEngineCore import QWebEngineProfile
+
+    if window is not None:
+        try:
+            window.setProperty("intentionalShutdown", True)
+            window.setProperty("closingAllowed", True)
+            loader = window.findChild(QObject, "documentReaderLoader")
+            if loader is not None:
+                loader.setProperty("active", False)
+            window.close()
+        except RuntimeError:
+            pass
+    if engine is not None:
+        engine.deleteLater()
+    if app is not None:
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    if bundle_handler is not None:
+        try:
+            QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(bundle_handler)
+        except RuntimeError:
+            pass
+        bundle_handler.deleteLater()
+    for w in studios:
+        if w is not None:
+            w.host_window = None
+    if app is not None:
+        app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    _PROBE_DARWIN_TEARDOWN_DONE = True
+
 
 def _real_reader_stop_probe(directory: str, screenshot_path: str = "") -> int:
+    import traceback
+
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
     os.environ["QT_QUICK_BACKEND"] = "software"
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --disable-dev-shm-usage")
     os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
-    from PySide6.QtCore import QFile, QIODevice, QMetaObject, QObject, QTimer, QUrl, Qt, Q_ARG
+    from PySide6.QtCore import QFile, QIODevice, QMetaObject, QObject, QUrl, Qt, Q_ARG
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
+    from PySide6.QtTest import QTest
     from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
     from PySide6.QtWidgets import QApplication
     from reader_assets import READER_SCHEME, ReaderBundleSchemeHandler, reader_bundle_url, register_reader_schemes
-    from studio import Session, Studio
 
     desktop_root = Path(__file__).resolve().parent
     QQuickStyle.setStyle("Material")
@@ -809,13 +978,13 @@ def _real_reader_stop_probe(directory: str, screenshot_path: str = "") -> int:
     session.settings["python"] = sys.executable
     session.settings["newNoteLocation"] = str(temp)
 
-    studio = Studio(True, session)
+    studio = QuietStudio(True, session)
     studio.settings["python"] = sys.executable
     studio.settings["readingMode"] = "live"
     studio.settings["welcomed"] = True
     studio.mode = "live"
 
-    window2 = Studio(True, session)
+    window2 = QuietStudio(True, session)
     window2.settings["python"] = sys.executable
     w2_replies: list[tuple[str, str, str]] = []
     window2.replied.connect(lambda req_id, raw, err: w2_replies.append((req_id, raw, err)))
@@ -863,47 +1032,49 @@ def _real_reader_stop_probe(directory: str, screenshot_path: str = "") -> int:
     sibling = studio._note("Field Notes.md", "# Field Notes\n\nSecondary open tab.\n", str(sibling_path), "# Field Notes\n\nSecondary open tab.\n")
     studio.tabs.append(sibling)
 
-    channel = QFile(":/qtwebchannel/qwebchannel.js")
-    if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
-        raise RuntimeError("Qt WebChannel runtime unavailable")
-    channel_script = bytes(channel.readAll()).decode()
-
-    engine = QQmlApplicationEngine()
-    engine.rootContext().setContextProperty("studio", studio)
-    engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
-    engine.rootContext().setContextProperty("channelScript", channel_script)
-    engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(desktop_root.parent / "public" / "brand-mark-fixed.svg")))
-    engine.load(QUrl.fromLocalFile(str(desktop_root / "qml" / "Main.qml")))
-    if not engine.rootObjects():
-        raise RuntimeError("Main.qml failed to load")
-    window = engine.rootObjects()[0]
-    window.setProperty("width", 1220)
-    window.setProperty("height", 860)
-    studio.host_window = window
-    window.show()
-    studio._emit()
-
-    reader = window.findChild(QObject, "documentReader")
-    if reader is None:
-        raise RuntimeError("documentReader WebEngineView not found")
-
-    def run_js(script: str) -> None:
-        ok = QMetaObject.invokeMethod(window, "runDocumentScript", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", script))
-        if not ok:
-            raise RuntimeError("runDocumentScript invocation failed")
-
-    def pump_until(predicate, timeout: float = 25.0, desc: str = "condition"):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            app.processEvents()
-            value = predicate()
-            if value:
-                return value
-            time.sleep(0.015)
-        raise TimeoutError(f"Timed out waiting for {desc}; reader title={reader.property('title')!r}")
-
+    engine = None
+    window = None
     child_pid = 0
     try:
+        channel = QFile(":/qtwebchannel/qwebchannel.js")
+        if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
+            raise RuntimeError("Qt WebChannel runtime unavailable")
+        channel_script = bytes(channel.readAll()).decode()
+
+        engine = QQmlApplicationEngine()
+        engine.rootContext().setContextProperty("studio", studio)
+        engine.rootContext().setContextProperty("readerUrl", reader_bundle_url())
+        engine.rootContext().setContextProperty("channelScript", channel_script)
+        engine.rootContext().setContextProperty("brandUrl", QUrl.fromLocalFile(str(desktop_root.parent / "public" / "brand-mark-fixed.svg")))
+        engine.load(QUrl.fromLocalFile(str(desktop_root / "qml" / "Main.qml")))
+        if not engine.rootObjects():
+            raise RuntimeError("Main.qml failed to load")
+        window = engine.rootObjects()[0]
+        window.setProperty("width", 1220)
+        window.setProperty("height", 860)
+        studio.host_window = window
+        window.show()
+        studio._emit()
+
+        reader = window.findChild(QObject, "documentReader")
+        if reader is None:
+            raise RuntimeError("documentReader WebEngineView not found")
+
+        def run_js(script: str) -> None:
+            ok = QMetaObject.invokeMethod(window, "runDocumentScript", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", script))
+            if not ok:
+                raise RuntimeError("runDocumentScript invocation failed")
+
+        def pump_until(predicate, timeout: float = 25.0, desc: str = "condition"):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                app.processEvents()
+                value = predicate()
+                if value:
+                    return value
+                QTest.qWait(15)
+            raise TimeoutError(f"Timed out waiting for {desc}; reader title={reader.property('title')!r}")
+
         pump_until(lambda: studio.ready, desc="studio.ready")
         # Wait for both PythonCell run buttons to mount in Live mode, then run Cell 0 once to produce a verified baseline output.
         run_js(
@@ -942,13 +1113,14 @@ def _real_reader_stop_probe(directory: str, screenshot_path: str = "") -> int:
 
         run_js(
             "(()=>{"
-            "const cells=document.querySelectorAll('.python-cell');"
-            "cells[0].querySelector('button.python-run').click();"
-            "cells[1].querySelector('button.python-run').click();"
+            "const initCells=document.querySelectorAll('.python-cell');"
+            "initCells[0].querySelector('button.python-run').click();"
+            "initCells[1].querySelector('button.python-run').click();"
             "const poll=()=>{"
-            "const s0=cells[0].querySelector('button.python-stop');"
-            "const s1=cells[1].querySelector('button.python-stop');"
-            "const out0=cells[0].querySelector('.cell-output')?.textContent||'';"
+            "const cells=document.querySelectorAll('.python-cell');"
+            "const s0=cells[0]?.querySelector('button.python-stop');"
+            "const s1=cells[1]?.querySelector('button.python-stop');"
+            "const out0=cells[0]?.querySelector('.cell-output')?.textContent||'';"
             "if(s0&&s1&&out0.includes('Baseline checksum: 42 (verified)')){"
             "const lb=cells[0].closest('.live-block');"
             "if(lb){lb.dispatchEvent(new PointerEvent('pointerover',{bubbles:true,pointerType:'mouse'}));}"
@@ -964,21 +1136,21 @@ def _real_reader_stop_probe(directory: str, screenshot_path: str = "") -> int:
             end_frame = time.monotonic() + 0.35
             while time.monotonic() < end_frame:
                 app.processEvents()
-                time.sleep(0.02)
+                QTest.qWait(20)
             img = window.grabWindow()
             img.save(screenshot_path)
 
         # Click Stop ONLY on Cell 0; Cell 1 and Window 2 must stay alive and complete cleanly.
         run_js(
             "(()=>{"
-            "const cells=document.querySelectorAll('.python-cell');"
-            "cells[0].querySelector('button.python-stop').click();"
+            "document.querySelectorAll('.python-cell')[0].querySelector('button.python-stop').click();"
             "const poll=()=>{"
-            "const s0=cells[0].querySelector('button.python-stop');"
-            "const s1=cells[1].querySelector('button.python-stop');"
+            "const cells=document.querySelectorAll('.python-cell');"
+            "const s0=cells[0]?.querySelector('button.python-stop');"
+            "const s1=cells[1]?.querySelector('button.python-stop');"
             "if(!s0&&s1){"
-            "const out0=cells[0].querySelector('.cell-output')?.textContent||'';"
-            "const err0=cells[0].querySelector('.cell-error')?.textContent||'';"
+            "const out0=cells[0]?.querySelector('.cell-output')?.textContent||'';"
+            "const err0=cells[0]?.querySelector('.cell-error,.cell-output.failed')?.textContent||'';"
             "document.title='probe:c0-stopped:'+JSON.stringify({out0,err0});return;}"
             "setTimeout(poll,25);};poll();})()"
         )
@@ -994,10 +1166,10 @@ def _real_reader_stop_probe(directory: str, screenshot_path: str = "") -> int:
         w2_release.write_text("go", encoding="utf-8")
         run_js(
             "(()=>{"
-            "const c1=document.querySelectorAll('.python-cell')[1];"
             "const poll=()=>{"
-            "const s1=c1.querySelector('button.python-stop');"
-            "const out1=c1.querySelector('.cell-output')?.textContent||'';"
+            "const c1=document.querySelectorAll('.python-cell')[1];"
+            "const s1=c1?.querySelector('button.python-stop');"
+            "const out1=c1?.querySelector('.cell-output')?.textContent||'';"
             "if(!s1&&out1.includes('Independent cell finished: 99')){"
             "document.title='probe:c1-done:'+JSON.stringify({out1});return;}"
             "setTimeout(poll,25);};poll();})()"
@@ -1021,22 +1193,23 @@ def _real_reader_stop_probe(directory: str, screenshot_path: str = "") -> int:
         }
         print(json.dumps(report), flush=True)
         return 0
+    except Exception:
+        traceback.print_exc()
+        return 1
     finally:
-        if child_pid:
-            _best_effort_kill(child_pid)
-        window.close()
-        for w in (window2, studio):
-            w.stop()
-            w.pool.shutdown(wait=True, cancel_futures=True)
-            w._search_pool.shutdown(wait=True, cancel_futures=True)
-            if w._python_pool is not None:
-                w._python_pool.shutdown(wait=True, cancel_futures=True)
-        session.writes.shutdown(wait=True)
-        app.processEvents()
+        _teardown_real_reader_stop_probe(
+            app=app,
+            session=session,
+            studios=(window2, studio),
+            engine=engine,
+            window=window,
+            bundle_handler=bundle_handler,
+            child_pid=child_pid,
+        )
 
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--probe-stop":
         shot = sys.argv[3] if len(sys.argv) >= 4 else ""
-        raise SystemExit(_real_reader_stop_probe(sys.argv[2], shot))
+        _exit_probe_process(_real_reader_stop_probe(sys.argv[2], shot))
     unittest.main()
