@@ -97,6 +97,23 @@ def main():
         args.smoke = True
         args.test_state = True
     if args.smoke_theme and not (args.smoke and args.test_state):parser.error("Theme smoke checks require isolated test state")
+    QGuiApplication.setApplicationName("super-md-qt" if args.test_state else "super-md")
+    QGuiApplication.setOrganizationName("SuperMD")
+    QGuiApplication.setDesktopFileName("dev.supermd.studio-test" if args.test_state else "dev.supermd.studio")
+    if not args.test_state and (args.background or args.agent_access):
+        from PySide6.QtCore import QStandardPaths
+        if __package__:
+            from .core.headless_approval import HEADLESS_APPROVAL_REQUIRED_ERROR, is_headless_startup_approved
+        else:
+            from core.headless_approval import HEADLESS_APPROVAL_REQUIRED_ERROR, is_headless_startup_approved
+        appdata_root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
+        fresh_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
+        if not (appdata_root / "native-instance.lock").exists() and not is_headless_startup_approved(
+            appdata_root, fresh_service_log=fresh_log
+        ):
+            os.environ.pop("SUPERMD_FRESH_SERVICE_LOG", None)
+            print(HEADLESS_APPROVAL_REQUIRED_ERROR, file=sys.stderr)
+            return 2
     if sys.platform.startswith("linux"):
         # Let Qt use the desktop's portal chooser (including its Wayland parent
         # handle), not a toolkit-built file/folder browser. The plugin is bundled.
@@ -113,9 +130,6 @@ def main():
     # schemes; they serve only packaged reader assets and per-note capabilities.
     register_reader_schemes()
     QtWebEngineQuick.initialize()
-    QGuiApplication.setApplicationName("super-md-qt" if args.test_state else "super-md")
-    QGuiApplication.setOrganizationName("SuperMD")
-    QGuiApplication.setDesktopFileName("dev.supermd.studio-test" if args.test_state else "dev.supermd.studio")
     app = StudioApplication(sys.argv)
     for file in (ROOT / "smd-core" / "fonts").glob("*.ttf"):
         QFontDatabase.addApplicationFont(str(file))
@@ -130,6 +144,20 @@ def main():
         open_existing=not (args.background and not args.note),
     ):
         return 0
+    if not args.test_state and (args.background or args.agent_access):
+        from PySide6.QtCore import QStandardPaths
+        if __package__:
+            from .core.headless_approval import HEADLESS_APPROVAL_REQUIRED_ERROR, is_headless_startup_approved
+        else:
+            from core.headless_approval import HEADLESS_APPROVAL_REQUIRED_ERROR, is_headless_startup_approved
+        appdata_root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
+        fresh_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
+        if not is_headless_startup_approved(appdata_root, fresh_service_log=fresh_log):
+            os.environ.pop("SUPERMD_FRESH_SERVICE_LOG", None)
+            if broker:
+                broker.close()
+            print(HEADLESS_APPROVAL_REQUIRED_ERROR, file=sys.stderr)
+            return 2
     if broker:
         try:
             broker.hold_process_exit_lock()

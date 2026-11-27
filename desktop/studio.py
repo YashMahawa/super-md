@@ -42,6 +42,10 @@ from documents import (
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
+if __package__:
+    from .core.headless_approval import has_legacy_background_markers, read_persisted_headless_approval
+else:
+    from core.headless_approval import has_legacy_background_markers, read_persisted_headless_approval
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
@@ -183,7 +187,7 @@ DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
-DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackground=False)
+DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackground=False, headlessServiceApproved=False)
 DEFAULTS.update(hideNonNoteFolders=True)
 
 def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
@@ -749,25 +753,18 @@ class Session(QObject):
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
         had_explicit_keep_in_background = isinstance(stored_settings, dict) and "keepInBackground" in stored_settings
         fresh_service_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
-        migrated_keep_in_background = not had_explicit_keep_in_background and (
-            (isinstance(stored_settings, dict) and any(
-                stored_settings.get(key) is True
-                for key in ("agentAccessEnabled", "cloudAgentEnabled", "background", "backgroundEnabled")
-            ))
-            or (self.data / "agent-sessions").is_dir()
-            or (self.data / "agent-cloud.json").is_file()
-            or (
-                not fresh_service_log
-                and (
-                    (self.data / "background-service.log").is_file()
-                    or (self.data.name == "qt-studio" and (self.data.parent / "background-service.log").is_file())
-                )
-            )
+        migrated_keep_in_background = has_legacy_background_markers(
+            self.data, stored_settings, fresh_service_log=fresh_service_log
         )
         # Local MCP access and cloud relay reconnection are explicit, persisted
         # opt-ins; each desktop launch mints a fresh temporary loopback token.
         self.settings["agentAccessEnabled"] = self.settings.get("agentAccessEnabled") is True
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
+        self.settings["headlessServiceApproved"] = (
+            stored_settings.get("headlessServiceApproved") is True
+            if isinstance(stored_settings, dict)
+            else False
+        )
         self.settings["keepInBackground"] = (
             stored_settings.get("keepInBackground") is True
             if had_explicit_keep_in_background
@@ -3262,6 +3259,8 @@ class Studio(QObject):
 
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
+        if not self.settings.get("headlessServiceApproved") and read_persisted_headless_approval(self.data):
+            self.settings["headlessServiceApproved"] = True
         persisted_settings = dict(self.settings)
         if getattr(getattr(self.session, "background", None), "_cli_started_agent_access", False):
             persisted_settings["agentAccessEnabled"] = False
@@ -4110,7 +4109,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility","keepInBackground","hideNonNoteFolders") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility","keepInBackground","headlessServiceApproved","hideNonNoteFolders") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())

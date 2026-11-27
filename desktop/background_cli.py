@@ -1,10 +1,12 @@
 """Control the per-user application service over its private local socket."""
 import argparse,hashlib,json,os,subprocess,sys,time
 from pathlib import Path
-try:
+if __package__:
     from .core.paths import DESKTOP_DIR
-except ImportError:
+    from .core.headless_approval import HEADLESS_APPROVAL_REQUIRED_ERROR, approve_headless_startup, is_headless_startup_approved
+else:
     from core.paths import DESKTOP_DIR
+    from core.headless_approval import HEADLESS_APPROVAL_REQUIRED_ERROR, approve_headless_startup, is_headless_startup_approved
 
 def _daemon_command(*,executable=None,frozen=None,platform=None,env=None):
     frozen=getattr(sys,'frozen',False) if frozen is None else bool(frozen)
@@ -29,7 +31,7 @@ def _daemon_command(*,executable=None,frozen=None,platform=None,env=None):
 
 def main(argv):
     parser=argparse.ArgumentParser(description='Super MD background service')
-    parser.add_argument('action',choices=['start','status','stop'])
+    parser.add_argument('action',choices=['start','status','stop','approve'])
     args=parser.parse_args(argv)
     from PySide6.QtCore import QCoreApplication,QLockFile,QStandardPaths
     from PySide6.QtNetwork import QLocalSocket
@@ -42,6 +44,9 @@ def main(argv):
     platform=sys.platform
     is_win=platform.startswith('win')
     root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
+    if args.action=='approve':
+        approve_headless_startup(root)
+        print(json.dumps({'ok':True,'result':{'approved':True,'action':'approve'}}));return 0
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def _instance_lock_held():
         if not root.exists():return False
@@ -162,30 +167,41 @@ def main(argv):
         running=bool(reply.get('running',True))
         if reply.get('sessionsDirectory'):sessions_dir=str(reply['sessionsDirectory'])
     else:
-        running=False;root.mkdir(parents=True,exist_ok=True)
-        lock_probe=QLockFile(str(root/'native-instance.lock'));lock_probe.setStaleLockTime(0)
-        lock_deadline=time.monotonic()+20;lock_cleared=False
-        while time.monotonic()<lock_deadline:
-            if lock_probe.tryLock(100):
-                lock_probe.unlock()
-                if _process_exit_clear():lock_cleared=True;break
-                time.sleep(.05);continue
-            probe=request('status',startup_poll=True)
-            if probe is not None and probe.get('ok',False):
-                if probe.get('running'):
-                    running=True;break
-                if not probe.get('stopping'):
-                    started=request('start',startup_poll=True)
-                    if started is not None:
-                        if not started.get('ok',False):
-                            raise ValueError(started.get('error') or 'Super MD refused to start background agent access')
-                        running=bool(started.get('running',True))
-                        if started.get('sessionsDirectory'):sessions_dir=str(started['sessionsDirectory'])
-                        break
-        if not running and not lock_cleared:
-            raise ValueError('Background service did not start; previous instance is still shutting down')
+        running=False
+        if _instance_lock_held():
+            lock_probe=QLockFile(str(root/'native-instance.lock'));lock_probe.setStaleLockTime(0)
+            lock_deadline=time.monotonic()+20;lock_cleared=False
+            while time.monotonic()<lock_deadline:
+                if lock_probe.tryLock(100):
+                    lock_probe.unlock()
+                    if _process_exit_clear():lock_cleared=True;break
+                    time.sleep(.05);continue
+                probe=request('status',startup_poll=True)
+                if probe is not None and probe.get('ok',False):
+                    if probe.get('running'):
+                        running=True;break
+                    if not probe.get('stopping'):
+                        started=request('start',startup_poll=True)
+                        if started is not None:
+                            if not started.get('ok',False):
+                                raise ValueError(started.get('error') or 'Super MD refused to start background agent access')
+                            running=bool(started.get('running',True))
+                            if started.get('sessionsDirectory'):sessions_dir=str(started['sessionsDirectory'])
+                            break
+            if not running and not lock_cleared:
+                raise ValueError('Background service did not start; previous instance is still shutting down')
+        elif root.exists() and not _process_exit_clear():
+            exit_deadline=time.monotonic()+20;exit_cleared=False
+            while time.monotonic()<exit_deadline:
+                if _process_exit_clear():exit_cleared=True;break
+                time.sleep(.05)
+            if not exit_cleared:
+                raise ValueError('Background service did not start; previous instance is still shutting down')
+        if not running and not is_headless_startup_approved(root,fresh_service_log=False):
+            raise ValueError(HEADLESS_APPROVAL_REQUIRED_ERROR)
         proc=None;daemon_exit_code=None
         if not running:
+            root.mkdir(parents=True,exist_ok=True)
             flags=(getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|getattr(subprocess,'CREATE_NO_WINDOW',0)) if is_win else 0
             popen_session={'process_group':0} if platform=='darwin' else {'start_new_session':not is_win}
             log_path=root/'background-service.log'
