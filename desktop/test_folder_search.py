@@ -92,7 +92,7 @@ def _webengine_e2e_probe() -> int:
         portable_note = folder / "research" / "deep" / "quantum-field.smd"
         documents.write_portable(
             portable_note,
-            "# Quantum Field\n\n```mermaid\ngraph TD\n  A[AuroraSignal] --> B\n```\n\nReal prose with AuroraSignal inside portable bundle.\nSecond AuroraSignal line.\n",
+            "# Quantum Field\n\n```mermaid\ngraph TD\n  A[AuroraSignal] --> B\n```\n\nİstanbul 📓 prose with AuroraSignal inside portable bundle.\nSecond AuroraSignal line with [reference](https://example.com/HiddenUrlSignal).\n",
             {"assets/pixel.png": TINY_PNG},
         )
 
@@ -220,7 +220,43 @@ def _webengine_e2e_probe() -> int:
             ).get("value")
             == {"open": True, "query": "AuroraSignal", "status": "1 / 2", "highlighted": True},
             timeout=15.0,
-        ), "Expected seeded in-note ReadingSearch highlighting 2 matches"
+        ), "Expected seeded in-note ReadingSearch highlighting occurrence 1 / 2"
+
+        # 3. Reopen Ctrl+Shift+F, move Down to the 2nd occurrence of "AuroraSignal" (after İstanbul 📓), press Return -> reveals 2 / 2!
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen for 2nd occurrence"
+        window.requestActivate()
+        search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus for 2nd occurrence"
+        assert _wait_until(
+            lambda: not studio.folderSearchState["scanning"] and len(studio.folderSearchState["matches"]) == 2,
+            timeout=10.0,
+        ), f"Expected 2 matches for AuroraSignal on reopen, got {studio.folderSearchState}"
+        QTest.keyClick(window, Qt.Key.Key_Down)
+        QTest.keyClick(window, Qt.Key.Key_Return)
+        assert _wait_until(lambda: not bool(search_dialog.property("visible")), timeout=8.0)
+        assert _wait_until(
+            lambda: eval_reader("document.querySelector('.reading-search output')?.textContent || ''").get("value") == "2 / 2",
+            timeout=15.0,
+        ), f"Expected 2nd folder-search occurrence to reveal 2 / 2, got {eval_reader('document.querySelector(\".reading-search output\")?.textContent || \"\"')}"
+
+        # 4. Hidden Markdown URL hit reveals block separately as "In Markdown source" instead of "No matches".
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen for hidden URL"
+        window.requestActivate()
+        search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus for hidden URL"
+        search_input.setProperty("text", "HiddenUrlSignal")
+        assert _wait_until(
+            lambda: not studio.folderSearchState["scanning"] and len(studio.folderSearchState["matches"]) == 1,
+            timeout=10.0,
+        ), f"Expected 1 match for HiddenUrlSignal, got {studio.folderSearchState}"
+        QTest.keyClick(window, Qt.Key.Key_Return)
+        assert _wait_until(lambda: not bool(search_dialog.property("visible")), timeout=8.0)
+        assert _wait_until(
+            lambda: eval_reader("document.querySelector('.reading-search output')?.textContent || ''").get("value") == "In Markdown source",
+            timeout=15.0,
+        ), f"Expected hidden URL hit status 'In Markdown source', got {eval_reader('document.querySelector(\".reading-search output\")?.textContent || \"\"')}"
 
         print(json.dumps({"ok": True, "lines": lines}), flush=True)
         window.setProperty("closingAllowed", True)
@@ -306,6 +342,11 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertEqual((m_both["snippet"], m_both["matchStart"], m_both["matchEnd"]), ("İstanbul 📓: NOTE", 13, 17))
         # Line 4: "Straße: note" -> 'ß' expands to "ss" in casefold, original UTF-16 [8, 12)
         self.assertEqual((m_strasse["snippet"], m_strasse["matchStart"], m_strasse["matchEnd"]), ("Straße: note", 8, 12))
+
+        u16_bytes = markdown.encode("utf-16-le")
+        for hit, expected_text in zip(res["matches"], ["note", "note", "NOTE", "note", "NOTE"]):
+            s, e = hit["sourceStart"], hit["sourceEnd"]
+            self.assertEqual(u16_bytes[2 * s : 2 * e].decode("utf-16-le"), expected_text)
 
         # Verify actual QML JS String.prototype.slice highlighting inside FolderSearchDialog.qml!
         qml_root = Path(__file__).resolve().parent / "qml"
@@ -900,6 +941,64 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.assertEqual(self.studio.flush_operation["action"], "sync_for_search")
         self.studio.openFolderSearchMatch("", str(target), "Needle", True)
         self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
+
+    def test_repeated_matches_crlf_unicode_offsets_and_studio_handoff(self):
+        crlf_markdown = (
+            "# İstanbul 📓\r\n"
+            "First 📓 EchoToken and second EchoToken on same line.\r\n"
+            "Straße precedes third ECHOTOKEN here.\r\n"
+        )
+        tabs = [{
+            "id": "tab-repeat",
+            "name": "repeat.md",
+            "path": "",
+            "content": crlf_markdown,
+            "dirty": True,
+        }]
+        res = stream_text_search("echotoken", tabs, [], None, case_sensitive=False)
+        self.assertEqual(len(res["matches"]), 3)
+        u16 = crlf_markdown.encode("utf-16-le")
+        sliced = [u16[2 * m["sourceStart"] : 2 * m["sourceEnd"]].decode("utf-16-le") for m in res["matches"]]
+        self.assertEqual(sliced, ["EchoToken", "EchoToken", "ECHOTOKEN"])
+        self.assertEqual([m["matchText"] for m in res["matches"]], ["EchoToken", "EchoToken", "ECHOTOKEN"])
+        self.assertLess(res["matches"][0]["sourceStart"], res["matches"][1]["sourceStart"])
+        self.assertLess(res["matches"][1]["sourceStart"], res["matches"][2]["sourceStart"])
+
+        # Handoff to closed disk note preserves exact 2nd occurrence sourceStart/sourceEnd/matchText in seededFind.
+        disk_note = self.root / "handoff.md"
+        disk_content = "# İstanbul 📓\nFirst Needle.\nSecond Needle after 📓.\n"
+        disk_note.write_text(disk_content, encoding="utf-8")
+        disk_hits = stream_text_search("Needle", [], [], self.root, case_sensitive=True)["matches"]
+        self.assertEqual(len(disk_hits), 2)
+        second = disk_hits[1]
+        disk_u16 = disk_content.encode("utf-16-le")
+        self.assertEqual(disk_u16[2 * second["sourceStart"] : 2 * second["sourceEnd"]].decode("utf-16-le"), "Needle")
+        self.assertEqual(second["matchText"], "Needle")
+
+        active_tab = self.studio.tabs[0]
+        self.studio.ready = True
+        self.studio.openFolderSearchMatch("", str(disk_note), "Needle", True, second["sourceStart"], second["sourceEnd"], second["matchText"])
+        op = self.studio.flush_operation
+        self.assertIsNotNone(op)
+        self.studio.post("f-open", "document_flushed", json.dumps({"operation": op, "id": active_tab["id"], "content": active_tab["content"]}))
+        self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "handoff.md"))
+        # Also verify active-tab re-seed passes sourceStart/sourceEnd/matchText into window.supermdFind.
+        calls: list[str] = []
+        self.studio.readerCall.connect(calls.append)
+        opened_tab = self.studio._current()
+        self.studio.openFolderSearchMatch(opened_tab["id"], opened_tab["path"], "Needle", True, second["sourceStart"], second["sourceEnd"], second["matchText"])
+        op_active = self.studio.flush_operation
+        self.assertIsNotNone(op_active)
+        self.studio.post("f-active", "document_flushed", json.dumps({"operation": op_active, "id": opened_tab["id"], "content": opened_tab["content"]}))
+        self.assertTrue(
+            any(
+                f'"sourceStart": {second["sourceStart"]}' in call
+                and f'"sourceEnd": {second["sourceEnd"]}' in call
+                and '"matchText": "Needle"' in call
+                for call in calls
+            ),
+            calls,
+        )
 
     def test_sync_for_search_preserves_matches_when_unchanged_and_rescans_when_flushed_edits_arrive(self):
         note = self.root / "synced.md"

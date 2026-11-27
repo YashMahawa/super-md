@@ -67,6 +67,112 @@ from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_work
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
 from core.paths import DESKTOP_DIR, resource_root
 
+FOLDER_TREE_NOTE_SUFFIXES = frozenset({".md", ".smd", ".txt"})
+FOLDER_TREE_SCAN_BUDGET = 25000
+
+
+def _is_folder_tree_note_name(filename: str) -> bool:
+    return bool(filename) and not filename.startswith(".") and Path(filename).suffix.lower() in FOLDER_TREE_NOTE_SUFFIXES
+
+
+def _probe_directory_visible_note(
+    dir_path: Path,
+    *,
+    depth: int,
+    max_depth: int = MAX_FOLDER_DEPTH,
+    budget: list[int] | None = None,
+    memo: dict[str, bool] | None = None,
+) -> bool | None:
+    """Return True if a visible note exists, False if confirmed absent, or None if scan bounds stopped early."""
+    key = folder_ops.normalize_path_key(dir_path)
+    if memo is not None and key in memo:
+        return memo[key]
+    if depth > max_depth:
+        return None
+    if budget is not None and budget[0] <= 0:
+        return None
+    subdirs: list[Path] = []
+    found = False
+    unresolved = False
+    saw_entry = False
+    try:
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                saw_entry = True
+                if budget is not None:
+                    if budget[0] <= 0:
+                        unresolved = True
+                        break
+                    budget[0] -= 1
+                name = entry.name
+                if name.startswith("."):
+                    continue
+                try:
+                    entry_path = Path(entry.path)
+                    if entry.is_symlink() or folder_ops._is_link_or_junction(entry_path):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        subdirs.append(entry_path)
+                    elif entry.is_file(follow_symlinks=False) and _is_folder_tree_note_name(name):
+                        found = True
+                        break
+                except OSError:
+                    continue
+        if not saw_entry and budget is not None:
+            budget[0] -= 1
+    except OSError:
+        if memo is not None:
+            memo[key] = False
+        return False
+    if found:
+        if memo is not None:
+            memo[key] = True
+        return True
+    if unresolved:
+        return None
+    for subdir in subdirs:
+        sub_result = _probe_directory_visible_note(
+            subdir,
+            depth=depth + 1,
+            max_depth=max_depth,
+            budget=budget,
+            memo=memo,
+        )
+        if sub_result is True:
+            if memo is not None:
+                memo[key] = True
+            return True
+        if sub_result is None:
+            unresolved = True
+            if budget is not None and budget[0] <= 0:
+                break
+    if unresolved:
+        return None
+    if memo is not None:
+        memo[key] = False
+    return False
+
+
+def _directory_has_visible_note(
+    dir_path: Path,
+    *,
+    depth: int,
+    max_depth: int = MAX_FOLDER_DEPTH,
+    budget: list[int] | None = None,
+    memo: dict[str, bool] | None = None,
+) -> bool:
+    return (
+        _probe_directory_visible_note(
+            dir_path,
+            depth=depth,
+            max_depth=max_depth,
+            budget=budget,
+            memo=memo,
+        )
+        is not False
+    )
+
+
 ROOT = resource_root()
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
@@ -78,6 +184,7 @@ DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
 DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackground=False)
+DEFAULTS.update(hideNonNoteFolders=True)
 
 def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
     """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
@@ -940,6 +1047,7 @@ class Studio(QObject):
         self._files_revision = 0
         self._outline_revision = 0
         self.expanded: set[str] = set()
+        self._pinned_visible_dirs: set[str] = set()
         self.folder_filter = ""
         self._folder_searching = False
         self._search_generation = 0
@@ -1191,6 +1299,22 @@ class Studio(QObject):
             return {"id": "", "name": "Super MD", "content": "", "path": "", "saved": "", "assets": {}, "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "outline": []}
         return next((t for t in self.tabs if t["id"] == self.active), self.tabs[0])
 
+    @staticmethod
+    def _seeded_find_bounds(data: dict) -> dict:
+        start = data.get("sourceStart")
+        end = data.get("sourceEnd")
+        if (
+            isinstance(start, int) and not isinstance(start, bool)
+            and isinstance(end, int) and not isinstance(end, bool)
+            and start >= 0 and end >= start
+        ):
+            bounds: dict[str, object] = {"sourceStart": start, "sourceEnd": end}
+            match_text = data.get("matchText")
+            if isinstance(match_text, str) and match_text:
+                bounds["matchText"] = match_text
+            return bounds
+        return {}
+
     def _consume_seeded_find(self, tab: dict) -> dict | None:
         pending = self._pending_seeded_find
         if not pending or not tab.get("id"):
@@ -1202,7 +1326,9 @@ class Studio(QObject):
         if not matches_id and not matches_path:
             return None
         self._pending_seeded_find = None
-        return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+        seeded = {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+        seeded.update(self._seeded_find_bounds(pending))
+        return seeded
 
     def _notify_sidebar(self):
         if self.retired:
@@ -1407,8 +1533,13 @@ class Studio(QObject):
             if self.retired or error:return
             for old,new in result.items():self.session.locationChanged.emit(old,new or "")
             self._reload_changed_content(changed)
-            if self.folder:self.session.workspace_links.invalidate(self.folder)
-            if self.folder and (self.folder in changed or set(self.expanded)&changed):self._load_tree()
+            if self.folder:
+                self.session.workspace_links.invalidate(self.folder)
+            if self.folder and any(
+                folder_ops.same_path(ch, self.folder) or folder_ops.matches_path_prefix(ch, self.folder, is_directory=True)
+                for ch in changed
+            ):
+                self._load_tree()
         self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
 
     def _location_changed(self,old,new):
@@ -1905,18 +2036,34 @@ class Studio(QObject):
             self.workspaceSearchChanged.emit()
 
     @Slot(str, str, str, bool)
-    def openFolderSearchMatch(self, tab_id: str, path: str, query: str, case_sensitive: bool = False):
+    @Slot(str, str, str, bool, int, int)
+    @Slot(str, str, str, bool, int, int, str)
+    def openFolderSearchMatch(
+        self,
+        tab_id: str,
+        path: str,
+        query: str,
+        case_sensitive: bool = False,
+        source_start: int = -1,
+        source_end: int = -1,
+        match_text: str = "",
+    ):
         if self.retired:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
-        target_payload = json.dumps({
+        payload: dict[str, object] = {
             "tabId": tab_id or "",
             "path": path or "",
             "query": query or "",
             "caseSensitive": bool(case_sensitive),
-        })
-        self._flush("open_search_match", target_payload)
+        }
+        payload.update(self._seeded_find_bounds({
+            "sourceStart": source_start,
+            "sourceEnd": source_end,
+            "matchText": match_text,
+        }))
+        self._flush("open_search_match", json.dumps(payload))
 
     @Property(bool, notify=changed)
     def agentAccessEnabled(self):
@@ -3608,6 +3755,7 @@ class Studio(QObject):
         if not root.is_dir():
             return
         root_str = folder_ops.canonical_path_str(root)
+        self._pinned_visible_dirs.clear()
         valid_expanded = {root_str}
         for raw in expanded_paths or []:
             if not raw:
@@ -3788,6 +3936,7 @@ class Studio(QObject):
         self.folder = folder_ops.canonical_path_str(path)
         self.session.workspace_links.invalidate(self.folder)
         self.settings["welcomed"] = True
+        self._pinned_visible_dirs.clear()
         self.expanded = {self.folder}
         self._preferences()
         self._recover()
@@ -3824,10 +3973,18 @@ class Studio(QObject):
             self._start_subfolder_search()
             return
         folder, expanded = self.folder, set(self.expanded)
+        hide_non_note = bool(self.settings.get("hideNonNoteFolders", True))
         expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
+        pinned_visible_keys = {folder_ops.normalize_path_key(item) for item in getattr(self, "_pinned_visible_dirs", ()) if item}
+        custom_budget = getattr(self, "_folder_tree_scan_budget", None)
+        initial_budget = FOLDER_TREE_SCAN_BUDGET if custom_budget is None else max(0, int(custom_budget))
         def scan():
             entries: list[dict[str, object]] = []
+            note_memo: dict[str, bool] = {}
+            scan_budget = [initial_budget]
             def visit(path, depth):
+                if depth > 256:
+                    return
                 try:
                     children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
                 except OSError:
@@ -3838,17 +3995,34 @@ class Studio(QObject):
                     if child.name.startswith(".") or folder_ops._is_link_or_junction(child):
                         continue
                     directory = child.is_dir()
-                    if directory or is_searchable_note_name(child.name):
+                    if directory:
                         child_str = folder_ops.canonical_path_str(child)
-                        is_expanded = folder_ops.normalize_path_key(child_str) in expanded_keys
-                        entries.append({"name": child.name, "path": child_str, "directory": directory, "depth": depth, "expanded": is_expanded})
-                        if directory and is_expanded:
+                        child_key = folder_ops.normalize_path_key(child_str)
+                        if (
+                            hide_non_note
+                            and child_key not in pinned_visible_keys
+                            and not _directory_has_visible_note(
+                                child,
+                                depth=depth + 1,
+                                max_depth=MAX_FOLDER_DEPTH,
+                                budget=scan_budget,
+                                memo=note_memo,
+                            )
+                        ):
+                            continue
+                        is_expanded = child_key in expanded_keys
+                        entries.append({"name": child.name, "path": child_str, "directory": True, "depth": depth, "expanded": is_expanded})
+                        if is_expanded:
                             visit(child, depth + 1)
+                    elif is_searchable_note_name(child.name):
+                        child_str = folder_ops.canonical_path_str(child)
+                        entries.append({"name": child.name, "path": child_str, "directory": False, "depth": depth, "expanded": False})
             visit(folder, 0)
             return entries
         def finished(result, error):
-            if not error and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder) and not self.folder_filter.strip():
+            if not error and result is not None and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder) and not self.folder_filter.strip():
                 self.files = result
+                self._watch_notes()
         self._submit(scan, finished, False)
 
     @Slot(str)
@@ -3862,6 +4036,8 @@ class Studio(QObject):
         if existing:
             for item in existing:
                 self.expanded.discard(item)
+            for item in [p for p in self._pinned_visible_dirs if folder_ops.same_path(p, canon)]:
+                self._pinned_visible_dirs.discard(item)
         else:
             self.expanded.add(canon)
         self._recover()
@@ -3876,7 +4052,9 @@ class Studio(QObject):
             self.session.workspace_links.invalidate(self.folder)
         self.folder = ""
         self.files = []
+        self._pinned_visible_dirs.clear()
         self.expanded.clear()
+        self._watch_notes()
         self._recover()
         self._emit(False)
 
@@ -3932,7 +4110,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility","keepInBackground") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility","keepInBackground","hideNonNoteFolders") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())
@@ -3951,6 +4129,12 @@ class Studio(QObject):
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
         self.settings[key] = value
         if key == "shortcuts": self._notify_shortcuts()
+        if key == "hideNonNoteFolders":
+            for win in list(self.session.windows.values()):
+                if not win.retired and win.folder:
+                    if value:
+                        win._pinned_visible_dirs.clear()
+                    win._load_tree()
         self._preferences()
         self._emit()
 
@@ -3997,6 +4181,7 @@ class Studio(QObject):
             path = request.get("path") or ""
             query = request.get("query") or ""
             case_sensitive = bool(request.get("caseSensitive", False))
+            bounds = self._seeded_find_bounds(request)
             existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
             if existing is None and path:
                 resolved = os.path.normcase(str(Path(path).resolve(strict=False)))
@@ -4005,17 +4190,18 @@ class Studio(QObject):
                 if existing["id"] == self.active and self.ready:
                     self._pending_seeded_find = None
                     if query:
-                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps({'caseSensitive': case_sensitive})})")
+                        find_opts = {"caseSensitive": case_sensitive, **bounds}
+                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps(find_opts)})")
                     self._focus_open_target(self._activation_generation)
                 else:
-                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive} if query else None
+                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
                     self.selectTab(existing["id"])
                     if existing["id"] == self.active and not self.ready:
                         pass
                     self._focus_open_target(self._activation_generation)
             elif path:
                 local = str(local_path(path))
-                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive} if query else None
+                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
                 def opened(_note, error):
                     if error and self._pending_seeded_find and self._pending_seeded_find.get("path") == local:
                         self._pending_seeded_find = None
@@ -4420,6 +4606,10 @@ class Studio(QObject):
                 folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
                 for p in win.expanded
             }
+            win._pinned_visible_dirs = {
+                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+                for p in getattr(win, "_pinned_visible_dirs", ())
+            }
             if win._pending_seeded_find and win._pending_seeded_find.get("path"):
                 seeded_path = win._pending_seeded_find["path"]
                 if folder_ops.matches_path_prefix(seeded_path, old_path, is_directory=is_dir):
@@ -4542,7 +4732,9 @@ class Studio(QObject):
                     try:
                         win_root = Path(folder_ops.canonical_path_str(win.folder))
                         if folder_ops.matches_path_prefix(created_dir, str(win_root), is_directory=True):
-                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created))
+                            ancestors = folder_ops.ancestor_directories_in_folder(win_root, created)
+                            win.expanded.update(ancestors)
+                            win._pinned_visible_dirs.update(ancestors)
                             win._recover()
                             win._load_tree()
                     except OSError:
