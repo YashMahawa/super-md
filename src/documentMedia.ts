@@ -6,10 +6,25 @@ import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
 import { maskFrontmatter } from "./frontmatter";
 import { remarkObsidianMath } from "./obsidianMath";
+import {
+  isRemoteImageApproved,
+  isRemoteOrExplicitScheme,
+  loadedReaderImageData,
+  normalizeApprovedImageUrls,
+  normalizeTrustedImageHosts,
+  type RemoteImageConsentPolicy,
+} from "./remoteImageConsent";
 
 export interface ImportedImage { source: string; alt: string }
 export interface LinkDetails { url: string; title: string; thumbnail?: string }
-export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source);
+export const attachmentSource = (source: string) => /^assets\/(?:import|image)-[a-zA-Z0-9-]+\.(?:png|jpg|jpeg|svg|gif|webp|avif)$/.test(source) && source.length <= 7 + 150;
+const compatPortableAssetSource = (source: string, ext: string) => {
+  if (!source.startsWith("assets/")) return false;
+  const name = source.slice(7);
+  if (!name || name.length > 159 || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name)) return false;
+  const actualExt = name.split(".").pop()?.toLowerCase();
+  return ext === "jpg" ? actualExt === "jpg" || actualExt === "jpeg" : actualExt === ext;
+};
 export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&").replace(/[\r\n]+/g, " ");
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
@@ -82,23 +97,12 @@ export async function importImageFiles(files: File[]): Promise<ImportedImage[]> 
   const images = await Promise.all(files.map(async (file) => ({ name: file.name, data: await readImage(file) })));
   return invoke<ImportedImage[]>("import_images", { images });
 }
-export interface PrepareFmdOptions {
-  localAssets?: Iterable<string>;
-  omitLocalAssets?: boolean;
-  trustedImageHosts?: readonly string[];
-  resolveConsentedRemoteImage?: (url: string) => string | null;
-}
-function remoteImageHost(url: string): string | null {
-  if (!/^https?:\/\//i.test(url)) return null;
-  try {
-    const parsed = new URL(url);
-    return (parsed.protocol === "http:" || parsed.protocol === "https:") && !parsed.username && !parsed.password && parsed.host
-      ? parsed.host.toLowerCase()
-      : null;
-  } catch {
-    return null;
-  }
-}
+const isValidLocalPortableAssetKey = (source: string) => {
+  if (!source.startsWith("assets/")) return false;
+  const name = source.slice(7);
+  if (!name || name.length > 159 || name === "." || name === ".." || !/^[A-Za-z0-9._-]+$/.test(name)) return false;
+  return /\.(?:png|jpe?g|svg|gif|webp|avif)$/i.test(name);
+};
 interface HtmlImgSrcSpan {
   source: string;
   valueStart: number;
@@ -188,20 +192,37 @@ function scanHtmlImgSrcSpans(raw: string, baseOffset: number): HtmlImgSrcSpan[] 
 }
 // FMD keeps interactive source blocks intact. Only image URLs are rewritten;
 // their bytes live in the envelope, never in the displayed Markdown editor.
-export async function prepareFmd(markdown: string, documentPath: string | null, options?: PrepareFmdOptions) {
+export type PrepareFmdOptions = RemoteImageConsentPolicy & {
+  portable?: boolean;
+  localAssets?: Iterable<string>;
+  omitLocalAssets?: boolean;
+};
+
+interface NormalizedFmdConsent {
+  noteId?: string;
+  trustedHosts: Set<string>;
+  approvedUrls: Set<string>;
+  loadedImageData?: ReadonlyMap<string, string> | Record<string, string>;
+}
+
+async function prepareFmdInternal(
+  markdown: string,
+  documentPath: string | null,
+  portableDoc: boolean,
+  consent: NormalizedFmdConsent,
+  localAssetSet: ReadonlySet<string>,
+  omitLocalAssets: boolean,
+  shared: Map<string, Promise<string | null>>,
+  assets: Record<string, string>,
+): Promise<string> {
   const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
   const tree = processor.parse(maskFrontmatter(markdown));
-  const assets: Record<string, string> = {}; const work: Promise<void>[] = [];
-  const shared = new Map<string, Promise<string>>();
+  const work: Promise<void>[] = [];
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const definitions = new Map<string, any>(); const usedDefinitions = new Set<string>();
-  const localAssetSet = new Set(options?.localAssets ?? []);
-  const omitLocalAssets = Boolean(options?.omitLocalAssets);
-  const enforceRemoteConsent = options?.trustedImageHosts !== undefined;
-  const trustedHosts = new Set((options?.trustedImageHosts ?? []).map((host) => host.trim().toLowerCase()).filter(Boolean));
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
   const collect = (source: string, replace: (name: string) => void) => {
-    if (!shared.has(source)) shared.set(source, (async () => {
+    if (!shared.has(source)) shared.set(source, (async (): Promise<string | null> => {
       if (omitLocalAssets && localAssetSet.has(source)) {
         return source;
       }
@@ -209,31 +230,32 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
       if (/^data:/i.test(source)) {
         if (!/^data:image\//i.test(source)) throw new Error(`Unsupported image ${source}`);
         data = source;
-      } else if (/^https?:/i.test(source)) {
-        const consentedData = options?.resolveConsentedRemoteImage?.(source) ?? null;
-        if (consentedData) {
-          data = consentedData;
-        } else {
-          if (enforceRemoteConsent) {
-            const host = remoteImageHost(source);
-            if (!host || !trustedHosts.has(host)) {
-              throw new Error(`Remote image from ${host || source} requires explicit consent in the reader before saving a portable note.`);
-            }
-          }
+      } else if (isRemoteOrExplicitScheme(source)) {
+        const preloaded = loadedReaderImageData(source, {
+          noteId: consent.noteId,
+          loadedImageData: consent.loadedImageData,
+          trustedHosts: consent.trustedHosts,
+          approvedUrls: consent.approvedUrls,
+          enforcePolicy: true,
+        });
+        if (preloaded) {
+          data = preloaded;
+        } else if (isRemoteImageApproved(source, consent.trustedHosts, consent.approvedUrls)) {
           data = (await invoke<{ body: string }>("fetch_resource", { url: source, image: true })).body;
+        } else {
+          return null;
         }
-      } else if (enforceRemoteConsent && (source.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(source))) {
-        throw new Error(`Remote image ${source} requires explicit consent in the reader before saving a portable note.`);
       } else {
         data = await invoke<string>("load_asset", { documentPath: documentPath || "", source });
       }
       const type = data.match(/^data:image\/([^;]+);base64,/i)?.[1]?.toLowerCase();
       if (!type) throw new Error(`Unsupported image ${source}`);
-      const name = attachmentSource(source) || localAssetSet.has(source) ? source : `assets/image-${crypto.randomUUID()}.${type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type}`;
+      const ext = type === "svg+xml" ? "svg" : type === "jpeg" ? "jpg" : type;
+      const name = attachmentSource(source) || ((portableDoc || localAssetSet.has(source)) && compatPortableAssetSource(source, ext)) ? source : `assets/image-${crypto.randomUUID()}.${ext}`;
       assets[name] = data;
       return name;
     })());
-    work.push(shared.get(source)!.then(replace));
+    work.push(shared.get(source)!.then((name) => { if (name !== null) replace(name); }));
   };
   visit(tree, (node: any) => {
     if (node.type === "image") collect(node.url, (name) => {
@@ -263,7 +285,16 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
       const blockEnd = node.position.end.offset;
       const chars = markdown.slice(blockStart, blockEnd).split("");
       visit(node, (child: any) => {
-        if ((child.type === "inlineCode" || child.type === "inlineMath" || child.type === "math" || child.type === "code") && child.position) {
+        if (
+          (child.type === "inlineCode" ||
+            child.type === "inlineMath" ||
+            child.type === "math" ||
+            child.type === "code" ||
+            child.type === "image" ||
+            child.type === "imageReference" ||
+            child.type === "html") &&
+          child.position
+        ) {
           const from = Math.max(0, child.position.start.offset - blockStart);
           const to = Math.min(chars.length, child.position.end.offset - blockStart);
           for (let i = from; i < to; i++) chars[i] = " ";
@@ -299,11 +330,12 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
     const offset = work.length;
     for (const source of stepSources) collect(source, name => { rewritten.set(source, name); });
     for(const step of deck.steps) if(typeof step.markdown==='string') {
-      const originalStepMarkdown = step.markdown;
-      work.push(prepareFmd(originalStepMarkdown, documentPath, options).then(prepared=>{
-        if (prepared.content !== originalStepMarkdown) markdownChanged = true;
-        step.markdown=prepared.content;
-        Object.assign(assets,prepared.assets);
+      const originalMarkdown = step.markdown;
+      work.push(prepareFmdInternal(originalMarkdown, documentPath, portableDoc, consent, localAssetSet, omitLocalAssets, shared, assets).then(prepared => {
+        if (prepared !== originalMarkdown) {
+          step.markdown = prepared;
+          markdownChanged = true;
+        }
       }));
     }
     // All corresponding assets must finish loading before serializing this deck.
@@ -313,11 +345,13 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
       for (const step of deck.steps!) {
         if (typeof step.image === "string" && rewritten.has(step.image)) {
           const nextImage = rewritten.get(step.image)!;
-          if (nextImage !== step.image) imageChanged = true;
-          step.image = nextImage;
+          if (nextImage !== step.image) {
+            step.image = nextImage;
+            imageChanged = true;
+          }
         }
       }
-      if (!omitLocalAssets || imageChanged || markdownChanged) {
+      if (imageChanged || markdownChanged) {
         edits.push({start: payloadStart, end: payloadEnd, value: JSON.stringify(deck, null, 2)});
       }
     }));
@@ -325,5 +359,21 @@ export async function prepareFmd(markdown: string, documentPath: string | null, 
   await Promise.all(work);
   let content = markdown;
   for (const edit of edits.sort((a, b) => b.start - a.start)) content = content.slice(0, edit.start) + edit.value + content.slice(edit.end);
+  return content;
+}
+
+export async function prepareFmd(markdown: string, documentPath: string | null, options: PrepareFmdOptions = {}) {
+  const portableDoc = options.portable ?? /\.(?:smd|fmd)$/i.test(documentPath || "");
+  const assets: Record<string, string> = {};
+  const shared = new Map<string, Promise<string | null>>();
+  const localAssetSet = new Set(Array.from(options.localAssets ?? []).filter(isValidLocalPortableAssetKey));
+  const omitLocalAssets = Boolean(options.omitLocalAssets);
+  const consent: NormalizedFmdConsent = {
+    noteId: options.noteId,
+    trustedHosts: normalizeTrustedImageHosts(options.trustedImageHosts),
+    approvedUrls: normalizeApprovedImageUrls(options.approvedImageUrls),
+    loadedImageData: options.loadedImageData,
+  };
+  const content = await prepareFmdInternal(markdown, documentPath, portableDoc, consent, localAssetSet, omitLocalAssets, shared, assets);
   return { content, assets };
 }

@@ -48,23 +48,27 @@ internal class ReaderBridge(
     }
 
     /** Waits for the live reader to flush its acknowledged edit queue for this exact note. */
-    suspend fun requestFlush(noteId: String, timeoutMillis: Long = 12_000): Boolean {
-        if (retired.get() || noteId.isBlank()) return false
+    suspend fun requestFlush(noteId: String, timeoutMillis: Long = 12_000): Boolean =
+        requestFlushStatus(noteId, timeoutMillis) == ReaderFlushStatus.ACKNOWLEDGED
+
+    /** Waits for the live reader's flush outcome, distinguishing active-note handoff lag from errors. */
+    suspend fun requestFlushStatus(noteId: String, timeoutMillis: Long = 12_000): ReaderFlushStatus {
+        if (retired.get() || noteId.isBlank()) return ReaderFlushStatus.FAILED
         val request = flushBarrier.register(UUID.randomUUID().toString(), noteId)
         try {
             if (retired.get()) {
                 flushBarrier.cancel(request.token, request)
-                return false
+                return ReaderFlushStatus.FAILED
             }
             val script = "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}})"
             if (!web.post {
-                    if (retired.get()) flushBarrier.complete(request.token, "", null, null, "Reader retired")
+                    if (retired.get()) flushBarrier.complete(request.token, "", null, null, "Reader retired", wellFormed = false)
                     else web.evaluateJavascript(script, null)
                 }) {
                 flushBarrier.cancel(request.token, request)
-                return false
+                return ReaderFlushStatus.FAILED
             }
-            return withTimeoutOrNull(timeoutMillis) { request.result.await() } == true
+            return withTimeoutOrNull(timeoutMillis) { request.status.await() } ?: ReaderFlushStatus.FAILED
         } finally {
             flushBarrier.cancel(request.token, request)
         }
@@ -124,6 +128,32 @@ internal class ReaderBridge(
                     "load_python_output" -> loadPythonOutput(args)
                     "load_asset" -> model.asset(args.getString("documentPath"), args.getString("source"))
                     "load_text_asset" -> model.textAsset(args.getString("documentPath"), args.getString("source"))
+                    "open_workspace_link", "open_relative_note" -> {
+                        val fragment = if (args.has("fragment") && !args.isNull("fragment")) {
+                            args.opt("fragment") as? String ?: error("Invalid heading target")
+                        } else if (args.has("heading") && !args.isNull("heading")) {
+                            args.opt("heading") as? String ?: error("Invalid heading target")
+                        } else {
+                            ""
+                        }
+                        val wikilink = if (command == "open_workspace_link") args.optBoolean("wikilink", false) else false
+                        model.openWorkspaceLink(
+                            args.optString("documentPath", ""),
+                            args.getString("target"),
+                            fragment,
+                            wikilink,
+                        )
+                    }
+                    "open_external_url" -> {
+                        val rawUrl = args.getString("url")
+                        require(rawUrl.length in 1..4096) { "Invalid external URL" }
+                        val uri = Uri.parse(rawUrl)
+                        require(classifyReaderNavigationUrl(uri, isForMainFrame = true) == ReaderUrlDecision.OPEN_EXTERNAL) {
+                            "Unsupported external URL"
+                        }
+                        launchExternalReaderUri(web.context, uri)
+                        true
+                    }
                     "resolve_reader_asset" -> withContext(Dispatchers.IO) {
                         val source = args.getString("source")
                         val (noteId, asset) = model.resolveReaderAsset(args.getString("documentPath"), source)
@@ -324,6 +354,7 @@ internal class ReaderBridge(
             content,
             current?.takeIf { model.state.value.active.id == it.id }?.content,
             if (wellFormed) error else "Malformed flush acknowledgement",
+            wellFormed = wellFormed,
         )
         return if (accepted) JSONObject().put("accepted", true)
         else JSONObject().put("accepted", false).put("reason", "conflict")
@@ -542,15 +573,26 @@ fun configureReader(web: WebView, model: StudioViewModel, scope: CoroutineScope,
         }
         override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
             // The bridge is available only in the bundled offline reader. Allow only
-            // the main reader entrypoint and its opaque-origin Mermaid sandbox subframe.
-            if (!shouldOverrideReaderNavigation(request.url, request.isForMainFrame)) return false
-            if (request.isForMainFrame && request.url.scheme?.lowercase() in listOf("https", "http", "mailto")) {
-                runCatching { view.context.startActivity(Intent(Intent.ACTION_VIEW, request.url)) }
+            // the main reader entrypoint and its opaque-origin Mermaid sandbox subframe,
+            // and never send internal appassets.androidplatform.net paths to an external browser.
+            return when (classifyReaderNavigationUrl(request.url, request.isForMainFrame)) {
+                ReaderUrlDecision.ALLOW_READER -> false
+                ReaderUrlDecision.OPEN_EXTERNAL -> {
+                    launchExternalReaderUri(view.context, request.url)
+                    true
+                }
+                ReaderUrlDecision.BLOCK_INTERNAL -> true
             }
-            return true
         }
     }
     web.setTag(R.id.reader_bridge_tag, bridge)
     web.addJavascriptInterface(bridge, "SuperMD")
     web.loadUrl("https://appassets.androidplatform.net/assets/web/android-reader.html")
+}
+
+private fun launchExternalReaderUri(context: android.content.Context, uri: Uri) {
+    val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+        if (context !is android.app.Activity) addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    runCatching { context.startActivity(intent) }
 }
