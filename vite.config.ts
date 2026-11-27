@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
@@ -60,41 +61,66 @@ export function renderSandboxDocument(iifeScript: string): string {
   return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"></head><body style="margin:0;padding:0;overflow:hidden"><script>${escaped}</script></body></html>`;
 }
 
-function mermaidSandboxPlugin(): Plugin {
+export type MermaidSandboxBuildOutput =
+  | string
+  | {
+      script: string;
+      inputs?: Iterable<string>;
+    };
+
+export function mermaidSandboxPlugin(
+  buildSandboxScript?: () => Promise<MermaidSandboxBuildOutput>,
+): Plugin {
+  const repoRoot = fileURLToPath(new URL(".", import.meta.url));
   const virtualId = "virtual:mermaid-sandbox-url";
   const resolvedId = "\0" + virtualId;
   const devRoute = "/@mermaid-sandbox.html";
   const devScriptRoute = "/@mermaid-sandbox.js";
   let isServe = false;
   let isNative = false;
-  let cachedBundlePromise: Promise<{ script: string; html: string }> | null = null;
 
-  const getSandboxBundle = () => {
-    if (!cachedBundlePromise) {
-      cachedBundlePromise = (async () => {
-        const esbuild = await import("esbuild");
-        const entry = fileURLToPath(new URL("./src/mermaidSandboxEntry.ts", import.meta.url));
-        const bundled = await esbuild.build({
-          entryPoints: [entry],
-          bundle: true,
-          write: false,
-          format: "iife",
-          platform: "browser",
-          target: "es2020",
-          charset: "ascii",
-          legalComments: "none",
-          minify: true,
-          alias: {
-            "decode-named-character-reference": fileURLToPath(
-              new URL("./node_modules/decode-named-character-reference/index.js", import.meta.url),
-            ),
-          },
-        });
-        const script = bundled.outputFiles[0]?.text ?? "";
-        return { script, html: renderSandboxDocument(script) };
-      })();
-    }
-    return cachedBundlePromise;
+  const normalizeWatchPath = (filePath: string) => {
+    const resolved = path.resolve(repoRoot, filePath);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+
+  const runDefaultBuild = async (): Promise<{ script: string; inputs: string[] }> => {
+    const esbuild = await import("esbuild");
+    const entry = fileURLToPath(new URL("./src/mermaidSandboxEntry.ts", import.meta.url));
+    const bundled = await esbuild.build({
+      entryPoints: [entry],
+      bundle: true,
+      metafile: true,
+      write: false,
+      format: "iife",
+      platform: "browser",
+      target: "es2020",
+      charset: "ascii",
+      legalComments: "none",
+      minify: true,
+      alias: {
+        "decode-named-character-reference": fileURLToPath(
+          new URL("./node_modules/decode-named-character-reference/index.js", import.meta.url),
+        ),
+      },
+    });
+    return {
+      script: bundled.outputFiles[0]?.text ?? "",
+      inputs: Object.keys(bundled.metafile?.inputs ?? {}),
+    };
+  };
+
+  const buildSandboxBundle = async () => {
+    const built = buildSandboxScript
+      ? await buildSandboxScript()
+      : await runDefaultBuild();
+    const script = typeof built === "string" ? built : built.script;
+    const inputs = typeof built === "string" ? undefined : built.inputs;
+    return {
+      script,
+      html: renderSandboxDocument(script),
+      inputs,
+    };
   };
 
   return {
@@ -108,6 +134,75 @@ function mermaidSandboxPlugin(): Plugin {
       return null;
     },
     configureServer(server) {
+      type CachedBundleEntry = {
+        buildId: number;
+        promise: Promise<{ script: string; html: string }>;
+      };
+      let cachedBundleEntry: CachedBundleEntry | null = null;
+      let latestBuildId = 0;
+      let watchedInputs = new Set<string>();
+
+      const isCurrentBuild = (
+        buildId: number,
+        buildPromise: Promise<{ script: string; html: string }> | null,
+      ) => buildId === latestBuildId && cachedBundleEntry !== null && cachedBundleEntry.promise === buildPromise;
+
+      const getDevSandboxBundle = (): CachedBundleEntry => {
+        if (!cachedBundleEntry) {
+          const buildId = ++latestBuildId;
+          let buildPromise: Promise<{ script: string; html: string }> | null = null;
+          buildPromise = (async () => {
+            const { script, html, inputs } = await buildSandboxBundle();
+            if (isCurrentBuild(buildId, buildPromise)) {
+              watchedInputs = inputs ? new Set(Array.from(inputs, normalizeWatchPath)) : new Set();
+            }
+            return { script, html };
+          })().catch((error) => {
+            if (isCurrentBuild(buildId, buildPromise)) {
+              cachedBundleEntry = null;
+            }
+            throw error;
+          });
+          const entry: CachedBundleEntry = { buildId, promise: buildPromise };
+          if (buildId === latestBuildId) {
+            cachedBundleEntry = entry;
+          }
+          return entry;
+        }
+        return cachedBundleEntry;
+      };
+
+      const getLatestDevSandboxBundle = async () => {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const entry = getDevSandboxBundle();
+          try {
+            const bundle = await entry.promise;
+            if (entry.buildId === latestBuildId || attempt === 3) {
+              return bundle;
+            }
+          } catch (error) {
+            if (entry.buildId === latestBuildId || attempt === 3) {
+              throw error;
+            }
+          }
+        }
+        return getDevSandboxBundle().promise;
+      };
+
+      const invalidateIfSandboxSource = (filePath: string) => {
+        if (
+          /[\\/]mermaidSandbox/i.test(filePath) ||
+          watchedInputs.has(normalizeWatchPath(filePath))
+        ) {
+          latestBuildId += 1;
+          cachedBundleEntry = null;
+        }
+      };
+      server.watcher?.on("change", invalidateIfSandboxSource);
+      server.watcher?.on("add", invalidateIfSandboxSource);
+      server.watcher?.on("unlink", invalidateIfSandboxSource);
+      void getDevSandboxBundle().promise.catch(() => {});
+
       server.middlewares.use(async (req, res, next) => {
         const requestPath = req.url?.split("?", 1)[0];
         if (
@@ -117,19 +212,29 @@ function mermaidSandboxPlugin(): Plugin {
           next();
           return;
         }
+        let bundle: { script: string; html: string };
         try {
-          cachedBundlePromise = null;
-          const bundle = await getSandboxBundle();
-          const isScript = requestPath === devScriptRoute;
-          res.statusCode = 200;
-          res.setHeader(
-            "Content-Type",
-            isScript ? "application/javascript; charset=utf-8" : "text/html; charset=utf-8",
-          );
-          res.setHeader("Cache-Control", "no-store");
-          res.end(req.method === "HEAD" ? undefined : isScript ? bundle.script : bundle.html);
+          bundle = await getLatestDevSandboxBundle();
         } catch (error) {
-          next(error);
+          if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+            next(error);
+          }
+          return;
+        }
+        if (res.headersSent || res.writableEnded || res.destroyed) {
+          return;
+        }
+        const isScript = requestPath === devScriptRoute;
+        res.statusCode = 200;
+        res.setHeader(
+          "Content-Type",
+          isScript ? "application/javascript; charset=utf-8" : "text/html; charset=utf-8",
+        );
+        res.setHeader("Cache-Control", "no-store");
+        if (req.method === "HEAD") {
+          res.end();
+        } else {
+          res.end(isScript ? bundle.script : bundle.html);
         }
       });
     },
@@ -138,7 +243,7 @@ function mermaidSandboxPlugin(): Plugin {
       if (isServe) {
         return `export const sandboxScriptUrl = ${JSON.stringify(devScriptRoute)}; export default ${JSON.stringify(devRoute)};`;
       }
-      const bundle = await getSandboxBundle();
+      const bundle = await buildSandboxBundle();
       const refId = this.emitFile({
         type: "asset",
         name: "mermaid-sandbox.html",

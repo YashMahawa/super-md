@@ -91,9 +91,11 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
 
     const primaryLeafInLive = page.locator("li", { hasText: "1.2.2.a.iii Primary Deep Leaf Target" }).last();
     const rootMilestoneInLive = page.locator("li", { hasText: "1. Root Milestone 1" }).first();
-    await primaryLeafInLive.evaluate((el) => el.scrollIntoView({ block: "start" }));
-    await page.evaluate(() => {
-      document.querySelector<HTMLElement>(".android-reading")!.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await primaryLeafInLive.evaluate((el) => {
+      const root = el.closest<HTMLElement>(".android-reading")!;
+      root.dispatchEvent(new WheelEvent("wheel", { deltaY: 4, bubbles: true }));
+      el.scrollIntoView({ block: "start" });
+      root.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
     await expect.poll(() => readingRoot.evaluate((el) => el.scrollTop)).toBeGreaterThan(1500);
     await expect.poll(() => isVisibleWithinScroller(primaryLeafInLive, readingRoot)).toBe(true);
@@ -116,13 +118,14 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
 
     // 3. Scroll the Split preview pane deeper to a second 5-level leaf item, then transition Split -> Source.
     const secondaryLeafInSplit = page.locator(".android-reading li", { hasText: "2.3.2.b.iv Secondary Deep Leaf Target" }).last();
-    await secondaryLeafInSplit.evaluate((el) => el.scrollIntoView({ block: "start" }));
-    await page.evaluate(() => {
-      const root = document.querySelector<HTMLElement>(".android-reading")!;
+    await secondaryLeafInSplit.evaluate((el) => {
+      const root = el.closest<HTMLElement>(".android-reading")!;
       root.dispatchEvent(new WheelEvent("wheel", { deltaY: 4, bubbles: true }));
+      el.scrollIntoView({ block: "start" });
       root.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
-    await page.waitForTimeout(80);
+    await expect.poll(() => isVisibleWithinScroller(secondaryLeafInSplit, readingRoot)).toBe(true);
+    await page.evaluate(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(() => resolve()))));
 
     await page.evaluate((state) => window.supermdLoad?.({ ...state, mode: "editor" }), baseState);
     await expect(page.locator(".android-reading")).toHaveCount(0);
@@ -275,10 +278,10 @@ test.describe("shared source anchor across Split, Source, Live and unsaved draft
 
     // Scroll the Split preview pane to the deep nested checklist leaf item.
     const deepLeafInPreview = page.locator(".preview-pane li", { hasText: "2.3.2.b.iv Secondary Deep Leaf Target" }).last();
-    await deepLeafInPreview.evaluate((el) => el.scrollIntoView({ block: "start" }));
-    await page.evaluate(() => {
-      const scroller = document.querySelector<HTMLElement>(".preview-pane .reading-scroll")!;
+    await deepLeafInPreview.evaluate((el) => {
+      const scroller = el.closest<HTMLElement>(".preview-pane .reading-scroll")!;
       scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: 4, bubbles: true }));
+      el.scrollIntoView({ block: "start" });
       scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
     await expect.poll(() => previewScroller.evaluate((el) => el.scrollTop)).toBeGreaterThan(1500);
