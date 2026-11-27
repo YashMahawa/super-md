@@ -12,20 +12,10 @@ from typing import Any
 
 if __package__ and "." in __package__:
     from .. import documents
-    from ..agent_documents import (
-        AgentDocumentError,
-        DocumentStore,
-        RevisionConflict,
-        _symlink_component,
-    )
+    from ..agent_documents import AgentDocumentError, DocumentStore, RevisionConflict
 else:
     import documents
-    from agent_documents import (
-        AgentDocumentError,
-        DocumentStore,
-        RevisionConflict,
-        _symlink_component,
-    )
+    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict
 
 from . import validators as _v
 from .context_normalizer import normalize_initial_reading_context, viewport_contexts
@@ -157,20 +147,23 @@ def svg_source_blocks(data: bytes, metadata: dict[str, Any], offset: int = 0, li
 def resolve_live_asset_path(store: DocumentStore, raw_path: str) -> str:
     if not isinstance(raw_path, str) or not raw_path.strip() or len(raw_path) > 4096 or "\0" in raw_path:
         raise AgentDocumentError("asset_path must be a non-empty file path")
-    expanded = os.path.expanduser(raw_path)
+    cleaned = _v.strip_extended_length_prefix(raw_path)
+    if not cleaned or not cleaned.strip():
+        raise AgentDocumentError("asset_path must be a non-empty file path")
+    expanded = os.path.expanduser(cleaned)
     cand = Path(expanded)
-    if (cand.name not in ("", ".", "..") and cand.name.startswith(".")) or (
-        not cand.is_absolute() and any(part not in (".", "..") and part.startswith(".") for part in cand.parts)
-    ):
+    if _v.is_hidden_name(cand.name) or (not cand.is_absolute() and any(_v.is_hidden_name(part) for part in cand.parts)):
         raise AgentDocumentError("Hidden files and directories are not allowed")
-    if cand.is_absolute() and (cand.is_symlink() or _symlink_component(cand) is not None):
-        raise AgentDocumentError("Symbolic links are not allowed")
-    if cand.is_absolute() and store.roots:
-        try:
-            store.resolve(expanded)
-        except AgentDocumentError as error:
-            if "outside the configured workspace roots" not in str(error):
-                raise
+    if cand.is_absolute():
+        aliased = _v.rewrite_system_path_alias(cand)
+        if _v.is_link_or_junction(aliased) or _v.has_link_or_junction_component(aliased):
+            raise AgentDocumentError("Symbolic links are not allowed")
+        if store.roots:
+            try:
+                store.resolve(expanded)
+            except AgentDocumentError as error:
+                if "outside the configured workspace roots" not in str(error):
+                    raise
     return expanded
 
 

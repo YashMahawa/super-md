@@ -21,8 +21,11 @@ if str(DESKTOP_DIR) not in sys.path:
 
 
 @unittest.skipUnless(importlib.util.find_spec("mcp"), "install desktop/requirements-agent.txt for official SDK transport tests")
-class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
-    async def test_rooted_mcp_delegates_live_smd_asset_bounds_to_studio(self) -> None:
+class AgentMCPSplitCoordinationTest(unittest.TestCase):
+    def test_rooted_mcp_delegates_live_smd_asset_bounds_to_studio(self) -> None:
+        asyncio.run(self._run_rooted_mcp_delegates_live_smd_asset_bounds_to_studio())
+
+    async def _run_rooted_mcp_delegates_live_smd_asset_bounds_to_studio(self) -> None:
         from agent_live import create_qt_bridge
         from agent_live_client import MultiSessionLiveClient
         from documents import write_portable
@@ -42,7 +45,7 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(coro)
             while not task.done():
                 app.processEvents()
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.003)
             return await task
 
         with tempfile.TemporaryDirectory() as folder:
@@ -169,7 +172,10 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
                 app.processEvents()
                 shutil.rmtree(session.data, ignore_errors=True)
 
-    async def test_live_metadata_is_bounded_redacted_and_revision_bound(self) -> None:
+    def test_live_metadata_is_bounded_redacted_and_revision_bound(self) -> None:
+        asyncio.run(self._run_live_metadata_is_bounded_redacted_and_revision_bound())
+
+    async def _run_live_metadata_is_bounded_redacted_and_revision_bound(self) -> None:
         from mcp import Client
         from mcp_server import build_mcp_server
 
@@ -216,7 +222,10 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
             fake.asset_page_revision, fake.render_revision = rev, "d" * 64
             self.assertTrue((await client.call_tool("view_current", {"tabId": "w1:t1", "includeImage": True})).is_error)
 
-    async def test_shared_validators_preserve_accepted_input_errors_and_limits(self) -> None:
+    def test_shared_validators_preserve_accepted_input_errors_and_limits(self) -> None:
+        asyncio.run(self._run_shared_validators_preserve_accepted_input_errors_and_limits())
+
+    async def _run_shared_validators_preserve_accepted_input_errors_and_limits(self) -> None:
         from agent_documents import AgentDocumentError
         from mcp import Client
         from mcp_server import build_mcp_server
@@ -317,6 +326,37 @@ class AgentMCPExtractionUnitTest(unittest.TestCase):
         self.assertEqual((cap["contextRevisionMatches"], cap["properties"], cread["properties"], cread["visibleSource"]["next_offset"]), (True, {"title": "Doc"}, {"title": "Doc"}, 5))
         mcap, mread = cn.viewport_contexts({"tabId": "raw", "revision": "b" * 64, "sourceLength": 20, "properties": {"title": "Stale"}, "visibleSource": {"text": "hello", "start": 0, "end": 5}}, "s:w:raw", rev)
         self.assertEqual((mcap["contextRevisionMatches"], mcap["properties"], mread), (False, {"title": "Stale"}, None))
+
+    def test_resolve_live_asset_path_uses_shared_validators(self) -> None:
+        from agent import mcp_live_helpers as lh
+        from agent import validators as v
+        from agent_documents import AgentDocumentError, DocumentStore
+
+        store = DocumentStore([], allow_empty=True)
+        self.assertEqual(lh.resolve_live_asset_path(store, r"\\?\  spaced\fig.svg "), r"  spaced\fig.svg ")
+        with self.assertRaisesRegex(AgentDocumentError, "non-empty"):
+            lh.resolve_live_asset_path(store, r"\\?\   ")
+        with self.assertRaisesRegex(AgentDocumentError, "Hidden"):
+            lh.resolve_live_asset_path(store, ".secret/fig.svg")
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder).resolve(strict=True)
+            fig = base / "fig.svg"
+            fig.write_text("<svg/>", encoding="utf-8")
+            with patch.object(Path, "is_junction", lambda p: p == fig, create=True), self.assertRaisesRegex(AgentDocumentError, "Symbolic links"):
+                lh.resolve_live_asset_path(store, str(fig))
+            if os.name == "posix":
+                priv = base / "private" / "var"
+                (priv / "notes").mkdir(parents=True)
+                real_fig = priv / "notes" / "ok.svg"
+                real_fig.write_text("<svg/>", encoding="utf-8")
+                alias_var = base / "var"
+                alias_var.symlink_to(priv)
+                esc = priv / "notes" / "esc.svg"
+                esc.symlink_to(fig)
+                with patch.object(v, "SYSTEM_PATH_ALIASES", ((str(alias_var), str(priv)),)):
+                    self.assertEqual(lh.resolve_live_asset_path(store, str(alias_var / "notes" / "ok.svg")), str(alias_var / "notes" / "ok.svg"))
+                    with self.assertRaisesRegex(AgentDocumentError, "Symbolic links"):
+                        lh.resolve_live_asset_path(store, str(alias_var / "notes" / "esc.svg"))
 
 
 if __name__ == "__main__":
