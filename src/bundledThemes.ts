@@ -1,27 +1,12 @@
+import bundledThemeCatalog from '../public/themes/index.json';
+
 export interface BundledThemePreset {
   readonly id: string;
   readonly name: string;
   readonly filename: string;
 }
 
-export const BUNDLED_THEMES: readonly BundledThemePreset[] = [
-  { id: 'apricot-glow', name: 'Apricot glow', filename: 'apricot-glow.supermd-theme.json' },
-  { id: 'avengers-assembly', name: 'Avengers Assembly', filename: 'avengers-assembly.supermd-theme.json' },
-  { id: 'avengers-ink', name: 'Avengers Ink', filename: 'avengers-ink.supermd-theme.json' },
-  { id: 'blueprint', name: 'Blueprint', filename: 'blueprint.supermd-theme.json' },
-  { id: 'catnap-paws', name: 'Catnap paws', filename: 'catnap-paws.supermd-theme.json' },
-  { id: 'copper-grid', name: 'Copper grid', filename: 'copper-grid.supermd-theme.json' },
-  { id: 'doctor-doom', name: 'Doctor Doom', filename: 'doctor-doom.supermd-theme.json' },
-  { id: 'gotham-midnight', name: 'Gotham Midnight', filename: 'gotham-midnight.supermd-theme.json' },
-  { id: 'ink-dots', name: 'Ink dots', filename: 'ink-dots.supermd-theme.json' },
-  { id: 'iron-man-reactor', name: 'Iron Man Reactor', filename: 'iron-man-reactor.supermd-theme.json' },
-  { id: 'lazy-sunday-cats', name: 'Lazy Sunday cats', filename: 'lazy-sunday-cats.supermd-theme.json' },
-  { id: 'midnight-paws', name: 'Midnight paws', filename: 'midnight-paws.supermd-theme.json' },
-  { id: 'plum-linen', name: 'Plum linen', filename: 'plum-linen.supermd-theme.json' },
-  { id: 'rose-paper', name: 'Rose paper', filename: 'rose-paper.supermd-theme.json' },
-  { id: 'spider-city', name: 'Spider City', filename: 'spider-city.supermd-theme.json' },
-  { id: 'study-desk', name: 'Study desk', filename: 'study-desk.supermd-theme.json' },
-];
+export const BUNDLED_THEMES: readonly BundledThemePreset[] = bundledThemeCatalog;
 
 const BUNDLED_THEME_IDS = new Set(BUNDLED_THEMES.map(preset => preset.id));
 

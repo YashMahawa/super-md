@@ -827,7 +827,15 @@ class PortableUnchangedAssetSaveTest {
                 model.state.value.folderRelative == "Sem1" &&
                     model.state.value.files.any { it.directory && it.name == "Math" }
             }
+            val sem1DocId = provider.docIdForExistingFile(File(tempDir, "Sem1"))
             val mathUri = Uri.parse(model.state.value.files.single { it.directory && it.name == "Math" }.uri)
+            val renameRotatedLatch = java.util.concurrent.CountDownLatch(1)
+            provider.afterRenameDocument = { renameRotatedLatch.countDown() }
+            provider.afterChildrenQuery = { parentDocId ->
+                if (parentDocId == sem1DocId) {
+                    renameRotatedLatch.await(150, TimeUnit.MILLISECONDS)
+                }
+            }
             model.listFolder(treeUri, "Sem1/Math")
             model.renameFolderEntry(mathUri, "Sem1/Math", isDirectory = true, requested = "PureMath")
             awaitCondition {
@@ -835,6 +843,8 @@ class PortableUnchangedAssetSaveTest {
                     model.state.value.active.relative == "Sem1/PureMath/1.1 Linear Workbook.smd" &&
                     model.state.value.active.uri != renamedFileUri
             }
+            provider.afterChildrenQuery = null
+            provider.afterRenameDocument = null
             val rotatedDirNoteUri = model.state.value.active.uri!!
             assertTrue(
                 "Directory rename must preserve pinned recent entry with rotated child URI",
@@ -891,6 +901,7 @@ class PortableUnchangedAssetSaveTest {
             assertEquals("Sem1/PureMath/Workbook Copy.smd", model.state.value.active.relative)
             assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
 
+            val saveAsCopyAssetDir = model.state.value.active.assetDirectory!!
             val verifyMedia = MediaStorage(app)
             val reopenedCopy = File(tempDir, "Sem1/PureMath/Workbook Copy.smd").inputStream().use(verifyMedia::openFmd)
             try {
@@ -900,6 +911,66 @@ class PortableUnchangedAssetSaveTest {
             } finally {
                 File(bundlesRoot, reopenedCopy.directory).deleteRecursively()
             }
+
+            // 4. Standalone picker grant Save As (non-tree document URI) preserves the exact picker grant,
+            //    derives openRel from the provider when inside the open folder, and clears relative when outside.
+            val pickerInTreeFile = File(tempDir, "Sem1/PureMath/Picker Copy.smd")
+            val pickerInTreeUri = provider.createPickerDocument(pickerInTreeFile)
+            assertTrue(!android.provider.DocumentsContract.isTreeUri(pickerInTreeUri))
+            val pickerInTreeMd = "$saveAsMd\nSaved via standalone picker grant inside open folder.\n"
+            model.edit(noteId, pickerInTreeMd)
+            model.media.resetPortableCounters()
+            model.completePortableSaveAs(pickerInTreeUri, noteId)
+            awaitCondition {
+                model.state.value.active.uri == pickerInTreeUri.toString() &&
+                    !model.state.value.active.dirty &&
+                    !model.state.value.busy
+            }
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(pickerInTreeUri.toString(), model.state.value.active.uri)
+            assertEquals("Picker Copy.smd", model.state.value.active.name)
+            assertEquals("Sem1/PureMath/Picker Copy.smd", model.state.value.active.relative)
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+            val pickerInTreeAssetDir = model.state.value.active.assetDirectory!!
+
+            val pickerFollowupMd = "$pickerInTreeMd\nFollow-up in-place save on standalone grant.\n"
+            model.edit(noteId, pickerFollowupMd)
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy }
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(0, model.media.portableAssetExtractions.get())
+            assertEquals(pickerInTreeUri.toString(), model.state.value.active.uri)
+            assertEquals("Sem1/PureMath/Picker Copy.smd", model.state.value.active.relative)
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+
+            val outsideDir = Files.createTempDirectory("opaque-outside-save-as").toFile()
+            try {
+                val pickerOutsideFile = File(outsideDir, "Outside Copy.smd")
+                val pickerOutsideUri = provider.createPickerDocument(pickerOutsideFile)
+                val pickerOutsideMd = "$pickerFollowupMd\nSaved via standalone picker grant outside open folder.\n"
+                model.edit(noteId, pickerOutsideMd)
+                model.media.resetPortableCounters()
+                model.completePortableSaveAs(pickerOutsideUri, noteId)
+                awaitCondition {
+                    model.state.value.active.uri == pickerOutsideUri.toString() &&
+                        !model.state.value.active.dirty &&
+                        !model.state.value.busy
+                }
+                assertEquals(0, model.media.portableBase64Decodes.get())
+                assertEquals(0, model.media.portableBase64Encodes.get())
+                assertEquals(pickerOutsideUri.toString(), model.state.value.active.uri)
+                assertEquals("Outside Copy.smd", model.state.value.active.name)
+                assertNull("Save As outside open folder must clear stale folder-relative path", model.state.value.active.relative)
+                assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+            } finally {
+                outsideDir.deleteRecursively()
+            }
+
+            File(bundlesRoot, saveAsCopyAssetDir).deleteRecursively()
+            File(bundlesRoot, pickerInTreeAssetDir).deleteRecursively()
             File(bundlesRoot, initialAssetDir).deleteRecursively()
         } finally {
             app.getSharedPreferences("studio", 0).edit().putString("recent", previousRecentJson).apply()
@@ -1103,7 +1174,11 @@ private class PortableOpaqueSafProvider(
     private var nextSeq = 1
     private val idToPath = linkedMapOf<String, String>()
     private val pathToId = linkedMapOf<String, String>()
-    val unknownIdQueries = mutableListOf<String>()
+    val unknownIdQueries: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
+    @Volatile
+    var afterChildrenQuery: ((parentDocId: String) -> Unit)? = null
+    @Volatile
+    var afterRenameDocument: (() -> Unit)? = null
 
     init {
         idToPath[ROOT_ID] = rootDir.canonicalPath
@@ -1126,6 +1201,15 @@ private class PortableOpaqueSafProvider(
 
     @Synchronized
     fun docIdForExistingFile(file: File): String = idForFile(file)
+
+    @Synchronized
+    fun createPickerDocument(file: File): Uri {
+        file.parentFile?.mkdirs()
+        check(file.createNewFile())
+        val plainUri = android.provider.DocumentsContract.buildDocumentUri(attachedAuthority, idForFile(file))
+        grantPermissions(plainUri)
+        return plainUri
+    }
 
     @Synchronized
     private fun idForFile(file: File): String {
@@ -1219,6 +1303,8 @@ private class PortableOpaqueSafProvider(
             if (!parent.isDirectory) throw java.io.FileNotFoundException(parentDocId)
             return android.database.MatrixCursor(cols).also { cursor ->
                 parent.listFiles()?.forEach { child -> includeFile(cursor, child) }
+            }.also {
+                afterChildrenQuery?.invoke(parentDocId)
             }
         }
         val docId = android.provider.DocumentsContract.getDocumentId(uri)
@@ -1274,6 +1360,7 @@ private class PortableOpaqueSafProvider(
                 val outUri = treeUriForDocId(newId)
                 grantPermissions(outUri)
                 out.putParcelable("uri", outUri)
+                afterRenameDocument?.invoke()
             }
         }
         return out
