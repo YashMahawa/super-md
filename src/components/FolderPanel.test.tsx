@@ -18,3 +18,35 @@ it('routes directory requests through the shared bridge and shows failures',asyn
   expect(host.querySelector('[role=alert]')?.textContent).toContain('Folder unavailable');
   act(()=>root.unmount());
 });
+
+it('lists .qmd and .Rmd notes with exact case, filters file names case-insensitively, and opens them',async()=>{
+  localStorage.clear();const host=document.createElement('div'),root=createRoot(host),open=vi.fn();
+  vi.mocked(invoke).mockResolvedValueOnce([
+    {name:'biostats',path:'/lab/biostats',directory:true},
+    {name:'ClinicalTrial.Rmd',path:'/lab/ClinicalTrial.Rmd',directory:false},
+    {name:'quarto-report.qmd',path:'/lab/quarto-report.qmd',directory:false},
+    {name:'UPPER_MODEL.QMD',path:'/lab/UPPER_MODEL.QMD',directory:false},
+  ]);
+  await act(async()=>root.render(<FolderPanel root="/lab" activePath="/lab/ClinicalTrial.Rmd" onChoose={vi.fn()} onHide={vi.fn()} onOpen={open}/>));
+  const labels=()=>Array.from(host.querySelectorAll('.folder-tree button.folder-entry span')).map(x=>x.textContent);
+  expect(labels()).toEqual(['biostats','ClinicalTrial.Rmd','quarto-report.qmd','UPPER_MODEL.QMD']);
+
+  const filterInput=host.querySelector('input[aria-label="Filter file names"]') as HTMLInputElement;
+  const setInputValue=(value:string)=>{
+    const setter=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')?.set;
+    setter?.call(filterInput,value);
+    filterInput.dispatchEvent(new Event('input',{bubbles:true}));
+    filterInput.dispatchEvent(new Event('change',{bubbles:true}));
+  };
+
+  await act(async()=>setInputValue('.rmd'));
+  expect(labels()).toEqual(['biostats','ClinicalTrial.Rmd']);
+
+  await act(async()=>setInputValue('.QMD'));
+  expect(labels()).toEqual(['biostats','quarto-report.qmd','UPPER_MODEL.QMD']);
+
+  const qmdButton=Array.from(host.querySelectorAll<HTMLButtonElement>('.folder-tree button.folder-entry')).find(x=>x.textContent==='quarto-report.qmd')!;
+  act(()=>qmdButton.click());
+  expect(open).toHaveBeenCalledWith('/lab/quarto-report.qmd');
+  act(()=>root.unmount());
+});

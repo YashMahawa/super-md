@@ -28,7 +28,7 @@ internal object ExportFilename {
     // them as format suffixes instead of turning e.g. `draft.fmd` into
     // `draft.fmd.pdf` when the user switches export format.
     private val knownSuffixes = (NativeExportFormat.entries.map { ".${it.extension}" } +
-        listOf(".fmd", ".markdown", ".txt")).sortedByDescending(String::length)
+        listOf(".fmd", ".markdown", ".qmd", ".rmd", ".txt")).sortedByDescending(String::length)
     private val genericMimeTypes = setOf("application/octet-stream", "binary/octet-stream")
 
     /** Preserve human text and punctuation while excluding path/control and Windows-invalid characters. */

@@ -2685,7 +2685,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 copyAttachments(note, destination)
                 resolver.openOutputStream(destination, "wt")?.use { it.write(note.content.toByteArray()) } ?: error("Writing permission is unavailable; use Save as")
                 documentAccess.persist(destination)
-                val resolvedName = resolveDisplayName(destination) ?: ExportFilename.suggestedName(note.name, NativeExportFormat.MARKDOWN)
+                val resolvedName = resolveDisplayName(destination)
+                    ?: if (uri == null) note.name else ExportFilename.suggestedName(note.name, NativeExportFormat.MARKDOWN)
                 Triple(destination, resolvedName, resolveOpenFolderRelativeOnIo(destination))
             }
             val (writtenTarget, savedName, openRel) = savedResult

@@ -17,7 +17,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 
-private val SEARCHABLE_EXTENSIONS = setOf("md", "smd", "fmd", "markdown", "txt")
+private val SEARCHABLE_EXTENSIONS = setOf("md", "smd", "fmd", "markdown", "qmd", "rmd", "txt")
 private const val MAX_WALK_ENTRIES = 10_000
 private const val MAX_FOLDER_DEPTH = 32
 private const val MAX_SEARCH_MATCHES = 500

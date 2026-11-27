@@ -5,8 +5,8 @@ import os
 import re
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
-NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
-KNOWN_FORMAT_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".smd", ".fmd", ".pdf", ".zip", ".html", ".docx"})
+NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".qmd", ".rmd", ".md", ".txt")
+KNOWN_FORMAT_SUFFIXES = frozenset({".md", ".markdown", ".qmd", ".rmd", ".txt", ".smd", ".fmd", ".pdf", ".zip", ".html", ".docx"})
 _WINDOWS_PATH_RE = re.compile(r"^([a-zA-Z]:[\\/]|\\\\)")
 
 

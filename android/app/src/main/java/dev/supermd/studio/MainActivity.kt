@@ -98,6 +98,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
 
+internal val OPEN_NOTE_MIME_TYPES = arrayOf(
+    "text/*",
+    "application/octet-stream",
+    "application/vnd.supermd.smd",
+    "application/vnd.supermd.fmd",
+    "application/x-quarto",
+    "application/x-rmarkdown",
+    "application/gzip",
+    "application/x-gzip",
+)
+
 internal fun shouldShowNativeBusyOverlay(busy: Boolean, readerReady: Boolean, readerOwnsProgress: Boolean): Boolean =
     !readerOwnsProgress && (busy || !readerReady)
 
@@ -1205,7 +1216,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 "open" -> if (request.optJSONObject("options")?.optBoolean("background", false) == true) {
                     reply(null, "Background file picking is unavailable on Android; open the file in Super MD first")
                     true
-                } else { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); reply(JSONObject().put("accepted", true).put("message", "Choose a file in Android's document picker"), null); true }
+                } else { open.launch(OPEN_NOTE_MIME_TYPES); reply(JSONObject().put("accepted", true).put("message", "Choose a file in Android's document picker"), null); true }
                 "save" -> false
                 else -> false
             }
@@ -1344,7 +1355,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                     state = state,
                     recent = recent,
                     folderRelative = state.folderRelative,
-                    onOpenNote = { open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")); scope.launch { drawer.close() } },
+                    onOpenNote = { open.launch(OPEN_NOTE_MIME_TYPES); scope.launch { drawer.close() } },
                     onOpenFolder = { folder.launch(state.folder?.let(android.net.Uri::parse)) },
                     onCloseFolder = model::closeFolder,
                     onFolderRoot = { model.navigateFolderUp() },
@@ -1712,7 +1723,7 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
         )
     }
     state.error?.let { AlertDialog(onDismissRequest = model::dismissError, title = { Text("Couldn't finish") }, text = { Text(it, Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState())) }, confirmButton = { TextButton(onClick = model::dismissError) { Text("OK") } }) }
-    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(arrayOf("text/*", "application/octet-stream", "application/vnd.supermd.smd", "application/vnd.supermd.fmd", "application/gzip", "application/x-gzip")) }
+    if (!state.welcomed) WelcomeSetup(state, model) { model.welcomeDone(); open.launch(OPEN_NOTE_MIME_TYPES) }
 }
 
 internal fun buildHighlightedSnippet(
@@ -1787,7 +1798,7 @@ internal fun buildHighlightedSnippet(
                     Column(Modifier.weight(1f)) {
                         Text("Search across notes", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .txt)"
+                            if (hasFolder) "Streams live tabs and folder notes (.md, .smd, .fmd, .markdown, .qmd, .rmd, .txt)"
                             else "No folder open · searching open tabs and accessible recent notes",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

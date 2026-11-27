@@ -512,6 +512,8 @@ def export_destination(value: str, format: str) -> Path:
         ".smd": "smd",
         ".md": "md",
         ".markdown": "md",
+        ".qmd": "md",
+        ".rmd": "md",
         ".txt": "md",
         ".zip": "mdzip",
     }
@@ -3199,7 +3201,7 @@ class Studio(QObject):
             if images:
                 self.message = "Drop images inside an open note to insert them."
             else:
-                self.message = "Only Markdown notes (.md, .smd, .fmd, .markdown, .txt) and folders can be opened by dropping."
+                self.message = "Only Markdown notes (.md, .smd, .fmd, .markdown, .qmd, .rmd, .txt) and folders can be opened by dropping."
             self._emit(False)
             return
 
@@ -5179,7 +5181,7 @@ class Studio(QObject):
         requested_format = args.get("format")
         current_format = "smd" if tab.get("portable") or Path(tab.get("path") or tab["name"]).suffix.lower() == ".smd" else "md"
         filename_suffix = Path(args.get("filename", "")).suffix.lower() if isinstance(args.get("filename", ""), str) else ""
-        filename_format = "smd" if filename_suffix == ".smd" else "md" if filename_suffix in (".md", ".markdown") else None
+        filename_format = "smd" if filename_suffix == ".smd" else "md" if filename_suffix in (".md", ".markdown", ".qmd", ".rmd") else None
         fmt = requested_format or (filename_format if args.get("saveAs") or args.get("filename") else None) or current_format
         if fmt not in ("md", "smd"):
             raise ValueError("Save format must be md or smd")

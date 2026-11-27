@@ -1980,3 +1980,202 @@ class StudioTest(unittest.TestCase):
         self.assertFalse(studio._is_dirty(smd_tab))
         self.assertEqual(open_note(copy_smd), ("portable draft ![pic](assets/a.svg)", {"assets/a.svg": svg_a}, True))
         self.assertEqual(open_note(orig_smd), ("external smd", {}, True))
+
+    def test_qmd_and_rmd_open_dialog_folder_list_filename_search_and_ordinary_save(self):
+        import fnmatch
+        import re
+        from PySide6.QtCore import QRegularExpression, Qt
+        from folder_ops import note_extension, note_stem, validate_entry_name
+        from studio import export_destination
+
+        repo_root = Path(__file__).resolve().parent.parent
+        main_qml = (repo_root / "desktop" / "qml" / "Main.qml").read_text(encoding="utf-8")
+        filter_match = re.search(r'id:\s*openDialog.*?nameFilters:\s*\["Notes \(([^)]+)\)"', main_qml, re.DOTALL)
+        self.assertIsNotNone(filter_match)
+        globs = filter_match.group(1).split()
+
+        for sample in (
+            "report.qmd",
+            "REPORT.QMD",
+            "Mixed.qMd",
+            "analysis.Rmd",
+            "analysis.rmd",
+            "ANALYSIS.RMD",
+            "Mixed.rMd",
+        ):
+            self.assertTrue(
+                any(
+                    QRegularExpression.fromWildcard(
+                        pattern, Qt.CaseSensitivity.CaseInsensitive
+                    ).match(sample).hasMatch()
+                    for pattern in globs
+                ),
+                f"Expected Qt wildcard filter to match {sample}",
+            )
+
+        for portal_sample in ("report.qmd", "REPORT.QMD", "analysis.Rmd", "analysis.rmd", "ANALYSIS.RMD"):
+            self.assertTrue(
+                any(fnmatch.fnmatchcase(portal_sample, pattern) for pattern in globs),
+                f"Expected case-sensitive desktop portal glob to match {portal_sample}",
+            )
+
+        # OS file associations must remain untouched in this slice.
+        for assoc_rel in (
+            "desktop/windows/installer.nsi",
+            "desktop/linux/dev.supermd.studio.desktop",
+            "desktop/linux/supermd.xml",
+            "desktop/app_integration.py",
+            "desktop/install_linux.py",
+            "android/app/src/main/AndroidManifest.xml",
+            "src-tauri/tauri.conf.json",
+        ):
+            assoc_text = (repo_root / assoc_rel).read_text(encoding="utf-8")
+            self.assertNotRegex(assoc_text, r"(?i)\.(qmd|rmd)\b", f"Unexpected OS association in {assoc_rel}")
+
+        folder = self.studio.data / "quarto-rmd-workspace"
+        sub = folder / "biostats"
+        sub.mkdir(parents=True)
+
+        qmd_initial = (
+            "---\n"
+            "title: \"Quarto Longitudinal Study\"\n"
+            "format: html\n"
+            "---\n\n"
+            "# Quarto Study\n\n"
+            "```{python}\n"
+            "#| label: fig-curve\n"
+            "#| echo: false\n"
+            "x = [1, 2, 3]\n"
+            "```\n\n"
+            "```{mermaid}\n"
+            "graph LR\n"
+            "  Raw --> Clean\n"
+            "```\n"
+        )
+        rmd_initial = (
+            "---\n"
+            "title: \"Clinical Trial Summary\"\n"
+            "output: html_document\n"
+            "---\n\n"
+            "```{r setup, include=FALSE}\n"
+            "knitr::opts_chunk$set(echo = TRUE)\n"
+            "```\n\n"
+            "Baseline prose with inline math $\\alpha = 0.05$.\n"
+        )
+
+        qmd_path = folder / "quarto-guide.qmd"
+        rmd_path = folder / "ClinicalTrial.Rmd"
+        upper_qmd = folder / "UPPER_REPORT.QMD"
+        mixed_qmd = folder / "MixedCase.qMd"
+        sub_upper_rmd = sub / "SurvivalModel.RMD"
+        sub_lower_rmd = sub / "lowercase.rmd"
+        sub_mixed_rmd = sub / "weird.rMd"
+
+        qmd_path.write_text(qmd_initial, encoding="utf-8")
+        rmd_path.write_text(rmd_initial, encoding="utf-8")
+        upper_qmd.write_text("# Upper QMD\n", encoding="utf-8")
+        mixed_qmd.write_text("# Mixed qMd\n", encoding="utf-8")
+        sub_upper_rmd.write_text("# Survival RMD\n", encoding="utf-8")
+        sub_lower_rmd.write_text("# Lower rmd\n", encoding="utf-8")
+        sub_mixed_rmd.write_text("# Mixed rMd\n", encoding="utf-8")
+        (folder / ".hidden.qmd").write_text("hidden", encoding="utf-8")
+        (folder / ".hidden.Rmd").write_text("hidden", encoding="utf-8")
+        (folder / "qmd").write_text("dotless qmd", encoding="utf-8")
+        (folder / "rmd").write_text("dotless rmd", encoding="utf-8")
+        (folder / "dataset.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+
+        studio = self.studio
+        studio.openFolder(str(folder))
+        self._wait_for(lambda: len(studio.files) == 5)
+        self.assertEqual(
+            [(entry["name"], entry["directory"]) for entry in studio.files],
+            [
+                ("biostats", True),
+                ("ClinicalTrial.Rmd", False),
+                ("MixedCase.qMd", False),
+                ("quarto-guide.qmd", False),
+                ("UPPER_REPORT.QMD", False),
+            ],
+        )
+
+        # Filename search at root + collapsed subfolders across case variants.
+        studio.setFolderFilter(".rmd")
+        self._wait_for(
+            lambda: not studio.filter_timer.isActive()
+            and not studio._folder_searching
+            and [entry["name"] for entry in studio.files if not entry["directory"]]
+            == ["lowercase.rmd", "SurvivalModel.RMD", "weird.rMd", "ClinicalTrial.Rmd"]
+        )
+
+        studio.setFolderFilter(".QMD")
+        self._wait_for(
+            lambda: not studio.filter_timer.isActive()
+            and not studio._folder_searching
+            and [entry["name"] for entry in studio.files if not entry["directory"]]
+            == ["MixedCase.qMd", "quarto-guide.qmd", "UPPER_REPORT.QMD"]
+        )
+
+        studio.setFolderFilter("survival")
+        self._wait_for(
+            lambda: not studio.filter_timer.isActive()
+            and not studio._folder_searching
+            and [entry["name"] for entry in studio.files if not entry["directory"]] == ["SurvivalModel.RMD"]
+        )
+        studio.setFolderFilter("")
+        self._wait_for(lambda: len(studio.files) == 5)
+
+        # Helper stem/extension preservation checks.
+        self.assertEqual(note_extension("ClinicalTrial.Rmd"), ".Rmd")
+        self.assertEqual(note_stem("ClinicalTrial.Rmd"), "ClinicalTrial")
+        self.assertEqual(note_extension("UPPER_REPORT.QMD"), ".QMD")
+        self.assertEqual(validate_entry_name("Experiment", is_directory=False, current_ext=".Rmd"), "Experiment.Rmd")
+        self.assertEqual(validate_entry_name("Experiment.Rmd", is_directory=False, current_ext=".Rmd"), "Experiment.Rmd")
+        self.assertEqual(validate_entry_name("Experiment", is_directory=False, current_ext=".qmd"), "Experiment.qmd")
+        self.assertEqual(export_destination(str(rmd_path), "md"), rmd_path)
+        self.assertEqual(export_destination(str(qmd_path), "md"), qmd_path)
+
+        # Open, ordinary edit, and save for .qmd preserves exact filename and raw source.
+        studio.openNote(str(qmd_path))
+        self._wait_for(lambda: studio._current()["name"] == "quarto-guide.qmd" and studio.busy == 0)
+        qmd_tab = studio._current()
+        self.assertEqual(qmd_tab["name"], "quarto-guide.qmd")
+        self.assertEqual(qmd_tab["path"], str(qmd_path))
+        self.assertFalse(qmd_tab["portable"])
+        self.assertEqual(qmd_tab["content"], qmd_initial)
+
+        qmd_edited = qmd_initial + "\nUpdated longitudinal interpretation.\n"
+        qmd_tab["content"] = qmd_edited
+        studio.save()
+        self._wait_for(lambda: not studio.saving and not studio._is_dirty(qmd_tab))
+        self.assertEqual(qmd_tab["name"], "quarto-guide.qmd")
+        self.assertEqual(qmd_tab["path"], str(qmd_path))
+        self.assertEqual(qmd_path.read_text(encoding="utf-8"), qmd_edited)
+        self.assertFalse((folder / "quarto-guide.md").exists())
+        self.assertFalse((folder / "quarto-guide.smd").exists())
+
+        # Open, ordinary edit, save, and autosave for .Rmd preserves capital-R .Rmd and R chunks verbatim.
+        studio.openNote(str(rmd_path))
+        self._wait_for(lambda: studio._current()["name"] == "ClinicalTrial.Rmd" and studio.busy == 0)
+        rmd_tab = studio._current()
+        self.assertEqual(rmd_tab["name"], "ClinicalTrial.Rmd")
+        self.assertEqual(rmd_tab["path"], str(rmd_path))
+        self.assertFalse(rmd_tab["portable"])
+        self.assertEqual(rmd_tab["content"], rmd_initial)
+        self.assertTrue(studio.defaultExportLocation("pdf").toLocalFile().endswith("ClinicalTrial.pdf"))
+
+        rmd_edited = rmd_initial + "\nPrimary endpoint remained unchanged.\n"
+        rmd_tab["content"] = rmd_edited
+        studio.save()
+        self._wait_for(lambda: not studio.saving and not studio._is_dirty(rmd_tab))
+        self.assertEqual(rmd_tab["name"], "ClinicalTrial.Rmd")
+        self.assertEqual(rmd_tab["path"], str(rmd_path))
+        self.assertEqual(rmd_path.read_text(encoding="utf-8"), rmd_edited)
+        self.assertFalse((folder / "ClinicalTrial.md").exists())
+
+        rmd_autosaved = rmd_edited + "Autosaved follow-up paragraph.\n"
+        rmd_tab["content"] = rmd_autosaved
+        studio._autosave()
+        self._wait_for(lambda: not studio.saving and rmd_path.read_text(encoding="utf-8") == rmd_autosaved)
+        self.assertEqual(rmd_tab["name"], "ClinicalTrial.Rmd")
+        self.assertEqual(rmd_tab["path"], str(rmd_path))
+        self.assertFalse((folder / "ClinicalTrial.md").exists())

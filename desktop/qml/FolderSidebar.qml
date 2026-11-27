@@ -22,7 +22,7 @@ ColumnLayout {
 
     function noteStem(name) {
         const raw = name || ""
-        const known = raw.replace(/\.(markdown|smd|fmd|md|txt)$/i, "")
+        const known = raw.replace(/\.(markdown|smd|fmd|qmd|rmd|md|txt)$/i, "")
         if (known !== raw && known.length > 0) return known
         const custom = raw.replace(/\.[A-Za-z][A-Za-z0-9]{0,15}$/, "")
         return custom.length > 0 ? custom : raw

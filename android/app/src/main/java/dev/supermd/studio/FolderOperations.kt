@@ -7,9 +7,9 @@ private const val MAX_SAF_SUBTREE_DIRS = 256
 private const val MAX_SAF_SUBTREE_DEPTH = 32
 private const val MAX_SAF_OPEN_FOLDER_PROBE_DIRS = 64
 
-internal val FOLDER_NOTE_EXTENSIONS = setOf("md", "smd", "markdown", "fmd", "txt")
-private val KNOWN_NOTE_SUFFIXES = listOf(".markdown", ".smd", ".fmd", ".md", ".txt")
-private val KNOWN_EXPORT_FORMATS = setOf("md", "markdown", "txt", "smd", "fmd", "pdf", "zip", "html", "docx")
+internal val FOLDER_NOTE_EXTENSIONS = setOf("md", "smd", "markdown", "fmd", "qmd", "rmd", "txt")
+private val KNOWN_NOTE_SUFFIXES = listOf(".markdown", ".smd", ".fmd", ".qmd", ".rmd", ".md", ".txt")
+private val KNOWN_EXPORT_FORMATS = setOf("md", "markdown", "qmd", "rmd", "txt", "smd", "fmd", "pdf", "zip", "html", "docx")
 
 // --- Naming & relative path helpers ---
 

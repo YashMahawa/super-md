@@ -67,16 +67,134 @@ class WorkspaceFolderAndRenameTest {
         assertTrue(isSearchableNoteName("bundle.smd"))
         assertTrue(isSearchableNoteName("legacy.fmd"))
         assertTrue(isSearchableNoteName("chapter.markdown"))
+        assertTrue(isSearchableNoteName("quarto-paper.qmd"))
+        assertTrue(isSearchableNoteName("QUARTO-PAPER.QMD"))
+        assertTrue(isSearchableNoteName("Mixed.qMd"))
+        assertTrue(isSearchableNoteName("ClinicalAnalysis.Rmd"))
+        assertTrue(isSearchableNoteName("clinical.rmd"))
+        assertTrue(isSearchableNoteName("CLINICAL.RMD"))
+        assertTrue(isSearchableNoteName("Mixed.rMd"))
         assertTrue(isSearchableNoteName("1.2 Linear Algebra.txt"))
         assertTrue(isSearchableNoteName("UPPER.TXT"))
 
         // Dotless filenames that match extension tokens must NOT be treated as supported extensions.
         assertFalse(isSearchableNoteName("md"))
+        assertFalse(isSearchableNoteName("qmd"))
+        assertFalse(isSearchableNoteName("rmd"))
+        assertFalse(isSearchableNoteName("Rmd"))
         assertFalse(isSearchableNoteName("txt"))
         assertFalse(isSearchableNoteName("smd"))
         assertFalse(isSearchableNoteName("README"))
         assertFalse(isSearchableNoteName(".hidden.md"))
+        assertFalse(isSearchableNoteName(".hidden.qmd"))
+        assertFalse(isSearchableNoteName(".hidden.Rmd"))
         assertFalse(isSearchableNoteName(".txt"))
+
+        assertEquals("Rmd", noteExtension("ClinicalAnalysis.Rmd"))
+        assertEquals("QMD", noteExtension("QUARTO-PAPER.QMD"))
+        assertEquals("ClinicalAnalysis", noteStem("ClinicalAnalysis.Rmd"))
+        assertEquals("QUARTO-PAPER", noteStem("QUARTO-PAPER.QMD"))
+        assertEquals("Analysis.Rmd", validateFolderEntryName("Analysis", isDirectory = false, currentExtension = ".Rmd"))
+        assertEquals("Analysis.Rmd", validateFolderEntryName("Analysis.Rmd", isDirectory = false, currentExtension = ".Rmd"))
+        assertEquals("Analysis.qmd", validateFolderEntryName("Analysis", isDirectory = false, currentExtension = ".qmd"))
+    }
+
+    @Test
+    fun qmdAndRmdOpenFolderListSearchAndOrdinarySavePreserveFilenameAndSource() {
+        assertTrue(OPEN_NOTE_MIME_TYPES.contains("text/*"))
+        assertTrue(OPEN_NOTE_MIME_TYPES.contains("application/octet-stream"))
+        assertTrue(OPEN_NOTE_MIME_TYPES.contains("application/x-quarto"))
+        assertTrue(OPEN_NOTE_MIME_TYPES.contains("application/x-rmarkdown"))
+
+        val qmdSource = "---\ntitle: \"Quarto Trial\"\n---\n\n```{python}\n#| label: fig-1\nx = [1, 2, 3]\n```\n"
+        val rmdSource = "---\ntitle: \"Clinical Rmd\"\n---\n\n```{r setup, include=FALSE}\nknitr::opts_chunk\$set(echo = TRUE)\n```\n"
+
+        File(root, "biostats").mkdirs()
+        val qmdFile = File(root, "quarto-study.qmd").apply { writeText(qmdSource) }
+        val rmdFile = File(root, "ClinicalAnalysis.Rmd").apply { writeText(rmdSource) }
+        File(root, "UPPER_REPORT.QMD").writeText("# Upper QMD\n")
+        File(root, "biostats/SurvivalModel.RMD").writeText("# Survival RMD\n\nBiomarkerToken in RMD.\n")
+        File(root, "biostats/mixed.qMd").writeText("# Mixed qMd\n\nBiomarkerToken in qMd.\n")
+        File(root, "qmd").writeText("Dotless qmd")
+        File(root, "rmd").writeText("Dotless rmd")
+        File(root, ".hidden.Rmd").writeText("Hidden Rmd")
+
+        val treeUri = DocumentsContract.buildTreeDocumentUri(authority, "root")
+        app.grantUriPermission(
+            app.packageName,
+            treeUri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+        )
+
+        val key = "qmd-rmd-workflow-${System.nanoTime()}".also(workspaceKeys::add)
+        val model = newModel(key)
+        model.setFolder(treeUri)
+        await {
+            model.state.value.files.map { it.name } ==
+                listOf("biostats", "ClinicalAnalysis.Rmd", "quarto-study.qmd", "UPPER_REPORT.QMD")
+        }
+
+        // Cross-note search finds content inside .RMD and .qMd in subfolders too.
+        model.openFolderSearch()
+        model.updateFolderSearch("BiomarkerToken", caseSensitive = false, includeDiagrams = false)
+        await {
+            !model.folderSearch.value.scanning &&
+                model.folderSearch.value.matches.map { it.name }.sorted() == listOf("SurvivalModel.RMD", "mixed.qMd")
+        }
+        model.closeFolderSearch()
+
+        // Open .qmd, edit, and ordinary in-place save preserves exact filename and raw source.
+        val qmdEntry = model.state.value.files.first { it.name == "quarto-study.qmd" }
+        model.open(Uri.parse(qmdEntry.uri), qmdEntry.relative)
+        await { model.state.value.active.name == "quarto-study.qmd" && !model.state.value.busy }
+        assertFalse(model.state.value.active.portable)
+        assertEquals(qmdSource, model.state.value.active.content)
+
+        val qmdId = model.state.value.active.id
+        val qmdEdited = "$qmdSource\nAdded Quarto discussion paragraph.\n"
+        model.edit(qmdId, qmdEdited)
+        var qmdSaveErr: String? = "pending"
+        model.save(noteId = qmdId) { qmdSaveErr = it }
+        await { qmdSaveErr != "pending" && !model.state.value.busy }
+        assertEquals(null, qmdSaveErr)
+        assertEquals("quarto-study.qmd", model.state.value.active.name)
+        assertEquals(qmdEdited, qmdFile.readText())
+        assertFalse(File(root, "quarto-study.md").exists())
+
+        // Open .Rmd, including when single-URI display name is omitted (simulated via file:// URI),
+        // edit, and ordinary in-place save preserves capital-R ClinicalAnalysis.Rmd!
+        val rmdEntry = model.state.value.files.first { it.name == "ClinicalAnalysis.Rmd" }
+        model.open(Uri.parse(rmdEntry.uri), rmdEntry.relative)
+        await { model.state.value.active.name == "ClinicalAnalysis.Rmd" && !model.state.value.busy }
+        assertFalse(model.state.value.active.portable)
+        assertEquals(rmdSource, model.state.value.active.content)
+
+        val rmdId = model.state.value.active.id
+        val rmdEdited = "$rmdSource\nPrimary endpoint preserved.\n"
+        model.edit(rmdId, rmdEdited)
+        var rmdSaveErr: String? = "pending"
+        model.save(noteId = rmdId) { rmdSaveErr = it }
+        await { rmdSaveErr != "pending" && !model.state.value.busy }
+        assertEquals(null, rmdSaveErr)
+        assertEquals("ClinicalAnalysis.Rmd", model.state.value.active.name)
+        assertEquals(rmdEdited, rmdFile.readText())
+        assertFalse(File(root, "ClinicalAnalysis.md").exists())
+
+        // Also verify file:// URI (where DocumentFile.fromSingleUri returns null display name)
+        // keeps ClinicalAnalysis.Rmd on ordinary in-place save instead of rewriting Note.name to .md.
+        val directRmdFile = File(root, "DirectFileUri.Rmd").apply { writeText(rmdSource) }
+        model.open(Uri.fromFile(directRmdFile))
+        await { model.state.value.active.name == "DirectFileUri.Rmd" && !model.state.value.busy }
+        val directId = model.state.value.active.id
+        val directEdited = "$rmdSource\nSaved through file URI.\n"
+        model.edit(directId, directEdited)
+        var directSaveErr: String? = "pending"
+        model.save(noteId = directId) { directSaveErr = it }
+        await { directSaveErr != "pending" && !model.state.value.busy }
+        assertEquals(null, directSaveErr)
+        assertEquals("DirectFileUri.Rmd", model.state.value.active.name)
+        assertEquals(directEdited, directRmdFile.readText())
+        assertFalse(File(root, "DirectFileUri.md").exists())
     }
 
     @Test

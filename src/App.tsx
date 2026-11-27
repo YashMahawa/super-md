@@ -402,7 +402,7 @@ export default function App() {
     openingRef.current = true;
     try {
       const doc = android ? await (async () => {
-        const selected = await pickMobileDocument({ multiple: false, directory: false, filters: [{ name: "Markdown", extensions: ["md", "markdown", "smd"] }] });
+        const selected = await pickMobileDocument({ multiple: false, directory: false, filters: [{ name: "Markdown", extensions: ["md", "markdown", "smd", "fmd", "qmd", "QMD", "rmd", "Rmd", "RMD", "txt"] }] });
         return typeof selected === "string" ? { path: selected, content: await readTextFile(selected) } : null;
       })() : await invoke<DocumentData | null>("open_document");
       if (doc) applyDocument(doc);
@@ -519,7 +519,7 @@ export default function App() {
       if (payload.type !== "drop") return;
       const images = payload.paths.filter((name) => /\.(png|jpe?g|svg|gif|webp|avif)$/i.test(name));
       if (images.length) { const id = documentsRef.current.activeId; try { const imported = await invoke<ImportedImage[]>("import_image_paths", { paths: images }); setDocuments((current) => { const tab = current.tabs.find((tab) => tab.id === id); return tab ? editTab(current, id, tab.content + "\n\n" + imported.map(imageMarkdown).join("\n\n") + "\n") : current; }); } catch (e) { flash(String(e)); } return; }
-      const candidate = payload.paths.find((name) => /\.(smd|md|markdown|fmd)$/i.test(name));
+      const candidate = payload.paths.find((name) => /\.(smd|md|markdown|fmd|qmd|rmd|txt)$/i.test(name));
       if (!candidate) { flash("Drop an image, .fmd, .smd or Markdown document"); return; }
       try { applyDocument(await invoke<DocumentData>("read_document_at", { path: candidate })); }
       catch (error) { flash(`Could not open dropped file: ${error}`); }
