@@ -280,3 +280,89 @@ test('reader dismissal stays scoped to the current tab across relative link navi
     {id:'tab-lecture',open:false},
   ]);
 });
+
+test('seeded Find occurrence handoff (#96) preserves outgoing Live draft, selects target occurrence, and dismisses cleanly on Android Back',async({page})=>{
+  await page.setViewportSize({width:390,height:844});
+  await page.addInitScript(()=>{
+    (window as any).__notes={};
+    window.SuperMD={post:(id,command,raw)=>{
+      const args=JSON.parse(raw);
+      if(command==='document_changed'&&typeof args.id==='string'&&typeof args.content==='string'){
+        (window as any).__notes[args.id]=args.content;
+      }
+      queueMicrotask(()=>window.supermdReply?.(id,command==='load_python_output'?null:true,null));
+    }};
+  });
+  await page.goto('/android-reader.html');await page.waitForFunction(()=>!!window.supermdLoad);
+
+  await page.evaluate(()=>{
+    document.documentElement.dataset.platform='android';
+    window.supermdLoad?.({
+      id:'seed-outgoing',
+      path:'/course/Outgoing.md',
+      content:'# Outgoing\n\nInitial block.',
+      mode:'live',
+      dark:false,
+      fullscreen:false,
+      colors:{primary:'#42669e','on-primary':'#ffffff','primary-container':'#d7e3ff','on-primary-container':'#162c4c',surface:'#f7f9fd','surface-low':'#f0f3fa','surface-high':'#e5ebf5',text:'#191c20',muted:'#56647c',outline:'#c4c6d0'},
+      font:'Manrope',
+      size:16,
+      zoom:100,
+      restorePosition:false,
+    });
+  });
+  await page.locator('.live-block').filter({hasText:'Initial block.'}).dblclick();
+  const liveTextarea=page.locator('.live-active-block textarea');
+  await expect(liveTextarea).toBeVisible();
+  await liveTextarea.evaluate((area:HTMLTextAreaElement)=>{
+    area.value='Initial block kept before seeded Find switch.';
+    area.setSelectionRange(area.value.length,area.value.length);
+  });
+
+  const filler=Array.from({length:30},(_,i)=>`Filler paragraph ${i+1} for scroll height.`).join('\n\n');
+  const seededContent=`# Seeded target\n\nFirst needle at top.\n\n${filler}\n\nSecond needle at bottom.`;
+  const secondStart=seededContent.lastIndexOf('needle');
+  const secondEnd=secondStart+'needle'.length;
+
+  await page.evaluate(({seededContent,secondStart,secondEnd})=>{
+    window.supermdLoad?.({
+      id:'seed-target',
+      path:'/course/Target.md',
+      content:seededContent,
+      mode:'live',
+      dark:false,
+      fullscreen:false,
+      colors:{primary:'#42669e','on-primary':'#ffffff','primary-container':'#d7e3ff','on-primary-container':'#162c4c',surface:'#f7f9fd','surface-low':'#f0f3fa','surface-high':'#e5ebf5',text:'#191c20',muted:'#56647c',outline:'#c4c6d0'},
+      font:'Manrope',
+      size:16,
+      zoom:100,
+      restorePosition:true,
+      readingLocation:{top:0,offset:0,zoom:100,mode:'live'},
+      seededFind:{query:'needle',caseSensitive:false,sourceStart:secondStart,sourceEnd:secondEnd,matchText:'needle'},
+    });
+  },{seededContent,secondStart,secondEnd});
+
+  expect(await page.evaluate(()=>(window as any).__notes['seed-outgoing'])).toBe('# Outgoing\n\nInitial block kept before seeded Find switch.');
+  const findField=page.getByRole('searchbox',{name:'Find in note'});
+  await expect(findField).toHaveValue('needle');
+  await expect(page.getByRole('search').locator('output')).toHaveText('2 / 2');
+  expect(await page.evaluate(()=>({
+    id:document.documentElement.dataset.readerNoteId,
+    overlay:document.documentElement.dataset.readerOverlay,
+    dismissible:document.documentElement.dataset.readerDismissible,
+  }))).toEqual({id:'seed-target',overlay:'true',dismissible:'false'});
+
+  const scrollBeforeBack=await page.evaluate(()=>document.querySelector<HTMLElement>('.android-reading')?.scrollTop??0);
+  expect(scrollBeforeBack).toBeGreaterThan(50);
+
+  const dismissResult=await page.evaluate(()=>{
+    const dismissed=Boolean(window.supermdDismiss?.());
+    const d=document.documentElement.dataset;
+    return {dismissed,overlay:d.readerOverlay==='true',dismissible:d.readerDismissible==='true'};
+  });
+  expect(dismissResult).toEqual({dismissed:true,overlay:false,dismissible:false});
+  await expect(page.locator('.reading-search')).toHaveCount(0);
+  const scrollAfterBack=await page.evaluate(()=>document.querySelector<HTMLElement>('.android-reading')?.scrollTop??0);
+  expect(Math.abs(scrollAfterBack-scrollBeforeBack)).toBeLessThan(8);
+  expect(await page.evaluate(()=>Boolean(window.supermdDismiss?.()))).toBe(false);
+});

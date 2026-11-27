@@ -657,4 +657,70 @@ class AndroidBackHandlingUnitTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test fun readerCoordinatorProtocolAndCloseReopenOrderingStayConsistentWithDismissibleState() {
+        val model = newModel()
+        model.reading(autosave = false)
+        model.welcomeDone()
+        model.newNote(content = "# Coordinator\n\nAlpha block.")
+        idleUntil { model.state.value.active.name == "Untitled.md" && model.state.value.active.content.contains("Alpha block.") }
+        val noteId = model.state.value.active.id
+
+        // #244/#267 ReaderProtocolAndOutlineCoordinator: readerSync + readerPatch route through editNote(fromReader = true)
+        // so both readerEcho and readerStateIsNativeAuthoritative remain intact.
+        assertTrue(model.readerSync(noteId, "epoch-1", 0L, "# Coordinator\n\nAlpha block.").getBoolean("accepted"))
+        assertTrue(
+            model.readerPatch(
+                noteId,
+                "epoch-1",
+                0L,
+                1L,
+                listOf(ReaderEditChange(15, 20, "Beta")),
+            ).getBoolean("accepted"),
+        )
+        assertEquals("# Coordinator\n\nBeta block.", model.state.value.active.content)
+        assertEquals("# Coordinator\n\nBeta block.", model.readerEcho[noteId])
+        assertTrue(model.readerStateIsNativeAuthoritative(noteId))
+
+        // Direct native edit clears readerEcho and retires the reader edit protocol session so stale patches are rejected.
+        model.edit(noteId, "# Coordinator\n\nNative override.")
+        assertEquals(null, model.readerEcho[noteId])
+        assertTrue(model.readerStateIsNativeAuthoritative(noteId))
+        assertFalse(
+            "Stale reader patch from retired epoch-1 session must be rejected after native edit",
+            model.readerPatch(
+                noteId,
+                "epoch-1",
+                1L,
+                2L,
+                listOf(ReaderEditChange(0, 1, "#")),
+            ).getBoolean("accepted"),
+        )
+
+        // Re-sync protocol and mark active note dismissible, then close and reopen (#122 ordering):
+        // close clears readerDismissible + protocol, and reopen restores the draft cleanly without stale protocol or dismissible state.
+        assertTrue(model.readerSync(noteId, "epoch-2", 0L, "# Coordinator\n\nNative override.").getBoolean("accepted"))
+        assertTrue(model.readerStateIsNativeAuthoritative(noteId))
+        model.readerDismissible(true, noteId)
+        assertTrue(model.state.value.readerDismissible)
+
+        model.close(noteId)
+        idleUntil { model.state.value.tabs.none { it.id == noteId } && model.state.value.closedTabs.any { it.id == noteId } }
+        assertFalse(model.state.value.readerDismissible)
+
+        model.reopen()
+        idleUntil { model.state.value.active.id == noteId }
+        assertEquals("# Coordinator\n\nNative override.", model.state.value.active.content)
+        assertFalse(
+            "Reopened note must reject stale epoch-2 patches until reader re-syncs",
+            model.readerPatch(
+                noteId,
+                "epoch-2",
+                0L,
+                1L,
+                listOf(ReaderEditChange(0, 1, "#")),
+            ).getBoolean("accepted"),
+        )
+        assertFalse("Reopened note must not resurrect stale readerDismissible state", model.state.value.readerDismissible)
+    }
 }
