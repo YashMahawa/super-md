@@ -226,212 +226,41 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         return true
     }
     private fun sameDocumentUri(left: String, right: String) = sameDocument(Uri.parse(left), Uri.parse(right))
-    private fun blockedWritesSnapshot(): Set<String> = synchronized(blockedDocumentWrites) { LinkedHashSet(blockedDocumentWrites) }
-    private fun syncBlockedWriteState() {
-        val snapshot = blockedWritesSnapshot()
-        if (mutable.value.blockedWriteUris != snapshot) {
-            mutable.value = mutable.value.copy(blockedWriteUris = snapshot)
-        }
-    }
-    private fun markDocumentWriteBlocked(uri: String) {
-        synchronized(blockedDocumentWrites) {
-            if (blockedDocumentWrites.none { sameDocumentUri(it, uri) }) {
-                blockedDocumentWrites.add(uri)
+    private lateinit var documentAccessCoordinatorCache: DocumentAccessCoordinator
+    private val documentAccessCoordinator: DocumentAccessCoordinator
+        get() = if (::documentAccessCoordinatorCache.isInitialized) documentAccessCoordinatorCache else synchronized(this) {
+            if (!::documentAccessCoordinatorCache.isInitialized) {
+                documentAccessCoordinatorCache = DocumentAccessCoordinator(
+                    app = getApplication(), scope = viewModelScope, resolver = resolver,
+                    readDocumentAccess = { documentAccess }, accessRequestsMutable = accessRequestsMutable,
+                    blockedDocumentWrites = blockedDocumentWrites, documentAccessClearSeq = documentAccessClearSeq,
+                    promptedDocumentAccess = promptedDocumentAccess, promptedAssetAccess = promptedAssetAccess,
+                    pendingAccessHeadings = pendingAccessHeadings, documentWrites = documentWrites,
+                    closingNoteIds = closingNoteIds, readState = { mutable.value },
+                    writeState = { mutable.value = it }, changeState = ::change,
+                    sameDocumentUri = ::sameDocumentUri, rememberLinkedAsset = ::rememberLinkedAsset,
+                    invalidateNoteAssets = ::invalidateNoteAssets, readAssetAccessRestored = { assetAccessRestored },
+                    performReaderBarrier = ::performReaderBarrier, readerBarrierFailed = ::readerBarrierFailed,
+                    rememberNote = ::remember, scheduleAutosave = ::scheduleAutosave,
+                    openNote = { uri, heading -> open(uri, pendingHeading = heading) }, fail = ::fail,
+                )
             }
+            documentAccessCoordinatorCache
         }
-        syncBlockedWriteState()
-    }
-    private fun writeIsBlocked(uri: String) = synchronized(blockedDocumentWrites) {
-        blockedDocumentWrites.any { sameDocumentUri(it, uri) }
-    }
-    private fun clearDocumentAccessFailure(uri: String) {
-        documentAccessClearSeq.incrementAndGet()
-        synchronized(blockedDocumentWrites) {
-            blockedDocumentWrites.removeAll { sameDocumentUri(it, uri) }
-        }
-        promptedDocumentAccess.removeAll { sameDocumentUri(it, uri) }
-        syncBlockedWriteState()
-    }
-    private fun requestDocumentAccess(uri: String, note: Note?, writing: Boolean, explicit: Boolean = false): String {
-        if (writing) {
-            synchronized(blockedDocumentWrites) {
-                if (blockedDocumentWrites.none { sameDocumentUri(it, uri) }) {
-                    blockedDocumentWrites.add(uri)
-                }
-            }
-        }
-        val blockedSnapshot = blockedWritesSnapshot()
-        val alreadyPrompted = promptedDocumentAccess.any { sameDocumentUri(it, uri) }
-        promptedDocumentAccess.add(uri)
-        if ((!alreadyPrompted || explicit) && accessRequestsMutable.value == null) {
-            val name = note?.name ?: Uri.parse(uri).lastPathSegment?.substringAfterLast('/') ?: "This note"
-            accessRequestsMutable.value = DocumentAccessRequest(uri, name, note?.id, writing)
-        }
-        mutable.value = if (!alreadyPrompted || explicit) {
-            mutable.value.copy(busy = false, blockedWriteUris = blockedSnapshot, message = DOCUMENT_ACCESS_MESSAGE)
-        } else {
-            mutable.value.copy(busy = false, blockedWriteUris = blockedSnapshot)
-        }
-        return DOCUMENT_ACCESS_MESSAGE
-    }
-    fun requestWriteAccessIfBlocked(id: String, explicit: Boolean = false): Boolean {
-        val note = mutable.value.tabs.firstOrNull { it.id == id } ?: return false
-        val uri = note.uri ?: return false
-        if (!writeIsBlocked(uri)) return false
-        requestDocumentAccess(uri, note, writing = true, explicit = explicit)
-        return true
-    }
-    fun documentWriteNeedsAccess(id: String): Boolean {
-        val current = mutable.value
-        return current.writeNeedsAccess(id) || current.tabs.firstOrNull { it.id == id }?.uri?.let(::writeIsBlocked) == true
-    }
-    private fun resolveVerifiedWriteDestination(source: Uri): Uri {
-        val candidate = documentAccess.resolve(source, writing = true)
-        if (!DocumentsContract.isTreeUri(candidate) || documentAccess.hasWriteGrant(candidate)) {
-            return candidate
-        }
-        if (!DocumentsContract.isTreeUri(source)) {
-            return source
-        }
-        val authority = source.authority?.takeIf { it.isNotEmpty() }
-        val docId = runCatching { DocumentsContract.getDocumentId(source) }.getOrNull()?.takeIf { it.isNotEmpty() }
-        val plainFallback = if (authority != null && docId != null) {
-            DocumentsContract.buildDocumentUri(authority, docId)
-        } else {
-            null
-        }
-        if (plainFallback != null && documentAccess.hasWriteGrant(plainFallback)) {
-            return plainFallback
-        }
-        throw SecurityException("Write access to this folder document has not been confirmed")
-    }
-    internal fun reportDocumentSaveFailure(id: String, error: Throwable, fallback: String): String {
-        val note = mutable.value.tabs.firstOrNull { it.id == id }
-        return if (isDocumentAccessFailure(error) && note?.uri != null) requestDocumentAccess(note.uri, note, writing = true)
-        else { fail(fallback); fallback }
-    }
-    fun restoreDocumentAccess(request: DocumentAccessRequest, chosen: Uri) = viewModelScope.launch {
-        val wasBlockedBeforeRestore = writeIsBlocked(request.uri) || writeIsBlocked(chosen.toString())
-        try {
-            if (request.assetSource != null) {
-                val note = mutable.value.tabs.firstOrNull { it.id == request.noteId } ?: error("The note is no longer open")
-                require(sameDocumentUri(note.uri ?: note.id, request.uri)) { "The note's destination changed; its draft was left intact." }
-                withContext(Dispatchers.IO) {
-                    documentAccess.persist(chosen)
-                    val name = DocumentFile.fromSingleUri(getApplication(), chosen)?.name
-                    require(name == request.name) { "Choose ${request.name}; the selected file has a different name." }
-                    resolver.openFileDescriptor(chosen, "r")?.use { } ?: error("Android did not grant read access")
-                }
-                rememberLinkedAsset(note, request.assetSource, chosen)
-                promptedAssetAccess.remove("${note.id}\n${request.assetSource}")
-                invalidateNoteAssets(note.id)
-                accessRequestsMutable.value = null
-                mutable.value = mutable.value.copy(message = "Linked file access restored. You can retry the export.")
-                assetAccessRestored?.invoke(note.uri ?: note.id, request.assetSource)
-                return@launch
-            }
-            require(sameDocument(Uri.parse(request.uri), chosen)) { "Choose the original ${request.name}. To use another destination, save a copy instead." }
-            val (resolved, writeRestored) = withContext(Dispatchers.IO) {
-                documentAccess.persist(chosen)
-                val target = documentAccess.resolve(chosen, request.writing)
-                // Verify without truncating or writing any bytes. The existing
-                // draft and its saved baseline remain authoritative.
-                if (request.writing && DocumentsContract.isTreeUri(target) && !documentAccess.hasWriteGrant(target)) {
-                    throw SecurityException("Android did not grant write access to this file")
-                }
-                resolver.openFileDescriptor(target, if (request.writing) "rw" else "r")?.use { }
-                    ?: error("Android did not grant access to this file")
-                if (request.writing) {
-                    target to true
-                } else {
-                    val writeCandidate = documentAccess.resolve(chosen, writing = true)
-                    val candidateWritable = documentAccess.hasWriteGrant(writeCandidate) &&
-                        runCatching { resolver.openFileDescriptor(writeCandidate, "rw")?.use { true } == true }.getOrDefault(false)
-                    if (candidateWritable) {
-                        writeCandidate to true
-                    } else {
-                        val targetWritable = target != writeCandidate &&
-                            documentAccess.hasWriteGrant(target) &&
-                            runCatching { resolver.openFileDescriptor(target, "rw")?.use { true } == true }.getOrDefault(false)
-                        target to targetWritable
-                    }
-                }
-            }
-            val carriedHeading = pendingAccessHeadings.keys
-                .firstOrNull { key -> sameDocumentUri(key, resolved.toString()) || sameDocumentUri(key, request.uri) }
-                ?.let(pendingAccessHeadings::remove)
-            val note = mutable.value.tabs.firstOrNull { it.id == request.noteId }
-            require(request.noteId == null || note != null) { "The note was closed; its recovery data was left intact." }
-            if (note != null) {
-                require(note.uri?.let { sameDocumentUri(it, request.uri) } == true) { "The note's destination changed; its draft was left intact." }
-                val shouldActivate = !request.writing || carriedHeading != null
-                val jump = carriedHeading?.takeIf { it.isNotBlank() }?.let { PendingHeadingJump(note.id, it, UUID.randomUUID().toString()) }
-                val existingNoteUri = note.uri
-                val keepExistingNoteUri = !writeRestored &&
-                    DocumentsContract.isTreeUri(resolved) &&
-                    documentAccess.resolveReadAccess(resolved) is SafReadAccess.PendingTreeMembership &&
-                    runCatching { resolver.openFileDescriptor(Uri.parse(existingNoteUri), "r")?.use { true } == true }.getOrDefault(false)
-                val updatedNoteUri = if (keepExistingNoteUri) existingNoteUri else resolved.toString()
-                val currentActiveId = mutable.value.active.id
-                var barrierRejected = false
-                if (shouldActivate && currentActiveId.isNotEmpty() && currentActiveId != note.id) {
-                    val accepted = performReaderBarrier(currentActiveId) {
-                        change { state ->
-                            state.copy(
-                                tabs = state.tabs.map { if (it.id == note.id) it.copy(uri = updatedNoteUri) else it },
-                                activeId = note.id,
-                                pendingHeading = jump ?: state.pendingHeading,
-                                message = "File access restored; your draft is unchanged",
-                            )
-                        }
-                    }
-                    if (!accepted) {
-                        barrierRejected = true
-                        change { state -> state.copy(tabs = state.tabs.map { if (it.id == note.id) it.copy(uri = updatedNoteUri) else it }) }
-                    }
-                } else {
-                    change { state ->
-                        state.copy(
-                            tabs = state.tabs.map { if (it.id == note.id) it.copy(uri = updatedNoteUri) else it },
-                            activeId = if (shouldActivate) note.id else state.activeId,
-                            pendingHeading = jump ?: state.pendingHeading,
-                            message = "File access restored; your draft is unchanged",
-                        )
-                    }
-                }
-                if (writeRestored) {
-                    clearDocumentAccessFailure(request.uri)
-                    clearDocumentAccessFailure(resolved.toString())
-                } else {
-                    markDocumentWriteBlocked(request.uri)
-                    markDocumentWriteBlocked(resolved.toString())
-                    promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) || sameDocumentUri(it, resolved.toString()) }
-                }
-                accessRequestsMutable.value = null
-                mutable.value.tabs.firstOrNull { it.id == note.id }?.let(::remember)
-                if (barrierRejected) readerBarrierFailed()
-                if (note.dirty && writeRestored) scheduleAutosave(note.id)
-            } else {
-                if (writeRestored) {
-                    clearDocumentAccessFailure(request.uri)
-                    clearDocumentAccessFailure(resolved.toString())
-                } else {
-                    markDocumentWriteBlocked(request.uri)
-                    markDocumentWriteBlocked(resolved.toString())
-                    promptedDocumentAccess.removeAll { sameDocumentUri(it, request.uri) || sameDocumentUri(it, resolved.toString()) }
-                }
-                accessRequestsMutable.value = null
-                open(resolved, pendingHeading = carriedHeading)
-            }
-        } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
-        catch (error: Exception) {
-            if (request.writing || wasBlockedBeforeRestore) {
-                markDocumentWriteBlocked(request.uri)
-            }
-            val detail = if (isDocumentAccessFailure(error)) "This file is still read-only. Your draft is safe; choose the original file with write access or save a copy." else error.message ?: "Access could not be restored"
-            accessRequestsMutable.value = request.copy(detail = detail)
-        }
-    }
+    private fun markDocumentWriteBlocked(uri: String) = documentAccessCoordinator.markDocumentWriteBlocked(uri)
+    private fun writeIsBlocked(uri: String): Boolean = documentAccessCoordinator.writeIsBlocked(uri)
+    private fun clearDocumentAccessFailure(uri: String) = documentAccessCoordinator.clearDocumentAccessFailure(uri)
+    private fun requestDocumentAccess(uri: String, note: Note?, writing: Boolean, explicit: Boolean = false): String =
+        documentAccessCoordinator.requestDocumentAccess(uri, note, writing, explicit)
+    fun requestWriteAccessIfBlocked(id: String, explicit: Boolean = false): Boolean =
+        documentAccessCoordinator.requestWriteAccessIfBlocked(id, explicit)
+    fun documentWriteNeedsAccess(id: String): Boolean = documentAccessCoordinator.documentWriteNeedsAccess(id)
+    private fun resolveVerifiedWriteDestination(source: Uri): Uri =
+        documentAccessCoordinator.resolveVerifiedWriteDestination(source)
+    internal fun reportDocumentSaveFailure(id: String, error: Throwable, fallback: String): String =
+        documentAccessCoordinator.reportDocumentSaveFailure(id, error, fallback)
+    fun restoreDocumentAccess(request: DocumentAccessRequest, chosen: Uri) =
+        documentAccessCoordinator.restoreDocumentAccess(request, chosen)
     private val windowPrefs = app.getSharedPreferences("studio-window-$workspaceKey", 0)
     private val themesDir = File(app.filesDir, "themes")
     internal var themeValidator: (String) -> String = { PdfEngine.validateTheme(it) }
@@ -1095,54 +924,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
     @androidx.annotation.VisibleForTesting
     internal fun isStartupAccessSeedActive(): Boolean = startupAccessSeedJob?.isActive == true
 
-    private fun seedRestoredDocumentAccess(initialFolderJob: Job?): Job? {
-        val candidateUris = mutable.value.tabs
-            .mapNotNull { it.uri }
-            .filter { raw -> runCatching { Uri.parse(raw).scheme.equals("content", ignoreCase = true) }.getOrDefault(false) }
-            .distinct()
-        if (candidateUris.isEmpty()) return null
-        return viewModelScope.launch {
-            if (
-                initialFolderJob != null &&
-                mutable.value.folder?.let { !isKnownPathDocumentProvider(Uri.parse(it).authority) } == true
-            ) {
-                runCatching { initialFolderJob.join() }
-            }
-            val deniedUris = withContext(Dispatchers.IO) {
-                buildMap<String, Long> {
-                    for (raw in candidateUris) {
-                        if (coroutineContext[Job]?.isActive == false) break
-                        documentWrites.withLock {
-                            val stillOpen = mutable.value.tabs.any { tab ->
-                                tab.id !in closingNoteIds && tab.uri != null && sameDocumentUri(tab.uri, raw)
-                            }
-                            if (!stillOpen) return@withLock
-                            val clearSeq = documentAccessClearSeq.get()
-                            val parsed = Uri.parse(raw)
-                            if (
-                                documentAccess.evaluateRestoredWriteAccess(resolver, parsed) ==
-                                DocumentWriteGuardOutcome.PERMISSION_DENIED
-                            ) {
-                                put(raw, clearSeq)
-                            }
-                        }
-                    }
-                }
-            }
-            if (deniedUris.isEmpty()) return@launch
-            documentWrites.withLock {
-                val openUris = mutable.value.tabs
-                    .filter { it.id !in closingNoteIds }
-                    .mapNotNull { it.uri }
-                deniedUris.forEach { (raw, clearSeqAtCheck) ->
-                    val matchingOpen = openUris.any { open -> sameDocumentUri(open, raw) }
-                    if (matchingOpen && documentAccessClearSeq.get() == clearSeqAtCheck) {
-                        markDocumentWriteBlocked(raw)
-                    }
-                }
-            }
-        }
-    }
+    private fun seedRestoredDocumentAccess(initialFolderJob: Job?): Job? =
+        documentAccessCoordinator.seedRestoredDocumentAccess(initialFolderJob)
     override fun onCleared() {
         activeStudioViewModels.remove(this)
         viewModelRetired.set(true)
