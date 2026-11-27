@@ -79,6 +79,7 @@ def init_studio_window(
     studio_obj._brand_svg = (Path(root) / "public/brand-mark-fixed.svg").read_text(encoding="utf-8")
     studio_obj.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
     studio_obj._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
+    studio_obj._python_pool: concurrent.futures.ThreadPoolExecutor | None = None
     studio_obj.workspaceSearchBatch.connect(studio_obj._on_workspace_search_batch)
     if session is None:
         if session_cls is None:
@@ -390,6 +391,8 @@ def stop_window(
         studio_obj._folder_search_cancel.set()
     if (search_pool := getattr(studio_obj, "_search_pool", None)) is not None:
         search_pool.shutdown(wait=False, cancel_futures=True)
+    if (python_pool := getattr(studio_obj, "_python_pool", None)) is not None:
+        python_pool.shutdown(wait=False, cancel_futures=True)
     if (export_jobs := getattr(studio_obj, "_export_jobs", None)) is not None:
         export_jobs.cancel_all()
     if (python_jobs := getattr(studio_obj, "_python_jobs", None)) is not None:

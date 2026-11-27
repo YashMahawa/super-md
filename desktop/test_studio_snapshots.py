@@ -48,6 +48,8 @@ class StudioSnapshotsTests(unittest.TestCase):
             win.stop()
             win.pool.shutdown(wait=True, cancel_futures=True)
             win._search_pool.shutdown(wait=True, cancel_futures=True)
+            if getattr(win, "_python_pool", None) is not None:
+                win._python_pool.shutdown(wait=True, cancel_futures=True)
         session.writes.shutdown(wait=True)
         self.app.processEvents()
         shutil.rmtree(data_dir, ignore_errors=True)
@@ -148,6 +150,9 @@ class StudioSnapshotsTests(unittest.TestCase):
         try:
             storage_cancel, folder_cancel = threading.Event(), threading.Event()
             win._storage_cancel_event, win._folder_search_cancel = storage_cancel, folder_cancel
+            self.assertIsNone(win._python_pool)
+            python_pool_calls = []
+            win._python_pool = SimpleNamespace(shutdown=lambda *, wait=True, cancel_futures=False: python_pool_calls.append((wait, cancel_futures)))
             empty_export, nonempty_export = session.data / "reserved-empty.pdf", session.data / "keep.pdf"
             empty_export.write_bytes(b"")
             nonempty_export.write_bytes(b"pdf")
@@ -165,6 +170,7 @@ class StudioSnapshotsTests(unittest.TestCase):
                 prefs.assert_called_once_with(False)
 
             self.assertTrue(win.retired and storage_cancel.is_set() and folder_cancel.is_set())
+            self.assertEqual(python_pool_calls, [(False, True)])
             self.assertEqual((empty_export.exists(), nonempty_export.exists(), retired_calls, win._opening_paths, rename_cleanups), (False, True, [False], {}, []))
             self.assertEqual((win.note_watcher, win.palette_watcher, win.custom_theme_watcher), (studio._STOPPED_WATCHER,) * 3)
             self.assertFalse(win.theme_timer.isActive() or win.window_id in session.windows)
@@ -199,8 +205,8 @@ class StudioSnapshotsTests(unittest.TestCase):
         self.assertTrue(ns._retired and deleted_later)
         self.assertIs(ns.note_watcher, studio_snapshots._DEFAULT_STOPPED_WATCHER)
 
-        with tempfile.TemporaryDirectory(prefix="supermd-root-") as tmp:
-            fake_root = Path(tmp)
+        fake_root = Path(tempfile.mkdtemp(prefix="supermd-root-"))
+        try:
             (fake_root / "public").mkdir(parents=True)
             (fake_root / "public/brand-mark-fixed.svg").write_text("<svg id='patched'/>", encoding="utf-8")
             created_timers, created_watchers, deleted_watchers, py_jobs, preview_events = [], [], [], [], []
@@ -247,6 +253,7 @@ class StudioSnapshotsTests(unittest.TestCase):
                     deleted_watchers.append(obj)
                     obj.deleteLater()
 
+            win = None
             with (
                 patch.object(studio, "ROOT", fake_root),
                 patch("studio.Session", side_effect=lambda _iso: base_session) as session_mock,
@@ -258,8 +265,8 @@ class StudioSnapshotsTests(unittest.TestCase):
                 patch("studio.custom_theme", FakeCustomTheme),
                 patch("studio.shiboken6", FakeShiboken),
             ):
-                win = QuietStudio(True)
                 try:
+                    win = QuietStudio(True)
                     self.assertEqual((win._brand_svg, session_mock.call_count, palette_mock.call_count), ("<svg id='patched'/>", 1, 1))
                     self.assertEqual((win.system_mode, win.system_colors, len(created_watchers), len(py_jobs)), ("dark", {"primary": "#123456"}, 3, 1))
                     self.assertGreaterEqual(len(created_timers), 9)
@@ -273,4 +280,6 @@ class StudioSnapshotsTests(unittest.TestCase):
                     self.assertIn(("cancel", True), preview_events)
                     self.assertTrue(any(kind == "retain" for kind, _ in preview_events))
                 finally:
-                    self._dispose(base_session, win)
+                    self._dispose(base_session, *([win] if win is not None else ()))
+        finally:
+            shutil.rmtree(fake_root, ignore_errors=True)
