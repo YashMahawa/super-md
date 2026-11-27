@@ -1,9 +1,5 @@
 """Unit tests for desktop/studio_runtime.py behind the Studio facade."""
-import json
-import os
-import sys
-import tempfile
-import unittest
+import ast, json, os, sys, tempfile, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import QGuiApplication
 import studio as studio_module
-import updates
+import studio_runtime, updates
 from studio import Session, Studio
 
 class QuietStudio(Studio):
@@ -20,9 +16,7 @@ class QuietStudio(Studio):
         self.system_dark = True
 
 def _asset(name: str, version: str = "9.9.9") -> dict:
-    return {"version": version, "name": name, "size": 4,
-            "url": f"{updates.REPO}/releases/download/v{version}/{name}",
-            "checksums": f"{updates.REPO}/releases/download/v{version}/SHA256SUMS"}
+    return {"version": version, "name": name, "size": 4, "url": f"{updates.REPO}/releases/download/v{version}/{name}", "checksums": f"{updates.REPO}/releases/download/v{version}/SHA256SUMS"}
 
 class StudioRuntimeTest(unittest.TestCase):
     @classmethod
@@ -58,8 +52,7 @@ class StudioRuntimeTest(unittest.TestCase):
             action, done = jobs.pop()
             done(action(), None)
             inspect_mock.assert_called_once()
-        self.assertFalse(self.studio.storageBusy)
-        self.assertEqual(json.loads(self.studio.storageReport)["scannedEntries"], 4)
+        self.assertEqual((self.studio.storageBusy, json.loads(self.studio.storageReport)["scannedEntries"]), (False, 4))
 
         with submit_patch, patch.object(studio_module, "inspect_storage", side_effect=OSError("/secret/home/file")):
             self.studio.inspectStorage()
@@ -83,8 +76,7 @@ class StudioRuntimeTest(unittest.TestCase):
             self.studio.update_path = "/verified/installer"
             self.studio.clearStorageCategory("update-state")
             self.assertEqual(self.studio.storageCleanupStatus, "Cleanup is unavailable while storage or updates are in use.")
-            self.studio.update_path = ""
-            self.studio.storage_busy = True
+            self.studio.update_path, self.studio.storage_busy = "", True
             self.studio.clearStorageCategory("execution-results")
             self.assertEqual(jobs, [])
             self.studio.storage_busy = False
@@ -104,6 +96,11 @@ class StudioRuntimeTest(unittest.TestCase):
                 self.assertIn("Cleanup failed", self.studio.storageCleanupStatus)
 
     def test_app_version_release_link_restore_download_and_desktop_integration(self):
+        tree, bad = ast.parse(Path(studio_runtime.__file__).read_text(encoding="utf-8")), ("studio", "desktop.studio", "importlib")
+        self.assertEqual([a.name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names if a.name in bad or getattr(n, "module", "") in bad], [])
+        self.assertFalse(any(getattr(n, "name", getattr(n, "id", "")) == "_studio_module" for n in ast.walk(tree)))
+        self.assertFalse(any(isinstance(n, ast.Attribute) and getattr(n.value, "id", "") == "sys" and n.attr == "modules" for n in ast.walk(tree)))
+        self.assertFalse(any(isinstance(n, ast.ExceptHandler) and "ImportError" in ast.unparse(n.type or ast.Constant(None)) for n in ast.walk(tree)))
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "package.json").write_text('{"version": "2.4.6"}', encoding="utf-8")
@@ -127,8 +124,8 @@ class StudioRuntimeTest(unittest.TestCase):
             done(action(), None)
             self.assertEqual((self.studio.update_path, self.studio.updateStatus), (saved["path"], "Verified update ready in Downloads."))
             timer.assert_called_once()
-        with submit_patch, patch("app_integration.available", return_value=True), \
-             patch("app_integration.integrate_current", return_value="/local/bin/super-md") as integrate:
+        with submit_patch, patch("studio.app_integration.available", return_value=True), \
+             patch("studio.app_integration.integrate_current", return_value="/local/bin/super-md") as integrate:
             self.studio.setDesktopIntegration(False)
             self.assertFalse(self.studio.settings["desktopIntegration"])
             self.studio.setDesktopIntegration(True)
@@ -141,9 +138,8 @@ class StudioRuntimeTest(unittest.TestCase):
             _, done = jobs.pop()
             done(None, "launcher conflict")
             self.assertEqual(self.studio.updateStatus, "Desktop integration failed: launcher conflict")
-        self.studio.update_path = ""
-        self.studio.update_info = saved["release"]
-        with submit_patch, patch("updates.download", return_value="/downloads/verified.AppImage") as dl_mock:
+        self.studio.update_path, self.studio.update_info = "", saved["release"]
+        with submit_patch, patch("studio.updates.download", return_value="/downloads/verified.AppImage") as dl_mock:
             self.studio.downloadUpdate()
             action, done = jobs.pop()
             done(action(), None)
@@ -154,8 +150,7 @@ class StudioRuntimeTest(unittest.TestCase):
     def test_check_updates_retention_and_install_update_variants(self):
         jobs, submit_patch = self._capture_submit()
         info = _asset("Super-MD_9.9.9_amd64.AppImage")
-        self.studio.update_info = info
-        self.studio.update_path = "/verified/Super-MD_9.9.9_amd64.AppImage"
+        self.studio.update_info, self.studio.update_path = info, "/verified/Super-MD_9.9.9_amd64.AppImage"
         with submit_patch:
             self.studio.checkUpdates()
             _, done = jobs.pop()
@@ -172,8 +167,7 @@ class StudioRuntimeTest(unittest.TestCase):
         self.studio.update_info = {"version": "bad"}
         self.studio.installUpdate()
         self.assertIn("invalid", self.studio.updateStatus)
-        self.studio.update_info = _asset("Super-MD_9.9.9_amd64.deb")
-        self.studio.update_path = "/verified/Super-MD_9.9.9_amd64.deb"
+        self.studio.update_info, self.studio.update_path = _asset("Super-MD_9.9.9_amd64.deb"), "/verified/Super-MD_9.9.9_amd64.deb"
         mismatched = {"path": self.studio.update_path, "release": _asset("Super-MD_9.9.8_amd64.deb", "9.9.8")}
         with submit_patch, patch("updates.load_ready", return_value=mismatched):
             self.studio.installUpdate()
@@ -200,8 +194,7 @@ class StudioRuntimeTest(unittest.TestCase):
             for name, kind, open_ret, marks_installed, expected in cases:
                 session_events.clear()
                 self.session.update_installed = False
-                self.studio.update_path = "/verified/" + name
-                self.studio.update_info = _asset(name)
+                self.studio.update_path, self.studio.update_info = "/verified/" + name, _asset(name)
                 saved = {"path": self.studio.update_path, "release": self.studio.update_info}
                 with self.subTest(name=name, open_ret=open_ret), submit_patch, \
                      patch("app_integration.available", return_value=True), patch("updates.load_ready", return_value=saved), \
@@ -212,9 +205,8 @@ class StudioRuntimeTest(unittest.TestCase):
                     action, done = jobs.pop()
                     done(action(), None)
                     self.assertIn(expected, self.studio.updateStatus)
-                    self.assertEqual(self.session.update_installed, marks_installed)
-                    self.assertEqual(self.studio.backgroundEnabled, not marks_installed)
-                    self.assertEqual(bool(session_events), marks_installed)
+                    self.assertEqual((self.session.update_installed, self.studio.backgroundEnabled, bool(session_events)),
+                                     (marks_installed, not marks_installed, marks_installed))
                     if kind == "appimage":
                         app_inst.assert_called_once()
                     elif kind == "windows":
@@ -228,6 +220,8 @@ class StudioRuntimeTest(unittest.TestCase):
         self.studio.folder = "/workspace/notes"
         self.studio.tabs = [self.studio._note("a.md", path="/other/dir/a.md"), self.studio._note("Untitled.md")]
         self.assertEqual(self.studio._python_folders(), ["/workspace/notes", str(Path("/other/dir/a.md").parent)])
+        with patch.object(studio_module, "python_runtime", SimpleNamespace(bundled_available=lambda: True)):
+            self.assertTrue(self.studio.pythonBundled)
         proxy = SimpleNamespace(retired=False, settings={"python": ""}, data=self.studio.data, _preferences=lambda notify=True: None, _emit=lambda *_a: None)
         with patch("python_runtime.default_python", return_value="/venv/bin/python"):
             Studio._choose_default_python(proxy)
@@ -239,11 +233,8 @@ class StudioRuntimeTest(unittest.TestCase):
             self.studio.installPythonPackages(sys.executable)
             self.studio.setupPython()
             self.assertEqual((jobs, self.studio.pythonBusy), ([], False))
-        for choices, expected in (
-            ([], "No Python found"),
-            ([{"path": "/bin/python3", "matplotlib": False}], "numpy and matplotlib are missing"),
-            ([{"path": "/bin/python3", "matplotlib": True}], ""),
-        ):
+        for choices, expected in (([], "No Python found"), ([{"path": "/bin/python3", "matplotlib": False}], "numpy and matplotlib are missing"),
+                                  ([{"path": "/bin/python3", "matplotlib": True}], "")):
             with submit_patch, patch("python_runtime.discover", return_value=choices):
                 self.studio.refreshPython()
                 action, done = jobs.pop()

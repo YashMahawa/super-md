@@ -2491,7 +2491,7 @@ class Studio(QObject):
     def windowId(self): return self.window_id
 
     @Property(str,constant=True)
-    def appVersion(self):return studio_runtime.app_version(self)
+    def appVersion(self):return studio_runtime.app_version(self, root=ROOT, frozen=bool(getattr(sys, "frozen", False)))
 
     @Property(str,notify=changed)
     def updateStatus(self):return self.update_status
@@ -2518,31 +2518,31 @@ class Studio(QObject):
     def storageCleanupStatus(self):return self.storage_cleanup_status
 
     @Slot(str)
-    def clearStorageCategory(self, category):return studio_runtime.clear_storage_category_action(self, category)
+    def clearStorageCategory(self, category):return studio_runtime.clear_storage_category_action(self, category, clear_storage_fn=clear_storage_category)
 
     @Slot()
-    def openLatestGitHubRelease(self):return studio_runtime.open_latest_github_release(self)
+    def openLatestGitHubRelease(self):return studio_runtime.open_latest_github_release(self, updates_mod=updates, open_url_fn=QDesktopServices.openUrl)
 
     @Slot()
-    def inspectStorage(self):return studio_runtime.inspect_storage_action(self)
+    def inspectStorage(self):return studio_runtime.inspect_storage_action(self, inspect_storage_fn=inspect_storage)
 
     @Slot()
     def cancelStorageInspection(self):return studio_runtime.cancel_storage_inspection(self)
 
     @Property(bool,constant=True)
-    def desktopIntegrationAvailable(self):return studio_runtime.desktop_integration_available(self)
+    def desktopIntegrationAvailable(self):return studio_runtime.desktop_integration_available(self, app_integration_mod=app_integration)
 
-    def _restore_update(self):return studio_runtime.restore_update(self)
+    def _restore_update(self):return studio_runtime.restore_update(self, updates_mod=updates, single_shot_fn=QTimer.singleShot)
 
     @Slot(bool)
-    def setDesktopIntegration(self,enabled):return studio_runtime.set_desktop_integration(self,enabled)
+    def setDesktopIntegration(self,enabled):return studio_runtime.set_desktop_integration(self, enabled, app_integration_mod=app_integration)
 
     @Slot()
-    def downloadUpdate(self):return studio_runtime.download_update(self)
+    def downloadUpdate(self):return studio_runtime.download_update(self, updates_mod=updates, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot()
     @Slot(bool)
-    def checkUpdates(self,automatic=False):return studio_runtime.check_updates(self,automatic)
+    def checkUpdates(self,automatic=False):return studio_runtime.check_updates(self, automatic, updates_mod=updates, root=ROOT, sys_platform=sys.platform, gui_app_cls=QGuiApplication)
 
     @Property(bool,notify=changed)
     def backgroundEnabled(self):return studio_runtime.background_enabled(self)
@@ -2570,24 +2570,24 @@ class Studio(QObject):
     def pythonBusy(self): return self.python_busy
 
     @Property(bool,constant=True)
-    def pythonBundled(self): return studio_runtime.python_bundled(self)
+    def pythonBundled(self): return studio_runtime.python_bundled(self, python_runtime_mod=python_runtime)
 
     def _python_folders(self): return studio_runtime.python_folders(self)
 
-    def _choose_default_python(self, emit: bool = True): return studio_runtime.choose_default_python(self, emit)
+    def _choose_default_python(self, emit: bool = True): return studio_runtime.choose_default_python(self, emit, python_runtime_mod=python_runtime)
 
     @Slot(str)
     def _python_progress(self, text): return studio_runtime.python_progress(self, text)
 
     @Slot()
-    def refreshPython(self): return studio_runtime.refresh_python(self)
+    def refreshPython(self): return studio_runtime.refresh_python(self, python_runtime_mod=python_runtime)
 
     @Slot(str)
-    def installPythonPackages(self, path): return studio_runtime.install_python_packages(self, path)
+    def installPythonPackages(self, path): return studio_runtime.install_python_packages(self, path, python_runtime_mod=python_runtime)
 
     @Slot()
     def setupPython(self):
-        return studio_runtime.setup_python(self)
+        return studio_runtime.setup_python(self, python_runtime_mod=python_runtime)
 
     @Slot(int, int, bool)
     def rememberWindow(self, width, height, maximized):
@@ -2599,7 +2599,7 @@ class Studio(QObject):
 
     @Slot()
     def installUpdate(self):
-        return studio_runtime.install_update(self)
+        return studio_runtime.install_update(self, updates_mod=updates, app_integration_mod=app_integration, open_url_fn=QDesktopServices.openUrl, start_detached_fn=QProcess.startDetached)
 
     def _can_move(self):
         return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
