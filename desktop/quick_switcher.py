@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import os
+import stat
 import threading
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import folder_ops
-from workspace_search import canonical_note_key, walk_folder_notes
+from workspace_search import MAX_FOLDER_DEPTH, MAX_WALK_ENTRIES, canonical_note_key, walk_folder_notes
 
 QUICK_SWITCHER_SUFFIXES = (".md", ".smd")
 MAX_QUICK_SWITCHER_RESULTS = 100
+DirStamp = tuple[int, int, int, int]
 
 
 def is_quick_switcher_note_name(name: str) -> bool:
@@ -20,57 +22,158 @@ def is_quick_switcher_note_name(name: str) -> bool:
     return folder_ops.note_extension(name).lower() in QUICK_SWITCHER_SUFFIXES
 
 
-def _dir_stamp(path: Path) -> tuple[int, int] | None:
+def _clean_native_path_str(value: str | os.PathLike[str] | None) -> str:
+    """Strip Win32 extended-length prefixes while preserving significant outer whitespace."""
+    if value is None or not isinstance(value, (str, os.PathLike)):
+        return ""
+    raw = folder_ops.strip_extended_length_prefix(
+        os.fspath(value) if isinstance(value, os.PathLike) else value
+    )
+    if not raw or not raw.strip() or "\x00" in raw:
+        return ""
+    return raw
+
+
+def _note_cache_key(path: str | os.PathLike[str] | None) -> str:
+    cleaned = _clean_native_path_str(path)
+    if not cleaned:
+        return ""
+    expanded = os.path.expanduser(cleaned)
+    return folder_ops.normalize_path_key(expanded) or canonical_note_key(expanded)
+
+
+def _resolve_index_root(folder_root: str | os.PathLike[str] | None) -> tuple[Path, str] | None:
+    raw = _clean_native_path_str(folder_root)
+    if not raw:
+        return None
     try:
-        st = path.stat()
-        return (st.st_mtime_ns, getattr(st, "st_ino", 0))
+        candidate = Path(os.path.expanduser(raw))
+        if folder_ops._is_link_or_junction(candidate) or not candidate.is_dir():
+            return None
+        resolved = Path(folder_ops.canonical_path_str(candidate.resolve(strict=True)))
+        if not resolved.is_dir():
+            return None
     except OSError:
         return None
+    key = folder_ops.normalize_path_key(resolved)
+    return (resolved, key) if key else None
 
 
-def _collect_dir_stamps(root: Path) -> tuple[tuple[str, tuple[int, int]], ...]:
-    from workspace_search import MAX_FOLDER_DEPTH, MAX_WALK_ENTRIES
+def _dir_stamp(path: Path) -> DirStamp | None:
+    try:
+        st = path.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return None
+    if folder_ops._is_link_or_junction(path):
+        return None
+    return (
+        st.st_mtime_ns,
+        getattr(st, "st_ctime_ns", 0),
+        getattr(st, "st_ino", 0),
+        getattr(st, "st_dev", 0),
+    )
 
-    stamps: list[tuple[str, tuple[int, int]]] = []
+
+def _collect_dir_snapshot(
+    root: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> tuple[tuple[tuple[str, DirStamp], ...], frozenset[str]] | None:
+    stamps: list[tuple[str, DirStamp]] = []
+    note_paths: set[str] = set()
     stack: list[tuple[Path, int]] = [(root, 0)]
     visited = 0
     while stack and visited < MAX_WALK_ENTRIES:
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         current, depth = stack.pop()
+        if depth > MAX_FOLDER_DEPTH:
+            continue
         stamp = _dir_stamp(current)
         if stamp is None:
-            return ()
-        stamps.append((str(current), stamp))
+            return None
+        stamps.append((folder_ops.canonical_path_str(current), stamp))
         visited += 1
-        if depth >= MAX_FOLDER_DEPTH:
-            continue
         try:
             with os.scandir(current) as entries:
                 for entry in entries:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
                     if entry.name.startswith("."):
                         continue
                     try:
-                        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        entry_path = Path(entry.path)
+                        if entry.is_symlink() or folder_ops._is_link_or_junction(entry_path):
                             continue
-                        sub = Path(entry.path)
-                        if folder_ops._is_link_or_junction(sub):
-                            continue
-                        stack.append((sub, depth + 1))
+                        if entry.is_dir(follow_symlinks=False):
+                            if depth < MAX_FOLDER_DEPTH:
+                                stack.append((entry_path, depth + 1))
+                        elif entry.is_file(follow_symlinks=False) and is_quick_switcher_note_name(entry.name):
+                            canon = folder_ops.canonical_path_str(entry.path)
+                            if canon:
+                                note_paths.add(canon)
                     except OSError:
-                        continue
+                        return None
         except OSError:
-            return ()
-    return tuple(stamps)
+            return None
+    if stack:
+        return None
+    stamps.sort(key=lambda item: item[0])
+    return tuple(stamps), frozenset(note_paths)
+
+
+def _collect_dir_stamps(root: Path) -> tuple[tuple[str, DirStamp], ...]:
+    snapshot = _collect_dir_snapshot(root)
+    return snapshot[0] if snapshot is not None else ()
 
 
 class FolderNoteIndex:
     """Thread-safe in-memory folder index reusing `walk_folder_notes` across quick-switcher queries."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        on_invalidate: Callable[[str | os.PathLike[str] | None], None] | None = None,
+    ) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[str, tuple[list[dict], tuple[tuple[str, tuple[int, int]], ...]]] = {}
+        self._entries: dict[str, tuple[list[dict], tuple[tuple[str, DirStamp], ...]]] = {}
+        self._generation = 0
+        self._on_invalidate = on_invalidate
 
-    def peek_entries(self, folder_root: str | Path) -> list[dict] | None:
-        key = folder_ops.normalize_path_key(folder_root)
+    def _evict_matching(self, target_path: str | os.PathLike[str] | None) -> bool:
+        with self._lock:
+            self._generation += 1
+            raw = _clean_native_path_str(target_path)
+            if not raw:
+                had_entries = bool(self._entries)
+                self._entries.clear()
+                return had_entries
+            expanded = os.path.expanduser(raw)
+            to_drop = [
+                root_key
+                for root_key in self._entries
+                if folder_ops.matches_path_prefix(expanded, root_key, is_directory=True)
+                or folder_ops.matches_path_prefix(root_key, expanded, is_directory=True)
+                or (
+                    raw != expanded
+                    and (
+                        folder_ops.matches_path_prefix(raw, root_key, is_directory=True)
+                        or folder_ops.matches_path_prefix(root_key, raw, is_directory=True)
+                    )
+                )
+            ]
+            for root_key in to_drop:
+                self._entries.pop(root_key, None)
+            return bool(to_drop)
+
+    def peek_entries(self, folder_root: str | os.PathLike[str]) -> list[dict] | None:
+        raw = _clean_native_path_str(folder_root)
+        if not raw:
+            return []
+        resolved_pair = _resolve_index_root(raw)
+        key = resolved_pair[1] if resolved_pair is not None else folder_ops.normalize_path_key(os.path.expanduser(raw))
         if not key:
             return []
         with self._lock:
@@ -79,28 +182,23 @@ class FolderNoteIndex:
 
     def get_entries(
         self,
-        folder_root: str | Path,
+        folder_root: str | os.PathLike[str],
         *,
         cancel_event: threading.Event | None = None,
         revalidate: bool = True,
     ) -> list[dict]:
-        raw = folder_ops.strip_extended_length_prefix(str(folder_root or "").strip())
+        raw = _clean_native_path_str(folder_root)
         if not raw:
             return []
-        candidate = Path(raw).expanduser()
-        try:
-            if folder_ops._is_link_or_junction(candidate) or not candidate.is_dir():
-                self.invalidate(raw)
-                return []
-            resolved = Path(folder_ops.canonical_path_str(candidate.resolve(strict=True)))
-        except OSError:
-            self.invalidate(raw)
+        resolved_pair = _resolve_index_root(raw)
+        if resolved_pair is None:
+            if self._evict_matching(raw) and self._on_invalidate is not None:
+                self._on_invalidate(raw)
             return []
-        key = folder_ops.normalize_path_key(resolved)
-        if not key:
-            return []
+        resolved, key = resolved_pair
 
         with self._lock:
+            scan_gen = self._generation
             cached = self._entries.get(key)
 
         if cached is not None:
@@ -110,11 +208,16 @@ class FolderNoteIndex:
             if stamps and all(_dir_stamp(Path(dpath)) == expected for dpath, expected in stamps):
                 return list(entries)
 
+        pre_snapshot = _collect_dir_snapshot(resolved, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+
         walked = walk_folder_notes(resolved, cancel_event=cancel_event)
         if cancel_event is not None and cancel_event.is_set():
             return []
 
         filtered: list[dict] = []
+        walked_paths: set[str] = set()
         for entry in walked:
             name = entry.get("name") or ""
             epath = entry.get("path") or ""
@@ -126,54 +229,59 @@ class FolderNoteIndex:
             except OSError:
                 continue
             canon_path = folder_ops.canonical_path_str(epath)
+            if not canon_path:
+                continue
+            walked_paths.add(canon_path)
             filtered.append({
                 "name": name,
                 "path": canon_path,
                 "relative": entry.get("relative") or name,
             })
 
-        stamps = _collect_dir_stamps(resolved)
+        post_snapshot = _collect_dir_snapshot(resolved, cancel_event=cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return []
+
+        coherent = False
+        post_stamps: tuple[tuple[str, DirStamp], ...] = ()
+        if pre_snapshot is not None and post_snapshot is not None:
+            pre_stamps, pre_notes = pre_snapshot
+            post_stamps, post_notes = post_snapshot
+            notes_match = (
+                walked_paths == post_notes
+                if len(walked) < MAX_WALK_ENTRIES
+                else (bool(walked_paths) and walked_paths.issubset(post_notes))
+            )
+            coherent = bool(
+                post_stamps
+                and pre_stamps == post_stamps
+                and pre_notes == post_notes
+                and notes_match
+            )
+
         with self._lock:
-            self._entries[key] = (filtered, stamps)
+            if coherent and self._generation == scan_gen:
+                self._entries[key] = (filtered, post_stamps)
+            elif cached is not None and self._entries.get(key) is cached:
+                self._entries.pop(key, None)
         return list(filtered)
 
-    def invalidate(self, target_path: str | Path | None = None) -> None:
-        with self._lock:
-            if target_path is None or not str(target_path).strip():
-                self._entries.clear()
-                return
-            target_str = str(target_path)
-            to_drop = [
-                root_key
-                for root_key in self._entries
-                if folder_ops.matches_path_prefix(target_str, root_key, is_directory=True)
-                or folder_ops.matches_path_prefix(root_key, target_str, is_directory=True)
-            ]
-            for root_key in to_drop:
-                self._entries.pop(root_key, None)
+    def invalidate(self, target_path: str | os.PathLike[str] | None = None) -> None:
+        self._evict_matching(target_path)
+        if self._on_invalidate is not None:
+            self._on_invalidate(target_path)
 
 
-def normalize_workspace_roots(raw_roots: Iterable[str | Path | None]) -> list[Path]:
-    """Return deduplicated, non-symlink canonical directory roots."""
+def normalize_workspace_roots(raw_roots: Iterable[str | os.PathLike[str] | None]) -> list[Path]:
+    """Return deduplicated, non-symlink canonical directory roots preserving significant whitespace."""
     roots: list[Path] = []
     seen: set[str] = set()
     for raw in raw_roots:
-        if raw is None:
+        resolved_pair = _resolve_index_root(raw)
+        if resolved_pair is None:
             continue
-        text = folder_ops.strip_extended_length_prefix(str(raw).strip())
-        if not text or "\x00" in text:
-            continue
-        try:
-            candidate = Path(text).expanduser()
-            if folder_ops._is_link_or_junction(candidate) or not candidate.is_dir():
-                continue
-            resolved = Path(folder_ops.canonical_path_str(candidate.resolve(strict=True)))
-            if not resolved.is_dir():
-                continue
-        except OSError:
-            continue
-        key = folder_ops.normalize_path_key(resolved)
-        if key and key not in seen:
+        resolved, key = resolved_pair
+        if key not in seen:
             seen.add(key)
             roots.append(resolved)
     return roots
@@ -324,13 +432,12 @@ def build_quick_switcher_candidates(
 ) -> list[dict]:
     """Build deduplicated `.md` and `.smd` quick-switcher candidates with disambiguating parent paths."""
     display_roots = coalesce_walk_roots(workspace_roots)
-    pinned_keys = {canonical_note_key(p) for p in pinned_paths if p}
+    pinned_keys = {k for p in pinned_paths if (k := _note_cache_key(p))}
     recent_rank_by_key: dict[str, int] = {}
     for idx, rpath in enumerate(recent_paths):
-        if rpath:
-            rkey = canonical_note_key(rpath)
-            if rkey not in recent_rank_by_key:
-                recent_rank_by_key[rkey] = idx
+        rkey = _note_cache_key(rpath)
+        if rkey and rkey not in recent_rank_by_key:
+            recent_rank_by_key[rkey] = idx
 
     candidates: list[dict] = []
     by_key: dict[str, dict] = {}
@@ -371,11 +478,12 @@ def build_quick_switcher_candidates(
     for tab_order, (_, tab) in enumerate(ordered_tabs):
         tab_id = tab.get("id") or ""
         raw_path = tab.get("path") or ""
-        canon_path = folder_ops.canonical_path_str(raw_path) if raw_path else ""
+        cleaned_tab_path = _clean_native_path_str(raw_path)
+        canon_path = folder_ops.canonical_path_str(os.path.expanduser(cleaned_tab_path)) if cleaned_tab_path else ""
         name = tab.get("name") or (Path(canon_path).name if canon_path else "Untitled.md")
         if not is_quick_switcher_note_name(name):
             continue
-        key = canonical_note_key(canon_path) if canon_path else f"tab:{tab_id}"
+        key = _note_cache_key(canon_path) if canon_path else f"tab:{tab_id}"
         if key in by_key:
             continue
         if raw_path and _match_open_tab_samefile(raw_path) is not None:
@@ -407,13 +515,14 @@ def build_quick_switcher_candidates(
     # Include pinned and recent `.md` / `.smd` files on disk.
     combined_recent = list(dict.fromkeys([*pinned_paths, *recent_paths]))
     for rpath in combined_recent:
-        if not rpath:
+        cleaned_rpath = _clean_native_path_str(rpath)
+        if not cleaned_rpath:
             continue
-        key = canonical_note_key(rpath)
-        if key in by_key:
+        key = _note_cache_key(cleaned_rpath)
+        if not key or key in by_key:
             continue
         try:
-            candidate = Path(folder_ops.strip_extended_length_prefix(str(rpath))).expanduser()
+            candidate = Path(os.path.expanduser(cleaned_rpath))
             if folder_ops._is_link_or_junction(candidate) or not candidate.is_file():
                 continue
             canon_path = folder_ops.canonical_path_str(candidate.resolve(strict=True))
@@ -422,8 +531,8 @@ def build_quick_switcher_candidates(
         name = Path(canon_path).name
         if not is_quick_switcher_note_name(name):
             continue
-        key = canonical_note_key(canon_path)
-        if key in by_key:
+        key = _note_cache_key(canon_path)
+        if not key or key in by_key:
             continue
         samefile_tab = _match_open_tab_samefile(canon_path)
         if samefile_tab is not None:
@@ -455,8 +564,8 @@ def build_quick_switcher_candidates(
             fname = fentry.get("name") or ""
             if not fpath or not is_quick_switcher_note_name(fname):
                 continue
-            key = canonical_note_key(fpath)
-            if key in by_key:
+            key = _note_cache_key(fpath)
+            if not key or key in by_key:
                 continue
             samefile_tab = _match_open_tab_samefile(fpath)
             if samefile_tab is not None:
@@ -599,7 +708,8 @@ def rank_quick_switcher_items(
     max_results: int = MAX_QUICK_SWITCHER_RESULTS,
 ) -> list[dict]:
     """Filter and rank quick-switcher candidates by filename and disambiguating parent path."""
-    cleaned = (query or "").replace("\\", "/").strip()
+    raw_query = (query or "").replace("\\", "/")
+    cleaned = raw_query.strip()
     if not cleaned:
         ordered = sorted(
             candidates,
@@ -616,6 +726,7 @@ def rank_quick_switcher_items(
     tokens = [tok.casefold() for tok in cleaned.split() if tok]
     scored: list[tuple[tuple, dict]] = []
     full_cf = cleaned.casefold()
+    raw_cf = raw_query.casefold()
     for item in candidates:
         total = 0
         matched = True
@@ -637,6 +748,11 @@ def rank_quick_switcher_items(
                 total += 250
             elif full_cf in name_cf:
                 total += 160
+        if raw_cf != full_cf:
+            parent_cf = item["parentPath"].casefold()
+            name_cf = item["name"].casefold()
+            if parent_cf == raw_cf or parent_cf.endswith("/" + raw_cf) or name_cf == raw_cf:
+                total += 80
         if item["pinned"]:
             total += 28
         if item["open"]:

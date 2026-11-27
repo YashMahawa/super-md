@@ -713,6 +713,280 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
             self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == req_id))["opened"])
             self.assertEqual(self.studio._current()["path"], expected_path)
 
+    def test_incoherent_scan_creating_note_between_walk_and_stamp_collection_is_not_cached(self):
+        # 1. Creating Newer.md after walk_folder_notes and before post-walk stamp collection:
+        #    must NOT publish a stale cache snapshot that hides Newer.md on repeated revalidation.
+        vault = self.root / "coherent-vault"
+        vault.mkdir(parents=True)
+        (vault / "Existing.md").write_text("# Existing\n", encoding="utf-8")
+
+        index = quick_switcher.FolderNoteIndex()
+        real_walk = quick_switcher.walk_folder_notes
+        injected = False
+
+        def walk_then_create_newer(folder_root, *args, **kwargs):
+            nonlocal injected
+            walked = real_walk(folder_root, *args, **kwargs)
+            if not injected:
+                injected = True
+                (vault / "Newer.md").write_text("# Newer\n", encoding="utf-8")
+            return walked
+
+        with mock.patch.object(quick_switcher, "walk_folder_notes", side_effect=walk_then_create_newer):
+            first_scan = index.get_entries(vault, revalidate=True)
+
+        self.assertEqual([item["name"] for item in first_scan], ["Existing.md"])
+        self.assertIsNone(index.peek_entries(vault), "Incoherent scan must not publish a cached snapshot")
+
+        revalidated = index.get_entries(vault, revalidate=True)
+        revalidated_again = index.get_entries(vault, revalidate=True)
+        fresh = quick_switcher.FolderNoteIndex().get_entries(vault, revalidate=True)
+        expected_names = ["Existing.md", "Newer.md"]
+        self.assertEqual([item["name"] for item in revalidated], expected_names)
+        self.assertEqual([item["name"] for item in revalidated_again], expected_names)
+        self.assertEqual([item["name"] for item in fresh], expected_names)
+        self.assertIsNotNone(index.peek_entries(vault), "Subsequent coherent scan should publish to cache")
+        self.assertEqual([item["name"] for item in index.peek_entries(vault) or []], expected_names)
+
+        # 2. Even if directory timestamps do not advance during the scan window (coarse filesystem tick)
+        #    and a previous cached entry existed, the stale entry is evicted rather than preserved.
+        vault_coarse = self.root / "coherent-coarse-vault"
+        vault_coarse.mkdir(parents=True)
+        (vault_coarse / "Initial.md").write_text("# Initial\n", encoding="utf-8")
+
+        coarse_index = quick_switcher.FolderNoteIndex()
+        self.assertEqual([it["name"] for it in coarse_index.get_entries(vault_coarse)], ["Initial.md"])
+        self.assertIsNotNone(coarse_index.peek_entries(vault_coarse))
+
+        # Trigger revalidation rescan by advancing directory mtime, then hold _dir_stamp constant across the rescan
+        # while creating NewerCoarse.md between walk_folder_notes and post-walk snapshot collection.
+        bumped_ns = vault_coarse.stat().st_mtime_ns + 2_000_000_000
+        os.utime(vault_coarse, ns=(bumped_ns, bumped_ns))
+        fixed_stamp = quick_switcher._dir_stamp(vault_coarse)
+        coarse_injected = False
+
+        def walk_then_create_same_tick(folder_root, *args, **kwargs):
+            nonlocal coarse_injected
+            walked = real_walk(folder_root, *args, **kwargs)
+            if not coarse_injected:
+                coarse_injected = True
+                (vault_coarse / "NewerCoarse.md").write_text("# Newer Coarse\n", encoding="utf-8")
+            return walked
+
+        with (
+            mock.patch.object(quick_switcher, "_dir_stamp", return_value=fixed_stamp),
+            mock.patch.object(quick_switcher, "walk_folder_notes", side_effect=walk_then_create_same_tick),
+        ):
+            coarse_scan = coarse_index.get_entries(vault_coarse, revalidate=True)
+
+        self.assertEqual([it["name"] for it in coarse_scan], ["Initial.md"])
+        self.assertIsNone(coarse_index.peek_entries(vault_coarse))
+        self.assertEqual(
+            [it["name"] for it in coarse_index.get_entries(vault_coarse, revalidate=True)],
+            ["Initial.md", "NewerCoarse.md"],
+        )
+
+    def test_native_folder_with_significant_whitespace_does_not_index_sibling_vault(self):
+        import folder_ops
+
+        vault_plain = self.root / "Vault"
+        vault_plain.mkdir(parents=True)
+        (vault_plain / "SiblingNote.md").write_text("# Sibling Vault\n", encoding="utf-8")
+
+        vault_space = self.root / "Vault "
+        try:
+            vault_space.mkdir(parents=True)
+        except OSError:
+            self.skipTest("Filesystem does not support trailing spaces in directory names")
+        if folder_ops.same_path(vault_plain, vault_space) or os.path.samefile(vault_plain, vault_space):
+            self.skipTest("Platform normalizes trailing spaces on directory creation")
+
+        (vault_space / "TrailingNote.md").write_text("# Trailing Space Vault\n\nSee [[TrailingTarget]]\n", encoding="utf-8")
+        (vault_space / "TrailingTarget.md").write_text("# Trailing Target\n", encoding="utf-8")
+
+        # Root normalization and cache keys must keep `Vault` and `Vault ` distinct.
+        self.assertEqual(quick_switcher.normalize_workspace_roots([str(vault_space)]), [vault_space])
+        both_roots = quick_switcher.normalize_workspace_roots([str(vault_plain), str(vault_space)])
+        self.assertEqual(both_roots, [vault_plain, vault_space])
+        self.assertNotEqual(
+            folder_ops.normalize_path_key(vault_plain),
+            folder_ops.normalize_path_key(vault_space),
+        )
+
+        # FolderNoteIndex warmed on `Vault` must not collide with or serve `Vault `.
+        idx = quick_switcher.FolderNoteIndex()
+        self.assertEqual([it["name"] for it in idx.get_entries(str(vault_plain))], ["SiblingNote.md"])
+        self.assertIsNone(idx.peek_entries(str(vault_space)))
+        self.assertEqual(
+            [it["name"] for it in idx.get_entries(str(vault_space))],
+            ["TrailingNote.md", "TrailingTarget.md"],
+        )
+        idx.invalidate(str(vault_plain))
+        self.assertIsNone(idx.peek_entries(str(vault_plain)))
+        self.assertIsNotNone(idx.peek_entries(str(vault_space)))
+
+        # End-to-end Studio: warm `Vault`, then select native `Vault ` (both raw path and file:// QUrl).
+        self.studio.openFolder(str(vault_plain))
+        self.assertTrue(_wait_until(lambda: any(f["name"] == "SiblingNote.md" for f in self.studio.files)))
+        self.studio.openQuickSwitcher()
+        self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+        self.assertEqual(
+            [it["name"] for it in self.studio.quickSwitcherState["items"] if not it["open"]],
+            ["SiblingNote.md"],
+        )
+        self.studio.closeQuickSwitcher()
+
+        for folder_arg in (str(vault_space), QUrl.fromLocalFile(str(vault_space)).toString()):
+            self.studio.openFolder(folder_arg)
+            self.assertEqual(self.studio.folder, str(vault_space))
+            self.assertEqual(Path(self.studio.defaultSaveFolder().toLocalFile()), vault_space)
+            self.assertTrue(
+                _wait_until(
+                    lambda: {f["name"] for f in self.studio.files} == {"TrailingNote.md", "TrailingTarget.md"}
+                )
+            )
+            self.studio.openQuickSwitcher()
+            self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+            qs_disk_names = [it["name"] for it in self.studio.quickSwitcherState["items"] if not it["open"]]
+            self.assertEqual(qs_disk_names, ["TrailingNote.md", "TrailingTarget.md"])
+            self.assertNotIn("SiblingNote.md", [it["name"] for it in self.studio.quickSwitcherState["items"]])
+            self.studio.closeQuickSwitcher()
+
+        # Restoring workspace folder and pairing `Vault` + `Vault ` via setNoteLocation preserves both roots.
+        self.studio.closeFolder()
+        self.studio._restore_workspace_folder(str(vault_space))
+        self.assertEqual(self.studio.folder, str(vault_space))
+
+        (vault_plain / "Shared.md").write_text("# Plain Shared\n", encoding="utf-8")
+        (vault_space / "Shared.md").write_text("# Space Shared\n", encoding="utf-8")
+        self.studio.openFolder(str(vault_plain))
+        self.studio.setNoteLocation(str(vault_space))
+        self.assertEqual(self.studio.settings["newNoteLocation"], str(vault_space))
+
+        self.studio.openQuickSwitcher()
+        self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+        self.studio.setQuickSwitcherQuery("Shared.md")
+        shared_items = self.studio.quickSwitcherState["items"]
+        self.assertEqual(len(shared_items), 2)
+        self.assertEqual({it["parentPath"] for it in shared_items}, {"Vault", "Vault "})
+        self.studio.setQuickSwitcherQuery("Vault ")
+        ranked_space = [it for it in self.studio.quickSwitcherState["items"] if it["name"] == "Shared.md"]
+        self.assertEqual(ranked_space[0]["parentPath"], "Vault ")
+        self.studio.closeQuickSwitcher()
+
+    def test_mutual_workspace_link_and_quick_switcher_cache_invalidation_and_save_as_tree_updates(self):
+        from test_studio import QuietStudio
+
+        ws_a = self.root / "ws-alpha"
+        ws_b = self.root / "ws-beta"
+        (ws_a / "drafts").mkdir(parents=True)
+        (ws_b / "nested").mkdir(parents=True)
+        note_a = ws_a / "drafts" / "Origin.md"
+        note_a.write_text("# Origin\n", encoding="utf-8")
+        peer_b = ws_b / "Peer.md"
+        peer_b.write_text("# Peer\n", encoding="utf-8")
+        (ws_b / "nested" / "ExistingNested.md").write_text("# Nested\n", encoding="utf-8")
+
+        studio_b = QuietStudio(True, self.session)
+        try:
+            self.studio.ready = True
+            studio_b.ready = True
+            self.studio.openFolder(str(ws_a))
+            self.studio.toggleDirectory(str(ws_a / "drafts"))
+            studio_b.openFolder(str(ws_b))
+            studio_b.toggleDirectory(str(ws_b / "nested"))
+            studio_b.openNote(str(peer_b))
+            self.assertTrue(_wait_until(lambda: any(f["name"] == "Origin.md" for f in self.studio.files)))
+            self.assertTrue(_wait_until(lambda: any(f["name"] == "ExistingNested.md" for f in studio_b.files)))
+            self.assertTrue(_wait_until(lambda: studio_b._current()["path"] == str(peer_b)))
+
+            # Warm both caches on ws_a and ws_b.
+            self.session.workspace_links.scan(ws_a)
+            self.session.workspace_links.scan(ws_b)
+            self.studio.openQuickSwitcher()
+            self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+            self.studio.closeQuickSwitcher()
+            self.assertIsNotNone(self.session.folder_note_index.peek_entries(ws_a))
+            self.assertIsNotNone(self.session.folder_note_index.peek_entries(ws_b))
+            self.assertEqual(len(self.session.workspace_links._entries), 2)
+
+            # 1. Invalidating WorkspaceLinkCache for ws_a mutually invalidates FolderNoteIndex for ws_a only.
+            self.session.workspace_links.invalidate(ws_a)
+            self.assertIsNone(self.session.folder_note_index.peek_entries(ws_a))
+            self.assertIsNotNone(self.session.folder_note_index.peek_entries(ws_b))
+
+            # 2. Re-warm ws_a, then invalidate FolderNoteIndex for ws_b -> mutually invalidates WorkspaceLinkCache for ws_b only.
+            self.session.workspace_links.scan(ws_a)
+            self.session.folder_note_index.get_entries(ws_a)
+            self.assertEqual(len(self.session.workspace_links._entries), 2)
+            self.session.folder_note_index.invalidate(ws_b)
+            self.assertIsNone(self.session.folder_note_index.peek_entries(ws_b))
+            self.assertEqual(len(self.session.workspace_links._entries), 1)
+
+            # 3. Markdown Save As into ws_b/nested updates trees and invalidates both caches.
+            self.studio.openNote(str(note_a))
+            self.assertTrue(_wait_until(lambda: self.studio._current()["path"] == str(note_a)))
+            self.session.workspace_links.scan(ws_b)
+            self.session.folder_note_index.get_entries(ws_b)
+
+            saved_md = ws_b / "nested" / "SavedFromA.md"
+            self.studio.saveAs(str(saved_md))
+            self.assertTrue(_wait_until(lambda: self.studio._current()["path"] == str(saved_md) and saved_md.is_file()))
+            self.assertTrue(_wait_until(lambda: any(f["name"] == "SavedFromA.md" for f in studio_b.files)))
+
+            replies: list[tuple[str, str, str]] = []
+            studio_b.replied.connect(lambda req_id, res, err: replies.append((req_id, res, err)))
+            studio_b.post(
+                "link-saved-md",
+                "open_workspace_link",
+                json.dumps(
+                    {
+                        "documentPath": str(peer_b.resolve()),
+                        "target": "SavedFromA",
+                        "fragment": "",
+                        "wikilink": True,
+                    }
+                ),
+            )
+            self.assertTrue(_wait_until(lambda: any(r[0] == "link-saved-md" for r in replies)))
+            self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == "link-saved-md"))["opened"])
+
+            # 4. Portable .smd Save As back into ws_a updates both open folder trees and both caches.
+            self.session.workspace_links.scan(ws_a)
+            self.session.workspace_links.scan(ws_b)
+            self.session.folder_note_index.get_entries(ws_a)
+            self.session.folder_note_index.get_entries(ws_b)
+
+            saved_smd = ws_a / "PortableSaved.smd"
+            self.studio.saveAs(str(saved_smd))
+            self.assertEqual(self.studio.pending_save_as, str(saved_smd))
+            save_replies: list[tuple[str, str, str]] = []
+            self.studio.replied.connect(lambda req_id, res, err: save_replies.append((req_id, res, err)))
+            self.studio.post(
+                "portable-save-as",
+                "export_fmd_native",
+                json.dumps(
+                    {
+                        "content": "# Portable Saved\n",
+                        "originalContent": self.studio._current()["content"],
+                        "assets": {},
+                    }
+                ),
+            )
+            self.assertTrue(_wait_until(lambda: any(r[0] == "portable-save-as" for r in save_replies)))
+            self.assertEqual(self.studio._current()["path"], str(saved_smd))
+            self.assertTrue(_wait_until(lambda: any(f["name"] == "PortableSaved.smd" for f in self.studio.files)))
+
+            self.studio.openQuickSwitcher()
+            self.assertTrue(_wait_until(lambda: not self.studio.quickSwitcherState["loading"]))
+            qs_names = {it["name"] for it in self.studio.quickSwitcherState["items"]}
+            self.assertIn("PortableSaved.smd", qs_names)
+            self.assertIn("SavedFromA.md", qs_names)
+            self.studio.closeQuickSwitcher()
+        finally:
+            studio_b.stop()
+            studio_b.pool.shutdown(wait=True)
+
     def test_qml_quick_switcher_dialog_renders_parent_paths_and_restores_focus_in_qml_scene(self):
         ws = self.root / "qml-scene"
         (ws / "design").mkdir(parents=True)
