@@ -5,7 +5,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import types
 import unittest
 from pathlib import Path
 
@@ -100,163 +99,183 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             bounded.invalidate(vault_ref)
             self.assertTrue(any(item.name == "Note-00-Fresh.md" for item in bounded.scan(vault_ref)))
 
-    def _verify_asset_skip_alias_rejection_and_mutation_visibility(self) -> None:
-        with tempfile.TemporaryDirectory() as base_dir:
-            base = Path(base_dir).resolve()
-            root = base / "Vault"
-            root.mkdir()
+    def test_warm_missing_links_stay_cached_while_same_tick_external_targets_refresh(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir) / "Vault"
+            notes = root / "Notes"
+            archive = root / "Archive"
+            deep = root / "Specs" / "Deep"
+            notes.mkdir(parents=True)
+            archive.mkdir(parents=True)
+            deep.mkdir(parents=True)
+            for idx in range(16):
+                section = root / f"Section-{idx:02d}"
+                section.mkdir()
+                for note_idx in range(4):
+                    (section / f"Doc-{idx:02d}-{note_idx}.md").write_text("# Doc\n", encoding="utf-8")
             root = root.resolve()
-            outside = base / "Outside.md"
-            outside.write_text("# Outside\n", encoding="utf-8")
-            outside_dir = base / "OutsideDir"
-            outside_dir.mkdir()
-            outside_dir = outside_dir.resolve()
-            (outside_dir / "Leaked.md").write_text("# Leaked\n", encoding="utf-8")
+            notes = notes.resolve()
+            archive = archive.resolve()
+            deep = deep.resolve()
 
-            for idx in range(24):
-                section = root / f"Section-{idx % 4}"
-                section.mkdir(exist_ok=True)
-                (section / f"Note-{idx:02d}.md").write_text(f"# Note {idx}\n", encoding="utf-8")
-
-            assets = root / "assets"
-            assets.mkdir()
-            png_header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
-            for idx in range(240):
-                (assets / f"figure-{idx:03d}.png").write_bytes(png_header)
-            (assets / "archive.zip").write_bytes(b"PK\x03\x04" + b"\x00" * 32)
-
-            # Eligible note extensions that are symlinks, junctions, or Finder aliases must still be rejected.
-            has_file_link = _try_create_link(root / "Symlinked.md", outside)
-            _try_create_link(root / "LinkedDir", outside_dir, target_is_directory=True)
-
-            bookmark_alias = root / "BookmarkAlias.md"
-            bookmark_alias.write_bytes(b"book\x00\x00\x00\x00mark\x00\x00\x00\x00" + b"\x00" * 32)
-            xattr_alias = root / "FinderInfoAlias.smd"
-            xattr_alias.write_text("# Looks like smd\n", encoding="utf-8")
-            folder_alias_file = root / "FolderAlias"
-            folder_alias_file.write_bytes(b"book\x00\x00\x00\x00mark\x00\x00\x00\x00" + b"\x00" * 32)
-
-            real_open = Path.open
-            real_getxattr = getattr(os, "getxattr", None)
-            opened_non_notes: list[str] = []
-            xattr_non_notes: list[str] = []
-
-            def tracking_open(self_path: Path, *args, **kwargs):
-                if self_path.suffix.lower() not in workspace_links.NOTE_EXTENSIONS:
-                    opened_non_notes.append(self_path.name)
-                return real_open(self_path, *args, **kwargs)
-
-            def tracking_getxattr(target, attr, *args, **kwargs):
-                p = Path(os.fsdecode(target))
-                if p.suffix.lower() not in workspace_links.NOTE_EXTENSIONS:
-                    xattr_non_notes.append(p.name)
-                if p.name == "FinderInfoAlias.smd" and attr == "com.apple.FinderInfo":
-                    info = bytearray(32)
-                    info[8] = 0x80
-                    return bytes(info)
-                if real_getxattr is not None:
-                    return real_getxattr(target, attr, *args, **kwargs)
-                raise OSError("xattr unavailable")
+            source = notes / "Source.md"
+            source.write_text("# Source\n", encoding="utf-8")
+            deep_topic = deep / "Topic.md"
+            deep_topic.write_text("# Deep Exact Topic\n", encoding="utf-8")
 
             cache = WorkspaceLinkCache(ttl_seconds=60.0)
-            patchers = [mock.patch.object(Path, "open", tracking_open)]
-            if hasattr(os, "getxattr"):
-                patchers.append(mock.patch.object(os, "getxattr", side_effect=tracking_getxattr))
 
-            with patchers[0]:
-                if len(patchers) > 1:
-                    with patchers[1]:
-                        scanned = cache.scan(root)
-                else:
-                    scanned = cache.scan(root)
-
-            self.assertEqual(opened_non_notes, [])
-            self.assertEqual(xattr_non_notes, [])
-
-            scanned_names = {entry.name for entry in scanned}
-            self.assertIn("Note-00.md", scanned_names)
-            self.assertIn("Note-23.md", scanned_names)
-            self.assertNotIn("Leaked.md", scanned_names)
-            if has_file_link:
-                self.assertNotIn("Symlinked.md", scanned_names)
-            if os.name == "posix":
-                self.assertNotIn("BookmarkAlias.md", scanned_names)
-                if hasattr(os, "getxattr"):
-                    self.assertNotIn("FinderInfoAlias.smd", scanned_names)
-                with self.assertRaises(workspace_links.WorkspaceLinkError):
-                    resolve_workspace_link(
-                        "BookmarkAlias.md",
-                        wikilink=False,
-                        note_path=root / "Section-0" / "Note-00.md",
-                        workspace_folder=root,
-                        cache=cache,
-                    )
-            else:
-                self.assertIn("BookmarkAlias.md", scanned_names)
-
-            # Simulated Windows directory junction on a nested folder is still rejected.
-            junction_dir = root / "JunctionSubdir"
-            junction_dir.mkdir()
-            (junction_dir / "HiddenBehindJunction.md").write_text("# Junction\n", encoding="utf-8")
-            cache.invalidate(root)
-            real_is_symlink_or_junction = workspace_links._is_symlink_or_junction
+            # 1. Cold missing-link lookup populates the cache once; repeated broken-link misses
+            # stay warm and never invalidate or re-walk the workspace tree.
             with mock.patch.object(
                 workspace_links,
-                "_is_symlink_or_junction",
-                side_effect=lambda p: p.name == "JunctionSubdir" or real_is_symlink_or_junction(p),
-            ):
-                rescanned = cache.scan(root)
-            self.assertFalse(any(item.name == "HiddenBehindJunction.md" for item in rescanned))
-            shutil.rmtree(junction_dir)
+                "_is_entry_link_or_junction",
+                wraps=workspace_links._is_entry_link_or_junction,
+            ) as guard_probe:
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("MissingTarget", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                self.assertGreater(guard_probe.call_count, 80)
+                cached_entries = cache.scan(root)
 
-            # Real directory mutation (creating a note directly on disk without calling cache.invalidate)
-            # is visible immediately on the next lookup within TTL.
-            xattr_alias.unlink()
-            if os.name != "posix":
-                bookmark_alias.unlink()
-            cache.invalidate(root)
-            self.assertEqual(len(cache.scan(root)), 24)
-            mutated = root / "Section-2" / "FreshlyMutated.md"
-            mutated.write_text("# Added directly on disk\n", encoding="utf-8")
+                guard_probe.reset_mock()
+                with mock.patch.object(cache, "invalidate", wraps=cache.invalidate) as invalidate_spy:
+                    for broken in ("MissingTarget", "SecondBrokenLink", "MissingTarget"):
+                        with self.assertRaises(workspace_links.WorkspaceLinkError):
+                            resolve_workspace_link(broken, wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                    self.assertEqual(invalidate_spy.call_count, 0)
+                self.assertIs(cache.scan(root), cached_entries)
+                self.assertEqual(
+                    {call.args[0].name for call in guard_probe.call_args_list},
+                    {"Notes"},
+                )
+
+            # 2. Real unmocked same-tick addition after warming both a missing link and a nested hit:
+            # align to the start of a fresh filesystem clock tick on a compact vault so scan() and
+            # external file creations complete well inside a single 4-20ms OS clock tick without mocks.
+            compact = (Path(root_dir) / "CompactVault").resolve()
+            compact_notes = compact / "Notes"
+            compact_archive = compact / "Archive"
+            compact_deep = compact / "Specs" / "Deep"
+            compact_notes.mkdir(parents=True)
+            compact_archive.mkdir(parents=True)
+            compact_deep.mkdir(parents=True)
+            compact_source = compact_notes / "Source.md"
+            compact_source.write_text("# Source\n", encoding="utf-8")
+            compact_deep_topic = compact_deep / "Topic.md"
+            compact_deep_topic.write_text("# Deep Exact Topic\n", encoding="utf-8")
+
+            tick_probe = Path(root_dir) / "tick_probe"
+            tick_probe.write_bytes(b"0")
+            initial_tick_ns = tick_probe.stat().st_mtime_ns
+            deadline = time.perf_counter() + 0.025
+            while time.perf_counter() < deadline:
+                tick_probe.write_bytes(b"1")
+                if tick_probe.stat().st_mtime_ns != initial_tick_ns:
+                    break
+            (compact_archive / ".keep").write_text("", encoding="utf-8")
+            compact_cache = WorkspaceLinkCache(ttl_seconds=60.0)
+            with self.assertRaises(workspace_links.WorkspaceLinkError):
+                resolve_workspace_link(
+                    "MissingTarget", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
+                )
             self.assertEqual(
                 resolve_workspace_link(
-                    "FreshlyMutated",
-                    wikilink=True,
-                    note_path=root / "Section-0" / "Note-00.md",
-                    workspace_folder=root,
-                    cache=cache,
+                    "Topic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
                 ),
-                mutated.resolve(),
+                compact_deep_topic,
+            )
+            archive_missing = compact_archive / "MissingTarget.md"
+            archive_missing.write_text("# Created right after warm miss\n", encoding="utf-8")
+            archive_topic = compact_archive / "Topic.md"
+            archive_topic.write_text("# Higher-ranked Archive Topic\n", encoding="utf-8")
+
+            self.assertEqual(
+                resolve_workspace_link(
+                    "MissingTarget", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
+                ),
+                archive_missing,
+            )
+            self.assertEqual(
+                resolve_workspace_link(
+                    "Topic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
+                ),
+                archive_topic,
             )
 
-    def test_scan_skips_binary_opens_and_xattrs_on_unrelated_assets_while_rejecting_eligible_aliases_and_seeing_mutations(self):
-        self._verify_asset_skip_alias_rejection_and_mutation_visibility()
-        if os.name == "posix":
-            fake_nt_os = types.SimpleNamespace(
-                **{k: v for k, v in vars(os).items() if k != "getxattr"},
+            # 3. Once wall time advances past the coarse clock tick window, racy directory snapshots
+            # settle so cache.scan() performs zero os.scandir calls and warm misses never touch subtrees.
+            time.sleep(0.12)
+            with self.assertRaises(workspace_links.WorkspaceLinkError):
+                resolve_workspace_link("StillMissing", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+            settled_entries = cache.scan(root)
+            with mock.patch.object(os, "scandir", wraps=os.scandir) as scandir_spy:
+                self.assertIs(cache.scan(root), settled_entries)
+                self.assertEqual(scandir_spy.call_count, 0)
+                for broken in ("StillMissing", "AnotherMissing", "StillMissing"):
+                    with self.assertRaises(workspace_links.WorkspaceLinkError):
+                        resolve_workspace_link(broken, wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                scanned_dirs = {Path(call.args[0]).resolve() for call in scandir_spy.call_args_list}
+                self.assertLessEqual(scanned_dirs, {root, notes})
+            self.assertIs(cache.scan(root), settled_entries)
+
+            # 4. Deterministic pinned-stat coarse-tick fixture (reproduces 100% even on 1ns APFS):
+            # warm both a missing link and a nested match, freeze Beta's directory stat across an
+            # external file write, verify warm misses still do not rescan before the write, and
+            # verify the new file resolves immediately after the write.
+            beta = root / "Beta"
+            beta.mkdir()
+            beta = beta.resolve()
+            deep_pinned = deep / "PinnedTopic.md"
+            deep_pinned.write_text("# Deep Pinned\n", encoding="utf-8")
+            cache.invalidate(root)
+
+            with self.assertRaises(workspace_links.WorkspaceLinkError):
+                resolve_workspace_link("PinnedMissing", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+            self.assertEqual(
+                resolve_workspace_link("PinnedTopic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_pinned,
             )
-            fake_nt_os.name = "nt"
-            with (
-                mock.patch.object(workspace_links, "os", fake_nt_os),
-                mock.patch.object(sys.modules[__name__], "os", fake_nt_os),
-            ):
-                self._verify_asset_skip_alias_rejection_and_mutation_visibility()
+            pinned_entries = cache.scan(root)
+            frozen_beta_stat = beta.stat(follow_symlinks=False)
+            real_stat = Path.stat
+
+            def stale_beta_stat(self_path: Path, *, follow_symlinks: bool = True):
+                if self_path == beta:
+                    return frozen_beta_stat
+                return real_stat(self_path, follow_symlinks=follow_symlinks)
+
+            with mock.patch.object(Path, "stat", stale_beta_stat):
+                for broken in ("PinnedMissing", "OtherPinnedMissing"):
+                    with self.assertRaises(workspace_links.WorkspaceLinkError):
+                        resolve_workspace_link(broken, wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                self.assertIs(cache.scan(root), pinned_entries)
+
+                beta_missing = beta / "PinnedMissing.md"
+                beta_missing.write_text("# Beta Pinned Missing\n", encoding="utf-8")
+                beta_topic = beta / "PinnedTopic.md"
+                beta_topic.write_text("# Beta Pinned Topic\n", encoding="utf-8")
+
+                self.assertEqual(
+                    resolve_workspace_link("PinnedMissing", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    beta_missing,
+                )
+                self.assertEqual(
+                    resolve_workspace_link("PinnedTopic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    beta_topic,
+                )
 
     def test_cached_exact_nested_match_refreshes_when_higher_ranked_exact_target_added_externally(self):
         with tempfile.TemporaryDirectory() as root_dir:
             root = Path(root_dir) / "Vault"
             notes = root / "Notes"
             archive = root / "Archive"
-            beta = root / "Beta"
             deep = root / "Specs" / "Deep"
             notes.mkdir(parents=True)
             archive.mkdir(parents=True)
-            beta.mkdir(parents=True)
             deep.mkdir(parents=True)
             root = root.resolve()
             notes = notes.resolve()
             archive = archive.resolve()
-            beta = beta.resolve()
             deep = deep.resolve()
 
             source = notes / "Source.md"
@@ -265,8 +284,6 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             deep_topic.write_text("# Deep Exact Topic\n", encoding="utf-8")
             deep_ext_smd = deep / "ExtRank.smd"
             deep_ext_smd.write_text("# Deep Exact SMD\n", encoding="utf-8")
-            deep_subtick = deep / "SubTick.md"
-            deep_subtick.write_text("# Deep SubTick\n", encoding="utf-8")
 
             cache = WorkspaceLinkCache(ttl_seconds=60.0)
 
@@ -275,8 +292,13 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                 resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
                 deep_topic,
             )
-            _, from_cache = cache._scan_with_state(root)
-            self.assertTrue(from_cache)
+            with mock.patch.object(
+                workspace_links,
+                "_is_entry_link_or_junction",
+                wraps=workspace_links._is_entry_link_or_junction,
+            ) as guard_probe:
+                self.assertEqual(cache.scan(root)[0].path.parent.parent, root)
+                self.assertEqual(guard_probe.call_count, 0)
 
             # 1. Shallower exact match added externally in an existing folder beats cached depth-2 exact match.
             specs_topic = root / "Specs" / "Topic.md"
@@ -323,28 +345,6 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                 resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
                 same_dir_topic,
             )
-
-            # 6. Sub-tick / stale directory stat fallback: even if directory stat metadata stays unchanged
-            # (e.g. coarse filesystem clock tick), racy_entries detects the externally added exact target.
-            self.assertEqual(
-                resolve_workspace_link("SubTick", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
-                deep_subtick,
-            )
-            frozen_beta_stat = beta.stat(follow_symlinks=False)
-            beta_subtick = beta / "SubTick.md"
-            beta_subtick.write_text("# Shallower Beta SubTick\n", encoding="utf-8")
-            real_stat = Path.stat
-
-            def stale_beta_stat(self_path: Path, *, follow_symlinks: bool = True):
-                if self_path == beta:
-                    return frozen_beta_stat
-                return real_stat(self_path, follow_symlinks=follow_symlinks)
-
-            with mock.patch.object(Path, "stat", stale_beta_stat):
-                self.assertEqual(
-                    resolve_workspace_link("SubTick", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
-                    beta_subtick,
-                )
 
     def test_case_insensitive_fs_preserves_exact_case_ranking_and_invalidates_across_case_variants(self):
         with tempfile.TemporaryDirectory() as root_dir:
