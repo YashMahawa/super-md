@@ -1,11 +1,6 @@
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
-import { maskFrontmatter } from "./frontmatter";
-import { remarkObsidianMath } from "./obsidianMath";
+import { parseMaskedMarkdown } from "./markdownExportParser";
 import {
   isRemoteImageApproved,
   isRemoteOrExplicitScheme,
@@ -29,7 +24,7 @@ export const markdownLabel = (value: string) => value.replace(/[\\[\]]/g, "\\$&"
 export const imageMarkdown = (image: ImportedImage) => `![${markdownLabel(image.alt)}](<${image.source.replace(/>/g, "%3E")}>)`;
 export interface ImageRange { from: number; to: number; source: string }
 export function imageRanges(markdown: string): ImageRange[] {
-  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
+  const { tree } = parseMaskedMarkdown(markdown);
   const definitions = new Map<string, string>(); const result: ImageRange[] = [];
   visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
   visit(tree, (node: any) => {
@@ -116,8 +111,7 @@ async function prepareFmdInternal(
   shared: Map<string, Promise<string | null>>,
   assets: Record<string, string>,
 ): Promise<string> {
-  const processor = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath);
-  const tree = processor.parse(maskFrontmatter(markdown));
+  const { tree } = parseMaskedMarkdown(markdown);
   const work: Promise<void>[] = [];
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const definitions = new Map<string, any>(); const usedDefinitions = new Set<string>();
