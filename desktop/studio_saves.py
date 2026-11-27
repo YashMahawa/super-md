@@ -181,6 +181,7 @@ def after_flush(studio_obj, operation: dict, *, local_path_fn=_default_local_pat
                     studio_obj._pending_seeded_find = None
             studio_obj._open_note(local, explicit=True, completion_callback=opened)
     elif action == "reload_reader":
+        if (py_jobs := getattr(studio_obj, "_python_jobs", None)) is not None: py_jobs.cancel_tab(studio_obj.active)
         studio_obj.ready = studio_obj.reader_overlay = studio_obj.image_overlay = False
         studio_obj._last_reader_text = None
         studio_obj._last_reader_agent_seq.clear()

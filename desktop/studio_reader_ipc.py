@@ -53,6 +53,13 @@ def _handle_immediate_command(
         job_id = args.get("jobId")
         if not isinstance(job_id, str) or not job_id or len(job_id) > 128: raise ValueError("Invalid PDF export job id")
         studio_obj.replied.emit(request_id, json.dumps({"cancelled": studio_obj._export_jobs.cancel(job_id)}), "")
+    elif command == "stop_python":
+        job_id = args.get("jobId")
+        if not isinstance(job_id, str) or not job_id or len(job_id) > 128: raise ValueError("Invalid Python cell job id")
+        tab_filter = args.get("id")
+        if tab_filter is not None and (not isinstance(tab_filter, str) or not tab_filter or len(tab_filter) > 128):
+            raise ValueError("Invalid Python cell tab id")
+        studio_obj.replied.emit(request_id, json.dumps({"stopped": studio_obj._python_jobs.cancel_job(job_id, tab_id=tab_filter)}), "")
     elif command == "reader_ready":
         studio_obj.ready, studio_obj._last_reader_text = True, None
         studio_obj._last_reader_agent_seq.clear()
@@ -432,11 +439,13 @@ def post_message(
         python, export_job = studio_obj.settings["python"], None
         if command == "export_pdf_native":
             if not output: raise ValueError("Choose a PDF destination before exporting")
-            export_job = studio_obj._export_jobs.register(args.get("jobId") or uuid.uuid4().hex)
+            pdf_job_id = uuid.uuid4().hex if (raw_pdf_job := args.get("jobId")) is None else raw_pdf_job
+            export_job = studio_obj._export_jobs.register(pdf_job_id)
         elif command == "run_python":
             if studio_obj.retired or captured["id"] in getattr(studio_obj, "_closing_tabs", ()):
                 raise ValueError("The note for this operation is no longer open")
-            python_job = studio_obj._python_jobs.register(captured["id"])
+            py_job_id = uuid.uuid4().hex if (raw_py_job := args.get("jobId")) is None else raw_py_job
+            python_job = studio_obj._python_jobs.register(captured["id"], job_id=py_job_id)
         export_result = lambda path: studio_obj._agent_export_metadata(Path(path), agent_export_info["format"]) if agent_export_info else {"path": str(path)}
         work = lambda: _run_worker_command(
             studio_obj, command, args, captured, context=context, output=output, save_as=save_as,
@@ -455,11 +464,15 @@ def post_message(
         if is_portable_tab_save and (studio_obj.retired or getattr(studio_obj.writes, "_shutdown", False)):
             studio_obj.saving.discard(saving_tab_id)
             return
-        if python_job is not None and (studio_obj.retired or getattr(studio_obj.pool, "_shutdown", False)):
+        python_executor = (
+            studio_obj._get_python_pool() if hasattr(studio_obj, "_get_python_pool")
+            else getattr(studio_obj, "_python_pool", getattr(studio_obj, "pool", None))
+        ) if command == "run_python" else None
+        if python_job is not None and (studio_obj.retired or python_executor is None or getattr(python_executor, "_shutdown", False)):
             studio_obj._python_jobs.discard(python_job)
             return
-        studio_obj._submit(work, finished, command in ("run_python", "export_fmd_native", "export_pdf_native", "export_markdown_native"),
-                           studio_obj.writes if command in ("export_fmd_native", "export_markdown_native") else None)
+        executor = python_executor if command == "run_python" else (studio_obj.writes if command in ("export_fmd_native", "export_markdown_native") else None)
+        studio_obj._submit(work, finished, command in ("export_fmd_native", "export_pdf_native", "export_markdown_native"), executor)
     except Exception as error:
         if python_job is not None: studio_obj._python_jobs.discard(python_job)
         if hasattr(studio_obj, "_agent_exports"):

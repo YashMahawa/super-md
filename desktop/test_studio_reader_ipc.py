@@ -55,6 +55,8 @@ class StudioReaderIpcTests(unittest.TestCase):
             self.studio.stop()
         self.studio.pool.shutdown(wait=True, cancel_futures=True)
         self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
+        if self.studio._python_pool is not None:
+            self.studio._python_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
         self.app.processEvents()
         self.temp_dir.cleanup()
@@ -108,6 +110,17 @@ class StudioReaderIpcTests(unittest.TestCase):
         self.assertIn("Invalid PDF export job id", self._wait_reply("cx-bad")[1])
 
         tab = self.studio._current()
+        py_job = self.studio._python_jobs.register(tab["id"], job_id="py-job-1")
+        self.addCleanup(self.studio._python_jobs.discard, py_job)
+        self.studio.post("sp-miss", "stop_python", json.dumps({"jobId": "py-job-1", "id": "other-tab"}))
+        self.assertEqual((json.loads(self._wait_reply("sp-miss")[0])["stopped"], py_job.cancelled.is_set()), (False, False))
+        self.studio.post("sp-ok", "stop_python", json.dumps({"jobId": "py-job-1", "id": tab["id"]}))
+        self.assertEqual((json.loads(self._wait_reply("sp-ok")[0])["stopped"], py_job.cancelled.is_set()), (True, True))
+        self.studio.post("sp-bad-job", "stop_python", json.dumps({"jobId": ""}))
+        self.assertIn("Invalid Python cell job id", self._wait_reply("sp-bad-job")[1])
+        self.studio.post("sp-bad-tab", "stop_python", json.dumps({"jobId": "py-job-1", "id": ""}))
+        self.assertIn("Invalid Python cell tab id", self._wait_reply("sp-bad-tab")[1])
+
         self.studio._last_reader_text = (tab["id"], "stale")
         self.studio._last_reader_agent_seq[tab["id"]] = 3
         self.studio.post("rr", "reader_ready", "{}")
@@ -218,10 +231,12 @@ class StudioReaderIpcTests(unittest.TestCase):
         ctx = {"document": tab["id"], "cell": "c1", "interpreter": sys.executable}
         cell_out = {"stdout": "42\n", "stderr": "", "images": [], "ok": True}
 
-        with patch.object(self.studio, "_python", return_value=cell_out), \
+        seen_jobs: list[str] = []
+        with patch.object(self.studio, "_python", side_effect=lambda *_a, **kw: (seen_jobs.append(kw["job"].job_id), cell_out)[1]), \
              patch.object(self.session.python_outputs, "store", side_effect=OSError("cache read-only")):
-            self.studio.post("py-fallback", "run_python", json.dumps({"id": tab["id"], "code": "print(42)", "context": ctx}))
+            self.studio.post("py-fallback", "run_python", json.dumps({"id": tab["id"], "jobId": "cell-job-7", "code": "print(42)", "context": ctx}))
             py_res = json.loads(self._wait_reply("py-fallback")[0])
+        self.assertEqual(seen_jobs, ["cell-job-7"])
         self.assertTrue(py_res["provenance"]["unsaved"] and pending_python.matches("print(42)", cell_out, ctx))
         pending_python.forget("print(42)", ctx)
 
@@ -281,7 +296,10 @@ class StudioReaderIpcTests(unittest.TestCase):
         with patch.object(self.studio, "_submit", side_effect=lambda work, done, *rest: submitted.append((work, done, rest))):
             self.studio.pending_export = str(md_out)
             self.studio.post("sub-1", "export_markdown_native", json.dumps({"id": tab["id"], "content": "# X\n", "assets": {}}))
+            self.studio.post("sub-py", "run_python", json.dumps({"id": tab["id"], "jobId": "sub-py-job", "code": "1+1"}))
+        self.studio._python_jobs.discard(self.studio._python_jobs._by_id.get("sub-py-job"))
         self.assertEqual(submitted[0][2], (True, self.studio.writes))
+        self.assertEqual(submitted[1][2], (False, self.studio._python_pool))
 
         proxy_replies: list[tuple] = []
         proxy = SimpleNamespace(
