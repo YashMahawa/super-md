@@ -5,6 +5,7 @@ export {headingSlug} from './headingSlug';
 export type {OutlineEntry} from './documentAnalysis';
 import {revealWindowed} from "./windowedSearch";
 import {applyDocumentZoom,invalidateDocumentZoom,refreshDocumentExtent} from './documentZoom';
+import {clearProgrammaticAnchorScroll,hasExternalAnchorScroll,markProgrammaticAnchorScroll,snapshotAnchorScroll,type AnchorScrollSnapshot} from './sourceAnchor';
 import {invoke} from './nativeBridge';
 import {isLocalHref,parseRelativeNoteLink,safeDecodeURIComponent,type ClassifiedRenderedLink} from './workspaceLinks';
 export {isLocalHref,parseRelativeNoteLink};
@@ -104,15 +105,37 @@ export function navigateToHeading(root:Element,rawTarget:string):boolean {
     || headings.find(node => (node.textContent || '').trim().toLowerCase() === lower);
   if (!heading) return true; // Broken local links must not escape into a browser.
   cancelHeadingNavigation(root);
+  const host=root as HTMLElement;
   let observer:ResizeObserver|undefined,timer=0,frame=0;
-  const token={stop:()=>{observer?.disconnect();window.clearTimeout(timer);cancelAnimationFrame(frame);}};jumps.set(root,token);
-  const host=root as HTMLElement;host.dataset.navigating='true';
+  let alignedSnapshot:AnchorScrollSnapshot|null=null;
+  const inputEvents=['wheel','touchstart','pointerdown','keydown'] as const;
+  const onUserInput=()=>cancelHeadingNavigation(root);
+  const onScroll=()=>{
+    if(hasExternalAnchorScroll(alignedSnapshot)){
+      clearProgrammaticAnchorScroll(host);
+      cancelHeadingNavigation(root);
+    }
+  };
+  const token={stop:()=>{
+    observer?.disconnect();
+    window.clearTimeout(timer);
+    cancelAnimationFrame(frame);
+    inputEvents.forEach(name=>window.removeEventListener(name,onUserInput,{capture:true}));
+    host.removeEventListener('scroll',onScroll);
+  }};
+  jumps.set(root,token);
+  host.dataset.navigating='true';
   revealWindowed(heading);
   // Native scrollIntoView can clamp against the old magnified spacer, or move
   // a WebView ancestor rather than its reading pane. Lazy blocks also change
   // height after the first frame. Resolve and align within this scroller only.
   const align=(frames:number)=>{
     if(jumps.get(root)!==token || !host.isConnected)return;
+    if(hasExternalAnchorScroll(alignedSnapshot)){
+      clearProgrammaticAnchorScroll(host);
+      cancelHeadingNavigation(root);
+      return;
+    }
     const mounted=Array.from(root.querySelectorAll<HTMLElement>('[id]')).find(node=>node.id===heading.id) || heading;
     if(!host.contains(mounted)){cancelHeadingNavigation(root);return;}
     revealWindowed(mounted);
@@ -123,11 +146,15 @@ export function navigateToHeading(root:Element,rawTarget:string):boolean {
     // the permanent first-note spacer, so hidden controls add no jump margin.
     const visibleChrome=Number.parseFloat(getComputedStyle(host.ownerDocument.documentElement).getPropertyValue('--native-visible-chrome-inset'));
     const gap=16+(Number.isFinite(visibleChrome)?Math.max(0,Math.min(480,visibleChrome)):0);
+    markProgrammaticAnchorScroll(host);
     host.scrollTop+=mounted.getBoundingClientRect().top-host.getBoundingClientRect().top-gap;
+    alignedSnapshot=snapshotAnchorScroll(host);
     mounted.tabIndex=-1;mounted.focus({preventScroll:true});
     if(frames>0)frame=requestAnimationFrame(()=>align(frames-1));
   };
   align(0);
+  inputEvents.forEach(name=>window.addEventListener(name,onUserInput,{capture:true,passive:true}));
+  host.addEventListener('scroll',onScroll,{passive:true});
   frame=requestAnimationFrame(()=>align(5));
   const page=host.querySelector<HTMLElement>('.document-page');
   if(page&&typeof ResizeObserver!=='undefined'){
