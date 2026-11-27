@@ -1,76 +1,31 @@
 import { compileSearchPattern, nextSearchMatch, type SearchMatchConfig } from "./windowedSearch";
 
 export const STEP_REVEAL_EVENT = "supermd-reveal-step";
-
-export interface StepRevealDetail {
-  stepIndex: number;
-  openLegacyNote?: boolean;
-}
-
-export interface DecodedStringSpan {
-  contentStart: number;
-  contentEnd: number;
-  decoded: string;
-  toSource: number[];
-  trimStartIndex: number;
-  trimEndIndex: number;
-}
-
+export interface StepRevealDetail { stepIndex: number; openLegacyNote?: boolean; }
+export interface DecodedStringSpan { contentStart: number; contentEnd: number; decoded: string; toSource: number[]; trimStartIndex: number; trimEndIndex: number; }
 export interface StepSourceSpan {
-  stepIndex: number;
-  objectStart: number;
-  objectEnd: number;
-  labelSpan?: DecodedStringSpan;
-  markdownSpan?: DecodedStringSpan;
-  descriptionSpan?: DecodedStringSpan;
-  chartTitleSpan?: DecodedStringSpan;
-  hasMarkdown: boolean;
-  hasLegacyDescription: boolean;
+  stepIndex: number; objectStart: number; objectEnd: number;
+  labelSpan?: DecodedStringSpan; markdownSpan?: DecodedStringSpan; descriptionSpan?: DecodedStringSpan; chartTitleSpan?: DecodedStringSpan;
+  hasMarkdown: boolean; hasLegacyDescription: boolean;
 }
-
-export interface StepDeckSourceInfo {
-  titleSpan?: DecodedStringSpan;
-  steps: StepSourceSpan[];
-}
-
-export type StepVisibleRegion =
-  | "deck-title"
-  | "chart-title"
-  | "step-label"
-  | "step-markdown"
-  | "step-legacy-description";
-
+export interface StepDeckSourceInfo { titleSpan?: DecodedStringSpan; steps: StepSourceSpan[]; }
+export type StepVisibleRegion = "deck-title" | "chart-title" | "step-label" | "step-markdown" | "step-legacy-description";
 export interface StepDeckOccurrenceClassification {
-  stepIndex: number | null;
-  openLegacyNote: boolean;
-  visibleRegion: StepVisibleRegion | null;
-  fieldSpan: DecodedStringSpan | null;
-  decodedRange: { from: number; to: number } | null;
+  stepIndex: number | null; openLegacyNote: boolean; visibleRegion: StepVisibleRegion | null;
+  fieldSpan: DecodedStringSpan | null; decodedRange: { from: number; to: number } | null;
 }
 
-const NO_OCCURRENCE: StepDeckOccurrenceClassification = {
-  stepIndex: null,
-  openLegacyNote: false,
-  visibleRegion: null,
-  fieldSpan: null,
-  decodedRange: null,
-};
+const NO_OCCURRENCE: StepDeckOccurrenceClassification = { stepIndex: null, openLegacyNote: false, visibleRegion: null, fieldSpan: null, decodedRange: null };
+const JSON_ESCAPES: Record<string, string> = { "\"": "\"", "\\": "\\", "/": "/", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t" };
 
 export function extractFenceBodySpan(rawFence: string, fenceStart: number): { body: string; bodyStart: number } | null {
   if (rawFence.trimStart().startsWith("{")) return { body: rawFence, bodyStart: fenceStart };
   let lead = 0;
   while (lead < rawFence.length && (rawFence[lead] === "\r" || rawFence[lead] === "\n")) lead++;
-  const slice = lead ? rawFence.slice(lead) : rawFence;
-  const base = fenceStart + lead;
-  const firstBreak = slice.indexOf("\n");
+  const slice = lead ? rawFence.slice(lead) : rawFence, base = fenceStart + lead, firstBreak = slice.indexOf("\n");
   if (firstBreak < 0 || !/^[ \t>]*(?:`{3,}|~{3,})/.test(slice.slice(0, firstBreak))) return null;
-  const bodyOffset = firstBreak + 1;
-  let bodyEnd = slice.length;
-  const trimmedEnd = slice.replace(/[ \t\r\n]+$/, "");
-  const lastBreak = trimmedEnd.lastIndexOf("\n");
-  if (lastBreak >= firstBreak && /^[ \t>]*(?:`{3,}|~{3,})[ \t]*$/.test(trimmedEnd.slice(lastBreak + 1))) {
-    bodyEnd = lastBreak;
-  }
+  const bodyOffset = firstBreak + 1, trimmedEnd = slice.replace(/[ \t\r\n]+$/, ""), lastBreak = trimmedEnd.lastIndexOf("\n");
+  const bodyEnd = lastBreak >= firstBreak && /^[ \t>]*(?:`{3,}|~{3,})[ \t]*$/.test(trimmedEnd.slice(lastBreak + 1)) ? lastBreak : slice.length;
   return bodyEnd >= bodyOffset ? { body: slice.slice(bodyOffset, bodyEnd), bodyStart: base + bodyOffset } : null;
 }
 
@@ -82,33 +37,17 @@ function decodeJsonStringWithOffsets(rawContent: string, contentStart: number): 
     if (ch === "\\") {
       if (i + 1 >= rawContent.length) return null;
       const esc = rawContent[i + 1];
-      let mapped = "";
-      let advance = 2;
-      switch (esc) {
-        case "\"": mapped = "\""; break;
-        case "\\": mapped = "\\"; break;
-        case "/": mapped = "/"; break;
-        case "b": mapped = "\b"; break;
-        case "f": mapped = "\f"; break;
-        case "n": mapped = "\n"; break;
-        case "r": mapped = "\r"; break;
-        case "t": mapped = "\t"; break;
-        case "u": {
-          const hex = rawContent.slice(i + 2, i + 6);
-          if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
-          mapped = String.fromCharCode(parseInt(hex, 16));
-          advance = 6;
-          break;
-        }
-        default: return null;
+      let mapped = JSON_ESCAPES[esc], advance = 2;
+      if (mapped === undefined) {
+        if (esc !== "u") return null;
+        const hex = rawContent.slice(i + 2, i + 6);
+        if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
+        mapped = String.fromCharCode(parseInt(hex, 16));
+        advance = 6;
       }
-      toSource.push(contentStart + i);
-      decoded += mapped;
-      i += advance;
+      toSource.push(contentStart + i); decoded += mapped; i += advance;
     } else {
-      toSource.push(contentStart + i);
-      decoded += ch;
-      i += 1;
+      toSource.push(contentStart + i); decoded += ch; i += 1;
     }
   }
   toSource.push(contentStart + rawContent.length);
@@ -122,16 +61,11 @@ function decodeJsonStringWithOffsets(rawContent: string, contentStart: number): 
 class JsonSpanScanner {
   private readonly text: string;
   private readonly base: number;
-
-  constructor(text: string, base: number) {
-    this.text = text;
-    this.base = base;
-  }
+  constructor(text: string, base: number) { this.text = text; this.base = base; }
 
   skipWs(pos: number): number {
     const s = this.text;
-    let i = pos;
-    let atLineStart = i === 0 || s[i - 1] === "\n";
+    let i = pos, atLineStart = i === 0 || s[i - 1] === "\n";
     while (i < s.length) {
       const c = s[i];
       if (c === " " || c === "\t" || c === "\r") i++;
@@ -163,8 +97,7 @@ class JsonSpanScanner {
 
   skipValue(pos: number, depth = 0): number {
     if (depth > 64) return -1;
-    const s = this.text;
-    const i = this.skipWs(pos);
+    const s = this.text, i = this.skipWs(pos);
     if (i >= s.length) return -1;
     const ch = s[i];
     if (ch === "\"") return this.skipString(i);
@@ -204,11 +137,9 @@ class JsonSpanScanner {
   }
 
   scanObjectTitleProperty(pos: number): { titleSpan?: DecodedStringSpan; next: number } | null {
-    const s = this.text;
-    const i = this.skipWs(pos);
+    const s = this.text, i = this.skipWs(pos);
     if (s[i] !== "{") return null;
-    let cur = this.skipWs(i + 1);
-    let titleSpan: DecodedStringSpan | undefined;
+    let cur = this.skipWs(i + 1), titleSpan: DecodedStringSpan | undefined;
     if (s[cur] === "}") return { titleSpan, next: cur + 1 };
     while (cur < s.length) {
       const key = this.scanString(cur);
@@ -219,8 +150,7 @@ class JsonSpanScanner {
       if (key.value === "title" && s[cur] === "\"") {
         const val = this.scanString(cur);
         if (!val) return null;
-        titleSpan = val.span;
-        cur = this.skipWs(val.next);
+        titleSpan = val.span; cur = this.skipWs(val.next);
       } else {
         const afterVal = this.skipValue(cur, 1);
         if (afterVal < 0) return null;
@@ -234,20 +164,12 @@ class JsonSpanScanner {
   }
 
   scanStepObject(pos: number, stepIndex: number): { step: StepSourceSpan; next: number } | null {
-    const s = this.text;
-    const start = this.skipWs(pos);
+    const s = this.text, start = this.skipWs(pos);
     if (s[start] !== "{") return null;
     let cur = this.skipWs(start + 1);
-    let labelSpan: DecodedStringSpan | undefined;
-    let markdownSpan: DecodedStringSpan | undefined;
-    let descriptionSpan: DecodedStringSpan | undefined;
-    let chartTitleSpan: DecodedStringSpan | undefined;
-    if (s[cur] === "}") {
-      return {
-        step: { stepIndex, objectStart: this.base + start, objectEnd: this.base + cur + 1, hasMarkdown: false, hasLegacyDescription: false },
-        next: cur + 1,
-      };
-    }
+    let labelSpan: DecodedStringSpan | undefined, markdownSpan: DecodedStringSpan | undefined;
+    let descriptionSpan: DecodedStringSpan | undefined, chartTitleSpan: DecodedStringSpan | undefined;
+    if (s[cur] === "}") return { step: { stepIndex, objectStart: this.base + start, objectEnd: this.base + cur + 1, hasMarkdown: false, hasLegacyDescription: false }, next: cur + 1 };
     while (cur < s.length) {
       const key = this.scanString(cur);
       if (!key) return null;
@@ -264,8 +186,7 @@ class JsonSpanScanner {
       } else if (key.value === "chart" && s[cur] === "{") {
         const chartObj = this.scanObjectTitleProperty(cur);
         if (!chartObj) return null;
-        chartTitleSpan = chartObj.titleSpan;
-        cur = this.skipWs(chartObj.next);
+        chartTitleSpan = chartObj.titleSpan; cur = this.skipWs(chartObj.next);
       } else {
         const afterVal = this.skipValue(cur, 1);
         if (afterVal < 0) return null;
@@ -276,15 +197,10 @@ class JsonSpanScanner {
         const hasLegacyDescription = !hasMarkdown && Boolean(descriptionSpan && descriptionSpan.decoded.length > 0);
         return {
           step: {
-            stepIndex,
-            objectStart: this.base + start,
-            objectEnd: this.base + cur + 1,
-            ...(labelSpan ? { labelSpan } : {}),
-            ...(markdownSpan ? { markdownSpan } : {}),
-            ...(descriptionSpan ? { descriptionSpan } : {}),
-            ...(chartTitleSpan ? { chartTitleSpan } : {}),
-            hasMarkdown,
-            hasLegacyDescription,
+            stepIndex, objectStart: this.base + start, objectEnd: this.base + cur + 1,
+            ...(labelSpan ? { labelSpan } : {}), ...(markdownSpan ? { markdownSpan } : {}),
+            ...(descriptionSpan ? { descriptionSpan } : {}), ...(chartTitleSpan ? { chartTitleSpan } : {}),
+            hasMarkdown, hasLegacyDescription,
           },
           next: cur + 1,
         };
@@ -296,13 +212,11 @@ class JsonSpanScanner {
   }
 
   scanStepDeck(): StepDeckSourceInfo | null {
-    const s = this.text;
-    const rootStart = this.skipWs(0);
+    const s = this.text, rootStart = this.skipWs(0);
     if (s[rootStart] !== "{") return null;
     let cur = this.skipWs(rootStart + 1);
     if (s[cur] === "}") return null;
-    let titleSpan: DecodedStringSpan | undefined;
-    let steps: StepSourceSpan[] | null = null;
+    let titleSpan: DecodedStringSpan | undefined, steps: StepSourceSpan[] | null = null;
     while (cur < s.length) {
       const key = this.scanString(cur);
       if (!key) return null;
@@ -312,15 +226,12 @@ class JsonSpanScanner {
       if (key.value === "title" && s[cur] === "\"") {
         const val = this.scanString(cur);
         if (!val) return null;
-        titleSpan = val.span;
-        cur = this.skipWs(val.next);
+        titleSpan = val.span; cur = this.skipWs(val.next);
       } else if (key.value === "steps" && s[cur] === "[") {
         const parsedSteps: StepSourceSpan[] = [];
         cur = this.skipWs(cur + 1);
-        if (s[cur] === "]") {
-          steps = parsedSteps;
-          cur = this.skipWs(cur + 1);
-        } else {
+        if (s[cur] === "]") { steps = parsedSteps; cur = this.skipWs(cur + 1); }
+        else {
           while (cur < s.length) {
             const parsedStep = this.scanStepObject(cur, parsedSteps.length);
             if (!parsedStep) return null;
@@ -360,34 +271,19 @@ export function inspectChartSource(rawFence: string, fenceStart = 0): { titleSpa
 
 function binarySearchSourceOffset(toSource: number[], target: number): number {
   let lo = 0, hi = toSource.length - 1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >>> 1;
-    const val = toSource[mid];
-    if (val === target) return mid;
-    if (val < target) lo = mid + 1;
-    else hi = mid - 1;
-  }
+  while (lo <= hi) { const mid = (lo + hi) >>> 1, val = toSource[mid]; if (val === target) return mid; if (val < target) lo = mid + 1; else hi = mid - 1; }
   return -1;
 }
 
-export function mapSourceRangeToDecoded(
-  span: DecodedStringSpan,
-  range: { from: number; to: number },
-  trimmedOnly = false,
-): { from: number; to: number } | null {
+export function mapSourceRangeToDecoded(span: DecodedStringSpan, range: { from: number; to: number }, trimmedOnly = false): { from: number; to: number } | null {
   if (range.from < span.contentStart || range.to > span.contentEnd || range.to <= range.from) return null;
-  const dFrom = binarySearchSourceOffset(span.toSource, range.from);
-  const dTo = dFrom >= 0 ? binarySearchSourceOffset(span.toSource, range.to) : -1;
+  const dFrom = binarySearchSourceOffset(span.toSource, range.from), dTo = dFrom >= 0 ? binarySearchSourceOffset(span.toSource, range.to) : -1;
   if (dFrom < 0 || dTo <= dFrom) return null;
   if (trimmedOnly && (dFrom < span.trimStartIndex || dTo > span.trimEndIndex)) return null;
   return { from: dFrom, to: dTo };
 }
 
-export function classifyStepDeckOccurrence(
-  deckInfo: StepDeckSourceInfo,
-  range: { from: number; to: number },
-  activeStepIndex = 0,
-): StepDeckOccurrenceClassification {
+export function classifyStepDeckOccurrence(deckInfo: StepDeckSourceInfo, range: { from: number; to: number }, activeStepIndex = 0): StepDeckOccurrenceClassification {
   for (const step of deckInfo.steps) {
     if (range.from < step.objectStart || range.from >= step.objectEnd || range.to > step.objectEnd) continue;
     const tryField = (span: DecodedStringSpan | undefined, visibleRegion: StepVisibleRegion, trimmedOnly: boolean, openLegacyNote = false) => {
@@ -402,22 +298,14 @@ export function classifyStepDeckOccurrence(
       (step.hasLegacyDescription ? tryField(step.descriptionSpan, "step-legacy-description", false, true) : null);
     if (hit) return hit;
     const inLegacyRaw = Boolean(step.hasLegacyDescription && step.descriptionSpan && range.from >= step.descriptionSpan.contentStart && range.to <= step.descriptionSpan.contentEnd);
-    return {
-      stepIndex: step.stepIndex,
-      openLegacyNote: inLegacyRaw,
-      visibleRegion: null,
-      fieldSpan: inLegacyRaw ? (step.descriptionSpan ?? null) : null,
-      decodedRange: null,
-    };
+    return { stepIndex: step.stepIndex, openLegacyNote: inLegacyRaw, visibleRegion: null, fieldSpan: inLegacyRaw ? (step.descriptionSpan ?? null) : null, decodedRange: null };
   }
   if (deckInfo.titleSpan) {
     const decodedRange = mapSourceRangeToDecoded(deckInfo.titleSpan, range, true);
     if (decodedRange) {
       const clampedActive = Math.max(0, Math.min(activeStepIndex, deckInfo.steps.length - 1));
       const targetStep = deckInfo.steps[clampedActive]?.hasMarkdown ? clampedActive : deckInfo.steps.findIndex(s => s.hasMarkdown);
-      if (targetStep >= 0) {
-        return { stepIndex: targetStep, openLegacyNote: false, visibleRegion: "deck-title", fieldSpan: deckInfo.titleSpan, decodedRange };
-      }
+      if (targetStep >= 0) return { stepIndex: targetStep, openLegacyNote: false, visibleRegion: "deck-title", fieldSpan: deckInfo.titleSpan, decodedRange };
     }
   }
   return NO_OCCURRENCE;
@@ -428,9 +316,7 @@ export function closestSourceOwner(el: Element | null): HTMLElement | null {
   while (cur) {
     const stepDeck = cur.closest<HTMLElement>(".step-cards");
     if (stepDeck && stepDeck !== cur) {
-      cur = stepDeck.hasAttribute("data-source-start")
-        ? stepDeck
-        : (stepDeck.parentElement?.closest<HTMLElement>("[data-source-start],.code-container") ?? null);
+      cur = stepDeck.hasAttribute("data-source-start") ? stepDeck : (stepDeck.parentElement?.closest<HTMLElement>("[data-source-start],.code-container") ?? null);
       continue;
     }
     return cur;
@@ -442,11 +328,7 @@ export function resolveRenderedStepCard(owner: HTMLElement): HTMLElement | null 
   if (owner.classList.contains("step-cards")) return owner;
   if (owner.classList.contains("step-cards-placeholder")) {
     const deckId = owner.getAttribute("data-step-deck-id");
-    if (deckId) {
-      for (const card of document.querySelectorAll<HTMLElement>(".step-viewer .step-cards")) {
-        if (card.getAttribute("data-step-deck-id") === deckId) return card;
-      }
-    }
+    if (deckId) for (const card of document.querySelectorAll<HTMLElement>(".step-viewer .step-cards")) if (card.getAttribute("data-step-deck-id") === deckId) return card;
   }
   return owner.querySelector<HTMLElement>(".step-cards");
 }
@@ -455,11 +337,13 @@ export function stepCardScrollTarget(owner: HTMLElement): Element {
   const card = resolveRenderedStepCard(owner);
   if (!card || card.closest(".step-viewer")) return owner;
   const viewportHeight = typeof window !== "undefined" && window.innerHeight > 0 ? window.innerHeight : 800;
-  if (card.getBoundingClientRect().height > viewportHeight * 0.85) {
-    return card.querySelector(".step-cards-inline-figure,.step-cards-chart-frame.is-current,.step-cards-figure.is-current,.step-cards-stage") ?? card;
-  }
-  return card;
+  return card.getBoundingClientRect().height > viewportHeight * 0.85
+    ? (card.querySelector(".step-cards-inline-figure,.step-cards-chart-frame.is-current,.step-cards-figure.is-current,.step-cards-stage") ?? card)
+    : card;
 }
+
+export const ownerScrollTarget = (owner: HTMLElement): Element =>
+  owner.matches(".step-cards,.step-cards-placeholder") ? stepCardScrollTarget(owner) : owner;
 
 export function stepRegionElement(card: HTMLElement, region: StepVisibleRegion): Element | null {
   switch (region) {
@@ -471,13 +355,7 @@ export function stepRegionElement(card: HTMLElement, region: StepVisibleRegion):
   }
 }
 
-export function isDirectChartTitleMatch(
-  rawFence: string,
-  fenceStart: number,
-  candidate: { from: number; to: number },
-  query?: string,
-  options: SearchMatchConfig = false,
-): boolean {
+export function isDirectChartTitleMatch(rawFence: string, fenceStart: number, candidate: { from: number; to: number }, query?: string, options: SearchMatchConfig = false): boolean {
   const chartInfo = inspectChartSource(rawFence, fenceStart);
   if (!chartInfo?.titleSpan) return false;
   const dRange = mapSourceRangeToDecoded(chartInfo.titleSpan, candidate, true);
@@ -485,26 +363,66 @@ export function isDirectChartTitleMatch(
   if (query !== undefined && chartInfo.titleSpan.toSource[dRange.to] - chartInfo.titleSpan.toSource[dRange.from] !== dRange.to - dRange.from) {
     const { pattern } = compileSearchPattern(query, options, false);
     if (!pattern) return false;
-    const sub = chartInfo.titleSpan.decoded.slice(dRange.from, dRange.to);
-    const m = pattern.exec(sub);
+    const sub = chartInfo.titleSpan.decoded.slice(dRange.from, dRange.to), m = pattern.exec(sub);
     if (!m || m.index !== 0 || m[0].length !== sub.length) return false;
   }
   return true;
 }
 
-export function stepDeckFenceMatches(
-  rawFence: string,
-  fenceStart: number,
-  query: string,
-  options: SearchMatchConfig = false,
-): Array<{ from: number; to: number }> {
+function isDecodedSliceVisibleMatch(span: DecodedStringSpan, dRange: { from: number; to: number }, region: StepVisibleRegion, pattern: RegExp | null, hiddenSpans?: (decoded: string) => Array<{ from: number; to: number }>): boolean {
+  if (span.toSource[dRange.to] - span.toSource[dRange.from] !== dRange.to - dRange.from) {
+    if (!pattern) return false;
+    pattern.lastIndex = 0;
+    const sub = span.decoded.slice(dRange.from, dRange.to), m = pattern.exec(sub);
+    if (!m || m.index !== 0 || m[0].length !== sub.length) return false;
+  }
+  if ((region === "step-markdown" || region === "step-legacy-description") && span.decoded.length <= 200_000 && hiddenSpans) {
+    if (hiddenSpans(span.decoded).some(h => dRange.from >= h.from && dRange.to <= h.to)) return false;
+  }
+  return true;
+}
+
+export function isStepDeckVisibleMatch(rawFence: string, fenceStart: number, card: HTMLElement | null, candidate: { from: number; to: number }, query?: string, options: SearchMatchConfig = false, hiddenSpans?: (decoded: string) => Array<{ from: number; to: number }>): boolean {
+  if (!card || card.classList.contains("step-cards-error")) return false;
+  const deckInfo = inspectStepDeckSource(rawFence, fenceStart);
+  if (!deckInfo) return false;
+  const currentStep = Number(card.getAttribute("data-step-index") ?? 0) || 0;
+  const occ = classifyStepDeckOccurrence(deckInfo, candidate, currentStep);
+  if (occ.stepIndex === null || occ.stepIndex !== currentStep || !occ.visibleRegion || !occ.fieldSpan || !occ.decodedRange) return false;
+  const { pattern } = query !== undefined ? compileSearchPattern(query, options, false) : { pattern: null };
+  return isDecodedSliceVisibleMatch(occ.fieldSpan, occ.decodedRange, occ.visibleRegion, pattern, hiddenSpans);
+}
+
+export function resolveStepDeckDomMatch(rawFence: string, fenceStart: number, card: HTMLElement | null, ranges: Array<{ from: number; to: number }>, activeIndex: number, query: string, options: SearchMatchConfig, getDomRanges: (scope: Element) => Range[], hiddenSpans?: (decoded: string) => Array<{ from: number; to: number }>): Range | null {
+  const target = ranges[activeIndex], fenceEnd = fenceStart + rawFence.length;
+  if (!target || !card || card.classList.contains("step-cards-error")) return null;
+  const deckInfo = inspectStepDeckSource(rawFence, fenceStart);
+  if (!deckInfo) return null;
+  const currentStep = Number(card.getAttribute("data-step-index") ?? 0) || 0;
+  const occ = classifyStepDeckOccurrence(deckInfo, target, currentStep);
+  if (occ.stepIndex === null || occ.stepIndex !== currentStep || !occ.visibleRegion || !occ.fieldSpan || !occ.decodedRange) return null;
+  const { pattern } = compileSearchPattern(query, options, false);
+  if (!isDecodedSliceVisibleMatch(occ.fieldSpan, occ.decodedRange, occ.visibleRegion, pattern, hiddenSpans)) return null;
+  const scopeEl = stepRegionElement(card, occ.visibleRegion);
+  if (!scopeEl) return null;
+  const domRanges = getDomRanges(scopeEl);
+  if (!domRanges.length) return null;
+  let ordinal = 0;
+  for (let i = 0; i < activeIndex; i++) {
+    const candidate = ranges[i];
+    if (candidate.from < fenceStart || candidate.to > fenceEnd) continue;
+    const prev = classifyStepDeckOccurrence(deckInfo, candidate, currentStep);
+    if (prev.stepIndex === currentStep && prev.visibleRegion === occ.visibleRegion && prev.fieldSpan && prev.decodedRange && isDecodedSliceVisibleMatch(prev.fieldSpan, prev.decodedRange, prev.visibleRegion, pattern, hiddenSpans)) ordinal++;
+  }
+  return domRanges[ordinal] ?? null;
+}
+
+export function stepDeckFenceMatches(rawFence: string, fenceStart: number, query: string, options: SearchMatchConfig = false): Array<{ from: number; to: number }> {
   const extracted = extractFenceBodySpan(rawFence, fenceStart);
   if (!extracted) return [];
   const { pattern } = compileSearchPattern(query, options, false);
   if (!pattern) return [];
-  const text = `${extracted.body}\n`;
-  const bodyLen = extracted.body.length;
-  const ranges: Array<{ from: number; to: number }> = [];
+  const text = `${extracted.body}\n`, bodyLen = extracted.body.length, ranges: Array<{ from: number; to: number }> = [];
   let match: RegExpExecArray | null;
   while ((match = nextSearchMatch(pattern, text)) && ranges.length < 5000) {
     if (match.index >= bodyLen) continue;
@@ -514,16 +432,21 @@ export function stepDeckFenceMatches(
   return ranges;
 }
 
-export function revealStepCardsSlide(
-  owner: HTMLElement,
-  bounds: { start: number; end: number } | null,
-  content: string,
-  target: { from: number; to: number },
-  openNestedDisclosures?: (desc: Element) => boolean,
-): { changed: boolean; card: HTMLElement | null } {
-  const stepOwner = owner.matches(".step-cards,.step-cards-placeholder")
-    ? owner
-    : owner.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
+export function stepWindowedFenceRanges(wBlock: HTMLElement, content: string, query: string, options: SearchMatchConfig, getBounds: (el: Element, content?: string) => { start: number; end: number } | null): Array<{ from: number; to: number }> | null {
+  const wBounds = getBounds(wBlock, content);
+  if (!wBounds) return null;
+  const stepOwner = wBlock.matches(".step-cards,.step-cards-placeholder") ? wBlock : wBlock.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
+  if (stepOwner) {
+    const sBounds = getBounds(stepOwner, content);
+    if (!sBounds || content.slice(wBounds.start, sBounds.start).trim() || content.slice(sBounds.end, wBounds.end).trim()) return null;
+    return stepDeckFenceMatches(content.slice(sBounds.start, sBounds.end), sBounds.start, query, options);
+  }
+  const raw = content.slice(wBounds.start, wBounds.end);
+  return /^\s*(?:`{3,}|~{3,})[ \t]*\{?[ \t]*smd-steps\b/i.test(raw) ? stepDeckFenceMatches(raw, wBounds.start, query, options) : null;
+}
+
+export function revealStepCardsSlide(owner: HTMLElement, bounds: { start: number; end: number } | null, content: string, target: { from: number; to: number }, openNestedDisclosures?: (desc: Element) => boolean): { changed: boolean; card: HTMLElement | null } {
+  const stepOwner = owner.matches(".step-cards,.step-cards-placeholder") ? owner : owner.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
   if (!stepOwner || stepOwner.classList.contains("step-cards-error")) return { changed: false, card: null };
   const initialCard = resolveRenderedStepCard(stepOwner);
   if (!bounds) return { changed: false, card: initialCard };
@@ -533,11 +456,7 @@ export function revealStepCardsSlide(
   const beforeLegacyOpen = Boolean(initialCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
   const occ = classifyStepDeckOccurrence(deckInfo, target, beforeStep);
   if (occ.stepIndex === null) return { changed: false, card: initialCard };
-  (initialCard ?? stepOwner).dispatchEvent(
-    new CustomEvent<StepRevealDetail>(STEP_REVEAL_EVENT, {
-      detail: { stepIndex: occ.stepIndex, openLegacyNote: occ.openLegacyNote },
-    }),
-  );
+  (initialCard ?? stepOwner).dispatchEvent(new CustomEvent<StepRevealDetail>(STEP_REVEAL_EVENT, { detail: { stepIndex: occ.stepIndex, openLegacyNote: occ.openLegacyNote } }));
   const liveCard = resolveRenderedStepCard(stepOwner);
   let openedNested = false;
   if (liveCard && occ.visibleRegion === "step-markdown" && openNestedDisclosures) {
@@ -547,4 +466,9 @@ export function revealStepCardsSlide(
   const afterStep = Number(liveCard?.getAttribute("data-step-index") ?? stepOwner.getAttribute("data-step-index") ?? 0) || 0;
   const afterLegacyOpen = Boolean(liveCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
   return { changed: afterStep !== beforeStep || afterLegacyOpen !== beforeLegacyOpen || openedNested, card: liveCard };
+}
+
+export function revealStepCardsForOwner(owner: HTMLElement, content: string, target: { from: number; to: number }, getBounds: (el: Element, content?: string) => { start: number; end: number } | null, openNestedDisclosures?: (desc: Element) => boolean): { changed: boolean; card: HTMLElement | null } {
+  const stepOwner = owner.matches(".step-cards,.step-cards-placeholder") ? owner : owner.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
+  return stepOwner ? revealStepCardsSlide(stepOwner, getBounds(stepOwner, content), content, target, openNestedDisclosures) : { changed: false, card: null };
 }

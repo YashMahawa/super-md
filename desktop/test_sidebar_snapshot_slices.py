@@ -76,16 +76,16 @@ def _extract_qml_function(qml: str, signature: str) -> str:
 
 def _production_sidebar_harness_qml() -> bytes:
     qml = MAIN_QML.read_text(encoding="utf-8")
-    sidebar_start = qml.index("        Pane {\n            visible: sidebar && !viewState.fullscreen && !viewState.imageOverlay")
+    sidebar_start = qml.index("        WorkspaceSidebar {")
     sidebar_end = qml.index("        Item {\n            SplitView.fillWidth: true", sidebar_start)
     sidebar_pane = textwrap.dedent(qml[sidebar_start:sidebar_end]).rstrip()
     sidebar_pane = sidebar_pane.replace(
-        "SplitView.preferredWidth: 260\n    SplitView.minimumWidth: 200\n    SplitView.maximumWidth: 500",
-        "Layout.preferredWidth: 300\n    Layout.fillHeight: true",
+        "WorkspaceSidebar {",
+        "WorkspaceSidebar {\n    Layout.preferredWidth: 300\n    Layout.fillHeight: true",
         1,
     )
 
-    popup_start = qml.index("    Popup {\n        id: contentsPopup")
+    popup_start = qml.index("    ContentsPopup {")
     popup_end = qml.index("    AppDialog {\n        id: settingsDialog", popup_start)
     popup_block = textwrap.dedent(qml[popup_start:popup_end]).rstrip()
 
@@ -106,6 +106,8 @@ ApplicationWindow {{
     visible: true
     color: viewState.colors.surface
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var shortcutBindings: JSON.parse(studio.shortcutBindings)
     property var shortcutLabels: JSON.parse(studio.shortcutLabels)
@@ -143,6 +145,8 @@ ApplicationWindow {{
         TabStrip {{
             width: parent.width
             viewState: window.viewState
+            tabs: window.tabsState
+            activeTabId: window.activeTabId
             shortcutLabels: window.shortcutLabels
         }}
         Rectangle {{ width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }}
