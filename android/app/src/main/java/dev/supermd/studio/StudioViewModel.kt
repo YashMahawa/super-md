@@ -88,6 +88,9 @@ data class PendingSeededFind(
     val nonce: Long = System.nanoTime(),
     val targetTabId: String? = null,
     val targetUri: String? = null,
+    val sourceStart: Int? = null,
+    val sourceEnd: Int? = null,
+    val matchText: String? = null,
 )
 data class StudioState(val latexAutofix:Boolean=false, val typewriterScroll:Boolean=false, val selectionAssistant:String="chatgpt", val centerLock:Boolean=true, val customTheme:String="", val activeThemeKind:String="builtin", val activeThemeId:String="", val customThemeSource:String="", val savedThemes:List<SavedThemeEntry> = emptyList(), val patternKind:String="", val patternOpacity:Float=-1f, val patternSize:Float=0f, val patternSpacing:Float=0f, val restorePosition:Boolean=true, val fullDocumentAccessibility:Boolean=false, val startup:String="restore", val imageAppearance:String="original", val svgAppearance:String="original", val imageContrast:Float=1.25f, val spellCheck:Boolean = false, val grammarCheck:Boolean = false, val accent: String = "system", val widthPercent: Float = 100f, val lineHeight: Float = 1.65f, val autosave: Boolean = true, val customFonts: List<String> = emptyList(), val readerOverlay: Boolean = false, val editorFocused: Boolean = false, val zoomCommand: Long = 0, val tabs: List<Note> = listOf(Note(name = "Welcome.md", content = sample, saved = sample)), val closedTabs: List<Note> = emptyList(), val activeId: String = "", val mode: String = "live", val fullscreen: Boolean = false, val normalZoom: Float = 100f, val fullscreenZoom: Float = 100f, val theme: String = "system", val fullscreenTheme: String = "black", val motion: Boolean = true, val font: String = "Manrope", val size: Float = 15f, val folder: String? = null, val folderRelative: String = "", val files: List<FileEntry> = emptyList(), val busy: Boolean = false, val message: String? = null, val error: String? = null, val welcomed: Boolean = false, val pdf: String = "{\"pageSize\":\"a4\",\"margin\":14,\"fontSize\":10.5,\"lineHeight\":1.4,\"paragraphSpacing\":0.65,\"fontFamily\":\"Manrope\",\"pageNumbers\":true}", val storageReport: StorageReport? = null, val storageScanning: Boolean = false, val conflictedTabIds: Set<String> = emptySet(), val blockedWriteUris: Set<String> = emptySet(), val pendingCloseNoteId: String? = null, val pendingSaveConflictNoteId: String? = null, val pendingHeading: PendingHeadingJump? = null, val folderAccessPrompt: WorkspaceFolderPrompt? = null) {
     val active get() = tabs.find { it.id == activeId } ?: tabs.firstOrNull() ?: EMPTY_NOTE
@@ -4001,12 +4004,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             (match.tabId != null && tab.id == match.tabId) ||
                 (!match.uri.isNullOrBlank() && !tab.uri.isNullOrBlank() && sameDocumentUri(tab.uri, match.uri))
         }
+        val hasValidRange = match.sourceStart >= 0 && match.sourceEnd >= match.sourceStart
         if (query.isNotEmpty()) {
             seededFindMutable.value = PendingSeededFind(
                 query = query,
                 caseSensitive = caseSensitive,
                 targetTabId = existing?.id ?: match.tabId,
                 targetUri = existing?.uri ?: match.uri,
+                sourceStart = if (hasValidRange) match.sourceStart else null,
+                sourceEnd = if (hasValidRange) match.sourceEnd else null,
+                matchText = if (hasValidRange) match.matchText.takeIf { it.isNotEmpty() } else null,
             )
         }
         if (existing != null) {

@@ -70,6 +70,8 @@ class StudioSettingsAndProtocolCoordinatorTest {
         assertTrue("Condition timed out", predicate())
     }
 
+    private fun waitUntil(predicate: () -> Boolean) = await(predicate)
+
     @Test fun coldRestoreSettingsPreferencesZoomOverlayModeAndStorageCleanupWorkEndToEnd() {
         val prefs = app.getSharedPreferences("studio", 0)
         prefs.edit().putString("patternKind", "dots").putFloat("patternOpacity", 0.12f).putBoolean("centerLock", false)
@@ -147,9 +149,31 @@ class StudioSettingsAndProtocolCoordinatorTest {
         assertFalse(conflict.getBoolean("accepted"))
         model.preserveMalformedReaderResync(smdId, "# Malformed envelope draft")
         val conflictDir = File(app.filesDir, "reader-conflicts")
-        await { (conflictDir.listFiles { f -> f.extension == "json" }?.size ?: 0) == 2 }
+        await { (conflictDir.listFiles { f -> f.extension == "json" }?.size ?: 0) == 2 && model.state.value.error != null }
         val payloads = conflictDir.listFiles { f -> f.extension == "json" }!!.map { JSONObject(it.readText()).getString("content") }.toSet()
         assertEquals(setOf("# Conflicting reader text", "# Malformed envelope draft"), payloads)
+        assertEquals("Reader edits conflicted with newer native content. A private recovery copy was saved.", model.state.value.error)
+    }
+
+    @Test fun concurrentReaderConflictPreservationCreatesDirectoryWithoutRace() {
+        val model = newModel()
+        model.reading(autosave = false)
+        model.newNote(content = "# Native")
+        waitUntil { model.state.value.active.name == "Untitled.md" }
+        val noteId = model.state.value.active.id
+        val conflictDir = File(app.filesDir, "reader-conflicts").apply { deleteRecursively() }
+        assertFalse(conflictDir.exists())
+
+        repeat(10) { index ->
+            if (index % 2 == 0) {
+                assertFalse(model.readerResync(noteId, "ep-$index", 0L, listOf("# Stale-$index"), "# Draft $index").getBoolean("accepted"))
+            } else {
+                model.preserveMalformedReaderResync(noteId, "# Draft $index")
+            }
+        }
+        waitUntil { (conflictDir.listFiles { f -> f.extension == "json" }?.size ?: 0) == 10 && model.state.value.error != null }
+        val payloads = conflictDir.listFiles { f -> f.extension == "json" }!!.map { JSONObject(it.readText()).getString("content") }.toSet()
+        assertEquals((0 until 10).map { "# Draft $it" }.toSet(), payloads)
         assertEquals("Reader edits conflicted with newer native content. A private recovery copy was saved.", model.state.value.error)
     }
 }
