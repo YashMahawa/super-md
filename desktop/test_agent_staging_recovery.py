@@ -14,7 +14,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, QTimer
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
@@ -78,6 +78,33 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
         studio.pool.shutdown(wait=True, cancel_futures=True)
         session.writes.shutdown(wait=True)
         self.app.processEvents()
+
+    def _read_text_with_sharing_retry(self, path: Path, *, timeout: float = 2.0) -> str:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                return path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                raise
+            except (PermissionError, OSError):
+                if time.monotonic() >= deadline:
+                    raise
+                self.app.processEvents()
+                time.sleep(0.01)
+
+    def _wait_for_file_text(self, path: Path, predicate, *, timeout: float = 3.0) -> str:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                current = self._read_text_with_sharing_retry(path, timeout=0.5)
+                if predicate(current):
+                    return current
+            except FileNotFoundError:
+                pass
+            if time.monotonic() >= deadline:
+                return self._read_text_with_sharing_retry(path, timeout=0.5)
+            self.app.processEvents()
+            time.sleep(0.01)
 
     def _start_live_bridge(self, session: Session, studio: Studio):
         bridge = agent_live.create_qt_bridge(session, session.data)
@@ -158,7 +185,7 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
 
                 recovery_path = root / "recovery.json"
                 self.assertTrue(recovery_path.is_file())
-                data = json.loads(recovery_path.read_text(encoding="utf-8"))
+                data = json.loads(self._read_text_with_sharing_retry(recovery_path))
                 recovered = next((item for item in data if item["id"] == bg_tab["id"]), None)
                 self.assertIsNotNone(recovered)
                 self.assertIn("Staged AI text.", recovered["content"])
@@ -167,18 +194,15 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                 # Autosave skips staged inactive tabs so disk stays untouched until user activates or saves.
                 studio._autosave()
                 QTest.qWait(60)
-                self.assertEqual(bg_file.read_text(encoding="utf-8"), bg_initial)
+                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
 
                 # Selecting the tab clears agent_staged and resumes normal autosave to disk.
                 studio.selectTab(bg_tab["id"])
                 self.assertEqual(studio.active, bg_tab["id"])
                 self.assertFalse(bg_tab["agent_staged"])
                 studio._autosave()
-                save_deadline = time.monotonic() + 2.0
-                while time.monotonic() < save_deadline and bg_file.read_text(encoding="utf-8") == bg_initial:
-                    self.app.processEvents()
-                    time.sleep(0.01)
-                self.assertIn("Staged AI text.", bg_file.read_text(encoding="utf-8"))
+                saved_bg = self._wait_for_file_text(bg_file, lambda text: text != bg_initial, timeout=3.0)
+                self.assertIn("Staged AI text.", saved_bg)
 
                 # Explicit save_document on a staged inactive tab writes directly to disk and clears agent_staged.
                 manual_rev0 = hashlib.sha256(manual_initial.encode("utf-8")).hexdigest()
@@ -189,7 +213,7 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                     "operations": [{"type": "replace", "old": "Step 0.", "new": "Step 1."}],
                 })
                 self.assertTrue(manual_tab["agent_staged"])
-                self.assertEqual(manual_file.read_text(encoding="utf-8"), manual_initial)
+                self.assertEqual(self._read_text_with_sharing_retry(manual_file), manual_initial)
 
                 manual_rev1 = hashlib.sha256(manual_tab["content"].encode("utf-8")).hexdigest()
                 saved = studio._agent_document_action({
@@ -200,7 +224,7 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                 self.assertFalse(saved["isDirty"])
                 self.assertFalse(manual_tab["agent_staged"])
                 self.assertEqual(studio.active, bg_tab["id"])
-                self.assertEqual(manual_file.read_text(encoding="utf-8"), "# Manual Note\n\nStep 1.\n")
+                self.assertEqual(self._read_text_with_sharing_retry(manual_file), "# Manual Note\n\nStep 1.\n")
             finally:
                 self.dispose(session, studio)
 
@@ -241,6 +265,8 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                 call_box: dict = {}
 
                 with patch.object(studio_module, "atomic_json", side_effect=gated_atomic_json):
+                    call_started = time.monotonic()
+
                     def run_patch():
                         try:
                             call_box["result"] = client.patch_tab(
@@ -252,6 +278,7 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                         except BaseException as exc:
                             call_box["error"] = exc
                         finally:
+                            call_box["elapsed"] = time.monotonic() - call_started
                             call_done.set()
 
                     worker = threading.Thread(target=run_patch, daemon=True)
@@ -263,21 +290,37 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                         time.sleep(0.005)
                     self.assertTrue(write_started.is_set(), "Expected recovery.json write to begin")
 
-                    # Pump Qt events while the recovery write is held open:
-                    # patch_tab MUST NOT return prematurely, UI stays responsive,
+                    # Use an explicit queued Qt event-loop barrier while the recovery write is held open:
+                    # patch_tab MUST NOT return prematurely, UI continues processing queued events,
                     # focus stays on Active.md, and uncommitted content is not exposed in memory.
-                    ui_ticks = 0
-                    hold_until = time.monotonic() + 0.08
-                    while time.monotonic() < hold_until:
+                    ui_barrier_steps = 0
+                    ui_barrier_done = threading.Event()
+
+                    def advance_ui_barrier():
+                        nonlocal ui_barrier_steps
+                        ui_barrier_steps += 1
+                        if ui_barrier_steps >= 4:
+                            ui_barrier_done.set()
+                        else:
+                            QTimer.singleShot(0, advance_ui_barrier)
+
+                    QTimer.singleShot(0, advance_ui_barrier)
+                    hold_started = time.monotonic()
+                    min_hold_s = 0.06
+                    barrier_deadline = hold_started + 3.0
+                    while (
+                        (not ui_barrier_done.is_set() or (time.monotonic() - hold_started) < min_hold_s)
+                        and time.monotonic() < barrier_deadline
+                    ):
                         self.app.processEvents()
-                        ui_ticks += 1
                         time.sleep(0.005)
-                    self.assertGreater(ui_ticks, 3)
+                    self.assertTrue(ui_barrier_done.is_set(), "UI event-loop barrier did not complete while write was held")
+                    self.assertEqual(ui_barrier_steps, 4)
                     self.assertFalse(call_done.is_set(), "patch_tab returned before recovery.json committed")
                     self.assertFalse(recovery_path.exists())
                     self.assertEqual(studio.active, active_tab["id"])
                     self.assertEqual(bg_tab["content"], bg_initial)
-                    self.assertEqual(bg_file.read_text(encoding="utf-8"), bg_initial)
+                    self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
 
                     # Release the recovery write and verify exact commit before acknowledgment.
                     release_write.set()
@@ -288,6 +331,7 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                     worker.join(timeout=1.0)
 
                 self.assertNotIn("error", call_box)
+                self.assertGreaterEqual(call_box["elapsed"], min_hold_s)
                 result = call_box["result"]
                 expected_after = "# Background\n\nAfter delayed stage.\n"
                 self.assertTrue(result["changed"])
@@ -295,7 +339,7 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
 
                 # Immediately on return, recovery.json already holds the exact staged snapshot.
                 self.assertTrue(recovery_path.is_file())
-                recovered = json.loads(recovery_path.read_text(encoding="utf-8"))
+                recovered = json.loads(self._read_text_with_sharing_retry(recovery_path))
                 bg_entry = next(item for item in recovered if item["id"] == bg_tab["id"])
                 self.assertEqual(bg_entry["content"], expected_after)
                 self.assertTrue(bg_entry["agent_staged"])
@@ -306,7 +350,7 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                 self.assertTrue(bg_tab["agent_staged"])
                 studio._autosave()
                 QTest.qWait(40)
-                self.assertEqual(bg_file.read_text(encoding="utf-8"), bg_initial)
+                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
             finally:
                 if bridge is not None:
                     bridge.stop()
@@ -1015,13 +1059,125 @@ class DesktopAgentStagingRecoveryTests(unittest.TestCase):
                 self.assertEqual(res["revision"], hashlib.sha256(expected_after.encode("utf-8")).hexdigest())
                 self.assertEqual(bg_tab["content"], expected_after)
                 self.assertTrue(bg_tab["agent_staged"])
-                recovered = {item["id"]: item for item in json.loads(recovery_path.read_text(encoding="utf-8"))}
+                recovered = {item["id"]: item for item in json.loads(self._read_text_with_sharing_retry(recovery_path))}
                 self.assertEqual(recovered[bg_tab["id"]]["content"], expected_after)
-                self.assertEqual(bg_file.read_text(encoding="utf-8"), bg_initial)
+                self.assertEqual(self._read_text_with_sharing_retry(bg_file), bg_initial)
             finally:
                 if bridge is not None:
                     bridge.stop()
                 self.dispose(session, studio)
+
+    def test_staged_patch_tab_preserves_exact_snapshot_across_rename_and_shutdown_drain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            workspace_dir = root / "workspace"
+            sub_dir = workspace_dir / "docs"
+            sub_dir.mkdir(parents=True, exist_ok=True)
+            active_file = workspace_dir / "Active.md"
+            bg_file = sub_dir / "Background.md"
+            active_initial = "# Active\n\nFocused note.\n"
+            bg_initial = "# Background\n\nOriginal disk text.\n"
+            active_file.write_text(active_initial, encoding="utf-8")
+            bg_file.write_text(bg_initial, encoding="utf-8")
+
+            session, studio = self.make_studio(state_dir)
+            retired_cleanly = False
+            try:
+                studio.folder = studio_module.folder_ops.canonical_path_str(workspace_dir)
+                active_canon = studio_module.folder_ops.canonical_path_str(active_file)
+                bg_canon = studio_module.folder_ops.canonical_path_str(bg_file)
+                active_tab = studio._note("Active.md", active_initial, active_canon, saved=active_initial)
+                bg_tab = studio._note("Background.md", bg_initial, bg_canon, saved=bg_initial)
+                studio.tabs = [active_tab, bg_tab]
+                studio.active = active_tab["id"]
+                studio.ready = True
+                studio._recover()
+                studio._emit(True)
+                session.writes.flush(timeout=2.0)
+
+                rev0 = hashlib.sha256(bg_initial.encode("utf-8")).hexdigest()
+                staged_text = "# Background\n\nStaged across rename.\n"
+                patch_res = studio._agent_document_action({
+                    "action": "patch_tab",
+                    "tabId": bg_tab["id"],
+                    "expectedRevision": rev0,
+                    "operations": [{"type": "replace", "old": "Original disk text.", "new": "Staged across rename."}],
+                })
+                self.assertTrue(patch_res["changed"])
+                self.assertEqual(studio.active, active_tab["id"])
+                self.assertTrue(bg_tab["agent_staged"])
+
+                # 1. Live rename of the staged note updates startup.json + recovery.json without focus steal or disk overwrite.
+                studio.renameEntry(bg_canon, "RenamedBg.md")
+                rename_deadline = time.monotonic() + 3.0
+                while Path(bg_tab["path"]).name != "RenamedBg.md" and time.monotonic() < rename_deadline:
+                    self.app.processEvents()
+                    time.sleep(0.01)
+                session.writes.flush(timeout=2.0)
+                self.app.processEvents()
+
+                renamed_note = sub_dir / "RenamedBg.md"
+                self.assertTrue(renamed_note.is_file())
+                self.assertEqual(self._read_text_with_sharing_retry(renamed_note), bg_initial)
+                self.assertEqual(studio.active, active_tab["id"])
+                self.assertTrue(bg_tab["agent_staged"])
+
+                # 2. Folder rename initiated immediately before window retirement drains via #145 shutdown finalizer.
+                rename_entered = threading.Event()
+                release_rename = threading.Event()
+                real_rename_retry = studio_module._rename_path_with_windows_retry
+
+                def gated_rename(src, dst):
+                    rename_entered.set()
+                    self.assertTrue(release_rename.wait(5.0))
+                    return real_rename_retry(src, dst)
+
+                with patch.object(studio_module, "_rename_path_with_windows_retry", side_effect=gated_rename):
+                    studio.renameEntry(str(sub_dir), "archive")
+                    self.assertTrue(rename_entered.wait(2.0))
+                    studio.stop()
+                    studio.pool.shutdown(wait=True, cancel_futures=True)
+                    retired_cleanly = True
+
+                    shutdown_done = threading.Event()
+                    t = threading.Thread(
+                        target=lambda: (session.writes.shutdown(wait=True), shutdown_done.set()),
+                        daemon=True,
+                    )
+                    t.start()
+                    time.sleep(0.02)
+                    release_rename.set()
+                    t.join(timeout=3.0)
+                    self.assertTrue(shutdown_done.is_set())
+
+                final_note = workspace_dir / "archive" / "RenamedBg.md"
+                final_canon = studio_module.folder_ops.canonical_path_str(final_note)
+                self.assertTrue(final_note.is_file())
+                self.assertEqual(self._read_text_with_sharing_retry(final_note), bg_initial)
+
+                recovery_entries = {
+                    item["id"]: item
+                    for item in json.loads(self._read_text_with_sharing_retry(state_dir / "recovery.json"))
+                }
+                self.assertEqual(recovery_entries[bg_tab["id"]]["path"], final_canon)
+                self.assertEqual(recovery_entries[bg_tab["id"]]["content"], staged_text)
+                self.assertTrue(recovery_entries[bg_tab["id"]]["agent_staged"])
+
+                startup_data = json.loads(self._read_text_with_sharing_retry(state_dir / "startup.json"))
+                self.assertIn(final_canon, startup_data["paths"])
+
+                restarted_session, restarted_studio = self.make_studio(state_dir)
+                try:
+                    restored = next(item for item in restarted_studio.tabs if item["id"] == bg_tab["id"])
+                    self.assertEqual(restored["path"], final_canon)
+                    self.assertEqual(restored["content"], staged_text)
+                    self.assertTrue(restored["agent_staged"])
+                finally:
+                    self.dispose(restarted_session, restarted_studio)
+            finally:
+                if not retired_cleanly:
+                    self.dispose(session, studio)
 
     @staticmethod
     def _capture_exception(sink: list[BaseException], fn):
