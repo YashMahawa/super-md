@@ -79,9 +79,24 @@ class SubpackagePathsTest(unittest.TestCase):
                 configured_appdata_root({APPDATA_OVERRIDE_ENV: "relative/appdata"})
             override_dir.mkdir(parents=True, exist_ok=True)
             symlink_dir = root / "symlink-appdata"
-            symlink_dir.symlink_to(override_dir, target_is_directory=True)
-            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
-                configured_appdata_root({APPDATA_OVERRIDE_ENV: str(symlink_dir)})
+            created_link = False
+            try:
+                symlink_dir.symlink_to(override_dir, target_is_directory=True)
+                created_link = True
+            except OSError as exc:
+                if sys.platform == "win32" and getattr(exc, "winerror", None) == 1314:
+                    proc = subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(symlink_dir), str(override_dir)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    created_link = proc.returncode == 0
+                else:
+                    raise
+            if created_link:
+                with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                    configured_appdata_root({APPDATA_OVERRIDE_ENV: str(symlink_dir)})
 
     def test_run_tests_discovers_nested_tests_with_top_level_dir(self) -> None:
         captured: dict[str, object] = {}

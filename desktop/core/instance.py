@@ -11,10 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication, QDir, QLockFile, QMetaMethod, QObject, QStandardPaths, QTimer, QUrl, Qt, Signal, Slot
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-try:
-    from .paths import appdata_root
-except ImportError:
-    from core.paths import appdata_root
+from .paths import appdata_root
 
 _PROCESS_EXIT_LOCKS = []
 

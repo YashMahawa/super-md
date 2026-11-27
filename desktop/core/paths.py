@@ -17,6 +17,13 @@ def resource_root() -> Path:
     return SOURCE_ROOT
 
 
+def _is_link_or_junction(candidate: Path) -> bool:
+    if candidate.is_symlink():
+        return True
+    is_junction = getattr(candidate, "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
 def configured_appdata_root(env: Mapping[str, str] | None = None) -> Path | None:
     raw = (os.environ if env is None else env).get(APPDATA_OVERRIDE_ENV, "").strip()
     if not raw:
@@ -24,7 +31,7 @@ def configured_appdata_root(env: Mapping[str, str] | None = None) -> Path | None
     candidate = Path(raw).expanduser()
     if not candidate.is_absolute():
         raise ValueError(f"{APPDATA_OVERRIDE_ENV} must be an absolute path: {raw!r}")
-    if candidate.is_symlink():
+    if _is_link_or_junction(candidate):
         raise ValueError(f"{APPDATA_OVERRIDE_ENV} must not be a symlink: {raw!r}")
     return candidate.resolve()
 

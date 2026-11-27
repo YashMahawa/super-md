@@ -807,8 +807,11 @@ class BackgroundTests(unittest.TestCase):
                 f"sys.path.insert(0, {str(DESKTOP_DIR)!r})",
                 "from PySide6.QtCore import QCoreApplication, QUrl",
                 "from PySide6.QtGui import QFileOpenEvent",
+                "import python_runtime",
+                "python_runtime.discover = lambda *_a, **_kw: []",
                 "import main as desktop_main",
-                "from studio import Session",
+                "from studio import Session, Studio",
+                "Studio._restore_update = lambda self: None",
                 "from test_studio import QuietStudio",
                 "app = desktop_main.StudioApplication(['super-md-fileopen-test'])",
                 "session = Session(True)",
@@ -847,11 +850,13 @@ class BackgroundTests(unittest.TestCase):
                 "finally:",
                 "    studio.stop()",
                 "    studio.pool.shutdown(wait=True, cancel_futures=True)",
+                "    if hasattr(studio, '_search_pool'): studio._search_pool.shutdown(wait=True, cancel_futures=True)",
                 "    session.writes.shutdown(wait=True)",
                 "    shutil.rmtree(session.data, ignore_errors=True)",
             ])
             completed = subprocess.run(
                 [sys.executable, "-c", probe_script],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -921,6 +926,7 @@ class BackgroundTests(unittest.TestCase):
         ])
         completed = subprocess.run(
             [sys.executable, "-c", probe_script],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             encoding="utf-8",
