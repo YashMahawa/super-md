@@ -4599,7 +4599,7 @@ class Studio(QObject):
         elif action == "window": self.newWindowRequested.emit()
 
     def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
-        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
+        extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}[format]
         selected = filename or Path(tab["name"]).stem or "Super MD export"
         if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
             raise ValueError("Export filename must be a basename")
