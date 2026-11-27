@@ -99,6 +99,128 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             bounded.invalidate(vault_ref)
             self.assertTrue(any(item.name == "Note-00-Fresh.md" for item in bounded.scan(vault_ref)))
 
+    def test_scan_skips_binary_opens_and_xattrs_on_unrelated_assets_while_rejecting_eligible_aliases_and_seeing_mutations(self):
+        with tempfile.TemporaryDirectory() as base_dir:
+            base = Path(base_dir).resolve()
+            root = base / "Vault"
+            root.mkdir()
+            outside = base / "Outside.md"
+            outside.write_text("# Outside\n", encoding="utf-8")
+            outside_dir = base / "OutsideDir"
+            outside_dir.mkdir()
+            (outside_dir / "Leaked.md").write_text("# Leaked\n", encoding="utf-8")
+
+            for idx in range(24):
+                section = root / f"Section-{idx % 4}"
+                section.mkdir(exist_ok=True)
+                (section / f"Note-{idx:02d}.md").write_text(f"# Note {idx}\n", encoding="utf-8")
+
+            assets = root / "assets"
+            assets.mkdir()
+            png_header = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+            for idx in range(240):
+                (assets / f"figure-{idx:03d}.png").write_bytes(png_header)
+            (assets / "archive.zip").write_bytes(b"PK\x03\x04" + b"\x00" * 32)
+
+            # Eligible note extensions that are symlinks, junctions, or Finder aliases must still be rejected.
+            has_file_link = _try_create_link(root / "Symlinked.md", outside)
+            _try_create_link(root / "LinkedDir", outside_dir, target_is_directory=True)
+
+            bookmark_alias = root / "BookmarkAlias.md"
+            bookmark_alias.write_bytes(b"book\x00\x00\x00\x00mark\x00\x00\x00\x00" + b"\x00" * 32)
+            xattr_alias = root / "FinderInfoAlias.smd"
+            xattr_alias.write_text("# Looks like smd\n", encoding="utf-8")
+            folder_alias_file = root / "FolderAlias"
+            folder_alias_file.write_bytes(b"book\x00\x00\x00\x00mark\x00\x00\x00\x00" + b"\x00" * 32)
+
+            real_open = Path.open
+            real_getxattr = getattr(os, "getxattr", None)
+            opened_non_notes: list[str] = []
+            xattr_non_notes: list[str] = []
+
+            def tracking_open(self_path: Path, *args, **kwargs):
+                if self_path.suffix.lower() not in workspace_links.NOTE_EXTENSIONS:
+                    opened_non_notes.append(self_path.name)
+                return real_open(self_path, *args, **kwargs)
+
+            def tracking_getxattr(target, attr, *args, **kwargs):
+                p = Path(os.fsdecode(target))
+                if p.suffix.lower() not in workspace_links.NOTE_EXTENSIONS:
+                    xattr_non_notes.append(p.name)
+                if p.name == "FinderInfoAlias.smd" and attr == "com.apple.FinderInfo":
+                    info = bytearray(32)
+                    info[8] = 0x80
+                    return bytes(info)
+                if real_getxattr is not None:
+                    return real_getxattr(target, attr, *args, **kwargs)
+                raise OSError("xattr unavailable")
+
+            cache = WorkspaceLinkCache(ttl_seconds=60.0)
+            patchers = [mock.patch.object(Path, "open", tracking_open)]
+            if hasattr(os, "getxattr"):
+                patchers.append(mock.patch.object(os, "getxattr", side_effect=tracking_getxattr))
+
+            with patchers[0]:
+                if len(patchers) > 1:
+                    with patchers[1]:
+                        scanned = cache.scan(root)
+                else:
+                    scanned = cache.scan(root)
+
+            self.assertEqual(opened_non_notes, [])
+            self.assertEqual(xattr_non_notes, [])
+
+            scanned_names = {entry.name for entry in scanned}
+            self.assertIn("Note-00.md", scanned_names)
+            self.assertIn("Note-23.md", scanned_names)
+            self.assertNotIn("Leaked.md", scanned_names)
+            if has_file_link:
+                self.assertNotIn("Symlinked.md", scanned_names)
+            if os.name == "posix":
+                self.assertNotIn("BookmarkAlias.md", scanned_names)
+                if hasattr(os, "getxattr"):
+                    self.assertNotIn("FinderInfoAlias.smd", scanned_names)
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link(
+                        "BookmarkAlias.md",
+                        wikilink=False,
+                        note_path=root / "Section-0" / "Note-00.md",
+                        workspace_folder=root,
+                        cache=cache,
+                    )
+
+            # Simulated Windows directory junction on a nested folder is still rejected.
+            junction_dir = root / "JunctionSubdir"
+            junction_dir.mkdir()
+            (junction_dir / "HiddenBehindJunction.md").write_text("# Junction\n", encoding="utf-8")
+            cache.invalidate(root)
+            with mock.patch.object(
+                workspace_links,
+                "_is_symlink_or_junction",
+                side_effect=lambda p: p.name == "JunctionSubdir",
+            ):
+                rescanned = cache.scan(root)
+            self.assertFalse(any(item.name == "HiddenBehindJunction.md" for item in rescanned))
+            shutil.rmtree(junction_dir)
+
+            # Real directory mutation (creating a note directly on disk without calling cache.invalidate)
+            # is visible immediately on the next lookup within TTL.
+            xattr_alias.unlink()
+            cache.invalidate(root)
+            self.assertEqual(len(cache.scan(root)), 24)
+            mutated = root / "Section-2" / "FreshlyMutated.md"
+            mutated.write_text("# Added directly on disk\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link(
+                    "FreshlyMutated",
+                    wikilink=True,
+                    note_path=root / "Section-0" / "Note-00.md",
+                    workspace_folder=root,
+                    cache=cache,
+                ),
+                mutated.resolve(),
+            )
+
     def test_case_insensitive_fs_preserves_exact_case_ranking_and_invalidates_across_case_variants(self):
         with tempfile.TemporaryDirectory() as root_dir:
             root = Path(root_dir).resolve() / "Vault"

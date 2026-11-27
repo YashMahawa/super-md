@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -95,26 +96,31 @@ def _is_within_or_equal(candidate: Path, boundary: Path) -> bool:
     return candidate == boundary or boundary in candidate.parents
 
 
-def _is_macos_alias_file(path: Path) -> bool:
-    if os.name != "posix" or not hasattr(os, "getxattr"):
+def _is_macos_alias_file(path: Path, *, known_regular_file: bool = False) -> bool:
+    if os.name != "posix":
         return False
     try:
-        finder_info = os.getxattr(path, "com.apple.FinderInfo", follow_symlinks=False)
-        if len(finder_info) >= 10 and (finder_info[8] & 0x80):
-            return True
+        if not known_regular_file and not path.is_file():
+            return False
     except OSError:
-        pass
+        return False
+    if hasattr(os, "getxattr"):
+        try:
+            finder_info = os.getxattr(path, "com.apple.FinderInfo", follow_symlinks=False)
+            if len(finder_info) >= 10 and (finder_info[8] & 0x80):
+                return True
+        except OSError:
+            pass
     try:
-        if path.is_file():
-            with path.open("rb") as handle:
-                if handle.read(16) == b"book\x00\x00\x00\x00mark\x00\x00\x00\x00":
-                    return True
+        with path.open("rb") as handle:
+            if handle.read(16) == b"book\x00\x00\x00\x00mark\x00\x00\x00\x00":
+                return True
     except OSError:
         pass
     return False
 
 
-def _is_link_or_junction(path: Path) -> bool:
+def _is_symlink_or_junction(path: Path) -> bool:
     try:
         if path.is_symlink():
             return True
@@ -125,16 +131,31 @@ def _is_link_or_junction(path: Path) -> bool:
             return True
     except OSError:
         return False
-    return _is_macos_alias_file(path)
+    return False
 
 
-def _is_entry_link_or_junction(entry: os.DirEntry[str]) -> bool:
+def _is_entry_symlink_or_junction(entry: os.DirEntry[str]) -> bool:
     try:
         if entry.is_symlink():
             return True
+        is_junction = getattr(entry, "is_junction", None)
+        if callable(is_junction) and is_junction():
+            return True
     except OSError:
         return True
-    return _is_link_or_junction(Path(entry.path))
+    return _is_symlink_or_junction(Path(entry.path))
+
+
+def _is_link_or_junction(path: Path, *, known_regular_file: bool = False) -> bool:
+    if _is_symlink_or_junction(path):
+        return True
+    return _is_macos_alias_file(path, known_regular_file=known_regular_file)
+
+
+def _is_entry_link_or_junction(entry: os.DirEntry[str], *, known_regular_file: bool = False) -> bool:
+    if _is_entry_symlink_or_junction(entry):
+        return True
+    return _is_macos_alias_file(Path(entry.path), known_regular_file=known_regular_file)
 
 
 def _match_child_entry(
@@ -149,12 +170,14 @@ def _match_child_entry(
     case-insensitive filesystems such as macOS APFS and Windows NTFS.
     """
     direct = parent_dir / segment
-    if _is_link_or_junction(direct):
+    if _is_symlink_or_junction(direct):
         raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
     try:
         probed_stat = direct.stat(follow_symlinks=False)
     except OSError:
         return None
+    if stat.S_ISREG(probed_stat.st_mode) and _is_macos_alias_file(direct, known_regular_file=True):
+        raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
 
     seg_fold = segment.casefold()
     folded_match: os.DirEntry[str] | None = None
@@ -163,7 +186,7 @@ def _match_child_entry(
             for entry in iterator:
                 name = entry.name
                 if name == segment:
-                    if _is_entry_link_or_junction(entry):
+                    if _is_entry_symlink_or_junction(entry):
                         raise WorkspaceLinkError("Linked note symlink paths are not allowed.")
                     return entry
                 if name.casefold() != seg_fold:
@@ -224,6 +247,8 @@ class _DirStamp:
     path: Path
     mtime_ns: int
     ctime_ns: int
+    size: int
+    nlink: int
     file_id: tuple[int, int] | None
 
 
@@ -258,7 +283,12 @@ class WorkspaceLinkCache:
                 st = stamp.path.stat(follow_symlinks=False)
             except OSError:
                 return False
-            if st.st_mtime_ns != stamp.mtime_ns or st.st_ctime_ns != stamp.ctime_ns:
+            if (
+                st.st_mtime_ns != stamp.mtime_ns
+                or st.st_ctime_ns != stamp.ctime_ns
+                or st.st_size != stamp.size
+                or st.st_nlink != stamp.nlink
+            ):
                 return False
             if stamp.file_id is not None and _stat_identity(st) != stamp.file_id:
                 return False
@@ -300,6 +330,9 @@ class WorkspaceLinkCache:
                 self._entries.pop(key, None)
 
     def scan(self, boundary: Path | str | os.PathLike[str]) -> tuple[IndexedNote, ...]:
+        return self._scan_with_state(boundary)[0]
+
+    def _scan_with_state(self, boundary: Path | str | os.PathLike[str]) -> tuple[tuple[IndexedNote, ...], bool]:
         boundary_path = _resolve_clean_directory(boundary, "workspace folder")
         root_fold = _fold_cache_path(boundary_path)
         now = time.monotonic()
@@ -318,7 +351,7 @@ class WorkspaceLinkCache:
                 and os.fspath(cached.root) == os.fspath(boundary_path)
                 and self._is_fresh(cached, now)
             ):
-                return cached.entries
+                return cached.entries, True
 
         collected: list[IndexedNote] = []
         dir_stamps: list[_DirStamp] = []
@@ -342,6 +375,8 @@ class WorkspaceLinkCache:
                 path=current_dir,
                 mtime_ns=dir_stat.st_mtime_ns,
                 ctime_ns=dir_stat.st_ctime_ns,
+                size=dir_stat.st_size,
+                nlink=dir_stat.st_nlink,
                 file_id=_stat_identity(dir_stat),
             ))
 
@@ -351,7 +386,10 @@ class WorkspaceLinkCache:
                 if not name or name.startswith("."):
                     continue
                 try:
-                    if _is_entry_link_or_junction(entry):
+                    if entry.is_symlink():
+                        continue
+                    is_junction = getattr(entry, "is_junction", None)
+                    if callable(is_junction) and is_junction():
                         continue
                     is_dir = entry.is_dir(follow_symlinks=False)
                     is_file = not is_dir and entry.is_file(follow_symlinks=False)
@@ -362,11 +400,15 @@ class WorkspaceLinkCache:
                 rel_posix = f"{rel_prefix}/{name}" if rel_prefix else name
                 if is_dir:
                     if depth + 1 <= self.max_depth:
+                        if _is_symlink_or_junction(child_path):
+                            continue
                         subdirs.append((child_path, rel_posix, depth + 1))
                 elif is_file:
                     suffix = Path(name).suffix.lower()
                     ext_rank = _EXTENSION_PRIORITY.get(suffix)
                     if ext_rank is None:
+                        continue
+                    if _is_link_or_junction(child_path, known_regular_file=True):
                         continue
                     if len(collected) >= self.max_files:
                         truncated = True
@@ -411,7 +453,7 @@ class WorkspaceLinkCache:
             while len(self._entries) >= 16 and root_fold not in self._entries:
                 self._entries.pop(next(iter(self._entries)))
             self._entries[root_fold] = snapshot
-        return snapshot.entries
+        return snapshot.entries, False
 
 
 def _has_supported_note_extension(name: str) -> bool:
@@ -677,11 +719,11 @@ def resolve_workspace_link(
 
     # 2. Bounded, cached scan across the workspace folder.
     active_cache = cache if cache is not None else _DEFAULT_CACHE
-    entries = active_cache.scan(boundary)
+    entries, from_cache = active_cache._scan_with_state(boundary)
     winner, saw_stale = _rank_and_select_indexed_match(entries, cleaned, note_dir, boundary)
-    if saw_stale:
+    if saw_stale or (from_cache and winner is None):
         active_cache.invalidate(boundary)
-        entries = active_cache.scan(boundary)
+        entries, _ = active_cache._scan_with_state(boundary)
         winner, _ = _rank_and_select_indexed_match(entries, cleaned, note_dir, boundary)
     if winner is not None:
         return winner
