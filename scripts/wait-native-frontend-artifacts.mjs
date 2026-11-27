@@ -33,7 +33,43 @@ function validatePage(page, label) {
   return list;
 }
 
-function inspectProducerReadiness({ repository, runId, run, jobsPage }) {
+function readHeader(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === 'function') return headers.get(name);
+  const match = Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase());
+  return match ? String(match[1]) : null;
+}
+
+function parseNonNegativeInt(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  return /^[0-9]{1,12}$/.test(trimmed) ? Number(trimmed) : null;
+}
+
+export function sanitizeRateLimitHeaders(headers) {
+  const limit = parseNonNegativeInt(readHeader(headers, 'x-ratelimit-limit'));
+  const remaining = parseNonNegativeInt(readHeader(headers, 'x-ratelimit-remaining'));
+  const used = parseNonNegativeInt(readHeader(headers, 'x-ratelimit-used'));
+  const reset = parseNonNegativeInt(readHeader(headers, 'x-ratelimit-reset'));
+  const retryAfter = parseNonNegativeInt(readHeader(headers, 'retry-after'));
+  const rawResource = readHeader(headers, 'x-ratelimit-resource');
+  const resource = typeof rawResource === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(rawResource.trim())
+    ? rawResource.trim()
+    : null;
+  return { limit, remaining, used, reset, retryAfter, resource };
+}
+
+export function formatRateLimitDiagnostics(rateLimit) {
+  const fields = [];
+  if (rateLimit.remaining !== null) fields.push(`remaining=${rateLimit.remaining}`);
+  if (rateLimit.limit !== null) fields.push(`limit=${rateLimit.limit}`);
+  if (rateLimit.used !== null) fields.push(`used=${rateLimit.used}`);
+  if (rateLimit.reset !== null) fields.push(`reset=${rateLimit.reset}`);
+  if (rateLimit.retryAfter !== null) fields.push(`retryAfter=${rateLimit.retryAfter}s`);
+  if (rateLimit.resource !== null) fields.push(`resource=${rateLimit.resource}`);
+  return fields.length > 0 ? fields.join(', ') : 'rate-limit headers absent';
+}
+
+export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
   const expectedRunId = Number(runId);
   if (run?.id !== expectedRunId) throw new Error(`GitHub returned workflow run ${run?.id}, expected ${runId}`);
   if (run?.repository?.full_name?.toLowerCase() !== repository.toLowerCase()) {
@@ -45,20 +81,20 @@ function inspectProducerReadiness({ repository, runId, run, jobsPage }) {
   if (producerJobs.length > 1) throw new Error('Ambiguous native frontend producer jobs in this workflow run');
   if (producerJobs.length === 0) {
     if (run.status === 'completed') throw new Error('Native frontend producer is missing from the completed workflow run');
-    return { ready: false, reason: 'producer job has not been registered yet' };
+    return { ready: false, queued: true, reason: 'producer job has not been registered yet' };
   }
 
   const [producer] = producerJobs;
   if (producer.status === 'completed' && producer.conclusion !== 'success') {
     throw new Error(`Native frontend producer failed (${producer.conclusion || 'unknown'}); refusing fallback`);
   }
-  if (producer.status !== 'completed') return { ready: false, reason: `producer job is ${producer.status}` };
-  return { ready: true };
-}
-
-export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha, run, jobsPage, artifactsPage }) {
-  const producerState = inspectProducerReadiness({ repository, runId, run, jobsPage });
-  if (!producerState.ready) return producerState;
+  if (producer.status !== 'completed') {
+    return {
+      ready: false,
+      queued: producer.status !== 'in_progress',
+      reason: `producer job is ${producer.status}`,
+    };
+  }
 
   const artifacts = validatePage(artifactsPage, 'workflow artifacts');
   const expected = frontendArtifactNames(sourceSha);
@@ -68,69 +104,23 @@ export function inspectFrontendArtifactReadiness({ repository, runId, sourceSha,
   for (const artifact of [dist, manifest]) {
     if (artifact?.expired) throw new Error('Native frontend artifact has expired; refusing fallback');
   }
-  if (!dist || !manifest) return { ready: false, reason: 'exact-SHA artifact pair is not yet listed' };
+  if (!dist || !manifest) return { ready: false, queued: false, reason: 'exact-SHA artifact pair is not yet listed' };
   return { ready: true, names: expected };
 }
 
-function getHeader(headers, name) {
-  if (!headers) return null;
-  if (typeof headers.get === 'function') return headers.get(name);
-  const lower = name.toLowerCase();
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === lower && value != null) return String(value);
+function computeRetryDelayMs({ attempt, pollIntervalMs, maxBackoffMs, rateLimit, nowMs }) {
+  const exponentialMs = Math.min(maxBackoffMs, pollIntervalMs * (2 ** Math.min(Math.max(0, attempt - 1), 6)));
+  let hintedMs = 0;
+  if (rateLimit?.retryAfter !== null && rateLimit?.retryAfter !== undefined) {
+    hintedMs = Math.max(hintedMs, rateLimit.retryAfter * 1_000);
   }
-  return null;
+  if (rateLimit?.remaining === 0 && rateLimit?.reset !== null && rateLimit?.reset !== undefined) {
+    hintedMs = Math.max(hintedMs, (rateLimit.reset * 1_000) - nowMs);
+  }
+  return Math.min(maxBackoffMs, Math.max(exponentialMs, hintedMs));
 }
 
-function parseRetryDelayMs(headers, nowMs) {
-  const retryAfter = getHeader(headers, 'retry-after')?.trim();
-  if (retryAfter) {
-    if (/^\d+(\.\d+)?$/.test(retryAfter)) {
-      return Math.ceil(Number(retryAfter) * 1_000);
-    }
-    const retryDateMs = Date.parse(retryAfter);
-    if (Number.isFinite(retryDateMs)) {
-      return Math.max(0, retryDateMs - nowMs);
-    }
-  }
-  const remaining = getHeader(headers, 'x-ratelimit-remaining')?.trim();
-  const reset = getHeader(headers, 'x-ratelimit-reset')?.trim();
-  if (remaining === '0' && reset && /^\d+$/.test(reset)) {
-    return Math.max(0, Number(reset) * 1_000 - nowMs + 1_000);
-  }
-  return null;
-}
-
-async function readErrorMessage(response) {
-  try {
-    if (typeof response.text === 'function') {
-      const raw = await response.text();
-      if (!raw) return '';
-      try {
-        const parsed = JSON.parse(raw);
-        if (typeof parsed?.message === 'string') return parsed.message.trim();
-      } catch {
-        // Non-JSON error body
-      }
-      return raw.trim().slice(0, 300);
-    }
-    if (typeof response.json === 'function') {
-      const parsed = await response.json();
-      if (typeof parsed?.message === 'string') return parsed.message.trim();
-    }
-  } catch {
-    // Ignore error-body read failures
-  }
-  return '';
-}
-
-function isRateLimitForbidden(headers, message) {
-  if (getHeader(headers, 'retry-after')?.trim()) return true;
-  if (getHeader(headers, 'x-ratelimit-remaining')?.trim() === '0') return true;
-  return /\brate limit\b/i.test(message);
-}
-
-async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
+async function githubJson(url, token, fetchImpl, requestTimeoutMs) {
   let response;
   try {
     response = await fetchImpl(url, {
@@ -143,31 +133,33 @@ async function githubJson(url, token, fetchImpl, requestTimeoutMs, nowMs) {
     });
   } catch (error) {
     if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || error instanceof TypeError) {
-      return { retry: true, status: error.name || 'network-error', retryAfterMs: null, rateLimited: false };
+      return { retry: true, reason: `transient request error (${error.name || 'network-error'})`, rateLimit: null };
     }
     throw error;
   }
   if (!response.ok) {
-    const retryAfterMs = parseRetryDelayMs(response.headers, nowMs);
-    if (response.status >= 500 || response.status === 429) {
+    const rateLimit = sanitizeRateLimitHeaders(response.headers);
+    const summary = formatRateLimitDiagnostics(rateLimit);
+    const isRateLimited = response.status === 429
+      || (response.status === 403 && (rateLimit.retryAfter !== null || rateLimit.remaining === 0));
+    if (isRateLimited) {
       return {
         retry: true,
-        status: response.status,
-        retryAfterMs,
-        rateLimited: response.status === 429,
+        rateLimit,
+        reason: `rate-limited HTTP ${response.status} (${summary})`,
       };
     }
-    const message = await readErrorMessage(response);
-    if (response.status === 403 && isRateLimitForbidden(response.headers, message)) {
+    if (response.status >= 500) {
       return {
         retry: true,
-        status: 403,
-        retryAfterMs,
-        rateLimited: true,
+        rateLimit,
+        reason: `GitHub API HTTP ${response.status} (${summary})`,
       };
     }
-    const detail = message ? `: ${message}` : '';
-    throw new Error(`GitHub Actions API request failed with HTTP ${response.status}${detail}`);
+    if (response.status === 403) {
+      throw new Error(`GitHub Actions API request forbidden with HTTP 403 (not rate-limited; ${summary})`);
+    }
+    throw new Error(`GitHub Actions API request failed with HTTP ${response.status} (${summary})`);
   }
   return { value: await response.json() };
 }
@@ -180,64 +172,59 @@ export async function waitForNativeFrontendArtifacts({
   apiUrl,
   fetchImpl = fetch,
   sleep = delay,
-  timeoutMs = 900_000,
+  timeoutMs = 600_000,
+  queueTimeoutMs = Math.max(timeoutMs, 1_800_000),
   pollIntervalMs = 5_000,
+  maxBackoffMs = 60_000,
   now = Date.now,
 }) {
   const endpoint = assertInputs({ repository, runId, sourceSha, token, apiUrl });
   frontendArtifactNames(sourceSha);
-  const baseHref = endpoint.href.replace(/\/?$/, '/');
   const runPath = `repos/${repository}/actions/runs/${runId}`;
   const started = now();
-  let consecutiveRateLimits = 0;
-  let lastTransientStatus = null;
-  const remainingMs = () => Math.max(1, timeoutMs - (now() - started));
-  const pause = async (requestedDelayMs = pollIntervalMs) => {
-    const left = timeoutMs - (now() - started);
-    if (left > 0) await sleep(Math.min(Math.max(0, requestedDelayMs), left));
+  let sawQueued = false;
+  let activeStarted = null;
+  let retryAttempt = 0;
+  let lastReason = null;
+  const deadline = () => {
+    if (activeStarted !== null) return Math.min(started + queueTimeoutMs, activeStarted + timeoutMs);
+    return started + (sawQueued ? queueTimeoutMs : timeoutMs);
   };
-  const pauseForRetry = async result => {
-    lastTransientStatus = result.status;
-    if (result.rateLimited) {
-      consecutiveRateLimits += 1;
-    }
-    const backoffMs = result.rateLimited
-      ? Math.min(60_000, pollIntervalMs * (2 ** Math.min(consecutiveRateLimits - 1, 4)))
-      : pollIntervalMs;
-    const waitMs = result.retryAfterMs != null
-      ? Math.max(pollIntervalMs, result.retryAfterMs)
-      : backoffMs;
+  const remainingMs = () => Math.max(1, deadline() - now());
+  const pause = async (waitMs = pollIntervalMs) => {
+    const left = deadline() - now();
+    if (left > 0) await sleep(Math.min(waitMs, left));
+  };
+  const pauseRetry = async result => {
+    retryAttempt += 1;
+    lastReason = result.reason;
+    const waitMs = computeRetryDelayMs({
+      attempt: retryAttempt,
+      pollIntervalMs,
+      maxBackoffMs,
+      rateLimit: result.rateLimit,
+      nowMs: now(),
+    });
     await pause(waitMs);
   };
-  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()), now());
-  while (now() - started < timeoutMs) {
-    const runResult = await request(new URL(runPath, baseHref));
+  const request = url => githubJson(url, token, fetchImpl, Math.min(15_000, remainingMs()));
+  while (now() < deadline()) {
+    const runResult = await request(new URL(runPath, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (runResult.retry) {
-      await pauseForRetry(runResult);
+      await pauseRetry(runResult);
       continue;
     }
-    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, baseHref));
+    const jobsResult = await request(new URL(`${runPath}/jobs?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (jobsResult.retry) {
-      await pauseForRetry(jobsResult);
+      await pauseRetry(jobsResult);
       continue;
     }
-    const producerState = inspectProducerReadiness({
-      repository,
-      runId,
-      run: runResult.value,
-      jobsPage: jobsResult.value,
-    });
-    if (!producerState.ready) {
-      consecutiveRateLimits = 0;
-      await pause();
-      continue;
-    }
-    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, baseHref));
+    const artifactsResult = await request(new URL(`${runPath}/artifacts?per_page=100`, `${endpoint.href.replace(/\/?$/, '/')}`));
     if (artifactsResult.retry) {
-      await pauseForRetry(artifactsResult);
+      await pauseRetry(artifactsResult);
       continue;
     }
-    consecutiveRateLimits = 0;
+    retryAttempt = 0;
     const state = inspectFrontendArtifactReadiness({
       repository,
       runId,
@@ -247,10 +234,16 @@ export async function waitForNativeFrontendArtifacts({
       artifactsPage: artifactsResult.value,
     });
     if (state.ready) return state.names;
+    lastReason = state.reason;
+    if (state.queued) {
+      sawQueued = true;
+    } else if (activeStarted === null) {
+      activeStarted = now();
+    }
     await pause();
   }
-  const transientSuffix = lastTransientStatus != null ? ` (last transient status: ${lastTransientStatus})` : '';
-  throw new Error(`Timed out waiting for native frontend artifacts for source ${sourceSha} in run ${runId}${transientSuffix}; no fallback used`);
+  const detail = lastReason ? ` (${lastReason})` : '';
+  throw new Error(`Timed out waiting for native frontend artifacts for source ${sourceSha} in run ${runId}${detail}; no fallback used`);
 }
 
 async function main() {

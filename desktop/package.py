@@ -10,9 +10,20 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from package_runtime import wayland_dependencies
+if __package__:
+    from .core.paths import SOURCE_ROOT
+    from .scripts.package_runtime import wayland_dependencies
+else:
+    try:
+        from core.paths import SOURCE_ROOT
+        from scripts.package_runtime import wayland_dependencies
+    except ModuleNotFoundError as _exc:
+        if _exc.name not in ("core", "core.paths", "scripts", "scripts.package_runtime"):
+            raise
+        from desktop.core.paths import SOURCE_ROOT
+        from desktop.scripts.package_runtime import wayland_dependencies
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = SOURCE_ROOT
 OUTPUT = ROOT / "desktop/dist"
 PHASES = []
 CHECKSUM_CHUNK_SIZE = 1024 * 1024
