@@ -6,7 +6,7 @@ import { editorFindQuery, editorFindRange, ensureEditorSearchRangeVisible } from
 import { windowedMatches, revealWindowed, compileSearchPattern, nextSearchMatch, normalizeSearchOptions, type WindowedMatch, type SearchMatchConfig, type SearchMatchOptions } from "../windowedSearch";
 import { parseFrontmatter, type FrontmatterVisibleField, type FrontmatterVisibleSpan, type ParsedFrontmatter } from "../frontmatter";
 import { cancelHeadingNavigation } from "../documentNavigation";
-import { clearSearchTopClearances, scrollSearchMatchIntoView } from "../searchScroll";
+import { clearSearchTopClearances, isSearchMatchInUnobstructedBand, scrollSearchMatchIntoView } from "../searchScroll";
 export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
 
 const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
@@ -69,10 +69,7 @@ export function nextSearchIndex(index: number, direction: number, count: number)
 
 function revealMountedBlock(element: Element): void {
   if (!(element instanceof HTMLElement)) return;
-  if (!element.closest('[data-windowed-mounted="false"]')) {
-    revealWindowed(element);
-    return;
-  }
+  if (!element.closest('[data-windowed-mounted="false"]')) return;
   const root = element.closest<HTMLElement>(".android-reading");
   const hadNavigating = Boolean(root?.dataset.navigating);
   if (root && !hadNavigating) root.dataset.navigating = "true";
@@ -769,7 +766,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     settleCleanup.current = null;
     recordSettleScrollerRef.current = null;
   };
-  const scheduleSearchSettle = (anchorHost: Element | null, step: () => boolean) => {
+  const scheduleSearchSettle = (anchorHost: Element | null, step: (verifyOnly?: boolean) => boolean | "realigned") => {
     clearSettleFrames();
     const scroller = anchorHost?.matches(".android-reading,.reading-scroll")
       ? (anchorHost as HTMLElement)
@@ -781,6 +778,9 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     let frame = 0;
     let timer = 0;
     let remainingFrames = 4;
+    let verifyFrames = 2;
+    let adjustGuard = 8;
+    let dirtyLayout = false;
     let layoutMutating = false;
     let mutatingQueued = false;
     const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
@@ -827,18 +827,44 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const runPass = () => {
       frame = 0;
       if (!active) return;
-      if (!step()) {
+      const verifyOnly = remainingFrames <= 0 && !dirtyLayout;
+      dirtyLayout = false;
+      const prevScrollTop = scroller?.scrollTop ?? 0;
+      const prevScrollHeight = scroller?.scrollHeight ?? 0;
+      const result = step(verifyOnly);
+      if (!result) {
         stop();
         return;
       }
       recordScrollerState();
+      const heightChanged = Boolean(scroller && scroller.scrollHeight !== prevScrollHeight);
+      if (heightChanged) adjustGuard = 8;
+      const adjusted = Boolean(
+        heightChanged ||
+          result === "realigned" ||
+          (scroller && Math.abs(scroller.scrollTop - prevScrollTop) > 0.5),
+      );
       if (remainingFrames > 0) {
         remainingFrames--;
+        if (adjusted) verifyFrames = 2;
         frame = requestAnimationFrame(runPass);
+      } else if (adjusted && adjustGuard > 0) {
+        adjustGuard--;
+        verifyFrames = 2;
+        frame = requestAnimationFrame(runPass);
+      } else if (verifyFrames > 0) {
+        verifyFrames--;
+        if (verifyFrames > 0) frame = requestAnimationFrame(runPass);
       }
     };
-    const schedulePass = () => {
-      if (!active || frame) return;
+    const schedulePass = (fromLayoutChange = false) => {
+      if (!active) return;
+      if (fromLayoutChange) {
+        dirtyLayout = true;
+        verifyFrames = 2;
+        adjustGuard = 8;
+      }
+      if (frame) return;
       frame = requestAnimationFrame(runPass);
     };
     const onUserGesture = (event: Event) => {
@@ -859,40 +885,42 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         });
       }
       armStopTimer();
-      schedulePass();
+      schedulePass(true);
     };
     const onScroll = () => {
       if (!active || !scroller || layoutMutating) return;
       if (scroller.scrollHeight !== recordedScrollHeight) {
         recordScrollerState();
         armStopTimer();
-        schedulePass();
+        schedulePass(true);
         return;
       }
       if (Math.abs(scroller.scrollTop - recordedScrollTop) > 2) stop();
     };
     const page = scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body")
       ?? (eventHost instanceof HTMLElement ? eventHost : null);
+    const pageSpace = scroller?.querySelector<HTMLElement>(".document-page-space") ?? null;
     const readPageHeight = (entry?: ResizeObserverEntry) =>
-      entry?.borderBoxSize?.[0]?.blockSize
-      ?? entry?.contentRect.height
+      (entry && entry.target === page ? entry.borderBoxSize?.[0]?.blockSize ?? entry.contentRect.height : undefined)
       ?? page?.offsetHeight
       ?? page?.getBoundingClientRect().height
       ?? 0;
     let lastPageHeight = readPageHeight();
-    const observer = page && typeof ResizeObserver !== "undefined"
+    const observer = (page || pageSpace) && typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(entries => {
           if (!active) return;
-          const nextHeight = readPageHeight(entries[0]);
+          const pageEntry = entries.find(e => e.target === page);
+          const nextHeight = readPageHeight(pageEntry);
           const scrollerHeightChanged = Boolean(scroller && scroller.scrollHeight !== recordedScrollHeight);
           if (Math.abs(nextHeight - lastPageHeight) <= 0.5 && !scrollerHeightChanged) return;
           lastPageHeight = nextHeight;
           if (scrollerHeightChanged) recordScrollerState();
           armStopTimer();
-          schedulePass();
+          schedulePass(true);
         })
       : undefined;
     if (page && observer) observer.observe(page);
+    if (pageSpace && pageSpace !== page && observer) observer.observe(pageSpace);
     eventHost.addEventListener("supermd-window-change", onWindowChange);
     scroller?.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("wheel", onUserGesture, { capture: true, passive: true });
@@ -1079,13 +1107,14 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
     if (scroll) {
       const expectedIndex = indexRef.current;
-      scheduleSearchSettle(host, () => {
+      scheduleSearchSettle(host, (verifyOnly = false) => {
         if (!sourceSearchRef.current || indexRef.current !== expectedIndex) return false;
         const liveHost = findReadingHost();
         const liveRange = ranges[targetIndex];
         if (!liveHost || !liveRange) return false;
         const currentBlock = findContainingBlock(liveHost, liveRange, sourceText);
         if (!currentBlock) return false;
+        const wasUnmountedInPass = Boolean(currentBlock.closest('[data-windowed-mounted="false"]'));
         revealMountedBlock(currentBlock);
         const settledBlock = findContainingBlock(liveHost, liveRange, sourceText) ?? currentBlock;
         const settledOwner = deepestSourceOwner(settledBlock, liveRange, sourceText) ?? settledBlock;
@@ -1097,14 +1126,18 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
           : settledOwner;
         const settledBounds = !settledDomRange ? sourceBounds(settledOwner, sourceText) : null;
         const settledOffset = settledBounds && settledBounds.end > settledBounds.start ? (liveRange.from - settledBounds.start) / (settledBounds.end - settledBounds.start) : undefined;
-        scrollSearchMatchIntoView({ range: settledDomRange, target: settledScrollEl ?? settledBlock, host: liveHost, proportionalOffset: settledOffset });
-        if (registry && HighlightClass) {
+        const scrollOpts = { range: settledDomRange, target: settledScrollEl ?? settledBlock, host: liveHost, proportionalOffset: settledOffset };
+        const needsScroll = !verifyOnly || wasUnmountedInPass || !isSearchMatchInUnobstructedBand(scrollOpts);
+        if (needsScroll) {
+          scrollSearchMatchIntoView(scrollOpts);
+        }
+        if (registry && HighlightClass && needsScroll) {
           const visible = readingMatches(liveHost, query, filterOptions);
           registry.set("smd-search", new HighlightClass(...(customSliceMatch && settledDomRange ? [...visible, settledDomRange] : visible)));
           registry.delete("smd-search-current");
           if (settledDomRange) registry.set("smd-search-current", new HighlightClass(settledDomRange));
         }
-        return true;
+        return verifyOnly && needsScroll ? "realigned" : true;
       });
     }
   };
@@ -1125,21 +1158,26 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry.delete("smd-search-current");
       if (range) registry.set("smd-search-current", new HighlightClass(range));
     }
-    scheduleSearchSettle(host ?? match.element, () => {
+    scheduleSearchSettle(host ?? match.element, (verifyOnly = false) => {
       if (sourceSearchRef.current || indexRef.current !== next || !match.element.isConnected) return false;
+      const wasUnmountedInPass = Boolean(match.element.closest('[data-windowed-mounted="false"]'));
       revealMountedBlock(match.element);
       const liveHost = findReadingHost();
       openDisclosuresFor(match.element, match.element);
       let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
       if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
       const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
-      scrollSearchMatchIntoView({ range: liveRange, target: liveScrollEl ?? match.element, host: liveHost });
-      if (registry && HighlightClass) {
+      const scrollOpts = { range: liveRange, target: liveScrollEl ?? match.element, host: liveHost };
+      const needsScroll = !verifyOnly || wasUnmountedInPass || !isSearchMatchInUnobstructedBand(scrollOpts);
+      if (needsScroll) {
+        scrollSearchMatchIntoView(scrollOpts);
+      }
+      if (registry && HighlightClass && needsScroll) {
         registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
         registry.delete("smd-search-current");
         if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
       }
-      return true;
+      return verifyOnly && needsScroll ? "realigned" : true;
     });
   };
 
@@ -1614,12 +1652,13 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
               const sliceText = content.slice(targetRange.from, targetRange.to);
               const sliceRanges = sliceText ? sourceMatches(content, sliceText, true) : [];
               const sliceIdx = sliceRanges.length ? findMatchingSourceRangeIndex(sliceRanges, targetRange) : -1;
-              scheduleSearchSettle(host, () => {
+              scheduleSearchSettle(host, (verifyOnly = false) => {
                 if (sourceSearchRef.current || indexRef.current !== -1) return false;
                 const liveHost = findReadingHost();
                 if (!liveHost || !liveHost.isConnected) return false;
                 const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
                 if (!initialLiveBlock || !initialLiveBlock.isConnected) return false;
+                const wasUnmountedInPass = Boolean(initialLiveBlock.closest('[data-windowed-mounted="false"]'));
                 revealMountedBlock(initialLiveBlock);
                 const liveBlock = findContainingBlock(liveHost, targetRange, content) ?? initialLiveBlock;
                 const liveOwner = deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock;
@@ -1627,15 +1666,19 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
                 const liveDomRange = sliceIdx >= 0 ? mapSourceRangeToDomRange(liveBlock, content, sliceRanges, sliceIdx, sliceText, true) : null;
                 const liveScrollEl = liveDomRange ? (liveDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveDomRange.startContainer as Element : liveDomRange.startContainer.parentElement) : liveOwner;
                 openDisclosuresFor(liveScrollEl, liveBlock, liveDomRange, targetRange);
-                scrollSearchMatchIntoView({ range: liveDomRange, target: liveScrollEl ?? liveOwner, host: liveHost });
-                if (registry && HighlightClass) {
+                const scrollOpts = { range: liveDomRange, target: liveScrollEl ?? liveOwner, host: liveHost };
+                const needsScroll = !verifyOnly || wasUnmountedInPass || !isSearchMatchInUnobstructedBand(scrollOpts);
+                if (needsScroll) {
+                  scrollSearchMatchIntoView(scrollOpts);
+                }
+                if (registry && HighlightClass && needsScroll) {
                   const visible = activeWindowed.length ? readingMatches(liveHost, query, filterOptions) : [];
                   if (liveDomRange) {
                     registry.set("smd-search", new HighlightClass(...visible, liveDomRange));
                     registry.set("smd-search-current", new HighlightClass(liveDomRange));
                   }
                 }
-                return true;
+                return verifyOnly && needsScroll ? "realigned" : true;
               });
             }
             return;
@@ -1656,11 +1699,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             registry.delete("smd-search-current");
           }
           if (wasUnmounted) {
-            scheduleSearchSettle(host, () => {
+            scheduleSearchSettle(host, (verifyOnly = false) => {
               if (sourceSearchRef.current || indexRef.current !== -1 || hiddenSourceAnchorRef.current !== targetRange) return false;
               const liveHost = findReadingHost();
               if (!liveHost || !liveHost.isConnected) return false;
               const initialLiveBlock = findContainingBlock(liveHost, targetRange, content);
+              const wasUnmountedInPass = Boolean(initialLiveBlock?.closest('[data-windowed-mounted="false"]'));
               if (initialLiveBlock) revealMountedBlock(initialLiveBlock);
               const liveBlock = (initialLiveBlock ? findContainingBlock(liveHost, targetRange, content) : null) ?? initialLiveBlock;
               const liveOwner = liveBlock ? (deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock) : null;
@@ -1668,8 +1712,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
               const liveTarget = liveOwner ?? liveBlock ?? owner ?? block;
               const liveBounds = sourceBounds(liveTarget, content);
               const liveOffset = liveBounds && liveBounds.end > liveBounds.start ? (targetRange.from - liveBounds.start) / (liveBounds.end - liveBounds.start) : undefined;
-              scrollSearchMatchIntoView({ target: liveTarget, host: liveHost, proportionalOffset: liveOffset });
-              return true;
+              const scrollOpts = { target: liveTarget, host: liveHost, proportionalOffset: liveOffset };
+              const needsScroll = !verifyOnly || wasUnmountedInPass || !isSearchMatchInUnobstructedBand(scrollOpts);
+              if (needsScroll) {
+                scrollSearchMatchIntoView(scrollOpts);
+              }
+              return verifyOnly && needsScroll ? "realigned" : true;
             });
           }
           return;

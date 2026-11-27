@@ -2005,4 +2005,264 @@ describe("ReadingSearch DOM behavior", () => {
       host.remove();
     }
   });
+
+  it("verifies rendered Range inside .android-reading after multi-wave WindowedBlock settling without rogue preserveWindowedScroll cancellation", async () => {
+    const { default: WindowedBlock } = await import("./WindowedBlock");
+    class TestIntersectionObserver {
+      static instances: TestIntersectionObserver[] = [];
+      constructor(readonly callback: IntersectionObserverCallback) { TestIntersectionObserver.instances.push(this); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      emitBatch(entries: Array<{ target: Element; isIntersecting: boolean }>) {
+        this.callback(entries as unknown as IntersectionObserverEntry[], this as unknown as IntersectionObserver);
+      }
+    }
+    class NoopResizeObserver {
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+    vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const makeBlocks = (replaced25: boolean) =>
+      Array.from({ length: 24 }, (_, idx) =>
+        idx === 0
+          ? "Read [Docs](https://example.org/token-00) and token-01."
+          : idx === 12
+            ? replaced25
+              ? "Offscreen item-25 match."
+              : "Offscreen token-25 match."
+            : idx === 20
+              ? "Distant token-45 match."
+              : `Readable windowed study paragraph ${idx}.`,
+      );
+
+    let currentContent = makeBlocks(false).join("\n\n");
+    const computeOffsets = (chunks: string[]) => {
+      const list: Array<{ start: number; end: number }> = [];
+      let cur = 0;
+      for (const chunk of chunks) {
+        list.push({ start: cur, end: cur + chunk.length });
+        cur += chunk.length + 2;
+      }
+      return list;
+    };
+
+    const origHighlight = (window as unknown as { Highlight?: unknown }).Highlight;
+    const origCss = globalThis.CSS;
+    const highlightMap = new Map<string, { ranges: Range[] }>();
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) { this.ranges = ranges; }
+    }
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { ...(origCss ?? {}), highlights: highlightMap }, configurable: true, writable: true });
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+    const origElementFromPoint = document.elementFromPoint;
+
+    let silentUpperDriftPx = 0;
+    let simulatedScrollTop = 0;
+
+    const renderScene = (text: string) => {
+      const chunks = text.split("\n\n");
+      const offsets = computeOffsets(chunks);
+      root.render(
+        <div className="android-document">
+          <ReadingSearch
+            content={text}
+            close={() => {}}
+            initialReplace
+            onChange={(next) => {
+              currentContent = next;
+              renderScene(next);
+            }}
+          />
+          <section className="android-reading">
+            <div className="reader-chrome-spacer" aria-hidden="true" />
+            <div className="document-page-space">
+              <div className="document-page">
+                <div className="markdown-body">
+                  {chunks.map((chunk, idx) => (
+                    <WindowedBlock
+                      key={idx}
+                      enabled
+                      estimate={120}
+                      text={chunk}
+                      data-source-start={offsets[idx].start}
+                      data-source-end={offsets[idx].end}
+                    >
+                      <p>{chunk.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")}</p>
+                    </WindowedBlock>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>,
+      );
+    };
+
+    try {
+      await act(async () => { renderScene(currentContent); });
+      const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+      const spacer = host.querySelector<HTMLElement>(".reader-chrome-spacer")!;
+      const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+      const getSpacerMargin = () => parseFloat(spacer.style.marginBottom || "0") || 0;
+      const getBlocks = () => Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      const blockHeight = (el: HTMLElement) => (el.getAttribute("data-windowed-mounted") === "true" ? 48 : 120);
+      const blockTopDoc = (targetIdx: number) => {
+        const list = getBlocks();
+        let y = getSpacerMargin() + (targetIdx > 0 ? silentUpperDriftPx : 0);
+        for (let i = 0; i < targetIdx; i++) y += blockHeight(list[i]);
+        return y;
+      };
+      const totalDocHeight = () =>
+        Math.max(600, getSpacerMargin() + getBlocks().reduce((sum, el) => sum + blockHeight(el), 0) + silentUpperDriftPx);
+
+      Object.defineProperty(scroller, "scrollTop", {
+        configurable: true,
+        get: () => simulatedScrollTop,
+        set: (v: number) => {
+          const next = Math.max(0, v);
+          if (next !== simulatedScrollTop) {
+            simulatedScrollTop = next;
+            queueMicrotask(() => scroller.dispatchEvent(new Event("scroll")));
+          }
+        },
+      });
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => totalDocHeight() });
+      searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 88);
+      scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+      const bindBlockRects = () => {
+        getBlocks().forEach((el, idx) => {
+          el.getBoundingClientRect = () => new DOMRect(40, blockTopDoc(idx) - scroller.scrollTop, 680, blockHeight(el));
+        });
+      };
+      bindBlockRects();
+
+      // Simulate elementFromPoint hitting an upper placeholder block (e.g. y=160) when scrolled deep,
+      // which would arm preserveWindowedScroll if revealMountedBlock fired supermd-reveal-window unguarded.
+      document.elementFromPoint = (_x: number, y: number) => {
+        const list = getBlocks();
+        for (let i = 0; i < list.length; i++) {
+          const top = blockTopDoc(i) - scroller.scrollTop;
+          if (y >= top && y <= top + blockHeight(list[i])) return list[i];
+        }
+        return scroller;
+      };
+
+      const computeRangeRect = (range: Range): DOMRect => {
+        const list = getBlocks();
+        const ownerIdx = list.findIndex((el) => el.contains(range.startContainer));
+        const top = (ownerIdx >= 0 ? blockTopDoc(ownerIdx) : getSpacerMargin()) + 10 - scroller.scrollTop;
+        return new DOMRect(48, top, 110, 20);
+      };
+      Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+      Range.prototype.getClientRects = function () {
+        const r = computeRangeRect(this);
+        return Object.assign([r], { item: (i: number) => (i === 0 ? r : null) }) as unknown as DOMRectList;
+      };
+
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch([{ target: getBlocks()[0], isIntersecting: true }]);
+      });
+
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => wholeWordBtn.click());
+      act(() => regexBtn.click());
+      act(() => setInputValue(searchInput, "(token)-(\\d+)"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 4");
+
+      // Advance 1 / 4 (URL) -> 2 / 4 (token-01) -> 3 / 4 (offscreen token-25 in block 12).
+      act(() => nextBtn.click());
+      act(() => nextBtn.click());
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+      expect(getBlocks()[12].getAttribute("data-windowed-mounted")).toBe("true");
+
+      // Wave 1 after 2 frames, Wave 2 after 2 more frames, plus silent post-wave margin drift on verification frame.
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(6, 12).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(1, 6).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      // Drain active layout pass so next queued frame is verifyOnly, then shift geometry above block 12 without events.
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      silentUpperDriftPx = -240;
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      expect(scroller.scrollTop).toBeGreaterThan(0);
+      const current25 = highlightMap.get("smd-search-current")?.ranges[0];
+      expect(current25?.toString()).toBe("token-25");
+      const rect25 = computeRangeRect(current25!);
+      expect(rect25.top).toBeGreaterThanOrEqual(12 + 88 + 12 - 1);
+      expect(rect25.bottom).toBeLessThanOrEqual(600 - 16 + 1);
+
+      // Single Replace expands $2 -> item-25 and advances to 3 / 3 (token-45 in block 20), keeping it in band.
+      const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+      act(() => setInputValue(replaceInput, "item-$2"));
+      const replaceSingle = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+      await act(async () => { replaceSingle.click(); });
+      bindBlockRects();
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(currentContent).toContain("Offscreen item-25 match.");
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+      expect(getBlocks()[20].getAttribute("data-windowed-mounted")).toBe("true");
+
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(13, 17).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      const current45 = highlightMap.get("smd-search-current")?.ranges[0];
+      expect(current45?.toString()).toBe("token-45");
+      const rect45 = computeRangeRect(current45!);
+      expect(rect45.top).toBeGreaterThanOrEqual(12 + 88 + 12 - 1);
+      expect(rect45.bottom).toBeLessThanOrEqual(600 - 16 + 1);
+
+      // Manual scroll cancels any remaining verification/settle passes so subsequent block mounts do not snap scrollTop back.
+      scroller.scrollTop = 180;
+      await act(async () => {
+        await Promise.resolve();
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(17, 20).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(scroller.scrollTop).toBe(180);
+    } finally {
+      document.elementFromPoint = origElementFromPoint;
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
+      vi.unstubAllGlobals();
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 });

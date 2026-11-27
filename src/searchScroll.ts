@@ -240,6 +240,14 @@ export function scrollRectIntoSearchScroller(
     return;
   }
 
+  if (
+    Math.abs(targetScrollTop - prevScrollTop) <= 0.5 &&
+    rect.top >= visibleTop - 1 &&
+    (rect.bottom <= visibleBottom + 1 || matchHeight >= bandHeight)
+  ) {
+    return;
+  }
+
   scroller.scrollTop = targetScrollTop;
   if (scroller.matches(".android-reading")) refreshDocumentExtent(scroller);
   if (resolveLiveRect) {
@@ -266,6 +274,48 @@ export function scrollRectIntoSearchScroller(
       }
     }
   }
+}
+
+export function isSearchMatchInUnobstructedBand(options: {
+  range?: Range | null;
+  target?: Element | null;
+  host?: Element | null;
+  proportionalOffset?: number;
+}): boolean {
+  const { range = null, target = null, host = null, proportionalOffset } = options;
+  const anchorEl =
+    target ??
+    (range
+      ? range.startContainer.nodeType === Node.ELEMENT_NODE
+        ? (range.startContainer as Element)
+        : range.startContainer.parentElement
+      : null);
+  if (anchorEl?.closest('[data-windowed-mounted="false"]')) return false;
+  const scroller = resolveSearchScroller(anchorEl, host);
+  if (!scroller) return true;
+  if (scroller.matches(".android-reading")) refreshDocumentExtent(scroller);
+  const band = unobstructedBand(scroller);
+  if (!band) return true;
+  for (let cur = anchorEl; cur && cur !== scroller; cur = cur.parentElement) {
+    if (!(cur instanceof HTMLElement) || !isVerticallyScrollableElement(cur)) continue;
+    const curRect = cur.getBoundingClientRect();
+    if (curRect.height <= 0) continue;
+    const innerRect = readRangeOrElementRect(range, cur === anchorEl ? null : anchorEl);
+    if (!innerRect) continue;
+    const innerHeight = Math.max(0, innerRect.bottom - innerRect.top);
+    const pad = Math.min(12, curRect.height * 0.15);
+    const innerTop = curRect.top + pad;
+    const innerBottom = Math.max(innerTop + 8, curRect.bottom - pad);
+    const innerBand = Math.max(1, innerBottom - innerTop);
+    if (innerRect.top < innerTop - 1 || (innerHeight < innerBand && innerRect.bottom > innerBottom + 1)) {
+      return false;
+    }
+  }
+  const bandHeight = Math.max(1, band.visibleBottom - band.visibleTop);
+  const rect = readRangeOrElementRect(range, anchorEl, bandHeight, proportionalOffset);
+  if (!rect) return false;
+  const matchHeight = Math.max(0, rect.bottom - rect.top);
+  return rect.top >= band.visibleTop - 1 && (rect.bottom <= band.visibleBottom + 1 || matchHeight >= bandHeight);
 }
 
 export function scrollSearchMatchIntoView(options: {
