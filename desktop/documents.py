@@ -521,11 +521,12 @@ def _decode_text_note(raw: str, path: Path, *, decode_assets: bool = True) -> tu
     return raw, {}, False
 
 
-import portable_search
-from portable_search import (
-    MAX_SEARCH_MARKDOWN_BYTES, _PORTABLE_ENVELOPE_RE, _PORTABLE_FORMATS,
-    _extract_portable_markdown, iter_single_member_gzip_chunks,
-)
+if __package__:
+    from . import portable_search
+    from .portable_search import MAX_SEARCH_MARKDOWN_BYTES, _PORTABLE_ENVELOPE_RE, _PORTABLE_FORMATS, _extract_portable_markdown, iter_single_member_gzip_chunks
+else:
+    import portable_search
+    from portable_search import MAX_SEARCH_MARKDOWN_BYTES, _PORTABLE_ENVELOPE_RE, _PORTABLE_FORMATS, _extract_portable_markdown, iter_single_member_gzip_chunks
 
 def _lookup_cached_portable_markdown(stat_key: tuple[int, int, int, int]) -> str | None:
     if not _RECENT_PORTABLE_FILES:

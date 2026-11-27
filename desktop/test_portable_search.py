@@ -7,6 +7,8 @@ import gzip
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -54,6 +56,15 @@ class PortableSearchTest(unittest.TestCase):
             "# Injected Cache\n",
         )
         self.assertEqual(len(seen_keys), 1)
+
+        env = {k: v for k, v in os.environ.items() if k not in {"PYTHONPATH", "PYTHONSAFEPATH", "PYTHONSTARTUP"}}
+        probe = (
+            "from desktop import documents, portable_search\n"
+            "assert documents.portable_search is portable_search\n"
+            f"assert documents.read_searchable_markdown({str(smd_path)!r}) == '# Standalone\\n\\nDirect scanner call.\\n'\n"
+        )
+        proc = subprocess.run([sys.executable, "-E", "-c", probe], cwd=Path(__file__).resolve().parent.parent, env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stdout + "\n" + proc.stderr)
 
     def test_single_member_gzip_rejects_truncation_concatenation_and_trailing_bytes(self) -> None:
         compressed = documents.compressed_bundle("# Portable Title\n\nBody text.\n", {})
