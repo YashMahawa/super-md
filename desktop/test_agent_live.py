@@ -740,12 +740,26 @@ class AgentLiveExtractionTests(unittest.TestCase):
             live_native.native_result({"action": "read_tab", "tabId": "tab-1", "heading": "missing"}, studio)
 
     def test_shared_validators_preserve_native_path_identity_grants_and_revocation(self):
+        import os
+
         from agent import validators
         from agent.live_client import LiveBridgeError
 
+        self.assertEqual(
+            validators.strip_extended_length_prefix("\\\\?\\C:\\  Notes\\inside.md"),
+            "C:\\  Notes\\inside.md",
+        )
+        self.assertEqual(
+            validators.strip_extended_length_prefix("\\\\?\\UNC\\server\\share\\  Notes"),
+            "\\\\server\\share\\  Notes",
+        )
+
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            spaced_root = base / "  Notes  "
+            # Win32 APIs strip trailing spaces on directory creation, whereas leading
+            # spaces are valid on Windows and leading/trailing spaces are valid on POSIX.
+            spaced_name = "  Notes  " if os.name != "nt" else "  Notes"
+            spaced_root = base / spaced_name
             stripped_decoy = base / "Notes"
             spaced_root.mkdir()
             stripped_decoy.mkdir()
@@ -763,7 +777,7 @@ class AgentLiveExtractionTests(unittest.TestCase):
 
             canon_spaced = validators.canonical_approved_directory(str(spaced_root))
             self.assertIsNotNone(canon_spaced)
-            self.assertEqual(canon_spaced.name, "  Notes  ")
+            self.assertEqual(canon_spaced.name, spaced_name)
             self.assertFalse(validators.same_native_path(spaced_root, stripped_decoy))
             self.assertEqual(validators.normalize_approved_roots([str(spaced_root), "   "]), [str(canon_spaced)])
 
