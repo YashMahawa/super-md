@@ -8,6 +8,7 @@ import {refreshDocumentExtent} from './documentZoom';
  * Call from load/promise callbacks, not during React rendering or effects. */
 export function commitMediaLayout(element:HTMLElement|null,update:()=>void):void {
   const root=element?.closest<HTMLElement>('.android-reading,.reading-scroll,.live-pane');
+  const beforeTop=root?.scrollTop;
   const block=element?.closest<HTMLElement>('[data-windowed-block]');
   const restore=root?(block?captureWindowedScrollAnchor(root,block):captureScrollAnchor(root)):undefined;
   flushSync(update);
@@ -16,4 +17,5 @@ export function commitMediaLayout(element:HTMLElement|null,update:()=>void):void
   block?.dispatchEvent(new Event('supermd-media-layout'));
   if(root)refreshDocumentExtent(root);
   restore?.();
+  if(root&&beforeTop!==undefined&&Math.abs(root.scrollTop-beforeTop)>.5)(root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop=root.scrollTop;
 }

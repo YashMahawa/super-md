@@ -134,6 +134,7 @@ class StudioTabsTest(unittest.TestCase):
         self.assertEqual(len(self.studio.tabs), 2)
         alpha_tab = next(t for t in self.studio.tabs if t["path"] == str(alpha))
         self.assertEqual((self.studio.active, alpha_tab.get("pendingHeading")), (alpha_tab["id"], "Details"))
+        self.assertEqual((self.studio.has_open_tab_for_path(alpha), self.studio.has_open_tab_for_path(vault), Studio._same_open_tab_path(str(alpha), alpha)), (True, False, True))
 
         with patch("studio.uuid.uuid4", return_value=SimpleNamespace(hex="customhex123")):
             self.studio.newNote()
@@ -182,7 +183,9 @@ class StudioTabsTest(unittest.TestCase):
         with patch.object(self.studio, "_flush") as flush_spy:
             target.receiveTab(self.studio.window_id, second_id, 1)
         self.assertEqual((flush_spy.call_args.args[0], json.loads(flush_spy.call_args.args[1])), ("move_tab", {"window": target.window_id, "tab": second_id, "index": 1}))
-        self.assertTrue(self.studio._move_tab(target, second_id, 0))
+        with patch.object(self.studio._preview_jobs, "cancel_tab", wraps=self.studio._preview_jobs.cancel_tab) as cancel_preview:
+            self.assertTrue(self.studio._move_tab(target, second_id, 0))
+        cancel_preview.assert_called_once_with(second_id)
         self.assertIs(target.tabs[0], second_tab)
         self.assertEqual(target.active, second_id)
         self.assertTrue(all(d["id"] != second_id for d in self.session.drafts.get(self.studio.window_id, [])))
@@ -229,8 +232,10 @@ class StudioTabsTest(unittest.TestCase):
             self.studio.resolveClose("save")
         save_spy.assert_called_once()
         self.studio.pending_close = tab_id
-        self.studio.resolveClose("discard")
-        self.assertTrue(_wait_until(lambda: all(t["id"] != tab_id for t in self.studio.tabs) and len(self.studio.closed_tabs) == 1))
+        with patch.object(self.studio._preview_jobs, "cancel_tab", wraps=self.studio._preview_jobs.cancel_tab) as cancel_close:
+            self.studio.resolveClose("discard")
+            self.assertTrue(_wait_until(lambda: all(t["id"] != tab_id for t in self.studio.tabs) and len(self.studio.closed_tabs) == 1))
+        cancel_close.assert_any_call(tab_id)
         self.assertEqual((self.studio._agent_jump_tab_id, tab_id in self.studio._last_reader_agent_seq), ("", False))
 
         self.studio.reopenTab()

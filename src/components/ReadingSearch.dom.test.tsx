@@ -1520,4 +1520,198 @@ describe("ReadingSearch DOM behavior", () => {
       host.remove();
     }
   });
+
+  it("runs single Replace on Enter in the replacement input when a valid match is selected, respects inactive/invalid/IME states, and disables spelling and autocorrections", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const scrolled: Element[] = [];
+    const origScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () { scrolled.push(this); };
+
+    let current = "Alpha intro.\n\n> [!NOTE]- Folded\n> Alpha hidden.\n\nAlpha tail.";
+    const onChangeSpy = vi.fn((next: string) => {
+      current = next;
+      renderView();
+    });
+
+    const renderView = () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={current} close={() => {}} initialReplace onChange={onChangeSpy} />
+          <section className="android-reading">
+            <LiveEditor
+              markdown={current}
+              onChange={(next) => { current = next; renderView(); }}
+              documentPath={null}
+              python=""
+              dark={false}
+              spellCheck
+              grammarCheck
+            />
+          </section>
+        </div>
+      );
+    };
+
+    const pressEnter = (
+      target: HTMLInputElement,
+      init: KeyboardEventInit & { keyCode?: number } = {},
+    ) => {
+      const { keyCode, ...rest } = init;
+      const ev = new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+        cancelable: true,
+        ...rest,
+      });
+      if (keyCode !== undefined) {
+        Object.defineProperty(ev, "keyCode", { get: () => keyCode });
+      }
+      act(() => { target.dispatchEvent(ev); });
+      return ev;
+    };
+
+    try {
+      await act(async () => { renderView(); });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const replaceInput = () => host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+
+      // Literal Markdown replacement input disables spelling and automatic corrections.
+      expect(replaceInput().getAttribute("type")).toBe("text");
+      expect(replaceInput().getAttribute("spellcheck")).toBe("false");
+      expect(replaceInput().getAttribute("autocorrect")).toBe("off");
+      expect(replaceInput().getAttribute("autocapitalize")).toBe("none");
+      expect(replaceInput().getAttribute("autocomplete")).toBe("off");
+
+      act(() => setInputValue(replaceInput(), "`beta_code`"));
+      replaceInput().focus();
+      expect(document.activeElement).toBe(replaceInput());
+
+      // 1. Inactive: empty query -> Enter is a no-op.
+      const emptyEv = pressEnter(replaceInput());
+      expect(emptyEv.defaultPrevented).toBe(true);
+      expect(onChangeSpy).not.toHaveBeenCalled();
+
+      // 2. Inactive: 0 matches ("No matches") -> Enter is a no-op.
+      act(() => setInputValue(searchInput, "MissingToken"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("No matches");
+      pressEnter(replaceInput());
+      expect(onChangeSpy).not.toHaveBeenCalled();
+
+      // 3. Inactive: unselected passive 0 / 3 state -> Enter does not replace or scroll.
+      act(() => setInputValue(searchInput, "Alpha"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+      scrolled.length = 0;
+      pressEnter(replaceInput());
+      expect(onChangeSpy).not.toHaveBeenCalled();
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+      expect(scrolled).toHaveLength(0);
+
+      // 4. Invalid: malformed regex -> Enter is a no-op.
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      act(() => {
+        regexBtn.click();
+        setInputValue(searchInput, "([unclosed");
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("Invalid regular expression");
+      pressEnter(replaceInput());
+      expect(onChangeSpy).not.toHaveBeenCalled();
+
+      // Restore valid query and select match 1 / 3.
+      act(() => {
+        regexBtn.click();
+        setInputValue(searchInput, "Alpha");
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+
+      // 5. In-progress IME composition (isComposing, keyCode 229, and compositionstart..compositionend) must not trigger Replace.
+      replaceInput().focus();
+      const imeNative = pressEnter(replaceInput(), { isComposing: true });
+      expect(imeNative.defaultPrevented).toBe(false);
+      expect(onChangeSpy).not.toHaveBeenCalled();
+
+      const ime229 = pressEnter(replaceInput(), { keyCode: 229 });
+      expect(ime229.defaultPrevented).toBe(false);
+      expect(onChangeSpy).not.toHaveBeenCalled();
+
+      act(() => { replaceInput().dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true })); });
+      const imeSessionEnter = pressEnter(replaceInput());
+      expect(imeSessionEnter.defaultPrevented).toBe(false);
+      expect(onChangeSpy).not.toHaveBeenCalled();
+      act(() => { replaceInput().dispatchEvent(new CompositionEvent("compositionend", { bubbles: true })); });
+
+      // Modifier chords (Shift/Ctrl/Meta/Alt+Enter) do not trigger single Replace.
+      pressEnter(replaceInput(), { shiftKey: true });
+      pressEnter(replaceInput(), { ctrlKey: true });
+      pressEnter(replaceInput(), { metaKey: true });
+      pressEnter(replaceInput(), { altKey: true });
+      expect(onChangeSpy).not.toHaveBeenCalled();
+      expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+
+      // External content edits invalidate the active match back to 0 / 3, so Enter will not replace stale offsets.
+      current = "Edited prefix.\n\n" + current;
+      act(() => { renderView(); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+      pressEnter(replaceInput());
+      expect(onChangeSpy).not.toHaveBeenCalled();
+
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+
+      // Identical replacement text (nextContent === content) still advances selection and scrolls like single Replace.
+      act(() => setInputValue(replaceInput(), "Alpha"));
+      scrolled.length = 0;
+      pressEnter(replaceInput());
+      expect(onChangeSpy).not.toHaveBeenCalled();
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      expect(scrolled.length).toBeGreaterThan(0);
+
+      // Reset to 1 / 3 and literal Markdown replacement text for sequential Enter replacements.
+      const prevBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Previous match"]')!;
+      act(() => {
+        prevBtn.click();
+        setInputValue(replaceInput(), "`beta_code`");
+      });
+      expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+
+      // 6. Plain Enter after composition ends replaces match 1, preserves focus, opens closed callout for match 2, and scrolls viewport!
+      scrolled.length = 0;
+      const validEnter1 = pressEnter(replaceInput());
+      expect(validEnter1.defaultPrevented).toBe(true);
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(current).toBe("Edited prefix.\n\n`beta_code` intro.\n\n> [!NOTE]- Folded\n> Alpha hidden.\n\nAlpha tail.");
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+      expect(host.querySelector("details.callout")?.hasAttribute("open")).toBe(true);
+      expect(scrolled.length).toBeGreaterThan(0);
+      expect(document.activeElement).toBe(replaceInput());
+
+      // Pressing Enter again sequentially replaces match 2 -> advances to 1 / 1, then match 3 -> "No matches", then safe no-op.
+      pressEnter(replaceInput());
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(current).toBe("Edited prefix.\n\n`beta_code` intro.\n\n> [!NOTE]- Folded\n> `beta_code` hidden.\n\nAlpha tail.");
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+
+      pressEnter(replaceInput());
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(current).toBe("Edited prefix.\n\n`beta_code` intro.\n\n> [!NOTE]- Folded\n> `beta_code` hidden.\n\n`beta_code` tail.");
+      expect(host.querySelector("output")?.textContent).toBe("No matches");
+
+      onChangeSpy.mockClear();
+      pressEnter(replaceInput());
+      expect(onChangeSpy).not.toHaveBeenCalled();
+    } finally {
+      Element.prototype.scrollIntoView = origScrollIntoView;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 });

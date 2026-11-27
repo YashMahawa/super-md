@@ -1,7 +1,7 @@
 """Note tab model, cross-window tab drag/detach, note open/navigation, and close/recovery helpers."""
 from __future__ import annotations
 
-import copy, json, os, sys, uuid
+import contextlib, copy, json, os, sys, uuid
 from pathlib import Path
 from PySide6.QtCore import QMetaObject, QObject, QPointF, QTimer, QUrl, Qt
 from PySide6.QtGui import QCursor, QGuiApplication
@@ -140,15 +140,19 @@ def move_tab(studio_obj, target, tab_id: str, index: int, *, single_shot_fn=QTim
         return False
     old = studio_obj.tabs.index(note)
     studio_obj.tabs.remove(note)
+    _call_optional(getattr(studio_obj, "_preview_jobs", None), "cancel_tab", tab_id)
     studio_obj.session.reader_assets.revoke_tab(studio_obj.window_id, tab_id)
     target.tabs.insert(max(0, min(len(target.tabs), index)), note)
     target.active = tab_id
+    _call_optional(target, "_activate_tab_state", note)
     emptied = not studio_obj.tabs
     if emptied:
         studio_obj.tabs.append(_call_method(studio_obj, "_note", make_note, "Untitled.md"))
     if studio_obj.active == tab_id:
         studio_obj.active = studio_obj.tabs[min(old, len(studio_obj.tabs) - 1)]["id"]
-    studio_obj.session.drafts[studio_obj.window_id] = studio_obj._window_recovery_drafts()
+        _call_optional(studio_obj, "_activate_tab_state", _call_method(studio_obj, "_current", current_tab))
+    with getattr(studio_obj.session, "_rename_state_lock", None) or contextlib.nullcontext():
+        studio_obj.session.drafts[studio_obj.window_id] = studio_obj._window_recovery_drafts()
     _call_optional(target, "_recover")
     _call_optional(studio_obj, "_emit")
     _call_optional(target, "_emit")
@@ -182,9 +186,79 @@ def complete_tab_drag(studio_obj, tab_id: str, *, mouse_buttons_fn=QGuiApplicati
                     return
     _call_method(studio_obj, "detachTab", detach_tab, tab_id)
 
-def open_path(studio_obj, value: str, *, local_path_fn=local_path) -> None:
+def same_open_tab_path(tab_path: str, path: Path, *, folder_ops_mod=folder_ops) -> bool:
+    if not tab_path:
+        return False
+    if tab_path == str(path) or folder_ops_mod.same_path(tab_path, path):
+        return True
+    try:
+        return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
+    except OSError:
+        return False
+
+def has_open_tab_for_path(studio_obj, value, *, local_path_fn=local_path, folder_ops_mod=folder_ops) -> bool:
+    if getattr(studio_obj, "retired", False):
+        return False
+    path = value if isinstance(value, Path) else local_path_fn(str(value))
+    if path.is_dir():
+        return False
+    same_fn = getattr(studio_obj, "_same_open_tab_path", None)
+    check_tab = same_fn if callable(same_fn) else (lambda tp, p: same_open_tab_path(tp, p, folder_ops_mod=folder_ops_mod))
+    if any(check_tab(tab.get("path", ""), path) for tab in getattr(studio_obj, "tabs", ())):
+        return True
+    if any(folder_ops_mod.same_path(restoring, path) for restoring in getattr(studio_obj, "_restoring_paths", ())):
+        return True
+    return any(count > 0 and folder_ops_mod.same_path(opening, path) for opening, count in getattr(studio_obj, "_opening_paths", {}).items())
+
+def open_path(studio_obj, value: str, *, local_path_fn=local_path, folder_ops_mod=folder_ops) -> None:
+    if getattr(studio_obj, "retired", False):
+        return
     path = local_path_fn(value)
-    studio_obj.openFolder(str(path)) if path.is_dir() else _call_method(studio_obj, "openNote", open_note_slot, str(path))
+    if path.is_dir():
+        studio_obj.openFolder(str(path))
+        if getattr(studio_obj, "folder", "") and folder_ops_mod.same_path(studio_obj.folder, path):
+            _call_optional(getattr(studio_obj, "workspaceFolderDropped", None), "emit")
+            host = getattr(studio_obj, "host_window", None)
+            if host is not None:
+                host.raise_()
+                host.requestActivate()
+        return
+    had_unwelcomed_placeholder = not bool(getattr(studio_obj, "settings", {}).get("welcomed"))
+    opening_paths = getattr(studio_obj, "_opening_paths", None)
+    canon_opening = folder_ops_mod.canonical_path_str(path)
+    if canon_opening and opening_paths is not None:
+        opening_paths[canon_opening] = opening_paths.get(canon_opening, 0) + 1
+    open_generation = getattr(studio_obj, "_activation_generation", 0) + 1
+
+    def finish_open_path(opened_tab, error):
+        if canon_opening and opening_paths is not None and canon_opening in opening_paths:
+            remaining_opens = opening_paths[canon_opening] - 1
+            if remaining_opens > 0:
+                opening_paths[canon_opening] = remaining_opens
+            else:
+                opening_paths.pop(canon_opening, None)
+        if error or opened_tab is None or getattr(studio_obj, "retired", False):
+            return
+        previous_active = studio_obj.active
+        placeholder_removed = bool(_call_optional(
+            studio_obj, "_remove_untouched_startup_placeholders", keep_tab_id=opened_tab["id"], allow_welcome_sample=had_unwelcomed_placeholder,
+        ))
+        active_changed = studio_obj.active != previous_active
+        was_unwelcomed = not bool(studio_obj.settings.get("welcomed"))
+        if was_unwelcomed:
+            studio_obj.settings["welcomed"] = True
+            _call_optional(studio_obj, "_preferences", notify=False)
+        if placeholder_removed:
+            studio_obj.recovery_timer.start(800)
+        if placeholder_removed or was_unwelcomed:
+            emit_load = active_changed or (was_unwelcomed and studio_obj.active == opened_tab["id"] and open_generation == studio_obj._activation_generation)
+            _call_optional(studio_obj, "_emit", emit_load)
+
+    _call_method(
+        studio_obj, "_open_note",
+        lambda s, v, **kw: open_note_workflow(s, v, local_path_fn=local_path_fn, folder_ops_mod=folder_ops_mod, **kw),
+        str(path), explicit=True, completion_callback=finish_open_path,
+    )
 
 def choose_folder(studio_obj, *, sys_platform: str = sys.platform) -> None:
     if not sys_platform.startswith("linux"):
@@ -265,17 +339,9 @@ def open_note_workflow(
                 _call_optional(window, "_emit", False)
         _call_method(studio_obj, "_focus_open_target", focus_open_target, activation_generation)
 
-    def same_open_tab_path(tab_path: str) -> bool:
-        if not tab_path:
-            return False
-        if tab_path == str(path) or fops.same_path(tab_path, path):
-            return True
-        try:
-            return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
-        except OSError:
-            return False
-
-    found = next((t for t in studio_obj.tabs if same_open_tab_path(t["path"])), None)
+    same_fn = getattr(studio_obj, "_same_open_tab_path", None)
+    check_open_path = (lambda tp: same_fn(tp, path)) if callable(same_fn) else (lambda tp: same_open_tab_path(tp, path, folder_ops_mod=fops))
+    found = next((t for t in studio_obj.tabs if check_open_path(t["path"])), None)
     if found:
         studio_obj._agent_open_paths.add(fops.canonical_path_str(path))
         studio_obj._restoring_paths.discard(str(path))
@@ -288,10 +354,12 @@ def open_note_workflow(
     def finished(result, error):
         studio_obj._restoring_paths.discard(str(path))
         if error:
+            if restoring and not studio_obj._restoring_paths and activation_generation == studio_obj._activation_generation:
+                _call_optional(studio_obj, "_activate_tab_state", _call_method(studio_obj, "_current", current_tab))
             done(None, error)
             return
         content, assets, portable = result
-        existing = next((tab for tab in studio_obj.tabs if same_open_tab_path(tab["path"])), None)
+        existing = next((tab for tab in studio_obj.tabs if check_open_path(tab["path"])), None)
         if existing:
             activate_existing(existing)
             done(existing, None)
@@ -311,8 +379,11 @@ def open_note_workflow(
             should_activate = str(path) == target_active or not any(t["id"] == studio_obj.active for t in studio_obj.tabs)
         if should_activate:
             studio_obj.active = note["id"]
+            _call_optional(studio_obj, "_activate_tab_state", note)
             if pending_heading:
                 note["pendingHeading"] = pending_heading
+        elif restoring and not studio_obj._restoring_paths and activation_generation == studio_obj._activation_generation:
+            _call_optional(studio_obj, "_activate_tab_state", _call_method(studio_obj, "_current", current_tab))
         studio_obj.settings["welcomed"] = True
         _prepend_recent(studio_obj, path, fops)
         studio_obj.recovery_timer.start(800)
@@ -429,6 +500,7 @@ def remove_tab(studio_obj, tab_id: str, *, snapshot_tab_fn=snapshot_tab_state, s
     if tab_id in studio_obj._closing_tabs:
         return
     studio_obj._closing_tabs.add(tab_id)
+    _call_optional(getattr(studio_obj, "_preview_jobs", None), "cancel_tab", tab_id)
     studio_obj._python_jobs.cancel_tab(tab_id)
     captured = snapshot_tab_fn(removed)
 
@@ -453,6 +525,7 @@ def remove_tab(studio_obj, tab_id: str, *, snapshot_tab_fn=snapshot_tab_state, s
     studio_obj._submit(lambda: studio_obj.session.closed_note_store.save(captured), saved, False, studio_obj.writes)
 
 def finish_remove_tab(studio_obj, tab_id: str) -> None:
+    _call_optional(getattr(studio_obj, "_preview_jobs", None), "cancel_tab", tab_id)
     studio_obj._python_jobs.cancel_tab(tab_id)
     studio_obj.reader_edits.clear(tab_id)
     current_index = next((i for i, tab in enumerate(studio_obj.tabs) if tab["id"] == tab_id), None)
