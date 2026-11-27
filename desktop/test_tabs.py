@@ -46,6 +46,7 @@ ApplicationWindow {
         QTest.qWait(50)
 
     def _activate_window(self):
+        self.window.show()
         self.window.requestActivate()
         QTest.qWaitForWindowActive(self.window, 1000)
         self.app.processEvents()
@@ -652,6 +653,55 @@ class TabParentDisambiguationUnitTest(unittest.TestCase):
                 ("Notes.md", r"D:\Notes.md"),
             ]),
             ["C:", "D:"],
+        )
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("Notes.md", r"\\server\share\Notes.md"),
+                ("Notes.md", r"\\?\UNC\server\share\docs\Notes.md"),
+            ]),
+            ["//server/share", "docs"],
+        )
+
+    def test_windows_os_name_and_outer_whitespace_preservation(self):
+        from unittest import mock
+
+        with mock.patch.object(folder_ops.os, "name", "nt"):
+            self.assertEqual(
+                folder_ops.disambiguate_tab_parents([
+                    ("README.md", "/README.md"),
+                    ("README.md", "/docs/README.md"),
+                ]),
+                ["/", "docs"],
+            )
+            self.assertEqual(
+                folder_ops.disambiguate_tab_parents([
+                    ("README.md", "/docs/README.md"),
+                    ("README.md", "/work/docs/README.md"),
+                ]),
+                ["/docs", "work/docs"],
+            )
+            self.assertEqual(
+                folder_ops.disambiguate_tab_parents([
+                    ("README.md", r"\README.md"),
+                    ("README.md", r"\docs\README.md"),
+                ]),
+                ["/", "docs"],
+            )
+            self.assertEqual(
+                folder_ops.disambiguate_tab_parents([
+                    ("Notes.md", r"\\?\C:\Users\alice\work\docs\Notes.md"),
+                    ("Notes.md", r"D:\Users\alice\work\docs\Notes.md"),
+                ]),
+                ["C:/…/docs", "D:/…/docs"],
+            )
+
+        self.assertEqual(
+            folder_ops.disambiguate_tab_parents([
+                ("  Overview.md", "/work/Cohort A /  Overview.md"),
+                ("  Overview.md", "/work/Cohort B /  Overview.md"),
+                ("Overview.md", "/work/Cohort A /Overview.md"),
+            ]),
+            ["Cohort A ", "Cohort B ", ""],
         )
 
 

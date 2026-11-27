@@ -240,16 +240,26 @@ def remap_path_prefix(candidate: str, old_path: str, new_path: str, *, is_direct
 
 
 def _split_parent_segments(raw_path: str) -> tuple[str, tuple[str, ...], str]:
-    cleaned = strip_extended_length_prefix(str(raw_path or "").strip())
-    if not cleaned:
+    cleaned = strip_extended_length_prefix(str(raw_path or ""))
+    if not cleaned.strip():
         return "", (), ""
     pure = _pure_path(cleaned)
     parent = pure.parent
     raw_parts = parent.parts
     if isinstance(pure, PureWindowsPath):
-        anchor = pure.anchor.replace("\\", "/").rstrip("/")
+        if pure.drive:
+            anchor = pure.drive.replace("\\", "/").rstrip("/")
+        elif pure.root:
+            anchor = "/"
+        else:
+            anchor = ""
         named = tuple(part for part in raw_parts[1 if pure.anchor else 0:] if part and part != ".")
-        parent_key = f"{anchor}/{'/'.join(named)}".casefold() if anchor else "/".join(named).casefold()
+        if anchor == "/":
+            parent_key = f"/{'/'.join(named)}".casefold()
+        elif anchor:
+            parent_key = f"{anchor}/{'/'.join(named)}".casefold()
+        else:
+            parent_key = "/".join(named).casefold()
         return anchor, named, parent_key
     anchor = "/" if pure.anchor else ""
     named = tuple(part for part in raw_parts[1 if pure.anchor else 0:] if part and part != ".")
@@ -274,9 +284,9 @@ def disambiguate_tab_parents(tabs: Sequence[tuple[str, str]]) -> list[str]:
     contexts = [""] * len(tabs)
     groups: dict[str, list[int]] = {}
     for index, (raw_name, _raw_path) in enumerate(tabs):
-        key = str(raw_name or "").strip().casefold()
-        if key:
-            groups.setdefault(key, []).append(index)
+        name_str = str(raw_name or "")
+        if name_str.strip():
+            groups.setdefault(name_str.casefold(), []).append(index)
 
     for indices in groups.values():
         if len(indices) < 2:
@@ -292,7 +302,7 @@ def disambiguate_tab_parents(tabs: Sequence[tuple[str, str]]) -> list[str]:
             max_depth = max(1, len(named) + (1 if anchor else 0))
             path_items.append({
                 "index": index,
-                "name": str(raw_name or "").strip(),
+                "name": str(raw_name or ""),
                 "anchor": anchor,
                 "named": named,
                 "parent_key": parent_key or anchor,
