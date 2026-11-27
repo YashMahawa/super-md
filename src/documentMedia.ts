@@ -24,7 +24,7 @@ export interface ImageRange { from: number; to: number; source: string }
 export function imageRanges(markdown: string): ImageRange[] {
   const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
   const definitions = new Map<string, string>(); const result: ImageRange[] = [];
-  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node.url); });
+  visit(tree, "definition", (node: any) => { if (!definitions.has(node.identifier)) definitions.set(node.identifier, node.url); });
   visit(tree, (node: any) => {
     const source = node.type === "image" ? node.url : node.type === "imageReference" ? definitions.get(node.identifier) : undefined;
     if (source && node.position) result.push({ source, from: node.position.start.offset, to: node.position.end.offset });
@@ -113,7 +113,7 @@ async function prepareFmdInternal(
   const work: Promise<void>[] = [];
   const edits: Array<{ start: number; end: number; value: string }> = [];
   const definitions = new Map<string, any>(); const usedDefinitions = new Set<string>();
-  visit(tree, "definition", (node: any) => { definitions.set(node.identifier, node); });
+  visit(tree, "definition", (node: any) => { if (!definitions.has(node.identifier)) definitions.set(node.identifier, node); });
   const collect = (source: string, replace: (name: string) => void) => {
     if (!shared.has(source)) shared.set(source, (async (): Promise<string | null> => {
       let data: string;
