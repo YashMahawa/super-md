@@ -223,9 +223,185 @@ describe("YAML frontmatter parser", () => {
       "---\n\ttitle: Leading Tab\n---\nBody",
       "---\n- list_root_not_mapping\n---\nBody",
       "---\ntitle: Missing Closer\nBody",
+      "---\n\"title\":CompactValue\n---\n# Body\n",
+      "---\n'title':CompactValue\n---\n# Body\n",
+      "---\ntitle:\u00a0NoAsciiSpaceAfterColon\n---\n# Body\n",
     ]) {
       expect(parseFrontmatter(malformed, { includeSpans: true })).toBeNull();
       expect(frontmatterVisibleValueSpans(malformed)).toEqual([]);
+    }
+  });
+
+  it("preserves trimStart Unicode-whitespace compatibility and exact value spans across quoted keys, quoted values, flow maps, and sequence/flow tags", () => {
+    const fixtures: Array<{
+      name: string;
+      source: string;
+      expectedEnd?: number;
+      expectedBody: string;
+      expectedEntries: Record<string, unknown>;
+      expectedProperties: {
+        title?: string;
+        subtitle?: string;
+        authors: string[];
+        date?: string;
+        description?: string;
+        tags: string[];
+        aliases: string[];
+      };
+      expectedSpans: Array<{ field: "title" | "author" | "tag"; fieldOrdinal: number; text: string }>;
+    }> = [
+      {
+        name: "#150 double-quoted key followed by U+00A0 before colon",
+        source: "---\n\"title\"\u00a0: NBSP Before Colon\n---\n# Body\n",
+        expectedEnd: 36,
+        expectedBody: "# Body\n",
+        expectedEntries: { title: "NBSP Before Colon" },
+        expectedProperties: { title: "NBSP Before Colon", authors: [], tags: [], aliases: [] },
+        expectedSpans: [{ field: "title", fieldOrdinal: 0, text: "NBSP Before Colon" }],
+      },
+      {
+        name: "#150 single-quoted key followed by U+00A0 before colon",
+        source: "---\n'title'\u00a0: NBSP Before Colon\n---\n# Body\n",
+        expectedEnd: 36,
+        expectedBody: "# Body\n",
+        expectedEntries: { title: "NBSP Before Colon" },
+        expectedProperties: { title: "NBSP Before Colon", authors: [], tags: [], aliases: [] },
+        expectedSpans: [{ field: "title", fieldOrdinal: 0, text: "NBSP Before Colon" }],
+      },
+      {
+        name: "plain key with double-quoted value after colon + U+00A0",
+        source: "---\ntitle: \u00a0\"Double Quoted Title\"\n---\n# Body\n",
+        expectedBody: "# Body\n",
+        expectedEntries: { title: "Double Quoted Title" },
+        expectedProperties: { title: "Double Quoted Title", authors: [], tags: [], aliases: [] },
+        expectedSpans: [{ field: "title", fieldOrdinal: 0, text: "Double Quoted Title" }],
+      },
+      {
+        name: "plain key with single-quoted value after colon + U+00A0",
+        source: "---\ntitle: \u00a0'Single Quoted Title'\n---\n# Body\n",
+        expectedBody: "# Body\n",
+        expectedEntries: { title: "Single Quoted Title" },
+        expectedProperties: { title: "Single Quoted Title", authors: [], tags: [], aliases: [] },
+        expectedSpans: [{ field: "title", fieldOrdinal: 0, text: "Single Quoted Title" }],
+      },
+      {
+        name: "double- and single-quoted keys with U+00A0 before and after colon and quoted values",
+        source: "---\n\"title\"\u00a0: \u00a0\"Conservation Laws\"\n'author'\u00a0: \u00a0'Emmy Noether'\n---\n# Body\n",
+        expectedBody: "# Body\n",
+        expectedEntries: { title: "Conservation Laws", author: "Emmy Noether" },
+        expectedProperties: { title: "Conservation Laws", authors: ["Emmy Noether"], tags: [], aliases: [] },
+        expectedSpans: [
+          { field: "title", fieldOrdinal: 0, text: "Conservation Laws" },
+          { field: "author", fieldOrdinal: 0, text: "Emmy Noether" },
+        ],
+      },
+      {
+        name: "flow tag list after colon + U+00A0 with quoted and plain items",
+        source: "---\ntags: \u00a0[\u00a0\"flow-alpha\",\u00a0'flow-beta',\u00a0flow-gamma\u00a0]\n---\n# Body\n",
+        expectedBody: "# Body\n",
+        expectedEntries: { tags: ["flow-alpha", "flow-beta", "flow-gamma"] },
+        expectedProperties: { authors: [], tags: ["flow-alpha", "flow-beta", "flow-gamma"], aliases: [] },
+        expectedSpans: [
+          { field: "tag", fieldOrdinal: 0, text: "flow-alpha" },
+          { field: "tag", fieldOrdinal: 1, text: "flow-beta" },
+          { field: "tag", fieldOrdinal: 2, text: "flow-gamma" },
+        ],
+      },
+      {
+        name: "sequence tags and sequence inline/flow items with U+00A0 after dash",
+        source: [
+          "---",
+          "tags:",
+          "  - \u00a0\"seq-double\"",
+          "  - \u00a0'seq-single'",
+          "  - \u00a0seq-plain",
+          "author:",
+          "  - \u00a0\"name\"\u00a0: \u00a0\"Richard Feynman\"",
+          "  - \u00a0'literal'\u00a0: \u00a0'Julian Schwinger'",
+          "  - \u00a0{ \"given\"\u00a0:\u00a0\"Freeman\", 'family'\u00a0:\u00a0'Dyson' }",
+          "---",
+          "# Body\n",
+        ].join("\n"),
+        expectedBody: "# Body\n",
+        expectedEntries: {
+          tags: ["seq-double", "seq-single", "seq-plain"],
+          author: [
+            { name: "Richard Feynman" },
+            { literal: "Julian Schwinger" },
+            { given: "Freeman", family: "Dyson" },
+          ],
+        },
+        expectedProperties: {
+          authors: ["Richard Feynman", "Julian Schwinger", "Freeman Dyson"],
+          tags: ["seq-double", "seq-single", "seq-plain"],
+          aliases: [],
+        },
+        expectedSpans: [
+          { field: "author", fieldOrdinal: 0, text: "Richard Feynman" },
+          { field: "author", fieldOrdinal: 0, text: "Julian Schwinger" },
+          { field: "author", fieldOrdinal: 0, text: "Freeman" },
+          { field: "author", fieldOrdinal: 0, text: "Dyson" },
+          { field: "tag", fieldOrdinal: 0, text: "seq-double" },
+          { field: "tag", fieldOrdinal: 1, text: "seq-single" },
+          { field: "tag", fieldOrdinal: 2, text: "seq-plain" },
+        ],
+      },
+      {
+        name: "flow maps with both quote styles, compact U+00A0 colons, and nested flow values",
+        source: [
+          "---",
+          "author: \u00a0[\u00a0{\u00a0\"given\"\u00a0:\u00a0\"Grace\",\u00a0'family'\u00a0:\u00a0'Hopper',\u00a0roles:\u00a0[compilers, cobol]\u00a0}\u00a0]",
+          "meta: \u00a0{\u00a0\"nested\"\u00a0:\u00a0[1, 2],\u00a0'inner'\u00a0:\u00a0{\u00a0key:\u00a0'val'\u00a0}\u00a0}",
+          "---",
+          "# Body\n",
+        ].join("\n"),
+        expectedBody: "# Body\n",
+        expectedEntries: {
+          author: [{ given: "Grace", family: "Hopper", roles: ["compilers", "cobol"] }],
+          meta: { nested: ["1", "2"], inner: { key: "val" } },
+        },
+        expectedProperties: {
+          authors: ["Grace Hopper"],
+          tags: [],
+          aliases: [],
+        },
+        expectedSpans: [
+          { field: "author", fieldOrdinal: 0, text: "Grace" },
+          { field: "author", fieldOrdinal: 0, text: "Hopper" },
+        ],
+      },
+    ];
+
+    for (const fixture of fixtures) {
+      const parsed = parseFrontmatter(fixture.source, { includeSpans: true });
+      expect(parsed, fixture.name).not.toBeNull();
+      if (fixture.expectedEnd !== undefined) {
+        expect(parsed!.end, fixture.name).toBe(fixture.expectedEnd);
+      }
+      expect(fixture.source.slice(parsed!.end), fixture.name).toBe(fixture.expectedBody);
+      expect(parsed!.raw + fixture.expectedBody, fixture.name).toBe(fixture.source);
+      expect(parsed!.entries, fixture.name).toEqual(fixture.expectedEntries);
+      expect(parsed!.properties, fixture.name).toEqual({
+        title: undefined,
+        subtitle: undefined,
+        date: undefined,
+        description: undefined,
+        ...fixture.expectedProperties,
+      });
+
+      const masked = maskFrontmatter(fixture.source);
+      expect(masked.length, fixture.name).toBe(fixture.source.length);
+      expect(masked.slice(parsed!.end), fixture.name).toBe(fixture.expectedBody);
+      for (let i = 0; i < parsed!.end; i++) {
+        const ch = fixture.source[i];
+        expect(masked[i], `${fixture.name} at ${i}`).toBe(ch === "\r" || ch === "\n" ? ch : " ");
+      }
+
+      const spans = parsed!.visibleSpans!;
+      expect(
+        spans.map((s) => ({ field: s.field, fieldOrdinal: s.fieldOrdinal, text: fixture.source.slice(s.start, s.end) })),
+        fixture.name,
+      ).toEqual(fixture.expectedSpans);
     }
   });
 });
