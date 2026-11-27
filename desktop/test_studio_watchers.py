@@ -25,10 +25,12 @@ class StudioWatchersUnitTests(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["StudioWatchersUnitTests"])
 
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="supermd-watchers-"))
+        self._raw_temp_dir = tempfile.mkdtemp(prefix="supermd-watchers-")
+        self.temp_dir = Path(folder_ops.canonical_path_str(self._raw_temp_dir))
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+        shutil.rmtree(self._raw_temp_dir, ignore_errors=True)
 
     def test_explicit_dependencies_and_zero_studio_or_sys_modules_lookups(self):
         self.assertFalse(hasattr(studio_watchers, "_studio_module"))
@@ -157,8 +159,8 @@ class StudioWatchersUnitTests(unittest.TestCase):
             Studio._external_note_changed(double, str(smd))
         self.assertEqual(spy_lp.call_count, 2)
         self.assertIn(str(smd), watched_added)
-        self.assertIn(str(self.temp_dir.resolve()), watched_added)
-        self.assertEqual(double.external_paths, {str(smd.resolve())})
+        self.assertIn(str(self.temp_dir), watched_added)
+        self.assertEqual(double.external_paths, {str(smd)})
         double.folder = str(self.temp_dir)
 
         write_portable(smd, "# V2\n", {"assets/keep.svg": str(url_keep), "assets/pic.png": url_v2})
@@ -209,7 +211,8 @@ class StudioWatchersUnitTests(unittest.TestCase):
         custom_lp = lambda p: (lp_calls.append(p), studio_watchers._default_local_path(p))[1]
         studio_watchers.watch_notes(double, force=True, local_path_fn=custom_lp, file_events_mod=custom_fe, folder_ops_mod=custom_ops)
         self.assertEqual(double.note_identities, {str(note): (7, 7)})
-        studio_watchers.external_note_changed(double, str(note), local_path_fn=custom_lp, folder_ops_mod=custom_ops)
+        raw_note = Path(self._raw_temp_dir) / "sub" / "ext.md"
+        studio_watchers.external_note_changed(double, str(raw_note), local_path_fn=custom_lp, folder_ops_mod=custom_ops)
         self.assertEqual(double.external_paths, {str(note)})
         studio_watchers.refresh_external_notes(double, file_events_mod=custom_fe, folder_ops_mod=custom_ops)
         self.assertEqual((len(rec_calls), emitted_locs, tree_loads), (1, [(str(note), "")], [True]))
