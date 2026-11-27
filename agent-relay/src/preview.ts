@@ -50,18 +50,52 @@ function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
+function textField(value: unknown, limit: number): string | undefined {
+  return typeof value === "string" ? value.slice(0, limit) : undefined;
+}
+
+export function boundedProperties(value: unknown): Record<string, unknown> | undefined {
+  const source = record(value);
+  if (!source) return undefined;
+  const result: Record<string, unknown> = {};
+  const title = textField(source.title, 300)?.trim();
+  if (title) result.title = title;
+  const authors = Array.isArray(source.authors)
+    ? source.authors.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 20).map((item) => item.trim().slice(0, 200))
+    : [];
+  const author = textField(source.author, 500)?.trim();
+  if (authors.length > 0) {
+    result.authors = authors;
+    result.author = author || authors.join(", ").slice(0, 500);
+  } else if (author) {
+    result.author = author;
+    result.authors = [author.slice(0, 200)];
+  }
+  const tags = Array.isArray(source.tags)
+    ? source.tags.filter((item): item is string => typeof item === "string" && item.trim().length > 0).slice(0, 50).map((item) => item.trim().slice(0, 100))
+    : [];
+  if (tags.length > 0) result.tags = tags;
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 /** Repair old clients' prefix-relative pagination using their authoritative code-point sourceLength. */
 export function normalizeReadingContext(value: unknown): Record<string, unknown> | undefined {
   const context = record(value);
   if (!context) return undefined;
-  const sourceLength = context.sourceLength;
-  const visibleSource = record(context.visibleSource);
-  if (!Number.isSafeInteger(sourceLength) || (sourceLength as number) < 0 || !visibleSource) return context;
+  let base: Record<string, unknown> = context;
+  if (Object.hasOwn(context, "properties")) {
+    const sanitized = boundedProperties(context.properties);
+    const { properties: _dropped, ...rest } = context;
+    base = sanitized ? { ...rest, properties: sanitized } : rest;
+  }
+  const sourceLength = base.sourceLength;
+  const visibleSource = record(base.visibleSource);
+  if (!Number.isSafeInteger(sourceLength) || (sourceLength as number) < 0 || !visibleSource) return base;
   const start = visibleSource.start;
   const end = visibleSource.end;
-  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || (start as number) < 0 || (end as number) < (start as number) || (end as number) > (sourceLength as number)) return context;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || (start as number) < 0 || (end as number) < (start as number) || (end as number) > (sourceLength as number)) return base;
   return {
-    ...context,
+    ...base,
     visibleSource: {
       ...visibleSource,
       total_chars: sourceLength,
@@ -69,10 +103,6 @@ export function normalizeReadingContext(value: unknown): Record<string, unknown>
       truncated: (end as number) < (sourceLength as number),
     },
   };
-}
-
-function textField(value: unknown, limit: number): string | undefined {
-  return typeof value === "string" ? value.slice(0, limit) : undefined;
 }
 
 function boundedReading(value: unknown): Record<string, unknown> | undefined {
@@ -211,6 +241,7 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   const selection = boundedSelection(source.selection ?? metadata?.selection);
   const viewport = boundedViewport(source.viewport ?? metadata?.viewport);
   const activeStep = boundedActiveStep(source.activeStep ?? metadata?.activeStep);
+  const properties = boundedProperties(source.properties ?? metadata?.properties);
   const pythonCells = boundedPythonCells(source.pythonCells);
   const sourceLength = Number.isSafeInteger(source.sourceLength) && (source.sourceLength as number) >= 0 ? source.sourceLength as number : undefined;
   const normalizedSource = sourceLength === undefined ? source.visibleSource : normalizeReadingContext({ sourceLength, visibleSource: source.visibleSource })?.visibleSource;
@@ -226,6 +257,7 @@ export function viewportContexts(image: Record<string, unknown>, requestedTab: s
   if (selection) captureContext.selection = selection;
   if (viewport) captureContext.viewport = viewport;
   if (activeStep) captureContext.activeStep = activeStep;
+  if (properties) captureContext.properties = properties;
   if (sourceRange) captureContext.sourceRange = sourceRange;
   const hasCoherentCapturedSource = revisionMatches && !!visibleSource && visibleSource.previewTruncated !== true && typeof source.revision === "string" && source.revision === expectedRevision;
   let capturedReadingContext: Record<string, unknown> | undefined;
