@@ -2,15 +2,20 @@ package dev.supermd.studio
 
 /** Human-readable handoff shown only after the user explicitly opens Live Agent setup. */
 object AgentSetupGuide {
-    fun instructions(config: AgentAccessConfig, skill: String? = null): String = buildString {
-        if (!skill.isNullOrBlank()) appendLine(skill)
+    fun instructions(config: AgentAccessConfig, skill: String? = null): String = instructions(skill)
+
+    fun instructions(skill: String? = null): String = buildString {
+        if (!skill.isNullOrBlank()) {
+            appendLine(skill.trimEnd())
+            appendLine()
+        }
         appendLine("# Connection for this installation")
         appendLine()
         appendLine("Keep Super MD open and Live Agent Access enabled while the agent is using your tabs.")
-        appendLine("Connect your AI client to this private MCP URL using Streamable HTTP:")
-        appendLine(config.mcpUrl)
+        appendLine("Private MCP connector URLs are secret bearer credentials and are not included in saved setup guides.")
+        appendLine("To connect your AI client using Streamable HTTP, open Super MD Settings → Agent connection (Live Agent Access) and tap Copy private MCP URL to get your own connector.")
         appendLine()
-        appendLine("Legacy SSE clients can connect at the same URL. Pairing keys and device keys belong only to Super MD and must not be copied into the AI client's configuration.")
+        appendLine("Legacy SSE clients can connect at that same URL. Pairing keys and device keys belong only to Super MD and must not be copied into the AI client's configuration.")
         appendLine("If you have several paired devices online, use list_devices first and choose a deviceId before editing or exporting.")
         appendLine("Edits require the SHA-256 revision returned by read_tab. If a revision conflict appears, reread the tab and rebuild the edit.")
         appendLine("The cloud relay routes live requests only; it does not store your note contents. A free relay may need a cold start after inactivity.")
