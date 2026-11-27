@@ -4,13 +4,18 @@ import android.app.Application
 import android.content.Intent
 import android.net.Uri
 import android.os.Looper
+import android.util.Base64
 import androidx.lifecycle.ViewModelStore
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.time.Duration
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import javax.imageio.ImageIO
 import kotlinx.coroutines.runBlocking
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -132,5 +137,80 @@ class ReaderBarrierAndTabNavigationCoordinatorTest {
         model.fail("")
         model.rejectExternalOpen(rejectedUri, "Blocked again", initial = true)
         assertEquals("", model.state.value.error)
+    }
+
+    @Test fun legacyMigrationReopenPortableAssetsAndNativeAuthoritativeBarrierWork() {
+        val key = "rb-tn-mig-${UUID.randomUUID()}".also(keys::add)
+        val image = BufferedImage(2, 2, BufferedImage.TYPE_INT_ARGB).apply { setRGB(0, 0, 0xFF1E88E5.toInt()) }
+        val png = "data:image/png;base64," + Base64.encodeToString(
+            ByteArrayOutputStream().also { ImageIO.write(image, "png", it) }.toByteArray(),
+            Base64.NO_WRAP,
+        )
+        val seedMedia = MediaStorage(app)
+        val copiedAssetDir = seedMedia.materializePortableDirectory(JSONObject().put("assets/diagram.png", png))
+        try {
+            val closedStore = ClosedNoteStore(File(app.filesDir, "workspaces/$key/closed-notes"))
+            val archivedPortable = Note(
+                name = "Recovered Study.smd",
+                content = "# Archived portable\n\n![diagram](assets/diagram.png)\n",
+                assetDirectory = copiedAssetDir,
+                assetsDirty = true,
+            )
+            val archivedRef = closedStore.save(archivedPortable)
+            closedStore.saveIndex(listOf(archivedRef))
+
+            val legacyClosed = Note(name = "Legacy.md", content = "# Legacy closed body\n")
+            val activeSeed = Note(name = "Open.md", content = "# Active seed\n")
+            val snapshotFile = File(app.filesDir, "workspaces/$key.json").apply { parentFile?.mkdirs() }
+            snapshotFile.bufferedWriter(Charsets.UTF_8).use { writer ->
+                NoteRecovery.write(
+                    writer,
+                    StudioState(tabs = listOf(activeSeed), closedTabs = listOf(legacyClosed), activeId = activeSeed.id),
+                )
+            }
+
+            val model = newModel(key)
+            await {
+                closedStore.loadIndexStrict().map { it.id }.toSet() == setOf(archivedRef.id, legacyClosed.id) &&
+                    model.state.value.closedTabs.find { it.id == legacyClosed.id }?.content?.isEmpty() == true
+            }
+            assertEquals(listOf(archivedRef.id, legacyClosed.id), model.state.value.closedTabs.map { it.id })
+
+            val interceptedSaves = AtomicInteger(0)
+            model.closedNoteIndexSaveInterceptor = { interceptedSaves.incrementAndGet() }
+            model.readerFlushStatusRequester = { ReaderFlushStatus.WRONG_ACTIVE_NOTE }
+
+            // Native is authoritative before reader sync, so WRONG_ACTIVE_NOTE barrier succeeds and reopens archived .smd + copied assets.
+            model.reopen()
+            await {
+                model.state.value.active.id == archivedRef.id &&
+                    closedStore.loadIndexStrict().map { it.id } == listOf(legacyClosed.id)
+            }
+            assertTrue(interceptedSaves.get() >= 1)
+            assertEquals(archivedPortable.content, model.state.value.active.content)
+            assertEquals(png, model.media.portableAssets(model.state.value.active.assetDirectory).getString("assets/diagram.png"))
+
+            // Divergent reader protocol makes native non-authoritative, so WRONG_ACTIVE_NOTE rejects reopen and preserves archive index.
+            model.readerSync(archivedRef.id, "epoch-1", 0L, archivedPortable.content)
+            model.edit(archivedRef.id, "# Diverged native text\n")
+            model.reopen()
+            await { model.state.value.message?.contains("The reader could not confirm its latest edits") == true }
+            assertEquals(listOf(legacyClosed.id), model.state.value.closedTabs.map { it.id })
+            assertEquals(listOf(legacyClosed.id), closedStore.loadIndexStrict().map { it.id })
+
+            // Once protocol is cleared, native is authoritative again and the migrated legacy note reopens cleanly.
+            model.clearReaderEditProtocol(archivedRef.id)
+            model.reopen()
+            await {
+                model.state.value.active.id == legacyClosed.id &&
+                    model.state.value.closedTabs.isEmpty() &&
+                    closedStore.loadIndexStrict().isEmpty()
+            }
+            assertTrue(interceptedSaves.get() >= 2)
+            assertEquals("# Legacy closed body\n", model.state.value.active.content)
+            model.closedNoteIndexSaveInterceptor = null
+        } finally {
+            File(app.filesDir, "portable-assets/$copiedAssetDir").deleteRecursively()
+        }
     }
 }
