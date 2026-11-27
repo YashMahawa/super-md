@@ -2,9 +2,29 @@
 import argparse,hashlib,json,os,subprocess,sys,time
 from pathlib import Path
 try:
-    from .core.paths import DESKTOP_DIR
+    from .core.paths import DESKTOP_DIR, appdata_root
 except ImportError:
-    from core.paths import DESKTOP_DIR
+    from core.paths import DESKTOP_DIR, appdata_root
+
+
+def _record_smoke_spawn(log_file: str, pid: object) -> None:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return
+    try:
+        target = Path(log_file)
+        if not target.is_absolute() or target.is_symlink() or not target.parent.is_dir():
+            return
+        pgid = None
+        if os.name != 'nt':
+            try:
+                pgid = os.getpgid(pid)
+            except OSError:
+                pgid = None
+        entry = {'pid': pid, 'pgid': pgid, 'token': os.environ.get('SUPERMD_SMOKE_RUN_ID', '')}
+        with target.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps(entry, separators=(',', ':')) + '\n')
+    except OSError:
+        pass
 
 def _daemon_command(*,executable=None,frozen=None,platform=None,env=None):
     frozen=getattr(sys,'frozen',False) if frozen is None else bool(frozen)
@@ -41,7 +61,7 @@ def main(argv):
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
     platform=sys.platform
     is_win=platform.startswith('win')
-    root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
+    root=appdata_root(writable_location_fn=QStandardPaths.writableLocation)
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def _instance_lock_held():
         if not root.exists():return False
@@ -190,9 +210,16 @@ def main(argv):
             popen_session={'process_group':0} if platform=='darwin' else {'start_new_session':not is_win}
             log_path=root/'background-service.log'
             had_legacy_log=log_path.is_file()
-            spawn_env=None if had_legacy_log else {**os.environ,'SUPERMD_FRESH_SERVICE_LOG':'1'}
+            smoke_spawn_log=os.environ.get('SUPERMD_SMOKE_SPAWN_LOG','').strip()
+            if had_legacy_log and not smoke_spawn_log:
+                spawn_env=None
+            else:
+                spawn_env=dict(os.environ)
+                spawn_env.pop('SUPERMD_SMOKE_SPAWN_LOG',None)
+                if not had_legacy_log:spawn_env['SUPERMD_FRESH_SERVICE_LOG']='1'
             with log_path.open('ab') as log:
                 proc=subprocess.Popen(_daemon_command(platform=platform),stdin=subprocess.DEVNULL,stdout=log,stderr=log,env=spawn_env,creationflags=flags,**popen_session)
+            if smoke_spawn_log:_record_smoke_spawn(smoke_spawn_log,proc.pid)
             deadline=time.monotonic()+30
             while time.monotonic()<deadline:
                 status=request('status',startup_poll=True)

@@ -11,6 +11,8 @@ from pathlib import Path
 from PySide6.QtCore import QCoreApplication, QDir, QLockFile, QMetaMethod, QObject, QStandardPaths, QTimer, QUrl, Qt, Signal, Slot
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
+from .paths import appdata_root
+
 _PROCESS_EXIT_LOCKS = []
 
 
@@ -443,7 +445,7 @@ class InstanceBroker(QObject):
     def __init__(self, parent=None, *, service_handler=None):
         super().__init__(parent)
         self.service_handler = service_handler
-        root = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
+        root = appdata_root(writable_location_fn=QStandardPaths.writableLocation)
         root.mkdir(parents=True, exist_ok=True)
         self.root = root
         self.lock = QLockFile(str(root / "native-instance.lock"))

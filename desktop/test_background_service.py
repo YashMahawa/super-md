@@ -437,6 +437,105 @@ class BackgroundTests(unittest.TestCase):
             )
             self.assertEqual(linux_cmd, [str(appimage.resolve()), "--background", "--agent-access"])
 
+    def test_appdata_override_isolates_session_broker_webengine_and_smoke_spawn_log(self):
+        import main as desktop_main
+
+        orig_writable = QStandardPaths.writableLocation
+
+        def forbid_appdata_writable_location(kind):
+            if kind == QStandardPaths.StandardLocation.AppDataLocation:
+                raise AssertionError("AppDataLocation must not be queried when SUPERMD_APPDATA_DIR is set")
+            return orig_writable(kind)
+
+        with tempfile.TemporaryDirectory(prefix="supermd-appdata-override-") as tmp:
+            root = Path(tmp).resolve()
+            disposable_appdata = (root / "service-home/AppData/Roaming/SuperMD/super-md").resolve()
+            spawn_log = root / "spawned-daemons.jsonl"
+            smoke_token = "smoke-token-12345"
+
+            class _FakeDefaultProfile:
+                def __init__(self):
+                    self.storage_path = None
+                    self.cache_path = None
+
+                def setPersistentStoragePath(self, value):
+                    self.storage_path = value
+
+                def setCachePath(self, value):
+                    self.cache_path = value
+
+                def settings(self):
+                    class _S:
+                        def setAttribute(self, *_args):
+                            pass
+                    return _S()
+
+                def urlSchemeHandler(self, _scheme):
+                    return object()
+
+            fake_profile = _FakeDefaultProfile()
+            env_patch = {
+                "SUPERMD_APPDATA_DIR": str(disposable_appdata),
+                "SUPERMD_SMOKE_RUN_ID": smoke_token,
+                "SUPERMD_SMOKE_SPAWN_LOG": str(spawn_log),
+            }
+            with patch.dict(os.environ, env_patch, clear=False), patch.object(
+                QStandardPaths, "writableLocation", side_effect=forbid_appdata_writable_location
+            ):
+                session = Session(False)
+                try:
+                    self.assertEqual(session.data, (disposable_appdata / "qt-studio").resolve())
+                    desktop_main._configure_reader_profile_storage(fake_profile, session)
+                    self.assertEqual(fake_profile.storage_path, str(session.data / "webengine-storage"))
+                    self.assertEqual(fake_profile.cache_path, str(session.data / "webengine-cache"))
+
+                    broker = InstanceBroker(self.qt_app, service_handler=lambda _action: {"ok": True, "running": True})
+                    try:
+                        self.assertEqual(broker.root, disposable_appdata)
+                        expected_name = "supermd-qt-" + hashlib.sha256(str(disposable_appdata).encode()).hexdigest()[:20]
+                        self.assertEqual(broker.name, expected_name)
+                    finally:
+                        broker.close()
+                finally:
+                    session.writes.shutdown(wait=True)
+
+                captured_spawn = {}
+
+                class _FakeSpawnedProc:
+                    pid = 54321
+
+                    def poll(self):
+                        return None
+
+                def capture_popen(cmd, **kwargs):
+                    captured_spawn["cmd"] = cmd
+                    captured_spawn["kwargs"] = kwargs
+                    return _FakeSpawnedProc()
+
+                out = io.StringIO()
+                with patch("instance.posix_ipc_exchange", side_effect=[
+                    (False, b"", True),
+                    (True, b'{"ok":true,"running":true,"agentAccess":true}\n', True),
+                ]), patch.object(background_cli.sys, "platform", "linux"), patch.object(
+                    background_cli.subprocess, "Popen", side_effect=capture_popen
+                ), redirect_stdout(out):
+                    rc = background_cli.main(["start"])
+
+                self.assertEqual(rc, 0)
+                started_payload = json.loads(out.getvalue())
+                self.assertEqual(
+                    Path(started_payload["result"]["sessionsDirectory"]).resolve(),
+                    (disposable_appdata / "qt-studio/agent-sessions").resolve(),
+                )
+                child_env = captured_spawn["kwargs"]["env"]
+                self.assertEqual(child_env["SUPERMD_APPDATA_DIR"], str(disposable_appdata))
+                self.assertEqual(child_env["SUPERMD_SMOKE_RUN_ID"], smoke_token)
+                self.assertNotIn("SUPERMD_SMOKE_SPAWN_LOG", child_env)
+                logged_entries = [json.loads(line) for line in spawn_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+                self.assertEqual(len(logged_entries), 1)
+                self.assertEqual(logged_entries[0]["pid"], 54321)
+                self.assertEqual(logged_entries[0]["token"], smoke_token)
+
     def test_upgrade_migration_preserves_legacy_background_and_agent_settings_without_opting_in_reader_only_users(self):
         root_temp = Path(tempfile.mkdtemp(prefix="supermd-upgrade-")).resolve()
         self.addCleanup(lambda: shutil.rmtree(root_temp, ignore_errors=True))
@@ -691,6 +790,164 @@ class BackgroundTests(unittest.TestCase):
         self.assertIn("JSON.parse(studio.sidebarSnapshot)", main_qml_source)
         self.assertIn('window.chooseSaveDestination("Save note"', main_qml_source)
         self.assertIn("studio.backgroundEnabled && !studio.hasOtherOpenWindows()", main_qml_source)
+
+    def test_native_file_open_event_dispatches_local_paths(self):
+        with tempfile.TemporaryDirectory(prefix="supermd-fileopen-") as tmp:
+            root = Path(tmp).resolve()
+            md_note = root / "Native Open Note.md"
+            md_note.write_text("# Native Open\n\nOpened via QFileOpenEvent.\n", encoding="utf-8")
+            url_note = root / "URL Open — ノート.md"
+            url_note.write_text("# URL Open\n\nOpened via local file URL.\n", encoding="utf-8")
+
+            probe_script = "\n".join([
+                "import json, os, shutil, sys",
+                "from pathlib import Path",
+                "os.environ['QT_QPA_PLATFORM'] = 'offscreen'",
+                "os.environ['QT_QUICK_BACKEND'] = 'software'",
+                f"sys.path.insert(0, {str(DESKTOP_DIR)!r})",
+                "from PySide6.QtCore import QCoreApplication, QUrl",
+                "from PySide6.QtGui import QFileOpenEvent",
+                "import python_runtime",
+                "python_runtime.discover = lambda *_a, **_kw: []",
+                "import main as desktop_main",
+                "from studio import Session, Studio",
+                "Studio._restore_update = lambda self: None",
+                "from test_studio import QuietStudio",
+                "app = desktop_main.StudioApplication(['super-md-fileopen-test'])",
+                "session = Session(True)",
+                "studio = QuietStudio(True, session)",
+                "class _Host:",
+                "    def __init__(self): self.visible = False",
+                "    def isVisible(self): return self.visible",
+                "    def show(self): self.visible = True",
+                "studio.host_window = _Host()",
+                "received = []",
+                "def on_open(path):",
+                "    received.append(path)",
+                "    studio.host_window.show()",
+                "    studio.openPath(path)",
+                "app.openRequested.connect(on_open)",
+                f"md_path = Path({str(md_note)!r})",
+                f"url_path = Path({str(url_note)!r})",
+                "try:",
+                "    assert QCoreApplication.sendEvent(app, QFileOpenEvent(str(md_path))) is True",
+                "    assert QCoreApplication.sendEvent(app, QFileOpenEvent(QUrl.fromLocalFile(str(url_path)))) is True",
+                "    QCoreApplication.sendEvent(app, QFileOpenEvent(QUrl('https://example.com/remote.md')))",
+                "    QCoreApplication.sendEvent(app, QFileOpenEvent(''))",
+                "    import time",
+                "    deadline = time.monotonic() + 5.0",
+                "    while time.monotonic() < deadline:",
+                "        app.processEvents()",
+                "        if {md_path.name, url_path.name}.issubset({tab['name'] for tab in studio.tabs}):",
+                "            break",
+                "        time.sleep(0.01)",
+                "    open_names = [tab['name'] for tab in studio.tabs]",
+                "    print(json.dumps({",
+                "        'received': received,",
+                "        'visible': studio.host_window.isVisible(),",
+                "        'tabs': open_names,",
+                "    }))",
+                "finally:",
+                "    studio.stop()",
+                "    studio.pool.shutdown(wait=True, cancel_futures=True)",
+                "    if hasattr(studio, '_search_pool'): studio._search_pool.shutdown(wait=True, cancel_futures=True)",
+                "    session.writes.shutdown(wait=True)",
+                "    shutil.rmtree(session.data, ignore_errors=True)",
+            ])
+            completed = subprocess.run(
+                [sys.executable, "-c", probe_script],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=25,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            result = json.loads(completed.stdout.strip().splitlines()[-1])
+            self.assertEqual(
+                [Path(p).resolve() for p in result["received"]],
+                [md_note.resolve(), url_note.resolve()],
+            )
+            self.assertTrue(result["visible"])
+            self.assertIn(md_note.name, result["tabs"])
+            self.assertIn(url_note.name, result["tabs"])
+
+    def test_tray_recent_menu_commands_open_selected_notes_and_handle_empty_state(self):
+        # Run with a dedicated QApplication singleton because earlier suites in
+        # run_tests.py initialize QGuiApplication, under which QMenu (QWidget) aborts.
+        probe_script = "\n".join([
+            "import json, os, sys",
+            "from types import SimpleNamespace",
+            "from unittest.mock import patch",
+            "os.environ['QT_QPA_PLATFORM'] = 'offscreen'",
+            f"sys.path.insert(0, {str(DESKTOP_DIR)!r})",
+            "from PySide6.QtCore import QObject",
+            "from PySide6.QtWidgets import QApplication",
+            "from background_service import BackgroundService",
+            "from studio import ROOT",
+            "qt_app = QApplication(['super-md-tray-recent-test'])",
+            "class _AppStub(QObject):",
+            "    def setQuitOnLastWindowClosed(self, _v): pass",
+            "    def quit(self): pass",
+            "opened = []",
+            "session = SimpleNamespace(settings={'keepInBackground': False}, windows={}, recent=[])",
+            "with patch('background_service.QSystemTrayIcon') as tray_cls:",
+            "    tray_cls.isSystemTrayAvailable.return_value = True",
+            "    service = BackgroundService(_AppStub(), session, ROOT, opened.append, force=False)",
+            "    assert service.tray is None and not tray_cls.called",
+            "    session.settings['keepInBackground'] = True",
+            "    service.sync()",
+            "    assert service.menu is not None and service.recents is not None",
+            "    tray_cls.return_value.setContextMenu.assert_called_once_with(service.menu)",
+            "    service.recents.aboutToShow.emit()",
+            "    empty_actions = service.recents.actions()",
+            "    assert len(empty_actions) == 1",
+            "    empty_info = (empty_actions[0].text(), empty_actions[0].isEnabled())",
+            "    empty_actions[0].trigger()",
+            "    assert opened == []",
+            "    session.recent = [",
+            "        '/workspace/alpha/Daily.md',",
+            "        '/workspace/beta/Daily.md',",
+            "        '/workspace/research/量子統計.smd',",
+            "        *[f'/workspace/archive/Note-{index}.md' for index in range(3, 12)],",
+            "    ]",
+            "    service.recents.aboutToShow.emit()",
+            "    recent_actions = service.recents.actions()",
+            "    first_three = [(a.text(), a.toolTip(), a.isEnabled()) for a in recent_actions[:3]]",
+            "    recent_actions[1].trigger()",
+            "    recent_actions[2].trigger()",
+            "    next(a for a in service.menu.actions() if a.text() == 'Open Super MD').trigger()",
+            "    print(json.dumps({",
+            "        'empty': list(empty_info),",
+            "        'count': len(recent_actions),",
+            "        'firstThree': first_three,",
+            "        'opened': opened,",
+            "    }))",
+        ])
+        completed = subprocess.run(
+            [sys.executable, "-c", probe_script],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        result = json.loads(completed.stdout.strip().splitlines()[-1])
+        self.assertEqual(result["empty"], ["No recent notes", False])
+        self.assertEqual(result["count"], 10)
+        self.assertEqual(
+            result["firstThree"],
+            [
+                ["Daily.md", "/workspace/alpha/Daily.md", True],
+                ["Daily.md", "/workspace/beta/Daily.md", True],
+                ["量子統計.smd", "/workspace/research/量子統計.smd", True],
+            ],
+        )
+        self.assertEqual(
+            result["opened"],
+            ["/workspace/beta/Daily.md", "/workspace/research/量子統計.smd", None],
+        )
 
 
 _HEADLESS_DAEMON_BOOTSTRAP = """

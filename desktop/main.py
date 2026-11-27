@@ -42,6 +42,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
+from core.paths import configured_appdata_root
 from external_open import ExternalOpenRouter
 from agent_live import create_qt_bridge
 from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes
@@ -65,6 +66,13 @@ class StudioApplication(QApplication):
         elif sys.platform == "darwin" and event.type() == QEvent.Type.ApplicationActivate:
             self.reopenRequested.emit()
         return super().event(event)
+
+
+def _configure_reader_profile_storage(profile, session) -> None:
+    if configured_appdata_root() is not None:
+        profile.setPersistentStoragePath(str(session.data / "webengine-storage"))
+        profile.setCachePath(str(session.data / "webengine-cache"))
+
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("read", "inspect", "assets", "extract", "pack", "export", "export-json", "doctor", "validate-theme"):
@@ -155,6 +163,7 @@ def main():
         if reader_profile_ready["initialized"]:
             return
         profile = QWebEngineProfile.defaultProfile()
+        _configure_reader_profile_storage(profile, session)
         profile.installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
         profile.installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
         reader_profile_ready["initialized"] = True
