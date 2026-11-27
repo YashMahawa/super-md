@@ -19,8 +19,8 @@ import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import DocumentProperties from "./DocumentProperties";
 import {DocumentAppearance} from '../documentAppearance';
-import {svgDataBackdrop,svgImage} from '../svgImage';
-import {adaptSvgData,decodeSvgDataUri} from '../svgTheme';
+import {parseValidatedSvg} from '../svgImage';
+import {adaptValidatedSvg,decodeSvgDataUri} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
 import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
@@ -141,19 +141,24 @@ function AssetImage({ noteId, src = "", alt = "", documentPath, trustedImageHost
     return()=>window.removeEventListener('supermd-asset-access-restored',restored);
   },[documentPath,embedded,error,isRemote,src]);
   const isSvgData=/^data:image\/svg\+xml(?:[;,]|$)/i.test(resolved);
-  const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
+  const validatedSvg=useMemo(()=>{
+    if(!resolved||!isSvgData)return null;
+    try{return {svg:parseValidatedSvg(decodeSvgDataUri(resolved)),error:''};}
+    catch(reason){return {svg:null,error:reason instanceof Error?reason.message:String(reason)};}
+  },[resolved,isSvgData]);
+  const svgBacking=validatedSvg?.svg?.backing;
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
   const adapted=useMemo(()=>{
     if(!resolved||!isSvgData)return {src:resolved,error:''};
+    if(!validatedSvg?.svg)return {src:'',error:validatedSvg?.error??'This SVG is not valid XML.'};
+    if(!adaptsSvg)return {src:resolved,error:''};
     try{
-      if(adaptsSvg&&svgBacking)return {src:adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'),error:''};
-      svgImage(decodeSvgDataUri(resolved));
-      return {src:resolved,error:''};
+      return {src:'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(adaptValidatedSvg(validatedSvg.svg,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome')),error:''};
     }catch(reason){
       return {src:'',error:reason instanceof Error?reason.message:String(reason)};
     }
-  },[resolved,isSvgData,svgBacking,appearance,adaptsSvg]);
+  },[resolved,isSvgData,validatedSvg,appearance,adaptsSvg]);
   const adaptedSource=adapted.src;
   const displayError=error||adapted.error;
   // A one-time approval belongs to the exact note and URL the user approved.

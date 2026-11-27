@@ -67,6 +67,8 @@ class DocumentAccessTest {
             putBoolean("autosave", previousAutosave ?: true)
             if (previousRecent == null) remove("recent") else putString("recent", previousRecent)
         }.commit()
+        RevocableTestDocumentsProvider.reset(app)
+        TestAuthorityGrants.clear()
         ShadowContentResolver.reset()
         root.deleteRecursively()
         workspaceKeys.forEach { File(app.filesDir, "workspaces/$it").deleteRecursively() }
@@ -1499,6 +1501,331 @@ class DocumentAccessTest {
         model.open(unconfirmedProbePlainUri)
         await { model.documentAccessRequests.value?.noteId == probeTabId }
         assertEquals(probeDraft, model.state.value.tabs.single { it.id == probeTabId }.content)
+    }
+
+    @Test fun nativeTabRenameRoutesRevokedAndDowngradedDirectGrantsToDocumentRecoveryWithoutAutoReplay() {
+        registerRevocableProvider()
+        val baseline = "# Original Direct Note\n"
+        val directUri = RevocableTestDocumentsProvider.putMarkdown(app, "DirectNote.md", baseline)
+        RevocableTestDocumentsProvider.grantReadWrite(directUri)
+
+        val model = newModel()
+        model.open(directUri)
+        await { model.state.value.tabs.any { it.uri == directUri.toString() } }
+        val noteId = model.state.value.tabs.single { it.uri == directUri.toString() }.id
+
+        val unsavedDraft = "# Original Direct Note\n\nLocal draft preserved across denied rename.\n"
+        model.edit(noteId, unsavedDraft)
+        assertTrue(model.state.value.tabs.single { it.id == noteId }.dirty)
+        assertFalse(model.documentWriteNeedsAccess(noteId))
+
+        // Ordinary non-permission provider failure must remain distinct from permission denial.
+        RevocableTestDocumentsProvider.setOrdinaryRenameError("DirectNote.md", true)
+        var outcome: Pair<Boolean, String?>? = null
+        model.rename(noteId, "RenamedDirect", showGlobalError = true) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to "Simulated transient provider rename error for DirectNote.md", outcome)
+        assertEquals(
+            "Could not rename note: Simulated transient provider rename error for DirectNote.md",
+            model.state.value.error,
+        )
+        assertNull(model.documentAccessRequests.value)
+        assertFalse(model.documentWriteNeedsAccess(noteId))
+        assertEquals(1, RevocableTestDocumentsProvider.renameAttempts("DirectNote.md"))
+        assertEquals(unsavedDraft, model.state.value.tabs.single { it.id == noteId }.content)
+        assertEquals(baseline, model.state.value.tabs.single { it.id == noteId }.saved)
+        RevocableTestDocumentsProvider.setOrdinaryRenameError("DirectNote.md", false)
+        model.dismissError()
+
+        // Revoked direct grant routes into explicit document access recovery without generic error.
+        RevocableTestDocumentsProvider.revokeAll(directUri)
+        outcome = null
+        model.rename(noteId, "RenamedDirect", showGlobalError = true) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to DOCUMENT_ACCESS_MESSAGE, outcome)
+        assertNull(model.state.value.error)
+        assertEquals(DOCUMENT_ACCESS_MESSAGE, model.state.value.message)
+        assertTrue(model.documentWriteNeedsAccess(noteId))
+        assertEquals(
+            DocumentAccessRequest(directUri.toString(), "DirectNote.md", noteId, writing = true),
+            model.documentAccessRequests.value,
+        )
+        assertEquals(1, RevocableTestDocumentsProvider.renameAttempts("DirectNote.md"))
+        val afterRevokedAttempt = model.state.value.tabs.single { it.id == noteId }
+        assertEquals("DirectNote.md", afterRevokedAttempt.name)
+        assertEquals(unsavedDraft, afterRevokedAttempt.content)
+        assertEquals(baseline, afterRevokedAttempt.saved)
+        assertTrue(afterRevokedAttempt.dirty)
+
+        // Dismissing the prompt ("Not now") and retrying rename explicitly re-opens the recovery prompt without calling provider.
+        model.dismissDocumentAccess()
+        assertNull(model.documentAccessRequests.value)
+        outcome = null
+        model.rename(noteId, "RenamedDirect", showGlobalError = false) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to DOCUMENT_ACCESS_MESSAGE, outcome)
+        assertEquals(noteId, model.documentAccessRequests.value?.noteId)
+        assertEquals(true, model.documentAccessRequests.value?.writing)
+        assertEquals(1, RevocableTestDocumentsProvider.renameAttempts("DirectNote.md"))
+
+        // Downgraded (read-only) direct grant on another tab also routes into explicit write-access recovery.
+        val downgradedUri = RevocableTestDocumentsProvider.putMarkdown(app, "ReadOnlyDirect.md", "# ReadOnly Baseline\n")
+        RevocableTestDocumentsProvider.grantReadWrite(downgradedUri)
+        model.dismissDocumentAccess()
+        model.open(downgradedUri)
+        await { model.state.value.tabs.any { it.uri == downgradedUri.toString() } }
+        val downgradedId = model.state.value.tabs.single { it.uri == downgradedUri.toString() }.id
+        model.edit(downgradedId, "# ReadOnly Draft\n")
+        RevocableTestDocumentsProvider.revokeAll(downgradedUri)
+        RevocableTestDocumentsProvider.grantReadOnly(downgradedUri)
+
+        outcome = null
+        model.rename(downgradedId, "AttemptedReadOnlyRename", showGlobalError = true) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to DOCUMENT_ACCESS_MESSAGE, outcome)
+        assertNull(model.state.value.error)
+        assertTrue(model.documentWriteNeedsAccess(downgradedId))
+        assertEquals(downgradedId, model.documentAccessRequests.value?.noteId)
+        assertEquals("# ReadOnly Draft\n", model.state.value.tabs.single { it.id == downgradedId }.content)
+        assertEquals("ReadOnlyDirect.md", model.state.value.tabs.single { it.id == downgradedId }.name)
+
+        // Restoring RW access to DirectNote.md unblocks write state, preserves draft, and does NOT auto-replay rename.
+        model.dismissDocumentAccess()
+        model.select(noteId)
+        model.requestWriteAccessIfBlocked(noteId, explicit = true)
+        val restoreReq = checkNotNull(model.documentAccessRequests.value)
+        RevocableTestDocumentsProvider.grantReadWrite(directUri)
+        model.restoreDocumentAccess(restoreReq, directUri)
+        await { !model.documentWriteNeedsAccess(noteId) && model.documentAccessRequests.value == null }
+
+        assertEquals(1, RevocableTestDocumentsProvider.renameAttempts("DirectNote.md"))
+        val afterRestore = model.state.value.tabs.single { it.id == noteId }
+        assertEquals("DirectNote.md", afterRestore.name)
+        assertEquals(unsavedDraft, afterRestore.content)
+        assertEquals(baseline, afterRestore.saved)
+        assertTrue(afterRestore.dirty)
+        assertTrue(RevocableTestDocumentsProvider.fileForDocId(app, "DirectNote.md").exists())
+        assertFalse(RevocableTestDocumentsProvider.fileForDocId(app, "RenamedDirect.md").exists())
+
+        // User-initiated retry after access returns renames the file and preserves the local draft.
+        outcome = null
+        model.rename(noteId, "RenamedDirect", showGlobalError = false) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(true to null, outcome)
+        val afterRetry = model.state.value.tabs.single { it.id == noteId }
+        assertEquals("RenamedDirect.md", afterRetry.name)
+        assertEquals(unsavedDraft, afterRetry.content)
+        assertEquals(baseline, afterRetry.saved)
+        assertTrue(afterRetry.dirty)
+        assertFalse(model.documentWriteNeedsAccess(noteId))
+        assertNull(model.state.value.error)
+        assertFalse(RevocableTestDocumentsProvider.fileForDocId(app, "DirectNote.md").exists())
+        assertEquals(baseline, RevocableTestDocumentsProvider.fileForDocId(app, "RenamedDirect.md").readText(Charsets.UTF_8))
+    }
+
+    @Test fun nativeTabRenameRoutesRevokedAndDowngradedTreeGrantsToDocumentRecoveryWithoutAutoReplay() {
+        registerRevocableProvider()
+        val vaultTreeUri = RevocableTestDocumentsProvider.treeUri(app, "vault")
+        val planBaseline = "# Plan Baseline\n"
+        val notesBaseline = "# Notes Baseline\n"
+        val planPlainUri = RevocableTestDocumentsProvider.putMarkdown(app, "vault/Plan.md", planBaseline)
+        RevocableTestDocumentsProvider.putMarkdown(app, "vault/Notes.md", notesBaseline)
+        RevocableTestDocumentsProvider.putMarkdown(app, "vault/Existing.md", "# Existing\n")
+        RevocableTestDocumentsProvider.grantReadWrite(vaultTreeUri)
+
+        val planTreeUri = DocumentsContract.buildDocumentUriUsingTree(vaultTreeUri, "vault/Plan.md")
+        val notesTreeUri = DocumentsContract.buildDocumentUriUsingTree(vaultTreeUri, "vault/Notes.md")
+
+        val model = newModel()
+        model.setFolder(vaultTreeUri)
+        await { model.state.value.folder == vaultTreeUri.toString() && model.state.value.files.any { it.name == "Plan.md" } }
+
+        model.open(planTreeUri, "Plan.md")
+        await { model.state.value.tabs.any { it.name == "Plan.md" && it.uri != null } }
+        val planId = model.state.value.tabs.single { it.name == "Plan.md" }.id
+        val planDraft = "# Plan Baseline\n\nUnsaved plan draft.\n"
+        model.edit(planId, planDraft)
+
+        model.open(notesTreeUri, "Notes.md")
+        await { model.state.value.tabs.any { it.name == "Notes.md" && it.uri != null } }
+        val notesId = model.state.value.tabs.single { it.name == "Notes.md" }.id
+        val notesDraft = "# Notes Baseline\n\nUnsaved notes draft.\n"
+        model.edit(notesId, notesDraft)
+
+        // Duplicate name in open folder remains an ordinary validation error, not an access prompt.
+        model.select(planId)
+        var outcome: Pair<Boolean, String?>? = null
+        model.rename(planId, "Existing", showGlobalError = false) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to "'Existing.md' already exists in this folder", outcome)
+        assertNull(model.documentAccessRequests.value)
+        assertFalse(model.documentWriteNeedsAccess(planId))
+
+        // Case A: Downgraded (read-only) tree grant routes to document recovery, preserves draft,
+        // does not auto-replay on single-file RW restore, and succeeds on retry while folder stays read-only.
+        RevocableTestDocumentsProvider.revokeAll(vaultTreeUri)
+        RevocableTestDocumentsProvider.grantReadOnly(vaultTreeUri)
+
+        outcome = null
+        model.rename(planId, "UpdatedPlan", showGlobalError = true) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to DOCUMENT_ACCESS_MESSAGE, outcome)
+        assertNull(model.state.value.error)
+        assertTrue(model.documentWriteNeedsAccess(planId))
+        val planReq = checkNotNull(model.documentAccessRequests.value)
+        assertEquals(planId, planReq.noteId)
+        assertTrue(planReq.writing)
+        assertEquals("Plan.md", model.state.value.tabs.single { it.id == planId }.name)
+        assertEquals(planDraft, model.state.value.tabs.single { it.id == planId }.content)
+
+        RevocableTestDocumentsProvider.grantReadWrite(planPlainUri)
+        model.restoreDocumentAccess(planReq, planPlainUri)
+        await { !model.documentWriteNeedsAccess(planId) && model.documentAccessRequests.value == null }
+
+        assertEquals("Plan.md", model.state.value.tabs.single { it.id == planId }.name)
+        assertEquals(planDraft, model.state.value.tabs.single { it.id == planId }.content)
+        assertFalse(RevocableTestDocumentsProvider.fileForDocId(app, "vault/UpdatedPlan.md").exists())
+
+        outcome = null
+        model.rename(planId, "UpdatedPlan", showGlobalError = false) { ok, err -> outcome = ok to err }
+        await { outcome != null && model.state.value.files.any { it.name == "UpdatedPlan.md" } }
+        assertEquals(true to null, outcome)
+        val renamedPlan = model.state.value.tabs.single { it.id == planId }
+        assertEquals("UpdatedPlan.md", renamedPlan.name)
+        assertEquals("UpdatedPlan.md", renamedPlan.relative)
+        assertEquals(planDraft, renamedPlan.content)
+        assertEquals(planBaseline, renamedPlan.saved)
+        assertFalse("Read-only tree must not wrap standalone RW rename back into tree URI", DocumentsContract.isTreeUri(Uri.parse(renamedPlan.uri!!)))
+        assertNull(model.state.value.error)
+        assertEquals(planBaseline, RevocableTestDocumentsProvider.fileForDocId(app, "vault/UpdatedPlan.md").readText(Charsets.UTF_8))
+
+        // Case B: Completely revoked tree grant routes to document recovery, preserves draft,
+        // does not auto-replay when folder RW grant returns, and succeeds on explicit retry.
+        RevocableTestDocumentsProvider.revokeAll(vaultTreeUri)
+        model.select(notesId)
+        outcome = null
+        model.rename(notesId, "UpdatedNotes", showGlobalError = true) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to DOCUMENT_ACCESS_MESSAGE, outcome)
+        assertNull(model.state.value.error)
+        assertTrue(model.documentWriteNeedsAccess(notesId))
+        assertEquals(notesId, model.documentAccessRequests.value?.noteId)
+        assertEquals("Notes.md", model.state.value.tabs.single { it.id == notesId }.name)
+        assertEquals(notesDraft, model.state.value.tabs.single { it.id == notesId }.content)
+
+        model.dismissDocumentAccess()
+        RevocableTestDocumentsProvider.grantReadWrite(vaultTreeUri)
+        model.setFolder(vaultTreeUri)
+        await { !model.documentWriteNeedsAccess(notesId) && model.state.value.files.any { it.name == "Notes.md" } }
+
+        assertEquals("Notes.md", model.state.value.tabs.single { it.id == notesId }.name)
+        assertEquals(notesDraft, model.state.value.tabs.single { it.id == notesId }.content)
+        assertFalse(RevocableTestDocumentsProvider.fileForDocId(app, "vault/UpdatedNotes.md").exists())
+
+        outcome = null
+        model.rename(notesId, "UpdatedNotes", showGlobalError = false) { ok, err -> outcome = ok to err }
+        await { outcome != null && model.state.value.files.any { it.name == "UpdatedNotes.md" } }
+        assertEquals(true to null, outcome)
+        val renamedNotes = model.state.value.tabs.single { it.id == notesId }
+        assertEquals("UpdatedNotes.md", renamedNotes.name)
+        assertEquals("UpdatedNotes.md", renamedNotes.relative)
+        assertEquals(notesDraft, renamedNotes.content)
+        assertEquals(notesBaseline, renamedNotes.saved)
+        assertTrue(DocumentsContract.isTreeUri(Uri.parse(renamedNotes.uri!!)))
+        assertNull(model.state.value.error)
+        assertEquals(notesBaseline, RevocableTestDocumentsProvider.fileForDocId(app, "vault/UpdatedNotes.md").readText(Charsets.UTF_8))
+
+        // Case C: Revoked tree grant recovered via single-file restoreDocumentAccess while folder stays revoked.
+        RevocableTestDocumentsProvider.revokeAll(vaultTreeUri)
+        outcome = null
+        model.rename(notesId, "StandaloneRecoveredNotes", showGlobalError = true) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to DOCUMENT_ACCESS_MESSAGE, outcome)
+        assertNull(model.state.value.error)
+        val singleRestoreReq = checkNotNull(model.documentAccessRequests.value)
+        val updatedNotesPlainUri = DocumentsContract.buildDocumentUri(
+            RevocableTestDocumentsProvider.authority(app),
+            "vault/UpdatedNotes.md",
+        )
+        RevocableTestDocumentsProvider.grantReadWrite(updatedNotesPlainUri)
+        model.restoreDocumentAccess(singleRestoreReq, updatedNotesPlainUri)
+        await { !model.documentWriteNeedsAccess(notesId) && model.documentAccessRequests.value == null }
+        assertEquals("UpdatedNotes.md", model.state.value.tabs.single { it.id == notesId }.name)
+
+        outcome = null
+        model.rename(notesId, "StandaloneRecoveredNotes", showGlobalError = false) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(true to null, outcome)
+        assertEquals("StandaloneRecoveredNotes.md", model.state.value.tabs.single { it.id == notesId }.name)
+        assertNull(model.state.value.error)
+        assertEquals(notesBaseline, RevocableTestDocumentsProvider.fileForDocId(app, "vault/StandaloneRecoveredNotes.md").readText(Charsets.UTF_8))
+
+        // Case D: Tab backed by a persisted containing-folder tree grant when no workspace folder is open (state.folder == null).
+        val detachedModel = newModel()
+        val detachedBaseline = "# Detached Tree Baseline\n"
+        val detachedPlainUri = RevocableTestDocumentsProvider.putMarkdown(app, "vault/Detached.md", detachedBaseline)
+        RevocableTestDocumentsProvider.grantReadOnly(detachedPlainUri)
+        RevocableTestDocumentsProvider.grantReadWrite(vaultTreeUri)
+        detachedModel.documentAccess.persist(vaultTreeUri)
+        detachedModel.open(detachedPlainUri)
+        await { detachedModel.state.value.tabs.any { it.name == "Detached.md" && it.uri != null } }
+        assertNull(detachedModel.state.value.folder)
+        val detachedTabInitial = detachedModel.state.value.tabs.single { it.name == "Detached.md" }
+        val detachedId = detachedTabInitial.id
+        assertTrue(DocumentsContract.isTreeUri(Uri.parse(detachedTabInitial.uri!!)))
+        assertFalse(detachedModel.documentWriteNeedsAccess(detachedId))
+        val detachedDraft = "# Detached Tree Baseline\n\nUnsaved detached draft.\n"
+        detachedModel.edit(detachedId, detachedDraft)
+
+        RevocableTestDocumentsProvider.revokeAll(detachedPlainUri)
+        RevocableTestDocumentsProvider.revokeAll(vaultTreeUri)
+        RevocableTestDocumentsProvider.grantReadOnly(vaultTreeUri)
+        outcome = null
+        detachedModel.rename(detachedId, "RenamedDetached", showGlobalError = true) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(false to DOCUMENT_ACCESS_MESSAGE, outcome)
+        assertNull(detachedModel.state.value.error)
+        assertTrue(detachedModel.documentWriteNeedsAccess(detachedId))
+        assertEquals(detachedId, detachedModel.documentAccessRequests.value?.noteId)
+        assertEquals("Detached.md", detachedModel.state.value.tabs.single { it.id == detachedId }.name)
+        assertEquals(detachedDraft, detachedModel.state.value.tabs.single { it.id == detachedId }.content)
+
+        val detachedReq = checkNotNull(detachedModel.documentAccessRequests.value)
+        RevocableTestDocumentsProvider.grantReadWrite(vaultTreeUri)
+        detachedModel.documentAccess.persist(vaultTreeUri)
+        RevocableTestDocumentsProvider.grantReadOnly(detachedPlainUri)
+        detachedModel.restoreDocumentAccess(detachedReq, detachedPlainUri)
+        await { !detachedModel.documentWriteNeedsAccess(detachedId) && detachedModel.documentAccessRequests.value == null }
+        assertEquals("Detached.md", detachedModel.state.value.tabs.single { it.id == detachedId }.name)
+        assertFalse(RevocableTestDocumentsProvider.fileForDocId(app, "vault/RenamedDetached.md").exists())
+
+        outcome = null
+        detachedModel.rename(detachedId, "RenamedDetached", showGlobalError = false) { ok, err -> outcome = ok to err }
+        await { outcome != null }
+        assertEquals(true to null, outcome)
+        val renamedDetached = detachedModel.state.value.tabs.single { it.id == detachedId }
+        assertEquals("RenamedDetached.md", renamedDetached.name)
+        assertTrue(DocumentsContract.isTreeUri(Uri.parse(renamedDetached.uri!!)))
+        assertFalse(detachedModel.documentWriteNeedsAccess(detachedId))
+        assertEquals(detachedDraft, renamedDetached.content)
+        assertEquals(detachedBaseline, RevocableTestDocumentsProvider.fileForDocId(app, "vault/RenamedDetached.md").readText(Charsets.UTF_8))
+    }
+
+    private fun registerRevocableProvider(): String {
+        val testAuth = RevocableTestDocumentsProvider.authority(app)
+        val revocableProvider = RevocableTestDocumentsProvider().apply {
+            attachInfo(
+                app,
+                ProviderInfo().apply {
+                    authority = testAuth
+                    exported = true
+                    grantUriPermissions = true
+                },
+            )
+        }
+        ShadowContentResolver.registerProviderInternal(testAuth, revocableProvider)
+        RevocableTestDocumentsProvider.reset(app)
+        return testAuth
     }
 
     private fun newModel(): StudioViewModel {
