@@ -3,7 +3,9 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 import LiveEditor from "./LiveEditor";
+import MarkdownPreview from "./MarkdownPreview";
 import ReadingSearch, { resolveSourceBlock, resolveSourceHighlightRange, sourceMatches } from "./ReadingSearch";
+import { stepIndices } from "../renderedOutputs";
 import { registerWindowedText } from "../windowedSearch";
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
@@ -1521,11 +1523,7 @@ describe("ReadingSearch DOM behavior", () => {
     }
   });
 
-  it("reveals verified StepCards slides (prose, legacy notes, and diagram/chart specs) and standalone diagrams while rejecting stale offsets", async () => {
-    const host = document.createElement("div");
-    document.body.append(host);
-    const root = createRoot(host);
-
+  const buildStepAndDiagramFixture = () => {
     const stepDeckJson = JSON.stringify({
       title: "Fourier Harmonic Deck",
       steps: [
@@ -1537,8 +1535,7 @@ describe("ReadingSearch DOM behavior", () => {
     });
     const standaloneDiagram = '```smd-diagram\n{"width":360,"height":140,"nodes":[{"id":"a","label":"Standalone Harmonic Diagram","x":110,"y":70},{"id":"b","label":"Out","x":260,"y":70}],"edges":[{"from":"a","to":"b"}]}\n```';
     const standaloneChart = '```smd-chart\n{"title":"Harmonic Spectrum","series":[{"name":"wave","expression":"sin(x) + 0*1"}]}\n```';
-
-    let current = [
+    const doc = [
       "# Signal Notes",
       "",
       "Intro Harmonic paragraph.",
@@ -1551,24 +1548,30 @@ describe("ReadingSearch DOM behavior", () => {
       "",
       "Closing Harmonic paragraph.",
     ].join("\n");
-
     const rangeOf = (needle: string, fromOffset = 0) => {
-      const idx = current.indexOf(needle, fromOffset);
+      const idx = doc.indexOf(needle, fromOffset);
       expect(idx).toBeGreaterThanOrEqual(0);
       return { start: idx, end: idx + needle.length };
     };
+    return {
+      stepDeckJson,
+      doc,
+      slide3Hit: rangeOf("Harmonic", doc.indexOf("Slide three **")),
+      slide2DiagramHit: rangeOf("Harmonic", doc.indexOf('"Harmonic node"')),
+      slide4LegacyHit: rangeOf("Harmonic", doc.indexOf("Legacy Harmonic")),
+      standaloneDiagHit: rangeOf("Harmonic", doc.indexOf("Standalone Harmonic")),
+      chartTitleHit: rangeOf("Harmonic", doc.indexOf("Harmonic Spectrum")),
+      chartExprHit: rangeOf("sin(x)"),
+    };
+  };
 
-    const slide3Context = current.indexOf("Slide three **");
-    const slide3Hit = rangeOf("Harmonic", slide3Context);
-    const slide2Context = current.indexOf('"Harmonic node"');
-    const slide2DiagramHit = rangeOf("Harmonic", slide2Context);
-    const slide4Context = current.indexOf("Legacy Harmonic");
-    const slide4LegacyHit = rangeOf("Harmonic", slide4Context);
-    const standaloneDiagContext = current.indexOf("Standalone Harmonic");
-    const standaloneDiagHit = rangeOf("Harmonic", standaloneDiagContext);
-    const chartTitleContext = current.indexOf("Harmonic Spectrum");
-    const chartTitleHit = rangeOf("Harmonic", chartTitleContext);
-    const chartExprHit = rangeOf("sin(x)");
+  it("reveals verified StepCards occurrences across prose, legacy notes, diagram specs, and multi-slide windowed blocks", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const fixture = buildStepAndDiagramFixture();
+    let current = fixture.doc;
+    stepIndices.clear();
 
     const scrolledTargets: Element[] = [];
     const origScroll = Element.prototype.scrollIntoView;
@@ -1577,55 +1580,41 @@ describe("ReadingSearch DOM behavior", () => {
     };
 
     try {
-      const renderReader = async (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number }, live = true) => {
+      const renderLive = async (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number }) => {
         await act(async () => {
           root.render(
             <div className="android-document">
-              <ReadingSearch
-                content={current}
-                close={() => {}}
-                seed={seed}
-                onChange={live ? (next) => { current = next; } : undefined}
-              />
+              <ReadingSearch content={current} close={() => {}} seed={seed} onChange={(next) => { current = next; }} />
               <section className="android-reading">
-                {live ? (
-                  <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
-                ) : (
-                  <div className="markdown-body">
-                    <LiveEditor markdown={current} onChange={() => {}} documentPath={null} python="" dark={false} />
-                  </div>
-                )}
+                <LiveEditor markdown={current} onChange={(next) => { current = next; }} documentPath={null} python="" dark={false} />
               </section>
             </div>
           );
         });
-        await act(async () => {
-          await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
-        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
       };
 
-      // 1. Verified occurrence on Slide 3 markdown: switches StepCards to slide 3 (index 2) and selects visible match (not confused by nested <p data-source-start="0">).
-      await renderReader({
+      // 1. Slide 3 markdown: switches StepCards to slide 3 (index 2) and selects visible match (ignoring nested <p data-source-start="0">).
+      await renderLive({
         query: "harmonic",
         caseSensitive: false,
-        sourceStart: slide3Hit.start,
-        sourceEnd: slide3Hit.end,
+        sourceStart: fixture.slide3Hit.start,
+        sourceEnd: fixture.slide3Hit.end,
         matchText: "Harmonic",
         nonce: 1,
       });
       const stepCard = () => host.querySelector<HTMLElement>(".step-cards")!;
       expect(stepCard().getAttribute("data-step-index")).toBe("2");
       expect(stepCard().querySelector(".step-cards-progress")?.textContent).toBe("3 / 4");
-      // Visible matches on active DOM: Intro paragraph (1), deck heading on slide 3 (2), slide 3 markdown (3), chart figcaption (4), closing paragraph (5).
       expect(host.querySelector("output")?.textContent).toBe("3 / 5");
       expect(scrolledTargets.some((el) => stepCard().contains(el))).toBe(true);
 
-      // 2. Verified occurrence on Slide 4 legacy description: switches to slide 4 and opens .step-cards-legacy-note.
-      await renderReader({
+      // 2. Slide 4 legacy description: switches to slide 4 and opens .step-cards-legacy-note.
+      await renderLive({
         query: "Harmonic",
         caseSensitive: true,
-        sourceStart: slide4LegacyHit.start,
-        sourceEnd: slide4LegacyHit.end,
+        sourceStart: fixture.slide4LegacyHit.start,
+        sourceEnd: fixture.slide4LegacyHit.end,
         matchText: "Harmonic",
         nonce: 2,
       });
@@ -1633,13 +1622,13 @@ describe("ReadingSearch DOM behavior", () => {
       expect(stepCard().querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open).toBe(true);
       expect(host.querySelector("output")?.textContent).toBe("2 / 4");
 
-      // 3. Verified occurrence inside Slide 2 diagram JSON: switches StepCards to slide 2, reports In source · 0 / N without false prose selection, and hands off to Next match & Replace in source.
+      // 3. Slide 2 diagram JSON: switches StepCards to slide 2, reports In source · 0 / 3, and hands off to Replace in source.
       scrolledTargets.length = 0;
-      await renderReader({
+      await renderLive({
         query: "Harmonic",
         caseSensitive: true,
-        sourceStart: slide2DiagramHit.start,
-        sourceEnd: slide2DiagramHit.end,
+        sourceStart: fixture.slide2DiagramHit.start,
+        sourceEnd: fixture.slide2DiagramHit.end,
         matchText: "Harmonic",
         nonce: 3,
       });
@@ -1648,104 +1637,193 @@ describe("ReadingSearch DOM behavior", () => {
       expect(host.querySelector("output")?.textContent).toBe("In source · 0 / 3");
       expect(scrolledTargets.some((el) => stepCard() === el || stepCard().contains(el))).toBe(true);
 
-      // Toggling Replace in source from the hidden Slide 2 diagram occurrence maps directly to its exact source match!
       const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
       act(() => replaceToggle.click());
       const allSourceHarmonic = sourceMatches(current, "Harmonic", true);
-      const expectedDiagSourceIdx = allSourceHarmonic.findIndex((r) => r.from === slide2DiagramHit.start);
+      const expectedDiagSourceIdx = allSourceHarmonic.findIndex((r) => r.from === fixture.slide2DiagramHit.start);
       expect(expectedDiagSourceIdx).toBeGreaterThanOrEqual(0);
       expect(host.querySelector("output")?.textContent).toBe(`${expectedDiagSourceIdx + 1} / ${allSourceHarmonic.length}`);
       act(() => replaceToggle.click());
 
-      // 4. Verified occurrence inside standalone smd-diagram (Read mode via MarkdownPreview): scrolls diagram into view and reports In source.
-      const MarkdownPreview = (await import("./MarkdownPreview")).default;
-      scrolledTargets.length = 0;
+      // 4. Multi-slide windowed StepCards block: stepping Next switches slides and Replace in source maps exact slide ordinals.
+      stepIndices.clear();
+      const winFence = "```smd-steps\n" + fixture.stepDeckJson + "\n```";
+      const winDoc = "# Windowed Deck\n\n" + winFence;
+      const fenceStart = winDoc.indexOf(winFence);
+      const fenceEnd = fenceStart + winFence.length;
+      const winSlide3Start = winDoc.indexOf("Slide three **") + "Slide three **".length;
       await act(async () => {
         root.render(
           <div className="android-document">
             <ReadingSearch
-              content={current}
+              content={winDoc}
               close={() => {}}
-              seed={{
-                query: "Harmonic",
-                caseSensitive: true,
-                sourceStart: standaloneDiagHit.start,
-                sourceEnd: standaloneDiagHit.end,
-                matchText: "Harmonic",
-                nonce: 4,
-              }}
+              seed={{ query: "Derivation", caseSensitive: false, sourceStart: winSlide3Start + 11, sourceEnd: winSlide3Start + 21, matchText: "derivation", nonce: 4 }}
+              onChange={() => {}}
             />
             <section className="android-reading">
               <div className="markdown-body">
-                <MarkdownPreview markdown={current} documentPath={null} python="" dark={false} />
+                <div data-windowed-block="true" data-windowed-mounted="true" data-source-start={String(fenceStart)} data-source-end={String(fenceEnd)}>
+                  <MarkdownPreview markdown={winFence} documentPath={null} python="" dark={false} />
+                </div>
+              </div>
+            </section>
+          </div>
+        );
+      });
+      const wBlockEl = host.querySelector<HTMLElement>("[data-windowed-block]")!;
+      const innerCard = wBlockEl.querySelector<HTMLElement>(".step-cards")!;
+      innerCard.setAttribute("data-source-start", String(fenceStart));
+      innerCard.setAttribute("data-source-end", String(fenceEnd));
+      registerWindowedText(wBlockEl, `${fixture.stepDeckJson}\n`);
+      await act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch
+              content={winDoc}
+              close={() => {}}
+              seed={{ query: "Harmonic", caseSensitive: true, sourceStart: winSlide3Start, sourceEnd: winSlide3Start + "Harmonic".length, matchText: "Harmonic", nonce: 5 }}
+              onChange={() => {}}
+            />
+            <section className="android-reading">
+              <div className="markdown-body">
+                <div data-windowed-block="true" data-windowed-mounted="true" data-source-start={String(fenceStart)} data-source-end={String(fenceEnd)}>
+                  <MarkdownPreview markdown={winFence} documentPath={null} python="" dark={false} />
+                </div>
               </div>
             </section>
           </div>
         );
       });
       await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
-      const standaloneInlineDiag = host.querySelectorAll<HTMLElement>(".inline-diagram");
-      expect(standaloneInlineDiag.length).toBeGreaterThan(0);
-      expect(host.querySelector("output")?.textContent).toMatch(/^In source · 0 \/ \d+$/);
-      expect(scrolledTargets.some((el) => el.classList.contains("inline-diagram") || el.querySelector?.(".inline-diagram"))).toBe(true);
-
-      // Stepping Next from hidden standalone diagram occurrence lands on the next visible match (smd-chart figcaption "Harmonic Spectrum") rather than wrapping back to match 1!
+      expect(stepCard().getAttribute("data-step-index")).toBe("2");
+      const winSourceRanges = sourceMatches(winDoc, "Harmonic", true);
+      const winExpectedIdx = winSourceRanges.findIndex((r) => r.from === winSlide3Start);
+      expect(host.querySelector("output")?.textContent).toBe(`${winExpectedIdx + 1} / ${winSourceRanges.length}`);
+      const winReplaceBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+      act(() => winReplaceBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe(`${winExpectedIdx + 1} / ${winSourceRanges.length}`);
+      act(() => winReplaceBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe(`${winExpectedIdx + 1} / ${winSourceRanges.length}`);
       const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
       act(() => nextBtn.click());
-      const afterDiagText = host.querySelector("output")?.textContent ?? "";
-      const [afterNum, afterTotal] = afterDiagText.split(" / ").map(Number);
-      expect(afterNum).toBe(afterTotal - 1);
+      act(() => nextBtn.click());
+      expect(stepCard().getAttribute("data-step-index")).toBe("3");
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 
-      // 5. Verified occurrence in standalone smd-chart title vs hidden expression:
+  it("reveals standalone diagram/chart and render-error source occurrences while keeping stale offsets passive", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const fixture = buildStepAndDiagramFixture();
+    let current = fixture.doc;
+    stepIndices.clear();
+
+    const scrolledTargets: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function () {
+      scrolledTargets.push(this);
+    };
+
+    try {
+      const renderReader = async (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number }) => {
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch content={current} close={() => {}} seed={seed} />
+              <section className="android-reading">
+                <div className="markdown-body">
+                  <MarkdownPreview markdown={current} documentPath={null} python="" dark={false} />
+                </div>
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      };
+
+      // 1. Standalone smd-diagram in Read mode: scrolls diagram into view, reports In source, and hands off on Next match.
       await renderReader({
         query: "Harmonic",
         caseSensitive: true,
-        sourceStart: chartTitleHit.start,
-        sourceEnd: chartTitleHit.end,
+        sourceStart: fixture.standaloneDiagHit.start,
+        sourceEnd: fixture.standaloneDiagHit.end,
         matchText: "Harmonic",
-        nonce: 5,
+        nonce: 1,
+      });
+      expect(host.querySelectorAll<HTMLElement>(".inline-diagram").length).toBeGreaterThan(0);
+      expect(host.querySelector("output")?.textContent).toMatch(/^In source · 0 \/ \d+$/);
+      expect(scrolledTargets.some((el) => el.classList.contains("inline-diagram") || el.querySelector?.(".inline-diagram"))).toBe(true);
+
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      const [afterNum, afterTotal] = (host.querySelector("output")?.textContent ?? "").split(" / ").map(Number);
+      expect(afterNum).toBe(afterTotal - 1);
+
+      // 2. Standalone smd-chart visible title vs hidden expression.
+      await renderReader({
+        query: "Harmonic",
+        caseSensitive: true,
+        sourceStart: fixture.chartTitleHit.start,
+        sourceEnd: fixture.chartTitleHit.end,
+        matchText: "Harmonic",
+        nonce: 2,
       });
       expect(host.querySelector("output")?.textContent).not.toContain("In source");
 
       await renderReader({
         query: "sin(x)",
         caseSensitive: true,
-        sourceStart: chartExprHit.start,
-        sourceEnd: chartExprHit.end,
+        sourceStart: fixture.chartExprHit.start,
+        sourceEnd: fixture.chartExprHit.end,
         matchText: "sin(x)",
-        nonce: 6,
+        nonce: 3,
       });
       expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
 
-      // 6. Stale sourceStart/sourceEnd or mismatched matchText preserves active slide when mounted and keeps Slide 1 on fresh mount while remaining passive at 0 / N.
-      const baseDoc = current;
-      current = "Inserted prefix line shifting all offsets!\n\n" + current;
+      // 3. Stale sourceStart/sourceEnd preserves active slide when mounted and keeps Slide 1 on fresh mount at 0 / N.
       await renderReader({
         query: "Harmonic",
         caseSensitive: true,
-        sourceStart: slide3Hit.start,
-        sourceEnd: slide3Hit.end,
+        sourceStart: fixture.slide2DiagramHit.start,
+        sourceEnd: fixture.slide2DiagramHit.end,
         matchText: "Harmonic",
-        nonce: 7,
+        nonce: 4,
+      });
+      const stepCard = () => host.querySelector<HTMLElement>(".step-cards")!;
+      expect(stepCard().getAttribute("data-step-index")).toBe("1");
+
+      current = "Inserted prefix line shifting all offsets!\n\n" + fixture.doc;
+      await renderReader({
+        query: "Harmonic",
+        caseSensitive: true,
+        sourceStart: fixture.slide3Hit.start,
+        sourceEnd: fixture.slide3Hit.end,
+        matchText: "Harmonic",
+        nonce: 5,
       });
       expect(stepCard().getAttribute("data-step-index")).toBe("1");
       expect(host.querySelector("output")?.textContent).toMatch(/^0 \/ \d+$/);
 
-      const { stepIndices } = await import("../renderedOutputs");
       await act(async () => { root.render(<div />); });
       stepIndices.clear();
       await renderReader({
         query: "Harmonic",
         caseSensitive: true,
-        sourceStart: slide3Hit.start,
-        sourceEnd: slide3Hit.end,
+        sourceStart: fixture.slide3Hit.start,
+        sourceEnd: fixture.slide3Hit.end,
         matchText: "OtroTexto",
-        nonce: 8,
+        nonce: 6,
       });
       expect(stepCard().getAttribute("data-step-index")).toBe("0");
       expect(host.querySelector("output")?.textContent).toMatch(/^0 \/ \d+$/);
 
-      // 7. Malformed diagram rendering .render-error still scrolls into view at a verified source occurrence and reports In Markdown source without indexing diagnostic chrome.
+      // 4. Malformed diagram rendering .render-error scrolls into view without indexing diagnostic chrome.
       const brokenDoc = "# Intro\n\n```smd-chart\n{\"broken\": \"smd-chart\"}\n```\n";
       const brokenHitStart = brokenDoc.lastIndexOf("smd-chart");
       current = brokenDoc;
@@ -1756,30 +1834,62 @@ describe("ReadingSearch DOM behavior", () => {
         sourceStart: brokenHitStart,
         sourceEnd: brokenHitStart + "smd-chart".length,
         matchText: "smd-chart",
-        nonce: 9,
+        nonce: 7,
       });
       const renderErr = host.querySelector<HTMLElement>(".render-error");
       expect(renderErr).toBeTruthy();
       expect(host.querySelector("output")?.textContent).toBe("In Markdown source");
       expect(scrolledTargets).toContain(renderErr);
+    } finally {
+      Element.prototype.scrollIntoView = origScroll;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
 
-      // 8. Layout-driven settling (#146) re-aligns StepCards diagram & prose reveals across window layout changes and cancels on manual scroll or newer selection.
-      current = baseDoc;
-      stepIndices.clear();
-      let simScrollHeight = 9600;
-      let simScrollTop = 0;
-      Element.prototype.scrollIntoView = function () {
-        scrolledTargets.push(this);
-        simScrollTop = 3200;
+  it("settles StepCards diagram and prose reveals across layout shifts and cancels on manual scroll or newer selection", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const fixture = buildStepAndDiagramFixture();
+    const current = fixture.doc;
+    stepIndices.clear();
+
+    const scrolledTargets: Element[] = [];
+    const origScroll = Element.prototype.scrollIntoView;
+    let simScrollHeight = 9600;
+    let simScrollTop = 0;
+    Element.prototype.scrollIntoView = function () {
+      scrolledTargets.push(this);
+      simScrollTop = 3200;
+    };
+
+    try {
+      const renderReader = async (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number }) => {
+        await act(async () => {
+          root.render(
+            <div className="android-document">
+              <ReadingSearch content={current} close={() => {}} seed={seed} />
+              <section className="android-reading">
+                <div className="markdown-body">
+                  <MarkdownPreview markdown={current} documentPath={null} python="" dark={false} />
+                </div>
+              </section>
+            </div>
+          );
+        });
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
       };
+
       await renderReader({
         query: "Harmonic",
         caseSensitive: true,
-        sourceStart: slide2DiagramHit.start,
-        sourceEnd: slide2DiagramHit.end,
+        sourceStart: fixture.slide2DiagramHit.start,
+        sourceEnd: fixture.slide2DiagramHit.end,
         matchText: "Harmonic",
-        nonce: 10,
+        nonce: 1,
       });
+      const stepCard = () => host.querySelector<HTMLElement>(".step-cards")!;
       const scroller = host.querySelector<HTMLElement>(".android-reading")!;
       Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => simScrollHeight });
       Object.defineProperty(scroller, "scrollTop", {
@@ -1811,10 +1921,10 @@ describe("ReadingSearch DOM behavior", () => {
       await renderReader({
         query: "Harmonic",
         caseSensitive: true,
-        sourceStart: slide3Hit.start,
-        sourceEnd: slide3Hit.end,
+        sourceStart: fixture.slide3Hit.start,
+        sourceEnd: fixture.slide3Hit.end,
         matchText: "Harmonic",
-        nonce: 11,
+        nonce: 2,
       });
       expect(stepCard().getAttribute("data-step-index")).toBe("2");
       expect(host.querySelector("output")?.textContent).toBe("3 / 5");
@@ -1828,7 +1938,6 @@ describe("ReadingSearch DOM behavior", () => {
       expect(scrolledTargets.length).toBe(1);
       expect(stepCard().contains(scrolledTargets[0])).toBe(true);
 
-      // Stepping to Next match (4 / 5) replaces the active settle target, and manual scrollTop change cancels it.
       const liveNextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
       act(() => liveNextBtn.click());
       expect(host.querySelector("output")?.textContent).toBe("4 / 5");

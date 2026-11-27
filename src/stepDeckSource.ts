@@ -1,3 +1,5 @@
+import { compileSearchPattern, nextSearchMatch, type SearchMatchConfig } from "./windowedSearch";
+
 export const STEP_REVEAL_EVENT = "supermd-reveal-step";
 
 export interface StepRevealDetail {
@@ -46,26 +48,30 @@ export interface StepDeckOccurrenceClassification {
   decodedRange: { from: number; to: number } | null;
 }
 
-function extractFenceBodySpan(rawFence: string, fenceStart: number): { body: string; bodyStart: number } | null {
-  const trimmedStart = rawFence.trimStart();
-  if (trimmedStart.startsWith("{")) {
-    return { body: rawFence, bodyStart: fenceStart };
-  }
-  const firstBreak = rawFence.indexOf("\n");
-  if (firstBreak < 0) return null;
-  if (!/^[ \t>]*(?:`{3,}|~{3,})/.test(rawFence.slice(0, firstBreak))) return null;
+const NO_OCCURRENCE: StepDeckOccurrenceClassification = {
+  stepIndex: null,
+  openLegacyNote: false,
+  visibleRegion: null,
+  fieldSpan: null,
+  decodedRange: null,
+};
+
+export function extractFenceBodySpan(rawFence: string, fenceStart: number): { body: string; bodyStart: number } | null {
+  if (rawFence.trimStart().startsWith("{")) return { body: rawFence, bodyStart: fenceStart };
+  let lead = 0;
+  while (lead < rawFence.length && (rawFence[lead] === "\r" || rawFence[lead] === "\n")) lead++;
+  const slice = lead ? rawFence.slice(lead) : rawFence;
+  const base = fenceStart + lead;
+  const firstBreak = slice.indexOf("\n");
+  if (firstBreak < 0 || !/^[ \t>]*(?:`{3,}|~{3,})/.test(slice.slice(0, firstBreak))) return null;
   const bodyOffset = firstBreak + 1;
-  let bodyEnd = rawFence.length;
-  const trimmedEnd = rawFence.replace(/[ \t\r\n]+$/, "");
+  let bodyEnd = slice.length;
+  const trimmedEnd = slice.replace(/[ \t\r\n]+$/, "");
   const lastBreak = trimmedEnd.lastIndexOf("\n");
-  if (lastBreak >= firstBreak) {
-    const closingLine = trimmedEnd.slice(lastBreak + 1);
-    if (/^[ \t>]*(?:`{3,}|~{3,})[ \t]*$/.test(closingLine)) {
-      bodyEnd = lastBreak;
-    }
+  if (lastBreak >= firstBreak && /^[ \t>]*(?:`{3,}|~{3,})[ \t]*$/.test(trimmedEnd.slice(lastBreak + 1))) {
+    bodyEnd = lastBreak;
   }
-  if (bodyEnd < bodyOffset) return null;
-  return { body: rawFence.slice(bodyOffset, bodyEnd), bodyStart: fenceStart + bodyOffset };
+  return bodyEnd >= bodyOffset ? { body: slice.slice(bodyOffset, bodyEnd), bodyStart: base + bodyOffset } : null;
 }
 
 function decodeJsonStringWithOffsets(rawContent: string, contentStart: number): DecodedStringSpan | null {
@@ -94,8 +100,7 @@ function decodeJsonStringWithOffsets(rawContent: string, contentStart: number): 
           advance = 6;
           break;
         }
-        default:
-          return null;
+        default: return null;
       }
       toSource.push(contentStart + i);
       decoded += mapped;
@@ -111,14 +116,7 @@ function decodeJsonStringWithOffsets(rawContent: string, contentStart: number): 
   while (trimStartIndex < decoded.length && /\s/.test(decoded[trimStartIndex])) trimStartIndex++;
   let trimEndIndex = decoded.length;
   while (trimEndIndex > trimStartIndex && /\s/.test(decoded[trimEndIndex - 1])) trimEndIndex--;
-  return {
-    contentStart,
-    contentEnd: contentStart + rawContent.length,
-    decoded,
-    toSource,
-    trimStartIndex,
-    trimEndIndex,
-  };
+  return { contentStart, contentEnd: contentStart + rawContent.length, decoded, toSource, trimStartIndex, trimEndIndex };
 }
 
 class JsonSpanScanner {
@@ -136,57 +134,31 @@ class JsonSpanScanner {
     let atLineStart = i === 0 || s[i - 1] === "\n";
     while (i < s.length) {
       const c = s[i];
-      if (c === " " || c === "\t" || c === "\r") {
-        i++;
-      } else if (c === "\n") {
-        atLineStart = true;
-        i++;
-      } else if (atLineStart && c === ">") {
-        i++;
-      } else {
-        break;
-      }
+      if (c === " " || c === "\t" || c === "\r") i++;
+      else if (c === "\n") { atLineStart = true; i++; }
+      else if (atLineStart && c === ">") i++;
+      else break;
     }
     return i;
-  }
-
-  scanString(pos: number): { value: string; span: DecodedStringSpan; next: number } | null {
-    const s = this.text;
-    if (s[pos] !== "\"") return null;
-    let i = pos + 1;
-    while (i < s.length) {
-      const code = s.charCodeAt(i);
-      if (code < 0x20) return null;
-      if (code === 0x22) {
-        const rawContent = s.slice(pos + 1, i);
-        const span = decodeJsonStringWithOffsets(rawContent, this.base + pos + 1);
-        if (!span) return null;
-        return { value: span.decoded, span, next: i + 1 };
-      }
-      if (code === 0x5c) {
-        i += 2;
-        continue;
-      }
-      i++;
-    }
-    return null;
   }
 
   skipString(pos: number): number {
     const s = this.text;
     if (s[pos] !== "\"") return -1;
-    let i = pos + 1;
-    while (i < s.length) {
+    for (let i = pos + 1; i < s.length; i++) {
       const code = s.charCodeAt(i);
       if (code < 0x20) return -1;
       if (code === 0x22) return i + 1;
-      if (code === 0x5c) {
-        i += 2;
-        continue;
-      }
-      i++;
+      if (code === 0x5c) i++;
     }
     return -1;
+  }
+
+  scanString(pos: number): { value: string; span: DecodedStringSpan; next: number } | null {
+    const next = this.skipString(pos);
+    if (next < 0) return null;
+    const span = decodeJsonStringWithOffsets(this.text.slice(pos + 1, next - 1), this.base + pos + 1);
+    return span ? { value: span.decoded, span, next } : null;
   }
 
   skipValue(pos: number, depth = 0): number {
@@ -272,13 +244,7 @@ class JsonSpanScanner {
     let chartTitleSpan: DecodedStringSpan | undefined;
     if (s[cur] === "}") {
       return {
-        step: {
-          stepIndex,
-          objectStart: this.base + start,
-          objectEnd: this.base + cur + 1,
-          hasMarkdown: false,
-          hasLegacyDescription: false,
-        },
+        step: { stepIndex, objectStart: this.base + start, objectEnd: this.base + cur + 1, hasMarkdown: false, hasLegacyDescription: false },
         next: cur + 1,
       };
     }
@@ -360,11 +326,7 @@ class JsonSpanScanner {
             if (!parsedStep) return null;
             parsedSteps.push(parsedStep.step);
             cur = this.skipWs(parsedStep.next);
-            if (s[cur] === "]") {
-              steps = parsedSteps;
-              cur = this.skipWs(cur + 1);
-              break;
-            }
+            if (s[cur] === "]") { steps = parsedSteps; cur = this.skipWs(cur + 1); break; }
             if (s[cur] !== ",") return null;
             cur = this.skipWs(cur + 1);
           }
@@ -374,10 +336,7 @@ class JsonSpanScanner {
         if (afterVal < 0) return null;
         cur = this.skipWs(afterVal);
       }
-      if (s[cur] === "}") {
-        if (!steps || steps.length < 2) return null;
-        return { ...(titleSpan ? { titleSpan } : {}), steps };
-      }
+      if (s[cur] === "}") return steps && steps.length >= 2 ? { ...(titleSpan ? { titleSpan } : {}), steps } : null;
       if (s[cur] !== ",") return null;
       cur = this.skipWs(cur + 1);
     }
@@ -388,22 +347,19 @@ class JsonSpanScanner {
 export function inspectStepDeckSource(rawFence: string, fenceStart = 0): StepDeckSourceInfo | null {
   if (!rawFence || rawFence.length > 200_000) return null;
   const extracted = extractFenceBodySpan(rawFence, fenceStart);
-  if (!extracted) return null;
-  return new JsonSpanScanner(extracted.body, extracted.bodyStart).scanStepDeck();
+  return extracted ? new JsonSpanScanner(extracted.body, extracted.bodyStart).scanStepDeck() : null;
 }
 
 export function inspectChartSource(rawFence: string, fenceStart = 0): { titleSpan?: DecodedStringSpan } | null {
   if (!rawFence || rawFence.length > 200_000) return null;
   const extracted = extractFenceBodySpan(rawFence, fenceStart);
   if (!extracted) return null;
-  const scanner = new JsonSpanScanner(extracted.body, extracted.bodyStart);
-  const root = scanner.scanObjectTitleProperty(0);
-  return root ? { ...(root.titleSpan ? { titleSpan: root.titleSpan } : {}) } : null;
+  const root = new JsonSpanScanner(extracted.body, extracted.bodyStart).scanObjectTitleProperty(0);
+  return root ? (root.titleSpan ? { titleSpan: root.titleSpan } : {}) : null;
 }
 
 function binarySearchSourceOffset(toSource: number[], target: number): number {
-  let lo = 0;
-  let hi = toSource.length - 1;
+  let lo = 0, hi = toSource.length - 1;
   while (lo <= hi) {
     const mid = (lo + hi) >>> 1;
     const val = toSource[mid];
@@ -419,16 +375,11 @@ export function mapSourceRangeToDecoded(
   range: { from: number; to: number },
   trimmedOnly = false,
 ): { from: number; to: number } | null {
-  if (range.from < span.contentStart || range.to > span.contentEnd || range.to <= range.from) {
-    return null;
-  }
+  if (range.from < span.contentStart || range.to > span.contentEnd || range.to <= range.from) return null;
   const dFrom = binarySearchSourceOffset(span.toSource, range.from);
-  if (dFrom < 0) return null;
-  const dTo = binarySearchSourceOffset(span.toSource, range.to);
-  if (dTo <= dFrom) return null;
-  if (trimmedOnly && (dFrom < span.trimStartIndex || dTo > span.trimEndIndex)) {
-    return null;
-  }
+  const dTo = dFrom >= 0 ? binarySearchSourceOffset(span.toSource, range.to) : -1;
+  if (dFrom < 0 || dTo <= dFrom) return null;
+  if (trimmedOnly && (dFrom < span.trimStartIndex || dTo > span.trimEndIndex)) return null;
   return { from: dFrom, to: dTo };
 }
 
@@ -438,103 +389,162 @@ export function classifyStepDeckOccurrence(
   activeStepIndex = 0,
 ): StepDeckOccurrenceClassification {
   for (const step of deckInfo.steps) {
-    if (range.from >= step.objectStart && range.from < step.objectEnd && range.to <= step.objectEnd) {
-      if (step.chartTitleSpan) {
-        const decodedRange = mapSourceRangeToDecoded(step.chartTitleSpan, range, true);
-        if (decodedRange) {
-          return {
-            stepIndex: step.stepIndex,
-            openLegacyNote: false,
-            visibleRegion: "chart-title",
-            fieldSpan: step.chartTitleSpan,
-            decodedRange,
-          };
-        }
-      }
-      if (step.labelSpan) {
-        const decodedRange = mapSourceRangeToDecoded(step.labelSpan, range, true);
-        if (decodedRange) {
-          return {
-            stepIndex: step.stepIndex,
-            openLegacyNote: false,
-            visibleRegion: "step-label",
-            fieldSpan: step.labelSpan,
-            decodedRange,
-          };
-        }
-      }
-      if (step.hasMarkdown && step.markdownSpan) {
-        const decodedRange = mapSourceRangeToDecoded(step.markdownSpan, range, false);
-        if (decodedRange) {
-          return {
-            stepIndex: step.stepIndex,
-            openLegacyNote: false,
-            visibleRegion: "step-markdown",
-            fieldSpan: step.markdownSpan,
-            decodedRange,
-          };
-        }
-      }
-      if (step.hasLegacyDescription && step.descriptionSpan) {
-        const decodedRange = mapSourceRangeToDecoded(step.descriptionSpan, range, false);
-        if (decodedRange) {
-          return {
-            stepIndex: step.stepIndex,
-            openLegacyNote: true,
-            visibleRegion: "step-legacy-description",
-            fieldSpan: step.descriptionSpan,
-            decodedRange,
-          };
-        }
-        if (range.from >= step.descriptionSpan.contentStart && range.to <= step.descriptionSpan.contentEnd) {
-          return {
-            stepIndex: step.stepIndex,
-            openLegacyNote: true,
-            visibleRegion: null,
-            fieldSpan: step.descriptionSpan,
-            decodedRange: null,
-          };
-        }
-      }
-      return {
-        stepIndex: step.stepIndex,
-        openLegacyNote: false,
-        visibleRegion: null,
-        fieldSpan: null,
-        decodedRange: null,
-      };
-    }
+    if (range.from < step.objectStart || range.from >= step.objectEnd || range.to > step.objectEnd) continue;
+    const tryField = (span: DecodedStringSpan | undefined, visibleRegion: StepVisibleRegion, trimmedOnly: boolean, openLegacyNote = false) => {
+      if (!span) return null;
+      const decodedRange = mapSourceRangeToDecoded(span, range, trimmedOnly);
+      return decodedRange ? { stepIndex: step.stepIndex, openLegacyNote, visibleRegion, fieldSpan: span, decodedRange } : null;
+    };
+    const hit =
+      tryField(step.chartTitleSpan, "chart-title", true) ??
+      tryField(step.labelSpan, "step-label", true) ??
+      (step.hasMarkdown ? tryField(step.markdownSpan, "step-markdown", false) : null) ??
+      (step.hasLegacyDescription ? tryField(step.descriptionSpan, "step-legacy-description", false, true) : null);
+    if (hit) return hit;
+    const inLegacyRaw = Boolean(step.hasLegacyDescription && step.descriptionSpan && range.from >= step.descriptionSpan.contentStart && range.to <= step.descriptionSpan.contentEnd);
+    return {
+      stepIndex: step.stepIndex,
+      openLegacyNote: inLegacyRaw,
+      visibleRegion: null,
+      fieldSpan: inLegacyRaw ? (step.descriptionSpan ?? null) : null,
+      decodedRange: null,
+    };
   }
   if (deckInfo.titleSpan) {
     const decodedRange = mapSourceRangeToDecoded(deckInfo.titleSpan, range, true);
     if (decodedRange) {
       const clampedActive = Math.max(0, Math.min(activeStepIndex, deckInfo.steps.length - 1));
-      if (deckInfo.steps[clampedActive]?.hasMarkdown) {
-        return {
-          stepIndex: clampedActive,
-          openLegacyNote: false,
-          visibleRegion: "deck-title",
-          fieldSpan: deckInfo.titleSpan,
-          decodedRange,
-        };
-      }
-      const firstMarkdownStep = deckInfo.steps.findIndex(s => s.hasMarkdown);
-      if (firstMarkdownStep >= 0) {
-        return {
-          stepIndex: firstMarkdownStep,
-          openLegacyNote: false,
-          visibleRegion: "deck-title",
-          fieldSpan: deckInfo.titleSpan,
-          decodedRange,
-        };
+      const targetStep = deckInfo.steps[clampedActive]?.hasMarkdown ? clampedActive : deckInfo.steps.findIndex(s => s.hasMarkdown);
+      if (targetStep >= 0) {
+        return { stepIndex: targetStep, openLegacyNote: false, visibleRegion: "deck-title", fieldSpan: deckInfo.titleSpan, decodedRange };
       }
     }
   }
-  return {
-    stepIndex: null,
-    openLegacyNote: false,
-    visibleRegion: null,
-    fieldSpan: null,
-    decodedRange: null,
-  };
+  return NO_OCCURRENCE;
+}
+
+export function closestSourceOwner(el: Element | null): HTMLElement | null {
+  let cur = el?.closest<HTMLElement>("[data-source-start],.code-container") ?? null;
+  while (cur) {
+    const stepDeck = cur.closest<HTMLElement>(".step-cards");
+    if (stepDeck && stepDeck !== cur) {
+      cur = stepDeck.hasAttribute("data-source-start")
+        ? stepDeck
+        : (stepDeck.parentElement?.closest<HTMLElement>("[data-source-start],.code-container") ?? null);
+      continue;
+    }
+    return cur;
+  }
+  return null;
+}
+
+export function resolveRenderedStepCard(owner: HTMLElement): HTMLElement | null {
+  if (owner.classList.contains("step-cards")) return owner;
+  if (owner.classList.contains("step-cards-placeholder")) {
+    const deckId = owner.getAttribute("data-step-deck-id");
+    if (deckId) {
+      for (const card of document.querySelectorAll<HTMLElement>(".step-viewer .step-cards")) {
+        if (card.getAttribute("data-step-deck-id") === deckId) return card;
+      }
+    }
+  }
+  return owner.querySelector<HTMLElement>(".step-cards");
+}
+
+export function stepCardScrollTarget(owner: HTMLElement): Element {
+  const card = resolveRenderedStepCard(owner);
+  if (!card || card.closest(".step-viewer")) return owner;
+  const viewportHeight = typeof window !== "undefined" && window.innerHeight > 0 ? window.innerHeight : 800;
+  if (card.getBoundingClientRect().height > viewportHeight * 0.85) {
+    return card.querySelector(".step-cards-inline-figure,.step-cards-chart-frame.is-current,.step-cards-figure.is-current,.step-cards-stage") ?? card;
+  }
+  return card;
+}
+
+export function stepRegionElement(card: HTMLElement, region: StepVisibleRegion): Element | null {
+  switch (region) {
+    case "deck-title": return card.querySelector(".step-cards-heading");
+    case "chart-title": return card.querySelector(".step-cards-chart-frame.is-current figcaption");
+    case "step-label": return card.querySelector(".step-cards-step-title");
+    case "step-markdown": return card.querySelector(".step-cards-description");
+    case "step-legacy-description": return card.querySelector(".step-cards-legacy-note > div");
+  }
+}
+
+export function isDirectChartTitleMatch(
+  rawFence: string,
+  fenceStart: number,
+  candidate: { from: number; to: number },
+  query?: string,
+  options: SearchMatchConfig = false,
+): boolean {
+  const chartInfo = inspectChartSource(rawFence, fenceStart);
+  if (!chartInfo?.titleSpan) return false;
+  const dRange = mapSourceRangeToDecoded(chartInfo.titleSpan, candidate, true);
+  if (!dRange) return false;
+  if (query !== undefined && chartInfo.titleSpan.toSource[dRange.to] - chartInfo.titleSpan.toSource[dRange.from] !== dRange.to - dRange.from) {
+    const { pattern } = compileSearchPattern(query, options, false);
+    if (!pattern) return false;
+    const sub = chartInfo.titleSpan.decoded.slice(dRange.from, dRange.to);
+    const m = pattern.exec(sub);
+    if (!m || m.index !== 0 || m[0].length !== sub.length) return false;
+  }
+  return true;
+}
+
+export function stepDeckFenceMatches(
+  rawFence: string,
+  fenceStart: number,
+  query: string,
+  options: SearchMatchConfig = false,
+): Array<{ from: number; to: number }> {
+  const extracted = extractFenceBodySpan(rawFence, fenceStart);
+  if (!extracted) return [];
+  const { pattern } = compileSearchPattern(query, options, false);
+  if (!pattern) return [];
+  const text = `${extracted.body}\n`;
+  const bodyLen = extracted.body.length;
+  const ranges: Array<{ from: number; to: number }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = nextSearchMatch(pattern, text)) && ranges.length < 5000) {
+    if (match.index >= bodyLen) continue;
+    const end = Math.min(bodyLen, match.index + match[0].length);
+    if (end > match.index) ranges.push({ from: extracted.bodyStart + match.index, to: extracted.bodyStart + end });
+  }
+  return ranges;
+}
+
+export function revealStepCardsSlide(
+  owner: HTMLElement,
+  bounds: { start: number; end: number } | null,
+  content: string,
+  target: { from: number; to: number },
+  openNestedDisclosures?: (desc: Element) => boolean,
+): { changed: boolean; card: HTMLElement | null } {
+  const stepOwner = owner.matches(".step-cards,.step-cards-placeholder")
+    ? owner
+    : owner.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
+  if (!stepOwner || stepOwner.classList.contains("step-cards-error")) return { changed: false, card: null };
+  const initialCard = resolveRenderedStepCard(stepOwner);
+  if (!bounds) return { changed: false, card: initialCard };
+  const deckInfo = inspectStepDeckSource(content.slice(bounds.start, bounds.end), bounds.start);
+  if (!deckInfo) return { changed: false, card: initialCard };
+  const beforeStep = Number(initialCard?.getAttribute("data-step-index") ?? stepOwner.getAttribute("data-step-index") ?? 0) || 0;
+  const beforeLegacyOpen = Boolean(initialCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
+  const occ = classifyStepDeckOccurrence(deckInfo, target, beforeStep);
+  if (occ.stepIndex === null) return { changed: false, card: initialCard };
+  (initialCard ?? stepOwner).dispatchEvent(
+    new CustomEvent<StepRevealDetail>(STEP_REVEAL_EVENT, {
+      detail: { stepIndex: occ.stepIndex, openLegacyNote: occ.openLegacyNote },
+    }),
+  );
+  const liveCard = resolveRenderedStepCard(stepOwner);
+  let openedNested = false;
+  if (liveCard && occ.visibleRegion === "step-markdown" && openNestedDisclosures) {
+    const desc = liveCard.querySelector(".step-cards-description");
+    if (desc) openedNested = openNestedDisclosures(desc);
+  }
+  const afterStep = Number(liveCard?.getAttribute("data-step-index") ?? stepOwner.getAttribute("data-step-index") ?? 0) || 0;
+  const afterLegacyOpen = Boolean(liveCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
+  return { changed: afterStep !== beforeStep || afterLegacyOpen !== beforeLegacyOpen || openedNested, card: liveCard };
 }

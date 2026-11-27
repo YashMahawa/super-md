@@ -8,13 +8,16 @@ import { parseFrontmatter, type FrontmatterVisibleField, type FrontmatterVisible
 import { cancelHeadingNavigation } from "../documentNavigation";
 import { refreshDocumentExtent } from "../documentZoom";
 import {
-  STEP_REVEAL_EVENT,
   classifyStepDeckOccurrence,
-  inspectChartSource,
+  closestSourceOwner,
   inspectStepDeckSource,
-  mapSourceRangeToDecoded,
+  isDirectChartTitleMatch,
+  resolveRenderedStepCard,
+  revealStepCardsSlide,
+  stepCardScrollTarget,
+  stepDeckFenceMatches,
+  stepRegionElement,
   type DecodedStringSpan,
-  type StepRevealDetail,
   type StepVisibleRegion,
 } from "../stepDeckSource";
 export type { SearchMatchConfig, SearchMatchOptions } from "../windowedSearch";
@@ -190,21 +193,6 @@ function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
   return hidden;
 }
 
-function closestSourceOwner(el: Element | null): HTMLElement | null {
-  let cur = el?.closest<HTMLElement>("[data-source-start],.code-container") ?? null;
-  while (cur) {
-    const stepDeck = cur.closest<HTMLElement>(".step-cards");
-    if (stepDeck && stepDeck !== cur) {
-      cur = stepDeck.hasAttribute("data-source-start")
-        ? stepDeck
-        : (stepDeck.parentElement?.closest<HTMLElement>("[data-source-start],.code-container") ?? null);
-      continue;
-    }
-    return cur;
-  }
-  return null;
-}
-
 function sourceBounds(el: Element, content?: string): { start: number; end: number } | null {
   if (!(el instanceof HTMLElement) || el.tagName === "TEXTAREA") return null;
   const stepDeck = el.closest(".step-cards");
@@ -272,62 +260,12 @@ function openDisclosuresFor(target: Element | null, scope?: Element | null, rang
   return opened;
 }
 
-function resolveRenderedStepCard(owner: HTMLElement): HTMLElement | null {
-  if (owner.classList.contains("step-cards")) return owner;
-  if (owner.classList.contains("step-cards-placeholder")) {
-    const deckId = owner.getAttribute("data-step-deck-id");
-    if (deckId) {
-      for (const card of document.querySelectorAll<HTMLElement>(".step-viewer .step-cards")) {
-        if (card.getAttribute("data-step-deck-id") === deckId) return card;
-      }
-    }
-  }
-  return owner.querySelector<HTMLElement>(".step-cards");
-}
-
 function revealStepCardsForRange(owner: HTMLElement, content: string, target: SourceRange): { changed: boolean; card: HTMLElement | null } {
   const stepOwner = owner.matches(".step-cards,.step-cards-placeholder")
     ? owner
     : owner.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
-  if (!stepOwner || stepOwner.classList.contains("step-cards-error")) {
-    return { changed: false, card: null };
-  }
-  const bounds = sourceBounds(stepOwner, content);
-  if (!bounds) return { changed: false, card: resolveRenderedStepCard(stepOwner) };
-  const deckInfo = inspectStepDeckSource(content.slice(bounds.start, bounds.end), bounds.start);
-  const initialCard = resolveRenderedStepCard(stepOwner);
-  if (!deckInfo) return { changed: false, card: initialCard };
-  const beforeStep = Number(initialCard?.getAttribute("data-step-index") ?? stepOwner.getAttribute("data-step-index") ?? 0) || 0;
-  const beforeLegacyOpen = Boolean(initialCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
-  const occ = classifyStepDeckOccurrence(deckInfo, target, beforeStep);
-  if (occ.stepIndex === null) return { changed: false, card: initialCard };
-  (initialCard ?? stepOwner).dispatchEvent(
-    new CustomEvent<StepRevealDetail>(STEP_REVEAL_EVENT, {
-      detail: { stepIndex: occ.stepIndex, openLegacyNote: occ.openLegacyNote },
-    }),
-  );
-  const liveCard = resolveRenderedStepCard(stepOwner);
-  let openedNested = false;
-  if (liveCard && occ.visibleRegion === "step-markdown") {
-    const desc = liveCard.querySelector(".step-cards-description");
-    if (desc) openedNested = openDisclosuresFor(desc, desc, null, target);
-  }
-  const afterStep = Number(liveCard?.getAttribute("data-step-index") ?? stepOwner.getAttribute("data-step-index") ?? 0) || 0;
-  const afterLegacyOpen = Boolean(liveCard?.querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open);
-  return {
-    changed: afterStep !== beforeStep || afterLegacyOpen !== beforeLegacyOpen || openedNested,
-    card: liveCard,
-  };
-}
-
-function stepCardScrollTarget(owner: HTMLElement): Element {
-  const card = resolveRenderedStepCard(owner);
-  if (!card || card.closest(".step-viewer")) return owner;
-  const viewportHeight = typeof window !== "undefined" && window.innerHeight > 0 ? window.innerHeight : 800;
-  if (card.getBoundingClientRect().height > viewportHeight * 0.85) {
-    return card.querySelector(".step-cards-inline-figure,.step-cards-chart-frame.is-current,.step-cards-figure.is-current,.step-cards-stage") ?? card;
-  }
-  return card;
+  if (!stepOwner) return { changed: false, card: null };
+  return revealStepCardsSlide(stepOwner, sourceBounds(stepOwner, content), content, target, desc => openDisclosuresFor(desc, desc, null, target));
 }
 
 function isDecodedSliceVisibleMatch(
@@ -350,21 +288,6 @@ function isDecodedSliceVisibleMatch(
   return true;
 }
 
-function stepRegionElement(card: HTMLElement, region: StepVisibleRegion): Element | null {
-  switch (region) {
-    case "deck-title":
-      return card.querySelector(".step-cards-heading");
-    case "chart-title":
-      return card.querySelector(".step-cards-chart-frame.is-current figcaption");
-    case "step-label":
-      return card.querySelector(".step-cards-step-title");
-    case "step-markdown":
-      return card.querySelector(".step-cards-description");
-    case "step-legacy-description":
-      return card.querySelector(".step-cards-legacy-note > div");
-  }
-}
-
 function mapStepDeckSourceRangeToDomRange(
   owner: HTMLElement,
   content: string,
@@ -374,22 +297,16 @@ function mapStepDeckSourceRangeToDomRange(
   options: SearchMatchConfig,
 ): Range | null {
   const target = ranges[activeIndex];
-  if (!target) return null;
-  const bounds = sourceBounds(owner, content);
-  if (!bounds) return null;
-  const card = resolveRenderedStepCard(owner);
-  if (!card || card.classList.contains("step-cards-error")) return null;
+  const bounds = target ? sourceBounds(owner, content) : null;
+  const card = bounds ? resolveRenderedStepCard(owner) : null;
+  if (!target || !bounds || !card || card.classList.contains("step-cards-error")) return null;
   const deckInfo = inspectStepDeckSource(content.slice(bounds.start, bounds.end), bounds.start);
   if (!deckInfo) return null;
   const currentStep = Number(card.getAttribute("data-step-index") ?? 0) || 0;
   const occ = classifyStepDeckOccurrence(deckInfo, target, currentStep);
-  if (occ.stepIndex === null || occ.stepIndex !== currentStep || !occ.visibleRegion || !occ.fieldSpan || !occ.decodedRange) {
-    return null;
-  }
+  if (occ.stepIndex === null || occ.stepIndex !== currentStep || !occ.visibleRegion || !occ.fieldSpan || !occ.decodedRange) return null;
   const { pattern } = compileSearchPattern(query, options, false);
-  if (!isDecodedSliceVisibleMatch(occ.fieldSpan, occ.decodedRange, occ.visibleRegion, pattern)) {
-    return null;
-  }
+  if (!isDecodedSliceVisibleMatch(occ.fieldSpan, occ.decodedRange, occ.visibleRegion, pattern)) return null;
   const scopeEl = stepRegionElement(card, occ.visibleRegion);
   if (!scopeEl) return null;
   const domRanges = readingMatches(scopeEl, query, options).filter(
@@ -414,21 +331,21 @@ function mapStepDeckSourceRangeToDomRange(
   return domRanges[ordinal] ?? null;
 }
 
-function isDirectVisibleChartMatch(owner: HTMLElement, content: string, candidate: SourceRange, query?: string, options: SearchMatchConfig = false): boolean {
-  const bounds = sourceBounds(owner, content);
-  if (!bounds || candidate.from < bounds.start || candidate.to > bounds.end) return false;
-  const chartInfo = inspectChartSource(content.slice(bounds.start, bounds.end), bounds.start);
-  if (!chartInfo?.titleSpan) return false;
-  const dRange = mapSourceRangeToDecoded(chartInfo.titleSpan, candidate, true);
-  if (!dRange) return false;
-  if (query !== undefined && chartInfo.titleSpan.toSource[dRange.to] - chartInfo.titleSpan.toSource[dRange.from] !== dRange.to - dRange.from) {
-    const { pattern } = compileSearchPattern(query, options, false);
-    if (!pattern) return false;
-    const sub = chartInfo.titleSpan.decoded.slice(dRange.from, dRange.to);
-    const m = pattern.exec(sub);
-    if (!m || m.index !== 0 || m[0].length !== sub.length) return false;
+function stepWindowedFenceRanges(wBlock: HTMLElement, content: string, query: string, options: SearchMatchConfig): SourceRange[] | null {
+  const wBounds = sourceBounds(wBlock, content);
+  if (!wBounds) return null;
+  const stepOwner = wBlock.matches(".step-cards,.step-cards-placeholder")
+    ? wBlock
+    : wBlock.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder");
+  if (stepOwner) {
+    const sBounds = sourceBounds(stepOwner, content);
+    if (!sBounds) return null;
+    if (content.slice(wBounds.start, sBounds.start).trim() || content.slice(sBounds.end, wBounds.end).trim()) return null;
+    return stepDeckFenceMatches(content.slice(sBounds.start, sBounds.end), sBounds.start, query, options);
   }
-  return true;
+  const raw = content.slice(wBounds.start, wBounds.end);
+  if (!/^\s*(?:`{3,}|~{3,})[ \t]*\{?[ \t]*smd-steps\b/i.test(raw)) return null;
+  return stepDeckFenceMatches(raw, wBounds.start, query, options);
 }
 
 function visibleSourceSpan(owner: HTMLElement, content: string): { start: number; end: number } | null {
@@ -512,7 +429,10 @@ function deepestSourceOwner(block: HTMLElement, range: SourceRange, content?: st
 
 function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, query?: string, options: SearchMatchConfig = false): boolean {
   if (owner.matches(DIAGRAM_ONLY_SELECTOR)) return false;
-  if (owner.matches(".interactive-chart")) return isDirectVisibleChartMatch(owner, content, candidate, query, options);
+  if (owner.matches(".interactive-chart")) {
+    const bounds = sourceBounds(owner, content);
+    return Boolean(bounds && candidate.from >= bounds.start && candidate.to <= bounds.end && isDirectChartTitleMatch(content.slice(bounds.start, bounds.end), bounds.start, candidate, query, options));
+  }
   if (owner.matches(".step-cards,.step-cards-placeholder")) {
     const bounds = sourceBounds(owner, content);
     if (!bounds || candidate.from < bounds.start || candidate.to > bounds.end) return false;
@@ -1157,6 +1077,12 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
     if (liveWindowed) {
       if (!liveWindowed.length) return -1;
+      const wBlock = block.closest<HTMLElement>("[data-windowed-block]") ?? block;
+      const stepRanges = stepWindowedFenceRanges(wBlock, content, query, filterOptions);
+      if (stepRanges) {
+        const ord = findMatchingSourceRangeIndex(stepRanges, sr);
+        return ord >= 0 ? liveWindowed.findIndex(w => w.element === wBlock && w.ordinal === ord) : -1;
+      }
       if (!block.closest('[data-windowed-mounted="false"]')) {
         const resolved = mapSourceRangeToDomRange(block, content, activeSourceRanges, sourceIdx, query, filterOptions);
         if (!resolved) return -1;
@@ -1170,7 +1096,6 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       }
       const owner = deepestSourceOwner(block, sr, content);
       if (owner && !isDirectVisibleMatch(owner, content, sr, query, filterOptions)) return -1;
-      const wBlock = block.closest<HTMLElement>("[data-windowed-block]") ?? block;
       const wBounds = sourceBounds(wBlock, content);
       let targetOrdinal = 0;
       if (wBounds) {
@@ -1307,33 +1232,50 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!match) return;
     clearSettleFrames();
     revealMountedBlock(match.element);
-    openDisclosuresFor(match.element, match.element);
-    let range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-    if (openDisclosuresFor(match.element, match.element, range)) range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-    const scrollEl = range ? (range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement) : match.element;
-    scrollTargetIntoView(scrollEl ?? match.element, host);
+    const resolveWindowedTarget = () => {
+      const stepRanges = stepWindowedFenceRanges(match.element, content, query, filterOptions);
+      const stepOwner = stepRanges
+        ? (match.element.matches(".step-cards,.step-cards-placeholder")
+          ? match.element
+          : match.element.querySelector<HTMLElement>(".step-cards,.step-cards-placeholder"))
+        : null;
+      const stepTarget = stepRanges?.[match.ordinal];
+      if (stepOwner && stepRanges && stepTarget) {
+        const revealed = revealStepCardsForRange(stepOwner, content, stepTarget);
+        const domRange = mapStepDeckSourceRangeToDomRange(stepOwner, content, stepRanges, match.ordinal, query, filterOptions);
+        openDisclosuresFor(stepOwner, match.element, domRange, stepTarget);
+        const targetEl = domRange
+          ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement)
+          : stepCardScrollTarget(stepOwner);
+        return { range: domRange, scrollEl: targetEl ?? match.element, observed: revealed.card ?? stepOwner };
+      }
+      openDisclosuresFor(match.element, match.element);
+      let domRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      if (openDisclosuresFor(match.element, match.element, domRange)) domRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
+      const targetEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : match.element;
+      return { range: domRange, scrollEl: targetEl ?? match.element, observed: match.element };
+    };
+    const initial = resolveWindowedTarget();
+    scrollTargetIntoView(initial.scrollEl, host);
     updateIndex(next);
     if (registry && HighlightClass) {
       registry.set("smd-search", new HighlightClass(...readingMatches(host ?? match.element, query, filterOptions)));
       registry.delete("smd-search-current");
-      if (range) registry.set("smd-search-current", new HighlightClass(range));
+      if (initial.range) registry.set("smd-search-current", new HighlightClass(initial.range));
     }
     scheduleSearchSettle(host ?? match.element, () => {
       if (sourceSearchRef.current || indexRef.current !== next || !match.element.isConnected) return false;
       revealMountedBlock(match.element);
       const liveHost = findReadingHost();
-      openDisclosuresFor(match.element, match.element);
-      let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-      if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-      const liveScrollEl = liveRange ? (liveRange.startContainer.nodeType === Node.ELEMENT_NODE ? liveRange.startContainer as Element : liveRange.startContainer.parentElement) : match.element;
-      scrollTargetIntoView(liveScrollEl ?? match.element, liveHost);
+      const settled = resolveWindowedTarget();
+      scrollTargetIntoView(settled.scrollEl, liveHost);
       if (registry && HighlightClass) {
         registry.set("smd-search", new HighlightClass(...readingMatches(liveHost ?? match.element, query, filterOptions)));
         registry.delete("smd-search-current");
-        if (liveRange) registry.set("smd-search-current", new HighlightClass(liveRange));
+        if (settled.range) registry.set("smd-search-current", new HighlightClass(settled.range));
       }
       return true;
-    }, match.element);
+    }, initial.observed);
   };
 
   const selectDomMatch = (next: number, activeMatches: Range[], host: HTMLElement | null) => {
@@ -1348,19 +1290,21 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       registry.delete("smd-search-current");
       registry.set("smd-search-current", new HighlightClass(range));
     }
-    const observed = element?.closest(".step-cards,.interactive-chart") ?? element;
-    scheduleSearchSettle(host ?? element, () => {
-      if (sourceSearchRef.current || indexRef.current !== next || !range.startContainer.isConnected) return false;
-      const liveHost = findReadingHost();
-      const liveEl = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
-      openDisclosuresFor(liveEl, liveEl?.closest(".code-container,details") ?? liveEl, range);
-      scrollTargetIntoView(liveEl, liveHost);
-      if (registry && HighlightClass) {
-        registry.delete("smd-search-current");
-        registry.set("smd-search-current", new HighlightClass(range));
-      }
-      return true;
-    }, observed);
+    const observed = element?.closest(".step-cards,.interactive-chart");
+    if (observed || host?.querySelector(".step-cards,.mermaid,.svg-figure,.interactive-chart,[data-windowed-block]")) {
+      scheduleSearchSettle(host ?? element, () => {
+        if (sourceSearchRef.current || indexRef.current !== next || !range.startContainer.isConnected) return false;
+        const liveHost = findReadingHost();
+        const liveEl = range.startContainer.nodeType === Node.ELEMENT_NODE ? range.startContainer as Element : range.startContainer.parentElement;
+        openDisclosuresFor(liveEl, liveEl?.closest(".code-container,details") ?? liveEl, range);
+        scrollTargetIntoView(liveEl, liveHost);
+        if (registry && HighlightClass) {
+          registry.delete("smd-search-current");
+          registry.set("smd-search-current", new HighlightClass(range));
+        }
+        return true;
+      }, observed ?? element);
+    }
   };
 
   const toggleReplacing = (nextReplacing = !activeReplacing) => {
@@ -1391,23 +1335,29 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         else if (liveWindowed) {
           const active = liveWindowed[nextIndex];
           if (!active) nextIndex = -1;
-          else if (!active.element.closest('[data-windowed-mounted="false"]')) {
-            const domRange = readingMatches(active.element, query, filterOptions)[active.ordinal];
-            const mapped = domRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, domRange, query, filterOptions) : -1;
-            nextIndex = mapped >= 0 ? mapped : -1;
-          } else {
-            const bounds = sourceBounds(active.element, content);
-            let seen = 0, mapped = -1;
-            if (bounds) {
-              for (let i = 0; i < activeSourceRanges.length; i++) {
-                const sr = activeSourceRanges[i];
-                if (sr.from >= bounds.start && sr.to <= bounds.end && isDirectVisibleMatch(active.element, content, sr, query, filterOptions)) {
-                  if (seen === active.ordinal) { mapped = i; break; }
-                  seen++;
+          else {
+            const stepRanges = stepWindowedFenceRanges(active.element, content, query, filterOptions);
+            if (stepRanges) {
+              const sr = stepRanges[active.ordinal];
+              nextIndex = sr ? findMatchingSourceRangeIndex(activeSourceRanges, sr) : -1;
+            } else if (!active.element.closest('[data-windowed-mounted="false"]')) {
+              const domRange = readingMatches(active.element, query, filterOptions)[active.ordinal];
+              const mapped = domRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, domRange, query, filterOptions) : -1;
+              nextIndex = mapped >= 0 ? mapped : -1;
+            } else {
+              const bounds = sourceBounds(active.element, content);
+              let seen = 0, mapped = -1;
+              if (bounds) {
+                for (let i = 0; i < activeSourceRanges.length; i++) {
+                  const sr = activeSourceRanges[i];
+                  if (sr.from >= bounds.start && sr.to <= bounds.end && isDirectVisibleMatch(active.element, content, sr, query, filterOptions)) {
+                    if (seen === active.ordinal) { mapped = i; break; }
+                    seen++;
+                  }
                 }
               }
+              nextIndex = mapped >= 0 ? mapped : -1;
             }
-            nextIndex = mapped >= 0 ? mapped : -1;
           }
         } else {
           const m = matches[nextIndex];
@@ -1780,12 +1730,19 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
           hiddenSourceAnchorRef.current = null;
           if (seedSourceIndex >= 0) {
             if (activeWindowed) {
+              const wBlock = block.closest<HTMLElement>("[data-windowed-block]") ?? block;
+              const stepRanges = stepWindowedFenceRanges(wBlock, content, query, filterOptions);
               let wIdx = -1;
-              for (let i = 0; i < activeWindowed.length; i++) {
-                const w = activeWindowed[i];
-                if (w.element === block || w.element.contains(block) || block.contains(w.element)) {
-                  const wRange = readingMatches(w.element, query, filterOptions)[w.ordinal];
-                  if (wRange && sameDomRange(wRange, domRange)) { wIdx = i; break; }
+              if (stepRanges) {
+                const ord = findMatchingSourceRangeIndex(stepRanges, targetRange);
+                if (ord >= 0) wIdx = activeWindowed.findIndex(w => w.element === wBlock && w.ordinal === ord);
+              } else {
+                for (let i = 0; i < activeWindowed.length; i++) {
+                  const w = activeWindowed[i];
+                  if (w.element === block || w.element.contains(block) || block.contains(w.element)) {
+                    const wRange = readingMatches(w.element, query, filterOptions)[w.ordinal];
+                    if (wRange && sameDomRange(wRange, domRange)) { wIdx = i; break; }
+                  }
                 }
               }
               if (wIdx >= 0) {
