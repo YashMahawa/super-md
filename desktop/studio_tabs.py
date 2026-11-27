@@ -138,6 +138,7 @@ def move_tab(studio_obj, target, tab_id: str, index: int, *, single_shot_fn=QTim
     note = next((t for t in studio_obj.tabs if t["id"] == tab_id), None)
     if not note:
         return False
+    _call_optional(getattr(studio_obj, "_python_jobs", None), "cancel_tab", tab_id)
     old = studio_obj.tabs.index(note)
     studio_obj.tabs.remove(note)
     _call_optional(getattr(studio_obj, "_preview_jobs", None), "cancel_tab", tab_id)

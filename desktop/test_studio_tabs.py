@@ -183,9 +183,10 @@ class StudioTabsTest(unittest.TestCase):
         with patch.object(self.studio, "_flush") as flush_spy:
             target.receiveTab(self.studio.window_id, second_id, 1)
         self.assertEqual((flush_spy.call_args.args[0], json.loads(flush_spy.call_args.args[1])), ("move_tab", {"window": target.window_id, "tab": second_id, "index": 1}))
-        with patch.object(self.studio._preview_jobs, "cancel_tab", wraps=self.studio._preview_jobs.cancel_tab) as cancel_preview:
+        with patch.object(self.studio._preview_jobs, "cancel_tab", wraps=self.studio._preview_jobs.cancel_tab) as cancel_preview, patch.object(self.studio._python_jobs, "cancel_tab", wraps=self.studio._python_jobs.cancel_tab) as cancel_python:
             self.assertTrue(self.studio._move_tab(target, second_id, 0))
         cancel_preview.assert_called_once_with(second_id)
+        cancel_python.assert_called_once_with(second_id)
         self.assertIs(target.tabs[0], second_tab)
         self.assertEqual(target.active, second_id)
         self.assertTrue(all(d["id"] != second_id for d in self.session.drafts.get(self.studio.window_id, [])))
