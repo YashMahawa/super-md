@@ -42,6 +42,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
+from external_open import ExternalOpenRouter
 from agent_live import create_qt_bridge
 from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes
 from instance import InstanceBroker
@@ -297,6 +298,7 @@ def main():
             sync_frame()
         engines.append(engine)
         studios.append(studio)
+        external_router.register_window(studio, activated=show_window)
         if args.smoke:
             import time
             smoke_deadline = time.monotonic() + 30
@@ -545,8 +547,12 @@ def main():
         if note:
             studio.openPath(str(note))
         return studio
+    external_router = ExternalOpenRouter(studios, lambda note=None: create_window(note), app=app)
     app.aboutToQuit.connect(lambda:setattr(session,"quitting",True))
     def open_from_service(note=None):
+        if note:
+            external_router.open_requested(note)
+            return
         hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
         if hidden is not None:
             ensure_reader_profile()
