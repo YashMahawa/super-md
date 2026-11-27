@@ -225,6 +225,7 @@ def sync_path_change(studio_obj: Any, old_path: str, new_path: str, *, is_dir: b
         if matches(win.folder):
             win.folder = remap(win.folder)
         win.expanded = {remap(p) for p in win.expanded}
+        win._pinned_visible_dirs = {remap(p) for p in getattr(win, "_pinned_visible_dirs", ())}
         if win._pending_seeded_find and matches(win._pending_seeded_find.get("path")):
             win._pending_seeded_find["path"] = remap(win._pending_seeded_find["path"])
     if on_rebound is not None:
@@ -261,8 +262,11 @@ def _expand_created_in_windows(studio_obj: Any, created_path: str, expand_target
             with contextlib.suppress(OSError):
                 win_root = Path(folder_ops.canonical_path_str(win.folder))
                 if folder_ops.matches_path_prefix(created_path, str(win_root), is_directory=True):
-                    win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, expand_target))
+                    ancestors = folder_ops.ancestor_directories_in_folder(win_root, expand_target)
+                    win.expanded.update(ancestors)
                     if recover:
+                        if hasattr(win, "_pinned_visible_dirs"):
+                            win._pinned_visible_dirs.update(ancestors)
                         win._recover()
                     win._load_tree()
 

@@ -166,7 +166,7 @@ def refresh_external_notes(studio_obj: Any) -> None:
         folder = getattr(studio_obj, "folder", "")
         if folder and (effective or emitted_location_change) and (wl := getattr(session, "workspace_links", None)) is not None:
             wl.invalidate(folder)
-        if folder and effective and any(ops.same_path(d, p) for d in (folder, *getattr(studio_obj, "expanded", ())) for p in effective):
+        if folder and effective and any(ops.same_path(ch, folder) or ops.matches_path_prefix(ch, folder, is_directory=True) for ch in effective):
             _call_method(studio_obj, "_load_tree", None)
 
     _call_method(studio_obj, "_submit", _fallback_submit, lambda: _studio_module().file_events.reconcile(known, changed), reconciled, False)

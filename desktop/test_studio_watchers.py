@@ -127,13 +127,15 @@ class StudioWatchersUnitTests(unittest.TestCase):
         self.assertEqual((tab["conflict"], tab["content"], emitted[-1]), (True, "# Local dirty edit\n", ((False,), {})))
 
     def test_external_changed_and_refresh_honor_studio_local_path_file_events_and_submit_patches(self):
-        note = self.temp_dir / "ext.md"
+        note = self.temp_dir / "sub" / "ext.md"
+        note.parent.mkdir(parents=True)
         note.write_text("# Ext\n", encoding="utf-8")
-        emitted_locs, submitted = [], []
+        emitted_locs, submitted, tree_loads = [], [], []
         double = SimpleNamespace(
-            external_paths=set(), note_identities={str(note): (9, 9)}, tabs=[{"path": str(note)}],
+            folder=str(self.temp_dir), external_paths=set(), note_identities={str(note): (9, 9)}, tabs=[{"path": str(note)}],
             session=SimpleNamespace(locationChanged=SimpleNamespace(emit=lambda o, n: emitted_locs.append((o, n)))),
             _reload_changed_content=lambda changed: None,
+            _load_tree=lambda: tree_loads.append(True),
             _submit=lambda action, done, busy=True: (submitted.append(busy), done(action(), None)),
         )
         with patch.object(studio, "local_path", side_effect=lambda p: Path(p)):
@@ -141,7 +143,7 @@ class StudioWatchersUnitTests(unittest.TestCase):
         self.assertEqual(double.external_paths, {str(note)})
         with patch.object(studio.file_events, "reconcile", return_value={str(note): ""}) as spy_rec:
             studio_watchers.refresh_external_notes(double)
-        self.assertEqual((spy_rec.call_count, submitted, emitted_locs), (1, [False], [(str(note), "")]))
+        self.assertEqual((spy_rec.call_count, submitted, emitted_locs, tree_loads), (1, [False], [(str(note), "")], [True]))
 
 
 if __name__ == "__main__":
