@@ -48,23 +48,27 @@ internal class ReaderBridge(
     }
 
     /** Waits for the live reader to flush its acknowledged edit queue for this exact note. */
-    suspend fun requestFlush(noteId: String, timeoutMillis: Long = 12_000): Boolean {
-        if (retired.get() || noteId.isBlank()) return false
+    suspend fun requestFlush(noteId: String, timeoutMillis: Long = 12_000): Boolean =
+        requestFlushStatus(noteId, timeoutMillis) == ReaderFlushStatus.ACKNOWLEDGED
+
+    /** Waits for the live reader's flush outcome, distinguishing active-note handoff lag from errors. */
+    suspend fun requestFlushStatus(noteId: String, timeoutMillis: Long = 12_000): ReaderFlushStatus {
+        if (retired.get() || noteId.isBlank()) return ReaderFlushStatus.FAILED
         val request = flushBarrier.register(UUID.randomUUID().toString(), noteId)
         try {
             if (retired.get()) {
                 flushBarrier.cancel(request.token, request)
-                return false
+                return ReaderFlushStatus.FAILED
             }
             val script = "window.supermdFlush?.({action:'android_flush',target:${JSONObject.quote(noteId)},token:${JSONObject.quote(request.token)}})"
             if (!web.post {
-                    if (retired.get()) flushBarrier.complete(request.token, "", null, null, "Reader retired")
+                    if (retired.get()) flushBarrier.complete(request.token, "", null, null, "Reader retired", wellFormed = false)
                     else web.evaluateJavascript(script, null)
                 }) {
                 flushBarrier.cancel(request.token, request)
-                return false
+                return ReaderFlushStatus.FAILED
             }
-            return withTimeoutOrNull(timeoutMillis) { request.result.await() } == true
+            return withTimeoutOrNull(timeoutMillis) { request.status.await() } ?: ReaderFlushStatus.FAILED
         } finally {
             flushBarrier.cancel(request.token, request)
         }
@@ -348,6 +352,7 @@ internal class ReaderBridge(
             content,
             current?.takeIf { model.state.value.active.id == it.id }?.content,
             if (wellFormed) error else "Malformed flush acknowledgement",
+            wellFormed = wellFormed,
         )
         return if (accepted) JSONObject().put("accepted", true)
         else JSONObject().put("accepted", false).put("reason", "conflict")
