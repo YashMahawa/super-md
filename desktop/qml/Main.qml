@@ -409,7 +409,7 @@ ApplicationWindow {
                     DragHandler { enabled: studio.fedoraWindowFrame; target: null; onActiveChanged: if (active) window.startSystemMove() }
                     TapHandler { enabled: studio.fedoraWindowFrame; onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized() }
                 }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
+                ActionButton { objectName: "findInNoteButton"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
