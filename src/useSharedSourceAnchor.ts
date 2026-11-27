@@ -138,6 +138,84 @@ export function snapshotOutgoingTabOrPathAnchor(options: {
 const ANCHOR_SETTLE_INPUTS = ["wheel", "touchstart", "keydown", "pointerdown", "supermd-goto-offset"] as const;
 const ANCHOR_SETTLE_DELAYS = [120, 320, 700] as const;
 
+export interface SettleSharedSourceAnchorOptions {
+  id: string;
+  targetMode: AnchorViewMode;
+  getTargetZoom: () => number;
+  anchor: SharedSourceAnchor;
+  allowExactTop: boolean;
+  readingSelector: string;
+  getReadingRoot: () => HTMLElement | null;
+  shouldStop: () => boolean;
+  onExternalScroll?: (target: HTMLElement) => void;
+  runApplyPass?: (execute: () => AnchorScrollSnapshot | null) => void;
+  onSecondFrameSettled?: () => void;
+  onCleanup?: () => void;
+  delays?: readonly number[];
+}
+
+// Views settle over several frames (editor mount, zoom geometry, lazy math and
+// fonts). Re-apply the shared source anchor until stable, and stop immediately
+// when the person scrolls, types or opens search/live edit.
+export function settleSharedSourceAnchor({
+  id, targetMode, getTargetZoom, anchor, allowExactTop, readingSelector, getReadingRoot,
+  shouldStop, onExternalScroll, runApplyPass, onSecondFrameSettled, onCleanup, delays = ANCHOR_SETTLE_DELAYS,
+}: SettleSharedSourceAnchorOptions): () => void {
+  let stopped = false, applying = false;
+  const stop = () => { stopped = true; };
+  let readingSnapshot: AnchorScrollSnapshot | null = null;
+  const commitExternalScroll = (target: HTMLElement) => {
+    clearProgrammaticAnchorScroll(target);
+    stopped = true;
+    onExternalScroll?.(target);
+  };
+  const onScroll = (event: Event) => {
+    const target = event.target;
+    if (!applying && target instanceof HTMLElement && target.matches(readingSelector) && target === readingSnapshot?.element && hasExternalAnchorScroll(readingSnapshot)) {
+      commitExternalScroll(target);
+    }
+  };
+  ANCHOR_SETTLE_INPUTS.forEach(name => window.addEventListener(name, stop, { capture: true, passive: true }));
+  window.addEventListener("scroll", onScroll, { capture: true, passive: true });
+  let firstPass = true;
+  const apply = () => {
+    if (stopped) return;
+    if (readingSnapshot && hasExternalAnchorScroll(readingSnapshot)) { commitExternalScroll(readingSnapshot.element); return; }
+    if (shouldStop()) { stopped = true; return; }
+    const updateSelection = firstPass; firstPass = false; applying = true;
+    const execute = () => {
+      const readingRoot = getReadingRoot();
+      const targetZoom = getTargetZoom();
+      const effectiveAllowExactTop = allowExactTop && !(Boolean(readingRoot?.querySelector('[data-windowed-mounted="false"]')) && anchor.offset > 0);
+      applySharedAnchor({ id, targetMode, targetZoom, anchor, readingRoot, allowExactTop: effectiveAllowExactTop, updateSelection });
+      const requestedReadingTop = effectiveAllowExactTop && anchor.mode === targetMode && Math.abs(anchor.zoom - targetZoom) < 1 ? anchor.readingTop : undefined;
+      readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
+      return readingSnapshot;
+    };
+    try {
+      if (runApplyPass) runApplyPass(execute);
+      else execute();
+    } finally { applying = false; }
+  };
+  apply();
+  let innerFrame = 0;
+  const outerFrame = requestAnimationFrame(() => {
+    apply();
+    innerFrame = requestAnimationFrame(() => {
+      apply();
+      if (onSecondFrameSettled && !stopped && !shouldStop()) onSecondFrameSettled();
+    });
+  });
+  const timers = delays.map(delay => window.setTimeout(apply, delay));
+  return () => {
+    stopped = true;
+    onCleanup?.();
+    cancelAnimationFrame(outerFrame); cancelAnimationFrame(innerFrame); timers.forEach(window.clearTimeout);
+    ANCHOR_SETTLE_INPUTS.forEach(name => window.removeEventListener(name, stop, { capture: true }));
+    window.removeEventListener("scroll", onScroll, { capture: true });
+  };
+}
+
 export interface UseSharedSourceAnchorOptions {
   state: SharedAnchorReaderState | null;
   reference: RefObject<SharedAnchorReaderState | null>;
@@ -216,72 +294,40 @@ export function useSharedSourceAnchor({ state, reference, zoomReference, refs }:
       scrollInputVersion() !== startingInput || hasDocumentSelection() ||
       Boolean(document.querySelector(".live-active-block")) ||
       (!hadSearchOverlayAtStart && Boolean(document.querySelector(".reading-search,.cm-search")));
-    const runGuarded = (fn: () => void) => {
+    const runGuarded = (execute: () => AnchorScrollSnapshot | null) => {
       if (state.mode === "split") {
         const seq = ++restoringSplitSeq.current;
         restoringSplit.current = true;
-        fn();
+        const snapshot = execute();
         splitScrollTops.current = {
           editor: document.querySelector<HTMLElement>(".cm-scroller")?.scrollTop ?? null,
-          preview: document.querySelector<HTMLElement>(".android-reading")?.scrollTop ?? null,
+          preview: snapshot?.top ?? null,
         };
         requestAnimationFrame(() => { if (restoringSplitSeq.current === seq) restoringSplit.current = false; });
       } else {
         splitScrollTops.current = { editor: null, preview: null };
-        fn();
+        execute();
       }
     };
-    // The new view settles over several frames (editor mount, zoom geometry,
-    // lazy math and fonts). Re-apply the source anchor until it is stable,
-    // and stop as soon as the person scrolls, types or opens search/live edit.
-    const settleAnchor = (anchor: SharedSourceAnchor, allowExactTop: boolean) => {
-      let stopped = false, applying = false;
-      const stop = () => { stopped = true; };
-      let readingSnapshot: AnchorScrollSnapshot | null = null;
-      const commitExternalScroll = (target: HTMLElement) => {
-        clearProgrammaticAnchorScroll(target);
-        stopped = true;
-        if (reference.current?.mode === "split") {
-          restoringSplit.current = false;
-          splitScrollTops.current.preview = target.scrollTop;
-          splitPane.current = "preview";
-        }
-      };
-      const onScroll = (event: Event) => {
-        const target = event.target;
-        if (!applying && target instanceof HTMLElement && target.matches(".android-reading") && target === readingSnapshot?.element && hasExternalAnchorScroll(readingSnapshot)) {
-          commitExternalScroll(target);
-        }
-      };
-      ANCHOR_SETTLE_INPUTS.forEach(name => window.addEventListener(name, stop, { capture: true, passive: true }));
-      window.addEventListener("scroll", onScroll, { capture: true, passive: true });
-      let firstPass = true;
-      const apply = () => {
-        if (stopped) return;
-        if (readingSnapshot && hasExternalAnchorScroll(readingSnapshot)) { commitExternalScroll(readingSnapshot.element); return; }
-        if (shouldStop()) { stopped = true; return; }
-        const updateSelection = firstPass; firstPass = false; applying = true;
-        try {
-          runGuarded(() => {
-            const readingRoot = document.querySelector<HTMLElement>(".android-reading");
-            const effectiveAllowExactTop = allowExactTop && !(Boolean(readingRoot?.querySelector('[data-windowed-mounted="false"]')) && anchor.offset > 0);
-            applySharedAnchor({ id: state.id, targetMode: state.mode, targetZoom: zoomReference.current, anchor, readingRoot, allowExactTop: effectiveAllowExactTop, updateSelection });
-            const requestedReadingTop = effectiveAllowExactTop && anchor.mode === state.mode && Math.abs(anchor.zoom - zoomReference.current) < 1 ? anchor.readingTop : undefined;
-            readingSnapshot = snapshotAnchorScroll(readingRoot, requestedReadingTop);
-          });
-        } finally { applying = false; }
-      };
-      apply();
-      let innerFrame = 0;
-      const outerFrame = requestAnimationFrame(() => { apply(); innerFrame = requestAnimationFrame(apply); });
-      const timers = ANCHOR_SETTLE_DELAYS.map(delay => window.setTimeout(apply, delay));
-      return () => {
-        stopped = true;
-        cancelAnimationFrame(outerFrame); cancelAnimationFrame(innerFrame); timers.forEach(window.clearTimeout);
-        ANCHOR_SETTLE_INPUTS.forEach(name => window.removeEventListener(name, stop, { capture: true }));
-        window.removeEventListener("scroll", onScroll, { capture: true });
-      };
-    };
+    const settleAnchor = (anchor: SharedSourceAnchor, allowExactTop: boolean) =>
+      settleSharedSourceAnchor({
+        id: state.id,
+        targetMode: state.mode,
+        getTargetZoom: () => zoomReference.current,
+        anchor,
+        allowExactTop,
+        readingSelector: ".android-reading",
+        getReadingRoot: () => document.querySelector<HTMLElement>(".android-reading"),
+        shouldStop,
+        onExternalScroll: (target) => {
+          if (reference.current?.mode === "split") {
+            restoringSplit.current = false;
+            splitScrollTops.current.preview = target.scrollTop;
+            splitPane.current = "preview";
+          }
+        },
+        runApplyPass: runGuarded,
+      });
     if (modeAnchor.current !== null) {
       suppressedRestoreKey.current = null;
       const anchor = modeAnchor.current; modeAnchor.current = null;

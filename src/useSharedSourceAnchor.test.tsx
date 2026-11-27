@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { readingOffset } from "./readingPosition";
 import { commitMediaLayout } from "./mediaLayout";
 import * as sourceAnchor from "./sourceAnchor";
-import { parseImportedAnchor } from "./useSharedSourceAnchor";
+import { parseImportedAnchor, settleSharedSourceAnchor } from "./useSharedSourceAnchor";
 import { commitWindowedLayout } from "./windowedSearch";
 import { Reader } from "./androidReader";
 
@@ -346,5 +346,63 @@ describe("useSharedSourceAnchor", () => {
     act(() => { vi.advanceTimersByTime(150); });
     // Once an unmounted windowed block is present with anchor.offset > 0, settle passes switch allowExactTop -> false.
     expect(spy.mock.calls.at(-1)?.[0]).toMatchObject({ allowExactTop: false });
+  });
+
+  it("shares settleSharedSourceAnchor on Web .reading-scroll with exact-top vs semantic restore and external scroll cancellation", () => {
+    vi.useFakeTimers();
+    const spy = vi.spyOn(sourceAnchor, "applySharedAnchor");
+    const scroller = document.createElement("div");
+    scroller.className = "reading-scroll";
+    let scrollHeight = 2600;
+    installClampedScroller(scroller, 600, () => scrollHeight);
+    document.body.appendChild(scroller);
+
+    let secondFrameSettled = 0;
+    let externalScrollTop: number | null = null;
+    let cleanedUp = 0;
+    const stopExact = settleSharedSourceAnchor({
+      id: "web-tab-1",
+      targetMode: "split",
+      getTargetZoom: () => 100,
+      anchor: { offset: 24, mode: "split", zoom: 100, readingTop: 920 },
+      allowExactTop: true,
+      readingSelector: ".reading-scroll",
+      getReadingRoot: () => scroller,
+      shouldStop: () => false,
+      onExternalScroll: (target) => { externalScrollTop = target.scrollTop; },
+      onSecondFrameSettled: () => { secondFrameSettled += 1; },
+      onCleanup: () => { cleanedUp += 1; },
+      delays: [120, 320],
+    });
+    expect(scroller.scrollTop).toBe(920);
+    expect(spy.mock.calls[0]?.[0]).toMatchObject({ allowExactTop: true, updateSelection: true });
+    vi.advanceTimersByTime(40);
+    expect(secondFrameSettled).toBe(1);
+
+    // External scroll on .reading-scroll before [120, 320] ms passes cancels remaining passes and reports target top.
+    scroller.scrollTop = 1340;
+    scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
+    expect(externalScrollTop).toBe(1340);
+    vi.advanceTimersByTime(400);
+    expect(scroller.scrollTop).toBe(1340);
+    stopExact();
+    expect(cleanedUp).toBe(1);
+
+    // Mode-switch semantic restore (allowExactTop: false) preserves semantic offset behavior.
+    spy.mockClear();
+    const stopSemantic = settleSharedSourceAnchor({
+      id: "web-tab-1",
+      targetMode: "live",
+      getTargetZoom: () => 100,
+      anchor: { offset: 24, mode: "split", zoom: 100, readingTop: 920 },
+      allowExactTop: false,
+      readingSelector: ".reading-scroll",
+      getReadingRoot: () => scroller,
+      shouldStop: () => false,
+      delays: [120, 320],
+    });
+    expect(spy.mock.calls[0]?.[0]).toMatchObject({ allowExactTop: false, updateSelection: true });
+    stopSemantic();
+    scroller.remove();
   });
 });
