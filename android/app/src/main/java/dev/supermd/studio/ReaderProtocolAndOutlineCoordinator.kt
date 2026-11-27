@@ -137,11 +137,22 @@ internal class ReaderProtocolAndOutlineCoordinator(
             fail("Reader edits conflicted with newer native content, but the incoming draft is too large for a private recovery copy. Keep the reader open and copy it before continuing.")
             return
         }
+        val createdMillis = System.currentTimeMillis().coerceAtLeast(0L)
+        val sequence = conflictSequence.incrementAndGet()
         scope.launch(Dispatchers.IO) {
             var temporary: File? = null
             val saved = runCatching {
                 val root = File(app.filesDir, "reader-conflicts").apply { check((mkdirs() || isDirectory) && isDirectory) }
-                val destination = File(root, "reader-conflict-${UUID.randomUUID()}.json")
+                val destination = File(
+                    root,
+                    String.format(
+                        java.util.Locale.ROOT,
+                        "reader-conflict-%013d-%016x-%s.json",
+                        createdMillis,
+                        sequence,
+                        UUID.randomUUID(),
+                    ),
+                )
                 val tempFile = File(root, destination.name + ".tmp")
                 temporary = tempFile
                 val output = FileOutputStream(tempFile)
@@ -160,5 +171,9 @@ internal class ReaderProtocolAndOutlineCoordinator(
                 )
             }
         }
+    }
+
+    companion object {
+        private val conflictSequence = java.util.concurrent.atomic.AtomicLong(0L)
     }
 }
