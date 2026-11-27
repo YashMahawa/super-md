@@ -298,17 +298,27 @@ it('backs off on rate-limited HTTP 403/429 responses and distinguishes non-rate-
   assert.equal(formatRateLimitDiagnostics(sanitized), 'remaining=0, limit=1000');
 });
 
-it('wires explicit native_frontend job dependencies while keeping source-SHA and manifest checks and release-gate failure', () => {
-  const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+function assertNativeFrontendWorkflowWiring(rawCiWorkflow, rawReleaseWorkflow) {
+  const ciWorkflow = rawCiWorkflow.replace(/\r\n/g, '\n');
   assert.match(ciWorkflow, /\n  test:\n    needs: native_frontend\n/);
   assert.match(ciWorkflow, /\n  android-device-tests:\n    needs: native_frontend\n/);
   assert.match(ciWorkflow, /\n  release-gate:\n    name: All release tests passed\n    if: always\(\)\n    needs: \[native_frontend, test, browser, android-release, android-device-tests\]\n/);
   assert.equal((ciWorkflow.match(/native-frontend-artifact\.mjs verify dist/g) || []).length, 2);
   assert.equal(ciWorkflow.includes('node scripts/wait-native-frontend-artifacts.mjs'), false);
 
-  const releaseWorkflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  const releaseWorkflow = rawReleaseWorkflow.replace(/\r\n/g, '\n');
   assert.match(releaseWorkflow, /\n  desktop:\n    needs: \[prepare, native_frontend\]\n/);
   assert.match(releaseWorkflow, /\n  publish:\n    needs: \[prepare, native_frontend, desktop, android\]\n/);
   assert.equal((releaseWorkflow.match(/native-frontend-artifact\.mjs verify dist/g) || []).length, 1);
   assert.equal(releaseWorkflow.includes('node scripts/wait-native-frontend-artifacts.mjs'), false);
+}
+
+it('wires explicit native_frontend job dependencies while keeping source-SHA and manifest checks and release-gate failure', () => {
+  const ciWorkflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const releaseWorkflow = readFileSync(new URL('../.github/workflows/release.yml', import.meta.url), 'utf8');
+  assertNativeFrontendWorkflowWiring(ciWorkflow, releaseWorkflow);
+  assertNativeFrontendWorkflowWiring(
+    ciWorkflow.replace(/\r?\n/g, '\r\n'),
+    releaseWorkflow.replace(/\r?\n/g, '\r\n'),
+  );
 });
