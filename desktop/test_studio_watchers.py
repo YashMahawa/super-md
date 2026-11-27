@@ -177,8 +177,16 @@ class StudioWatchersUnitTests(unittest.TestCase):
             Studio._refresh_external_notes(double)
         self.assertEqual(len(rec_calls), 1)
 
-        tab["content"] = "# Local dirty edit\n"
         write_portable(smd, "# V3 external\n", {"assets/keep.svg": url_keep, "assets/pic.png": url_v2})
+        double._staging_tabs = {"t1"}
+        Studio._reload_changed_content(double, {str(smd)})
+        self.assertEqual((tab["conflict"], tab["content"]), (False, "# V2\n"))
+        double._staging_tabs.clear()
+        tab["agent_staged"] = True
+        Studio._reload_changed_content(double, {str(smd)})
+        self.assertEqual((tab["conflict"], tab["content"], emitted[-1]), (True, "# V2\n", ((False,), {})))
+        tab.update(agent_staged=False, conflict=False, content="# Local dirty edit\n")
+        write_portable(smd, "# V4 external\n", {"assets/keep.svg": url_keep, "assets/pic.png": url_v2})
         Studio._reload_changed_content(double, {str(smd)})
         self.assertEqual((tab["conflict"], tab["content"], emitted[-1]), (True, "# Local dirty edit\n", ((False,), {})))
 

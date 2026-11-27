@@ -108,6 +108,12 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         self.assertEqual(self.studio.message, "Wait for the current save to finish.")
         self.studio.saving.clear()
 
+        self.studio.message = ""
+        self.studio._staging_tabs.add(self.studio.active)
+        self.studio.renameEntry(str(note_path), "blocked-staging")
+        self.assertEqual(self.studio.message, "Wait for the current save to finish.")
+        self.studio._staging_tabs.clear()
+
         watch_calls: list[bool] = []
         orig_watch = self.studio._watch_notes
         with patch.object(self.studio, "_watch_notes", wraps=lambda force=False: (watch_calls.append(force), orig_watch(force=force))[1]):
@@ -143,6 +149,11 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
     def test_rename_note_outside_folder_untitled_samestat_collision_and_watcher_restore(self):
         untitled = self.studio._current()
         self.assertEqual(untitled["path"], "")
+        original_name = untitled["name"]
+        self.studio._staging_tabs.add(untitled["id"])
+        self.studio.renameNote(untitled["id"], "Blocked By Staging")
+        self.assertEqual(untitled["name"], original_name)
+        self.studio._staging_tabs.clear()
         self.studio.renameNote(untitled["id"], "Scratch Pad")
         self.assertEqual(untitled["name"], "Scratch Pad.md")
 

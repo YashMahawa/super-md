@@ -256,14 +256,14 @@ def reload_changed_content(
     watch_fn(force=True) if callable(watch_fn) else watch_notes(studio_obj, force=True, folder_ops_mod=folder_ops_mod)
     active_suspensions = _call_method(studio_obj, "_active_watch_suspensions", _active_suspensions)
     changed_set = changed if isinstance(changed, (set, frozenset)) else set(changed)
-    saving = getattr(studio_obj, "saving", ())
+    saving, staging = getattr(studio_obj, "saving", None) or (), getattr(studio_obj, "_staging_tabs", None) or ()
     if getattr(studio_obj, "note_file_stamps", None) is None:
         studio_obj.note_file_stamps = {}
     for tab in getattr(studio_obj, "tabs", ()):
         path = tab.get("path", "")
-        if not path or _path_suspended(studio_obj, path, active_suspensions, folder_ops_mod=folder_ops_mod) or not ({path, str(Path(path).parent)} & changed_set) or tab["id"] in saving:
+        if not path or _path_suspended(studio_obj, path, active_suspensions, folder_ops_mod=folder_ops_mod) or not ({path, str(Path(path).parent)} & changed_set) or tab["id"] in saving or tab["id"] in staging:
             continue
-        was_dirty = _call_method(studio_obj, "_is_dirty", _fallback_is_dirty, tab)
+        was_dirty = bool(_call_method(studio_obj, "_is_dirty", _fallback_is_dirty, tab) or tab.get("agent_staged"))
         try:
             st = Path(path).stat()
             stamp = (st.st_mtime_ns, st.st_size)
@@ -279,7 +279,7 @@ def reload_changed_content(
             if isinstance(getattr(studio_obj, "note_file_stamps", None), dict):
                 studio_obj.note_file_stamps[path] = stamp
             content, assets, portable = result
-            if was_dirty or _call_method(studio_obj, "_is_dirty", _fallback_is_dirty, current) or current.get("conflict"):
+            if was_dirty or _call_method(studio_obj, "_is_dirty", _fallback_is_dirty, current) or current.get("agent_staged") or current.get("conflict"):
                 if content != current["saved"] or assets != current.get("saved_assets", {}):
                     current["conflict"] = True
                     studio_obj.message = "This file changed outside Super MD. Autosave is paused for this tab."
