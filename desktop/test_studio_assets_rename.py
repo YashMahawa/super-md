@@ -43,7 +43,7 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         cls.app = QGuiApplication.instance() or QGuiApplication(["StudioAssetsRenameUnitTests"])
 
     def setUp(self):
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="supermd-assets-rename-"))
+        self.temp_dir = Path(folder_ops.canonical_path_str(tempfile.mkdtemp(prefix="supermd-assets-rename-")))
         self.open_root, self.outside_root = self.temp_dir / "workspace", self.temp_dir / "outside"
         self.open_root.mkdir()
         self.outside_root.mkdir()
@@ -322,9 +322,24 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             _note=lambda *a: {"id": "n1"}, _submit=lambda work, done, executor=None: done(work(), None),
         )
         studio_assets_rename.sync_path_change(lightweight, str(self.open_root / "a.md"), str(self.open_root / "b.md"), is_dir=False, message="Moved")
+        canon_b = folder_ops.canonical_path_str(self.open_root / "b.md")
         self.assertEqual(
             seeded_win._pending_seeded_find,
-            {"path": str(self.open_root / "b.md"), "sourceStart": 10, "sourceEnd": 15, "matchText": "topic"},
+            {"path": canon_b, "sourceStart": 10, "sourceEnd": 15, "matchText": "topic"},
+        )
+        short_root = self.temp_dir / "RUNNER~1" / "workspace"
+        short_prefix, canon_prefix = str(short_root), str(self.open_root)
+        seeded_win._pending_seeded_find = {"path": str(short_root / "a.md"), "sourceStart": 2, "sourceEnd": 7, "matchText": "alias"}
+        orig_realpath = folder_ops.os.path.realpath
+        with patch.object(
+            folder_ops.os.path,
+            "realpath",
+            side_effect=lambda p: orig_realpath(canon_prefix + str(p)[len(short_prefix):]) if str(p).startswith(short_prefix) else orig_realpath(p),
+        ):
+            studio_assets_rename.sync_path_change(lightweight, str(short_root / "a.md"), str(short_root / "b.md"), is_dir=False, message="Moved")
+        self.assertEqual(
+            seeded_win._pending_seeded_find,
+            {"path": canon_b, "sourceStart": 2, "sourceEnd": 7, "matchText": "alias"},
         )
         studio_assets_rename.create_subfolder(lightweight, str(self.open_root), "DoubleSub")
         studio_assets_rename.create_folder_note(lightweight, str(self.open_root), "DoubleNote", "md")
