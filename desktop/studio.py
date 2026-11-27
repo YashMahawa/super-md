@@ -54,6 +54,10 @@ import updates
 import app_integration
 import python_runtime
 import pending_python
+if __package__:
+    from . import studio_agent_staging
+else:
+    import studio_agent_staging
 from export_jobs import ExportJobRegistry
 import file_events
 import custom_theme
@@ -1204,65 +1208,26 @@ class Studio(QObject):
 
     @staticmethod
     def _bound_agent_edits(edits: list[dict]) -> list[dict]:
-        bounded = list(edits[-60:])
-        while len(bounded) > 1 and sum(len(item["before"].encode("utf-8")) + len(item["after"].encode("utf-8")) for item in bounded) > 2_000_000:
-            bounded.pop(0)
-        return bounded
+        return studio_agent_staging.bound_agent_edits(edits)
 
     def _append_agent_edit(self, tab: dict, before: str, after: str) -> None:
-        edits = list(tab.get("agent_edits") or [])
-        self._agent_edit_seq = max(self._agent_edit_seq, max((int(item.get("seq", 0)) for item in edits), default=0)) + 1
-        edits.append({"seq": self._agent_edit_seq, "before": before, "after": after})
-        tab["agent_edits"] = self._bound_agent_edits(edits)
+        studio_agent_staging.append_agent_edit(self, tab, before, after)
 
     def _activate_tab_state(self, tab: dict | None) -> None:
-        if tab is None:
-            return
-        if self._agent_jump_tab_id == tab["id"]:
-            self._agent_jump_tab_id = ""
-        if tab.get("agent_staged"):
-            tab["agent_staged"] = False
-            if self.settings.get("autosave") and tab.get("path") and self._is_dirty(tab) and not tab.get("conflict"):
-                self.autosave_timer.start(900)
+        studio_agent_staging.activate_tab_state(self, tab)
 
     def _clear_agent_staging(self, tab: dict | None) -> None:
-        if tab is None:
-            return
-        tab["agent_staged"] = False
-        tab["agent_unreviewed"] = False
-        if getattr(self, "_agent_jump_tab_id", "") == tab.get("id"):
-            self._agent_jump_tab_id = ""
+        studio_agent_staging.clear_agent_staging(self, tab)
 
     def _agent_connection_snapshot(self) -> dict:
-        bridge = getattr(self.session, "agent_bridge", None)
-        cloud_enabled = bool(bridge and bridge.cloudClient.enabled)
-        cloud_opt_in = bool(self.settings.get("cloudAgentEnabled"))
-        cloud_status = self.cloudAgentStatus
-        if self._cloud_revocation_pending:
-            return {"visible": True, "state": "connecting", "label": "Disconnecting…", "detail": cloud_status}
-        if cloud_enabled or (cloud_opt_in and self._agent_cloud_error):
-            if cloud_status == "Connected to relay":
-                return {"visible": True, "state": "connected", "label": "AI connected", "detail": cloud_status}
-            if cloud_status.startswith("Connecting"):
-                return {"visible": True, "state": "connecting", "label": "AI connecting…", "detail": cloud_status}
-            return {"visible": True, "state": "retrying", "label": "AI retrying…", "detail": cloud_status}
-        if bool(bridge and bridge.enabled):
-            return {"visible": True, "state": "local", "label": "AI live", "detail": self.agentAccessStatus}
-        return {"visible": False, "state": "off", "label": "", "detail": ""}
+        return studio_agent_staging.agent_connection_snapshot(self)
 
     def _agent_jump_snapshot(self) -> dict | None:
-        if not self._agent_jump_tab_id or self._agent_jump_tab_id == self.active:
-            return None
-        target = next((t for t in self.tabs if t["id"] == self._agent_jump_tab_id), None)
-        if target is None:
-            return None
-        return {"id": target["id"], "name": target["name"]}
+        return studio_agent_staging.agent_jump_snapshot(self)
 
     @Slot()
     def dismissAgentJump(self):
-        if self._agent_jump_tab_id:
-            self._agent_jump_tab_id = ""
-            self._emit(False)
+        studio_agent_staging.dismiss_agent_jump(self)
 
     @Property("QStringList",notify=sidebarChanged)
     def pinnedRecent(self):return list(self.session.pinned)
@@ -5132,268 +5097,19 @@ class Studio(QObject):
     _RECOVERY_NOTICE = "Couldn't save draft recovery data. Keep Super MD open and retry."
 
     def _validate_and_compute_patch_tab(self, args, *, bridge_revision_json: bool = False):
-        tab_id = args.get("tabId")
-        tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-        if tab is None or tab_id in getattr(self, "_closing_tabs", ()):
-            raise ValueError("The requested live tab is no longer open")
-        staging_tabs = getattr(self, "_staging_tabs", None)
-        if staging_tabs is not None and tab_id in staging_tabs:
-            raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
-        saving = getattr(self, "saving", None)
-        if saving is not None and tab_id in saving:
-            raise ValueError("A save is already in progress for this tab; retry after it finishes")
-        expected = args.get("expectedRevision")
-        previous = tab["content"]
-        revision = hashlib.sha256(previous.encode("utf-8")).hexdigest()
-        if not isinstance(expected, str) or expected != revision:
-            if bridge_revision_json and expected is not None:
-                raise ValueError(json.dumps({
-                    "error": "Revision conflict; inspect the current note before retrying",
-                    "currentRevision": revision,
-                    "sourceLength": len(previous),
-                }))
-            raise ValueError("Live tab revision changed; inspect it again before editing")
-        operations = args.get("operations")
-        if not isinstance(operations, list) or len(operations) > 100:
-            raise ValueError("operations must contain at most 100 edits")
-        if len(json.dumps(operations, ensure_ascii=False).encode("utf-8")) > 64_000:
-            raise ValueError("Patch operations exceed the 64 KB limit")
-        from agent_documents import apply_patch_operations_detailed
-        edited, operation_results = apply_patch_operations_detailed(previous, operations)
-        changed = edited != previous
-        return tab, tab_id, previous, revision, edited, operation_results, changed
+        return studio_agent_staging.validate_and_compute_patch_tab(self, args, bridge_revision_json=bridge_revision_json)
 
     def _build_staged_recovery_candidate(self, tab_id: str, current_tab: dict, previous: str, edited: str, changed: bool):
-        existing_edits = list(current_tab.get("agent_edits") or [])
-        if changed:
-            next_seq = max(
-                getattr(self, "_agent_edit_seq", 0),
-                max((int(item.get("seq", 0)) for item in existing_edits if isinstance(item, dict)), default=0),
-            ) + 1
-            candidate_edits = Studio._bound_agent_edits(
-                existing_edits + [{"seq": next_seq, "before": previous, "after": edited}]
-            )
-            candidate_tab = {
-                **current_tab,
-                "content": edited,
-                "agent_staged": True,
-                "agent_unreviewed": True,
-                "agent_edits": candidate_edits,
-            }
-        else:
-            next_seq = getattr(self, "_agent_edit_seq", 0)
-            candidate_edits = existing_edits
-            candidate_tab = dict(current_tab)
-        replaced_tabs = [candidate_tab if item["id"] == tab_id else item for item in self.tabs]
-        window_drafts = self._window_recovery_drafts(replaced_tabs)
-        all_drafts = self._combined_recovery_drafts(window_drafts)
-        return all_drafts, candidate_edits, next_seq
+        return studio_agent_staging.build_staged_recovery_candidate(self, tab_id, current_tab, previous, edited, changed)
 
-    def _commit_staged_patch_tab(
-        self,
-        current_tab: dict,
-        tab_id: str,
-        edited: str,
-        operation_results: list,
-        changed: bool,
-        candidate_edits: list[dict],
-        next_seq: int,
-    ) -> dict:
-        if changed:
-            current_tab["content"] = edited
-            self._agent_edit_seq = max(getattr(self, "_agent_edit_seq", 0), next_seq)
-            current_tab["agent_edits"] = candidate_edits
-            current_tab["agent_unreviewed"] = True
-            if self.active != tab_id:
-                current_tab["agent_staged"] = True
-                self._agent_jump_tab_id = tab_id
-            else:
-                current_tab["agent_staged"] = False
-                if (
-                    self.settings.get("autosave")
-                    and current_tab.get("path")
-                    and self._is_dirty(current_tab)
-                    and not current_tab.get("conflict")
-                ):
-                    self.autosave_timer.start(900)
-        if getattr(self, "message", "") == self._RECOVERY_NOTICE:
-            self.message = ""
-        self.session.drafts[self.window_id] = self._window_recovery_drafts()
-        if changed and self.active == tab_id:
-            self._recover()
-        else:
-            self._submit_startup_snapshot()
-        if changed:
-            self._emit(load=(self.active == tab_id))
-        return {
-            "tabId": tab_id,
-            "windowId": self.window_id,
-            "revision": hashlib.sha256(edited.encode("utf-8")).hexdigest(),
-            "sourceLength": len(edited),
-            "changed": changed,
-            "applied": len(operation_results),
-            "operation_results": operation_results,
-            "isDirty": edited != current_tab["saved"],
-        }
+    def _commit_staged_patch_tab(self, current_tab: dict, tab_id: str, edited: str, operation_results: list, changed: bool, candidate_edits: list[dict], next_seq: int) -> dict:
+        return studio_agent_staging.commit_staged_patch_tab(self, current_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq)
 
-    def _make_staged_recovery_write_action(
-        self,
-        tab_id: str,
-        previous: str,
-        snapshot: list,
-        decision_lock: threading.Lock,
-        attempt_state: dict,
-        rev_holder: list[int],
-        wrote_holder: list[bool],
-    ):
-        recovery_path = self.data / "recovery.json"
-
-        def should_abort_locked() -> bool:
-            if (
-                attempt_state["decided"]
-                or self.retired
-                or getattr(self.writes, "_shutdown", False)
-                or self.writes.latest_revision("recovery") != rev_holder[0]
-            ):
-                return True
-            live_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-            return live_tab is None or tab_id in self._closing_tabs or live_tab["content"] != previous
-
-        def should_abort() -> bool:
-            with decision_lock:
-                return should_abort_locked()
-
-        def write_action() -> None:
-            with decision_lock:
-                if should_abort_locked():
-                    if not attempt_state["decided"]:
-                        attempt_state["decided"] = True
-                        attempt_state["outcome"] = "aborted"
-                    raise ExactWriteAborted()
-            prior_bytes = recovery_path.read_bytes() if recovery_path.exists() else None
-            with stage_atomic_json(recovery_path, abort_check=should_abort) as staged:
-                atomic_json(recovery_path, snapshot)
-                with decision_lock:
-                    if should_abort_locked():
-                        if not attempt_state["decided"]:
-                            attempt_state["decided"] = True
-                            attempt_state["outcome"] = "aborted"
-                        if staged.intercepted:
-                            staged.discard()
-                        else:
-                            if prior_bytes is None:
-                                if recovery_path.exists():
-                                    recovery_path.unlink()
-                            else:
-                                atomic_write(recovery_path, prior_bytes)
-                        raise ExactWriteAborted()
-                    if staged.intercepted:
-                        staged.publish(recovery_path)
-                    attempt_state["decided"] = True
-                    attempt_state["outcome"] = "published"
-                    wrote_holder[0] = True
-
-        return write_action
+    def _make_staged_recovery_write_action(self, tab_id: str, previous: str, snapshot: list, decision_lock: threading.Lock, attempt_state: dict, rev_holder: list[int], wrote_holder: list[bool]):
+        return studio_agent_staging.make_staged_recovery_write_action(self, tab_id, previous, snapshot, decision_lock, attempt_state, rev_holder, wrote_holder)
 
     def _stage_inactive_patch_tab_sync(self, tab_id: str, previous: str, edited: str, operation_results: list, changed: bool) -> dict:
-        if self.retired or getattr(self.writes, "_shutdown", False):
-            raise ValueError("The target desktop window was closed")
-        max_attempts = max(1, int(getattr(self, "_max_agent_stage_attempts", 3)))
-        timeout = float(getattr(self, "_agent_stage_sync_timeout", 10.0))
-        had_recovery_timer = self.recovery_timer.isActive()
-        if had_recovery_timer:
-            self.recovery_timer.stop()
-        any_wrote_candidate = False
-        self._staging_tabs.add(tab_id)
-        try:
-            for attempt in range(max_attempts):
-                if self.retired or getattr(self.writes, "_shutdown", False):
-                    if any_wrote_candidate and not getattr(self.writes, "_shutdown", False):
-                        self._recover()
-                    raise ValueError("The target desktop window was closed")
-                current_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-                if current_tab is None or tab_id in self._closing_tabs:
-                    if any_wrote_candidate:
-                        self._recover()
-                    raise ValueError("The requested live tab is no longer open")
-                if current_tab["content"] != previous:
-                    if any_wrote_candidate:
-                        self._recover()
-                    raise ValueError("Live tab revision changed; inspect it again before editing")
-                if self.recovery_timer.isActive():
-                    had_recovery_timer = True
-                    self.recovery_timer.stop()
-                all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
-                    tab_id, current_tab, previous, edited, changed
-                )
-                decision_lock = threading.Lock()
-                attempt_state = {"decided": False, "outcome": None}
-                rev_holder = [0]
-                wrote_holder = [False]
-                write_action = self._make_staged_recovery_write_action(
-                    tab_id, previous, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder
-                )
-                rev, outcome = self.writes.submit_latest_exact(
-                    "recovery",
-                    write_action,
-                    on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev),
-                )
-                try:
-                    status, _done_rev, write_error = outcome.result(timeout=timeout)
-                except concurrent.futures.TimeoutError as exc:
-                    with decision_lock:
-                        if not attempt_state["decided"]:
-                            attempt_state["decided"] = True
-                            attempt_state["outcome"] = "timed_out"
-                        published = attempt_state["outcome"] == "published"
-                    if not published:
-                        if any_wrote_candidate:
-                            self._recover()
-                        elif had_recovery_timer:
-                            self.recovery_timer.start(800)
-                        raise RuntimeError(self._RECOVERY_ERROR_FAILED) from exc
-                    try:
-                        status, _done_rev, write_error = outcome.result(timeout=2.0)
-                    except concurrent.futures.TimeoutError as post_exc:
-                        self._recover()
-                        raise RuntimeError(self._RECOVERY_ERROR_FAILED) from post_exc
-                if wrote_holder[0]:
-                    any_wrote_candidate = True
-                if self.retired or getattr(self.writes, "_shutdown", False):
-                    raise ValueError("The target desktop window was closed")
-                now_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-                if now_tab is None or tab_id in self._closing_tabs:
-                    if any_wrote_candidate:
-                        self._recover()
-                    raise ValueError("The requested live tab is no longer open")
-                if now_tab["content"] != previous:
-                    if any_wrote_candidate:
-                        self._recover()
-                    raise ValueError("Live tab revision changed; inspect it again before editing")
-                if status == "failed" or write_error is not None:
-                    if any_wrote_candidate:
-                        self._recover()
-                    elif had_recovery_timer:
-                        self.recovery_timer.start(800)
-                    raise RuntimeError(self._RECOVERY_ERROR_FAILED) from write_error
-                if (
-                    status == "committed"
-                    and self.writes.committed_revision("recovery") == rev
-                    and self.writes.latest_revision("recovery") == rev
-                ):
-                    return self._commit_staged_patch_tab(
-                        now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq
-                    )
-                if attempt + 1 < max_attempts:
-                    continue
-                if any_wrote_candidate:
-                    self._recover()
-                elif had_recovery_timer:
-                    self.recovery_timer.start(800)
-                raise RuntimeError(self._RECOVERY_ERROR_SUPERSEDED)
-            raise RuntimeError(self._RECOVERY_ERROR_SUPERSEDED)
-        finally:
-            self._staging_tabs.discard(tab_id)
+        return studio_agent_staging.stage_inactive_patch_tab_sync(self, tab_id, previous, edited, operation_results, changed)
 
     def _stage_inactive_patch_tab_async(
         self,
@@ -5403,221 +5119,7 @@ class Studio(QObject):
         register_cancel=None,
         is_cancelled=None,
     ) -> None:
-        tab, tab_id, previous, revision, edited, operation_results, changed = self._validate_and_compute_patch_tab(
-            args, bridge_revision_json=True
-        )
-        if self.retired or getattr(self.writes, "_shutdown", False):
-            raise ValueError("The target desktop window was closed")
-        if tab_id == self.active:
-            result = self._agent_document_action(args)
-            on_complete(result, None)
-            return
-        if not changed and not (Studio._is_dirty(self, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
-            on_complete({
-                "tabId": tab_id,
-                "windowId": self.window_id,
-                "revision": revision,
-                "sourceLength": len(edited),
-                "changed": False,
-                "applied": len(operation_results),
-                "operation_results": operation_results,
-                "isDirty": False,
-            }, None)
-            return
-
-        max_attempts = max(1, int(getattr(self, "_max_agent_stage_attempts", 3)))
-        queue_token = uuid.uuid4().hex
-        finished_flag = False
-        active_in_queue = False
-        had_recovery_timer = False
-        any_wrote_candidate = False
-        stage_lock = threading.Lock()
-        stage_cancelled = False
-        current_attempt: tuple[threading.Lock, dict] | None = None
-
-        self._staging_tabs.add(tab_id)
-
-        def finish_stage(result, error):
-            nonlocal finished_flag
-            if finished_flag:
-                return
-            finished_flag = True
-            with self._write_callback_lock:
-                self._pending_write_retirements.pop(queue_token, None)
-            self._staging_tabs.discard(tab_id)
-            if active_in_queue:
-                self.session._advance_agent_stage_queue()
-            on_complete(result, error)
-
-        def finish_cancelled_on_ui(_result=None, _error=None):
-            if finished_flag:
-                return
-            if any_wrote_candidate and not self.retired and not getattr(self.writes, "_shutdown", False):
-                self._recover()
-            elif had_recovery_timer and not self.retired:
-                self.recovery_timer.start(800)
-            finish_stage(None, self._RECOVERY_ERROR_FAILED)
-
-        def cancel_stage() -> bool:
-            nonlocal stage_cancelled
-            with stage_lock:
-                active_attempt = current_attempt
-                if active_attempt is None:
-                    stage_cancelled = True
-                    published = False
-                else:
-                    d_lock, a_state = active_attempt
-                    with d_lock:
-                        if not a_state["decided"]:
-                            a_state["decided"] = True
-                            a_state["outcome"] = "timed_out"
-                        published = a_state["outcome"] == "published"
-                    if not published:
-                        stage_cancelled = True
-            if not published:
-                try:
-                    self.completed.emit((finish_cancelled_on_ui, None, None, False))
-                except RuntimeError:
-                    pass
-            return published
-
-        if callable(register_cancel):
-            register_cancel(cancel_stage)
-
-        with self._write_callback_lock:
-            self._pending_write_retirements[queue_token] = lambda: finish_stage(
-                None, "The target desktop window was closed"
-            )
-
-        def run_attempt(attempt: int) -> None:
-            nonlocal had_recovery_timer, any_wrote_candidate, current_attempt
-            if finished_flag:
-                return
-            with stage_lock:
-                cancelled_now = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
-            if cancelled_now:
-                finish_cancelled_on_ui()
-                return
-            if self.retired or getattr(self.writes, "_shutdown", False):
-                if any_wrote_candidate and not getattr(self.writes, "_shutdown", False):
-                    self._recover()
-                finish_stage(None, "The target desktop window was closed")
-                return
-            current_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-            if current_tab is None or tab_id in self._closing_tabs:
-                if any_wrote_candidate:
-                    self._recover()
-                finish_stage(None, "The requested live tab is no longer open")
-                return
-            if current_tab["content"] != previous:
-                if any_wrote_candidate:
-                    self._recover()
-                cur_rev = hashlib.sha256(current_tab["content"].encode("utf-8")).hexdigest()
-                finish_stage(None, json.dumps({
-                    "error": "Revision conflict; inspect the current note before retrying",
-                    "currentRevision": cur_rev,
-                    "sourceLength": len(current_tab["content"]),
-                }))
-                return
-            if self.recovery_timer.isActive():
-                had_recovery_timer = True
-                self.recovery_timer.stop()
-            all_drafts, candidate_edits, next_seq = self._build_staged_recovery_candidate(
-                tab_id, current_tab, previous, edited, changed
-            )
-            decision_lock = threading.Lock()
-            attempt_state = {"decided": False, "outcome": None}
-            with stage_lock:
-                if stage_cancelled or (callable(is_cancelled) and bool(is_cancelled())):
-                    finish_cancelled_on_ui()
-                    return
-                current_attempt = (decision_lock, attempt_state)
-            rev_holder = [0]
-            wrote_holder = [False]
-            write_action = self._make_staged_recovery_write_action(
-                tab_id, previous, all_drafts, decision_lock, attempt_state, rev_holder, wrote_holder
-            )
-
-            def on_write_done(outcome_tuple, _err_str):
-                nonlocal any_wrote_candidate
-                if finished_flag:
-                    return
-                status, rev, write_error = outcome_tuple
-                if wrote_holder[0]:
-                    any_wrote_candidate = True
-                with stage_lock:
-                    cancelled_after = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
-                if cancelled_after:
-                    finish_cancelled_on_ui()
-                    return
-                if self.retired or getattr(self.writes, "_shutdown", False):
-                    finish_stage(None, "The target desktop window was closed")
-                    return
-                now_tab = next((item for item in self.tabs if item["id"] == tab_id), None)
-                if now_tab is None or tab_id in self._closing_tabs:
-                    if any_wrote_candidate:
-                        self._recover()
-                    finish_stage(None, "The requested live tab is no longer open")
-                    return
-                if now_tab["content"] != previous:
-                    if any_wrote_candidate:
-                        self._recover()
-                    cur_rev = hashlib.sha256(now_tab["content"].encode("utf-8")).hexdigest()
-                    finish_stage(None, json.dumps({
-                        "error": "Revision conflict; inspect the current note before retrying",
-                        "currentRevision": cur_rev,
-                        "sourceLength": len(now_tab["content"]),
-                    }))
-                    return
-                if status == "failed" or write_error is not None:
-                    if any_wrote_candidate:
-                        self._recover()
-                    elif had_recovery_timer:
-                        self.recovery_timer.start(800)
-                    finish_stage(None, self._RECOVERY_ERROR_FAILED)
-                    return
-                if (
-                    status == "committed"
-                    and self.writes.committed_revision("recovery") == rev
-                    and self.writes.latest_revision("recovery") == rev
-                ):
-                    result = self._commit_staged_patch_tab(
-                        now_tab, tab_id, edited, operation_results, changed, candidate_edits, next_seq
-                    )
-                    finish_stage(result, None)
-                    return
-                if attempt + 1 < max_attempts:
-                    run_attempt(attempt + 1)
-                    return
-                if any_wrote_candidate:
-                    self._recover()
-                elif had_recovery_timer:
-                    self.recovery_timer.start(800)
-                finish_stage(None, self._RECOVERY_ERROR_SUPERSEDED)
-
-            self._submit_exact_recovery_write(
-                write_action,
-                on_write_done,
-                on_retired=lambda: finish_stage(None, "The target desktop window was closed"),
-                on_enqueued=lambda assigned_rev, box=rev_holder: box.__setitem__(0, assigned_rev),
-            )
-
-        def start_queued() -> bool:
-            nonlocal active_in_queue
-            if finished_flag:
-                return False
-            with stage_lock:
-                cancelled_before_start = stage_cancelled or (callable(is_cancelled) and bool(is_cancelled()))
-            if cancelled_before_start:
-                finish_cancelled_on_ui()
-                return False
-            with self._write_callback_lock:
-                self._pending_write_retirements.pop(queue_token, None)
-            active_in_queue = True
-            run_attempt(0)
-            return not finished_flag
-
-        self.session._enqueue_agent_stage(start_queued)
+        studio_agent_staging.stage_inactive_patch_tab_async(self, args, on_complete, register_cancel=register_cancel, is_cancelled=is_cancelled)
 
     def _agent_document_action(self, args):
         action = args.get("action")
