@@ -28,6 +28,7 @@ ScrollView {
     property bool draggingTab: false
     property bool rebuildingTabs: false
     property real lastContentWidth: 0
+    readonly property real maxTabWidth: Math.min(260, strip.availableWidth > 96 ? Math.max(140, strip.availableWidth - 32) : 260)
     height: 48
     contentHeight: 48
     contentWidth: {
@@ -59,7 +60,8 @@ ScrollView {
                 tabName: String(entry.name || ""),
                 tabPath: String(entry.path || ""),
                 tabDirty: Boolean(entry.dirty),
-                tabConflict: Boolean(entry.conflict)
+                tabConflict: Boolean(entry.conflict),
+                tabParentContext: String(entry.parentContext || "")
             })
         }
         let structureChanged = false
@@ -92,6 +94,7 @@ ScrollView {
             if (currentEntry.tabPath !== nextEntry.tabPath) tabModel.setProperty(index, "tabPath", nextEntry.tabPath)
             if (currentEntry.tabDirty !== nextEntry.tabDirty) tabModel.setProperty(index, "tabDirty", nextEntry.tabDirty)
             if (currentEntry.tabConflict !== nextEntry.tabConflict) tabModel.setProperty(index, "tabConflict", nextEntry.tabConflict)
+            if (currentEntry.tabParentContext !== nextEntry.tabParentContext) tabModel.setProperty(index, "tabParentContext", nextEntry.tabParentContext)
         }
         if (tabModel.count > desired.length) {
             tabModel.remove(desired.length, tabModel.count - desired.length)
@@ -110,6 +113,28 @@ ScrollView {
     function shortcutHint(label, key, fallback) {
         const raw = strip.shortcutLabels && strip.shortcutLabels[key] !== undefined ? strip.shortcutLabels[key] : fallback
         return raw && raw !== "Disabled" ? label + " (" + raw + ")" : label
+    }
+    function scrollTabIntoView(targetItem, updateRebuildState) {
+        if (strip.draggingTab) return
+        const flickable = strip.contentItem
+        if (!flickable || typeof flickable.contentX !== "number") return
+        const viewportWidth = strip.availableWidth > 0 ? strip.availableWidth : strip.width
+        if (viewportWidth <= 0 || !targetItem || targetItem.width <= 0) return
+        if (updateRebuildState) strip.rebuildingTabs = false
+        const margin = 16
+        const totalWidth = Math.max(viewportWidth, tabRow.implicitWidth)
+        strip.lastContentWidth = totalWidth
+        if (flickable.contentWidth + 0.5 < totalWidth) {
+            revealTimer.restart()
+        }
+        const maxScroll = Math.max(0, totalWidth - viewportWidth)
+        const leftEdge = Math.max(0, targetItem.x - margin)
+        const rightEdge = targetItem.x + targetItem.width + margin
+        let nextX = flickable.contentX
+        if (leftEdge < nextX) nextX = leftEdge
+        else if (rightEdge > nextX + viewportWidth) nextX = rightEdge - viewportWidth
+        nextX = Math.max(0, Math.min(maxScroll, nextX))
+        if (Math.abs(flickable.contentX - nextX) > 0.5) flickable.contentX = nextX
     }
     function revealActiveTab() {
         if (strip.draggingTab) return
@@ -139,21 +164,7 @@ ScrollView {
             revealTimer.restart()
             return
         }
-        strip.rebuildingTabs = false
-        const margin = 16
-        const totalWidth = Math.max(viewportWidth, tabRow.implicitWidth)
-        strip.lastContentWidth = totalWidth
-        if (flickable.contentWidth + 0.5 < totalWidth) {
-            revealTimer.restart()
-        }
-        const maxScroll = Math.max(0, totalWidth - viewportWidth)
-        const leftEdge = Math.max(0, activeItem.x - margin)
-        const rightEdge = activeItem.x + activeItem.width + margin
-        let nextX = flickable.contentX
-        if (leftEdge < nextX) nextX = leftEdge
-        else if (rightEdge > nextX + viewportWidth) nextX = rightEdge - viewportWidth
-        nextX = Math.max(0, Math.min(maxScroll, nextX))
-        if (Math.abs(flickable.contentX - nextX) > 0.5) flickable.contentX = nextX
+        strip.scrollTabIntoView(activeItem, true)
     }
     function scheduleRevealActiveTab() {
         if (!strip.rebuildingTabs) strip.revealActiveTab()
@@ -241,8 +252,12 @@ ScrollView {
                 required property string tabPath
                 required property bool tabDirty
                 required property bool tabConflict
+                required property string tabParentContext
                 readonly property bool isActive: tabId === strip.activeTabId
-                width: Math.min(260, label.implicitWidth + 64)
+                readonly property string parentContext: tabParentContext
+                readonly property string displayName: parentContext.length > 0 ? tabName + " · " + parentContext : tabName
+                readonly property string accessibleTabName: displayName + (tabDirty ? ", unsaved changes" : "")
+                width: Math.min(strip.maxTabWidth, label.implicitWidth + 64)
                 height: 40
                 y: (strip.height - height) / 2
                 onXChanged: if (isActive) strip.scheduleRevealActiveTab()
@@ -278,7 +293,7 @@ ScrollView {
                     color:strip.viewState.colors.surface;border.width:1;border.color:strip.viewState.colors.primary
                     Column {
                         anchors.fill:parent;anchors.margins:16;spacing:10
-                        Label {text:tab.tabName;font.weight:Font.DemiBold;width:parent.width;elide:Text.ElideRight}
+                        Label {text:tab.displayName;font.weight:Font.DemiBold;width:parent.width;elide:Text.ElideRight}
                         Label {text:"Release outside tabs to open a window";font.pixelSize:11;color:strip.viewState.colors.muted}
                         Label {id:previewBody;text:typeof studio !== "undefined" && studio && tab.tabId ? studio.tabPreview(tab.tabId) : "";textFormat:Text.PlainText;width:parent.width;height:105;clip:true;wrapMode:Text.WordWrap;font.pixelSize:12;color:strip.viewState.colors.text}
                     }
@@ -296,8 +311,76 @@ ScrollView {
                 RowLayout {
                     anchors.fill: parent
                     spacing: 0
-                    ActionButton { id: label; objectName: "noteTabLabel"; compact: true; text: (tab.tabDirty ? "• " : "") + tab.tabName; Layout.fillWidth: true; ToolTip.text: tab.tabPath || tab.tabName; onClicked: studio.selectTab(tab.tabId) }
-                    ActionButton { objectName: "noteTabCloseButton"; glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + tab.tabName; ToolTip.text: tab.isActive ? strip.shortcutHint("Close " + tab.tabName, "close_tab", "") : "Close " + tab.tabName; onClicked: { const id = tab.tabId; Qt.callLater(function() { studio.closeTabSafely(id) }) } }
+                    ActionButton {
+                        id: label
+                        objectName: "noteTabLabel"
+                        compact: true
+                        rightPadding: tab.parentContext.length > 0 ? 8 : 16
+                        text: (tab.tabDirty ? "• " : "") + tab.displayName
+                        Accessible.name: tab.accessibleTabName
+                        Layout.fillWidth: true
+                        ToolTip.text: tab.tabPath || tab.tabName
+                        onActiveFocusChanged: if (activeFocus) Qt.callLater(function() { if (label && label.activeFocus) strip.scrollTabIntoView(tab, false) })
+                        onClicked: studio.selectTab(tab.tabId)
+                        contentItem: Item {
+                            readonly property bool hasContext: tab.parentContext.length > 0
+                            readonly property real gap: hasContext ? 6 : 0
+                            readonly property real rawTitleWidth: Math.ceil(titleText.implicitWidth)
+                            readonly property real rawContextWidth: hasContext ? Math.ceil(contextText.implicitWidth) : 0
+                            readonly property real avail: Math.max(0, label.availableWidth)
+                            readonly property real minTitleWidth: Math.min(rawTitleWidth, Math.max(48, Math.floor(avail * 0.52)))
+                            readonly property real allocatedContextWidth: !hasContext ? 0 : (
+                                rawTitleWidth + gap + rawContextWidth <= avail
+                                    ? rawContextWidth
+                                    : Math.min(rawContextWidth, Math.max(0, avail - gap - minTitleWidth))
+                            )
+                            readonly property real allocatedTitleWidth: !hasContext
+                                ? Math.min(rawTitleWidth, avail)
+                                : Math.min(rawTitleWidth, Math.max(0, avail - gap - allocatedContextWidth))
+                            implicitWidth: rawTitleWidth + (hasContext ? gap + rawContextWidth : 0)
+                            implicitHeight: Math.max(titleText.implicitHeight, hasContext ? contextText.implicitHeight : 0)
+                            Text {
+                                id: titleText
+                                objectName: "noteTabTitle"
+                                x: 0
+                                width: parent.allocatedTitleWidth
+                                height: parent.height
+                                text: (tab.tabDirty ? "• " : "") + tab.tabName
+                                font: label.font
+                                color: strip.viewState.colors.text
+                                elide: Text.ElideRight
+                                verticalAlignment: Text.AlignVCenter
+                                textFormat: Text.PlainText
+                            }
+                            Text {
+                                id: contextText
+                                objectName: "noteTabParentContext"
+                                visible: parent.hasContext
+                                x: titleText.width + parent.gap
+                                width: parent.allocatedContextWidth
+                                height: parent.height
+                                text: tab.parentContext
+                                font.family: label.font.family
+                                font.pixelSize: 12
+                                font.weight: Font.Normal
+                                color: strip.viewState.colors.muted
+                                elide: Text.ElideMiddle
+                                verticalAlignment: Text.AlignVCenter
+                                textFormat: Text.PlainText
+                            }
+                        }
+                    }
+                    ActionButton {
+                        id: closeTabBtn
+                        objectName: "noteTabCloseButton"
+                        glyph: "X"
+                        compact: true
+                        implicitWidth: 36
+                        Accessible.name: "Close " + tab.displayName
+                        ToolTip.text: tab.isActive ? strip.shortcutHint("Close " + tab.displayName, "close_tab", "") : "Close " + tab.displayName
+                        onActiveFocusChanged: if (activeFocus) Qt.callLater(function() { if (closeTabBtn && closeTabBtn.activeFocus) strip.scrollTabIntoView(tab, false) })
+                        onClicked: { const id = tab.tabId; Qt.callLater(function() { studio.closeTabSafely(id) }) }
+                    }
                 }
                 DropArea {
                     id: dropZone

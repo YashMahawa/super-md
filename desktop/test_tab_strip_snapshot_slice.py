@@ -623,7 +623,25 @@ class TabStripSnapshotSliceTest(unittest.TestCase):
         self.wait_until(lambda: portable_label.property("text") == "Diagram.smd")
         self.assertEqual(destroyed, [])
 
-        # 4. Narrow overflowing strip still reveals newly activated edge tabs.
+        # 4. Duplicate-filename tab disambiguation updates parentContext in place via tabsSnapshot without delegate churn.
+        dup_overview = self.workspace / "Coursework" / "Overview.md"
+        dup_overview.write_text("# Coursework Overview\n", encoding="utf-8")
+        self.studio.openNote(str(dup_overview))
+        self.wait_until(lambda: folder_ops.same_path(self.studio._current()["path"], dup_overview))
+        dup_overview_id = self.studio.active
+        self.wait_until(lambda: overview_label.property("text") == f"Overview.md · {self.workspace.name}")
+        dup_item = next(t for t in self._note_tabs() if str(t.property("tabId")) == dup_overview_id)
+        dup_label = self._child_named(dup_item, "noteTabLabel")
+        self.assertEqual(dup_label.property("text"), "Overview.md · Coursework")
+        self.assertEqual(by_id[overview_id].property("parentContext"), self.workspace.name)
+        self.assertEqual(dup_item.property("parentContext"), "Coursework")
+        self.assertEqual(destroyed, [], "Opening duplicate-filename tab must keep existing noteTab delegates alive")
+        self.studio.closeTabSafely(dup_overview_id)
+        self.wait_until(lambda: overview_label.property("text") == "Overview.md")
+        self.assertEqual(by_id[overview_id].property("parentContext"), "")
+        self.assertEqual(destroyed, [], "Closing duplicate-filename tab must keep surviving noteTab delegates alive")
+
+        # 5. Narrow overflowing strip still reveals newly activated edge tabs.
         for idx in range(5):
             p = self.workspace / f"Extra {idx}.md"
             p.write_text(f"# Extra {idx}\n", encoding="utf-8")

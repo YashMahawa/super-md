@@ -1963,9 +1963,19 @@ class Studio(QObject):
         cached = getattr(self, "_tabs_slice_cache", None)
         if cached is not None and cached[0] == tabs_key:
             return cached[1]
+        parent_contexts = folder_ops.disambiguate_tab_parents(
+            [(name, path) for _, name, path, _, _ in tabs_key]
+        )
         encoded = json.dumps([
-            {"id": tid, "name": name, "path": path, "dirty": dirty, "conflict": conflict}
-            for tid, name, path, dirty, conflict in tabs_key
+            {
+                "id": tid,
+                "name": name,
+                "path": path,
+                "dirty": dirty,
+                "conflict": conflict,
+                "parentContext": parent_ctx,
+            }
+            for (tid, name, path, dirty, conflict), parent_ctx in zip(tabs_key, parent_contexts)
         ])
         self._tabs_slice_cache = (tabs_key, encoded)
         return encoded

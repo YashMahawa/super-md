@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 
 NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
@@ -236,3 +237,134 @@ def remap_path_prefix(candidate: str, old_path: str, new_path: str, *, is_direct
         if len(cand_parts) > len(old_parts):
             return str(_pure_path(new_canon).joinpath(*cand_parts[len(old_parts):]))
     return candidate
+
+
+def _split_parent_segments(raw_path: str) -> tuple[str, tuple[str, ...], str]:
+    cleaned = strip_extended_length_prefix(str(raw_path or ""))
+    if not cleaned.strip():
+        return "", (), ""
+    pure = _pure_path(cleaned)
+    parent = pure.parent
+    raw_parts = parent.parts
+    if isinstance(pure, PureWindowsPath):
+        if pure.drive:
+            anchor = pure.drive.replace("\\", "/").rstrip("/")
+        elif pure.root:
+            anchor = "/"
+        else:
+            anchor = ""
+        named = tuple(part for part in raw_parts[1 if pure.anchor else 0:] if part and part != ".")
+        if anchor == "/":
+            parent_key = f"/{'/'.join(named)}".casefold()
+        elif anchor:
+            parent_key = f"{anchor}/{'/'.join(named)}".casefold()
+        else:
+            parent_key = "/".join(named).casefold()
+        return anchor, named, parent_key
+    anchor = "/" if pure.anchor else ""
+    named = tuple(part for part in raw_parts[1 if pure.anchor else 0:] if part and part != ".")
+    parent_key = f"/{'/'.join(named)}" if anchor else "/".join(named)
+    return anchor, named, parent_key
+
+
+def _parent_segments_at_depth(anchor: str, named: tuple[str, ...], depth: int) -> tuple[str, ...]:
+    if not named:
+        return (anchor,) if anchor else ()
+    if depth <= len(named):
+        return named[-depth:]
+    if anchor == "/":
+        return ("/" + named[0], *named[1:])
+    if anchor:
+        return (anchor, *named)
+    return named
+
+
+def disambiguate_tab_parents(tabs: Sequence[tuple[str, str]]) -> list[str]:
+    """Return the shortest useful parent context for open tabs that share a filename."""
+    contexts = [""] * len(tabs)
+    groups: dict[str, list[int]] = {}
+    for index, (raw_name, _raw_path) in enumerate(tabs):
+        name_str = str(raw_name or "")
+        if name_str.strip():
+            groups.setdefault(name_str.casefold(), []).append(index)
+
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        path_items: list[dict] = []
+        unsaved_count = 0
+        for index in indices:
+            raw_name, raw_path = tabs[index]
+            anchor, named, parent_key = _split_parent_segments(raw_path)
+            if not parent_key and not anchor and not named:
+                unsaved_count += 1
+                continue
+            max_depth = max(1, len(named) + (1 if anchor else 0))
+            path_items.append({
+                "index": index,
+                "name": str(raw_name or ""),
+                "anchor": anchor,
+                "named": named,
+                "parent_key": parent_key or anchor,
+                "depth": 1,
+                "max_depth": max_depth,
+                "segs": (),
+                "label": "",
+            })
+
+        if not path_items:
+            continue
+
+        distinct_parents = {it["parent_key"] for it in path_items}
+        if unsaved_count == 0 and len(distinct_parents) <= 1 and len({it["name"] for it in path_items}) > 1:
+            continue
+
+        while True:
+            by_label: dict[str, list[dict]] = {}
+            for it in path_items:
+                segs = _parent_segments_at_depth(it["anchor"], it["named"], it["depth"])
+                label = "/".join(segs)
+                it["segs"] = segs
+                it["label"] = label
+                by_label.setdefault(label.casefold(), []).append(it)
+
+            progressed = False
+            for colliding in by_label.values():
+                if len(colliding) < 2:
+                    continue
+                if len({it["parent_key"] for it in colliding}) <= 1:
+                    continue
+                for it in colliding:
+                    if it["depth"] < it["max_depth"]:
+                        it["depth"] += 1
+                        progressed = True
+            if not progressed:
+                break
+
+        uncompacted_by_parent = {it["parent_key"]: it["label"].casefold() for it in path_items}
+        for it in path_items:
+            segs = it["segs"]
+            chosen = it["label"]
+            if len(segs) >= 4:
+                for keep in range(1, len(segs) - 2):
+                    candidate = f"{'/'.join(segs[:keep])}/…/{segs[-1]}"
+                    cand_cf = candidate.casefold()
+                    collision = False
+                    for other in path_items:
+                        if other["parent_key"] == it["parent_key"]:
+                            continue
+                        if uncompacted_by_parent[other["parent_key"]] == cand_cf:
+                            collision = True
+                            break
+                        other_segs = other["segs"]
+                        if len(other_segs) >= keep + 3:
+                            other_cand = f"{'/'.join(other_segs[:keep])}/…/{other_segs[-1]}"
+                            if other_cand.casefold() == cand_cf:
+                                collision = True
+                                break
+                    if not collision:
+                        chosen = candidate
+                        break
+            contexts[it["index"]] = chosen
+
+    return contexts
