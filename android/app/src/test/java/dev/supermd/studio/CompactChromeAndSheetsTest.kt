@@ -3,13 +3,24 @@
 package dev.supermd.studio
 
 import android.app.Activity
+import android.content.ContentProvider
+import android.content.ContentValues
+import android.content.pm.ProviderInfo
+import android.content.res.AssetFileDescriptor
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.net.Uri
 import android.provider.Settings
 import android.view.View
 import android.view.WindowManager
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.result.ActivityResultRegistry
+import androidx.activity.result.ActivityResultRegistryOwner
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
@@ -22,6 +33,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -46,9 +58,13 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.app.ActivityOptionsCompat
+import java.io.ByteArrayOutputStream
 import java.io.File
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -56,8 +72,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
+import org.robolectric.shadows.ShadowContentResolver
 import org.robolectric.shadows.ShadowWindowManagerGlobal
 
 @RunWith(RobolectricTestRunner::class)
@@ -570,5 +588,214 @@ class CompactChromeAndSheetsTest {
         composeRule.runOnIdle { sharing = true }
         composeRule.onNode(hasText("Prepare & share") and hasClickAction()).assertIsDisplayed()
         composeRule.onAllNodes(hasText("Saves directly to Downloads/Super MD.")).also { assertEquals(0, it.fetchSemanticsNodes().size) }
+    }
+
+    @Test
+    fun sharedOpenMimeTypesAndFullscreenCenterLockHelpersPreserveContracts() {
+        val expectedMimes = arrayOf(
+            "text/*",
+            "application/octet-stream",
+            "application/vnd.supermd.smd",
+            "application/vnd.supermd.fmd",
+            "application/gzip",
+            "application/x-gzip",
+        )
+        val first = noteOpenMimeTypes()
+        val second = noteOpenMimeTypes()
+        assertArrayEquals(expectedMimes, first)
+        assertNotSame(first, second)
+
+        var fullscreen by mutableStateOf(false)
+        var centerLock by mutableStateOf(false)
+        var fullscreenToggles = 0
+        var centerLockToggles = 0
+
+        composeRule.setContent {
+            MaterialTheme {
+                Row {
+                    FullscreenAndCenterLockActions(
+                        fullscreen = fullscreen,
+                        centerLock = centerLock,
+                        onToggleFullscreen = {
+                            fullscreenToggles++
+                            fullscreen = !fullscreen
+                        },
+                        onToggleCenterLock = {
+                            centerLockToggles++
+                            centerLock = !centerLock
+                        },
+                    )
+                }
+            }
+        }
+
+        composeRule.onNodeWithContentDescription("Fullscreen study")
+            .assertIsDisplayed()
+            .assertWidthIsAtLeast(48.dp)
+            .assertHeightIsAtLeast(48.dp)
+            .performClick()
+        assertEquals(1, fullscreenToggles)
+        assertTrue(fullscreen)
+
+        composeRule.onNodeWithContentDescription("Exit fullscreen")
+            .assertIsDisplayed()
+            .assertWidthIsAtLeast(48.dp)
+            .assertHeightIsAtLeast(48.dp)
+
+        composeRule.onNodeWithContentDescription("Lock document to centre")
+            .assertIsDisplayed()
+            .assertWidthIsAtLeast(48.dp)
+            .assertHeightIsAtLeast(48.dp)
+            .performClick()
+        assertEquals(1, centerLockToggles)
+        assertTrue(centerLock)
+
+        composeRule.onNodeWithContentDescription("Centre locked · unlock horizontal movement")
+            .assertIsDisplayed()
+            .assertWidthIsAtLeast(48.dp)
+            .assertHeightIsAtLeast(48.dp)
+    }
+
+    @Test
+    fun rememberByteDocumentExporterWritesBytesAndPreservesStatusMessages() {
+        val context = RuntimeEnvironment.getApplication()
+        var nextUri: Uri? = null
+        val launchedInputs = mutableListOf<String>()
+        val registryOwner = object : ActivityResultRegistryOwner {
+            override val activityResultRegistry = object : ActivityResultRegistry() {
+                override fun <I, O> onLaunch(
+                    requestCode: Int,
+                    contract: ActivityResultContract<I, O>,
+                    input: I,
+                    options: ActivityOptionsCompat?,
+                ) {
+                    launchedInputs += input.toString()
+                    dispatchResult(requestCode, nextUri)
+                }
+            }
+        }
+
+        val messages = mutableListOf<String>()
+        lateinit var exportPairing: (String, ByteArray) -> Unit
+        lateinit var exportGuide: (String, ByteArray) -> Unit
+
+        composeRule.setContent {
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides registryOwner) {
+                exportPairing = rememberByteDocumentExporter(
+                    mimeType = "application/json",
+                    missingStreamError = "Android could not write the pairing file",
+                    successMessage = "Trusted pairing file saved. Share it only with a device you trust.",
+                    failurePrefix = "Could not save pairing file",
+                    contentResolver = context.contentResolver,
+                    onMessage = { messages += it },
+                )
+                exportGuide = rememberByteDocumentExporter(
+                    mimeType = "text/markdown",
+                    missingStreamError = "Android could not write the setup guide",
+                    successMessage = "Setup instructions saved.",
+                    failurePrefix = "Could not save setup guide",
+                    contentResolver = context.contentResolver,
+                    onMessage = { messages += it },
+                )
+            }
+        }
+
+        val targetUri = Uri.parse("content://dev.supermd.test/pairing.json")
+        val written = ByteArrayOutputStream()
+        shadowOf(context.contentResolver).registerOutputStream(targetUri, written)
+        nextUri = targetUri
+        composeRule.runOnIdle {
+            exportPairing("SuperMD-pairing.json", "{\"origin\":\"https://relay.example\"}".toByteArray(Charsets.UTF_8))
+        }
+        assertEquals(listOf("SuperMD-pairing.json"), launchedInputs)
+        assertEquals("{\"origin\":\"https://relay.example\"}", written.toString(Charsets.UTF_8.name()))
+        assertEquals(listOf("Trusted pairing file saved. Share it only with a device you trust."), messages)
+
+        // Cancelled picker (null URI) leaves messages untouched
+        nextUri = null
+        composeRule.runOnIdle {
+            exportPairing("SuperMD-pairing.json", "ignored".toByteArray(Charsets.UTF_8))
+        }
+        assertEquals(1, messages.size)
+
+        // Missing output stream surfaces exact failure prefix + missing-stream error
+        val nullStreamAuthority = "dev.supermd.nullstream"
+        val nullStreamProvider = object : ContentProvider() {
+            override fun onCreate(): Boolean = true
+            override fun openAssetFile(uri: Uri, mode: String): AssetFileDescriptor? = null
+            override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = null
+            override fun getType(uri: Uri): String? = null
+            override fun insert(uri: Uri, values: ContentValues?): Uri? = null
+            override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
+            override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int = 0
+        }.also {
+            it.attachInfo(context, ProviderInfo().apply {
+                authority = nullStreamAuthority
+                exported = true
+                grantUriPermissions = true
+            })
+        }
+        ShadowContentResolver.registerProviderInternal(nullStreamAuthority, nullStreamProvider)
+        nextUri = Uri.parse("content://$nullStreamAuthority/null-stream.json")
+        composeRule.runOnIdle {
+            exportPairing("SuperMD-pairing.json", "payload".toByteArray(Charsets.UTF_8))
+        }
+        assertEquals(
+            "Could not save pairing file: Android could not write the pairing file",
+            messages.last(),
+        )
+
+        // Exception thrown by ContentResolver surfaces exact failure prefix + exception message
+        nextUri = Uri.parse("content://dev.supermd.test/unwritable.json")
+        composeRule.runOnIdle {
+            exportPairing("SuperMD-pairing.json", "payload".toByteArray(Charsets.UTF_8))
+        }
+        assertEquals(
+            "Could not save pairing file: No content provider: content://dev.supermd.test/unwritable.json",
+            messages.last(),
+        )
+
+        // Saved setup guide export writes credential-free instructions separately from pairing export
+        val pairingKey = "synthPairingKey_" + "A".repeat(28)
+        val connectorKey = "synthConnectorKey_" + "B".repeat(26)
+        val groupId = AgentAccessState.groupIdFor(pairingKey, connectorKey)
+        val syntheticConfig = AgentAccessConfig(
+            serverOrigin = "https://relay.synthetic.example",
+            pairingKey = pairingKey,
+            connectorKey = connectorKey,
+            groupId = groupId,
+            deviceId = "00000000-0000-4000-8000-000000000001",
+            deviceKey = "synthDeviceKey_" + "C".repeat(29),
+            displayName = "Synthetic Pixel",
+            platform = "android",
+        )
+        val guideUri = Uri.parse("content://dev.supermd.test/setup-guide.md")
+        val writtenGuide = ByteArrayOutputStream()
+        shadowOf(context.contentResolver).registerOutputStream(guideUri, writtenGuide)
+        nextUri = guideUri
+        composeRule.runOnIdle {
+            exportGuide(
+                "SuperMD-Live-Agent-setup.md",
+                AgentSetupGuide.instructions(syntheticConfig, "# Synthetic Skill\n\nAuthoring guidance.").toByteArray(Charsets.UTF_8),
+            )
+        }
+        assertEquals("SuperMD-Live-Agent-setup.md", launchedInputs.last())
+        assertEquals("Setup instructions saved.", messages.last())
+        val savedGuideText = writtenGuide.toString(Charsets.UTF_8.name())
+        assertTrue(savedGuideText.contains("# Synthetic Skill"))
+        assertTrue(savedGuideText.contains("# Connection for this installation"))
+        assertTrue(savedGuideText.contains("Settings → Agent connection"))
+        assertTrue(savedGuideText.contains("Copy private MCP URL"))
+        for (secret in listOf(
+            syntheticConfig.mcpUrl,
+            syntheticConfig.connectorKey,
+            syntheticConfig.pairingKey,
+            syntheticConfig.deviceKey,
+            syntheticConfig.groupId,
+            syntheticConfig.deviceId,
+            syntheticConfig.serverOrigin,
+        )) {
+            assertFalse("Saved guide must omit $secret", savedGuideText.contains(secret))
+        }
     }
 }
