@@ -1,207 +1,34 @@
-"""Unified local path validation, workspace drag-and-drop routing, and media writers for Studio."""
+"""Workspace drag-and-drop routing and streaming media writers for Studio."""
 from __future__ import annotations
-import base64, json, os, re, sys
+
+import base64, json, os, re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from PySide6.QtCore import QEvent, QObject, QPointF, Qt, QUrl
-from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent
 
-try:
+from PySide6.QtCore import QEvent, QObject, QPointF, Qt
+from PySide6.QtGui import QDragEnterEvent, QDragLeaveEvent, QGuiApplication
+
+if __package__:
     from . import folder_ops
-    from .documents import MIMES
-    from .workspace_search import KNOWN_NOTE_SUFFIXES, canonical_note_key
-except ImportError:
+else:
     import folder_ops
-    from documents import MIMES
-    from workspace_search import KNOWN_NOTE_SUFFIXES, canonical_note_key
 
-_DARWIN_SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
-    ("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc"),
-)
-_SYSTEM_PATH_ALIASES = _DARWIN_SYSTEM_PATH_ALIASES if sys.platform == "darwin" else ()
+ClassifyResult = tuple[list[Path], list[Path], list[Path], list[Path]]
+ExtractPathsFn = Callable[[Any], list[Path]]
+ClassifyPathsFn = Callable[[list[Path]], ClassifyResult]
 
-def _studio_module():
-    module = sys.modules.get("studio") or sys.modules.get("desktop.studio")
-    if module is not None:
-        return module
-    try:
-        from . import studio as module
-    except ImportError:
-        import studio as module
-    return module
-
-def _active_system_aliases(override: tuple[tuple[str, str], ...] | None) -> tuple[tuple[str, str], ...]:
-    if override is not None:
-        return override
-    return _DARWIN_SYSTEM_PATH_ALIASES if _studio_module().sys.platform == "darwin" else ()
-
-def _is_symlink_or_junction(path: Path) -> bool:
-    return path.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(path))
-
-def _resolve_canonical_roots(roots) -> tuple[list[Path], list[tuple[Path, Path]]]:
-    canonical_roots, root_aliases = [], []
-    for root in roots:
-        if not root:
-            continue
-        try:
-            supplied_root = Path(os.path.abspath(Path(root).expanduser()))
-            canonical_root = supplied_root.resolve(strict=True)
-        except (OSError, RuntimeError):
-            continue
-        if not canonical_root.is_dir():
-            continue
-        if canonical_root not in canonical_roots:
-            canonical_roots.append(canonical_root)
-        if supplied_root != canonical_root and (supplied_root, canonical_root) not in root_aliases:
-            root_aliases.append((supplied_root, canonical_root))
-    root_aliases.sort(key=lambda item: len(item[0].parts), reverse=True)
-    return canonical_roots, root_aliases
-
-def _resolve_local_file_without_links(
-    candidate: Path, *, root_aliases: list[tuple[Path, Path]],
-    unavailable_message: str, outside_message: str,
-    _system_aliases: tuple[tuple[str, str], ...] | None = None,
-) -> Path:
-    absolute = Path(os.path.abspath(candidate))
-    for raw_alias, raw_canonical in _active_system_aliases(_system_aliases):
-        alias, canonical = Path(raw_alias), Path(raw_canonical)
-        try:
-            if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
-                    and (absolute == alias or alias in absolute.parents)):
-                absolute = canonical / absolute.relative_to(alias)
-                break
-        except (OSError, RuntimeError):
-            continue
-    for supplied_root, canonical_root in root_aliases:
-        if absolute == supplied_root or supplied_root in absolute.parents:
-            absolute = canonical_root / absolute.relative_to(supplied_root)
-            break
-    current = Path(absolute.anchor)
-    for part in absolute.parts[1:]:
-        current = current / part
-        try:
-            if _is_symlink_or_junction(current):
-                raise ValueError(outside_message)
-        except OSError as error:
-            raise ValueError(unavailable_message) from error
-    try:
-        resolved = absolute.resolve(strict=True)
-    except (OSError, RuntimeError) as error:
-        raise ValueError(unavailable_message) from error
-    if not resolved.is_file():
-        raise ValueError(outside_message)
-    return resolved
-
-def _validate_local_tab_asset_path(
-    raw_path, note_path: Path, extra_roots: list[Path], *,
-    unavailable_message: str, outside_message: str,
-    _system_aliases: tuple[tuple[str, str], ...] | None = None,
-) -> Path:
-    if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
-        raise ValueError(unavailable_message)
-    candidate = Path(raw_path).expanduser()
-    if not candidate.is_absolute():
-        candidate = note_path.parent / candidate
-    canonical_roots, root_aliases = _resolve_canonical_roots((note_path.parent, *extra_roots))
-    resolved = _resolve_local_file_without_links(
-        candidate, root_aliases=root_aliases, unavailable_message=unavailable_message,
-        outside_message=outside_message, _system_aliases=_system_aliases,
-    )
-    if any(resolved == canonical_root or canonical_root in resolved.parents for canonical_root in canonical_roots):
-        return resolved
-    raise ValueError(outside_message)
-
-def agent_path_allowed(
-    studio_obj: Any, path: Path, *, _system_aliases: tuple[tuple[str, str], ...] | None = None,
-) -> bool:
-    """Check open targets against user-selected note roots and session paths."""
-    if path is None or "\0" in str(path):
-        return False
-    raw_roots: list[Path] = []
-    location = (getattr(studio_obj, "settings", None) or {}).get("newNoteLocation")
-    if location:
-        raw_roots.append(Path(location).expanduser())
-    if getattr(studio_obj, "folder", ""):
-        raw_roots.append(Path(studio_obj.folder))
-    raw_roots.extend(Path(tab["path"]).parent for tab in getattr(studio_obj, "tabs", ()) if tab.get("path"))
-    canonical_roots, root_aliases = _resolve_canonical_roots(raw_roots)
-    try:
-        resolved = _resolve_local_file_without_links(
-            Path(path), root_aliases=root_aliases, unavailable_message="unavailable",
-            outside_message="outside", _system_aliases=_system_aliases,
-        )
-    except (OSError, RuntimeError, ValueError):
-        return False
-    resolved_str = str(resolved)
-    if resolved_str in getattr(studio_obj, "_agent_owned_files", ()) or resolved_str in getattr(studio_obj, "_agent_open_paths", ()):
-        return True
-    return any(resolved == canonical_root or canonical_root in resolved.parents for canonical_root in canonical_roots)
-
-def local_path(value: str) -> Path:
-    url = QUrl(value)
-    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
-    return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
-
-def _extract_local_drop_paths(values) -> list[Path]:
-    paths, seen = [], set()
-    is_win32 = _studio_module().sys.platform == "win32"
-    for raw in values or ():
-        if raw is None:
-            continue
-        if isinstance(raw, QUrl):
-            if not raw.isLocalFile():
-                continue
-            local_str = raw.toLocalFile()
-        elif isinstance(raw, Path):
-            local_str = str(raw)
-        else:
-            text = str(raw).strip()
-            if not text:
-                continue
-            url = QUrl(text)
-            if url.isLocalFile():
-                local_str = url.toLocalFile()
-            elif not url.scheme() or (len(url.scheme()) == 1 and is_win32):
-                local_str = text
-            else:
-                continue
-        if not local_str:
-            continue
-        try:
-            resolved = Path(folder_ops.strip_extended_length_prefix(str(Path(local_str).expanduser().resolve())))
-        except (OSError, RuntimeError):
-            continue
-        key = canonical_note_key(resolved)
-        if key not in seen:
-            seen.add(key)
-            paths.append(resolved)
-    return paths
-
-def _classify_drop_paths(paths: list[Path]) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
-    folders, notes, images, unsupported = [], [], [], []
-    for path in paths:
-        try:
-            is_dir = path.is_dir()
-            is_file = False if is_dir else path.is_file()
-        except OSError:
-            unsupported.append(path)
-            continue
-        if is_dir:
-            folders.append(path)
-        elif is_file and path.suffix.lower() in KNOWN_NOTE_SUFFIXES:
-            notes.append(path)
-        elif is_file and path.suffix.lower().lstrip(".") in MIMES:
-            images.append(path)
-        else:
-            unsupported.append(path)
-    return folders, notes, images, unsupported
 
 class WorkspaceDropFilter(QObject):
     """Window-level drag/drop router preserving TabStrip drags and WebEngine image drops."""
 
-    def __init__(self, studio: Any, window: QObject, reader: QObject | None = None):
+    def __init__(
+        self, studio: Any, window: QObject, reader: QObject | None = None, *,
+        app_instance_fn: Callable[[], Any] = QGuiApplication.instance,
+    ):
         super().__init__(window)
         self.studio, self.window, self.reader = studio, window, reader
+        self._app_instance_fn = app_instance_fn
         self._intercepting_drag = self._forwarding = False
         window.installEventFilter(self)
 
@@ -230,8 +57,8 @@ class WorkspaceDropFilter(QObject):
         except (RuntimeError, TypeError, ValueError):
             return False
 
-    def _send_scene_event(self, factory) -> None:
-        app = _studio_module().QGuiApplication.instance()
+    def _send_scene_event(self, factory: Callable[[], QEvent]) -> None:
+        app = self._app_instance_fn()
         if app is None:
             return
         self._forwarding = True
@@ -287,11 +114,24 @@ class WorkspaceDropFilter(QObject):
             self.studio.handleExternalDrop(urls, over_reader)
         return True
 
-def drop_blocked(studio_obj: Any) -> bool:
-    return bool(studio_obj.retired or studio_obj.pending_close or studio_obj.flush_operation)
 
-def attach_window_drop_filter(studio_obj: Any, window: QObject | None, reader: QObject | None = None) -> None:
-    if window is None or studio_obj.retired:
+def drop_blocked(studio_obj: Any) -> bool:
+    return bool(
+        getattr(studio_obj, "retired", False)
+        or getattr(studio_obj, "pending_close", "")
+        or getattr(studio_obj, "flush_operation", "")
+    )
+
+
+def _is_drop_blocked(studio_obj: Any) -> bool:
+    return bool(studio_obj.dropBlocked) if hasattr(studio_obj, "dropBlocked") else drop_blocked(studio_obj)
+
+
+def attach_window_drop_filter(
+    studio_obj: Any, window: QObject | None, reader: QObject | None = None, *,
+    filter_cls: Callable[..., Any] = WorkspaceDropFilter,
+) -> None:
+    if window is None or getattr(studio_obj, "retired", False):
         return
     existing = getattr(studio_obj, "_workspace_drop_filter", None)
     if existing is not None and existing.window is window:
@@ -302,36 +142,53 @@ def attach_window_drop_filter(studio_obj: Any, window: QObject | None, reader: Q
             existing.window.removeEventFilter(existing)
         except RuntimeError:
             pass
-    filter_cls = getattr(_studio_module(), "WorkspaceDropFilter", WorkspaceDropFilter)
     studio_obj._workspace_drop_filter = filter_cls(studio_obj, window, reader)
 
-def should_intercept_external_drop(studio_obj: Any, urls, over_reader: bool = False) -> bool:
-    paths = _extract_local_drop_paths(urls)
+
+def should_intercept_external_drop(
+    studio_obj: Any, urls, over_reader: bool = False, *,
+    extract_paths_fn: ExtractPathsFn, classify_paths_fn: ClassifyPathsFn,
+) -> bool:
+    paths = extract_paths_fn(urls)
     if not paths:
         return False
-    if studio_obj.dropBlocked if hasattr(studio_obj, "dropBlocked") else drop_blocked(studio_obj):
+    if _is_drop_blocked(studio_obj):
         return True
-    folders, notes, images, unsupported = _classify_drop_paths(paths)
+    folders, notes, images, unsupported = classify_paths_fn(paths)
     return not (
         over_reader and studio_obj.settings.get("welcomed") and studio_obj.ready
-        and not studio_obj.reader_overlay and not studio_obj.image_overlay
+        and not getattr(studio_obj, "reader_overlay", False)
+        and not getattr(studio_obj, "image_overlay", False)
         and images and not folders and not notes and not unsupported
     )
 
-def open_dropped_urls(studio_obj: Any, urls) -> None:
-    if hasattr(studio_obj, "handleExternalDrop"):
-        studio_obj.handleExternalDrop(urls, False)
-    else:
-        handle_external_drop(studio_obj, urls, False)
 
-def handle_external_drop(studio_obj: Any, urls, over_reader: bool = False) -> None:
-    del over_reader
-    if studio_obj.dropBlocked if hasattr(studio_obj, "dropBlocked") else drop_blocked(studio_obj):
+def open_dropped_urls(
+    studio_obj: Any, urls, *,
+    extract_paths_fn: ExtractPathsFn | None = None, classify_paths_fn: ClassifyPathsFn | None = None,
+) -> None:
+    handler = getattr(studio_obj, "handleExternalDrop", None)
+    if callable(handler):
+        handler(urls, False)
         return
-    paths = _extract_local_drop_paths(urls)
+    if extract_paths_fn is None or classify_paths_fn is None:
+        raise TypeError("open_dropped_urls requires handleExternalDrop or explicit path collaborators")
+    handle_external_drop(
+        studio_obj, urls, False, extract_paths_fn=extract_paths_fn, classify_paths_fn=classify_paths_fn
+    )
+
+
+def handle_external_drop(
+    studio_obj: Any, urls, over_reader: bool = False, *,
+    extract_paths_fn: ExtractPathsFn, classify_paths_fn: ClassifyPathsFn,
+) -> None:
+    del over_reader
+    if _is_drop_blocked(studio_obj):
+        return
+    paths = extract_paths_fn(urls)
     if not paths:
         return
-    folders, notes, images, unsupported = _classify_drop_paths(paths)
+    folders, notes, images, unsupported = classify_paths_fn(paths)
     if not folders and not notes:
         studio_obj.message = (
             "Drop images inside an open note to insert them." if images
@@ -339,6 +196,7 @@ def handle_external_drop(studio_obj: Any, urls, over_reader: bool = False) -> No
         )
         studio_obj._emit(False)
         return
+
     notices: list[str] = []
     if len(folders) > 1:
         skipped = len(folders) - 1
@@ -351,23 +209,28 @@ def handle_external_drop(studio_obj: Any, urls, over_reader: bool = False) -> No
         )
     joined = "; ".join(notices)
     formatted_notice = (joined[0].upper() + joined[1:] + ".") if joined else ""
+
     if folders:
         studio_obj.openFolder(str(folders[-1]))
         studio_obj.workspaceFolderDropped.emit()
-        if not notes and studio_obj.host_window is not None:
-            studio_obj.host_window.raise_()
-            studio_obj.host_window.requestActivate()
+        host_window = getattr(studio_obj, "host_window", None)
+        if not notes and host_window is not None:
+            host_window.raise_()
+            host_window.requestActivate()
+
     if notes:
-        if hasattr(studio_obj, "_open_dropped_notes"):
-            studio_obj._open_dropped_notes(notes, notice=formatted_notice)
+        open_notes_fn = getattr(studio_obj, "_open_dropped_notes", None)
+        if callable(open_notes_fn):
+            open_notes_fn(notes, notice=formatted_notice)
         else:
             open_dropped_notes(studio_obj, notes, notice=formatted_notice)
     elif formatted_notice:
         studio_obj.message = formatted_notice
         studio_obj._emit(False)
 
+
 def open_dropped_notes(studio_obj: Any, note_paths: list[Path], *, notice: str = "") -> None:
-    if not note_paths or studio_obj.retired:
+    if not note_paths or getattr(studio_obj, "retired", False):
         return
     studio_obj._activation_generation += 1
     batch_generation = studio_obj._activation_generation
@@ -408,7 +271,7 @@ def open_dropped_notes(studio_obj: Any, note_paths: list[Path], *, notice: str =
             elif tab is not None:
                 opened_paths_by_index[index] = folder_ops.canonical_path_str(path)
             remaining -= 1
-            if remaining == 0 and not studio_obj.retired:
+            if remaining == 0 and not getattr(studio_obj, "retired", False):
                 if len(opened_paths_by_index) > 1:
                     ordered = [opened_paths_by_index[i] for i in sorted(opened_paths_by_index, reverse=True)]
                     studio_obj.recent = (
@@ -428,7 +291,8 @@ def open_dropped_notes(studio_obj: Any, note_paths: list[Path], *, notice: str =
             batch_insert=make_batch_insert(idx), should_activate_fn=make_should_activate(idx),
         )
 
-def _matches_media_signature(mime: str, data: bytes) -> bool:
+
+def matches_media_signature(mime: str, data: bytes) -> bool:
     head = data[:4096]
     if mime == "image/png":
         return head.startswith(b"\x89PNG\r\n\x1a\n")
@@ -444,7 +308,8 @@ def _matches_media_signature(mime: str, data: bytes) -> bool:
         return b"<svg" in head.lower()
     return mime == "text/plain"
 
-def _parse_media_envelope(raw: str):
+
+def parse_media_envelope(raw: str):
     if len(raw) > 524_288:
         key_pos = raw.find('"body"')
         colon_pos = raw.find(":", key_pos + 6) if key_pos >= 0 else -1
@@ -466,6 +331,7 @@ def _parse_media_envelope(raw: str):
         raise ValueError("Media data is invalid or exceeds 25 MB")
     return parsed, body, 0, len(body)
 
+
 def _decode_media_slice(chunk: str, *, allow_padding: bool) -> bytes:
     try:
         if not allow_padding and "=" in chunk:
@@ -474,8 +340,10 @@ def _decode_media_slice(chunk: str, *, allow_padding: bool) -> bytes:
     except (ValueError, base64.binascii.Error):
         raise ValueError("Media data is not valid base64") from None
 
-def _validate_and_write_media(
-    args: dict, directory: Path, *, source_str: str | None = None, body_start: int = 0, body_end: int | None = None,
+
+def validate_and_write_media(
+    args: dict, directory: Path, *, source_str: str | None = None, body_start: int = 0,
+    body_end: int | None = None, matches_signature_fn: Callable[[str, bytes], bool] = matches_media_signature,
 ) -> dict:
     if not isinstance(args, dict):
         raise ValueError("Invalid media payload")
@@ -506,7 +374,7 @@ def _validate_and_write_media(
     first_chunk = _decode_media_slice(source_str[body_start:first_end], allow_padding=first_end >= body_end)
     if not first_chunk or len(first_chunk) > 25_000_000:
         raise ValueError("Media data is empty or exceeds 25 MB")
-    if not _matches_media_signature(mime_type, first_chunk):
+    if not matches_signature_fn(mime_type, first_chunk):
         raise ValueError("Media bytes do not match the declared type")
 
     for suffix in range(1, 10000):
@@ -538,16 +406,3 @@ def _validate_and_write_media(
                 pass
             raise
     raise ValueError("Could not find an unused media filename")
-
-def media_download_directory(studio_obj: Any) -> Path:
-    std_paths = _studio_module().QStandardPaths
-    default_dir = std_paths.writableLocation(std_paths.StandardLocation.DownloadLocation) or str(Path.home())
-    directory = Path(studio_obj.settings.get("newNoteLocation") or default_dir).expanduser()
-    if not directory.is_dir():
-        raise ValueError("The media download folder is unavailable")
-    return directory
-
-def save_media_native(studio_obj: Any, args):
-    directory_fn = getattr(studio_obj, "_media_download_directory", None)
-    directory = directory_fn() if callable(directory_fn) else media_download_directory(studio_obj)
-    return _studio_module().Studio._validate_and_write_media(args, directory)

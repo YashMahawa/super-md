@@ -59,18 +59,11 @@ import app_integration
 import python_runtime
 import pending_python
 from export_jobs import ExportJobRegistry
-import file_events
-try:
+if __package__:
     from . import studio_paths_media
-except ImportError:
+else:
     import studio_paths_media
-_SYSTEM_PATH_ALIASES = studio_paths_media._SYSTEM_PATH_ALIASES
-_validate_local_tab_asset_path = studio_paths_media._validate_local_tab_asset_path
-local_path = studio_paths_media.local_path
-_extract_local_drop_paths = studio_paths_media._extract_local_drop_paths
-_classify_drop_paths = studio_paths_media._classify_drop_paths
-WorkspaceDropFilter = studio_paths_media.WorkspaceDropFilter
-_matches_media_signature = studio_paths_media._matches_media_signature
+import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
@@ -207,6 +200,83 @@ def _build_agent_skill_zip_bytes(root_dir: Path) -> bytes:
     return buffer.getvalue()
 
 
+_SYSTEM_PATH_ALIASES: tuple[tuple[str, str], ...] = (
+    (("/var", "/private/var"), ("/tmp", "/private/tmp"), ("/etc", "/private/etc"))
+    if sys.platform == "darwin"
+    else ()
+)
+
+
+def _validate_local_tab_asset_path(raw_path, note_path: Path, extra_roots: list[Path], *,
+                                   unavailable_message: str, outside_message: str,
+                                   _system_aliases: tuple[tuple[str, str], ...] | None = None) -> Path:
+    if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
+        raise ValueError(unavailable_message)
+    candidate = Path(raw_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = note_path.parent / candidate
+    absolute = Path(os.path.abspath(candidate))
+
+    # On macOS /var and /tmp are system-provided symlinks into /private. Rewrite
+    # those known aliases before walking path components so temp-folder paths
+    # work when tab["path"] was resolved, while still rejecting symlinks inside
+    # user folders.
+    system_aliases = _SYSTEM_PATH_ALIASES if _system_aliases is None else _system_aliases
+    for raw_alias, raw_canonical in system_aliases:
+        alias = Path(raw_alias)
+        canonical = Path(raw_canonical)
+        try:
+            if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
+                    and (absolute == alias or alias in absolute.parents)):
+                absolute = canonical / absolute.relative_to(alias)
+                break
+        except (OSError, RuntimeError):
+            continue
+
+    canonical_roots: list[Path] = []
+    root_aliases: list[tuple[Path, Path]] = []
+    for root in (note_path.parent, *extra_roots):
+        if not root:
+            continue
+        try:
+            supplied_root = Path(os.path.abspath(Path(root).expanduser()))
+            canonical_root = supplied_root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if not canonical_root.is_dir():
+            continue
+        if canonical_root not in canonical_roots:
+            canonical_roots.append(canonical_root)
+        if supplied_root != canonical_root:
+            pair = (supplied_root, canonical_root)
+            if pair not in root_aliases:
+                root_aliases.append(pair)
+    root_aliases.sort(key=lambda item: len(item[0].parts), reverse=True)
+
+    for supplied_root, canonical_root in root_aliases:
+        if absolute == supplied_root or supplied_root in absolute.parents:
+            absolute = canonical_root / absolute.relative_to(supplied_root)
+            break
+
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current = current / part
+        try:
+            if current.is_symlink() or (hasattr(os.path, "isjunction") and os.path.isjunction(current)):
+                raise ValueError(outside_message)
+        except OSError as error:
+            raise ValueError(unavailable_message) from error
+
+    try:
+        resolved = absolute.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError(unavailable_message) from error
+    if not resolved.is_file():
+        raise ValueError(outside_message)
+    if any(resolved == canonical_root or canonical_root in resolved.parents for canonical_root in canonical_roots):
+        return resolved
+    raise ValueError(outside_message)
+
 SAMPLE = """# A place to think\n\nWrite in Markdown. Read without distractions.\n\n> [!tip] Start with your notes\n> Open any note or folder. No vault, no import process.\n\n## Learn by exploring\n\n$$E = mc^2$$\n\n> [!answer]- Why does this matter?\n> Tap the heading to reveal an answer, then hide it to test yourself.\n\n```smd-chart\n{\"title\":\"A changing wave\",\"series\":[{\"name\":\"Sine\",\"expression\":\"sin(a*x)\",\"color\":\"#386a57\"},{\"name\":\"Cosine\",\"expression\":\"cos(a*x)\",\"color\":\"#bc6750\"}],\"sliders\":[{\"name\":\"a\",\"min\":0.1,\"max\":3,\"step\":0.05,\"value\":1}]}\n```\n\n## Matplotlib in three dimensions\n\nRun a Python cell to generate a 3D figure, then save it in your note or PDF.\n\n```python\nimport numpy as np\nimport matplotlib.pyplot as plt\nx, y = np.meshgrid(np.linspace(-2, 2, 32), np.linspace(-2, 2, 32))\nfig = plt.figure()\nax = fig.add_subplot(111, projection=\"3d\")\nax.plot_surface(x, y, x*x + y*y, cmap=\"viridis\")\n```\n\n[Back to exploring](#learn-by-exploring)\n"""
 
 def public_address(url: str) -> str:
@@ -241,6 +311,79 @@ class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
     def https_open(self, request):
         pinned = public_address(request.full_url)
         return self.do_open(lambda host, **kwargs: _PinnedHTTPSConnection(host, pinned=pinned, **kwargs), request, context=client_context())
+
+def local_path(value: str) -> Path:
+    url = QUrl(value)
+    resolved = Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve()
+    return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
+
+
+def _extract_local_drop_paths(values) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for raw in values or ():
+        if raw is None:
+            continue
+        if isinstance(raw, QUrl):
+            if not raw.isLocalFile():
+                continue
+            local_str = raw.toLocalFile()
+        elif isinstance(raw, Path):
+            local_str = str(raw)
+        else:
+            text = str(raw).strip()
+            if not text:
+                continue
+            url = QUrl(text)
+            if url.isLocalFile():
+                local_str = url.toLocalFile()
+            elif not url.scheme() or (len(url.scheme()) == 1 and sys.platform == "win32"):
+                local_str = text
+            else:
+                continue
+        if not local_str:
+            continue
+        try:
+            resolved = Path(local_str).expanduser().resolve()
+            resolved = Path(folder_ops.strip_extended_length_prefix(str(resolved)))
+        except (OSError, RuntimeError):
+            continue
+        key = canonical_note_key(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(resolved)
+    return paths
+
+
+def _classify_drop_paths(paths: list[Path]) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+    folders: list[Path] = []
+    notes: list[Path] = []
+    images: list[Path] = []
+    unsupported: list[Path] = []
+    for path in paths:
+        try:
+            is_dir = path.is_dir()
+            is_file = False if is_dir else path.is_file()
+        except OSError:
+            unsupported.append(path)
+            continue
+        if is_dir:
+            folders.append(path)
+        elif is_file:
+            suffix = path.suffix.lower()
+            if suffix in KNOWN_NOTE_SUFFIXES:
+                notes.append(path)
+            elif suffix.lstrip(".") in MIMES:
+                images.append(path)
+            else:
+                unsupported.append(path)
+        else:
+            unsupported.append(path)
+    return folders, notes, images, unsupported
+
+
+WorkspaceDropFilter = studio_paths_media.WorkspaceDropFilter
 
 def export_destination(value: str, format: str) -> Path:
     return studio_exports.export_destination(value, format)
@@ -299,6 +442,9 @@ class _StoppedFileWatcher:
 
 _STOPPED_WATCHER = _StoppedFileWatcher()
 
+
+def _matches_media_signature(mime: str, data: bytes) -> bool:
+    return studio_paths_media.matches_media_signature(mime, data)
 
 class Session(QObject):
     """One ordered persistence stream for every native window in the application."""
@@ -2906,19 +3052,25 @@ class Studio(QObject):
     @Slot(QObject)
     @Slot(QObject, QObject)
     def attachWindowDropFilter(self, window: QObject | None, reader: QObject | None = None):
-        studio_paths_media.attach_window_drop_filter(self, window, reader)
+        studio_paths_media.attach_window_drop_filter(self, window, reader, filter_cls=WorkspaceDropFilter)
 
     @Slot("QVariantList", bool, result=bool)
     def shouldInterceptExternalDrop(self, urls, over_reader: bool = False) -> bool:
-        return studio_paths_media.should_intercept_external_drop(self, urls, over_reader)
+        return studio_paths_media.should_intercept_external_drop(
+            self, urls, over_reader, extract_paths_fn=_extract_local_drop_paths, classify_paths_fn=_classify_drop_paths
+        )
 
     @Slot("QVariantList")
     def openDroppedUrls(self, urls):
-        studio_paths_media.open_dropped_urls(self, urls)
+        studio_paths_media.open_dropped_urls(
+            self, urls, extract_paths_fn=_extract_local_drop_paths, classify_paths_fn=_classify_drop_paths
+        )
 
     @Slot("QVariantList", bool)
     def handleExternalDrop(self, urls, over_reader: bool = False):
-        studio_paths_media.handle_external_drop(self, urls, over_reader)
+        studio_paths_media.handle_external_drop(
+            self, urls, over_reader, extract_paths_fn=_extract_local_drop_paths, classify_paths_fn=_classify_drop_paths
+        )
 
     def _open_dropped_notes(self, note_paths: list[Path], *, notice: str = ""):
         studio_paths_media.open_dropped_notes(self, note_paths, notice=notice)
@@ -4642,8 +4794,46 @@ class Studio(QObject):
                 "path": path, "title": title or tab["name"], "active": self.active == tab["id"] if active is None else active,
                 "sourceLength": len(content), "format": fmt, "isDirty": Studio._is_dirty(self, tab)}
 
-    def _agent_path_allowed(self, path: Path, *, _system_aliases=None) -> bool:
-        return studio_paths_media.agent_path_allowed(self, path, _system_aliases=_system_aliases)
+    def _agent_path_allowed(self, path: Path) -> bool:
+        """Check open targets against user-selected note roots and session paths."""
+        absolute = Path(os.path.abspath(path))
+        # On macOS /var is the system-provided alias for /private/var. Resolve
+        # this one known alias before checking path components so a temporary
+        # folder selected through /var remains usable, while symlinks inside
+        # the selected note root are still rejected below.
+        if sys.platform == "darwin":
+            alias = Path("/var")
+            canonical = Path("/private/var")
+            try:
+                if (alias.is_symlink() and alias.resolve(strict=True) == canonical.resolve(strict=True)
+                        and (absolute == alias or alias in absolute.parents)):
+                    absolute = canonical / absolute.relative_to(alias)
+            except (OSError, RuntimeError):
+                pass
+        try:
+            if not absolute.is_file(): return False
+            # Refuse symlinks in every component, including the selected file.
+            current = Path(absolute.anchor)
+            for component in absolute.parts[1:]:
+                current /= component
+                if current.is_symlink(): return False
+            resolved = absolute.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return False
+        if str(resolved) in self._agent_owned_files or str(resolved) in self._agent_open_paths:
+            return True
+        roots = []
+        location = self.settings.get("newNoteLocation")
+        if location: roots.append(Path(location).expanduser())
+        if self.folder: roots.append(Path(self.folder))
+        roots.extend(Path(tab["path"]).parent for tab in self.tabs if tab.get("path"))
+        for root in roots:
+            try:
+                root = root.resolve(strict=True)
+                if root.is_dir() and (resolved == root or root in resolved.parents): return True
+            except (OSError, RuntimeError):
+                continue
+        return False
 
     @staticmethod
     def _run_prepared_write_sync(studio, prepared):
@@ -4979,20 +5169,28 @@ class Studio(QObject):
 
     @staticmethod
     def _parse_media_envelope(raw: str):
-        return studio_paths_media._parse_media_envelope(raw)
+        return studio_paths_media.parse_media_envelope(raw)
 
     @staticmethod
     def _validate_and_write_media(args: dict, directory: Path, *, source_str: str | None = None,
                                   body_start: int = 0, body_end: int | None = None) -> dict:
-        return studio_paths_media._validate_and_write_media(
-            args, directory, source_str=source_str, body_start=body_start, body_end=body_end
+        return studio_paths_media.validate_and_write_media(
+            args,
+            directory,
+            source_str=source_str,
+            body_start=body_start,
+            body_end=body_end,
+            matches_signature_fn=_matches_media_signature,
         )
 
     def _media_download_directory(self) -> Path:
-        return studio_paths_media.media_download_directory(self)
+        directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
+        if not directory.is_dir():
+            raise ValueError("The media download folder is unavailable")
+        return directory
 
     def _save_media_native(self, args):
-        return studio_paths_media.save_media_native(self, args)
+        return Studio._validate_and_write_media(args, self._media_download_directory())
 
     def _prepare_replace_tab_asset(self, args):
         tab_id = args.get("tabId")
