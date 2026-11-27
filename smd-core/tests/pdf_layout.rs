@@ -745,6 +745,6 @@ fn stacked_inline_fractions_leave_clearance_between_lines() {
                 .parse::<f64>().unwrap()
         };
         let gap = vertical_edge("333", "yMin") - vertical_edge("222", "yMax");
-        assert!(gap >= 2., "consecutive inline fractions must have clearance, got {gap:.2}pt");
+        assert!(gap >= 7., "consecutive inline fractions must have clearance, got {gap:.2}pt");
     }
 }
