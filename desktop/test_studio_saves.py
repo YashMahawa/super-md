@@ -300,6 +300,13 @@ class StudioSavesTests(unittest.TestCase):
             self.assertTrue(folder_ops.same_path(self.studio.defaultSaveAsFolder().toLocalFile(), external))
             shutil.rmtree(external)
             self.assertTrue(folder_ops.same_path(self.studio.defaultSaveAsFolder().toLocalFile(), custom))
+            if os.name != "nt":
+                padded = self.root / " Padded Folder "
+                padded.mkdir()
+                self.assertEqual(studio_saves.existing_save_directory(padded), padded)
+                self.studio.settings["newNoteLocation"] = str(padded)
+                self.assertEqual(self.studio.defaultSaveFolder().toLocalFile(), str(padded))
+                self.studio.settings["newNoteLocation"] = str(custom)
 
         refreshes: list[tuple] = []
         with patch.object(self.studio, "_refresh_open_folder_trees", side_effect=lambda *c: refreshes.append(c)):

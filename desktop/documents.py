@@ -851,11 +851,25 @@ def _write_json_value(raw, value, seen: set[int]) -> None:
 _ATOMIC_JSON_STAGE_TLS = threading.local()
 
 
+def _stage_target_key(path: Path | str) -> str:
+    try:
+        resolved = os.path.realpath(os.path.abspath(os.fspath(path)))
+    except OSError:
+        resolved = os.path.abspath(os.fspath(path))
+    if os.name == "nt":
+        if resolved.startswith("\\\\?\\UNC\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif resolved.startswith("\\\\?\\"):
+            resolved = resolved[4:]
+    return os.path.normcase(os.path.normpath(resolved))
+
+
 class _StagedAtomicJsonScope:
     """Defer the final atomic rename of ``target_path`` until the caller commits."""
 
     def __init__(self, target_path: Path, abort_check=None):
-        self.target = Path(target_path).resolve()
+        self.target = Path(os.path.abspath(os.fspath(target_path)))
+        self.target_key = _stage_target_key(target_path)
         self.abort_check = abort_check
         self.intercepted = False
         self.temporary: str | None = None
@@ -904,7 +918,7 @@ def atomic_json(path: Path, value) -> None:
     capture_stage = (
         stage_scope is not None
         and not stage_scope.intercepted
-        and path_obj.resolve() == stage_scope.target
+        and _stage_target_key(path_obj) == stage_scope.target_key
     )
     if capture_stage:
         stage_scope.intercepted = True

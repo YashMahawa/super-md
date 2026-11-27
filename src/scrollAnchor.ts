@@ -26,7 +26,7 @@ export function captureScrollAnchor(root: HTMLElement, focus?:{x:number;y:number
     if (!root.isConnected || inputVersion!==capturedInput) return;
     // At the start of a note, stay at its start. Anchoring a paragraph farther
     // down while fonts/reflow change would otherwise crop the title above it.
-    if (scroll <= 1 && !focus) { root.scrollTop = 0; return; }
+    if (scroll <= 1 && !focus) { root.scrollTop = 0; (root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop = root.scrollTop; return; }
     // DOM Ranges retarget to a CONNECTED parent when their loading-label text
     // is removed. That parent is not the captured source: its zero/whole-box
     // rectangle used to manufacture a scroll correction on image completion.
@@ -35,6 +35,7 @@ export function captureScrollAnchor(root: HTMLElement, focus?:{x:number;y:number
     const previous=rangeAlive?top:blockTop;
     if (previous !== undefined && next !== undefined) root.scrollTop += next-previous;
     else root.scrollTop = scroll/max * Math.max(0,root.scrollHeight-root.clientHeight);
+    (root as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop = root.scrollTop;
     if(focus && left!==undefined && rangeAlive)root.scrollLeft+=range!.getBoundingClientRect().left-left;
   };
 }
