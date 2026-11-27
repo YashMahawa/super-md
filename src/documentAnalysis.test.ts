@@ -464,4 +464,32 @@ describe('shared source analysis',()=>{
     expect(normalized.value).not.toContain('strip_ledger_2399');
     expect(normalized.originalOffset(normalized.value.indexOf('# Tail Heading'))).toBe(largeDoc.indexOf('# Tail Heading'));
   });
+  it('preserves exact AST, position, and GFM semantics across the >4 KB plain-paragraph fast path',()=>{
+    const smallMulti='Second draft\n'+'P'.repeat(120);
+    const largeMulti='Second draft\n'+'P'.repeat(6000);
+    const smallAnalysis=analyzeDocument(smallMulti);
+    const largeAnalysis=analyzeDocument(largeMulti);
+    expect(largeAnalysis.tree.type).toBe('root');
+    expect(largeAnalysis.tree.children).toHaveLength(1);
+    expect(largeAnalysis.tree.position).toEqual({
+      start:{line:1,column:1,offset:0},
+      end:{line:2,column:6001,offset:largeMulti.length},
+    });
+    expect((largeAnalysis.tree.children[0] as any).type).toBe(smallAnalysis.tree.children[0]?.type);
+    expect(largeAnalysis.blocks.map(b=>({start:b.start,end:b.end,text:b.text}))).toEqual([
+      {start:0,end:largeMulti.length,text:largeMulti},
+    ]);
+    expect(largeAnalysis.bodyBlocks.map(b=>({start:b.start,end:b.end,text:b.text}))).toEqual([
+      {start:0,end:largeMulti.length,text:largeMulti},
+    ]);
+
+    // Ensure HTML entities, www. autolinks, and leading continuation spaces still use remark parsing
+    const withEntity='Plain prefix '+'a'.repeat(5000)+' &amp; tail';
+    const entityNode=(analyzeDocument(withEntity).tree.children[0] as any).children[0];
+    expect(entityNode.value).toContain(' & tail');
+
+    const withWww='Visit www.example.com '+'a'.repeat(5000);
+    const wwwChildren=(analyzeDocument(withWww).tree.children[0] as any).children;
+    expect(wwwChildren.some((c:any)=>c.type==='link')).toBe(true);
+  });
 });

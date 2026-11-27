@@ -67,17 +67,55 @@ export function hydrateDocumentAnalysis(source:string,compact:CompactDocumentAna
   };
 }
 
-const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use([remarkImageAttributes,remarkSvgBlocks,remarkBracedFences,remarkStudySyntax,remarkEquationReferences]);
+const sharedTailPlugins=[remarkImageAttributes,remarkSvgBlocks,remarkBracedFences,remarkStudySyntax,remarkEquationReferences];
+const processor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath).use(sharedTailPlugins);
+const plainProcessor=unified().use(remarkParse).use(remarkSourceSyntax).use(remarkMath).use(remarkObsidianMath).use(sharedTailPlugins);
+const PLAIN_PARAGRAPH_EXCLUDED=/[\0#=\-*_+>`~<\[\\\]!&$%:|@.){\r\t]/;
+const GFM_SYNTAX_CANDIDATE=/[|~[:@]|www\./i;
 const cache=new Map<string,{value:DocumentAnalysis;weight:number}>();let retained=0;
 const LIMIT=8_000_000;
 function textOf(node:any):string{return typeof node.value==='string'?node.value:(node.children||[]).map(textOf).join('');}
+
+function analyzePlainParagraph(source:string):DocumentAnalysis|null {
+  const len=source.length;
+  if(!len||source[0]===' '||source[0]==='\n'||source[len-1]===' '||source[len-1]==='\n')return null;
+  if(PLAIN_PARAGRAPH_EXCLUDED.test(source)||source.includes('\n\n')||source.includes('\n ')||source.includes(' \n'))return null;
+  let lines=1,lastNewline=-1,idx=source.indexOf('\n');
+  while(idx!==-1){
+    lines++;
+    lastNewline=idx;
+    idx=source.indexOf('\n',idx+1);
+  }
+  const position={
+    start:{line:1,column:1,offset:0},
+    end:{line:lines,column:len-lastNewline,offset:len},
+  };
+  const tree:Root={
+    type:'root',
+    children:[{
+      type:'paragraph',
+      children:[{type:'text',value:source,position}],
+      position,
+    }],
+    position,
+  };
+  const block=createLazySourceBlock(source,0,len);
+  return {tree,blocks:[block],bodyBlocks:[block],frontmatter:null,outline:[],tasks:[],pythonCells:[]};
+}
 
 /** One bounded immutable analysis shared by outline, Live and rendering. Only
  * derived syntax is cached; source remains owned by the document/revision. */
 export function analyzeDocument(source:string):DocumentAnalysis {
   const hit=cache.get(source);if(hit){cache.delete(source);cache.set(source,hit);return hit.value;}
+  const plain=source.length>4096?analyzePlainParagraph(source):null;
+  if(plain){
+    const weight=source.length*2+480;
+    if(weight<=LIMIT){cache.set(source,{value:plain,weight});retained+=weight;while(retained>LIMIT||cache.size>16){const first=cache.keys().next().value!;retained-=cache.get(first)!.weight;cache.delete(first);}}
+    return plain;
+  }
   const frontmatter=parseFrontmatter(source),fmEnd=frontmatter?.end??0;
-  const tree=processor.runSync(processor.parse(source),source) as Root;
+  const activeProcessor=GFM_SYNTAX_CANDIDATE.test(source)?processor:plainProcessor;
+  const tree=activeProcessor.runSync(activeProcessor.parse(source),source) as Root;
   const outline:OutlineEntry[]=[],tasks:number[]=[],pythonCells:PythonCellSource[]=[],counts=new Map<string,number>(),pythonCounts=new Map<string,number>();let weight=source.length*2;
   visit(tree,(node:any)=>{
     weight+=160+(typeof node.value==='string'?node.value.length*2:0);

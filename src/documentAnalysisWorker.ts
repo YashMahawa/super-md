@@ -408,17 +408,38 @@ export function useDocumentAnalysis(
   const enabled=options.enabled??true;
   const client=options.client??sharedDocumentAnalysisClient;
   const minWorkerChars=options.minWorkerChars??WORKER_ANALYSIS_MIN_CHARS;
-  const shouldRunSync=!client.isAvailable()||source.length<=minWorkerChars;
+  const workerAvailable=client.isAvailable();
+  const [completed,setCompleted]=useState<{documentId:string;value:SourceDocumentAnalysis}|null>(()=>{
+    if(!enabled||documentId===null)return null;
+    const cached=client.peek(source);
+    if(cached)return {documentId,value:cached};
+    if(!workerAvailable||source.length<=minWorkerChars){
+      if(mode==='editor'&&!workerAvailable&&source.length>minWorkerChars)return null;
+      return {documentId,value:{source,analysis:analyzeDocument(source)}};
+    }
+    return null;
+  });
+  const retainedRef=useRef<{documentId:string;value:SourceDocumentAnalysis}|null>(completed);
+
+  const hasPriorForDoc=enabled&&documentId!==null&&(
+    retainedRef.current?.documentId===documentId||completed?.documentId===documentId
+  );
+  const deferLargeFallback=!workerAvailable&&source.length>minWorkerChars&&(mode==='editor'||hasPriorForDoc);
+  const shouldRunSync=source.length<=minWorkerChars||(!workerAvailable&&!deferLargeFallback);
 
   const peeked=enabled&&documentId!==null?client.peek(source):null;
+  const existingExact=enabled&&documentId!==null
+    ? (retainedRef.current?.documentId===documentId&&retainedRef.current.value.source===source
+      ? retainedRef.current.value
+      : completed?.documentId===documentId&&completed.value.source===source
+        ? completed.value
+        : null)
+    : null;
   const syncImmediate=enabled&&documentId!==null&&!peeked&&shouldRunSync
-    ? {source,analysis:analyzeDocument(source)}
+    ? (existingExact??{source,analysis:analyzeDocument(source)})
     : null;
   const immediate=peeked??syncImmediate;
 
-  const initialCompleted=documentId!==null&&immediate?{documentId,value:immediate}:null;
-  const [completed,setCompleted]=useState<{documentId:string;value:SourceDocumentAnalysis}|null>(initialCompleted);
-  const retainedRef=useRef<{documentId:string;value:SourceDocumentAnalysis}|null>(initialCompleted);
   if(!enabled||documentId===null){
     retainedRef.current=null;
   }else if(retainedRef.current?.documentId!==documentId){
@@ -473,14 +494,31 @@ export function useDocumentAnalysis(
       const seq=++session.nextSeq;
       session.appliedSeq=seq;
       session.lastImmediateSource=source;
-      const fallback={source,analysis:analyzeDocument(source)};
-      const next={documentId,value:fallback};
+      const reused=retainedRef.current?.documentId===documentId&&retainedRef.current.value.source===source
+        ? retainedRef.current.value
+        : {source,analysis:analyzeDocument(source)};
+      const next={documentId,value:reused};
       retainedRef.current=next;
-      setCompleted(prev=>prev?.documentId===documentId&&prev.value.source===source?prev:next);
+      setCompleted(prev=>prev?.documentId===documentId&&prev.value===reused?prev:next);
       return;
     }
 
-    const hasPriorForDoc=retainedRef.current?.documentId===documentId;
+    if(!workerAvailable){
+      const seq=++session.nextSeq;
+      const timerId=setTimeout(()=>{
+        if(session.controller.signal.aborted||seq<session.appliedSeq)return;
+        session.appliedSeq=seq;
+        session.lastImmediateSource=source;
+        const fallback={source,analysis:analyzeDocument(source)};
+        const next={documentId,value:fallback};
+        retainedRef.current=next;
+        setCompleted(prev=>prev?.documentId===documentId&&prev.value.source===source?prev:next);
+      },120);
+      return()=>{
+        clearTimeout(timerId);
+      };
+    }
+
     const coalesceMs=mode==='editor'&&hasPriorForDoc&&source.length>WORKER_ANALYSIS_MIN_CHARS?120:0;
     const seq=++session.nextSeq;
     const requestController=new AbortController();

@@ -19,8 +19,8 @@ import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import DocumentProperties from "./DocumentProperties";
 import {DocumentAppearance} from '../documentAppearance';
-import {svgDataBackdrop,svgImage} from '../svgImage';
-import {adaptSvgData,decodeSvgDataUri} from '../svgTheme';
+import {parseValidatedSvg} from '../svgImage';
+import {adaptValidatedSvg,decodeSvgDataUri} from '../svgTheme';
 import {analyzeDocument} from '../documentAnalysis';
 import type {PythonCellSource, SourceDocumentAnalysis} from '../documentAnalysis';
 import {isSvgAssetPath,resolveReaderRasterAsset} from '../readerAssets';
@@ -72,6 +72,7 @@ export function remarkCallouts() {
     const match = first.value.match(/^\[!([\w-]+)\]([+-]?)[ \t]*/i);
     if (!match) return;
     const type = match[1].toLowerCase();
+    const fold = match[2];
     first.value = first.value.slice(match[0].length);
     // A title is a line of inline Markdown, not just the first text node.
     // Keep emphasis, links and math in their original AST form and split only
@@ -94,14 +95,15 @@ export function remarkCallouts() {
     const parts=split(paragraph.children);
     paragraph.children=parts.body;
     if(!paragraph.children.length)node.children.shift();
-    const title=parts.title.some((child:any)=>child.type!=='text'||child.value.trim())?parts.title:[{type:'text',value:type[0].toUpperCase()+type.slice(1)}];
-    const collapsible = Boolean(match[2]) || type === "answer" || type === "solution";
+    const hasCustomTitle=parts.title.some((child:any)=>child.type!=='text'||child.value.trim());
+    const title=hasCustomTitle?parts.title:[{type:'text',value:type[0].toUpperCase()+type.slice(1)}];
+    const collapsible = Boolean(fold) || type === "answer" || type === "solution";
     node.children.unshift({
       type: "paragraph",
       data: { hName: collapsible ? "summary" : "p", hProperties: { className: "callout-title" } },
       children: title
     });
-    node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:match[2] === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type } };
+    node.data = { hName: collapsible ? "details" : "aside", hProperties: { ...(collapsible ? {open:fold === "+"} : {}), className: `callout callout-${type}`, "data-callout-type": type, ...(fold ? {"data-callout-fold": fold} : {}), ...(!hasCustomTitle ? {"data-callout-default-title": "true"} : {}) } };
     });
   };
 }
@@ -145,19 +147,24 @@ function AssetImage({ noteId, src = "", alt = "", documentPath, trustedImageHost
     return()=>window.removeEventListener('supermd-asset-access-restored',restored);
   },[documentPath,embedded,error,isRemote,src]);
   const isSvgData=/^data:image\/svg\+xml(?:[;,]|$)/i.test(resolved);
-  const svgBacking=useMemo(()=>svgDataBackdrop(resolved),[resolved]);
+  const validatedSvg=useMemo(()=>{
+    if(!resolved||!isSvgData)return null;
+    try{return {svg:parseValidatedSvg(decodeSvgDataUri(resolved)),error:''};}
+    catch(reason){return {svg:null,error:reason instanceof Error?reason.message:String(reason)};}
+  },[resolved,isSvgData]);
+  const svgBacking=validatedSvg?.svg?.backing;
   const appearance=useContext(DocumentAppearance);
   const adaptsSvg=appearance?.svgAppearance==='auto'||appearance?.svgAppearance==='monochrome';
   const adapted=useMemo(()=>{
     if(!resolved||!isSvgData)return {src:resolved,error:''};
+    if(!validatedSvg?.svg)return {src:'',error:validatedSvg?.error??'This SVG is not valid XML.'};
+    if(!adaptsSvg)return {src:resolved,error:''};
     try{
-      if(adaptsSvg&&svgBacking)return {src:adaptSvgData(resolved,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome'),error:''};
-      svgImage(decodeSvgDataUri(resolved));
-      return {src:resolved,error:''};
+      return {src:'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(adaptValidatedSvg(validatedSvg.svg,appearance?.colors??{},appearance?.dark??false,appearance?.svgAppearance==='monochrome')),error:''};
     }catch(reason){
       return {src:'',error:reason instanceof Error?reason.message:String(reason)};
     }
-  },[resolved,isSvgData,svgBacking,appearance,adaptsSvg]);
+  },[resolved,isSvgData,validatedSvg,appearance,adaptsSvg]);
   const adaptedSource=adapted.src;
   const displayError=error||adapted.error;
   // A one-time approval belongs to the exact note and URL the user approved.

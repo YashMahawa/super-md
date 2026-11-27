@@ -25,35 +25,41 @@ export function isProgrammaticAnchorScroll(element:Element|null|undefined,window
   return prop!==undefined&&now-prop<=windowMs;
 }
 
-export interface ReadingScrollSnapshot {
+export interface AnchorScrollSnapshot {
   element:HTMLElement;
   top:number;
-  scrollHeight:number;
-  clientHeight:number;
+  maxTop:number;
+  clampedUntil?:number;
 }
 
-export function snapshotReadingScroll(element:HTMLElement|null|undefined):ReadingScrollSnapshot|null {
+export function snapshotAnchorScroll(element:HTMLElement|null|undefined,requestedTop?:number):AnchorScrollSnapshot|null {
   if(!element)return null;
+  delete (element as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop;
+  const top=element.scrollTop;
+  const maxTop=Math.max(0,element.scrollHeight-element.clientHeight);
   return {
     element,
-    top:element.scrollTop,
-    scrollHeight:element.scrollHeight,
-    clientHeight:element.clientHeight,
+    top,
+    maxTop,
+    ...(requestedTop!==undefined&&top<requestedTop-2?{clampedUntil:requestedTop}:{}),
   };
 }
 
-export function hasExternalReadingScroll(
-  previous:ReadingScrollSnapshot|null,
-  current:HTMLElement|null|undefined,
-):boolean {
-  if(!previous||!current||previous.element!==current)return false;
+export function hasExternalAnchorScroll(previous:AnchorScrollSnapshot|null):boolean {
+  if(!previous||!previous.element.isConnected)return false;
+  const currentTop=previous.element.scrollTop;
+  if(Math.abs(currentTop-previous.top)<=2)return false;
+  const layoutTop=(previous.element as HTMLElement&{__layoutAnchorTop?:number}).__layoutAnchorTop;
+  if(layoutTop!==undefined&&Math.abs(currentTop-layoutTop)<=2)return false;
+  const currentMaxTop=Math.max(0,previous.element.scrollHeight-previous.element.clientHeight);
+  if(currentMaxTop<previous.top-2&&Math.abs(currentTop-currentMaxTop)<=2)return false;
   if(
-    Math.abs(current.scrollHeight-previous.scrollHeight)>1||
-    Math.abs(current.clientHeight-previous.clientHeight)>1
-  ){
-    return false;
-  }
-  return Math.abs(current.scrollTop-previous.top)>2;
+    previous.clampedUntil!==undefined&&
+    currentMaxTop>previous.maxTop+2&&
+    currentTop>=previous.top-2&&
+    Math.abs(currentTop-Math.min(previous.clampedUntil,currentMaxTop))<=2
+  )return false;
+  return true;
 }
 
 export interface PendingEditorAnchor {
