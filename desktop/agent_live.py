@@ -901,8 +901,11 @@ def _qt_bridge_class():
                         parent["completed"] = 0
                         parent["fallback"] = {}
                     for studio in candidates:
+                        checker = getattr(studio, "_is_tab_live_authorized", None)
                         tab_rows = []
                         for tab in studio.tabs:
+                            if callable(checker) and not checker(tab):
+                                continue
                             source = tab["content"]
                             tab_rows.append({"id": tab["id"], "windowId": studio.window_id,
                                              "title": tab["name"], "path": tab["path"],
@@ -981,6 +984,10 @@ def _qt_bridge_class():
                                   and any(tab["id"] == tab_id for tab in window.tabs)), None)
                     if owner is None:
                         raise ValueError("The requested live tab is no longer open")
+                    target_tab = next((tab for tab in owner.tabs if tab["id"] == tab_id), None)
+                    checker = getattr(owner, "_is_tab_live_authorized", None)
+                    if target_tab is not None and callable(checker) and not checker(target_tab) and action != "close_document":
+                        raise ValueError("The file is outside the approved agent note roots")
                     if tab_id != owner.active and action in ("render_tab", "get_context", "get_diagram_image", "latex_review", "latex_apply", "export_document"):
                         raise ValueError("This action needs the active reader view; activate the target tab explicitly first")
                     studio = owner
@@ -1065,21 +1072,28 @@ def _qt_bridge_class():
                 section_start, section_end = 0, len(source)
                 heading = payload.get("heading")
                 selected_heading = None
+                spans = None
                 if heading is not None:
                     try:
                         try:
-                            from .agent_documents import _headings, resolve_heading
+                            from .agent_documents import _read_headings_and_svg_spans, resolve_heading
                         except ImportError:
-                            from agent_documents import _headings, resolve_heading
-                        selected_heading = resolve_heading(_headings(source, include_internal=True), heading)
+                            from agent_documents import _read_headings_and_svg_spans, resolve_heading
+                        headings, precomputed_spans = _read_headings_and_svg_spans(
+                            source,
+                            include_headings=True,
+                            include_svg=view == "prose",
+                        )
+                        selected_heading = resolve_heading(headings, heading)
                         section_start = selected_heading["sectionStart"]
                         section_end = selected_heading["sectionEnd"]
                         if offset > section_end:
                             raise ValueError(f"offset must be within the selected section (sectionEnd {section_end})")
                         offset = max(section_start, offset)
+                        if view == "prose":
+                            spans = precomputed_spans
                     except ImportError:
                         raise ValueError("Heading outlines are unavailable") from None
-                spans = []
                 end = min(section_end, offset + limit)
                 if view == "prose":
                     try:
@@ -1087,10 +1101,13 @@ def _qt_bridge_class():
                             from .agent_documents import _prose_page_end, _svg_spans
                         except ImportError:
                             from agent_documents import _prose_page_end, _svg_spans
-                        spans = _svg_spans(source)
+                        if spans is None:
+                            spans = _svg_spans(source)
                         end = _prose_page_end(offset, limit, section_end, spans)
                     except Exception:
                         spans = []
+                else:
+                    spans = []
                 page_text = source[offset:end]
                 omitted = []
                 if view == "prose":
@@ -1340,7 +1357,7 @@ def _qt_bridge_class():
                 merged_rows = []
                 if isinstance(rows, list):
                     for row in rows:
-                        if not isinstance(row, dict):
+                        if not isinstance(row, dict) or row.get("id") not in fallback_by_id:
                             continue
                         merged = dict(fallback_by_id.get(row.get("id"), {}))
                         merged.update({key: row[key] for key in (

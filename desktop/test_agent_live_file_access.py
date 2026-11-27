@@ -622,6 +622,431 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
                 self.app.processEvents()
 
+    def test_generated_mcp_roots_exclude_open_tabs_while_single_note_operations_keep_working(self):
+        workspace_dir = self.base / "explicit-workspace"
+        configured_dir = self.base / "configured-notes"
+        standalone_dir = self.base / "standalone-notes"
+        for folder in (workspace_dir, configured_dir, standalone_dir):
+            folder.mkdir()
+
+        user_smd = standalone_dir / "authorized.smd"
+        sibling_note = standalone_dir / "unapproved-sibling.md"
+        local_svg = standalone_dir / "local-figure.svg"
+        replacement_svg = standalone_dir / "local-figure-v2.svg"
+        write_portable(
+            user_smd,
+            "# Authorized single note\n",
+            {"assets/existing.svg": "data:image/svg+xml;base64," + base64.b64encode(SVG_BYTES).decode("ascii")},
+        )
+        sibling_note.write_text("# Sibling\n", encoding="utf-8")
+        local_svg.write_bytes(SVG_BYTES)
+        replacement_svg.write_bytes(SVG_REPLACEMENT_BYTES)
+
+        bridge = create_qt_bridge(self.session, self.session.data)
+        self.session.agent_bridge = bridge
+        try:
+            self.studio.setAgentAccessEnabled(True)
+            self.studio.openNote(str(user_smd))
+            user_tab = self._await_tab_path(self.studio, user_smd)
+            self.studio.selectTab(user_tab["id"])
+
+            # Without workspace/configured roots, an open user tab must NOT add its parent folder to MCP --root.
+            self.assertEqual(self.studio._agent_mcp_roots(), [])
+            setup_payload = json.loads(self.studio.agentSetupInstructions)
+            self.assertNotIn("--root", setup_payload["args"])
+
+            # Configuring workspace and newNoteLocation populates only those explicit directory roots.
+            self.studio.openFolder(str(workspace_dir))
+            self.studio.setNoteLocation(str(configured_dir))
+            self.assertEqual(
+                self.studio._agent_mcp_roots(),
+                [str(workspace_dir), str(configured_dir)],
+            )
+            self.assertNotIn(str(standalone_dir), self.studio._agent_mcp_roots())
+
+            # Removing those roots clears MCP --root even though user_smd remains open.
+            self.studio.closeFolder()
+            self.studio.settings["newNoteLocation"] = ""
+            self.assertEqual(self.studio._agent_mcp_roots(), [])
+
+            # Single-note operations on the individually authorized note continue working,
+            # while sibling notes in standalone_dir remain blocked.
+            self.assertTrue(self.studio._agent_path_allowed(user_smd))
+            self.assertFalse(self.studio._agent_path_allowed(sibling_note))
+
+            patched = self.studio._agent_document_action({
+                "action": "patch_tab",
+                "tabId": user_tab["id"],
+                "expectedRevision": self._rev(user_tab["content"]),
+                "operations": [{"type": "replace", "old": "# Authorized single note\n", "new": "# Authorized single note\n\nUpdated body.\n"}],
+            })
+            saved = self.studio._agent_document_action({
+                "action": "save_document",
+                "tabId": user_tab["id"],
+                "expectedRevision": patched["revision"],
+            })
+            self.assertFalse(saved["pathChanged"])
+
+            attached = self.studio._attach_tab_asset_native({
+                "tabId": user_tab["id"],
+                "assetPath": str(local_svg),
+                "assetName": "added.svg",
+                "expectedRevision": saved["revision"],
+            })
+            self.assertEqual(attached["assetName"], "assets/added.svg")
+
+            replaced = self.studio._replace_tab_asset_native({
+                "tabId": user_tab["id"],
+                "assetName": "assets/existing.svg",
+                "assetPath": str(replacement_svg),
+                "expectedRevision": attached["revision"],
+            })
+            self.assertTrue(replaced["changed"])
+
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                self.studio._agent_document_action({
+                    "action": "open_document",
+                    "filename": str(sibling_note),
+                    "background": True,
+                })
+        finally:
+            bridge.stop()
+
+    def test_removing_approved_root_revokes_automation_opened_tabs_and_preserves_provenance_across_restart(self):
+        app_data = self.base / "root-removal-data"
+        workspace_a = self.base / "workspace-a"
+        workspace_b = self.base / "workspace-b"
+        configured_root = self.base / "configured-root"
+        standalone_dir = self.base / "standalone-user"
+        for folder in (app_data, workspace_a, workspace_b, configured_root, standalone_dir):
+            folder.mkdir()
+
+        auto_ws_smd = workspace_a / "auto-opened.smd"
+        ws_svg = workspace_a / "ws-fig.svg"
+        auto_cfg_md = configured_root / "auto-configured.md"
+        user_md = standalone_dir / "user-authorized.md"
+        write_portable(
+            auto_ws_smd,
+            "# Automation workspace note\n",
+            {"assets/fig.svg": "data:image/svg+xml;base64," + base64.b64encode(SVG_BYTES).decode("ascii")},
+        )
+        ws_svg.write_bytes(SVG_REPLACEMENT_BYTES)
+        auto_cfg_md.write_text("# Automation configured note\n", encoding="utf-8")
+        user_md.write_text("# User authorized note\n", encoding="utf-8")
+
+        session1 = Session(isolated=False, data=app_data)
+        session1.settings["python"] = sys.executable
+        studio1 = QuietStudio(False, session1)
+        bridge = create_qt_bridge(session1, session1.data)
+        session1.agent_bridge = bridge
+
+        def handle_native_request(raw: str):
+            request = json.loads(raw)
+            try:
+                if request["action"] == "flush_current":
+                    result = {"flushed": True}
+                elif request["action"] == "list_tabs":
+                    result = {"tabs": request["tabs"]}
+                else:
+                    result = studio1._agent_document_action(request)
+                bridge.complete(request["requestId"], result, window_id=studio1.window_id)
+            except Exception as error:
+                bridge.complete(request["requestId"], None, str(error), window_id=studio1.window_id)
+
+        studio1.agentRequest.connect(handle_native_request)
+        try:
+            studio1.setAgentAccessEnabled(True)
+            studio1.openFolder(str(workspace_a))
+            studio1.setNoteLocation(str(configured_root))
+            studio1.openNote(str(user_md))
+            user_tab = self._await_tab_path(studio1, user_md)
+
+            # Automation opens notes under workspace_a and configured_root.
+            studio1._agent_document_action({
+                "action": "open_document",
+                "filename": str(auto_ws_smd),
+                "background": False,
+            })
+            studio1._agent_document_action({
+                "action": "open_document",
+                "filename": str(auto_cfg_md),
+                "background": True,
+            })
+            auto_ws_tab = self._await_tab_path(studio1, auto_ws_smd)
+            auto_cfg_tab = self._await_tab_path(studio1, auto_cfg_md)
+            self.assertTrue(auto_ws_tab.get("agentOpened"))
+            self.assertTrue(auto_cfg_tab.get("agentOpened"))
+
+            # In-place save via automation while workspace_a is approved must NOT promote auto_ws_tab to user-granted.
+            patched_ws = studio1._agent_document_action({
+                "action": "patch_tab",
+                "tabId": auto_ws_tab["id"],
+                "expectedRevision": self._rev(auto_ws_tab["content"]),
+                "operations": [{"type": "replace", "old": "# Automation workspace note\n", "new": "# Automation workspace note\n\nSaved while approved.\n"}],
+            })
+            saved_ws = studio1._agent_document_action({
+                "action": "save_document",
+                "tabId": auto_ws_tab["id"],
+                "expectedRevision": patched_ws["revision"],
+            })
+            self.assertTrue(auto_ws_tab.get("agentOpened"))
+
+            # Switching workspace folder away from workspace_a immediately revokes access to auto_ws_smd!
+            studio1.openFolder(str(workspace_b))
+            self.assertNotIn(str(workspace_a), studio1._agent_mcp_roots())
+            self.assertEqual(
+                studio1._agent_mcp_roots(),
+                [str(workspace_b), str(configured_root)],
+            )
+            self.assertFalse(studio1._agent_path_allowed(auto_ws_smd))
+
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio1._agent_document_action({
+                    "action": "open_document",
+                    "filename": str(auto_ws_smd),
+                    "background": True,
+                })
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio1._agent_document_action({
+                    "action": "open_document",
+                    "filename": "",
+                    "tabId": auto_ws_tab["id"],
+                    "background": True,
+                })
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio1._agent_document_action({
+                    "action": "patch_tab",
+                    "tabId": auto_ws_tab["id"],
+                    "expectedRevision": saved_ws["revision"],
+                    "operations": [{"type": "replace", "old": "Saved while approved.", "new": "Blocked edit."}],
+                })
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio1._agent_document_action({
+                    "action": "save_document",
+                    "tabId": auto_ws_tab["id"],
+                    "expectedRevision": saved_ws["revision"],
+                })
+            studio1.selectTab(auto_ws_tab["id"])
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio1._attach_tab_asset_native({
+                    "tabId": auto_ws_tab["id"],
+                    "assetPath": str(ws_svg),
+                    "assetName": "extra.svg",
+                    "expectedRevision": saved_ws["revision"],
+                })
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio1._replace_tab_asset_native({
+                    "tabId": auto_ws_tab["id"],
+                    "assetName": "assets/fig.svg",
+                    "assetPath": str(ws_svg),
+                    "expectedRevision": saved_ws["revision"],
+                })
+
+            # Live bridge list_tabs and read_tab also exclude/reject the revoked automation-opened tab.
+            from mcp import Client
+
+            async def check_bridge():
+                live_client = MultiSessionLiveClient(bridge.discovery_dir)
+                server, _ = build_mcp_server([], live_client=live_client)
+
+                async def call_with_qt(coro):
+                    task = asyncio.create_task(coro)
+                    while not task.done():
+                        self.app.processEvents()
+                        await asyncio.sleep(0.01)
+                    return await task
+
+                async with Client(server) as client:
+                    listed = await call_with_qt(client.call_tool("list_sessions", {}))
+                    self.assertFalse(listed.is_error)
+                    sessions = listed.structured_content.get("sessions", [])
+                    listed_paths = [item.get("path") for item in sessions]
+                    self.assertNotIn(str(auto_ws_smd), listed_paths)
+                    self.assertIn(str(auto_cfg_md), listed_paths)
+                    self.assertIn(str(user_md), listed_paths)
+
+                    user_target = next(item["target"] for item in sessions if item.get("path") == str(user_md))
+                    revoked_target = user_target.rsplit(":", 1)[0] + ":" + auto_ws_tab["id"]
+                    revoked_read = await call_with_qt(client.call_tool("document_read", {
+                        "path": revoked_target,
+                    }))
+                    self.assertTrue(revoked_read.is_error)
+
+            asyncio.run(check_bridge())
+
+            # Removing configured_root revokes auto_cfg_md too, while user_md stays individually authorized!
+            studio1.settings["newNoteLocation"] = ""
+            studio1.closeFolder()
+            studio1._preferences()
+            studio1._recover()
+
+            self.assertFalse(studio1._agent_path_allowed(auto_cfg_md))
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio1._agent_document_action({
+                    "action": "patch_tab",
+                    "tabId": auto_cfg_tab["id"],
+                    "expectedRevision": self._rev(auto_cfg_tab["content"]),
+                    "operations": [{"type": "replace", "old": "# Automation configured note\n", "new": "# Blocked\n"}],
+                })
+
+            # Individually user-authorized note still supports live operations.
+            self.assertTrue(studio1._agent_path_allowed(user_md))
+            patched_user = studio1._agent_document_action({
+                "action": "patch_tab",
+                "tabId": user_tab["id"],
+                "expectedRevision": self._rev(user_tab["content"]),
+                "operations": [{"type": "replace", "old": "# User authorized note\n", "new": "# User authorized note\n\nStill authorized.\n"}],
+            })
+            studio1._agent_document_action({
+                "action": "save_document",
+                "tabId": user_tab["id"],
+                "expectedRevision": patched_user["revision"],
+            })
+        finally:
+            bridge.stop()
+            studio1.stop()
+            studio1.pool.shutdown(wait=True, cancel_futures=True)
+            session1.writes.shutdown(wait=True)
+            studio1.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+
+        # Restarting session preserves agentOpened provenance so removed roots stay revoked!
+        session2 = Session(isolated=False, data=app_data)
+        session2.settings["python"] = sys.executable
+        studio2 = QuietStudio(False, session2)
+        try:
+            restored_auto_ws = self._await_tab_path(studio2, auto_ws_smd)
+            restored_user = self._await_tab_path(studio2, user_md)
+            self.assertTrue(restored_auto_ws.get("agentOpened"))
+            self.assertFalse(studio2._agent_path_allowed(auto_ws_smd))
+            self.assertFalse(studio2._agent_path_allowed(auto_cfg_md))
+            self.assertTrue(studio2._agent_path_allowed(user_md))
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio2._agent_document_action({
+                    "action": "patch_tab",
+                    "tabId": restored_auto_ws["id"],
+                    "expectedRevision": self._rev(restored_auto_ws["content"]),
+                    "operations": [{"type": "replace", "old": "Saved while approved.", "new": "Still blocked."}],
+                })
+
+            # Explicit user open upgrades auto_ws_smd to an individual user-authorized note!
+            studio2.openNote(str(auto_ws_smd))
+            self.app.processEvents()
+            self.assertFalse(restored_auto_ws.get("agentOpened"))
+            self.assertTrue(studio2._agent_path_allowed(auto_ws_smd))
+            self.assertTrue(studio2._is_tab_live_authorized(restored_user))
+        finally:
+            studio2.stop()
+            studio2.pool.shutdown(wait=True, cancel_futures=True)
+            session2.writes.shutdown(wait=True)
+            studio2.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+
+    def test_ordered_external_drops_and_link_jumps_enforce_explicit_approval_rules(self):
+        drop_dir = self.base / "dropped-notes"
+        sibling_dir = self.base / "dropped-folder"
+        outside_dir = self.base / "outside-targets"
+        link_dir = self.base / "linked-notes"
+        for folder in (drop_dir, sibling_dir, outside_dir, link_dir):
+            folder.mkdir()
+
+        note_one = drop_dir / "01-first.md"
+        note_two = drop_dir / "02-second.md"
+        note_three = drop_dir / "03-third.md"
+        unopened_sibling = drop_dir / "unopened-sibling.md"
+        hidden_note = drop_dir / ".hidden-drop.md"
+        outside_secret = outside_dir / "secret.md"
+        folder_note = sibling_dir / "inside-folder.md"
+        link_source = link_dir / "index.md"
+        link_target = link_dir / "chapter-two.md"
+        link_sibling = link_dir / "unrelated.md"
+        for p in (
+            note_one,
+            note_two,
+            note_three,
+            unopened_sibling,
+            hidden_note,
+            outside_secret,
+            folder_note,
+            link_source,
+            link_target,
+            link_sibling,
+        ):
+            p.write_text(f"# {p.stem}\n\n## Details\n", encoding="utf-8")
+
+        drop_items: list[str] = [str(note_one), str(hidden_note), str(note_two), str(note_three)]
+        symlink_note = drop_dir / "symlink-note.md"
+        symlink_folder = drop_dir / "symlink-folder"
+        if os.name == "posix":
+            symlink_note.symlink_to(outside_secret)
+            symlink_folder.symlink_to(outside_dir, target_is_directory=True)
+            drop_items.insert(2, str(symlink_note))
+            self.assertTrue(self.studio.shouldInterceptExternalDrop([str(symlink_folder)], False))
+            self.studio.handleExternalDrop([str(symlink_folder)], False)
+            self.assertEqual(self.studio.folder, "")
+            self.assertFalse(self.studio._agent_path_allowed(outside_secret))
+
+        # 1. Ordered multi-file drop (#118): valid notes open in exact order, hidden/symlink items are skipped,
+        # and only the dropped notes receive single-note approval (not drop_dir or unopened_sibling).
+        self.studio.handleExternalDrop(drop_items, False)
+        tab_one = self._await_tab_path(self.studio, note_one)
+        tab_two = self._await_tab_path(self.studio, note_two)
+        tab_three = self._await_tab_path(self.studio, note_three)
+        deadline = time.monotonic() + 3.0
+        while self.studio.active != tab_three["id"] and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        opened_order = [
+            t["path"]
+            for t in self.studio.tabs
+            if t["path"] in {str(note_one), str(note_two), str(note_three)}
+        ]
+        self.assertEqual(opened_order, [str(note_one), str(note_two), str(note_three)])
+        self.assertEqual(self.studio.active, tab_three["id"])
+        self.assertIn("Skipped", self.studio.message)
+        for allowed_drop in (note_one, note_two, note_three):
+            self.assertTrue(self.studio._agent_path_allowed(allowed_drop))
+        for disallowed_drop in (unopened_sibling, hidden_note, outside_secret):
+            self.assertFalse(self.studio._agent_path_allowed(disallowed_drop))
+        self.assertEqual(self.studio._agent_mcp_roots(), [])
+
+        # Dropping a real folder approves that folder until closed.
+        self.studio.handleExternalDrop([str(sibling_dir)], False)
+        self.assertEqual(self.studio.folder, str(sibling_dir))
+        self.assertTrue(self.studio._agent_path_allowed(folder_note))
+        self.studio.closeFolder()
+        self.assertFalse(self.studio._agent_path_allowed(folder_note))
+
+        # 2. Relative link navigation & manual tab selection (#72):
+        # Link destination receives single-note approval + pendingHeading without directory grant,
+        # and manual selectTab clears pendingHeading.
+        replies: list[tuple[str, str, str]] = []
+        self.studio.replied.connect(lambda req_id, res, err: replies.append((req_id, res, err)))
+        self.studio.openNote(str(link_source))
+        self._await_tab_path(self.studio, link_source)
+        self.studio.post("rel-link-1", "open_workspace_link", json.dumps({
+            "documentPath": str(link_source),
+            "target": "chapter-two.md",
+            "fragment": "Details",
+            "wikilink": False,
+        }))
+        deadline = time.monotonic() + 3.0
+        while not any(r[0] == "rel-link-1" for r in replies) and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        target_tab = self._await_tab_path(self.studio, link_target)
+        self.assertEqual(self.studio.active, target_tab["id"])
+        self.assertIsInstance(target_tab.get("pendingHeading"), dict)
+        self.assertEqual(target_tab["pendingHeading"].get("heading"), "Details")
+        self.assertTrue(self.studio._agent_path_allowed(link_target))
+        self.assertFalse(self.studio._agent_path_allowed(link_sibling))
+        self.assertNotIn(str(link_dir), self.studio._agent_mcp_roots())
+
+        self.studio.selectTab(tab_one["id"])
+        self.assertIsNone(target_tab.get("pendingHeading"))
+
 
 if __name__ == "__main__":
     unittest.main()
