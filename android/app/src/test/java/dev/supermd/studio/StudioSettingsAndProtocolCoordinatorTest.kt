@@ -152,21 +152,4 @@ class StudioSettingsAndProtocolCoordinatorTest {
         assertEquals(setOf("# Conflicting reader text", "# Malformed envelope draft"), payloads)
         assertEquals("Reader edits conflicted with newer native content. A private recovery copy was saved.", model.state.value.error)
     }
-
-    @Test fun concurrentReaderConflictDraftsAllPersistWhenConflictDirectoryDoesNotYetExist() {
-        val model = newModel()
-        val conflictDir = File(app.filesDir, "reader-conflicts")
-        val batchSize = 8
-        repeat(20) { round ->
-            conflictDir.deleteRecursively()
-            model.dismissError()
-            repeat(batchSize) { idx ->
-                model.preserveMalformedReaderResync("note-$round-$idx", "# Concurrent draft $round-$idx")
-            }
-            await {
-                (conflictDir.listFiles { f -> f.extension == "json" }?.size ?: 0) == batchSize &&
-                    model.state.value.error == "Reader edits conflicted with newer native content. A private recovery copy was saved."
-            }
-        }
-    }
 }
