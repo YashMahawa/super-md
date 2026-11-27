@@ -1,15 +1,18 @@
 """Note tab model, cross-window tab drag/detach, note open/navigation, and close/recovery helpers."""
 from __future__ import annotations
 
-import copy, importlib, json, os, sys
+import copy, json, os, sys, uuid
 from pathlib import Path
-
-def _studio_module():
-    return (
-        sys.modules.get("studio")
-        or sys.modules.get("desktop.studio")
-        or importlib.import_module(".studio" if __package__ else "studio", __package__ or None)
-    )
+from PySide6.QtCore import QMetaObject, QObject, QPointF, QTimer, QUrl, Qt
+from PySide6.QtGui import QCursor, QGuiApplication
+if __package__:
+    from . import folder_ops
+    from .closed_notes import ClosedNoteStore
+    from .documents import open_note
+else:
+    import folder_ops
+    from closed_notes import ClosedNoteStore
+    from documents import open_note
 
 def _call_optional(obj, attr: str, *args, **kwargs):
     fn = getattr(obj, attr, None)
@@ -18,6 +21,16 @@ def _call_optional(obj, attr: str, *args, **kwargs):
 def _call_method(studio_obj, attr: str, fallback, *args, **kwargs):
     fn = getattr(studio_obj, attr, None)
     return fn(*args, **kwargs) if callable(fn) else fallback(studio_obj, *args, **kwargs)
+
+def local_path(value: str) -> Path:
+    url = QUrl(value)
+    return Path(folder_ops.strip_extended_length_prefix(str(Path(url.toLocalFile() if url.isLocalFile() else value).expanduser().resolve())))
+
+def _seeded_find_bounds(data: dict) -> dict:
+    start, end, match_text = data.get("sourceStart"), data.get("sourceEnd"), data.get("matchText")
+    if isinstance(start, int) and not isinstance(start, bool) and isinstance(end, int) and not isinstance(end, bool) and 0 <= start <= end:
+        return {"sourceStart": start, "sourceEnd": end, **({"matchText": match_text} if isinstance(match_text, str) and match_text else {})}
+    return {}
 
 def same_closed_revision(current: dict, captured: dict) -> bool:
     """Compare content-bearing fields after a background close snapshot."""
@@ -31,9 +44,7 @@ def snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -> dict:
             continue
         if key in ("assets", "saved_assets") and isinstance(value, dict):
             snapshot[key] = dict(value)
-        elif key == "outline" and isinstance(value, list):
-            snapshot[key] = copy.deepcopy(value)
-        elif key == "viewState" and value is not None:
+        elif (key == "outline" and isinstance(value, list)) or (key == "viewState" and value is not None):
             snapshot[key] = copy.deepcopy(value)
         elif isinstance(value, (str, int, float, bool)) or value is None:
             snapshot[key] = value
@@ -54,18 +65,17 @@ def _prepend_recent(studio_obj, path: Path, fops) -> str:
     return canon
 
 def _record_closed_reference(studio_obj, reference: dict) -> None:
-    next_refs = ([reference] + studio_obj.closed_tabs)[:_studio_module().ClosedNoteStore.LIMIT]
+    next_refs = ([reference] + studio_obj.closed_tabs)[:ClosedNoteStore.LIMIT]
     studio_obj.session.closed_note_store.save_index(next_refs)
     studio_obj.closed_tabs[:] = next_refs
 
-def pin_recent(studio_obj, path: str) -> None:
-    fops = _studio_module().folder_ops
-    matched_recent = next((item for item in studio_obj.recent if fops.same_path(item, path)), None)
+def pin_recent(studio_obj, path: str, *, folder_ops_mod=folder_ops) -> None:
+    matched_recent = next((item for item in studio_obj.recent if folder_ops_mod.same_path(item, path)), None)
     if matched_recent is None:
         return
     session = studio_obj.session
-    if any(fops.same_path(item, matched_recent) for item in session.pinned):
-        session.pinned = [item for item in session.pinned if not fops.same_path(item, matched_recent)]
+    if any(folder_ops_mod.same_path(item, matched_recent) for item in session.pinned):
+        session.pinned = [item for item in session.pinned if not folder_ops_mod.same_path(item, matched_recent)]
     else:
         session.pinned.append(matched_recent)
     studio_obj.recent = studio_obj.recent
@@ -73,13 +83,10 @@ def pin_recent(studio_obj, path: str) -> None:
     for window in tuple(getattr(session, "windows", {}).values()):
         _call_optional(window, "_notify_sidebar")
 
-def make_note(studio_obj, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False) -> dict:
+def make_note(studio_obj, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False, *, uuid_fn=uuid.uuid4) -> dict:
     asset_map = dict(assets) if assets else {}
-    return {
-        "id": _studio_module().uuid.uuid4().hex, "name": name, "content": content, "path": path, "saved": saved,
-        "assets": asset_map, "saved_assets": dict(asset_map), "assets_dirty": False, "portable": portable,
-        "conflict": False, "agent_staged": False, "agent_unreviewed": False, "agent_edits": [],
-    }
+    return {"id": uuid_fn().hex, "name": name, "content": content, "path": path, "saved": saved, "assets": asset_map, "saved_assets": dict(asset_map),
+            "assets_dirty": False, "portable": portable, "conflict": False, "agent_staged": False, "agent_unreviewed": False, "agent_edits": []}
 
 def is_dirty(studio_obj, tab: dict) -> bool:
     if tab.get("content") != tab.get("saved") or tab.get("assets_dirty"):
@@ -89,33 +96,24 @@ def is_dirty(studio_obj, tab: dict) -> bool:
 def current_tab(studio_obj) -> dict:
     tabs = getattr(studio_obj, "tabs", ())
     if not tabs:
-        return {
-            "id": "", "name": "Super MD", "content": "", "path": "", "saved": "", "assets": {},
-            "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "outline": [],
-        }
+        return {"id": "", "name": "Super MD", "content": "", "path": "", "saved": "", "assets": {}, "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "outline": []}
     return next((t for t in tabs if t["id"] == getattr(studio_obj, "active", "")), tabs[0])
 
-def consume_seeded_find(studio_obj, tab: dict) -> dict | None:
+def consume_seeded_find(studio_obj, tab: dict, *, seeded_find_bounds_fn=None) -> dict | None:
     pending = getattr(studio_obj, "_pending_seeded_find", None)
     if not pending or not tab.get("id"):
         return None
     target_id, target_path = pending.get("tabId") or "", pending.get("path") or ""
     matches_id = bool(target_id and tab["id"] == target_id)
-    matches_path = bool(
-        target_path and tab.get("path")
-        and os.path.normcase(str(Path(tab["path"]).resolve(strict=False))) == os.path.normcase(str(Path(target_path).resolve(strict=False)))
-    )
+    matches_path = bool(target_path and tab.get("path") and os.path.normcase(str(Path(tab["path"]).resolve(strict=False))) == os.path.normcase(str(Path(target_path).resolve(strict=False))))
     if not (matches_id or matches_path):
         return None
     studio_obj._pending_seeded_find = None
-    bounds_fn = getattr(studio_obj, "_seeded_find_bounds", None) or _studio_module().Studio._seeded_find_bounds
+    bounds_fn = seeded_find_bounds_fn or getattr(studio_obj, "_seeded_find_bounds", _seeded_find_bounds)
     return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False)), **bounds_fn(pending)}
 
 def can_move(studio_obj) -> bool:
-    return not any(
-        getattr(studio_obj, attr, False)
-        for attr in ("retired", "busy", "saving", "_staging_tabs", "pending_close", "pending_save_as", "pending_export", "flush_operation")
-    )
+    return not any(getattr(studio_obj, attr, False) for attr in ("retired", "busy", "saving", "_staging_tabs", "pending_close", "pending_save_as", "pending_export", "flush_operation"))
 
 def can_receive_tab(studio_obj, source_id: str, tab_id: str) -> bool:
     source = studio_obj.session.windows.get(source_id)
@@ -134,7 +132,7 @@ def receive_tab(studio_obj, source_id: str, tab_id: str, index: int) -> None:
     else:
         source._flush("move_tab", json.dumps({"window": studio_obj.window_id, "tab": tab_id, "index": index}))
 
-def move_tab(studio_obj, target, tab_id: str, index: int) -> bool:
+def move_tab(studio_obj, target, tab_id: str, index: int, *, single_shot_fn=QTimer.singleShot) -> bool:
     if target is studio_obj or not _call_method(studio_obj, "_can_move", can_move) or not _call_method(target, "_can_move", can_move):
         return False
     note = next((t for t in studio_obj.tabs if t["id"] == tab_id), None)
@@ -155,7 +153,7 @@ def move_tab(studio_obj, target, tab_id: str, index: int) -> bool:
     _call_optional(studio_obj, "_emit")
     _call_optional(target, "_emit")
     if emptied:
-        _studio_module().QTimer.singleShot(0, studio_obj.allowClose.emit)
+        single_shot_fn(0, studio_obj.allowClose.emit)
     return True
 
 def detach_tab(studio_obj, tab_id: str) -> None:
@@ -166,33 +164,30 @@ def tab_preview(studio_obj, tab_id: str) -> str:
     note = next((t for t in studio_obj.tabs if t["id"] == tab_id), None)
     return note["content"][:900] if note else ""
 
-def finish_tab_drag(studio_obj, tab_id: str, action: int) -> None:
-    st = _studio_module()
-    if action == int(st.Qt.DropAction.IgnoreAction.value):
-        st.QTimer.singleShot(150, lambda: _call_method(studio_obj, "_finish_tab_drag", complete_tab_drag, tab_id))
+def finish_tab_drag(studio_obj, tab_id: str, action: int, *, single_shot_fn=QTimer.singleShot) -> None:
+    if action == int(Qt.DropAction.IgnoreAction.value):
+        single_shot_fn(150, lambda: _call_method(studio_obj, "_finish_tab_drag", complete_tab_drag, tab_id))
 
-def complete_tab_drag(studio_obj, tab_id: str) -> None:
-    st = _studio_module()
-    if st.QGuiApplication.mouseButtons() & st.Qt.MouseButton.LeftButton:
+def complete_tab_drag(studio_obj, tab_id: str, *, mouse_buttons_fn=QGuiApplication.mouseButtons, cursor_pos_fn=QCursor.pos) -> None:
+    if mouse_buttons_fn() & Qt.MouseButton.LeftButton:
         return
-    cursor = st.QCursor.pos()
+    cursor = cursor_pos_fn()
     for backend in studio_obj.session.windows.values():
         host = backend.host_window
         if host and host.isVisible():
-            strip = host.findChild(st.QObject, "tabStrip")
+            strip = host.findChild(QObject, "tabStrip")
             if strip:
-                point = strip.mapFromGlobal(st.QPointF(cursor))
+                point = strip.mapFromGlobal(QPointF(cursor))
                 if 0 <= point.x() <= strip.width() and 0 <= point.y() <= strip.height():
                     return
     _call_method(studio_obj, "detachTab", detach_tab, tab_id)
 
-def open_path(studio_obj, value: str) -> None:
-    path = _studio_module().local_path(value)
+def open_path(studio_obj, value: str, *, local_path_fn=local_path) -> None:
+    path = local_path_fn(value)
     studio_obj.openFolder(str(path)) if path.is_dir() else _call_method(studio_obj, "openNote", open_note_slot, str(path))
 
-def choose_folder(studio_obj) -> None:
-    st = _studio_module()
-    if not st.sys.platform.startswith("linux"):
+def choose_folder(studio_obj, *, sys_platform: str = sys.platform) -> None:
+    if not sys_platform.startswith("linux"):
         studio_obj.folderPickerRequested.emit()
         return
     if getattr(studio_obj, "_folder_check", None) is not None:
@@ -200,7 +195,7 @@ def choose_folder(studio_obj) -> None:
     from PySide6.QtDBus import QDBusConnection, QDBusMessage, QDBusPendingCallWatcher, QDBusVariant
     message = QDBusMessage.createMethodCall("org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop", "org.freedesktop.DBus.Properties", "Get")
     message.setArguments(["org.freedesktop.portal.FileChooser", "version"])
-    parent = studio_obj if isinstance(studio_obj, st.QObject) else None
+    parent = studio_obj if isinstance(studio_obj, QObject) else None
     studio_obj._folder_check = watcher = QDBusPendingCallWatcher(QDBusConnection.sessionBus().asyncCall(message, 3000), parent)
 
     def finished(call):
@@ -220,29 +215,28 @@ def choose_folder(studio_obj) -> None:
 def open_note_slot(studio_obj, value: str) -> None:
     _call_method(studio_obj, "_open_note", open_note_workflow, value, explicit=True)
 
-def focus_open_target(studio_obj, generation: int) -> None:
-    st = _studio_module()
+def focus_open_target(studio_obj, generation: int, *, single_shot_fn=QTimer.singleShot) -> None:
     window = None if generation != studio_obj._activation_generation or getattr(studio_obj, "retired", False) else studio_obj.host_window
     if window is not None:
         window.raise_()
         window.requestActivate()
-        st.QTimer.singleShot(
+        single_shot_fn(
             0,
-            lambda: st.QMetaObject.invokeMethod(window, "focusReader", st.Qt.ConnectionType.QueuedConnection)
+            lambda: QMetaObject.invokeMethod(window, "focusReader", Qt.ConnectionType.QueuedConnection)
             if generation == studio_obj._activation_generation and not getattr(studio_obj, "retired", False) else None,
         )
 
 def open_note_workflow(
     studio_obj, value, *, explicit: bool, background: bool = False, activation_generation=None,
     completion_callback=None, batch_insert=None, should_activate_fn=None, pending_heading=None,
+    local_path_fn=local_path, open_note_fn=open_note, folder_ops_mod=folder_ops,
 ) -> None:
     done = completion_callback or (lambda *_: None)
     if getattr(studio_obj, "retired", False):
         done(None, "The document window is no longer available")
         return
-    st = _studio_module()
-    fops = st.folder_ops
-    path = st.local_path(value)
+    fops = folder_ops_mod
+    path = local_path_fn(value)
     if path.is_dir():
         studio_obj.openFolder(str(path))
         done(None, "A folder cannot be opened as a document")
@@ -329,11 +323,11 @@ def open_note_workflow(
             _call_method(studio_obj, "_focus_open_target", focus_open_target, activation_generation)
         done(note, None)
 
-    studio_obj._submit(lambda: st.open_note(path), finished)
+    studio_obj._submit(lambda: open_note_fn(path), finished)
 
-def new_note(studio_obj) -> None:
+def new_note(studio_obj, *, uuid_fn=uuid.uuid4) -> None:
     studio_obj._activation_generation += 1
-    note = _call_method(studio_obj, "_note", make_note, "Untitled.md")
+    note = _call_method(studio_obj, "_note", lambda s, n: make_note(s, n, uuid_fn=uuid_fn), "Untitled.md")
     studio_obj.tabs.append(note)
     studio_obj.active = note["id"]
     studio_obj.recovery_timer.start(800)
@@ -372,10 +366,9 @@ def tab_number(studio_obj, number: int) -> None:
     if 0 <= index < len(studio_obj.tabs):
         _call_method(studio_obj, "selectTab", select_tab, studio_obj.tabs[index]["id"])
 
-def reopen_tab(studio_obj) -> None:
+def reopen_tab(studio_obj, *, snapshot_tab_fn=snapshot_tab_state, same_closed_revision_fn=same_closed_revision) -> None:
     if not studio_obj.closed_tabs:
         return
-    st = _studio_module()
     studio_obj._activation_generation += 1
     activation_generation, reference = studio_obj._activation_generation, studio_obj.closed_tabs[0]
 
@@ -411,7 +404,7 @@ def reopen_tab(studio_obj) -> None:
         _call_optional(studio_obj, "_recover")
         _call_optional(studio_obj, "_emit")
 
-    read_note = lambda: studio_obj.session.closed_note_store.load(reference) if reference.get("_closedSnapshot") else st._snapshot_tab_state(reference)
+    read_note = lambda: studio_obj.session.closed_note_store.load(reference) if reference.get("_closedSnapshot") else snapshot_tab_fn(reference)
     studio_obj._submit(read_note, finished, False, studio_obj.writes)
 
 def close_tab(studio_obj, tab_id: str) -> None:
@@ -426,7 +419,7 @@ def close_tab(studio_obj, tab_id: str) -> None:
     else:
         _call_method(studio_obj, "_remove_tab", remove_tab, tab_id)
 
-def remove_tab(studio_obj, tab_id: str) -> None:
+def remove_tab(studio_obj, tab_id: str, *, snapshot_tab_fn=snapshot_tab_state, same_closed_revision_fn=same_closed_revision) -> None:
     removed = next((tab for tab in studio_obj.tabs if tab["id"] == tab_id), None)
     if removed is None:
         return
@@ -435,10 +428,9 @@ def remove_tab(studio_obj, tab_id: str) -> None:
         return
     if tab_id in studio_obj._closing_tabs:
         return
-    st = _studio_module()
     studio_obj._closing_tabs.add(tab_id)
     studio_obj._python_jobs.cancel_tab(tab_id)
-    captured = st._snapshot_tab_state(removed)
+    captured = snapshot_tab_fn(removed)
 
     def saved(reference, error):
         studio_obj._closing_tabs.discard(tab_id)
@@ -448,7 +440,7 @@ def remove_tab(studio_obj, tab_id: str) -> None:
         current = next((tab for tab in studio_obj.tabs if tab["id"] == tab_id), None)
         if current is None:
             return
-        if not st._same_closed_revision(current, captured):
+        if not same_closed_revision_fn(current, captured):
             studio_obj.message = "The note changed while it was closing. It remains open with the latest text."
             return
         try:
@@ -492,7 +484,7 @@ def request_window_close(studio_obj) -> bool:
     studio_obj.closeRequested.emit(dirty["name"])
     return False
 
-def resolve_close(studio_obj, choice: str) -> None:
+def resolve_close(studio_obj, choice: str, *, snapshot_tab_fn=snapshot_tab_state, same_closed_revision_fn=same_closed_revision) -> None:
     if choice == "cancel":
         was_window, studio_obj.pending_close = studio_obj.pending_close == "window", ""
         if was_window:
@@ -503,13 +495,12 @@ def resolve_close(studio_obj, choice: str) -> None:
         if studio_obj.pending_close != "window":
             action, studio_obj.pending_close = studio_obj.pending_close, ""
             if action:
-                _call_method(studio_obj, "_remove_tab", remove_tab, action)
+                _call_method(studio_obj, "_remove_tab", lambda s, tid: remove_tab(s, tid, snapshot_tab_fn=snapshot_tab_fn, same_closed_revision_fn=same_closed_revision_fn), action)
             return
-        st = _studio_module()
         current = _call_method(studio_obj, "_current", current_tab)
         if _has_note_substance(current):
             try:
-                _record_closed_reference(studio_obj, studio_obj.session.closed_note_store.save(st._snapshot_tab_state(current)))
+                _record_closed_reference(studio_obj, studio_obj.session.closed_note_store.save(snapshot_tab_fn(current)))
             except Exception as failure:
                 studio_obj.message = "Could not preserve the closed note: " + str(failure)
         current["saved"] = current["content"]

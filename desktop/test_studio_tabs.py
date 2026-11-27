@@ -1,7 +1,7 @@
 """Focused unit tests for extracted desktop/studio_tabs.py domain helpers and Studio facade."""
 from __future__ import annotations
 
-import json, os, shutil, sys, tempfile, time, unittest
+import ast, json, os, shutil, sys, tempfile, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,14 +13,13 @@ from PySide6.QtCore import QCoreApplication, QPoint, QPointF, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQuickControls2 import QQuickStyle
 
-import folder_ops
+import folder_ops, studio_tabs
 from studio import Session, Studio, _same_closed_revision, _snapshot_tab_state
 from test_studio import QuietStudio
 
 
 def _wait_until(predicate, timeout: float = 3.0) -> bool:
-    app = QCoreApplication.instance()
-    deadline = time.monotonic() + timeout
+    app, deadline = QCoreApplication.instance(), time.monotonic() + timeout
     while time.monotonic() < deadline:
         if app is not None:
             app.processEvents()
@@ -60,6 +59,12 @@ class StudioTabsTest(unittest.TestCase):
         return win
 
     def test_note_dirty_pin_recent_current_seeded_find_and_unbound_proxies(self):
+        tree = ast.parse(Path(studio_tabs.__file__).read_text(encoding="utf-8"))
+        imports = {a.name for n in ast.walk(tree) if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names} | {n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        self.assertTrue(imports.isdisjoint({"studio", "desktop.studio", "importlib"}))
+        self.assertFalse(any(isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and (n.value.id, n.attr) == ("sys", "modules") for n in ast.walk(tree)))
+        self.assertFalse(any((isinstance(n, ast.Name) and n.id == "_studio_module") or (isinstance(n, ast.FunctionDef) and n.name == "_studio_module") for n in ast.walk(tree)))
+        self.assertFalse(any(isinstance(n, ast.ExceptHandler) and n.type and "ImportError" in ast.unparse(n.type) for n in ast.walk(tree)))
         proxy = SimpleNamespace(tabs=[], active="")
         self.assertEqual((Studio._current(proxy)["id"], Studio._current(proxy)["name"]), ("", "Super MD"))
         img = "data:image/png;base64,AAAA"
@@ -67,12 +72,10 @@ class StudioTabsTest(unittest.TestCase):
         self.assertEqual((note["agent_staged"], note["agent_unreviewed"], note["agent_edits"]), (False, False, []))
         self.assertIsNot(note["assets"], note["saved_assets"])
         self.assertFalse(Studio._is_dirty(proxy, note))
-
         snap = _snapshot_tab_state({**note, "outline": [{"text": "Hi"}], "viewState": {"y": 12}}, include_view_state=False)
         self.assertNotIn("viewState", snap)
         self.assertIs(snap["assets"]["a.png"], img)
         self.assertTrue(_same_closed_revision(snap, dict(snap)))
-
         note["assets"]["b.png"] = img
         self.assertTrue(Studio._is_dirty(proxy, note))
         note["saved_assets"] = dict(note["assets"])
@@ -81,7 +84,6 @@ class StudioTabsTest(unittest.TestCase):
         note["assets_dirty"] = False
         note["content"] = "# Changed\n"
         self.assertTrue(Studio._is_dirty(proxy, note))
-
         first = self.root / "first.md"
         first.write_text("# First\n", encoding="utf-8")
         second = self._new_window()
@@ -94,12 +96,13 @@ class StudioTabsTest(unittest.TestCase):
         self.assertGreaterEqual(len(sidebar_hits), 1)
         self.studio.pinRecent(str(first))
         self.assertEqual(self.studio.pinnedRecent, [])
-
         self.studio._pending_seeded_find = {"tabId": "", "path": str(first), "query": "First", "caseSensitive": True, "sourceStart": 2, "sourceEnd": 7, "matchText": "First"}
         self.assertEqual(self.studio._consume_seeded_find(self.studio._current()), {"query": "First", "caseSensitive": True, "sourceStart": 2, "sourceEnd": 7, "matchText": "First"})
         self.assertIsNone(self.studio._pending_seeded_find)
         proxy._pending_seeded_find = {"tabId": note["id"], "path": "", "query": "Hi", "caseSensitive": False, "sourceStart": -1, "sourceEnd": 2}
         self.assertEqual(Studio._consume_seeded_find(proxy, note), {"query": "Hi", "caseSensitive": False})
+        proxy._pending_seeded_find = {"tabId": note["id"], "path": "", "query": "Hi", "caseSensitive": True, "sourceStart": 0, "sourceEnd": 2, "matchText": "Hi"}
+        self.assertEqual(studio_tabs.consume_seeded_find(proxy, note), {"query": "Hi", "caseSensitive": True, "sourceStart": 0, "sourceEnd": 2, "matchText": "Hi"})
 
     def test_open_note_reuse_startup_restore_pending_heading_folder_redirect_and_navigation(self):
         vault = self.root / "vault"
@@ -108,16 +111,13 @@ class StudioTabsTest(unittest.TestCase):
         alpha.write_text("# Alpha\n\n## Details\n", encoding="utf-8")
         beta.write_text("# Beta\n", encoding="utf-8")
         gamma.write_text("# Gamma\n", encoding="utf-8")
-
         picker_hits: list[int] = []
         self.studio.folderPickerRequested.connect(lambda: picker_hits.append(1))
         with patch("studio.sys.platform", "darwin"):
             self.studio.chooseFolder()
         self.assertEqual(len(picker_hits), 1)
-
         self.studio._open_note(str(vault), explicit=True)
         self.assertEqual(self.studio.folder, folder_ops.canonical_path_str(vault))
-
         self.studio._startup_placeholder_ids = {self.studio.tabs[0]["id"]}
         self.studio._restoring_paths = {str(beta), str(alpha)}
         self.studio._startup_entries = [{"path": str(alpha), "id": "a"}, {"path": str(beta), "id": "b"}]
@@ -135,8 +135,10 @@ class StudioTabsTest(unittest.TestCase):
         alpha_tab = next(t for t in self.studio.tabs if t["path"] == str(alpha))
         self.assertEqual((self.studio.active, alpha_tab.get("pendingHeading")), (alpha_tab["id"], "Details"))
 
-        self.studio.newNote()
+        with patch("studio.uuid.uuid4", return_value=SimpleNamespace(hex="customhex123")):
+            self.studio.newNote()
         untitled_id = self.studio.active
+        self.assertEqual(untitled_id, "customhex123")
         alpha_tab.update(content="# Alpha staged\n", agent_staged=True, agent_unreviewed=True)
         self.studio._agent_jump_tab_id = alpha_tab["id"]
         self.studio.settings["autosave"] = True
@@ -165,7 +167,6 @@ class StudioTabsTest(unittest.TestCase):
         self.studio.tabs[0]["content"] = "x" * 1000
         first_id = self.studio.tabs[0]["id"]
         self.assertEqual((len(self.studio.tabPreview(first_id)), self.studio.tabPreview("missing")), (900, ""))
-
         self.studio._staging_tabs.add(first_id)
         self.assertEqual((self.studio._can_move(), target.canReceiveTab(self.studio.window_id, first_id)), (False, False))
         self.studio._staging_tabs.clear()
@@ -181,7 +182,6 @@ class StudioTabsTest(unittest.TestCase):
         with patch.object(self.studio, "_flush") as flush_spy:
             target.receiveTab(self.studio.window_id, second_id, 1)
         self.assertEqual((flush_spy.call_args.args[0], json.loads(flush_spy.call_args.args[1])), ("move_tab", {"window": target.window_id, "tab": second_id, "index": 1}))
-
         self.assertTrue(self.studio._move_tab(target, second_id, 0))
         self.assertIs(target.tabs[0], second_tab)
         self.assertEqual(target.active, second_id)
@@ -228,7 +228,6 @@ class StudioTabsTest(unittest.TestCase):
         with patch.object(self.studio, "save") as save_spy:
             self.studio.resolveClose("save")
         save_spy.assert_called_once()
-
         self.studio.pending_close = tab_id
         self.studio.resolveClose("discard")
         self.assertTrue(_wait_until(lambda: all(t["id"] != tab_id for t in self.studio.tabs) and len(self.studio.closed_tabs) == 1))

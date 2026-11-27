@@ -1284,10 +1284,10 @@ class Studio(QObject):
 
     @Slot(str)
     def pinRecent(self,path):
-        return studio_tabs.pin_recent(self, path)
+        return studio_tabs.pin_recent(self, path, folder_ops_mod=folder_ops)
 
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
-        return studio_tabs.make_note(self, name, content, path, saved, assets, portable)
+        return studio_tabs.make_note(self, name, content, path, saved, assets, portable, uuid_fn=uuid.uuid4)
 
     def _is_dirty(self, tab: dict) -> bool:
         return studio_tabs.is_dirty(self, tab)
@@ -1377,7 +1377,7 @@ class Studio(QObject):
         return {}
 
     def _consume_seeded_find(self, tab: dict) -> dict | None:
-        return studio_tabs.consume_seeded_find(self, tab)
+        return studio_tabs.consume_seeded_find(self, tab, seeded_find_bounds_fn=getattr(self, "_seeded_find_bounds", Studio._seeded_find_bounds))
 
     def _notify_sidebar(self):
         if self.retired:
@@ -2886,7 +2886,7 @@ class Studio(QObject):
         return studio_tabs.receive_tab(self, source_id, tab_id, index)
 
     def _move_tab(self, target, tab_id, index):
-        return studio_tabs.move_tab(self, target, tab_id, index)
+        return studio_tabs.move_tab(self, target, tab_id, index, single_shot_fn=QTimer.singleShot)
 
     @Slot(str)
     def detachTab(self, tab_id):
@@ -2898,10 +2898,10 @@ class Studio(QObject):
 
     @Slot(str, int)
     def finishTabDrag(self, tab_id, action):
-        return studio_tabs.finish_tab_drag(self, tab_id, action)
+        return studio_tabs.finish_tab_drag(self, tab_id, action, single_shot_fn=QTimer.singleShot)
 
     def _finish_tab_drag(self, tab_id):
-        return studio_tabs.complete_tab_drag(self, tab_id)
+        return studio_tabs.complete_tab_drag(self, tab_id, mouse_buttons_fn=QGuiApplication.mouseButtons, cursor_pos_fn=QCursor.pos)
 
     @Property("QStringList", notify=changed)
     def fonts(self):
@@ -3594,25 +3594,25 @@ class Studio(QObject):
 
     @Slot(str)
     def openPath(self, value):
-        return studio_tabs.open_path(self, value)
+        return studio_tabs.open_path(self, value, local_path_fn=local_path)
 
     @Slot()
     def chooseFolder(self):
-        return studio_tabs.choose_folder(self)
+        return studio_tabs.choose_folder(self, sys_platform=sys.platform)
 
     @Slot(str)
     def openNote(self, value):
         return studio_tabs.open_note_slot(self, value)
 
     def _focus_open_target(self, generation):
-        return studio_tabs.focus_open_target(self, generation)
+        return studio_tabs.focus_open_target(self, generation, single_shot_fn=QTimer.singleShot)
 
     def _open_note(self, value, *, explicit, background=False, activation_generation=None, completion_callback=None, batch_insert=None, should_activate_fn=None, pending_heading=None):
-        return studio_tabs.open_note_workflow(self, value, explicit=explicit, background=background, activation_generation=activation_generation, completion_callback=completion_callback, batch_insert=batch_insert, should_activate_fn=should_activate_fn, pending_heading=pending_heading)
+        return studio_tabs.open_note_workflow(self, value, explicit=explicit, background=background, activation_generation=activation_generation, completion_callback=completion_callback, batch_insert=batch_insert, should_activate_fn=should_activate_fn, pending_heading=pending_heading, local_path_fn=local_path, open_note_fn=open_note, folder_ops_mod=folder_ops)
 
     @Slot()
     def newNote(self):
-        return studio_tabs.new_note(self)
+        return studio_tabs.new_note(self, uuid_fn=uuid.uuid4)
 
     @Slot(str)
     def selectTab(self, id):
@@ -3635,7 +3635,7 @@ class Studio(QObject):
 
     @Slot()
     def reopenTab(self):
-        return studio_tabs.reopen_tab(self)
+        return studio_tabs.reopen_tab(self, snapshot_tab_fn=_snapshot_tab_state, same_closed_revision_fn=_same_closed_revision)
 
     def _restore_workspace_folder(self, folder_path: str, expanded_paths: list[str] | None = None):
         if not folder_path:
@@ -4835,7 +4835,7 @@ class Studio(QObject):
         return studio_tabs.close_tab(self, id)
 
     def _remove_tab(self, id):
-        return studio_tabs.remove_tab(self, id)
+        return studio_tabs.remove_tab(self, id, snapshot_tab_fn=_snapshot_tab_state, same_closed_revision_fn=_same_closed_revision)
 
     def _finish_remove_tab(self,id):
         return studio_tabs.finish_remove_tab(self, id)
@@ -4846,7 +4846,7 @@ class Studio(QObject):
 
     @Slot(str)
     def resolveClose(self, choice):
-        return studio_tabs.resolve_close(self, choice)
+        return studio_tabs.resolve_close(self, choice, snapshot_tab_fn=_snapshot_tab_state, same_closed_revision_fn=_same_closed_revision)
 
     def _finish_close(self):
         return studio_tabs.finish_close(self)
