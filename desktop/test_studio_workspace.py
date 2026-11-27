@@ -20,6 +20,12 @@ from studio import Session, Studio
 from test_studio import QuietStudio
 
 
+class WorkspaceQuietStudio(QuietStudio):
+    def __init__(self, isolated: bool = False, session: Session | None = None):
+        with patch("studio.shutil.which", return_value=None):
+            super().__init__(isolated, session)
+
+
 def _wait_until(predicate, timeout: float = 3.0) -> bool:
     app = QCoreApplication.instance()
     deadline = time.monotonic() + timeout
@@ -28,7 +34,7 @@ def _wait_until(predicate, timeout: float = 3.0) -> bool:
             app.processEvents()
         if predicate():
             return True
-        time.sleep(0.01)
+        time.sleep(0.003)
     return bool(predicate())
 
 
@@ -44,7 +50,7 @@ class StudioWorkspaceTest(unittest.TestCase):
         self.root = Path(folder_ops.canonical_path_str(self.temp.name))
         self.session = Session(True)
         self.session.settings["python"] = sys.executable
-        self.studio = QuietStudio(True, self.session)
+        self.studio = WorkspaceQuietStudio(True, self.session)
 
     def tearDown(self):
         self.studio.stop()

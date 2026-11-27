@@ -16,6 +16,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
+from http.server import ThreadingHTTPServer
 from PySide6.QtCore import QEvent, QStandardPaths, QUrl
 from PySide6.QtGui import QGuiApplication
 
@@ -25,6 +26,8 @@ from agent_live_client import MultiSessionLiveClient
 from documents import open_note, write_portable
 from mcp_server import build_mcp_server
 from studio import Session, Studio, _validate_local_tab_asset_path
+
+_ORIG_SERVE_FOREVER = ThreadingHTTPServer.serve_forever
 
 
 PNG_BYTES = base64.b64decode(
@@ -39,32 +42,61 @@ class QuietStudio(Studio):
         session = session or Session(isolated)
         if not session.settings.get("python"):
             session.settings["python"] = sys.executable
-        super().__init__(isolated, session)
+        with patch("studio.shutil.which", return_value=None):
+            super().__init__(isolated, session)
 
     def _refresh_theme(self):
         self.system_dark = True
+
+    def _restore_update(self):
+        pass
 
 
 class AgentLiveFileAccessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.app = QGuiApplication.instance() or QGuiApplication(["Super MD live file access tests"])
+        cls._poll_patcher = patch.object(
+            ThreadingHTTPServer,
+            "serve_forever",
+            lambda srv, poll_interval=0.02: _ORIG_SERVE_FOREVER(srv, poll_interval=poll_interval),
+        )
+        cls._poll_patcher.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._poll_patcher.stop()
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name).resolve(strict=True)
-        self.session = Session(isolated=True)
-        self.session.settings["python"] = sys.executable
-        self.studio = QuietStudio(True, self.session)
+        self._session: Session | None = None
+        self._studio: QuietStudio | None = None
+
+    @property
+    def session(self) -> Session:
+        if self._session is None:
+            self._session = Session(isolated=True)
+            self._session.settings["python"] = sys.executable
+        return self._session
+
+    @property
+    def studio(self) -> QuietStudio:
+        if self._studio is None:
+            self._studio = QuietStudio(True, self.session)
+        return self._studio
 
     def tearDown(self):
-        self.studio.stop()
-        self.studio.pool.shutdown(wait=True, cancel_futures=True)
-        self.session.writes.shutdown(wait=True)
-        self.studio.deleteLater()
+        if self._studio is not None:
+            self._studio.stop()
+            self._studio._search_pool.shutdown(wait=True, cancel_futures=True)
+            self._studio.pool.shutdown(wait=True, cancel_futures=True)
+            self._studio.deleteLater()
+        if self._session is not None:
+            self._session.writes.shutdown(wait=True)
+            shutil.rmtree(self._session.data, ignore_errors=True)
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
-        shutil.rmtree(self.session.data, ignore_errors=True)
         self.temp.cleanup()
 
     def _rev(self, text: str) -> str:
@@ -171,7 +203,9 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                         })
         finally:
             second_studio.stop()
+            second_studio._search_pool.shutdown(wait=True, cancel_futures=True)
             second_studio.pool.shutdown(wait=True, cancel_futures=True)
+            retired_studio._search_pool.shutdown(wait=True, cancel_futures=True)
             retired_studio.pool.shutdown(wait=True, cancel_futures=True)
             second_studio.deleteLater()
             retired_studio.deleteLater()
@@ -426,6 +460,8 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 try:
                     if request["action"] == "flush_current":
                         result = {"flushed": True}
+                    elif request["action"] == "list_tabs":
+                        result = {"tabs": request["tabs"]}
                     elif request["action"] == "asset_action":
                         result = self.studio._attach_tab_asset_native(request)
                     else:
@@ -440,7 +476,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 task = asyncio.create_task(coro)
                 while not task.done():
                     self.app.processEvents()
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.002)
                 return await task
 
             with patch.object(QStandardPaths, "writableLocation", return_value=str(downloads_dir)):
@@ -544,6 +580,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             studio1._recover()
         finally:
             studio1.stop()
+            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             studio1.pool.shutdown(wait=True, cancel_futures=True)
             session1.writes.shutdown(wait=True)
             studio1.deleteLater()
@@ -587,6 +624,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             studio2.closeFolder()
         finally:
             studio2.stop()
+            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             studio2.pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
@@ -616,6 +654,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 self.assertEqual(studio3.folder, "")
             finally:
                 studio3.stop()
+                studio3._search_pool.shutdown(wait=True, cancel_futures=True)
                 studio3.pool.shutdown(wait=True, cancel_futures=True)
                 session3.writes.shutdown(wait=True)
                 studio3.deleteLater()
@@ -853,7 +892,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                     task = asyncio.create_task(coro)
                     while not task.done():
                         self.app.processEvents()
-                        await asyncio.sleep(0.01)
+                        await asyncio.sleep(0.002)
                     return await task
 
                 async with Client(server) as client:
@@ -905,6 +944,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
         finally:
             bridge.stop()
             studio1.stop()
+            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             studio1.pool.shutdown(wait=True, cancel_futures=True)
             session1.writes.shutdown(wait=True)
             studio1.deleteLater()
@@ -938,6 +978,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             self.assertTrue(studio2._is_tab_live_authorized(restored_user))
         finally:
             studio2.stop()
+            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             studio2.pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
@@ -1192,6 +1233,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
         finally:
             bridge1.stop()
             studio1.stop()
+            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             studio1.pool.shutdown(wait=True, cancel_futures=True)
             session1.writes.shutdown(wait=True)
             studio1.deleteLater()
@@ -1272,6 +1314,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             self.assertFalse(studio2._agent_path_allowed(decoy_note))
         finally:
             studio2.stop()
+            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             studio2.pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
