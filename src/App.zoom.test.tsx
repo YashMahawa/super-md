@@ -3,11 +3,9 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const native = vi.hoisted(() => ({ fullscreen: false }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => null) }));
-vi.mock("@tauri-apps/api/window", () => ({ getCurrentWindow: () => ({ isFullscreen: async () => native.fullscreen, setFullscreen: async (value: boolean) => { native.fullscreen = value; } }) }));
-vi.mock("@tauri-apps/api/webviewWindow", () => ({ WebviewWindow: class {} }));
-vi.mock("./components/Editor", () => ({ default: () => <div className="mock-editor" /> }));
+const invokeMock = vi.hoisted(() => vi.fn(async () => null));
+vi.mock("./nativeBridge", () => ({ invoke: invokeMock }));
+vi.mock("./components/Editor", () => ({ default: ({ value, onChange }: { value: string; onChange: (next: string) => void }) => <textarea className="mock-editor" aria-label="Mock source editor" value={value} onChange={(event) => onChange(event.target.value)} /> }));
 vi.mock("./components/MarkdownPreview", () => ({ default: () => <div className="mock-preview" /> }));
 import App from "./App";
 
@@ -19,9 +17,9 @@ let root: Root | null = null;
 afterEach(() => {
   if (root) act(() => root?.unmount());
   root = null;
-  native.fullscreen = false;
   document.body.innerHTML = "";
   localStorage.clear();
+  invokeMock.mockClear();
 });
 
 describe("workspace zoom modes", () => {
@@ -47,5 +45,40 @@ describe("workspace zoom modes", () => {
     await act(async () => { window.dispatchEvent(new KeyboardEvent("keydown", { key: "F11", bubbles: true })); });
     expect(document.documentElement.dataset.fullscreen).toBe("false");
     expect(host.querySelector<HTMLInputElement>('.zoom-entry input')?.value).toBe("115");
+  });
+
+  it("restores browser local-session tabs and user note paths and flushes updates on beforeunload", async () => {
+    localStorage.setItem("setup.complete", "true");
+    localStorage.setItem("workspace.tabs.browser", JSON.stringify({
+      tabs: [
+        { id: "saved-note", path: "/notes/research.smd", content: "# Saved Research", savedContent: "# Saved Research", name: "research.smd" },
+        { id: "dirty-draft", path: null, content: "Unsaved browser draft", savedContent: "", name: "Untitled.smd" },
+      ],
+      activeId: "dirty-draft",
+      recentlyClosed: [
+        { id: "closed-note", path: "/notes/archive.md", content: "Archived body", savedContent: "Archived body", name: "archive.md" },
+      ],
+    }));
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    root = createRoot(host);
+    await act(async () => { root?.render(<App />); });
+
+    const tabs = Array.from(host.querySelectorAll<HTMLButtonElement>('[role="tab"]'));
+    expect(tabs.map((tab) => tab.textContent)).toEqual(["research.smd", "Untitled.smd"]);
+    expect(tabs[0].getAttribute("title")).toBe("/notes/research.smd");
+    expect(tabs[1].getAttribute("aria-selected")).toBe("true");
+    expect(host.querySelector<HTMLTextAreaElement>(".mock-editor")?.value).toBe("Unsaved browser draft");
+    expect(invokeMock).not.toHaveBeenCalledWith("startup_document", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("load_draft", expect.anything());
+
+    await act(async () => { host.querySelector<HTMLButtonElement>(".tab-reopen")?.click(); });
+    expect(host.querySelector<HTMLTextAreaElement>(".mock-editor")?.value).toBe("Archived body");
+    await act(async () => { window.dispatchEvent(new Event("beforeunload")); });
+
+    const persisted = JSON.parse(localStorage.getItem("workspace.tabs.browser") || "null");
+    expect(persisted.activeId).toBe("closed-note");
+    expect(persisted.tabs.map((tab: { path: string | null }) => tab.path)).toEqual(["/notes/research.smd", null, "/notes/archive.md"]);
   });
 });
