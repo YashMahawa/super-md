@@ -20,6 +20,10 @@ class AtomicIoTest(unittest.TestCase):
         self.assertIs(documents.atomic_output_file, atomic_io.atomic_output_file)
         self.assertIs(documents.atomic_write, atomic_io.atomic_write)
         self.assertIs(documents.atomic_json, atomic_io.atomic_json)
+        self.assertIs(documents.stage_atomic_json, atomic_io.stage_atomic_json)
+        self.assertIs(documents._StagedAtomicJsonScope, atomic_io._StagedAtomicJsonScope)
+        self.assertIs(documents._stage_target_key, atomic_io._stage_target_key)
+        self.assertIs(documents._ATOMIC_JSON_STAGE_TLS, atomic_io._ATOMIC_JSON_STAGE_TLS)
         self.assertIs(documents._replace_with_windows_sharing_retry, atomic_io._replace_with_windows_sharing_retry)
         self.assertIs(documents._write_json_str, atomic_io._write_json_str)
         self.assertIs(documents._write_json_value, atomic_io._write_json_value)
@@ -32,6 +36,7 @@ class AtomicIoTest(unittest.TestCase):
             "from desktop import atomic_io, documents\n"
             "from desktop.core import closed_notes\n"
             "assert documents.atomic_json is atomic_io.atomic_json\n"
+            "assert documents.stage_atomic_json is atomic_io.stage_atomic_json\n"
             "assert documents.atomic_write is atomic_io.atomic_write\n"
             "assert documents.atomic_output_file is atomic_io.atomic_output_file\n"
             "assert closed_notes.atomic_json is atomic_io.atomic_json\n",
@@ -175,6 +180,44 @@ class AtomicIoTest(unittest.TestCase):
                     sleep_spy.assert_not_called()
                 self.assertEqual(fatal_target.read_bytes(), b"untouched")
                 self.assertEqual(list(root.glob("*.tmp")), [])
+
+    def test_stage_atomic_json_and_documents_writer_monkeypatch_propagation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            recovery = root / "recovery.json"
+            recovery.write_text('[{"v": 0}]', encoding="utf-8")
+
+            seen_payloads: list[object] = []
+            real_write_val = documents._write_json_value
+
+            def spy_write_val(raw, value, seen):
+                seen_payloads.append(value)
+                return real_write_val(raw, value, seen)
+
+            with patch.object(documents, "_write_json_value", side_effect=spy_write_val):
+                with documents.stage_atomic_json(recovery) as staged:
+                    documents.atomic_json(recovery, [{"v": 1}])
+                    self.assertTrue(staged.intercepted)
+                    self.assertIsNotNone(staged.temporary)
+                    self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 0}])
+                    staged.publish()
+                self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 1}])
+                self.assertEqual(list(root.glob("*.tmp")), [])
+            self.assertTrue(any(item == [{"v": 1}] for item in seen_payloads))
+
+            with documents.stage_atomic_json(recovery) as discarded:
+                documents.atomic_json(recovery, [{"v": 2}])
+                self.assertTrue(discarded.intercepted)
+                discarded.discard()
+            self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 1}])
+            self.assertEqual(list(root.glob("*.tmp")), [])
+
+            with documents.stage_atomic_json(recovery, abort_check=lambda: True) as aborted:
+                documents.atomic_json(recovery, [{"v": 3}])
+                self.assertTrue(aborted.intercepted)
+                self.assertIsNone(aborted.temporary)
+            self.assertEqual(json.loads(recovery.read_text(encoding="utf-8")), [{"v": 1}])
+            self.assertEqual(list(root.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

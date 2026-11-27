@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import {describe,it,expect,vi} from 'vitest';
+import {afterEach,describe,it,expect,vi} from 'vitest';
 import {agentDiagrams,diagramMetadata,visibleSourceRange,diagramMedia} from './agentView';
+import {mediaBytes,registerMedia} from './mediaExport';
 import {pythonResults,rememberPythonOutput,retainVisiblePython} from './renderedOutputs';
 import * as nativeBridge from './nativeBridge';
 describe('structured reader context',()=>{
@@ -132,4 +133,366 @@ it('indexes cached Matplotlib SVG and PNG figures per document without executing
  releaseVisible();
  invokeSpy.mockRestore();
  pythonResults.clear();
+});
+
+const PNG_SIGNATURE=new Uint8Array([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]);
+const CRC32_TABLE=(()=>{
+  const table=new Uint32Array(256);
+  for(let i=0;i<256;i++){
+    let crc=i;
+    for(let bit=0;bit<8;bit++)crc=(crc&1)?(0xedb88320^(crc>>>1)):(crc>>>1);
+    table[i]=crc>>>0;
+  }
+  return table;
+})();
+function crc32(bytes:Uint8Array):number{
+  let crc=0xffffffff;
+  for(const byte of bytes)crc=CRC32_TABLE[(crc^byte)&0xff]^(crc>>>8);
+  return (crc^0xffffffff)>>>0;
+}
+function adler32(bytes:Uint8Array):number{
+  let s1=1,s2=0;
+  for(const byte of bytes){s1=(s1+byte)%65521;s2=(s2+s1)%65521;}
+  return ((s2<<16)|s1)>>>0;
+}
+function pngChunk(type:string,data:Uint8Array):Uint8Array{
+  const chunk=new Uint8Array(12+data.length);
+  const view=new DataView(chunk.buffer);
+  view.setUint32(0,data.length);
+  for(let i=0;i<4;i++)chunk[4+i]=type.charCodeAt(i);
+  chunk.set(data,8);
+  view.setUint32(8+data.length,crc32(chunk.subarray(4,8+data.length)));
+  return chunk;
+}
+function createSyntheticPng(width:number,height:number,rgba:[number,number,number,number]){
+  const ihdr=new Uint8Array(13);
+  const ihdrView=new DataView(ihdr.buffer);
+  ihdrView.setUint32(0,width);
+  ihdrView.setUint32(4,height);
+  ihdr[8]=8;ihdr[9]=6;ihdr[10]=0;ihdr[11]=0;ihdr[12]=0;
+  const stride=1+width*4;
+  const raw=new Uint8Array(height*stride);
+  for(let y=0;y<height;y++){
+    const row=y*stride;
+    raw[row]=0;
+    for(let x=0;x<width;x++)raw.set(rgba,row+1+x*4);
+  }
+  const zlib=new Uint8Array(2+5+raw.length+4);
+  zlib[0]=0x78;zlib[1]=0x01;zlib[2]=0x01;
+  zlib[3]=raw.length&0xff;zlib[4]=(raw.length>>>8)&0xff;
+  const nlen=(~raw.length)&0xffff;
+  zlib[5]=nlen&0xff;zlib[6]=(nlen>>>8)&0xff;
+  zlib.set(raw,7);
+  new DataView(zlib.buffer).setUint32(7+raw.length,adler32(raw));
+  const ihdrChunk=pngChunk('IHDR',ihdr);
+  const idatChunk=pngChunk('IDAT',zlib);
+  const iendChunk=pngChunk('IEND',new Uint8Array(0));
+  const bytes=new Uint8Array(PNG_SIGNATURE.length+ihdrChunk.length+idatChunk.length+iendChunk.length);
+  let offset=0;
+  for(const part of [PNG_SIGNATURE,ihdrChunk,idatChunk,iendChunk]){bytes.set(part,offset);offset+=part.length;}
+  let binary='';
+  for(const byte of bytes)binary+=String.fromCharCode(byte);
+  const base64=btoa(binary);
+  return {bytes,base64,dataUri:`data:image/png;base64,${base64}`};
+}
+function decodeBase64Bytes(base64:string):Uint8Array{
+  return Uint8Array.from(atob(base64),ch=>ch.charCodeAt(0));
+}
+function decodeBase64Utf8(base64:string):string{
+  return new TextDecoder('utf-8',{fatal:true}).decode(decodeBase64Bytes(base64));
+}
+
+describe('diagramMedia remote consent and owning-note load_asset bridge',()=>{
+  const cleanups:Array<()=>void>=[];
+  afterEach(()=>{
+    while(cleanups.length)cleanups.pop()!();
+    vi.restoreAllMocks();
+  });
+
+  function installBridge(handler:(command:string,args:Record<string,unknown>)=>unknown|Promise<unknown>){
+    const previous=window.SuperMD;
+    const calls:Array<{command:string;args:Record<string,unknown>}>=[];
+    window.SuperMD={
+      post(id,command,rawArgs){
+        const parsed=JSON.parse(rawArgs) as Record<string,unknown>;
+        calls.push({command,args:parsed});
+        void Promise.resolve().then(()=>handler(command,parsed)).then(
+          value=>window.supermdReply?.(id,value,null),
+          error=>window.supermdReply?.(id,null,error instanceof Error?error.message:String(error)),
+        );
+      },
+    };
+    cleanups.push(()=>{
+      if(previous===undefined)delete window.SuperMD;
+      else window.SuperMD=previous;
+    });
+    return calls;
+  }
+
+  it('refuses remote images that have not appeared in the reader without loading them',async()=>{
+    const bridgeCalls=installBridge((command)=>{
+      throw new Error(`Unexpected native bridge command: ${command}`);
+    });
+    const invokeSpy=vi.spyOn(nativeBridge,'invoke');
+    const fetchSpy=vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('Unexpected network fetch'));
+
+    const deck={
+      title:'Walkthrough',
+      steps:[
+        {label:'Overview',markdown:'Before viewing the slide.'},
+        {label:'Remote slide',image:'https://images.example/slide.png'},
+      ],
+    };
+    const source=[
+      '![Unseen plot](https://images.example/unseen-plot.png)',
+      '',
+      '![Unseen vector][remote-svg]',
+      '',
+      '![Uppercase remote](HTTPS://images.example/uppercase.png)',
+      '',
+      '```smd-steps',
+      JSON.stringify(deck),
+      '```',
+      '',
+      '[remote-svg]: http://images.example/unseen.svg',
+    ].join('\n');
+
+    const diagrams=agentDiagrams(source);
+    expect(diagrams.map(item=>item.url)).toEqual([
+      'https://images.example/unseen-plot.png',
+      'http://images.example/unseen.svg',
+      'HTTPS://images.example/uppercase.png',
+      'https://images.example/slide.png',
+    ]);
+
+    for(const diagram of diagrams){
+      await expect(diagramMedia(diagram,'/vault/notes/lecture.md')).rejects.toThrow(
+        'Load this remote image in the app before requesting its pixels',
+      );
+    }
+    expect(bridgeCalls).toEqual([]);
+    expect(invokeSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Unconsented .remote-image-card / .image-error placeholders (and unrelated loaded remote images)
+    // still do not count as the requested remote image having appeared in the reader.
+    const otherPng=createSyntheticPng(2,2,[0x20,0x90,0x50,0xff]);
+    const container=document.createElement('div');
+    container.innerHTML=[
+      '<span class="remote-image-card" data-note-image-source="https://images.example/unseen-plot.png"><button type="button">Load image</button></span>',
+      '<span class="image-error" data-note-image-source="http://images.example/unseen.svg"><span>Image unavailable</span></span>',
+      '<span class="note-image" data-note-image-source="https://images.example/other-loaded.png"><img class="other-loaded" alt="Other"/></span>',
+    ].join('');
+    document.body.append(container);
+    cleanups.push(()=>container.remove());
+    cleanups.push(registerMedia(container.querySelector('.other-loaded'),{label:'Other',uri:()=>otherPng.dataUri}));
+
+    for(const diagram of diagrams){
+      await expect(diagramMedia(diagram,'/vault/notes/lecture.md')).rejects.toThrow(
+        'Load this remote image in the app before requesting its pixels',
+      );
+    }
+    expect(bridgeCalls).toEqual([]);
+    expect(invokeSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Once the user loads that exact remote image in the reader, diagramMedia reuses its registered
+    // pixels offline without invoking load_asset/fetch_resource or fetch, and refuses again once unmounted.
+    const consentedPng=createSyntheticPng(3,2,[0x16,0x88,0xdd,0xff]);
+    const mounted=document.createElement('span');
+    mounted.className='note-image';
+    mounted.dataset.noteImageSource='https://images.example/unseen-plot.png';
+    const mountedImg=document.createElement('img');
+    mountedImg.alt='Unseen plot';
+    mounted.append(mountedImg);
+    document.body.append(mounted);
+    const unregisterMounted=registerMedia(mountedImg,{label:'Unseen plot',uri:()=>consentedPng.dataUri});
+
+    const loadedMedia=await diagramMedia(diagrams[0],'/vault/notes/lecture.md');
+    const exported=await mediaBytes(loadedMedia,'original');
+    expect(exported.mimeType).toBe('image/png');
+    expect(exported.filename).toBe('Unseen plot.png');
+    expect(exported.width).toBe(3);
+    expect(exported.height).toBe(2);
+    expect(decodeBase64Bytes(exported.body)).toEqual(consentedPng.bytes);
+    expect(bridgeCalls).toEqual([]);
+    expect(invokeSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    unregisterMounted();
+    mounted.remove();
+    await expect(diagramMedia(diagrams[0],'/vault/notes/lecture.md')).rejects.toThrow(
+      'Load this remote image in the app before requesting its pixels',
+    );
+    expect(bridgeCalls).toEqual([]);
+    expect(invokeSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('loads relative PNG and SVG images via load_asset with the owning note path and preserves MIME and canonical bytes',async()=>{
+    const owningNotePath='/vault/courses/ml/lecture-03.md';
+    const lossPng=createSyntheticPng(3,2,[0x16,0x88,0xdd,0xff]);
+    const pipelineSvgSource='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 32"><rect width="48" height="32" fill="#ffffff"/><path id="pipeline-edge" d="M6 26 L24 8 L42 26" stroke="#1688dd" stroke-width="3" fill="none"/></svg>';
+    const pipelineSvgDataUri=`data:image/svg+xml;base64,${btoa(pipelineSvgSource)}`;
+    const stepSvgSource='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 40"><rect width="64" height="40" fill="#ffffff"/><circle id="step-centroid" cx="20" cy="20" r="8" fill="#d9480f"/></svg>';
+    const stepSvgDataUri=`data:image/svg+xml;charset=utf-8,${encodeURIComponent(stepSvgSource)}`;
+
+    const assetsBySource:Record<string,string>={
+      'assets/plots/loss.png':lossPng.dataUri,
+      '../shared/pipeline.svg':pipelineSvgDataUri,
+      './slides/init.svg':stepSvgDataUri,
+    };
+
+    const bridgeCalls=installBridge((command,args)=>{
+      if(command!=='load_asset')throw new Error(`Unexpected command: ${command}`);
+      if(args.documentPath!==owningNotePath)throw new Error(`Wrong documentPath: ${String(args.documentPath)}`);
+      const hit=assetsBySource[String(args.source)];
+      if(!hit)throw new Error(`Missing fixture for ${String(args.source)}`);
+      return hit;
+    });
+    const invokeSpy=vi.spyOn(nativeBridge,'invoke');
+    const fetchSpy=vi.spyOn(globalThis,'fetch').mockRejectedValue(new Error('Unexpected network fetch'));
+
+    const deck={
+      title:'K-means',
+      steps:[
+        {label:'Initialize',image:'./slides/init.svg'},
+        {label:'Converge',markdown:'Centroids stabilize.'},
+      ],
+    };
+    const source=[
+      '![Loss curve](assets/plots/loss.png)',
+      '',
+      '![Pipeline architecture][arch]',
+      '',
+      '```smd-steps',
+      JSON.stringify(deck),
+      '```',
+      '',
+      '[arch]: ../shared/pipeline.svg',
+    ].join('\n');
+
+    const diagrams=agentDiagrams(source);
+    expect(diagrams).toHaveLength(3);
+
+    // 1. Relative PNG image -> load_asset bridge call + image/png MIME + canonical PNG bytes & IHDR dimensions.
+    const pngMedia=await diagramMedia(diagrams[0],owningNotePath);
+    const pngOut=await mediaBytes(pngMedia,'original');
+    expect(invokeSpy).toHaveBeenNthCalledWith(1,'load_asset',{
+      documentPath:owningNotePath,
+      source:'assets/plots/loss.png',
+    });
+    expect(pngOut.mimeType).toBe('image/png');
+    expect(pngOut.filename).toBe('Loss curve.png');
+    expect(pngOut.width).toBe(3);
+    expect(pngOut.height).toBe(2);
+    const decodedPng=decodeBase64Bytes(pngOut.body);
+    expect(decodedPng.subarray(0,8)).toEqual(PNG_SIGNATURE);
+    expect(decodedPng).toEqual(lossPng.bytes);
+
+    // 2. Reference relative SVG (base64 data URI) -> load_asset bridge call + image/svg+xml MIME + canonical SVG XML.
+    const archMedia=await diagramMedia(diagrams[1],owningNotePath);
+    const archOut=await mediaBytes(archMedia,'svg');
+    expect(invokeSpy).toHaveBeenNthCalledWith(2,'load_asset',{
+      documentPath:owningNotePath,
+      source:'../shared/pipeline.svg',
+    });
+    expect(archOut.mimeType).toBe('image/svg+xml');
+    expect(archOut.filename).toBe('Pipeline architecture.svg');
+    const archXmlText=decodeBase64Utf8(archOut.body);
+    const archXml=new DOMParser().parseFromString(archXmlText,'image/svg+xml');
+    expect(archXml.querySelector('parsererror')).toBeNull();
+    expect(archXml.documentElement.getAttribute('xmlns')).toBe('http://www.w3.org/2000/svg');
+    expect(archXml.documentElement.getAttribute('viewBox')).toBe('0 0 48 32');
+    expect(archXml.documentElement.getAttribute('width')).toBe('48');
+    expect(archXml.documentElement.getAttribute('height')).toBe('32');
+    const edge=archXml.getElementById('pipeline-edge');
+    expect(edge?.getAttribute('d')).toBe('M6 26 L24 8 L42 26');
+    expect(edge?.getAttribute('stroke')?.toLowerCase()).toBe('#1688dd');
+
+    // 3. Step-deck relative SVG (percent-encoded UTF-8 data URI) -> load_asset bridge call + canonical SVG XML.
+    const stepMedia=await diagramMedia(diagrams[2],owningNotePath);
+    const stepOut=await mediaBytes(stepMedia,'original');
+    expect(invokeSpy).toHaveBeenNthCalledWith(3,'load_asset',{
+      documentPath:owningNotePath,
+      source:'./slides/init.svg',
+    });
+    expect(stepOut.mimeType).toBe('image/svg+xml');
+    expect(stepOut.filename).toBe('K-means — Initialize.svg');
+    const stepXmlText=decodeBase64Utf8(stepOut.body);
+    const stepXml=new DOMParser().parseFromString(stepXmlText,'image/svg+xml');
+    expect(stepXml.querySelector('parsererror')).toBeNull();
+    expect(stepXml.documentElement.getAttribute('xmlns')).toBe('http://www.w3.org/2000/svg');
+    expect(stepXml.documentElement.getAttribute('width')).toBe('64');
+    expect(stepXml.documentElement.getAttribute('height')).toBe('40');
+    const centroid=stepXml.getElementById('step-centroid');
+    expect(centroid?.getAttribute('cx')).toBe('20');
+    expect(centroid?.getAttribute('cy')).toBe('20');
+    expect(centroid?.getAttribute('r')).toBe('8');
+
+    expect(bridgeCalls).toEqual([
+      {command:'load_asset',args:{documentPath:owningNotePath,source:'assets/plots/loss.png'}},
+      {command:'load_asset',args:{documentPath:owningNotePath,source:'../shared/pipeline.svg'}},
+      {command:'load_asset',args:{documentPath:owningNotePath,source:'./slides/init.svg'}},
+    ]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('forwards each owning note path to load_asset when resolving identically named relative images across notes',async()=>{
+    const pngAlpha=createSyntheticPng(3,2,[0x12,0x64,0xab,0xff]);
+    const pngBeta=createSyntheticPng(5,4,[0xd9,0x48,0x0f,0xff]);
+    const pngDraft=createSyntheticPng(2,2,[0x2b,0x8a,0x3e,0xff]);
+    const fixturesByDocPath:Record<string,ReturnType<typeof createSyntheticPng>>={
+      '/vault/alpha/summary.md':pngAlpha,
+      '/vault/beta/nested/summary.md':pngBeta,
+      '':pngDraft,
+    };
+
+    const bridgeCalls=installBridge((command,args)=>{
+      if(command!=='load_asset'||args.source!=='assets/figure.png'){
+        throw new Error(`Unexpected bridge call: ${command} ${JSON.stringify(args)}`);
+      }
+      const fixture=fixturesByDocPath[String(args.documentPath)];
+      if(!fixture)throw new Error(`Unexpected documentPath: ${String(args.documentPath)}`);
+      return fixture.dataUri;
+    });
+    const invokeSpy=vi.spyOn(nativeBridge,'invoke');
+
+    const [diagram]=agentDiagrams('![Shared name](assets/figure.png)');
+    expect(diagram.kind).toBe('image');
+
+    const alphaOut=await mediaBytes(await diagramMedia(diagram,'/vault/alpha/summary.md'),'original');
+    const betaOut=await mediaBytes(await diagramMedia(diagram,'/vault/beta/nested/summary.md'),'original');
+    const draftOut=await mediaBytes(await diagramMedia(diagram,null),'original');
+
+    expect(invokeSpy.mock.calls).toEqual([
+      ['load_asset',{documentPath:'/vault/alpha/summary.md',source:'assets/figure.png'}],
+      ['load_asset',{documentPath:'/vault/beta/nested/summary.md',source:'assets/figure.png'}],
+      ['load_asset',{documentPath:'',source:'assets/figure.png'}],
+    ]);
+    expect(bridgeCalls).toEqual([
+      {command:'load_asset',args:{documentPath:'/vault/alpha/summary.md',source:'assets/figure.png'}},
+      {command:'load_asset',args:{documentPath:'/vault/beta/nested/summary.md',source:'assets/figure.png'}},
+      {command:'load_asset',args:{documentPath:'',source:'assets/figure.png'}},
+    ]);
+
+    expect({mime:alphaOut.mimeType,w:alphaOut.width,h:alphaOut.height,bytes:decodeBase64Bytes(alphaOut.body)}).toEqual({
+      mime:'image/png',
+      w:3,
+      h:2,
+      bytes:pngAlpha.bytes,
+    });
+    expect({mime:betaOut.mimeType,w:betaOut.width,h:betaOut.height,bytes:decodeBase64Bytes(betaOut.body)}).toEqual({
+      mime:'image/png',
+      w:5,
+      h:4,
+      bytes:pngBeta.bytes,
+    });
+    expect({mime:draftOut.mimeType,w:draftOut.width,h:draftOut.height,bytes:decodeBase64Bytes(draftOut.body)}).toEqual({
+      mime:'image/png',
+      w:2,
+      h:2,
+      bytes:pngDraft.bytes,
+    });
+  });
 });

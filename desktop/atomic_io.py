@@ -6,18 +6,37 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import threading
 import time
 from typing import BinaryIO
 
 JSON_WRITE_CHUNK = 262_144  # 256 KiB
 
 _is_trusted_ascii: Callable[[str], bool] = lambda _text: False
+_reexport_namespaces: list[dict[str, object]] = []
+_ATOMIC_JSON_STAGE_TLS = threading.local()
 
 
 def set_trusted_ascii_predicate(predicate: Callable[[str], bool] | None) -> None:
     """Register an optional fast-path predicate for validated ASCII strings."""
     global _is_trusted_ascii
     _is_trusted_ascii = (lambda _text: False) if predicate is None else predicate
+
+
+def _bind_reexport_namespace(namespace: dict[str, object]) -> None:
+    """Propagate monkeypatches from a re-exporting facade module (e.g. `documents`)."""
+    if all(existing is not namespace for existing in _reexport_namespaces):
+        _reexport_namespaces.append(namespace)
+
+
+def _resolve_reexported(name: str, current, default):
+    if current is not default:
+        return current
+    for namespace in _reexport_namespaces:
+        candidate = namespace.get(name, default)
+        if candidate is not default:
+            return candidate
+    return default
 
 
 def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
@@ -43,11 +62,84 @@ def _replace_with_windows_sharing_retry(source: str, target: Path) -> None:
             delay = min(0.04, delay * 2)
 
 
+_DEFAULT_REPLACE_RETRY = _replace_with_windows_sharing_retry
+
+
+def _stage_target_key(path: Path | str) -> str:
+    try:
+        resolved = os.path.realpath(os.path.abspath(os.fspath(path)))
+    except OSError:
+        resolved = os.path.abspath(os.fspath(path))
+    if os.name == "nt":
+        if resolved.startswith("\\\\?\\UNC\\"):
+            resolved = "\\\\" + resolved[8:]
+        elif resolved.startswith("\\\\?\\"):
+            resolved = resolved[4:]
+    return os.path.normcase(os.path.normpath(resolved))
+
+
+class _StagedAtomicJsonScope:
+    """Defer the final atomic rename of ``target_path`` until the caller commits."""
+
+    def __init__(self, target_path: Path, abort_check=None):
+        self.target = Path(os.path.abspath(os.fspath(target_path)))
+        self.target_key = _stage_target_key(target_path)
+        self.abort_check = abort_check
+        self.intercepted = False
+        self.temporary: str | None = None
+        self._previous = None
+
+    def __enter__(self):
+        self._previous = getattr(_ATOMIC_JSON_STAGE_TLS, "active", None)
+        _ATOMIC_JSON_STAGE_TLS.active = self
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        _ATOMIC_JSON_STAGE_TLS.active = self._previous
+        if exc_type is not None:
+            self.discard()
+        return False
+
+    def publish(self, destination: Path | None = None) -> None:
+        temp = self.temporary
+        if temp is None:
+            return
+        self.temporary = None
+        try:
+            _resolve_reexported(
+                "_replace_with_windows_sharing_retry",
+                _replace_with_windows_sharing_retry,
+                _DEFAULT_REPLACE_RETRY,
+            )(temp, destination or self.target)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
+    def discard(self) -> None:
+        temp = self.temporary
+        self.temporary = None
+        if temp is not None and os.path.exists(temp):
+            try:
+                os.unlink(temp)
+            except OSError:
+                pass
+
+
+def stage_atomic_json(target_path: Path, *, abort_check=None) -> _StagedAtomicJsonScope:
+    return _StagedAtomicJsonScope(target_path, abort_check=abort_check)
+
+
 @contextlib.contextmanager
-def atomic_output_file(path: Path, *, buffering: int = -1) -> Iterator[BinaryIO]:
+def atomic_output_file(
+    path: Path,
+    *,
+    buffering: int = -1,
+    _staged_scope: _StagedAtomicJsonScope | None = None,
+) -> Iterator[BinaryIO]:
     """Yield a sibling temp binary stream and atomically replace `path` on clean exit."""
     target = path if isinstance(path, Path) else Path(path)
     handle, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    handed_off = False
     try:
         try:
             raw = os.fdopen(handle, "wb", buffering=buffering)
@@ -65,9 +157,17 @@ def atomic_output_file(path: Path, *, buffering: int = -1) -> Iterator[BinaryIO]
             yield raw
             raw.flush()
             os.fsync(raw.fileno())
-        _replace_with_windows_sharing_retry(temporary, target)
+        if _staged_scope is not None:
+            _staged_scope.temporary = temporary
+            handed_off = True
+            return
+        _resolve_reexported(
+            "_replace_with_windows_sharing_retry",
+            _replace_with_windows_sharing_retry,
+            _DEFAULT_REPLACE_RETRY,
+        )(temporary, target)
     finally:
-        if os.path.exists(temporary):
+        if not handed_off and os.path.exists(temporary):
             os.unlink(temporary)
 
 
@@ -95,9 +195,12 @@ def _write_json_str(raw, text: str) -> None:
     raw.write(b'"')
 
 
+_DEFAULT_WRITE_JSON_STR = _write_json_str
+
+
 def _write_json_value(raw, value, seen: set[int]) -> None:
     if isinstance(value, str):
-        _write_json_str(raw, value)
+        _resolve_reexported("_write_json_str", _write_json_str, _DEFAULT_WRITE_JSON_STR)(raw, value)
     elif value is None:
         raw.write(b"null")
     elif value is True:
@@ -111,12 +214,13 @@ def _write_json_value(raw, value, seen: set[int]) -> None:
         if marker in seen:
             raise ValueError("Circular reference detected")
         seen.add(marker)
+        write_val = _resolve_reexported("_write_json_value", _write_json_value, _DEFAULT_WRITE_JSON_VALUE)
         try:
             raw.write(b"[")
             for idx, item in enumerate(value):
                 if idx:
                     raw.write(b", ")
-                _write_json_value(raw, item, seen)
+                write_val(raw, item, seen)
             raw.write(b"]")
         finally:
             seen.remove(marker)
@@ -125,6 +229,8 @@ def _write_json_value(raw, value, seen: set[int]) -> None:
         if marker in seen:
             raise ValueError("Circular reference detected")
         seen.add(marker)
+        write_str = _resolve_reexported("_write_json_str", _write_json_str, _DEFAULT_WRITE_JSON_STR)
+        write_val = _resolve_reexported("_write_json_value", _write_json_value, _DEFAULT_WRITE_JSON_VALUE)
         try:
             raw.write(b"{")
             first = True
@@ -133,7 +239,7 @@ def _write_json_value(raw, value, seen: set[int]) -> None:
                     raw.write(b", ")
                 first = False
                 if isinstance(key, str):
-                    _write_json_str(raw, key)
+                    write_str(raw, key)
                 elif key is None:
                     raw.write(b'"null"')
                 elif key is True:
@@ -145,7 +251,7 @@ def _write_json_value(raw, value, seen: set[int]) -> None:
                 else:
                     raise TypeError(f"keys must be str, int, float, bool or None, not {type(key).__name__}")
                 raw.write(b": ")
-                _write_json_value(raw, item, seen)
+                write_val(raw, item, seen)
             raw.write(b"}")
         finally:
             seen.remove(marker)
@@ -153,7 +259,25 @@ def _write_json_value(raw, value, seen: set[int]) -> None:
         raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
+_DEFAULT_WRITE_JSON_VALUE = _write_json_value
+
+
 def atomic_json(path: Path, value) -> None:
     """Write ordered recovery without full-workspace JSON + UTF-8 copies or long GIL holds."""
-    with atomic_output_file(path, buffering=JSON_WRITE_CHUNK) as file:
-        _write_json_value(file, value, set())
+    path_obj = path if isinstance(path, Path) else Path(path)
+    stage_scope = getattr(_ATOMIC_JSON_STAGE_TLS, "active", None)
+    capture_stage = (
+        stage_scope is not None
+        and not stage_scope.intercepted
+        and _stage_target_key(path_obj) == stage_scope.target_key
+    )
+    if capture_stage:
+        stage_scope.intercepted = True
+        if callable(stage_scope.abort_check) and stage_scope.abort_check():
+            return
+    with atomic_output_file(
+        path_obj,
+        buffering=JSON_WRITE_CHUNK,
+        _staged_scope=stage_scope if capture_stage else None,
+    ) as file:
+        _resolve_reexported("_write_json_value", _write_json_value, _DEFAULT_WRITE_JSON_VALUE)(file, value, set())

@@ -12,6 +12,16 @@ import time
 from collections.abc import Callable
 
 
+EXACT_COMMITTED = "committed"
+EXACT_SUPERSEDED = "superseded"
+EXACT_FAILED = "failed"
+EXACT_ABORTED = "aborted"
+
+
+class ExactWriteAborted(Exception):
+    """Raised inside an exact latest action when publication is declined before commit."""
+
+
 class LatestWriteExecutor:
     LATEST_KEYS = frozenset(("startup", "recovery"))
 
@@ -22,10 +32,30 @@ class LatestWriteExecutor:
             max_workers=1, thread_name_prefix=thread_name_prefix
         )
         self._condition = threading.Condition()
-        self._pending: dict[str, tuple[Callable, Callable | None]] = {}
+        self._pending: dict[str, tuple[int, Callable, Callable | None, Callable | None]] = {}
+        self._latest_revision: dict[str, int] = {}
+        self._committed_revision: dict[str, int] = {}
         self._scheduled = False
         self._shutdown = False
         self._worker_ids: set[int] = set()
+        self._drain_finalizers: list[Callable[[], None]] = []
+
+    def add_drain_finalizer(self, fn: Callable[[], None]) -> None:
+        """Register a callback to run after flush() or shutdown(wait=True) drains queued writes."""
+        if not callable(fn):
+            raise ValueError("drain finalizer must be callable")
+        with self._condition:
+            self._drain_finalizers.append(fn)
+
+    def latest_revision(self, key: str) -> int:
+        """Return the latest submitted revision number for ``key`` (0 if none)."""
+        with self._condition:
+            return self._latest_revision.get(key, 0)
+
+    def committed_revision(self, key: str) -> int:
+        """Return the latest durably committed revision number for ``key`` (0 if none)."""
+        with self._condition:
+            return self._committed_revision.get(key, 0)
 
     def submit(self, fn, /, *args, **kwargs):
         """Submit an ordinary FIFO job and preserve Future/result semantics."""
@@ -34,16 +64,68 @@ class LatestWriteExecutor:
                 raise RuntimeError("cannot schedule new futures after shutdown")
             return self._executor.submit(self._tracked, fn, args, kwargs)
 
-    def submit_latest(self, key: str, action: Callable, on_done: Callable | None = None) -> None:
-        """Replace the pending action for key, retaining at most one per key."""
+    def _enqueue_latest(
+        self,
+        key: str,
+        action: Callable,
+        on_done: Callable | None,
+        exact_done: Callable | None,
+        on_enqueued: Callable[[int], None] | None = None,
+    ) -> int:
         if key not in self.LATEST_KEYS or not callable(action):
             raise ValueError("Latest writes are limited to startup and recovery snapshots")
+        displaced = None
         with self._condition:
             if self._shutdown:
                 raise RuntimeError("cannot schedule new futures after shutdown")
-            self._pending[key] = (action, on_done)
+            rev = self._latest_revision.get(key, 0) + 1
+            self._latest_revision[key] = rev
+            if on_enqueued is not None:
+                on_enqueued(rev)
+            displaced = self._pending.get(key)
+            self._pending[key] = (rev, action, on_done, exact_done)
             if not self._scheduled:
                 self._schedule_locked()
+        if displaced is not None:
+            prev_rev, _prev_action, _prev_on_done, prev_exact_done = displaced
+            if prev_exact_done is not None:
+                try:
+                    prev_exact_done(EXACT_SUPERSEDED, prev_rev, None)
+                except Exception:
+                    pass
+        return rev
+
+    def submit_latest(self, key: str, action: Callable, on_done: Callable | None = None) -> int:
+        """Replace the pending action for key, retaining at most one per key."""
+        return self._enqueue_latest(key, action, on_done, None)
+
+    def submit_latest_exact(
+        self,
+        key: str,
+        action: Callable,
+        on_done: Callable | None = None,
+        exact_done: Callable | None = None,
+        *,
+        on_enqueued: Callable[[int], None] | None = None,
+    ) -> tuple[int, concurrent.futures.Future]:
+        """Submit a keyed snapshot and track whether that exact revision committed.
+
+        Resolves ``future`` (and optional ``exact_done``) with ``(status, rev, error)``
+        where ``status`` is ``"committed"``, ``"superseded"``, ``"aborted"``, or ``"failed"``.
+        """
+        outcome: concurrent.futures.Future = concurrent.futures.Future()
+
+        def finish_exact(status: str, rev: int, error: BaseException | None) -> None:
+            if not outcome.done():
+                outcome.set_result((status, rev, error))
+            if exact_done is not None:
+                try:
+                    exact_done(status, rev, error)
+                except Exception:
+                    pass
+
+        rev = self._enqueue_latest(key, action, on_done, finish_exact, on_enqueued=on_enqueued)
+        return rev, outcome
 
     def flush(self, timeout=3.0) -> None:
         """Wait for earlier FIFO work and all latest drains it leaves behind.
@@ -76,6 +158,22 @@ class LatestWriteExecutor:
                 if remaining <= 0:
                     raise TimeoutError("timed out waiting for latest writer drains")
                 self._condition.wait(remaining)
+            finalizers = list(self._drain_finalizers)
+            if finalizers:
+                if self._shutdown:
+                    raise RuntimeError("cannot flush after writer shutdown")
+                finalizer_future = self._executor.submit(
+                    self._tracked, self._run_drain_finalizers, (finalizers,), {}
+                )
+            else:
+                finalizer_future = None
+
+        if finalizer_future is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                finalizer_future.result(timeout=remaining)
+            except concurrent.futures.TimeoutError as failure:
+                raise TimeoutError("timed out waiting for writer drain finalizers") from failure
 
     def _schedule_locked(self):
         self._scheduled = True
@@ -104,18 +202,45 @@ class LatestWriteExecutor:
                     self._condition.notify_all()
                     return
 
-            for key, (action, on_done) in batch.items():
+            for key, (rev, action, on_done, exact_done) in batch.items():
+                if exact_done is not None:
+                    with self._condition:
+                        already_superseded = self._latest_revision.get(key, 0) != rev
+                    if already_superseded:
+                        try:
+                            exact_done(EXACT_SUPERSEDED, rev, None)
+                        except Exception:
+                            pass
+                        continue
                 error = None
+                aborted = False
                 try:
                     action()
+                except ExactWriteAborted:
+                    aborted = True
                 except Exception as failure:
                     error = failure
-                if on_done is not None:
+                with self._condition:
+                    if aborted:
+                        status = EXACT_ABORTED
+                    elif error is not None:
+                        status = EXACT_FAILED
+                    elif self._latest_revision.get(key, 0) == rev:
+                        self._committed_revision[key] = rev
+                        status = EXACT_COMMITTED
+                    else:
+                        status = EXACT_SUPERSEDED
+                if on_done is not None and not aborted:
                     try:
                         on_done(error)
                     except Exception:
                         # The writer's job is durable I/O; a notification
                         # callback must not strand the remaining latest slots.
+                        pass
+                if exact_done is not None:
+                    try:
+                        exact_done(status, rev, error)
+                    except Exception:
                         pass
 
             with self._condition:
@@ -141,6 +266,14 @@ class LatestWriteExecutor:
         with self._condition:
             return len(self._pending)
 
+    @staticmethod
+    def _run_drain_finalizers(finalizers):
+        for fn in finalizers:
+            try:
+                fn()
+            except Exception:
+                pass
+
     def shutdown(self, wait=True, *, cancel_futures=False):
         """Flush latest slots, then close the serial executor.
 
@@ -164,3 +297,7 @@ class LatestWriteExecutor:
                     self._condition.wait()
 
         self._executor.shutdown(wait=wait and not worker_call, cancel_futures=False)
+        if wait and not worker_call:
+            with self._condition:
+                finalizers = list(self._drain_finalizers)
+            self._run_drain_finalizers(finalizers)

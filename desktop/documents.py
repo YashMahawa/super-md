@@ -11,15 +11,13 @@ import threading
 import zlib
 from pathlib import Path
 if __package__:
-    from .atomic_io import (
-        _replace_with_windows_sharing_retry, _write_json_str, _write_json_value,
-        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate,
-    )
+    from .atomic_io import (_ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _bind_reexport_namespace,
+        _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, _write_json_value,
+        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate, stage_atomic_json)
 else:
-    from atomic_io import (
-        _replace_with_windows_sharing_retry, _write_json_str, _write_json_value,
-        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate,
-    )
+    from atomic_io import (_ATOMIC_JSON_STAGE_TLS, _StagedAtomicJsonScope, _bind_reexport_namespace,
+        _replace_with_windows_sharing_retry, _stage_target_key, _write_json_str, _write_json_value,
+        atomic_json, atomic_output_file, atomic_write, set_trusted_ascii_predicate, stage_atomic_json)
 
 MIMES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "svg": "image/svg+xml", "gif": "image/gif", "webp": "image/webp", "avif": "image/avif"}
 MAX_FILE = 120_000_000
@@ -238,6 +236,7 @@ def _is_cached_validated_asset(data: str) -> bool:
     return _lookup_validated_asset(data) is not None
 
 set_trusted_ascii_predicate(_is_cached_validated_asset)
+_bind_reexport_namespace(globals())
 
 def image_data(data: str) -> tuple[str, bytes]:
     mime, encoded_start, _ = _parse_image_header(data)

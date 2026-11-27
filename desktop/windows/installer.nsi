@@ -4,8 +4,8 @@ Name "Super MD"
 OutFile "..\dist\packages\Super-MD_${VERSION}_x64-setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Super MD"
 RequestExecutionLevel user
-!define MUI_ICON "..\..\src-tauri\icons\icon.ico"
-!define MUI_UNICON "..\..\src-tauri\icons\icon.ico"
+!define MUI_ICON "..\..\desktop\brand\icon.ico"
+!define MUI_UNICON "..\..\desktop\brand\icon.ico"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
