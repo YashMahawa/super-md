@@ -105,10 +105,6 @@ internal class ContentResolverTreeLister(private val context: Context) : Workspa
                         val mime = if (mimeIdx >= 0 && !cursor.isNull(mimeIdx)) cursor.getString(mimeIdx) else ""
                         val flags = if (flagsIdx >= 0 && !cursor.isNull(flagsIdx)) cursor.getInt(flagsIdx) else 0
                         val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-                        if (!isDir) {
-                            val (_, ext) = splitWorkspaceNameAndExt(name)
-                            if (ext !in WORKSPACE_NOTE_EXTENSIONS) continue
-                        }
                         val isVirtual = (flags and DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) != 0
                         val childUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
                         results += WorkspaceTreeChild(
@@ -144,17 +140,12 @@ internal class ContentResolverTreeLister(private val context: Context) : Workspa
         }
         return targetDir.listFiles().mapNotNull { file ->
             val name = file.name?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-            val isDir = file.isDirectory
-            if (!isDir) {
-                val (_, ext) = splitWorkspaceNameAndExt(name)
-                if (ext !in WORKSPACE_NOTE_EXTENSIONS) return@mapNotNull null
-            }
             val docId = runCatching { DocumentsContract.getDocumentId(file.uri) }.getOrDefault(name)
             WorkspaceTreeChild(
                 documentId = docId,
                 name = name,
                 uri = file.uri,
-                isDirectory = isDir,
+                isDirectory = file.isDirectory,
                 isVirtualOrLink = file.isVirtual,
             )
         }
@@ -253,38 +244,6 @@ internal fun expandWorkspaceCandidatePaths(
     return expanded
 }
 
-private fun matchLocalChildSegment(
-    dir: java.io.File,
-    segment: String,
-    exactCase: Boolean,
-): java.io.File? {
-    val direct = java.io.File(dir, segment)
-    if (java.nio.file.Files.isSymbolicLink(direct.toPath())) {
-        throw WorkspaceLinkException("Linked note symlink paths are not allowed.")
-    }
-    val entries = dir.listFiles()
-        ?.sortedWith(compareBy<java.io.File> { it.name.lowercase() }.thenBy { it.name })
-        ?: return null
-    var foldedMatch: java.io.File? = null
-    for (entry in entries) {
-        val name = entry.name
-        if (name.isEmpty()) continue
-        if (name == segment) {
-            if (java.nio.file.Files.isSymbolicLink(entry.toPath())) {
-                throw WorkspaceLinkException("Linked note symlink paths are not allowed.")
-            }
-            return entry
-        }
-        if (!exactCase && foldedMatch == null && name.equals(segment, ignoreCase = true)) {
-            if (java.nio.file.Files.isSymbolicLink(entry.toPath())) {
-                throw WorkspaceLinkException("Linked note symlink paths are not allowed.")
-            }
-            foldedMatch = entry
-        }
-    }
-    return if (exactCase) null else foldedMatch
-}
-
 internal fun resolveLocalFileWorkspaceLink(
     sourceUri: Uri,
     rawTarget: String,
@@ -301,40 +260,29 @@ internal fun resolveLocalFileWorkspaceLink(
     val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
     val candidateLists = expandWorkspaceCandidatePaths("", cleaned, wikilink)
     val boundaryPath = parentDir.toPath()
-    for (exactPass in listOf(true, false)) {
-        for (parts in candidateLists) {
-            var cur: java.io.File? = parentDir
-            for (segment in parts) {
-                cur = matchLocalChildSegment(cur!!, segment, exactCase = exactPass)
-                if (cur == null) break
+    for (parts in candidateLists) {
+        var cur = parentDir
+        for (segment in parts) {
+            val next = java.io.File(cur, segment)
+            if (java.nio.file.Files.isSymbolicLink(next.toPath())) {
+                throw WorkspaceLinkException("Linked note symlink paths are not allowed.")
             }
-            val matched = cur ?: continue
-            if (!matched.isFile) continue
-            val resolved = runCatching { matched.canonicalFile }.getOrNull() ?: continue
-            val resolvedPath = resolved.toPath()
-            if (!resolvedPath.startsWith(boundaryPath)) {
-                throw WorkspaceLinkException("Linked note is outside the authorized folder.")
-            }
-            return WorkspaceResolvedNote(
-                uri = Uri.fromFile(resolved),
-                name = resolved.name,
-                relative = boundaryPath.relativize(resolvedPath).toString().replace('\\', '/'),
-            )
+            cur = next
         }
+        if (!cur.isFile) continue
+        val resolved = runCatching { cur.canonicalFile }.getOrNull() ?: continue
+        val resolvedPath = resolved.toPath()
+        if (!resolvedPath.startsWith(boundaryPath)) {
+            throw WorkspaceLinkException("Linked note is outside the authorized folder.")
+        }
+        return WorkspaceResolvedNote(
+            uri = Uri.fromFile(resolved),
+            name = resolved.name,
+            relative = boundaryPath.relativize(resolvedPath).toString().replace('\\', '/'),
+        )
     }
     throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
 }
-
-internal data class WorkspaceCandidateBatch(
-    val candidates: List<WorkspaceResolvedNote>,
-    val fromCache: Boolean,
-    val topCandidateIsExactCase: Boolean,
-)
-
-internal data class LocalTreeProbeResult(
-    val matches: List<WorkspaceResolvedNote>,
-    val allParentDirsListed: Boolean,
-)
 
 private fun extensionPriority(extLower: String): Int {
     val idx = WORKSPACE_NOTE_EXTENSIONS.indexOf(extLower)
@@ -402,17 +350,6 @@ internal class WorkspaceLinkCache(
                 extractRelativeFromDocId(rootId, docId)?.takeIf { it.isNotEmpty() }?.let { return it }
             }
         }
-        if (!knownRelative.isNullOrBlank()) {
-            val knownParts = knownRelative.trim('/').split('/').filter { it.isNotEmpty() }
-            if (knownParts.isNotEmpty()) {
-                val probed = probeCandidateListsInTree(
-                    treeUri = treeUri,
-                    candidateLists = listOf(knownParts),
-                    includeFoldedPass = true,
-                )
-                probed.matches.firstOrNull { sameDocument(it.uri, noteUri) }?.let { return it.relative }
-            }
-        }
         val index = ensureIndexed(treeUri)
         if (!knownRelative.isNullOrBlank()) {
             val cleaned = knownRelative.trim('/')
@@ -420,83 +357,6 @@ internal class WorkspaceLinkCache(
             index.byRelativeLower[cleaned.lowercase()]?.takeIf { sameDocument(it.uri, noteUri) }?.let { return it.relative }
         }
         return index.entries.firstOrNull { sameDocument(it.uri, noteUri) }?.relative
-    }
-
-    /**
-     * Probes specific relative path candidates directly via `lister.listChildren` without scanning
-     * unrelated workspace directories. When `includeFoldedPass` is true, all `candidateLists` are
-     * evaluated for exact segment casing first before falling back to case-folded segment matching.
-     */
-    fun probeCandidateListsInTree(
-        treeUri: Uri,
-        candidateLists: List<List<String>>,
-        includeFoldedPass: Boolean,
-        dirMemo: MutableMap<String, List<WorkspaceTreeChild>?> = HashMap(),
-    ): LocalTreeProbeResult {
-        val rootDocId = runCatching { lister.rootDocumentId(treeUri) }.getOrNull()
-            ?: return LocalTreeProbeResult(emptyList(), allParentDirsListed = false)
-        val seen = LinkedHashMap<String, WorkspaceResolvedNote>()
-        var allListed = true
-
-        fun listDir(docId: String, depth: Int): List<WorkspaceTreeChild>? {
-            if (dirMemo.containsKey(docId)) return dirMemo[docId]
-            val listed = try {
-                lister.listChildren(treeUri, docId)
-                    .filter { child ->
-                        val n = child.name
-                        n.isNotBlank() && !n.startsWith('.') && !child.isVirtualOrLink &&
-                            !n.contains('/') && !n.contains('\\') && !n.contains('\u0000')
-                    }
-                    .sortedWith(compareBy<WorkspaceTreeChild> { it.name.lowercase() }.thenBy { it.name })
-            } catch (security: SecurityException) {
-                if (depth == 0) throw security
-                null
-            } catch (_: Exception) {
-                null
-            }
-            dirMemo[docId] = listed
-            return listed
-        }
-
-        val passes = if (includeFoldedPass) listOf(true, false) else listOf(true)
-        for (exactPass in passes) {
-            for (parts in candidateLists) {
-                if (parts.isEmpty() || parts.size - 1 > maxDepth) continue
-                var currentDocId = rootDocId
-                var relPrefix = ""
-                var failedListing = false
-                var matchedNote: WorkspaceResolvedNote? = null
-                for ((idx, segment) in parts.withIndex()) {
-                    val children = listDir(currentDocId, idx)
-                    if (children == null) {
-                        failedListing = true
-                        allListed = false
-                        break
-                    }
-                    val isLast = idx == parts.lastIndex
-                    val child = if (exactPass) {
-                        children.firstOrNull { it.name == segment && it.isDirectory != isLast }
-                    } else {
-                        children.firstOrNull { it.name == segment && it.isDirectory != isLast }
-                            ?: children.firstOrNull { it.name.equals(segment, ignoreCase = true) && it.isDirectory != isLast }
-                    } ?: break
-                    val currentRel = if (relPrefix.isEmpty()) child.name else "$relPrefix/${child.name}"
-                    if (!isLast) {
-                        currentDocId = child.documentId
-                        relPrefix = currentRel
-                    } else {
-                        val (_, ext) = splitWorkspaceNameAndExt(child.name)
-                        if (ext in WORKSPACE_NOTE_EXTENSIONS) {
-                            matchedNote = WorkspaceResolvedNote(child.uri, child.name, currentRel)
-                        }
-                    }
-                }
-                if (!failedListing && matchedNote != null) {
-                    seen.putIfAbsent(matchedNote.relative, matchedNote)
-                }
-            }
-        }
-        return LocalTreeProbeResult(seen.values.toList(), allListed)
     }
 
     fun resolve(
@@ -514,23 +374,6 @@ internal class WorkspaceLinkCache(
         wikilink: Boolean,
     ): List<WorkspaceResolvedNote> {
         val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
-        val batch = resolveCandidatesBatch(treeUri, noteRelative, rawTarget, wikilink)
-        if (batch.candidates.isNotEmpty()) return batch.candidates
-        val prefix = if (isExplicitRelativeWorkspaceTarget(cleaned, wikilink)) {
-            "Linked note not found"
-        } else {
-            "Note not found in folder"
-        }
-        throw WorkspaceLinkException("$prefix: ${Uri.decode(cleaned)}")
-    }
-
-    fun resolveCandidatesBatch(
-        treeUri: Uri,
-        noteRelative: String?,
-        rawTarget: String,
-        wikilink: Boolean,
-    ): WorkspaceCandidateBatch {
-        val cleaned = sanitizeWorkspaceLinkTarget(rawTarget)
         val noteParentDir = noteRelative?.let { if ('/' in it) it.substringBeforeLast('/') else "" }
         if (isExplicitRelativeWorkspaceTarget(cleaned, wikilink)) {
             if (noteRelative == null) {
@@ -538,20 +381,15 @@ internal class WorkspaceLinkCache(
             }
             val parentRelative = noteParentDir ?: ""
             val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
-            val (index, fromCache) = ensureIndexedWithState(treeUri)
+            val index = ensureIndexed(treeUri)
             val found = ArrayList<WorkspaceResolvedNote>(2)
-            var topIsExact = false
-            for (exactOnly in listOf(true, false)) {
-                for (parts in candidateLists) {
-                    resolveRelativeCandidate(index, parts.joinToString("/"), exactOnly = exactOnly)?.let { candidate ->
-                        if (found.none { it.relative == candidate.relative }) {
-                            if (found.isEmpty() && exactOnly) topIsExact = true
-                            found += candidate
-                        }
-                    }
+            for (parts in candidateLists) {
+                resolveRelativeCandidate(index, parts.joinToString("/"))?.let { candidate ->
+                    if (found.none { it.relative == candidate.relative }) found += candidate
                 }
             }
-            return WorkspaceCandidateBatch(found, fromCache, topIsExact)
+            if (found.isNotEmpty()) return found
+            throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
         }
 
         // Wikilink resolution (sibling, root, or ranked basename/subpath inside the granted folder)
@@ -560,7 +398,7 @@ internal class WorkspaceLinkCache(
         val queryLower = normalizedQuery.lowercase()
         val (_, queryExt) = splitWorkspaceNameAndExt(parts.last())
         val hasKnownNoteExt = queryExt in WORKSPACE_NOTE_EXTENSIONS
-        val (index, fromCache) = ensureIndexedWithState(treeUri)
+        val index = ensureIndexed(treeUri)
         val ordered = LinkedHashMap<String, WorkspaceResolvedNote>()
 
         if (noteParentDir != null) {
@@ -588,17 +426,8 @@ internal class WorkspaceLinkCache(
             }) {
                 ordered.putIfAbsent(entry.relative, entry.toResolved())
             }
-            val list = ordered.values.toList()
-            val topExact = list.firstOrNull()?.let { top ->
-                if (hasKnownNoteExt) {
-                    top.relative == normalizedQuery || top.relative.endsWith("/$normalizedQuery")
-                } else {
-                    val (stem, _) = splitWorkspaceNameAndExt(top.name)
-                    val topWithoutExt = if ('/' in top.relative) "${top.relative.substringBeforeLast('/')}/$stem" else stem
-                    topWithoutExt == normalizedQuery || topWithoutExt.endsWith("/$normalizedQuery")
-                }
-            } ?: false
-            return WorkspaceCandidateBatch(list, fromCache, topExact)
+            if (ordered.isNotEmpty()) return ordered.values.toList()
+            throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
         }
 
         val targetSegment = parts.single()
@@ -615,11 +444,8 @@ internal class WorkspaceLinkCache(
         }) {
             ordered.putIfAbsent(entry.relative, entry.toResolved())
         }
-        val list = ordered.values.toList()
-        val topExact = list.firstOrNull()?.let { top ->
-            if (hasKnownNoteExt) top.name == targetSegment else splitWorkspaceNameAndExt(top.name).first == targetSegment
-        } ?: false
-        return WorkspaceCandidateBatch(list, fromCache, topExact)
+        if (ordered.isNotEmpty()) return ordered.values.toList()
+        throw WorkspaceLinkException("Note not found in folder: ${Uri.decode(cleaned)}")
     }
 
     private fun resolveRelativeCandidate(
@@ -663,19 +489,16 @@ internal class WorkspaceLinkCache(
 
     private fun IndexedEntry.toResolved() = WorkspaceResolvedNote(uri = uri, name = name, relative = relative)
 
-    private fun ensureIndexed(treeUri: Uri): CachedTree =
-        ensureIndexedWithState(treeUri).first
-
-    private fun ensureIndexedWithState(treeUri: Uri): Pair<CachedTree, Boolean> {
+    private fun ensureIndexed(treeUri: Uri): CachedTree {
         val key = treeUri.toString()
         val now = clock()
-        cached?.takeIf { it.treeKey == key && now - it.builtAtMillis in 0..ttlMillis }?.let { return it to true }
+        cached?.takeIf { it.treeKey == key && now - it.builtAtMillis in 0..ttlMillis }?.let { return it }
         synchronized(lock) {
             val againNow = clock()
-            cached?.takeIf { it.treeKey == key && againNow - it.builtAtMillis in 0..ttlMillis }?.let { return it to true }
+            cached?.takeIf { it.treeKey == key && againNow - it.builtAtMillis in 0..ttlMillis }?.let { return it }
             val built = scanTree(treeUri, key, againNow)
             cached = built
-            return built to false
+            return built
         }
     }
 

@@ -242,6 +242,110 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             ):
                 self._verify_asset_skip_alias_rejection_and_mutation_visibility()
 
+    def test_cached_exact_nested_match_refreshes_when_higher_ranked_exact_target_added_externally(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir) / "Vault"
+            notes = root / "Notes"
+            archive = root / "Archive"
+            beta = root / "Beta"
+            deep = root / "Specs" / "Deep"
+            notes.mkdir(parents=True)
+            archive.mkdir(parents=True)
+            beta.mkdir(parents=True)
+            deep.mkdir(parents=True)
+            root = root.resolve()
+            notes = notes.resolve()
+            archive = archive.resolve()
+            beta = beta.resolve()
+            deep = deep.resolve()
+
+            source = notes / "Source.md"
+            source.write_text("# Source\n", encoding="utf-8")
+            deep_topic = deep / "Topic.md"
+            deep_topic.write_text("# Deep Exact Topic\n", encoding="utf-8")
+            deep_ext_smd = deep / "ExtRank.smd"
+            deep_ext_smd.write_text("# Deep Exact SMD\n", encoding="utf-8")
+            deep_subtick = deep / "SubTick.md"
+            deep_subtick.write_text("# Deep SubTick\n", encoding="utf-8")
+
+            cache = WorkspaceLinkCache(ttl_seconds=60.0)
+
+            # Warm cache with exact nested match at depth 2 and confirm warm-hit behavior.
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_topic,
+            )
+            _, from_cache = cache._scan_with_state(root)
+            self.assertTrue(from_cache)
+
+            # 1. Shallower exact match added externally in an existing folder beats cached depth-2 exact match.
+            specs_topic = root / "Specs" / "Topic.md"
+            specs_topic.write_text("# Shallower Specs Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                specs_topic.resolve(),
+            )
+
+            # 2. Alphabetically earlier exact match at same depth in an existing folder wins within TTL.
+            archive_topic = archive / "Topic.md"
+            archive_topic.write_text("# Archive Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                archive_topic,
+            )
+
+            # 3. Brand-new folder created externally with a higher-ranked exact target wins within TTL.
+            alpha = root / "Alpha"
+            alpha.mkdir()
+            alpha_topic = alpha / "Topic.md"
+            alpha_topic.write_text("# Alpha Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                alpha_topic.resolve(),
+            )
+
+            # 4. Higher-priority extension (.md ahead of cached .smd) in the same nested folder wins within TTL.
+            self.assertEqual(
+                resolve_workspace_link("ExtRank", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_ext_smd,
+            )
+            deep_ext_md = deep / "ExtRank.md"
+            deep_ext_md.write_text("# Deep Exact MD\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("ExtRank", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_ext_md,
+            )
+
+            # 5. Same-directory exact target added externally beats all cross-folder matches.
+            same_dir_topic = notes / "Topic.md"
+            same_dir_topic.write_text("# Same Dir Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                same_dir_topic,
+            )
+
+            # 6. Sub-tick / stale directory stat fallback: even if directory stat metadata stays unchanged
+            # (e.g. coarse filesystem clock tick), racy_entries detects the externally added exact target.
+            self.assertEqual(
+                resolve_workspace_link("SubTick", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_subtick,
+            )
+            frozen_beta_stat = beta.stat(follow_symlinks=False)
+            beta_subtick = beta / "SubTick.md"
+            beta_subtick.write_text("# Shallower Beta SubTick\n", encoding="utf-8")
+            real_stat = Path.stat
+
+            def stale_beta_stat(self_path: Path, *, follow_symlinks: bool = True):
+                if self_path == beta:
+                    return frozen_beta_stat
+                return real_stat(self_path, follow_symlinks=follow_symlinks)
+
+            with mock.patch.object(Path, "stat", stale_beta_stat):
+                self.assertEqual(
+                    resolve_workspace_link("SubTick", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    beta_subtick,
+                )
+
     def test_case_insensitive_fs_preserves_exact_case_ranking_and_invalidates_across_case_variants(self):
         with tempfile.TemporaryDirectory() as root_dir:
             root = Path(root_dir).resolve() / "Vault"
@@ -639,6 +743,77 @@ class StudioOpenTabJumpTest(unittest.TestCase):
         self.assertEqual(len(studio.tabs), tab_count)
         self.assertEqual(studio.active, first_tab_id)
         self.assertEqual(studio._current()["content"], "# First (unsaved draft)\n")
+
+    def test_external_higher_ranked_exact_target_supersedes_cached_nested_tab_without_losing_dirty_draft(self):
+        vault = (self.studio.data / "ranked_vault").resolve()
+        notes = vault / "Notes"
+        archive = vault / "Archive"
+        deep = vault / "Specs" / "Deep"
+        notes.mkdir(parents=True, exist_ok=True)
+        archive.mkdir(parents=True, exist_ok=True)
+        deep.mkdir(parents=True, exist_ok=True)
+
+        index_note = notes / "Index.md"
+        index_note.write_text("# Index\n\nSee [[Topic]]\n", encoding="utf-8")
+        deep_topic = deep / "Topic.md"
+        deep_topic.write_text("# Deep Topic\n", encoding="utf-8")
+
+        studio = self.studio
+        studio.ready = True
+        studio.settings["autosave"] = False
+        replies = []
+        studio.replied.connect(lambda req_id, res, err: replies.append((req_id, res, err)))
+
+        studio.openFolder(str(vault))
+        studio.openNote(str(index_note))
+        self._wait_until(lambda: studio._current()["path"] == str(index_note))
+
+        # Populate warm cache with nested exact match Specs/Deep/Topic.md and mark its open tab dirty.
+        replies.clear()
+        studio.post("rank-1", "open_workspace_link", json.dumps({
+            "documentPath": str(index_note),
+            "target": "Topic",
+            "wikilink": True,
+        }))
+        self._wait_until(lambda: any(r[0] == "rank-1" for r in replies))
+        self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == "rank-1"))["opened"])
+        self.assertEqual(studio._current()["path"], str(deep_topic))
+        deep_tab_id = studio.active
+        studio.post("dirty-deep", "document_changed", json.dumps({
+            "id": deep_tab_id,
+            "content": "# Deep Topic (unsaved draft)\n",
+        }))
+
+        # Externally add a higher-ranked shallower exact target Archive/Topic.md without calling invalidate().
+        archive_topic = archive / "Topic.md"
+        archive_topic.write_text("# Archive Topic\n", encoding="utf-8")
+
+        replies.clear()
+        studio.post("rank-2", "open_workspace_link", json.dumps({
+            "documentPath": str(index_note),
+            "target": "Topic",
+            "wikilink": True,
+        }))
+        self._wait_until(lambda: any(r[0] == "rank-2" for r in replies))
+        self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == "rank-2"))["opened"])
+        self.assertEqual(studio._current()["path"], str(archive_topic))
+        self.assertEqual(studio.recent[0], str(archive_topic))
+
+        # Previously open Specs/Deep/Topic.md tab retains its dirty draft and can still be focused by subpath.
+        deep_tab = next(t for t in studio.tabs if t["id"] == deep_tab_id)
+        self.assertEqual(deep_tab["content"], "# Deep Topic (unsaved draft)\n")
+
+        tab_count = len(studio.tabs)
+        replies.clear()
+        studio.post("rank-3", "open_workspace_link", json.dumps({
+            "documentPath": str(index_note),
+            "target": "Specs/Deep/Topic",
+            "wikilink": True,
+        }))
+        self._wait_until(lambda: any(r[0] == "rank-3" for r in replies))
+        self.assertEqual(len(studio.tabs), tab_count)
+        self.assertEqual(studio.active, deep_tab_id)
+        self.assertEqual(studio._current()["content"], "# Deep Topic (unsaved draft)\n")
 
     @unittest.skipIf(workspace_links._fcntl is None, "POSIX fcntl.fcntl FCNTL_BUFSZ test")
     def test_darwin_studio_rejects_traversal_and_symlinks_and_runs_folder_hooks_without_fcntl_error(self):

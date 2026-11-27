@@ -2457,31 +2457,22 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             resolver.openInputStream(target) ?: error("Document permission is unavailable; choose it again")
         }
         return inputStream.use { stream ->
-            readNoteFromOpenStream(target, relative, stream)
-        }
-    }
-    private fun readNoteFromOpenStream(
-        target: Uri,
-        relative: String?,
-        stream: java.io.InputStream,
-        resolvedName: String? = null,
-    ): Note {
-        val name = resolvedName?.takeIf(String::isNotBlank)
-            ?: resolveDisplayName(target)
-            ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
-            ?: "Note.md"
-        val buffered = stream.buffered()
-        buffered.mark(65536)
-        val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
-        val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
-        val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
-        return if (portable) {
-            val opened = media.openFmd(buffered)
-            Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
-                .also { recordPortableBaseline(it.id, opened.directory) }
-        } else {
-            val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
-            Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
+            val name = resolveDisplayName(target)
+                ?: relative?.substringAfterLast('/')?.takeIf(String::isNotBlank)
+                ?: "Note.md"
+            val buffered = stream.buffered()
+            buffered.mark(65536)
+            val prefix = ByteArray(32768); val count = buffered.read(prefix); buffered.reset()
+            val header = if (count > 0) String(prefix, 0, count, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\n', '\r', '\t') else ""
+            val portable = portableGzipHeader(prefix.copyOfRange(0, maxOf(count, 0))) || portableEnvelopeHeader(header)
+            if (portable) {
+                val opened = media.openFmd(buffered)
+                Note(name = name, uri = target.toString(), content = opened.markdown, saved = opened.markdown, relative = relative, assetDirectory = opened.directory)
+                    .also { recordPortableBaseline(it.id, opened.directory) }
+            } else {
+                val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
+            }
         }
     }
     private fun retainOpenedNote(note: Note, activate: Boolean, headingFragment: String? = null): String {
@@ -2508,14 +2499,13 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         externalIntentFlags: Int? = null,
         externalCaller: ExternalIntentCaller = ExternalIntentCaller(),
         request: Long = openRequests.begin(),
-        preloadedNote: Note? = null,
     ): JSONObject {
         val requestedHeading = headingFragment?.trim()?.takeIf { it.isNotEmpty() }
         val wasBlockedInitially = writeIsBlocked(uri.toString()) ||
             mutable.value.tabs.any { it.uri != null && sameDocumentUri(it.uri, uri.toString()) && writeIsBlocked(it.uri) }
         try {
             val (note, writeOpenState) = withContext(Dispatchers.IO) {
-                var loaded = preloadedNote ?: loadNoteForOpen(uri, relative, externalIntentFlags, externalCaller)
+                var loaded = loadNoteForOpen(uri, relative, externalIntentFlags, externalCaller)
                 val loadedUriStr = loaded.uri
                 val parsedLoaded = loadedUriStr?.let(Uri::parse)
                 val wasBlocked = wasBlockedInitially || writeIsBlocked(uri.toString()) || (loadedUriStr != null && writeIsBlocked(loadedUriStr))
@@ -4110,12 +4100,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
 
     private class PromptWorkspaceNoteAccessException(val targetUri: Uri) : Exception()
 
-    private data class PreparedWorkspaceNavigation(
-        val resolved: WorkspaceResolvedNote,
-        val preloadedNote: Note? = null,
-        val request: Long? = null,
-    )
-
     suspend fun openWorkspaceLink(
         documentPath: String,
         target: String,
@@ -4150,299 +4134,24 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
 
         val sourceUri = rawNoteUri?.takeIf { it.isNotBlank() }?.let(Uri::parse)
-        val prepared = try {
+        val resolved = try {
             withContext(Dispatchers.IO) {
                 val cleaned = sanitizeWorkspaceLinkTarget(trimmedTarget)
                 if (sourceUri != null && sourceUri.scheme == "file") {
-                    val localResolved = resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
-                    return@withContext PreparedWorkspaceNavigation(localResolved)
+                    return@withContext resolveLocalFileWorkspaceLink(sourceUri, cleaned, wikilink)!!
                 }
-
-                fun openSingleStreamCandidate(
-                    rawUri: Uri,
-                    expectedName: String,
-                    relative: String,
-                    confirmTreeChild: Boolean,
-                    requireExactDisplayName: Boolean = false,
-                    onCaseMismatch: ((Uri, String) -> Unit)? = null,
-                    onDenied: ((Uri) -> Unit)? = null,
-                ): PreparedWorkspaceNavigation? {
-                    if (confirmTreeChild) {
-                        canonicalTreeDocumentKey(rawUri)?.let(confirmedTreeDocumentKeys::add)
-                    }
-                    val targetUri = documentAccess.resolve(rawUri)
-                    if (!documentAccess.hasReadGrant(targetUri)) {
-                        onDenied?.invoke(targetUri)
-                        return null
-                    }
-                    val actualDisplayName = if (requireExactDisplayName) resolveDisplayName(targetUri) else null
-                    if (requireExactDisplayName && actualDisplayName != null && actualDisplayName != expectedName) {
-                        if (actualDisplayName.equals(expectedName, ignoreCase = true)) {
-                            onCaseMismatch?.invoke(targetUri, actualDisplayName)
-                        }
-                        return null
-                    }
-                    val stream = try {
-                        resolver.openInputStream(targetUri)
-                    } catch (_: java.io.FileNotFoundException) {
-                        return null
-                    } catch (error: Exception) {
-                        if (isDocumentAccessFailure(error)) {
-                            onDenied?.invoke(targetUri)
-                            return null
-                        }
-                        throw error
-                    } ?: return null
-
-                    val openRequest = openRequests.begin()
-                    val loadedNote = stream.use { openStream ->
-                        documentAccess.persist(targetUri)
-                        val existing = mutable.value.tabs.find {
-                            it.uri?.let { existingRaw ->
-                                sameDocumentUri(existingRaw, targetUri.toString()) ||
-                                    sameDocumentUri(existingRaw, rawUri.toString())
-                            } == true
-                        }
-                        if (existing != null) {
-                            val keepExistingUri = existing.uri != null &&
-                                DocumentsContract.isTreeUri(targetUri) &&
-                                documentAccess.resolveReadAccess(targetUri) is SafReadAccess.PendingTreeMembership
-                            existing.copy(
-                                uri = if (keepExistingUri) existing.uri else targetUri.toString(),
-                                relative = relative.ifEmpty { null } ?: existing.relative,
-                            )
-                        } else {
-                            readNoteFromOpenStream(
-                                target = targetUri,
-                                relative = relative.ifEmpty { null },
-                                stream = openStream,
-                                resolvedName = actualDisplayName ?: expectedName.takeIf { confirmTreeChild && it.isNotBlank() },
-                            )
-                        }
-                    }
-                    return PreparedWorkspaceNavigation(
-                        resolved = WorkspaceResolvedNote(targetUri, actualDisplayName ?: expectedName, relative),
-                        preloadedNote = loadedNote,
-                        request = openRequest,
-                    )
-                }
-
-                fun openTabRelativeInTree(tab: Note, folderUri: Uri, rootId: String): String? {
-                    val raw = tab.uri?.takeIf { it.isNotBlank() } ?: return null
-                    val tabUri = runCatching { Uri.parse(raw) }.getOrNull() ?: return null
-                    if (tabUri.scheme != "content" || tabUri.authority != folderUri.authority) return null
-                    relativeInOpenFolder(tabUri, folderUri.toString())?.let { return it }
-                    val docId = runCatching { DocumentsContract.getDocumentId(tabUri) }.getOrNull() ?: return null
-                    if (isKnownPathDocumentProvider(folderUri.authority)) {
-                        if (isKnownPathContainedInTree(folderUri.authority, rootId, docId)) {
-                            extractRelativeFromDocId(rootId, docId)?.takeIf { it.isNotEmpty() }?.let { return it }
-                        }
-                        return null
-                    }
-                    val authority = folderUri.authority?.takeIf { it.isNotEmpty() } ?: return null
-                    val canonicalTree = DocumentsContract.buildTreeDocumentUri(authority, rootId)
-                    if (isConfirmedTreeChild(canonicalTree, docId)) {
-                        tab.relative?.let(::normalizeRelativePath)?.takeIf { it.isNotEmpty() }?.let { return it }
-                        if (DocumentsContract.isTreeUri(tabUri) &&
-                            runCatching { DocumentsContract.getTreeDocumentId(tabUri) }.getOrNull() == rootId
+                fun firstReadableRankedCandidate(candidates: List<WorkspaceResolvedNote>): WorkspaceResolvedNote? {
+                    for (candidate in candidates) {
+                        canonicalTreeDocumentKey(candidate.uri)?.let(confirmedTreeDocumentKeys::add)
+                        val targetUri = documentAccess.resolve(candidate.uri)
+                        if (documentAccess.hasReadGrant(targetUri) &&
+                            runCatching { resolver.openInputStream(targetUri)?.use { true } == true }.getOrDefault(false)
                         ) {
-                            extractRelativeFromDocId(rootId, docId)?.takeIf { it.isNotEmpty() }?.let { return it }
+                            return candidate.copy(uri = targetUri)
                         }
                     }
                     return null
                 }
-
-                fun resolveInGrantedTree(treeMatch: SafTreeMatch, noteRel: String?): PreparedWorkspaceNavigation {
-                    val dirMemo = HashMap<String, List<WorkspaceTreeChild>?>()
-                    val openTabs = mutable.value.tabs
-                    if (explicitRelative) {
-                        val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
-                        val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink = false)
-
-                        // Stage 1A: Exact-case open-tab fast path on highest-priority candidate.
-                        val topParts = candidateLists.first()
-                        val topRel = topParts.joinToString("/")
-                        openTabs.firstOrNull { openTabRelativeInTree(it, treeMatch.folderUri, treeMatch.rootId) == topRel }?.let { tab ->
-                            val tabUri = Uri.parse(tab.uri!!)
-                            openSingleStreamCandidate(
-                                rawUri = tabUri,
-                                expectedName = topParts.last(),
-                                relative = topRel,
-                                confirmTreeChild = false,
-                                requireExactDisplayName = true,
-                            )?.let { return it }
-                        }
-
-                        // Stage 1B: Targeted local directory probe (exact-case pass before folded pass).
-                        var deniedTreeCandidate: Uri? = null
-                        val localProbe = workspaceLinks.probeCandidateListsInTree(
-                            treeUri = treeMatch.folderUri,
-                            candidateLists = candidateLists,
-                            includeFoldedPass = true,
-                            dirMemo = dirMemo,
-                        )
-                        for (candidate in localProbe.matches) {
-                            openSingleStreamCandidate(
-                                rawUri = candidate.uri,
-                                expectedName = candidate.name,
-                                relative = candidate.relative,
-                                confirmTreeChild = true,
-                                onDenied = { denied -> if (deniedTreeCandidate == null) deniedTreeCandidate = denied },
-                            )?.let { return it }
-                        }
-
-                        if (!localProbe.allParentDirsListed) {
-                            val foldedTreeFallbacks = ArrayList<Triple<Uri, String, String>>()
-                            for (parts in candidateLists) {
-                                val relJoined = parts.joinToString("/")
-                                val indexedUri = try {
-                                    readerFolderIndex.resolve(resolver, sourceNote.id, treeMatch.folderUri, treeMatch.rootId, parts).uri
-                                } catch (_: LinkedAssetAccessRequiredException) {
-                                    null
-                                } catch (_: SecurityException) {
-                                    null
-                                } catch (_: UnsupportedOperationException) {
-                                    null
-                                } catch (_: java.io.FileNotFoundException) {
-                                    null
-                                }
-                                if (indexedUri != null) {
-                                    openSingleStreamCandidate(
-                                        rawUri = indexedUri,
-                                        expectedName = parts.last(),
-                                        relative = relJoined,
-                                        confirmTreeChild = true,
-                                        onDenied = { denied -> if (deniedTreeCandidate == null) deniedTreeCandidate = denied },
-                                    )?.let { return it }
-                                }
-                                val candidateDocId = if (treeMatch.rootId.endsWith(':')) {
-                                    "${treeMatch.rootId}$relJoined"
-                                } else {
-                                    "${treeMatch.rootId.trimEnd('/')}/$relJoined"
-                                }
-                                val candidateTreeUri = DocumentsContract.buildDocumentUriUsingTree(treeMatch.folderUri, candidateDocId)
-                                openSingleStreamCandidate(
-                                    rawUri = candidateTreeUri,
-                                    expectedName = parts.last(),
-                                    relative = relJoined,
-                                    confirmTreeChild = false,
-                                    requireExactDisplayName = true,
-                                    onCaseMismatch = { uri, actualName -> foldedTreeFallbacks += Triple(uri, actualName, relJoined) },
-                                    onDenied = { denied -> if (deniedTreeCandidate == null) deniedTreeCandidate = denied },
-                                )?.let { return it }
-                            }
-                            for ((foldedUri, actualName, relJoined) in foldedTreeFallbacks) {
-                                openSingleStreamCandidate(
-                                    rawUri = foldedUri,
-                                    expectedName = actualName,
-                                    relative = relJoined,
-                                    confirmTreeChild = false,
-                                    onDenied = { denied -> if (deniedTreeCandidate == null) deniedTreeCandidate = denied },
-                                )?.let { return it }
-                            }
-                        }
-
-                        if (deniedTreeCandidate != null) {
-                            throw PromptWorkspaceNoteAccessException(deniedTreeCandidate!!)
-                        }
-                        throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
-                    }
-
-                    // Wikilink resolution inside granted SAF tree:
-                    val parts = workspaceRelativePathParts("", cleaned)
-                    val noteParentDir = noteRel?.let { if ('/' in it) it.substringBeforeLast('/') else "" }
-                    val (_, queryExt) = splitWorkspaceNameAndExt(parts.last())
-                    val hasKnownExt = queryExt in WORKSPACE_NOTE_EXTENSIONS
-
-                    fun expandExactParts(prefixDir: String): List<List<String>> {
-                        val base = if (prefixDir.isEmpty()) parts else prefixDir.split('/').filter { it.isNotEmpty() } + parts
-                        return if (hasKnownExt) {
-                            listOf(base)
-                        } else {
-                            WORKSPACE_NOTE_EXTENSIONS.map { ext -> base.dropLast(1) + "${base.last()}.$ext" }
-                        }
-                    }
-
-                    // Stage 1A: Exact-case open-tab probe on the strictly top-ranked target path.
-                    val topExactDir = noteParentDir ?: ""
-                    val topExactParts = expandExactParts(topExactDir).first()
-                    val topExactRel = topExactParts.joinToString("/")
-                    openTabs.firstOrNull { openTabRelativeInTree(it, treeMatch.folderUri, treeMatch.rootId) == topExactRel }?.let { tab ->
-                        val tabUri = Uri.parse(tab.uri!!)
-                        openSingleStreamCandidate(
-                            rawUri = tabUri,
-                            expectedName = topExactParts.last(),
-                            relative = topExactRel,
-                            confirmTreeChild = false,
-                            requireExactDisplayName = true,
-                        )?.let { return it }
-                    }
-
-                    // Stage 1B: Exact-case local sibling probe, then workspace-root probe before full-tree scan.
-                    val localProbeScopes = buildList {
-                        if (noteParentDir != null) add(expandExactParts(noteParentDir))
-                        if (noteParentDir == null || noteParentDir.isNotEmpty()) add(expandExactParts(""))
-                    }
-                    for (scopeCandidates in localProbeScopes) {
-                        val localExactProbe = workspaceLinks.probeCandidateListsInTree(
-                            treeUri = treeMatch.folderUri,
-                            candidateLists = scopeCandidates,
-                            includeFoldedPass = false,
-                            dirMemo = dirMemo,
-                        )
-                        for (candidate in localExactProbe.matches) {
-                            openSingleStreamCandidate(
-                                rawUri = candidate.uri,
-                                expectedName = candidate.name,
-                                relative = candidate.relative,
-                                confirmTreeChild = true,
-                            )?.let { return it }
-                        }
-                    }
-
-                    // Stage 2: Bounded cached workspace tree scan (with automatic fresh rescan on stale/mutated cache).
-                    val batch = workspaceLinks.resolveCandidatesBatch(
-                        treeUri = treeMatch.folderUri,
-                        noteRelative = noteRel,
-                        rawTarget = cleaned,
-                        wikilink = true,
-                    )
-                    var needFreshRescan = batch.fromCache && (batch.candidates.isEmpty() || !batch.topCandidateIsExactCase)
-                    if (!needFreshRescan) {
-                        for (candidate in batch.candidates) {
-                            openSingleStreamCandidate(
-                                rawUri = candidate.uri,
-                                expectedName = candidate.name,
-                                relative = candidate.relative,
-                                confirmTreeChild = true,
-                                requireExactDisplayName = batch.fromCache,
-                            )?.let { return it }
-                            if (batch.fromCache) {
-                                needFreshRescan = true
-                                break
-                            }
-                        }
-                    }
-                    if (needFreshRescan) {
-                        workspaceLinks.invalidate()
-                        val freshBatch = workspaceLinks.resolveCandidatesBatch(
-                            treeUri = treeMatch.folderUri,
-                            noteRelative = noteRel,
-                            rawTarget = cleaned,
-                            wikilink = true,
-                        )
-                        for (candidate in freshBatch.candidates) {
-                            openSingleStreamCandidate(
-                                rawUri = candidate.uri,
-                                expectedName = candidate.name,
-                                relative = candidate.relative,
-                                confirmTreeChild = true,
-                            )?.let { return it }
-                        }
-                    }
-                    throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
-                }
-
                 val treeMatch = when {
                     sourceUri != null -> findSafTree(sourceUri, allowEmbeddedTreeFallback = true)
                         ?: run {
@@ -4460,14 +4169,76 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     else -> null
                 }
                 if (treeMatch != null) {
-                    val noteRel = if (sourceUri == null) null else treeMatch.relativePath
-                    return@withContext resolveInGrantedTree(treeMatch, noteRel)
+                    if (!explicitRelative) {
+                        val noteRel = if (sourceUri == null) null else treeMatch.relativePath
+                        val ranked = runCatching {
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = noteRel, rawTarget = cleaned, wikilink = true)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(ranked)?.let { return@withContext it }
+                    }
+                    val parentRelative = treeMatch.relativePath.substringBeforeLast('/', "")
+                    val candidateLists = expandWorkspaceCandidatePaths(parentRelative, cleaned, wikilink)
+                    var deniedTreeCandidate: Uri? = null
+                    for (parts in candidateLists) {
+                        val relJoined = parts.joinToString("/")
+                        val indexedUri = try {
+                            readerFolderIndex.resolve(resolver, sourceNote.id, treeMatch.folderUri, treeMatch.rootId, parts).uri
+                        } catch (_: LinkedAssetAccessRequiredException) {
+                            null
+                        } catch (_: SecurityException) {
+                            null
+                        } catch (_: UnsupportedOperationException) {
+                            null
+                        } catch (_: java.io.FileNotFoundException) {
+                            null
+                        }
+                        if (indexedUri != null) {
+                            canonicalTreeDocumentKey(indexedUri)?.let(confirmedTreeDocumentKeys::add)
+                            val targetUri = documentAccess.resolve(indexedUri)
+                            return@withContext WorkspaceResolvedNote(targetUri, parts.last(), relJoined)
+                        }
+                        val candidateDocId = if (treeMatch.rootId.endsWith(':')) {
+                            "${treeMatch.rootId}$relJoined"
+                        } else {
+                            "${treeMatch.rootId.trimEnd('/')}/$relJoined"
+                        }
+                        val candidateUri = documentAccess.resolve(
+                            DocumentsContract.buildDocumentUriUsingTree(treeMatch.folderUri, candidateDocId),
+                        )
+                        if (!documentAccess.hasReadGrant(candidateUri)) {
+                            if (deniedTreeCandidate == null) deniedTreeCandidate = candidateUri
+                            continue
+                        }
+                        val readable = try {
+                            resolver.openInputStream(candidateUri)?.use { true } == true
+                        } catch (_: java.io.FileNotFoundException) {
+                            false
+                        } catch (error: Exception) {
+                            if (isDocumentAccessFailure(error) && deniedTreeCandidate == null) {
+                                deniedTreeCandidate = candidateUri
+                            }
+                            false
+                        }
+                        if (readable) {
+                            return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                        }
+                    }
+                    if (explicitRelative && sourceUri != null) {
+                        val rankedRel = runCatching {
+                            workspaceLinks.resolveCandidates(treeMatch.folderUri, noteRelative = treeMatch.relativePath, rawTarget = cleaned, wikilink = false)
+                        }.getOrDefault(emptyList())
+                        firstReadableRankedCandidate(rankedRel)?.let { return@withContext it }
+                    }
+                    if (deniedTreeCandidate != null) {
+                        throw PromptWorkspaceNoteAccessException(deniedTreeCandidate)
+                    }
+                    throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
                 }
                 if (!explicitRelative && openFolder != null) {
-                    val openTreeMatch = SafTreeMatch(openFolder, DocumentsContract.getTreeDocumentId(openFolder), "")
-                    runCatching { resolveInGrantedTree(openTreeMatch, noteRel = null) }.getOrNull()?.let {
-                        return@withContext it
-                    }
+                    val ranked = runCatching {
+                        workspaceLinks.resolveCandidates(openFolder, noteRelative = null, rawTarget = cleaned, wikilink = true)
+                    }.getOrDefault(emptyList())
+                    firstReadableRankedCandidate(ranked)?.let { return@withContext it }
                 }
 
                 val nonNullSourceUri = sourceUri ?: throw WorkspaceLinkException("Save this note before opening linked notes.")
@@ -4476,17 +4247,16 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                 val sep = maxOf(documentId.lastIndexOf('/'), documentId.lastIndexOf(':'))
 
                 linkedAssetUri(sourceNote, cleaned)?.let { grantedUri ->
-                    val firstParts = candidateLists.first()
-                    openSingleStreamCandidate(
-                        rawUri = grantedUri,
-                        expectedName = firstParts.last(),
-                        relative = firstParts.joinToString("/"),
-                        confirmTreeChild = false,
-                    )?.let { return@withContext it }
+                    val resolvedGranted = documentAccess.resolve(grantedUri)
+                    val grantedReadable = documentAccess.hasReadGrant(resolvedGranted) &&
+                        runCatching { resolver.openInputStream(resolvedGranted)?.use { true } == true }.getOrDefault(false)
+                    if (grantedReadable) {
+                        val firstParts = candidateLists.first()
+                        return@withContext WorkspaceResolvedNote(resolvedGranted, firstParts.last(), firstParts.joinToString("/"))
+                    }
                 }
 
                 var deniedCandidate: Uri? = null
-                val foldedStandaloneFallbacks = ArrayList<Triple<Uri, String, String>>()
                 for (parts in candidateLists) {
                     val relJoined = parts.joinToString("/")
                     val siblingDocId = if (sep >= 0) documentId.substring(0, sep + 1) + relJoined else relJoined
@@ -4498,30 +4268,30 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
                     val openMatch = mutable.value.tabs.firstOrNull { tab ->
                         tab.uri?.let { existingUri -> sameDocumentUri(existingUri, rawCandidate.toString()) } == true
                     }?.uri?.let(Uri::parse)
-                    openSingleStreamCandidate(
-                        rawUri = openMatch ?: rawCandidate,
-                        expectedName = parts.last(),
-                        relative = relJoined,
-                        confirmTreeChild = false,
-                        requireExactDisplayName = true,
-                        onCaseMismatch = { uri, actualName -> foldedStandaloneFallbacks += Triple(uri, actualName, relJoined) },
-                        onDenied = { denied -> if (deniedCandidate == null) deniedCandidate = denied },
-                    )?.let { return@withContext it }
-                }
-                for ((foldedUri, actualName, relJoined) in foldedStandaloneFallbacks) {
-                    openSingleStreamCandidate(
-                        rawUri = foldedUri,
-                        expectedName = actualName,
-                        relative = relJoined,
-                        confirmTreeChild = false,
-                        onDenied = { denied -> if (deniedCandidate == null) deniedCandidate = denied },
-                    )?.let { return@withContext it }
+                    val candidateUri = documentAccess.resolve(openMatch ?: rawCandidate)
+                    if (!documentAccess.hasReadGrant(candidateUri)) {
+                        if (deniedCandidate == null) deniedCandidate = candidateUri
+                        continue
+                    }
+                    val readable = try {
+                        resolver.openInputStream(candidateUri)?.use { true } == true
+                    } catch (_: java.io.FileNotFoundException) {
+                        false
+                    } catch (error: Exception) {
+                        if (isDocumentAccessFailure(error) && deniedCandidate == null) {
+                            deniedCandidate = candidateUri
+                        }
+                        false
+                    }
+                    if (readable) {
+                        return@withContext WorkspaceResolvedNote(candidateUri, parts.last(), relJoined)
+                    }
                 }
                 if (!explicitRelative) {
                     return@withContext null
                 }
                 if (deniedCandidate != null) {
-                    throw PromptWorkspaceNoteAccessException(deniedCandidate!!)
+                    throw PromptWorkspaceNoteAccessException(deniedCandidate)
                 }
                 throw WorkspaceLinkException("Linked note not found: ${Uri.decode(cleaned)}")
             }
@@ -4540,12 +4310,9 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             val msg = error.message ?: "Invalid relative note path."
             mutable.value = mutable.value.copy(busy = false, message = msg)
             return JSONObject().put("opened", false).put("message", msg)
-        } catch (error: Exception) {
-            val msg = "Could not open linked note: ${error.message}".also(::fail)
-            return JSONObject().put("opened", false).put("message", msg)
         }
 
-        if (prepared == null) {
+        if (resolved == null) {
             val notice = if (allowFolderPrompt) {
                 "Folder permission is needed to follow links from ${sourceNote.name}. Choose its containing folder."
             } else {
@@ -4566,14 +4333,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
 
         return openNoteInternal(
-            prepared.resolved.uri,
-            prepared.resolved.relative,
+            resolved.uri,
+            resolved.relative,
             headingFragment = trimmedFragment,
             scheduleDirtyAutosave = true,
             alwaysReportError = true,
             errorPrefix = "Could not open linked note",
-            request = prepared.request ?: openRequests.begin(),
-            preloadedNote = prepared.preloadedNote,
         )
     }
 

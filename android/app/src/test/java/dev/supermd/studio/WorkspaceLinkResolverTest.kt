@@ -13,12 +13,7 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.lifecycle.ViewModelStore
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -211,238 +206,6 @@ class WorkspaceLinkResolverTest {
         assertEquals("Deep Section", model.state.value.pendingHeading?.heading)
     }
 
-    @Test
-    fun stagedOpenTabAndLocalPathProbesSkipFullTreeScanAndAvoidDuplicateStreamOpens() {
-        // Build a 24-note + 240-PNG workspace to verify local/open-tab probes avoid full scans and duplicate opens.
-        // Fixture already has 3 notes (Index.md, Specs/Sub Note.md, Specs/Bundle.smd); add 21 more across 7 folders.
-        for (i in 0 until 21) {
-            val section = File(root, "Section%02d".format(i % 7)).apply { mkdirs() }
-            File(section, "Note%02d.md".format(i)).writeText("# Note $i\n")
-        }
-        val assetsDir = File(root, "assets").apply { mkdirs() }
-        for (i in 0 until 240) {
-            File(assetsDir, "img_%03d.png".format(i)).writeBytes(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47))
-        }
-
-        val model = newModel()
-        val treeUri = DocumentsContract.buildTreeDocumentUri(authority, "vault")
-        grantTreeReadWrite(treeUri)
-        val indexTreeDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Index.md")
-        val subTreeDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Specs/Sub Note.md")
-
-        model.setFolder(treeUri)
-        await { model.state.value.folder == treeUri.toString() }
-        model.open(indexTreeDocUri)
-        await { model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), indexTreeDocUri) } }
-        val indexTab = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), indexTreeDocUri) }
-        model.edit(indexTab.id, "# Dirty Index Draft\n")
-
-        // Stage 1B (cold wikilink subpath to unopened note): queries only root + Specs, 0 asset/unrelated folder queries, 1 stream open.
-        model.workspaceLinks.invalidate()
-        provider.resetTelemetry()
-        val coldSubOpen = callSuspend {
-            model.openWorkspaceLink(indexTab.uri!!, "Specs/Sub Note", "Deep Section", wikilink = true)
-        }
-        assertTrue(coldSubOpen.getBoolean("opened"))
-        assertEquals(setOf("vault", "vault/Specs"), provider.childDirectoryQueries.toSet())
-        assertFalse(provider.childDirectoryQueries.any { it.contains("assets") || it.contains("Section") })
-        assertEquals(listOf("vault/Specs/Sub Note.md"), provider.openedDocumentIds.toList())
-        val subTab = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), subTreeDocUri) }
-        assertEquals(subTab.id, model.state.value.activeId)
-
-        // Stage 1A (explicit relative to open tab): 0 child-directory queries, 1 stream open, dirty draft preserved.
-        model.workspaceLinks.invalidate()
-        provider.resetTelemetry()
-        val backToIndex = callSuspend {
-            model.openWorkspaceLink(subTab.uri!!, "../Index.md", "", wikilink = false)
-        }
-        assertTrue(backToIndex.getBoolean("opened"))
-        assertEquals(emptyList<String>(), provider.childDirectoryQueries.toList())
-        assertEquals(listOf("vault/Index.md"), provider.openedDocumentIds.toList())
-        assertEquals(indexTab.id, model.state.value.activeId)
-        assertEquals("# Dirty Index Draft\n", model.state.value.active.content)
-
-        // Stage 1A (wikilink subpath to confirmed open tab): 0 child-directory queries, 1 stream open.
-        model.workspaceLinks.invalidate()
-        provider.resetTelemetry()
-        val jumpToOpenSub = callSuspend {
-            model.openWorkspaceLink(indexTab.uri!!, "Specs/Sub Note", "Deep Section", wikilink = true)
-        }
-        assertTrue(jumpToOpenSub.getBoolean("opened"))
-        assertEquals(emptyList<String>(), provider.childDirectoryQueries.toList())
-        assertEquals(listOf("vault/Specs/Sub Note.md"), provider.openedDocumentIds.toList())
-        assertEquals(subTab.id, model.state.value.activeId)
-
-        // Stage 1B (local sibling wikilink to unopened .smd): queries only root + Specs, 0 asset/unrelated folder queries, 1 stream open.
-        model.workspaceLinks.invalidate()
-        provider.resetTelemetry()
-        val siblingBundle = callSuspend {
-            model.openWorkspaceLink(subTab.uri!!, "Bundle", "", wikilink = true)
-        }
-        assertTrue(siblingBundle.getBoolean("opened"))
-        assertEquals(setOf("vault", "vault/Specs"), provider.childDirectoryQueries.toSet())
-        assertFalse(provider.childDirectoryQueries.any { it.contains("assets") || it.contains("Section") })
-        assertEquals(listOf("vault/Specs/Bundle.smd"), provider.openedDocumentIds.toList())
-    }
-
-    @Test
-    fun stagedProbesPreserveExactCasePriorityOverFoldedSiblingAndOpenTabsAcrossAllModes() {
-        File(root, "Archive").mkdirs()
-        File(root, "Archive/Topic.md").writeText("# Exact Archive Topic\n")
-        File(root, "Specs/Deep").mkdirs()
-        File(root, "Specs/Deep/Sub.md").writeText("# Sub\n")
-        File(root, "Specs/Deep/topic.md").writeText("# Folded Sibling Topic\n")
-
-        val model = newModel()
-        val treeUri = DocumentsContract.buildTreeDocumentUri(authority, "vault")
-        grantTreeReadWrite(treeUri)
-        model.setFolder(treeUri)
-        await { model.state.value.folder == treeUri.toString() }
-
-        val subUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Specs/Deep/Sub.md")
-        val foldedSiblingUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Specs/Deep/topic.md")
-        val exactArchiveUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Archive/Topic.md")
-
-        // Even when folded sibling `Specs/Deep/topic.md` is ALREADY open with dirty edits, `[[Topic]]` from
-        // `Specs/Deep/Sub.md` must skip the folded sibling in Stage 1A/1B and open exact-case `Archive/Topic.md`.
-        model.open(foldedSiblingUri)
-        await { model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), foldedSiblingUri) } }
-        val foldedTab = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), foldedSiblingUri) }
-        model.edit(foldedTab.id, "# Dirty Folded Sibling\n")
-
-        model.open(subUri)
-        await { model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), subUri) } }
-        val subTab = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), subUri) }
-
-        provider.resetTelemetry()
-        val nestedExactRes = callSuspend {
-            model.openWorkspaceLink(subTab.uri!!, "Topic", "", wikilink = true)
-        }
-        assertTrue(nestedExactRes.getBoolean("opened"))
-        assertTrue(sameDocument(Uri.parse(model.state.value.active.uri!!), exactArchiveUri))
-        assertEquals(listOf("vault/Archive/Topic.md"), provider.openedDocumentIds.toList())
-        assertEquals("# Dirty Folded Sibling\n", model.state.value.tabs.single { it.id == foldedTab.id }.content)
-
-        // When exact-case `Specs/Deep/Topic.smd` coexists with folded `Specs/Deep/topic.md` in the same folder,
-        // both explicit relative `./Topic` and wikilink `[[Topic]]` prefer `Topic.smd` over `topic.md` without scanning Archive.
-        File(root, "Specs/Deep/Topic.smd").writeText("# Exact Sibling SMD\n")
-        val exactSiblingSmdUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Specs/Deep/Topic.smd")
-
-        provider.resetTelemetry()
-        val explicitExactRes = callSuspend {
-            model.openWorkspaceLink(subTab.uri!!, "./Topic", "", wikilink = false)
-        }
-        assertTrue(explicitExactRes.getBoolean("opened"))
-        assertTrue(sameDocument(Uri.parse(model.state.value.active.uri!!), exactSiblingSmdUri))
-        assertFalse(provider.childDirectoryQueries.contains("vault/Archive"))
-        assertEquals(listOf("vault/Specs/Deep/Topic.smd"), provider.openedDocumentIds.toList())
-
-        // Verify `file://` local resolution also prioritizes exact-case `Topic.smd` over folded `topic.md`,
-        // while still supporting case-folded fallback when no exact-case match exists.
-        assertEquals(
-            "Topic.smd",
-            resolveLocalFileWorkspaceLink(
-                sourceUri = Uri.fromFile(File(root, "Specs/Deep/Sub.md")),
-                rawTarget = "./Topic",
-                wikilink = false,
-            )?.relative,
-        )
-        assertEquals(
-            "Sub Note.md",
-            resolveLocalFileWorkspaceLink(
-                sourceUri = Uri.fromFile(File(root, "Specs/Bundle.smd")),
-                rawTarget = "./sub%20note.md",
-                wikilink = false,
-            )?.relative,
-        )
-    }
-
-    @Test
-    fun realDirectoryMutationsStayImmediatelyVisibleWithinCacheTtlAndScanBoundsHold() {
-        File(root, "Archive").mkdirs()
-        File(root, "Archive/Initial.md").writeText("# Initial\n")
-
-        val model = newModel()
-        val treeUri = DocumentsContract.buildTreeDocumentUri(authority, "vault")
-        grantTreeReadWrite(treeUri)
-        model.setFolder(treeUri)
-        await { model.state.value.folder == treeUri.toString() }
-
-        val indexUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Index.md")
-        val subUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, "vault/Specs/Sub Note.md")
-        model.open(indexUri)
-        await { model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), indexUri) } }
-        val indexTab = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), indexUri) }
-        model.open(subUri)
-        await { model.state.value.tabs.any { it.uri != null && sameDocument(Uri.parse(it.uri), subUri) } }
-        val subTab = model.state.value.tabs.single { it.uri != null && sameDocument(Uri.parse(it.uri), subUri) }
-
-        // Populate the 5s WorkspaceLinkCache with a nested lookup.
-        val warmRes = callSuspend {
-            model.openWorkspaceLink(indexTab.uri!!, "Initial", "", wikilink = true)
-        }
-        assertTrue(warmRes.getBoolean("opened"))
-
-        // Without invalidating workspaceLinks, add a new sibling note and a new nested note on disk.
-        File(root, "Specs/FreshSibling.md").writeText("# Fresh Sibling\n")
-        File(root, "Archive/FreshNested.md").writeText("# Fresh Nested\n")
-
-        provider.resetTelemetry()
-        val siblingRes = callSuspend {
-            model.openWorkspaceLink(subTab.uri!!, "FreshSibling", "", wikilink = true)
-        }
-        assertTrue(siblingRes.getBoolean("opened"))
-        assertEquals(listOf("vault/Specs/FreshSibling.md"), provider.openedDocumentIds.toList())
-
-        provider.resetTelemetry()
-        val nestedRes = callSuspend {
-            model.openWorkspaceLink(indexTab.uri!!, "FreshNested", "", wikilink = true)
-        }
-        assertTrue(nestedRes.getBoolean("opened"))
-        assertEquals(listOf("vault/Archive/FreshNested.md"), provider.openedDocumentIds.toList())
-
-        // Rename/delete a cached nested note on disk within TTL: stale target fails cleanly and renamed target resolves.
-        File(root, "Archive/Initial.md").renameTo(File(root, "Archive/RenamedInitial.md"))
-        model.close(model.state.value.tabs.single { it.name == "Initial.md" }.id)
-        await { model.state.value.tabs.none { it.name == "Initial.md" } }
-
-        val deletedRes = callSuspend {
-            model.openWorkspaceLink(indexTab.uri!!, "Initial", "", wikilink = true)
-        }
-        assertFalse(deletedRes.getBoolean("opened"))
-
-        val renamedRes = callSuspend {
-            model.openWorkspaceLink(indexTab.uri!!, "RenamedInitial", "", wikilink = true)
-        }
-        assertTrue(renamedRes.getBoolean("opened"))
-        assertEquals("RenamedInitial.md", model.state.value.active.name)
-
-        // Verify WorkspaceLinkCache scan bounds (maxFiles, maxDirectories, maxDepth) remain strictly enforced.
-        File(root, "Specs/TooDeep/Level3").mkdirs()
-        File(root, "Specs/TooDeep/Level3/HiddenByDepth.md").writeText("# Deep\n")
-        val boundedCache = WorkspaceLinkCache(
-            lister = ContentResolverTreeLister(app),
-            maxFiles = 3,
-            maxDirectories = 3,
-            maxDepth = 1,
-        )
-        val boundedBatch = boundedCache.resolveCandidatesBatch(
-            treeUri = treeUri,
-            noteRelative = "Index.md",
-            rawTarget = "HiddenByDepth",
-            wikilink = true,
-        )
-        assertTrue(boundedBatch.candidates.isEmpty())
-    }
-
-    private fun grantTreeReadWrite(treeUri: Uri) {
-        grantReadWrite(treeUri)
-        app.contentResolver.takePersistableUriPermission(
-            treeUri,
-            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-        )
-    }
-
     private fun grantReadWrite(uri: Uri) {
         app.grantUriPermission(
             app.packageName,
@@ -460,16 +223,7 @@ class WorkspaceLinkResolverTest {
         return model
     }
 
-    private fun <T> callSuspend(block: suspend () -> T): T {
-        val outcome = AtomicReference<Result<T>?>()
-        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
-            outcome.set(runCatching { block() })
-        }
-        await { outcome.get() != null }
-        return outcome.get()!!.getOrThrow()
-    }
-
-    private fun await(timeoutMs: Long = 15_000, condition: () -> Boolean) {
+    private fun await(timeoutMs: Long = 5_000, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         val mainLooper = shadowOf(Looper.getMainLooper())
         while (System.currentTimeMillis() < deadline) {
@@ -483,14 +237,6 @@ class WorkspaceLinkResolverTest {
 }
 
 private class FakeTreeDocumentProvider(private val rootDir: File) : ContentProvider() {
-    val childDirectoryQueries: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
-    val openedDocumentIds: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
-
-    fun resetTelemetry() {
-        childDirectoryQueries.clear()
-        openedDocumentIds.clear()
-    }
-
     fun attach(context: Context, authority: String) {
         val info = ProviderInfo().apply {
             this.authority = authority
@@ -507,12 +253,6 @@ private class FakeTreeDocumentProvider(private val rootDir: File) : ContentProvi
         return if (rel.isEmpty()) rootDir else File(rootDir, rel)
     }
 
-    private fun mimeForFile(file: File): String = when {
-        file.isDirectory -> DocumentsContract.Document.MIME_TYPE_DIR
-        file.extension.equals("png", ignoreCase = true) -> "image/png"
-        else -> "text/markdown"
-    }
-
     override fun query(
         uri: Uri,
         projection: Array<out String>?,
@@ -524,7 +264,6 @@ private class FakeTreeDocumentProvider(private val rootDir: File) : ContentProvi
         if ("children" in pathSegments) {
             val childrenIdx = pathSegments.indexOf("children")
             val parentDocId = Uri.decode(pathSegments[childrenIdx - 1])
-            childDirectoryQueries += parentDocId
             val dir = fileForDocId(parentDocId)
             val cols = projection ?: arrayOf(
                 DocumentsContract.Document.COLUMN_DOCUMENT_ID,
@@ -535,7 +274,7 @@ private class FakeTreeDocumentProvider(private val rootDir: File) : ContentProvi
             return MatrixCursor(cols).apply {
                 dir.listFiles()?.forEach { child ->
                     val childDocId = "$parentDocId/${child.name}"
-                    val mime = mimeForFile(child)
+                    val mime = if (child.isDirectory) DocumentsContract.Document.MIME_TYPE_DIR else "text/markdown"
                     addRow(
                         cols.map { col ->
                             when (col) {
@@ -559,7 +298,7 @@ private class FakeTreeDocumentProvider(private val rootDir: File) : ContentProvi
         )
         return MatrixCursor(cols).apply {
             if (file.exists()) {
-                val mime = mimeForFile(file)
+                val mime = if (file.isDirectory) DocumentsContract.Document.MIME_TYPE_DIR else "text/markdown"
                 addRow(
                     cols.map { col ->
                         when (col) {
@@ -577,8 +316,8 @@ private class FakeTreeDocumentProvider(private val rootDir: File) : ContentProvi
     }
 
     override fun getType(uri: Uri): String {
-        val file = runCatching { fileForDocId(DocumentsContract.getDocumentId(uri)) }.getOrNull() ?: return "text/markdown"
-        return mimeForFile(file)
+        val file = runCatching { fileForDocId(DocumentsContract.getDocumentId(uri)) }.getOrNull()
+        return if (file?.isDirectory == true) DocumentsContract.Document.MIME_TYPE_DIR else "text/markdown"
     }
 
     override fun insert(uri: Uri, values: ContentValues?): Uri? = null
@@ -586,11 +325,7 @@ private class FakeTreeDocumentProvider(private val rootDir: File) : ContentProvi
     override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?) = 0
 
     override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
-        val docId = DocumentsContract.getDocumentId(uri)
-        if (mode == "r") {
-            openedDocumentIds += docId
-        }
-        val file = fileForDocId(docId)
+        val file = fileForDocId(DocumentsContract.getDocumentId(uri))
         val flags = when (mode) {
             "r" -> ParcelFileDescriptor.MODE_READ_ONLY
             "rw" -> ParcelFileDescriptor.MODE_READ_WRITE

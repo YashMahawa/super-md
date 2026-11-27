@@ -242,6 +242,9 @@ class IndexedNote:
     ext_rank: int
 
 
+_RACY_STAMP_WINDOW_NS = 2_000_000_000
+
+
 @dataclass(frozen=True)
 class _DirStamp:
     path: Path
@@ -250,6 +253,7 @@ class _DirStamp:
     size: int
     nlink: int
     file_id: tuple[int, int] | None
+    racy_entries: frozenset[str] | None = None
 
 
 @dataclass
@@ -292,6 +296,16 @@ class WorkspaceLinkCache:
                 return False
             if stamp.file_id is not None and _stat_identity(st) != stamp.file_id:
                 return False
+            if stamp.racy_entries is not None:
+                try:
+                    with os.scandir(stamp.path) as iterator:
+                        live_entries = frozenset(
+                            entry.name for entry in iterator if entry.name and not entry.name.startswith(".")
+                        )
+                except OSError:
+                    return False
+                if live_entries != stamp.racy_entries:
+                    return False
         return True
 
     def invalidate(self, folder: str | os.PathLike[str] | None = None) -> None:
@@ -357,6 +371,7 @@ class WorkspaceLinkCache:
         dir_stamps: list[_DirStamp] = []
         visited_dirs = 0
         truncated = False
+        scan_wall_ns = time.time_ns()
         stack: list[tuple[Path, str, int]] = [(boundary_path, "", 0)]
 
         while stack:
@@ -371,6 +386,10 @@ class WorkspaceLinkCache:
                     dir_entries = sorted(iterator, key=lambda e: (e.name.casefold(), e.name))
             except OSError:
                 continue
+            is_racy = (
+                abs(scan_wall_ns - dir_stat.st_mtime_ns) <= _RACY_STAMP_WINDOW_NS
+                or abs(scan_wall_ns - dir_stat.st_ctime_ns) <= _RACY_STAMP_WINDOW_NS
+            )
             dir_stamps.append(_DirStamp(
                 path=current_dir,
                 mtime_ns=dir_stat.st_mtime_ns,
@@ -378,6 +397,11 @@ class WorkspaceLinkCache:
                 size=dir_stat.st_size,
                 nlink=dir_stat.st_nlink,
                 file_id=_stat_identity(dir_stat),
+                racy_entries=(
+                    frozenset(e.name for e in dir_entries if e.name and not e.name.startswith("."))
+                    if is_racy
+                    else None
+                ),
             ))
 
             subdirs: list[tuple[Path, str, int]] = []
@@ -396,23 +420,26 @@ class WorkspaceLinkCache:
                 except OSError:
                     continue
 
-                child_path = current_dir / name
-                rel_posix = f"{rel_prefix}/{name}" if rel_prefix else name
                 if is_dir:
                     if depth + 1 <= self.max_depth:
+                        child_path = current_dir / name
                         if _is_symlink_or_junction(child_path):
                             continue
+                        rel_posix = f"{rel_prefix}/{name}" if rel_prefix else name
                         subdirs.append((child_path, rel_posix, depth + 1))
                 elif is_file:
-                    suffix = Path(name).suffix.lower()
+                    dot = name.rfind(".")
+                    suffix = name[dot:].lower() if dot > 0 else ""
                     ext_rank = _EXTENSION_PRIORITY.get(suffix)
                     if ext_rank is None:
                         continue
+                    child_path = current_dir / name
                     if _is_link_or_junction(child_path, known_regular_file=True):
                         continue
                     if len(collected) >= self.max_files:
                         truncated = True
                         break
+                    rel_posix = f"{rel_prefix}/{name}" if rel_prefix else name
                     stem = name[:-len(suffix)] if suffix else name
                     no_ext_posix = rel_posix[:-len(suffix)] if suffix else rel_posix
                     collected.append(IndexedNote(
