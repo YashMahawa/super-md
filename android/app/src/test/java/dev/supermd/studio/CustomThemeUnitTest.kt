@@ -16,6 +16,7 @@ import androidx.lifecycle.ViewModelStore
 import java.io.File
 import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
+import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -67,7 +68,20 @@ class CustomThemeUnitTest {
     }
 
     @Test fun bundledThemeCatalogListsAllSixteenPresetsAndIsolatesOverridesAndExports() {
-        assertEquals(16, BUNDLED_THEMES.size)
+        val catalogFile = sequenceOf(
+            "../public/themes/index.json",
+            "../../public/themes/index.json",
+            "public/themes/index.json",
+        ).map(::File).first(File::isFile)
+        val expectedCatalog = JSONArray(catalogFile.readText(Charsets.UTF_8)).let { array ->
+            (0 until array.length()).map { index ->
+                val item = array.getJSONObject(index)
+                BundledThemePreset(item.getString("id"), item.getString("name"), item.getString("filename"))
+            }
+        }
+        assertEquals(16, expectedCatalog.size)
+        assertEquals(expectedCatalog, BUNDLED_THEMES)
+        assertEquals(expectedCatalog, bundledThemes(app.assets))
         val svg = "data:image/svg+xml;base64," + android.util.Base64.encodeToString("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 10 10\"/>".toByteArray(), android.util.Base64.NO_WRAP)
         val raw = JSONObject()
             .put("format", "supermd-theme")
