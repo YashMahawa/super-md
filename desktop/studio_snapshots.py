@@ -93,6 +93,7 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
     studio_obj.backgroundWriteCompleted.connect(studio_obj._complete_background_write)
     studio_obj.data = studio_obj.session.data
     studio_obj.settings = studio_obj.session.settings
+    studio_obj._defer_reader_activation = False
     studio_obj._agent_error = ""
     studio_obj._agent_cloud_error = ""
     studio_obj._agent_cloud_config_path = studio_obj.data / "agent-cloud.json"
@@ -288,8 +289,8 @@ def emit_state(studio_obj, load: bool = True) -> None:
         )
         payload = {
             **reading_settings, "readingLocation": studio_obj.session.locations.get(tab["path"]),
-            "id": tab["id"], "path": tab["path"] or tab["id"], "mode": studio_obj.mode,
-            "dark": dark, "fullscreen": studio_obj.fullscreen, "font": s["font"], "size": s["size"],
+            "id": tab["id"], "path": tab["path"] or tab["id"], "portable": bool(tab.get("portable", False)),
+            "mode": studio_obj.mode, "dark": dark, "fullscreen": studio_obj.fullscreen, "font": s["font"], "size": s["size"],
             "widthPercent": s["widthPercent"], "lineHeight": s["lineHeight"],
             "spellCheck": s["spellCheck"], "grammarCheck": s["grammarCheck"],
             "zoom": s["fullZoom" if studio_obj.fullscreen else "normalZoom"],

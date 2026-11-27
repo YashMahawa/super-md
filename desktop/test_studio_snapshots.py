@@ -76,6 +76,7 @@ class StudioSnapshotsTests(unittest.TestCase):
     def test_emit_state_delivers_content_unchanged_and_incremental_pending_agent_edits(self):
         session, win = self._make_window()
         try:
+            self.assertFalse(win.deferReaderActivation)
             loads = []
             win.readerLoad.connect(lambda raw: loads.append(json.loads(raw)))
             win.ready = True
@@ -84,11 +85,12 @@ class StudioSnapshotsTests(unittest.TestCase):
             tab["agent_edits"] = [{"seq": 1, "before": "# Initial", "after": "# Initial\n\nBody"}]
 
             win._emit(True)
-            self.assertEqual((loads[-1]["content"], loads[-1]["agentUnreviewed"], [e["seq"] for e in loads[-1]["pendingAgentEdits"]]), ("# Initial\n\nBody", True, [1]))
+            self.assertEqual((loads[-1]["content"], loads[-1]["portable"], loads[-1]["agentUnreviewed"], [e["seq"] for e in loads[-1]["pendingAgentEdits"]]), ("# Initial\n\nBody", False, True, [1]))
             self.assertNotIn("contentUnchanged", loads[-1])
 
+            tab["portable"] = True
             win._emit(True)
-            self.assertTrue(loads[-1]["contentUnchanged"])
+            self.assertEqual((loads[-1]["contentUnchanged"], loads[-1]["portable"]), (True, True))
             self.assertFalse("content" in loads[-1] or "pendingAgentEdits" in loads[-1])
 
             tab["agent_edits"].append({"seq": 2, "before": "# Initial\n\nBody", "after": "# Initial\n\nRevised"})
