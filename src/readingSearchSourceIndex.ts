@@ -4,7 +4,7 @@ export type SourceRange = { from: number; to: number };
 
 const MAX_SOURCE_INDEX_HOSTS = 8;
 const MAX_HIDDEN_SCAN_CHARS = 200_000;
-const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/gi;
+const INLINE_HTML_TAG_TOKEN = /<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/yi;
 export const SOURCE_CANDIDATE_SELECTOR = ".live-block,[data-windowed-block],[data-source-start],.code-container";
 const SOURCE_INDEX_ATTR_FILTER = ["data-source-start", "data-source-end", "data-windowed-mounted", "data-windowed-block", "class"];
 
@@ -52,76 +52,91 @@ export function getParsedFrontmatter(content: string): ParsedFrontmatter | null 
   return cachedFmResult;
 }
 
-export function markdownBracketEnd(raw: string, openIndex = 0): number {
-  if (raw[openIndex] !== "[") return raw.length;
+export function firstSourceRangeFrom(ranges: SourceRange[], minFrom: number, end = ranges.length): number {
+  let lo = 0, hi = Math.min(end, ranges.length);
+  while (lo < hi) { const mid = (lo + hi) >>> 1; if (ranges[mid].from < minFrom) lo = mid + 1; else hi = mid; }
+  return lo;
+}
+
+function skipInlineCodeSpan(raw: string, openIndex: number, unclosedTicks?: Set<number>): number {
+  let ticks = 1;
+  while (raw[openIndex + ticks] === "`") ticks++;
+  if (unclosedTicks?.has(ticks)) return openIndex + ticks - 1;
+  for (let pos = openIndex + ticks; pos < raw.length; ) {
+    const hit = raw.indexOf("`", pos);
+    if (hit < 0) break;
+    let run = 1;
+    while (raw[hit + run] === "`") run++;
+    if (run === ticks) return hit + run - 1;
+    pos = hit + run;
+  }
+  unclosedTicks?.add(ticks);
+  return openIndex + ticks - 1;
+}
+
+function scanBalancedInlineDelimiter(raw: string, openIndex: number, openChar: string, closeChar: string, allowCodeSpans: boolean, unclosedTicks?: Set<number>): number {
+  if (raw[openIndex] !== openChar) return raw.length;
   for (let i = openIndex, depth = 0; i < raw.length; i++) {
     const ch = raw[i];
     if (ch === "\\") { i++; continue; }
-    if (ch === "`") {
-      let ticks = 1;
-      while (raw[i + ticks] === "`") ticks++;
-      const close = raw.indexOf("`".repeat(ticks), i + ticks);
-      if (close >= 0) { i = close + ticks - 1; continue; }
-    }
-    if (ch === "[") depth++;
-    else if (ch === "]" && --depth === 0) return i;
+    if (allowCodeSpans && ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
+    if (ch === openChar) depth++;
+    else if (ch === closeChar && --depth === 0) return i;
   }
   return raw.length;
 }
 
-function markdownLinkTailEnd(raw: string, afterBracket: number): number {
-  if (raw[afterBracket] === "(") {
-    for (let i = afterBracket, depth = 0; i < raw.length; i++) {
-      const ch = raw[i];
-      if (ch === "\\") { i++; continue; }
-      if (ch === "(") depth++;
-      else if (ch === ")" && --depth === 0) return i + 1;
-    }
-    return raw.length;
-  }
-  if (raw[afterBracket] === "[") {
-    const end = markdownBracketEnd(raw, afterBracket);
-    return end < raw.length ? end + 1 : raw.length;
-  }
+export const markdownBracketEnd = (raw: string, openIndex = 0): number => scanBalancedInlineDelimiter(raw, openIndex, "[", "]", true);
+
+export function markdownLinkTailEnd(raw: string, afterBracket: number, unclosedTicks?: Set<number>): number {
+  if (raw[afterBracket] === "(") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "(", ")", false); return close < raw.length ? close + 1 : raw.length; }
+  if (raw[afterBracket] === "[") { const close = scanBalancedInlineDelimiter(raw, afterBracket, "[", "]", true, unclosedTicks); return close < raw.length ? close + 1 : raw.length; }
   return afterBracket;
 }
 
-function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
-  const hidden: SourceRange[] = [];
+export function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
+  if (!raw || raw.length > MAX_HIDDEN_SCAN_CHARS) return [];
+  const rawHidden: SourceRange[] = [], stack: Array<{ openIndex: number; isImage: boolean; slot: number }> = [], unclosedTicks = new Set<number>();
+  let noCommentClose = false;
   for (let i = 0; i < raw.length; i++) {
     const ch = raw[i];
     if (ch === "\\") { i++; continue; }
-    if (ch === "`") {
-      let ticks = 1;
-      while (raw[i + ticks] === "`") ticks++;
-      const close = raw.indexOf("`".repeat(ticks), i + ticks);
-      if (close >= 0) { i = close + ticks - 1; continue; }
-    }
+    if (ch === "`") { i = skipInlineCodeSpan(raw, i, unclosedTicks); continue; }
     if (ch === "<") {
-      INLINE_HTML_HIDDEN_TOKEN.lastIndex = i;
-      const htmlMatch = INLINE_HTML_HIDDEN_TOKEN.exec(raw);
-      if (htmlMatch && htmlMatch.index === i) {
-        const end = i + htmlMatch[0].length;
-        hidden.push({ from: offset + i, to: offset + end });
-        i = Math.max(i, end - 1);
-        continue;
+      if (raw.startsWith("<!--", i)) {
+        const close = noCommentClose ? -1 : raw.indexOf("-->", i + 4);
+        if (close >= 0) { rawHidden.push({ from: offset + i, to: offset + close + 3 }); i = close + 2; continue; }
+        noCommentClose = true;
+      } else {
+        INLINE_HTML_TAG_TOKEN.lastIndex = i;
+        const tagMatch = INLINE_HTML_TAG_TOKEN.exec(raw);
+        if (tagMatch) { const end = i + tagMatch[0].length; rawHidden.push({ from: offset + i, to: offset + end }); i = Math.max(i, end - 1); continue; }
       }
-    }
-    if (ch === "!" && raw[i + 1] === "[") {
-      const close = markdownBracketEnd(raw, i + 1);
-      if (close < raw.length) {
-        const end = markdownLinkTailEnd(raw, close + 1);
-        hidden.push({ from: offset + i, to: offset + end });
-        i = Math.max(i, end - 1);
-        continue;
+    } else if (ch === "!" && raw[i + 1] === "[") {
+      stack.push({ openIndex: i, isImage: true, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i }); i++;
+    } else if (ch === "[") {
+      stack.push({ openIndex: i, isImage: false, slot: rawHidden.length }); rawHidden.push({ from: offset + i, to: offset + i });
+    } else if (ch === "]" && stack.length) {
+      const frame = stack.pop()!, end = markdownLinkTailEnd(raw, i + 1, unclosedTicks);
+      if (end > i + 1) {
+        if (frame.isImage) { rawHidden.length = frame.slot; rawHidden.push({ from: offset + frame.openIndex, to: offset + end }); }
+        else { rawHidden[frame.slot].to = offset + frame.openIndex + 1; rawHidden.push({ from: offset + i, to: offset + end }); }
+        i = end - 1;
       }
-    }
-    if (ch === "[") {
-      const close = markdownBracketEnd(raw, i), end = close < raw.length ? markdownLinkTailEnd(raw, close + 1) : 0;
-      if (end > close + 1) { hidden.push({ from: offset + close, to: offset + end }); i = Math.max(i, end - 1); }
     }
   }
+  const hidden: SourceRange[] = [];
+  for (const span of rawHidden) {
+    if (span.to <= span.from) continue;
+    const prev = hidden[hidden.length - 1];
+    if (prev && prev.to >= span.from) prev.to = Math.max(prev.to, span.to); else hidden.push(span);
+  }
   return hidden;
+}
+
+export function isCoveredByHiddenSpan(hidden: SourceRange[], candidate: SourceRange): boolean {
+  const idx = firstSourceRangeFrom(hidden, candidate.from);
+  return (idx < hidden.length && hidden[idx].from === candidate.from && candidate.to <= hidden[idx].to) || (idx > 0 && candidate.to <= hidden[idx - 1].to);
 }
 
 export function sourceBounds(el: Element, content?: string): { start: number; end: number } | null {
@@ -388,7 +403,7 @@ export function isDirectVisibleMatch(owner: HTMLElement, content: string, candid
   const { visible, hidden } = getCachedOwnerSpans(owner, content, sharedIndex);
   if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
   if (deepestSourceOwner(owner, candidate, content, sharedIndex) !== owner) return false;
-  return !(hidden && hidden.some(h => candidate.from >= h.from && candidate.to <= h.to));
+  return !(hidden && isCoveredByHiddenSpan(hidden, candidate));
 }
 
 export function resolveSourceBlock(host: Element, range: SourceRange, content?: string): HTMLElement | null {

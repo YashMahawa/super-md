@@ -68,21 +68,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const [sourceRanges, setSourceRanges] = useState<SourceRange[]>([]);
   const [windowed, setWindowed] = useState<WindowedMatch[] | null>(null);
   const [appliedNonce, setAppliedNonce] = useState<number | null>(seed ? seed.nonce : null);
-  const pendingAutoSelect = useRef(Boolean(seed && seed.query));
-  const pendingSeedRange = useRef<SourceRange | null>(extractSeedRange(seed));
+  const pendingAutoSelect = useRef(Boolean(seed && seed.query)), pendingSeedRange = useRef<SourceRange | null>(extractSeedRange(seed));
   const pendingSeedMatchText = useRef<string | undefined>(extractSeedMatchText(seed));
   const [hiddenSourceHit, setHiddenSourceHit] = useState(false);
-  const hiddenSourceAnchorRef = useRef<SourceRange | null>(null);
-  const pendingReplaceIndex = useRef<number | null>(null);
+  const hiddenSourceAnchorRef = useRef<SourceRange | null>(null), pendingReplaceIndex = useRef<number | null>(null);
   if (seed && appliedNonce !== seed.nonce) {
     setAppliedNonce(seed.nonce);
     pendingAutoSelect.current = Boolean(seed.query);
     pendingSeedRange.current = extractSeedRange(seed);
     pendingSeedMatchText.current = extractSeedMatchText(seed);
     setHiddenSourceHit(false);
-    hiddenSourceAnchorRef.current = null;
-    pendingReplaceIndex.current = null;
-    clearCustomCurrent();
+    hiddenSourceAnchorRef.current = null; pendingReplaceIndex.current = null; clearCustomCurrent();
     if (index !== -1) updateIndex(-1);
     setQuery(seed.query.slice(0, 200));
     if (seed.caseSensitive !== undefined) setCaseSensitive(Boolean(seed.caseSensitive));
@@ -90,6 +86,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (regexp) setRegexp(false);
   }
   const activeReplacing = canReplace && replacing;
+  const replaceComposingRef = useRef(false);
+  if (!activeReplacing && replaceComposingRef.current) replaceComposingRef.current = false;
   const filterOptions: SearchMatchOptions = { caseSensitive, wholeWord, regexp };
   const { error: regexError } = compileSearchPattern(query, filterOptions, true);
   const sourceSearch = !!sourceSession || activeReplacing;
@@ -413,16 +411,25 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   };
   const moveRef = useRef(move); moveRef.current = move;
 
+  const effectiveIndex = pendingReplaceIndex.current !== null ? pendingReplaceIndex.current : index;
+  const criteriaSynced = prevState.current.query === query && prevState.current.caseSensitive === caseSensitive
+    && prevState.current.wholeWord === wholeWord && prevState.current.regexp === regexp
+    && (prevState.current.content === content || pendingReplaceIndex.current !== null);
+  const activeReplaceRanges = activeReplacing && criteriaSynced && query && !regexError
+    ? (prevState.current.content === content && sourceRanges.length ? sourceRanges : getSourceRanges()) : [];
+  const canSingleReplace = Boolean(activeReplacing && onChange && effectiveIndex >= 0 && effectiveIndex < activeReplaceRanges.length && activeReplaceRanges[effectiveIndex]);
+
   const handleSingleReplace = () => {
-    if (!canReplace || !onChange || !query || regexError || !sourceRanges.length || index < 0) return;
-    const target = sourceRanges[index];
+    if (!canSingleReplace || !onChange) return;
+    const target = activeReplaceRanges[effectiveIndex];
     if (!target) return;
-    const nextContent = replaceSourceMatches(content, query, replacement, filterOptions, index);
+    const nextContent = replaceSourceMatches(content, query, replacement, filterOptions, effectiveIndex);
     const replacedEnd = target.to + (nextContent.length - content.length);
     const nextRanges = getSourceRanges(nextContent, query, filterOptions);
     const foundNext = nextRanges.findIndex(r => r.from >= replacedEnd);
     const nextIndex = !nextRanges.length ? -1 : (foundNext >= 0 ? foundNext : 0);
     if (nextContent === content) {
+      pendingReplaceIndex.current = null;
       updateIndex(nextIndex);
       if (nextIndex >= 0) revealAndHighlightSource(nextIndex, nextRanges, nextContent, true);
       return;
@@ -733,8 +740,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
 
   useEffect(() => {
     syncSearchHighlights({
-      current: regexError ? null : index < 0 ? customCurrentRangeRef.current
-        : () => resolveActiveHighlightRange(findReadingHost(), index, { sourceSearch, content, sourceRanges, windowed, matches, query, filterOptions }),
+      current: regexError ? null : index < 0 ? customCurrentRangeRef.current : () => resolveActiveHighlightRange(findReadingHost(), index, { sourceSearch, content, sourceRanges, windowed, matches, query, filterOptions }),
     });
   }, [index, matches, windowed, sourceRanges, sourceSearch, sourceSession, content, query, caseSensitive, wholeWord, regexp, regexError]);
 
@@ -785,6 +791,6 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     <button className="search-icon" aria-pressed={regexp} onClick={() => { clearPendingSeed(); setRegexp(!regexp); }} title="Regular expression" aria-label="Regular expression"><AsteriskIcon size={20} weight="bold" /></button>
     {canReplace && <button className="search-icon" aria-pressed={activeReplacing} onClick={() => toggleReplacing()} title="Replace in source (Ctrl+H)" aria-label="Replace in source"><ArrowsClockwiseIcon size={20} weight="bold" /></button>}
     <button className="search-icon" onClick={close} title="Close search (Esc)" aria-label="Close search"><XIcon size={20} weight="bold" /></button>
-    {activeReplacing && onChange && <div className="search-replace"><input aria-label="Replacement text" placeholder="Replace with" value={replacement} onChange={e => setReplacement(e.target.value)} /><button disabled={!query || !!regexError || !count || index < 0} onClick={handleSingleReplace}>Replace</button><button disabled={!query || !!regexError || !count} onClick={handleReplaceAll}>Replace all</button><small>{regexError ? `${regexError}.` : regexp ? "Replaces regex matches in Markdown source ($1, $&, $$ supported)." : "Replaces literal text in Markdown source."}</small></div>}
+    {activeReplacing && onChange && <div className="search-replace"><input type="text" aria-label="Replacement text" autoCapitalize="none" autoCorrect="off" autoComplete="off" spellCheck={false} placeholder="Replace with" value={replacement} onChange={e => setReplacement(e.target.value)} onCompositionStart={() => { replaceComposingRef.current = true; }} onCompositionEnd={() => { replaceComposingRef.current = false; }} onBlur={() => { replaceComposingRef.current = false; }} onKeyDown={event => { if (replaceComposingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.metaKey || event.altKey) return; event.preventDefault(); if (canSingleReplace) handleSingleReplace(); }} /><button disabled={!canSingleReplace} onClick={handleSingleReplace}>Replace</button><button disabled={!query || !!regexError || !count} onClick={handleReplaceAll}>Replace all</button><small>{regexError ? `${regexError}.` : regexp ? "Replaces regex matches in Markdown source ($1, $&, $$ supported)." : "Replaces literal text in Markdown source."}</small></div>}
   </aside>;
 }

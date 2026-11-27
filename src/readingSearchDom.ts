@@ -5,11 +5,15 @@ import { cancelHeadingNavigation } from "./documentNavigation";
 import { refreshDocumentExtent } from "./documentZoom";
 import {
   SOURCE_CANDIDATE_SELECTOR, deepestSourceOwner, findContainingBlock, findContainingBlockInIndex,
-  getParsedFrontmatter, getSourceRangeIndex, invalidateSourceRangeIndex, isDirectVisibleMatch,
-  resolveSourceBlock, sourceBoundsForElement, type SourceRange, type SourceRangeIndex,
+  firstSourceRangeFrom, getParsedFrontmatter, getSourceRangeIndex, hiddenSpansInSlice, invalidateSourceRangeIndex,
+  isDirectVisibleMatch, markdownBracketEnd, markdownLinkTailEnd, resolveSourceBlock, sourceBoundsForElement,
+  type SourceRange, type SourceRangeIndex,
 } from "./readingSearchSourceIndex";
 export type { SearchMatchConfig, SearchMatchOptions, SourceRange };
-export { deepestSourceOwner, findContainingBlock, invalidateSourceRangeIndex, resolveSourceBlock };
+export {
+  deepestSourceOwner, findContainingBlock, firstSourceRangeFrom, hiddenSpansInSlice,
+  invalidateSourceRangeIndex, markdownBracketEnd, markdownLinkTailEnd, resolveSourceBlock,
+};
 
 export const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 export const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
@@ -36,7 +40,6 @@ const isAllowedFrontmatterField = (el: Element): el is HTMLElement => ["title", 
 export const rangeStartElement = (r: Range | null): Element | null => r ? (r.startContainer.nodeType === Node.ELEMENT_NODE ? r.startContainer as Element : r.startContainer.parentElement) : null;
 export const isLiveMatchRange = (r: Range | null | undefined, root?: Element): r is Range =>
   Boolean(r && !r.collapsed && (root ? root.contains(r.startContainer) : r.startContainer.isConnected) && !rangeStartElement(r)?.closest('[data-windowed-mounted="false"]'));
-
 function hasRelevantSearchMutation(records: MutationRecord[]): boolean {
   return records.some(r => {
     if (r.type !== "attributes" || r.attributeName !== "style") return true;
@@ -44,7 +47,6 @@ function hasRelevantSearchMutation(records: MutationRecord[]): boolean {
     return Boolean(s && (s.display === "none" || s.visibility === "hidden")) || Boolean(r.oldValue && /(?:none|hidden)/i.test(r.oldValue));
   });
 }
-
 export function getSearchDomVersion(el: Element): { root: Element; version: number } {
   const root = el.closest(".android-reading,.reading-scroll") ?? el.closest(".live-document,.markdown-body") ?? el;
   let entry = domVersions.get(root);
@@ -60,21 +62,14 @@ export function getSearchDomVersion(el: Element): { root: Element; version: numb
   }
   return { root, version: entry.version };
 }
-
 function searchOptionKey(query: string, options: SearchMatchConfig): string {
   const { caseSensitive, wholeWord, regexp } = normalizeSearchOptions(options);
   return `${query}\0${caseSensitive ? 1 : 0}${wholeWord ? 1 : 0}${regexp ? 1 : 0}`;
-}
-export function firstSourceRangeFrom(ranges: SourceRange[], minFrom: number, end = ranges.length): number {
-  let lo = 0, hi = Math.min(end, ranges.length);
-  while (lo < hi) { const mid = (lo + hi) >>> 1; if (ranges[mid].from < minFrom) lo = mid + 1; else hi = mid; }
-  return lo;
 }
 export function findMatchingSourceRangeIndex(ranges: SourceRange[], target: SourceRange): number {
   for (let i = firstSourceRangeFrom(ranges, target.from); i < ranges.length && ranges[i].from === target.from; i++) if (ranges[i].to === target.to) return i;
   return ranges.findIndex(r => r.from === target.from && r.to === target.to);
 }
-
 function isHiddenOrExcludedSearchElement(el: Element): boolean {
   if (EXCLUDED_SEARCH_TAGS.has(el.localName) || !el.hasAttributes()) return EXCLUDED_SEARCH_TAGS.has(el.localName);
   const cls = el.className;
@@ -88,25 +83,20 @@ function isHiddenOrExcludedSearchElement(el: Element): boolean {
   }
   return false;
 }
-
 export const nextSearchIndex = (index: number, direction: number, count: number): number =>
   count <= 0 ? -1 : index < 0 ? (direction < 0 ? count - 1 : 0) : ((index + direction) % count + count) % count;
-
 export function revealMountedBlock(element: Element): void {
   if (!(element instanceof HTMLElement)) return;
   const w = element.closest<HTMLElement>("[data-windowed-block]");
   if (w?.getAttribute("data-windowed-mounted") === "true") return;
-  if (w?.getAttribute("data-windowed-mounted") === "false") flushSync(() => revealWindowed(element));
-  else revealWindowed(element);
+  if (w?.getAttribute("data-windowed-mounted") === "false") flushSync(() => revealWindowed(element)); else revealWindowed(element);
 }
-
 export function scrollTargetIntoView(target: Element | null, host?: Element | null): void {
   if (!target) return;
   const scroller = target.closest<HTMLElement>(".android-reading,.reading-scroll") ?? (host?.matches(".android-reading,.reading-scroll") ? host as HTMLElement : host?.closest<HTMLElement>(".android-reading,.reading-scroll") ?? null);
   if (scroller) refreshDocumentExtent(scroller);
   target.scrollIntoView?.({ block: "center", behavior: "instant" });
 }
-
 function expandRegexReplacement(replacement: string, match: RegExpExecArray, source: string): string {
   return replacement.replace(/\$(?:\$|&|`|'|(\d{1,2})|<([^>]+)>)/g, (token, digits?: string, groupName?: string) => {
     if (token === "$$") return "$";
@@ -143,7 +133,6 @@ export function openDisclosuresFor(target: Element | null, scope?: Element | nul
 }
 
 const ownerDomScope = (owner: HTMLElement): Element => owner.matches(".code-container,.python-cell") ? (owner.querySelector("pre.python-source,pre") ?? owner) : owner;
-
 function directOwnerDomRanges(owner: HTMLElement, query: string, options: SearchMatchConfig): Range[] {
   return readingMatches(ownerDomScope(owner), query, options).filter(r => {
     if (owner.matches(".code-container,.python-cell") && r.startContainer.parentElement?.closest("summary")) return false;
@@ -281,24 +270,20 @@ function collectSearchText(root: Element, initialBlock: Element | null, state: {
         const value = (child as Text).data;
         if (!value) continue;
         if (state.block !== currentBlock) { state.text += "\n"; state.block = currentBlock; }
-        const start = state.text.length;
-        state.parts.push({ node: child as Text, start, end: start + value.length }); state.text += value;
+        state.parts.push({ node: child as Text, start: state.text.length, end: state.text.length + value.length }); state.text += value;
       } else if (child.nodeType === Node.ELEMENT_NODE) {
         const childEl = child as Element;
         if (isHiddenOrExcludedSearchElement(childEl)) continue;
-        if (isFrontmatterPropertiesContainer(childEl)) { walkFrontmatterFields(childEl); continue; }
-        walk(childEl, isAllowedFrontmatterField(childEl) || SEARCH_BLOCK_TAGS.has(childEl.localName) ? childEl : currentBlock);
+        if (isFrontmatterPropertiesContainer(childEl)) walkFrontmatterFields(childEl);
+        else walk(childEl, isAllowedFrontmatterField(childEl) || SEARCH_BLOCK_TAGS.has(childEl.localName) ? childEl : currentBlock);
       }
     }
   };
-  if (isFrontmatterPropertiesContainer(root)) walkFrontmatterFields(root);
-  else walk(root, initialBlock);
+  if (isFrontmatterPropertiesContainer(root)) walkFrontmatterFields(root); else walk(root, initialBlock);
 }
-
 function matchPartsToRanges(parts: Array<{ node: Text; start: number; end: number }>, text: string, pattern: RegExp): Range[] {
   if (!parts.length) return [];
-  // Case folding can expand Unicode characters and invalidate DOM offsets.
-  // Regex matches retain the original UTF-16 positions instead.
+  // Case folding can expand Unicode characters and invalidate DOM offsets; regex matches retain UTF-16 positions.
   const ranges: Range[] = [];
   let match: RegExpExecArray | null, firstIndex = 0, lastIndex = 0;
   while ((match = nextSearchMatch(pattern, text)) && ranges.length < MAX_SEARCH_MATCHES) {
@@ -315,7 +300,6 @@ function matchPartsToRanges(parts: Array<{ node: Text; start: number; end: numbe
   }
   return ranges;
 }
-
 export function readingMatches(host: Element, query: string, options: SearchMatchConfig = false): Range[] {
   const { pattern } = compileSearchPattern(query, options, false);
   if (!pattern) return [];
@@ -384,10 +368,9 @@ function visibleBlockSourceIndices(block: HTMLElement, content: string, sourceRa
 }
 
 export function insertDomRangeInOrder(ranges: Range[], target: Range): { ranges: Range[]; index: number } {
-  let index = ranges.findIndex(m => sameDomRange(m, target));
-  if (index >= 0) return { ranges, index };
-  const augmented = [...ranges], pos = augmented.findIndex(m => m.compareBoundaryPoints(Range.START_TO_START, target) > 0);
-  index = pos < 0 ? augmented.length : pos;
+  const existing = ranges.findIndex(m => sameDomRange(m, target));
+  if (existing >= 0) return { ranges, index: existing };
+  const augmented = [...ranges], pos = augmented.findIndex(m => m.compareBoundaryPoints(Range.START_TO_START, target) > 0), index = pos < 0 ? augmented.length : pos;
   augmented.splice(index, 0, target);
   return { ranges: augmented, index };
 }
@@ -408,7 +391,6 @@ function findWindowedDomMatch(liveWindowed: WindowedMatch[], domRange: Range, qu
   }
   return -1;
 }
-
 export function translateSourceIndexToRendered(host: Element | null, content: string, sourceRanges: SourceRange[], sourceIdx: number, query: string, options: SearchMatchConfig = false, knownWindowed?: WindowedMatch[] | null, knownMatches?: Range[]): number {
   const sr = sourceIdx >= 0 && host ? sourceRanges[sourceIdx] : undefined;
   if (!sr || !host) return -1;

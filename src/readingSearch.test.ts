@@ -6,7 +6,7 @@ import {getSearchQuery} from "@codemirror/search";
 import {EditorView} from "@codemirror/view";
 import {afterEach,beforeEach,describe,expect,it,vi} from "vitest";
 import ReadingSearch,{foldUnicodeForSearch,isValidSeedOccurrence,nextSearchIndex,readingMatches,replaceSourceMatches,resolveSourceBlock,resolveSourceHighlightRange,sourceMatches} from "./components/ReadingSearch";
-import {findMatchingSourceRangeIndex,insertDomRangeInOrder,rangeStartElement,syncSearchHighlights,translateRenderedIndexToSource,translateSourceIndexToRendered} from "./readingSearchDom";
+import {findMatchingSourceRangeIndex,hiddenSpansInSlice,insertDomRangeInOrder,markdownBracketEnd,markdownLinkTailEnd,rangeStartElement,syncSearchHighlights,translateRenderedIndexToSource,translateSourceIndexToRendered} from "./readingSearchDom";
 import Editor,{editorFindQuery} from "./components/Editor";
 import LiveEditor from "./components/LiveEditor";
 import MarkdownPreview from "./components/MarkdownPreview";
@@ -1178,6 +1178,240 @@ describe("readingSearchDom ordinal translation and highlight sync",()=>{
 
     qsaSpy.mockRestore();
     cleanups.forEach(fn=>fn());
+    host.remove();
+  });
+
+  it("deduplicates inline delimiter scanning while preserving escape-only link tails, Markdown masking, and exact UTF-16 Unicode ranges",()=>{
+    // Bracket labels skip single/multi-backtick code spans (exact run length), escaped brackets, and nested brackets, without pairing inner ticks of unclosed runs.
+    const singleCode="[`a]b`](https://example.com)";
+    expect(markdownBracketEnd(singleCode,0)).toBe(6);
+    const multiCode="[``a ` ] b``](https://example.com)";
+    expect(markdownBracketEnd(multiCode,0)).toBe(12);
+    const mismatchedInnerTicks="[`a `` ] b`](https://example.com)";
+    expect(markdownBracketEnd(mismatchedInnerTicks,0)).toBe(11);
+    const unclosedMultiTicks="[``a] ` b](https://example.com)";
+    expect(markdownBracketEnd(unclosedMultiTicks,0)).toBe(4);
+    const escapedAndNested="[outer \\[skip\\] [inner] end](https://example.com)";
+    expect(markdownBracketEnd(escapedAndNested,0)).toBe(escapedAndNested.indexOf("]("));
+
+    // Inline (...) link tails are escape-only: backticks inside URLs do NOT open code spans, while \(, \), \\), and nested (...) balance accurately.
+    const backtickUrl="[docs](https://example.com/a`b) visible `code`";
+    expect(markdownLinkTailEnd(backtickUrl,6)).toBe(backtickUrl.indexOf(") visible")+1);
+    const nestedParenUrl="[wiki](https://en.wikipedia.org/wiki/Foo_(bar)) tail";
+    expect(markdownLinkTailEnd(nestedParenUrl,6)).toBe(nestedParenUrl.indexOf(") tail")+1);
+    const escapedParenUrl="[esc](https://example.com/foo\\)bar) tail";
+    expect(markdownLinkTailEnd(escapedParenUrl,5)).toBe(escapedParenUrl.indexOf(") tail")+1);
+    const escapedSlashBeforeClose="[slash](https://example.com/foo\\\\) tail";
+    expect(markdownLinkTailEnd(escapedSlashBeforeClose,7)).toBe(escapedSlashBeforeClose.indexOf(") tail")+1);
+    // Reference-style [label][ref] link tails still honor backtick code spans via markdownBracketEnd, while non-tails return afterBracket.
+    const refTail="[label][`ref]1`] tail";
+    expect(markdownLinkTailEnd(refTail,7)).toBe(refTail.indexOf(" tail"));
+    expect(markdownLinkTailEnd("[literal] plain",9)).toBe(9);
+
+    // Markdown masking + exact UTF-16 offsets across astral surrogates (`📓`), Unicode case-fold expansions (`Straße`), inline HTML, escape-only backtick URLs, inline code, and images.
+    const md="📓 [See <mark>Straße</mark>](https://example.com/Straße`v1) and `[fake](https://visible.example/Straße)` after ![alt Straße](https://img.example/Straße.png).";
+    const hidden=hiddenSpansInSlice(md,100);
+    const isHidden=(from:number,to:number)=>hidden.some(h=>from>=h.from&&to<=h.to);
+    const ranges=sourceMatches(md,"Straße",true);
+    // Occurrences of "Straße" in `md`:
+    // 0: visible inside <mark>Straße</mark> within link label
+    // 1: hidden inside escape-only backtick URL (https://example.com/Straße`v1)
+    // 2: visible inside inline code span `[fake](https://visible.example/Straße)`
+    // 3: hidden inside image alt ![alt Straße]
+    // 4: hidden inside image URL (https://img.example/Straße.png)
+    expect(ranges).toHaveLength(5);
+    expect(ranges.map(r=>md.slice(r.from,r.to))).toEqual(["Straße","Straße","Straße","Straße","Straße"]);
+    expect(isHidden(ranges[0].from+100,ranges[0].to+100)).toBe(false);
+    expect(isHidden(ranges[1].from+100,ranges[1].to+100)).toBe(true);
+    expect(isHidden(ranges[2].from+100,ranges[2].to+100)).toBe(false);
+    expect(isHidden(ranges[3].from+100,ranges[3].to+100)).toBe(true);
+    expect(isHidden(ranges[4].from+100,ranges[4].to+100)).toBe(true);
+    // Also verify `<mark>` and `</mark>` inside the link label are masked while `and` after the backtick URL remains unmasked.
+    const openMark=md.indexOf("<mark>");
+    const andWord=md.indexOf("and");
+    expect(isHidden(100+openMark,100+openMark+6)).toBe(true);
+    expect(isHidden(100+andWord,100+andWord+3)).toBe(false);
+  });
+
+  it("preserves distinct reveal behavior on Replace exit between Read-mode transition and manual Replace toggle",async()=>{
+    const highlights=new Map<string,MockHighlight>();
+    Object.defineProperty(globalThis,"CSS",{configurable:true,value:{highlights}});
+    Object.defineProperty(window,"Highlight",{configurable:true,value:MockHighlight});
+    Element.prototype.scrollIntoView=vi.fn();
+    vi.spyOn(window,"requestAnimationFrame").mockImplementation(cb=>window.setTimeout(()=>cb(performance.now()),0));
+    vi.spyOn(window,"cancelAnimationFrame").mockImplementation(id=>window.clearTimeout(id));
+    const flushFrames=async()=>{
+      await act(async()=>{
+        await new Promise(resolve=>setTimeout(resolve,15));
+        await new Promise(resolve=>setTimeout(resolve,15));
+      });
+    };
+
+    const p0="Alpha needle.";
+    const p1="Beta needle.";
+    const doc=`${p0}\n\n${p1}`;
+    const p1Start=doc.indexOf(p1);
+    const host=document.createElement("div");
+    host.className="android-reading";
+    const s0=document.createElement("section");
+    s0.setAttribute("data-windowed-block","");
+    s0.setAttribute("data-windowed-mounted","true");
+    s0.setAttribute("data-source-start","0");
+    s0.setAttribute("data-source-end",String(p0.length));
+    s0.innerHTML=`<p data-source-start="0" data-source-end="${p0.length}">${p0}</p>`;
+
+    const s1=document.createElement("section");
+    s1.setAttribute("data-windowed-block","");
+    s1.setAttribute("data-windowed-mounted","true");
+    s1.setAttribute("data-source-start",String(p1Start));
+    s1.setAttribute("data-source-end",String(doc.length));
+    const mountS1=()=>{
+      s1.setAttribute("data-windowed-mounted","true");
+      s1.innerHTML=`<p data-source-start="${p1Start}" data-source-end="${doc.length}">${p1}</p>`;
+    };
+    const unmountS1=()=>{
+      s1.setAttribute("data-windowed-mounted","false");
+      s1.innerHTML='<span aria-hidden="true"></span>';
+    };
+    mountS1();
+    let revealCount=0;
+    s1.addEventListener("supermd-reveal-window",()=>{
+      revealCount++;
+      mountS1();
+    });
+    const searchRootEl=document.createElement("div");
+    host.append(s0,s1);
+    document.body.append(searchRootEl,host);
+    const clean0=registerWindowedText(s0,p0);
+    const clean1=registerWindowedText(s1,p1);
+
+    const onChange=vi.fn();
+    const root=createRoot(searchRootEl);
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{
+        content:doc,
+        close:()=>{},
+        onChange,
+        seed:{query:"needle",nonce:1},
+      }));
+    });
+    await flushFrames();
+
+    // Open Replace in source and step to 2 / 2 (in s1), then simulate s1 virtualizing offscreen (`data-windowed-mounted="false"`).
+    act(()=>searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!.click());
+    await flushFrames();
+    act(()=>searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!.click());
+    await flushFrames();
+    expect(searchRootEl.querySelector("output")?.textContent).toBe("2 / 2");
+
+    unmountS1();
+    revealCount=0;
+
+    // 1. Exiting Replace via `canReplace -> false` (Live -> Read transition, `onChange` omitted) does NOT reveal/mount offscreen s1 (`exitReplacingToRendered(false)`).
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{
+        content:doc,
+        close:()=>{},
+        seed:{query:"needle",nonce:1},
+      }));
+    });
+    await flushFrames();
+    expect(searchRootEl.querySelector(".search-replace")).toBeNull();
+    expect(searchRootEl.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(revealCount).toBe(0);
+    expect(s1.getAttribute("data-windowed-mounted")).toBe("false");
+
+    // 2. Re-enter Live Replace at 2 / 2 with s1 unmounted, then manually toggle `Replace in source` OFF -> DOES reveal/mount s1 (`exitReplacingToRendered(true)`).
+    await act(async()=>{
+      root.render(createElement(ReadingSearch,{
+        content:doc,
+        close:()=>{},
+        onChange,
+        seed:{query:"needle",nonce:1},
+      }));
+    });
+    await flushFrames();
+    act(()=>searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!.click());
+    await flushFrames();
+    expect(searchRootEl.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(s1.getAttribute("data-windowed-mounted")).toBe("false");
+
+    act(()=>searchRootEl.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!.click());
+    await flushFrames();
+    expect(searchRootEl.querySelector(".search-replace")).toBeNull();
+    expect(searchRootEl.querySelector("output")?.textContent).toBe("2 / 2");
+    expect(revealCount).toBe(1);
+    expect(s1.getAttribute("data-windowed-mounted")).toBe("true");
+    expect(highlights.get("smd-search-current")?.ranges[0]?.toString()).toBe("needle");
+
+    clean0();
+    clean1();
+    act(()=>root.unmount());
+  });
+
+  it("bounds hiddenSpansInSlice non-recursively across deeply nested bracket/link markup while preserving exact UTF-16 offsets and escape-only URL tails",()=>{
+    // 1. 2,500-deep nested links (~95 KB, well within 200 KB block limit) with astral UTF-16 surrogates (`📓`),
+    //    inner `<mark>`, HTML comment, inline code, and escape-only URL tails containing unmatched backticks and escaped `\)`.
+    //    Recursive `.slice()` + `...` spread would overflow the call stack or degrade quadratically; stack traversal stays linear & merges adjacent spans.
+    const depth=2500;
+    const prefix="📓 Intro ";
+    const core="See <!-- hidden Straße --><mark>Straße</mark> and `[keep](https://visible.example/Straße)`";
+    const tailUnit="](https://example.com/Straße`v1\\)ok)";
+    const deepNested=prefix+"[".repeat(depth)+core+tailUnit.repeat(depth)+" 💡 omega";
+    const baseOffset=42;
+    const hidden=hiddenSpansInSlice(deepNested,baseOffset);
+    const isHidden=(from:number,to:number)=>hidden.some(h=>from>=h.from&&to<=h.to);
+
+    // Adjacent `[` openings merge into 1 span, comment+`<mark>` merge into 1 span, `</mark>` stays 1 span, and all 2,500 `](...)` tails merge into 1 span = 4 disjoint sorted spans!
+    expect(hidden).toHaveLength(4);
+    for(let i=1;i<hidden.length;i++) expect(hidden[i-1].to).toBeLessThan(hidden[i].from);
+
+    // Exact UTF-16 offsets: `📓` occupies 2 UTF-16 code units, so opening `[` run spans `[prefix.length, prefix.length + depth)`.
+    expect(hidden[0]).toEqual({from:baseOffset+prefix.length,to:baseOffset+prefix.length+depth});
+    const visibleStrasseFrom=deepNested.indexOf("<mark>Straße</mark>")+"<mark>".length;
+    const codeStrasseFrom=deepNested.indexOf("visible.example/Straße")+"visible.example/".length;
+    const firstTailStrasseFrom=deepNested.indexOf("https://example.com/Straße")+"https://example.com/".length;
+    const lastTailStrasseFrom=deepNested.lastIndexOf("Straße");
+    const omegaFrom=deepNested.lastIndexOf("omega");
+    expect(deepNested.slice(visibleStrasseFrom,visibleStrasseFrom+6)).toBe("Straße");
+    expect(deepNested.slice(codeStrasseFrom,codeStrasseFrom+6)).toBe("Straße");
+    expect(deepNested.slice(firstTailStrasseFrom,firstTailStrasseFrom+6)).toBe("Straße");
+    expect(deepNested.slice(lastTailStrasseFrom,lastTailStrasseFrom+6)).toBe("Straße");
+    expect(isHidden(baseOffset+visibleStrasseFrom,baseOffset+visibleStrasseFrom+6)).toBe(false);
+    expect(isHidden(baseOffset+codeStrasseFrom,baseOffset+codeStrasseFrom+6)).toBe(false);
+    expect(isHidden(baseOffset+firstTailStrasseFrom,baseOffset+firstTailStrasseFrom+6)).toBe(true);
+    expect(isHidden(baseOffset+lastTailStrasseFrom,baseOffset+lastTailStrasseFrom+6)).toBe(true);
+    expect(isHidden(baseOffset+omegaFrom,baseOffset+omegaFrom+5)).toBe(false);
+
+    // 2. Pathological 25,000 unclosed `[` brackets + badge image-in-link `[![alt](img)](dest)` + unclosed outer `[` before `![alt](img)` + >200 KB guard.
+    const unclosedLead="📓 "+"[".repeat(25_000)+"[Visible Straße](https://example.com/Straße`tail) [![Badge Straße](https://img.example/Straße`1.png)](https://dest.example/Straße`2) [unclosed ![Img Straße](https://img.example/Straße`3.png)";
+    const unclosedHidden=hiddenSpansInSlice(unclosedLead,10);
+    const isUnclosedHidden=(from:number,to:number)=>unclosedHidden.some(h=>from>=h.from&&to<=h.to);
+    const unclosedHits=sourceMatches(unclosedLead,"Straße",true);
+    // 0: Visible Straße (visible)
+    // 1: first link escape-only backtick URL (hidden)
+    // 2: badge image alt (hidden)
+    // 3: badge image URL (hidden)
+    // 4: badge outer link URL (hidden)
+    // 5: trailing image alt after unclosed `[` (hidden)
+    // 6: trailing image URL after unclosed `[` (hidden)
+    expect(unclosedHits).toHaveLength(7);
+    expect(unclosedHits.map(r=>isUnclosedHidden(r.from+10,r.to+10))).toEqual([false,true,true,true,true,true,true]);
+    expect(isUnclosedHidden(10+2,10+2+25_000)).toBe(false);
+    expect(hiddenSpansInSlice("[x](https://example.com)".repeat(9000),0)).toEqual([]);
+
+    // 3. End-to-end `resolveSourceHighlightRange` on a rendered block containing deeply nested links, astral UTF-16 offsets, and escape-only URL tails.
+    const blockNested="📓 "+"[".repeat(400)+"Lead <mark>Straße</mark>"+"](https://example.com/Straße`x\\)y)".repeat(400)+" after";
+    const host=document.createElement("div");
+    host.className="markdown-body";
+    host.innerHTML=`<p data-source-start="0" data-source-end="${blockNested.length}">📓 <a href="https://example.com/Straße%60x)y">Lead <mark>Straße</mark></a> after</p>`;
+    document.body.append(host);
+    const nestedMatches=sourceMatches(blockNested,"straße",false);
+    expect(nestedMatches).toHaveLength(401);
+    expect(isValidSeedOccurrence(blockNested,nestedMatches[0],"strasse",false,"Straße")).toBe(true);
+    expect(resolveSourceHighlightRange(host,blockNested,nestedMatches,0,"straße",false)?.toString()).toBe("Straße");
+    expect(resolveSourceHighlightRange(host,blockNested,nestedMatches,1,"straße",false)).toBeNull();
+    expect(resolveSourceHighlightRange(host,blockNested,nestedMatches,400,"straße",false)).toBeNull();
     host.remove();
   });
 });
