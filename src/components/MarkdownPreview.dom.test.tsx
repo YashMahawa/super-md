@@ -7,7 +7,7 @@ const { loadAsset, toJsxRuntimeSpy } = vi.hoisted(() => ({
   loadAsset: vi.fn(async (command: string, _args: unknown) => command === "fetch_resource" ? {body:"data:image/png;base64,iVBORw0KGgo="} : "data:image/png;base64,iVBORw0KGgo="),
   toJsxRuntimeSpy: vi.fn(),
 }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: loadAsset }));
+vi.mock("../nativeBridge", () => ({ invoke: loadAsset }));
 vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
   const actual = await importOriginal<typeof import("hast-util-to-jsx-runtime")>();
   return {
