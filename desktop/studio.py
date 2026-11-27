@@ -78,7 +78,7 @@ except ImportError:
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
-from core.paths import DESKTOP_DIR, resource_root
+from core.paths import DESKTOP_DIR, appdata_root, resource_root
 
 FOLDER_TREE_NOTE_SUFFIXES = frozenset({".md", ".smd", ".txt"})
 FOLDER_TREE_SCAN_BUDGET = 25000
@@ -598,7 +598,7 @@ class Session(QObject):
         self._rename_state_lock = threading.RLock()
         self._retired_persist_needed = False
         self._last_recovered_window_id = ""
-        self.data = Path(data) if data is not None else (Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))/"qt-studio")
+        self.data = Path(data) if data is not None else (Path(tempfile.mkdtemp(prefix="supermd-test-")) if isolated else appdata_root(writable_location_fn=QStandardPaths.writableLocation)/"qt-studio")
         self.data=self.data.resolve()
         self.data.mkdir(parents=True,exist_ok=True)
         self.font_store = FontStore(self.data)

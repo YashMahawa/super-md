@@ -437,6 +437,105 @@ class BackgroundTests(unittest.TestCase):
             )
             self.assertEqual(linux_cmd, [str(appimage.resolve()), "--background", "--agent-access"])
 
+    def test_appdata_override_isolates_session_broker_webengine_and_smoke_spawn_log(self):
+        import main as desktop_main
+
+        orig_writable = QStandardPaths.writableLocation
+
+        def forbid_appdata_writable_location(kind):
+            if kind == QStandardPaths.StandardLocation.AppDataLocation:
+                raise AssertionError("AppDataLocation must not be queried when SUPERMD_APPDATA_DIR is set")
+            return orig_writable(kind)
+
+        with tempfile.TemporaryDirectory(prefix="supermd-appdata-override-") as tmp:
+            root = Path(tmp).resolve()
+            disposable_appdata = (root / "service-home/AppData/Roaming/SuperMD/super-md").resolve()
+            spawn_log = root / "spawned-daemons.jsonl"
+            smoke_token = "smoke-token-12345"
+
+            class _FakeDefaultProfile:
+                def __init__(self):
+                    self.storage_path = None
+                    self.cache_path = None
+
+                def setPersistentStoragePath(self, value):
+                    self.storage_path = value
+
+                def setCachePath(self, value):
+                    self.cache_path = value
+
+                def settings(self):
+                    class _S:
+                        def setAttribute(self, *_args):
+                            pass
+                    return _S()
+
+                def urlSchemeHandler(self, _scheme):
+                    return object()
+
+            fake_profile = _FakeDefaultProfile()
+            env_patch = {
+                "SUPERMD_APPDATA_DIR": str(disposable_appdata),
+                "SUPERMD_SMOKE_RUN_ID": smoke_token,
+                "SUPERMD_SMOKE_SPAWN_LOG": str(spawn_log),
+            }
+            with patch.dict(os.environ, env_patch, clear=False), patch.object(
+                QStandardPaths, "writableLocation", side_effect=forbid_appdata_writable_location
+            ):
+                session = Session(False)
+                try:
+                    self.assertEqual(session.data, (disposable_appdata / "qt-studio").resolve())
+                    desktop_main._configure_reader_profile_storage(fake_profile, session)
+                    self.assertEqual(fake_profile.storage_path, str(session.data / "webengine-storage"))
+                    self.assertEqual(fake_profile.cache_path, str(session.data / "webengine-cache"))
+
+                    broker = InstanceBroker(self.qt_app, service_handler=lambda _action: {"ok": True, "running": True})
+                    try:
+                        self.assertEqual(broker.root, disposable_appdata)
+                        expected_name = "supermd-qt-" + hashlib.sha256(str(disposable_appdata).encode()).hexdigest()[:20]
+                        self.assertEqual(broker.name, expected_name)
+                    finally:
+                        broker.close()
+                finally:
+                    session.writes.shutdown(wait=True)
+
+                captured_spawn = {}
+
+                class _FakeSpawnedProc:
+                    pid = 54321
+
+                    def poll(self):
+                        return None
+
+                def capture_popen(cmd, **kwargs):
+                    captured_spawn["cmd"] = cmd
+                    captured_spawn["kwargs"] = kwargs
+                    return _FakeSpawnedProc()
+
+                out = io.StringIO()
+                with patch("instance.posix_ipc_exchange", side_effect=[
+                    (False, b"", True),
+                    (True, b'{"ok":true,"running":true,"agentAccess":true}\n', True),
+                ]), patch.object(background_cli.sys, "platform", "linux"), patch.object(
+                    background_cli.subprocess, "Popen", side_effect=capture_popen
+                ), redirect_stdout(out):
+                    rc = background_cli.main(["start"])
+
+                self.assertEqual(rc, 0)
+                started_payload = json.loads(out.getvalue())
+                self.assertEqual(
+                    Path(started_payload["result"]["sessionsDirectory"]).resolve(),
+                    (disposable_appdata / "qt-studio/agent-sessions").resolve(),
+                )
+                child_env = captured_spawn["kwargs"]["env"]
+                self.assertEqual(child_env["SUPERMD_APPDATA_DIR"], str(disposable_appdata))
+                self.assertEqual(child_env["SUPERMD_SMOKE_RUN_ID"], smoke_token)
+                self.assertNotIn("SUPERMD_SMOKE_SPAWN_LOG", child_env)
+                logged_entries = [json.loads(line) for line in spawn_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+                self.assertEqual(len(logged_entries), 1)
+                self.assertEqual(logged_entries[0]["pid"], 54321)
+                self.assertEqual(logged_entries[0]["token"], smoke_token)
+
     def test_upgrade_migration_preserves_legacy_background_and_agent_settings_without_opting_in_reader_only_users(self):
         root_temp = Path(tempfile.mkdtemp(prefix="supermd-upgrade-")).resolve()
         self.addCleanup(lambda: shutil.rmtree(root_temp, ignore_errors=True))
