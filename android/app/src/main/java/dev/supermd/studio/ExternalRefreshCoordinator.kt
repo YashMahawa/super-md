@@ -295,7 +295,8 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                         }
                         val forceVerify = forceVerifyUris.any { sameDocumentUri(noteUriRaw, it) }
                         if (forceVerify) refreshStamps.invalidate(note.id)
-                        val canProbeStamp = canProbeDocumentStampForTarget(documentAccess, resolver, parsedUri, target, ownShareAuthority)
+                        val canProbeStamp = note.portable &&
+                            canProbeDocumentStampForTarget(documentAccess, resolver, parsedUri, target, ownShareAuthority)
                         val beforeWallMs = readRefreshClockMs()
                         val beforeStamp = if (canProbeStamp) {
                             try {
@@ -310,7 +311,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                         } else null
                         if (note.dirty) {
                             val preIoAssets = preIoBaselineAssets(snapshot)
-                            val hasAuthoritativePortableBaseline = !note.portable || !note.assetsDirty || preIoAssets != null
+                            val hasAuthoritativePortableBaseline = note.portable && (!note.assetsDirty || preIoAssets != null)
                             val expectedAssets = if (note.portable) {
                                 preIoAssets ?: baselinePortableAssets(note).also { writeResolvedBaseline(snapshot, it) }
                             } else null
@@ -321,7 +322,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                                     noteId = note.id,
                                     probed = beforeStamp,
                                     savedMarkdown = note.saved,
-                                    portable = note.portable,
+                                    portable = true,
                                     assetDirectory = note.assetDirectory,
                                     expectedPortableAssets = expectedAssets,
                                 )
@@ -358,7 +359,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                                     beforeWallMs = beforeWallMs,
                                     beforeStamp = beforeStamp,
                                     savedMarkdown = note.saved,
-                                    portable = note.portable,
+                                    portable = true,
                                     assetDirectory = note.assetDirectory,
                                     portableAssets = expectedAssets,
                                 )
@@ -436,20 +437,6 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                                 cleanUpdates[note.id] = CleanExternalUpdate(snapshot, disk.markdown, disk.directory, diskAssets, verifiedStamp)
                             }
                         } else {
-                            if (
-                                !forceVerify &&
-                                note.content == note.saved &&
-                                refreshStamps.matchesBaseline(
-                                    noteId = note.id,
-                                    probed = beforeStamp,
-                                    savedMarkdown = note.saved,
-                                    portable = false,
-                                    assetDirectory = null,
-                                    expectedPortableAssets = null,
-                                )
-                            ) {
-                                return@withLock
-                            }
                             val text = try {
                                 resolver.openInputStream(target)?.use { readLimited(it, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF") }
                             } catch (cancelled: CancellationException) {
@@ -461,22 +448,7 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                             } ?: return@withLock
                             if (text != note.content) {
                                 refreshStamps.invalidate(note.id)
-                                val verifiedStamp = verifyProbedStampAfterRead(resolver, target, canProbeStamp, beforeWallMs, beforeStamp)
-                                cleanUpdates[note.id] = CleanExternalUpdate(snapshot, text, verifiedStamp = verifiedStamp)
-                            } else {
-                                recordVerifiedDocumentStampIfStable(
-                                    refreshStamps = refreshStamps,
-                                    resolver = resolver,
-                                    noteId = note.id,
-                                    target = target,
-                                    canProbeStamp = canProbeStamp,
-                                    beforeWallMs = beforeWallMs,
-                                    beforeStamp = beforeStamp,
-                                    savedMarkdown = note.saved,
-                                    portable = false,
-                                    assetDirectory = null,
-                                    portableAssets = null,
-                                )
+                                cleanUpdates[note.id] = CleanExternalUpdate(snapshot, text)
                             }
                         }
                     }
@@ -567,16 +539,16 @@ internal class ExternalRefreshCoordinator<Snapshot>(
                     val verified = update.verifiedStamp ?: return@forEach
                     val expectedDir = update.directory ?: snapshotNote(update.snapshot).assetDirectory
                     val adopted = readState().tabs.firstOrNull {
-                        it.id == id && !it.dirty && it.saved == update.markdown && it.assetDirectory == expectedDir
+                        it.id == id && it.portable && !it.dirty && it.saved == update.markdown && it.assetDirectory == expectedDir
                     } ?: return@forEach
                     refreshStamps.record(
                         id,
                         VerifiedDocumentStamp(
                             stamp = verified,
                             savedMarkdown = adopted.saved,
-                            portable = adopted.portable,
+                            portable = true,
                             assetDirectory = adopted.assetDirectory,
-                            portableAssets = if (adopted.portable) update.assets?.let(::shallowCopyPortableAssets) else null,
+                            portableAssets = update.assets?.let(::shallowCopyPortableAssets),
                         ),
                     )
                 }

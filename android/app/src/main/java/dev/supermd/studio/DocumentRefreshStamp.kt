@@ -78,12 +78,11 @@ internal class DocumentRefreshStampStore {
         assetDirectory: String?,
         expectedPortableAssets: JSONObject?,
     ): Boolean {
-        if (probed == null) return false
+        if (!portable || probed == null) return false
         val cached = entries[noteId] ?: return false
-        if (cached.stamp != probed) return false
-        if (cached.portable != portable || cached.assetDirectory != assetDirectory) return false
+        if (!cached.portable || cached.stamp != probed) return false
+        if (cached.assetDirectory != assetDirectory) return false
         if (cached.savedMarkdown != savedMarkdown) return false
-        if (!portable) return true
         val cachedAssets = cached.portableAssets ?: return false
         val currentAssets = expectedPortableAssets ?: return false
         return portableAssetsMatch(cachedAssets, currentAssets)
@@ -220,13 +219,14 @@ internal fun recordVerifiedDocumentStampIfStable(
     assetDirectory: String?,
     portableAssets: JSONObject?,
 ) {
+    if (!portable) return
     val verified = verifyProbedStampAfterRead(resolver, target, canProbeStamp, beforeWallMs, beforeStamp) ?: return
     refreshStamps.record(
         noteId,
         VerifiedDocumentStamp(
             stamp = verified,
             savedMarkdown = savedMarkdown,
-            portable = portable,
+            portable = true,
             assetDirectory = assetDirectory,
             portableAssets = portableAssets?.let(::shallowCopyPortableAssets),
         ),

@@ -143,7 +143,7 @@ internal class ReloadFromDiskCoordinator(
                             val parsedNoteUri = Uri.parse(noteUri)
                             val access = documentAccess()
                             val target = access.resolve(parsedNoteUri)
-                            val canProbeStamp = canProbeDocumentStampForTarget(
+                            val canProbeStamp = note.portable && canProbeDocumentStampForTarget(
                                 documentAccess = access,
                                 resolver = resolver,
                                 parsedUri = parsedNoteUri,
@@ -179,7 +179,9 @@ internal class ReloadFromDiskCoordinator(
                                     )
                                 }
                             } ?: error("Document permission is unavailable; choose it again")
-                            reloadedVerifiedStamp = verifyProbedStampAfterRead(resolver, target, canProbeStamp, beforeWallMs, beforeStamp)
+                            reloadedVerifiedStamp = if (loaded.portable) {
+                                verifyProbedStampAfterRead(resolver, target, canProbeStamp, beforeWallMs, beforeStamp)
+                            } else null
                             reloaded = loaded
 
                             if (note.dirty) {
@@ -283,17 +285,19 @@ internal class ReloadFromDiskCoordinator(
                                 savedPortableAssets.remove(id)
                             }
                             refreshStamps.invalidate(id)
-                            reloadedVerifiedStamp?.let { verified ->
-                                refreshStamps.record(
-                                    id,
-                                    VerifiedDocumentStamp(
-                                        stamp = verified,
-                                        savedMarkdown = loadedNote.saved,
-                                        portable = loadedNote.portable,
-                                        assetDirectory = loadedNote.assetDirectory,
-                                        portableAssets = if (loadedNote.portable) savedPortableAssets[id]?.let(::shallowCopyPortableAssets) else null,
-                                    ),
-                                )
+                            if (loadedNote.portable) {
+                                reloadedVerifiedStamp?.let { verified ->
+                                    refreshStamps.record(
+                                        id,
+                                        VerifiedDocumentStamp(
+                                            stamp = verified,
+                                            savedMarkdown = loadedNote.saved,
+                                            portable = true,
+                                            assetDirectory = loadedNote.assetDirectory,
+                                            portableAssets = savedPortableAssets[id]?.let(::shallowCopyPortableAssets),
+                                        ),
+                                    )
+                                }
                             }
                             changeState { state ->
                                 state.copy(

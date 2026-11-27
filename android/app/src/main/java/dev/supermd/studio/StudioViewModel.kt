@@ -2266,19 +2266,6 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             } else {
                 val content = readLimited(buffered, 20_000_000).toString(Charsets.UTF_8).removePrefix("\uFEFF")
                 Note(name = name, uri = target.toString(), content = content, saved = content, relative = relative)
-                    .also { created ->
-                        recordVerifiedStampIfStable(
-                            noteId = created.id,
-                            target = target,
-                            canProbeStamp = canProbeStamp,
-                            beforeWallMs = beforeWallMs,
-                            beforeStamp = beforeStamp,
-                            savedMarkdown = created.saved,
-                            portable = false,
-                            assetDirectory = null,
-                            portableAssets = null,
-                        )
-                    }
             }
         }
     }

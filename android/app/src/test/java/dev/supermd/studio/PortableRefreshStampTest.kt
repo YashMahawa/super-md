@@ -199,6 +199,11 @@ class PortableRefreshStampTest {
             attachInfo(app, ProviderInfo().apply { authority = StampedRefreshDocumentProvider.AUTHORITY; exported = true; grantUriPermissions = true })
         }
         ShadowContentResolver.registerProviderInternal(StampedRefreshDocumentProvider.AUTHORITY, provider)
+        RevocableTestDocumentsProvider.reset(app)
+        val revocableProvider = RevocableTestDocumentsProvider().apply {
+            attachInfo(app, ProviderInfo().apply { authority = RevocableTestDocumentsProvider.authority(app); exported = true; grantUriPermissions = true })
+        }
+        ShadowContentResolver.registerProviderInternal(RevocableTestDocumentsProvider.authority(app), revocableProvider)
         app.getSharedPreferences("studio", Context.MODE_PRIVATE).edit().clear().commit()
         File(app.filesDir, "workspace.json").delete()
         File(app.filesDir, "portable-assets").deleteRecursively()
@@ -212,6 +217,8 @@ class PortableRefreshStampTest {
         drainAll()
         TestAuthorityGrants.clear()
         StampedRefreshDocumentProvider.reset(app, tempDir)
+        RevocableTestDocumentsProvider.reset(app)
+        TestAuthorityGrants.unregisterAuthority(RevocableTestDocumentsProvider.authority(app))
         ShadowContentResolver.reset()
         createdWorkspaces.forEach { key ->
             File(app.filesDir, "workspaces/$key.json").delete()
@@ -282,6 +289,20 @@ class PortableRefreshStampTest {
             jsonAssets.put(key, "data:image/png;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP))
         }
         return ByteArrayOutputStream().also { out -> media.writeFmd(out, markdown, jsonAssets) }.toByteArray()
+    }
+
+    private fun buildRawJsonPortableArchive(markdown: String, assets: Map<String, ByteArray>): ByteArray {
+        val jsonAssets = JSONObject()
+        assets.forEach { (key, bytes) ->
+            jsonAssets.put(key, "data:image/png;base64," + Base64.encodeToString(bytes, Base64.NO_WRAP))
+        }
+        return JSONObject()
+            .put("format", "supermd-smd")
+            .put("version", 1)
+            .put("markdown", markdown)
+            .put("assets", jsonAssets)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
     }
 
     @Test
@@ -363,28 +384,39 @@ class PortableRefreshStampTest {
         val baseTime = 1_760_010_000_000L
         val nowMs = baseTime + 5_000L
         val smdUri = StampedRefreshDocumentProvider.uriFor("report.smd")
+        val directSmdUri = StampedRefreshDocumentProvider.uriFor("direct.smd")
         val mdUri = StampedRefreshDocumentProvider.uriFor("notes.md")
         val initialSmd = buildPortableArchive("# Report A", mapOf("assets/chart.png" to pngBytes(1, 256)))
+        val initialDirectSmd = buildPortableArchive("# Direct A", mapOf("assets/d.png" to pngBytes(3, 256)))
         StampedRefreshDocumentProvider.putBytes("report.smd", initialSmd, "application/vnd.supermd.smd", lastModified = baseTime)
+        StampedRefreshDocumentProvider.putBytes("direct.smd", initialDirectSmd, "application/vnd.supermd.smd", lastModified = baseTime)
         StampedRefreshDocumentProvider.putText("notes.md", "# Notes A!", lastModified = baseTime)
 
         val model = newModel()
         model.refreshClockMs = { nowMs }
         model.open(smdUri)
         waitUntil { model.state.value.tabs.any { it.uri == smdUri.toString() } }
+        model.open(directSmdUri)
+        waitUntil { model.state.value.tabs.any { it.uri == directSmdUri.toString() } }
         model.open(mdUri)
         waitUntil { model.state.value.active.uri == mdUri.toString() }
         val smdTabId = model.state.value.tabs.first { it.uri == smdUri.toString() }.id
+        val directSmdTabId = model.state.value.tabs.first { it.uri == directSmdUri.toString() }.id
         val mdTabId = model.state.value.tabs.first { it.uri == mdUri.toString() }.id
         assertNotNull(model.refreshStamps.get(smdTabId))
-        assertNotNull(model.refreshStamps.get(mdTabId))
+        assertNotNull(model.refreshStamps.get(directSmdTabId))
+        assertNull("Plain Markdown tabs must not cache refresh stamps", model.refreshStamps.get(mdTabId))
 
         // Mutate provider bytes WITHOUT updating lastModified or reportedSize, simulating a provider that only notifies.
         val updatedSmd = buildPortableArchive("# Report B", mapOf("assets/chart.png" to pngBytes(2, 256)))
+        val updatedDirectSmd = buildPortableArchive("# Direct B", mapOf("assets/d.png" to pngBytes(4, 256)))
         StampedRefreshDocumentProvider.putBytes("report.smd", updatedSmd, "application/vnd.supermd.smd", lastModified = baseTime, reportedSize = initialSmd.size.toLong())
+        StampedRefreshDocumentProvider.putBytes("direct.smd", updatedDirectSmd, "application/vnd.supermd.smd", lastModified = baseTime, reportedSize = initialDirectSmd.size.toLong())
         StampedRefreshDocumentProvider.putText("notes.md", "# Notes B!", lastModified = baseTime)
 
-        // Direct targeted refreshExternal(mdUri) must bypass mdTab's stamp.
+        // Direct targeted refreshExternal(directSmdUri) must bypass directSmdTab's verified stamp, and plain mdUri updates cleanly.
+        model.refreshExternal(directSmdUri, immediate = true)
+        waitUntil { model.state.value.tabs.first { it.id == directSmdTabId }.content == "# Direct B" }
         model.refreshExternal(mdUri, immediate = true)
         waitUntil { model.state.value.tabs.first { it.id == mdTabId }.content == "# Notes B!" }
 
@@ -402,45 +434,55 @@ class PortableRefreshStampTest {
     @Test
     fun unknownAndEpochSecondMetadataNeverCacheStampsAndDetectSameLengthEdits() {
         var nowMs = 1_760_020_000_000L
-        val nullMetaMd = StampedRefreshDocumentProvider.uriFor("unknown-mod.md")
+        val nullMetaSmd = StampedRefreshDocumentProvider.uriFor("unknown-mod.smd")
         val epochSecSmd = StampedRefreshDocumentProvider.uriFor("seconds-mod.smd")
-        StampedRefreshDocumentProvider.putText("unknown-mod.md", "Alpha 1234", lastModified = null)
+        val nullMetaMd = StampedRefreshDocumentProvider.uriFor("unknown-mod.md")
+        val nullSmdV1 = buildRawJsonPortableArchive("Alpha 1234", mapOf("assets/u.png" to pngBytes(6, 256)))
+        val nullSmdV2 = buildRawJsonPortableArchive("Bravo 5678", mapOf("assets/u.png" to pngBytes(6, 256)))
+        val secSmdV1 = buildRawJsonPortableArchive("Slide 0001", mapOf("assets/p.png" to pngBytes(7, 256)))
+        val secSmdV2 = buildRawJsonPortableArchive("Slide 0002", mapOf("assets/p.png" to pngBytes(7, 256)))
+        assertEquals(nullSmdV1.size, nullSmdV2.size)
+        assertEquals(secSmdV1.size, secSmdV2.size)
+
+        StampedRefreshDocumentProvider.putBytes("unknown-mod.smd", nullSmdV1, "application/vnd.supermd.smd", lastModified = null)
         StampedRefreshDocumentProvider.putBytes(
             "seconds-mod.smd",
-            buildPortableArchive("Slide 0001", mapOf("assets/p.png" to pngBytes(7, 256))),
+            secSmdV1,
             "application/vnd.supermd.smd",
             lastModified = 1_760_020_000L, // Buggy Unix epoch seconds (~1.76e9) instead of ms
         )
+        StampedRefreshDocumentProvider.putText("unknown-mod.md", "Alpha 1234", lastModified = null)
 
         val model = newModel()
         model.refreshClockMs = { nowMs }
-        model.open(nullMetaMd)
-        waitUntil { model.state.value.tabs.any { it.uri == nullMetaMd.toString() } }
+        model.open(nullMetaSmd)
+        waitUntil { model.state.value.tabs.any { it.uri == nullMetaSmd.toString() } }
         model.open(epochSecSmd)
-        waitUntil { model.state.value.active.uri == epochSecSmd.toString() }
+        waitUntil { model.state.value.tabs.any { it.uri == epochSecSmd.toString() } }
+        model.open(nullMetaMd)
+        waitUntil { model.state.value.active.uri == nullMetaMd.toString() }
+        val nullSmdId = model.state.value.tabs.first { it.uri == nullMetaSmd.toString() }.id
+        val secSmdId = model.state.value.tabs.first { it.uri == epochSecSmd.toString() }.id
         val mdId = model.state.value.tabs.first { it.uri == nullMetaMd.toString() }.id
-        val smdId = model.state.value.tabs.first { it.uri == epochSecSmd.toString() }.id
 
         nowMs += 60_000L
         model.media.portableAssetExtractions.set(0)
         model.refreshExternal(immediate = true)
         waitUntil { !model.isRefreshExternalActive() }
-        assertNull("Null lastModified must never cache a verified stamp", model.refreshStamps.get(mdId))
-        assertNull("Epoch-second lastModified must never cache a verified stamp", model.refreshStamps.get(smdId))
+        assertNull("Null lastModified must never cache a verified stamp", model.refreshStamps.get(nullSmdId))
+        assertNull("Epoch-second lastModified must never cache a verified stamp", model.refreshStamps.get(secSmdId))
+        assertNull("Plain Markdown must not cache a verified stamp", model.refreshStamps.get(mdId))
         assertEquals("Unchanged portable fallback on unknown metadata must extract zero files", 0, model.media.portableAssetExtractions.get())
 
-        // Same-length external edits without notifyChange: passive refresh must detect both!
+        // Same-length external edits without notifyChange: passive refresh must detect all three!
+        StampedRefreshDocumentProvider.putBytes("unknown-mod.smd", nullSmdV2, "application/vnd.supermd.smd", lastModified = null)
+        StampedRefreshDocumentProvider.putBytes("seconds-mod.smd", secSmdV2, "application/vnd.supermd.smd", lastModified = 1_760_020_000L)
         StampedRefreshDocumentProvider.putText("unknown-mod.md", "Bravo 5678", lastModified = null)
-        StampedRefreshDocumentProvider.putBytes(
-            "seconds-mod.smd",
-            buildPortableArchive("Slide 0002", mapOf("assets/p.png" to pngBytes(7, 256))),
-            "application/vnd.supermd.smd",
-            lastModified = 1_760_020_000L,
-        )
         model.refreshExternal(immediate = true)
         waitUntil {
-            model.state.value.tabs.first { it.id == mdId }.content == "Bravo 5678" &&
-                model.state.value.tabs.first { it.id == smdId }.content == "Slide 0002"
+            model.state.value.tabs.first { it.id == nullSmdId }.content == "Bravo 5678" &&
+                model.state.value.tabs.first { it.id == secSmdId }.content == "Slide 0002" &&
+                model.state.value.tabs.first { it.id == mdId }.content == "Bravo 5678"
         }
     }
 
@@ -448,19 +490,25 @@ class PortableRefreshStampTest {
     fun coarseAndSubSecondGuardWindowsCatchSameLengthExternalEditsBeforeStampPromotion() {
         val coarseMod = 1_760_030_000_000L
         var nowMs = coarseMod + 900L
-        val safMdUri = StampedRefreshDocumentProvider.uriFor("coarse.md")
-        StampedRefreshDocumentProvider.putText("coarse.md", "Tick-One!!", lastModified = coarseMod)
+        val safSmdUri = StampedRefreshDocumentProvider.uriFor("coarse.smd")
+        val coarseV1 = buildRawJsonPortableArchive("Tick-One!!", mapOf("assets/t.png" to pngBytes(8, 256)))
+        val coarseV2 = buildRawJsonPortableArchive("Tick-Two!!", mapOf("assets/t.png" to pngBytes(8, 256)))
+        assertEquals(coarseV1.size, coarseV2.size)
+        StampedRefreshDocumentProvider.putBytes("coarse.smd", coarseV1, "application/vnd.supermd.smd", lastModified = coarseMod)
 
-        val localFile = File(tempDir, "fine-tick.md").apply { writeText("Fine-One!!", Charsets.UTF_8) }
+        val fineV1 = buildRawJsonPortableArchive("Fine-One!!", mapOf("assets/f.png" to pngBytes(9, 256)))
+        val fineV2 = buildRawJsonPortableArchive("Fine-Two!!", mapOf("assets/f.png" to pngBytes(9, 256)))
+        assertEquals(fineV1.size, fineV2.size)
+        val localFile = File(tempDir, "fine-tick.smd").apply { writeBytes(fineV1) }
         val fineTime = FileTime.from(1_760_030_000_123_456_000L, TimeUnit.NANOSECONDS)
         Files.setLastModifiedTime(localFile.toPath(), fineTime)
         val localUri = Uri.fromFile(localFile)
 
         val model = newModel()
         model.refreshClockMs = { nowMs }
-        model.open(safMdUri)
-        waitUntil { model.state.value.tabs.any { it.uri == safMdUri.toString() } }
-        val safId = model.state.value.tabs.first { it.uri == safMdUri.toString() }.id
+        model.open(safSmdUri)
+        waitUntil { model.state.value.tabs.any { it.uri == safSmdUri.toString() } }
+        val safId = model.state.value.tabs.first { it.uri == safSmdUri.toString() }.id
         assertNull("Whole-second stamp within 2.5s guard window must not be trusted yet", model.refreshStamps.get(safId))
 
         nowMs = fineTime.toMillis() + 10L
@@ -469,9 +517,9 @@ class PortableRefreshStampTest {
         val localId = model.state.value.tabs.first { it.uri == localUri.toString() }.id
         assertNull("Sub-second stamp within 50ms kernel-tick guard window must not be trusted yet", model.refreshStamps.get(localId))
 
-        // Same-length external edits preserving the EXACT same timestamps within the guard windows!
-        StampedRefreshDocumentProvider.putText("coarse.md", "Tick-Two!!", lastModified = coarseMod)
-        localFile.writeText("Fine-Two!!", Charsets.UTF_8)
+        // Same-length external edits preserving the EXACT same byte lengths and timestamps within the guard windows!
+        StampedRefreshDocumentProvider.putBytes("coarse.smd", coarseV2, "application/vnd.supermd.smd", lastModified = coarseMod)
+        localFile.writeBytes(fineV2)
         Files.setLastModifiedTime(localFile.toPath(), fineTime)
 
         nowMs = coarseMod + 1_200L
@@ -482,8 +530,10 @@ class PortableRefreshStampTest {
         }
 
         nowMs = coarseMod + 3_000L
+        model.media.portableAssetExtractions.set(0)
         model.refreshExternal(immediate = true)
         waitUntil { !model.isRefreshExternalActive() }
+        assertEquals(0, model.media.portableAssetExtractions.get())
         assertNotNull(model.refreshStamps.get(safId))
         assertNotNull(model.refreshStamps.get(localId))
     }
@@ -491,7 +541,7 @@ class PortableRefreshStampTest {
     @Test
     fun dirtyPortableAndMarkdownConflictsPauseAutosaveAndInAppSaveInvalidatesStamp() {
         val t0 = 1_760_040_000_000L
-        val nowMs = t0 + 5_000L
+        var nowMs = t0 + 5_000L
         val smdUri = StampedRefreshDocumentProvider.uriFor("dirty.smd")
         val mdUri = StampedRefreshDocumentProvider.uriFor("dirty.md")
         StampedRefreshDocumentProvider.putBytes("dirty.smd", buildPortableArchive("Base SMD 1", mapOf("assets/a.png" to pngBytes(11, 256))), "application/vnd.supermd.smd", lastModified = t0)
@@ -505,11 +555,21 @@ class PortableRefreshStampTest {
         waitUntil { model.state.value.active.uri == mdUri.toString() }
         val smdId = model.state.value.tabs.first { it.uri == smdUri.toString() }.id
         val mdId = model.state.value.tabs.first { it.uri == mdUri.toString() }.id
+        assertNotNull(model.refreshStamps.get(smdId))
+        assertNull(model.refreshStamps.get(mdId))
 
-        model.edit(mdId, "Save MD 02")
-        model.saveManual(noteId = mdId)
-        waitUntil { !model.state.value.tabs.first { it.id == mdId }.dirty }
-        assertNull("In-app save must invalidate cached stamp", model.refreshStamps.get(mdId))
+        // In-app portable save must invalidate the cached portable stamp; advance past guard window to re-promote.
+        model.select(smdId)
+        waitUntil { model.state.value.active.id == smdId && !model.isRefreshExternalActive() }
+        model.edit(smdId, "Save SMD 02")
+        model.saveManual(noteId = smdId)
+        waitUntil { !model.state.value.tabs.first { it.id == smdId }.dirty && !model.state.value.busy }
+        assertNull("In-app portable save must invalidate cached stamp", model.refreshStamps.get(smdId))
+
+        nowMs += 5_000L
+        model.refreshExternal(smdUri, immediate = true, forceVerifyTarget = false)
+        waitUntil { !model.isRefreshExternalActive() }
+        assertNotNull("Passive refresh past guard window promotes updated portable baseline stamp", model.refreshStamps.get(smdId))
 
         model.edit(smdId, "Local draft SMD")
         model.edit(mdId, "Local draft MD")
@@ -675,5 +735,57 @@ class PortableRefreshStampTest {
         val adoptedDir = model.state.value.active.assetDirectory!!
         assertEquals(setOf(adoptedDir), portableRoot.list()?.toSet().orEmpty())
         assertNotNull("Retry after cancellation must promote verified stamp for adopted archive", model.refreshStamps.get(tabId))
+    }
+
+    @Test
+    fun revocableProviderOrdinaryReadIoErrorOnResumeIsExercisedAndStaysDistinctFromPermissionDenial() {
+        val resumeUri = RevocableTestDocumentsProvider.putMarkdown(
+            app,
+            "ResumeTarget.md",
+            "# Saved before backgrounding\n",
+        )
+        val ordinaryErrorUri = RevocableTestDocumentsProvider.putMarkdown(
+            app,
+            "OrdinaryError.md",
+            "# Stays saved on transient I/O error\n",
+        )
+        RevocableTestDocumentsProvider.grantReadWrite(resumeUri)
+        RevocableTestDocumentsProvider.grantReadWrite(ordinaryErrorUri)
+
+        val baseWallMs = maxOf(
+            RevocableTestDocumentsProvider.fileForDocId(app, "OrdinaryError.md").lastModified(),
+            RevocableTestDocumentsProvider.fileForDocId(app, "ResumeTarget.md").lastModified(),
+        )
+        var nowMs = baseWallMs + 5_000L
+
+        val model = newModel(autosave = false)
+        model.refreshClockMs = { nowMs }
+        model.open(ordinaryErrorUri)
+        waitUntil { model.state.value.tabs.any { it.uri == ordinaryErrorUri.toString() } }
+        val ordinaryId = model.state.value.tabs.single { it.uri == ordinaryErrorUri.toString() }.id
+
+        model.open(resumeUri)
+        waitUntil { model.state.value.active.uri == resumeUri.toString() }
+
+        model.select(ordinaryId)
+        waitUntil { model.state.value.active.id == ordinaryId && !model.isRefreshExternalActive() }
+
+        val attemptsBeforeResume = RevocableTestDocumentsProvider.openReadAttempts("OrdinaryError.md")
+        RevocableTestDocumentsProvider.setOrdinaryReadIoError("OrdinaryError.md", true)
+        nowMs += 1_000L
+        model.refreshExternal(immediate = true)
+        waitUntil { !model.isRefreshExternalActive() }
+
+        assertTrue(
+            "Passive onResume refresh on plain markdown must open stream and exercise transient read I/O error",
+            RevocableTestDocumentsProvider.openReadAttempts("OrdinaryError.md") > attemptsBeforeResume,
+        )
+        assertFalse("Ordinary I/O error must not block writes", model.documentWriteNeedsAccess(ordinaryId))
+        assertNull(model.documentAccessRequests.value)
+        assertEquals(
+            "# Stays saved on transient I/O error\n",
+            model.state.value.tabs.single { it.id == ordinaryId }.content,
+        )
+        RevocableTestDocumentsProvider.setOrdinaryReadIoError("OrdinaryError.md", false)
     }
 }
