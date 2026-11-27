@@ -204,12 +204,29 @@ mod tests {
         }
     }
     #[test] fn all_gallery_themes_validate_with_embedded_art() {
-        let path=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/themes");
-        for entry in std::fs::read_dir(path).unwrap() {
-            let path=entry.unwrap().path();if path.extension().is_some_and(|ext|ext=="json") {
-                let raw=std::fs::read_to_string(&path).unwrap();assert!(parse(&raw).is_ok(),"{}: {:?}",path.display(),parse(&raw).err());
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CatalogEntry { id: String, name: String, filename: String }
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../public/themes");
+        let mut validated = BTreeMap::new();
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(filename) = path.file_name().and_then(|name| name.to_str()) else { continue };
+            if filename.ends_with(".supermd-theme.json") {
+                let raw = std::fs::read_to_string(&path).unwrap();
+                let theme = parse(&raw).unwrap_or_else(|err| panic!("{}: {err:?}", path.display()));
+                validated.insert(filename.to_string(), theme.name);
             }
         }
+        assert_eq!(validated.len(), 16);
+        let catalog: Vec<CatalogEntry> = serde_json::from_str(&std::fs::read_to_string(dir.join("index.json")).unwrap()).unwrap();
+        assert_eq!(catalog.len(), 16);
+        assert!(catalog.windows(2).all(|pair| pair[0].id < pair[1].id));
+        let catalog_map: BTreeMap<String, String> = catalog.into_iter().map(|entry| {
+            assert_eq!(entry.filename, format!("{}.supermd-theme.json", entry.id));
+            (entry.filename, entry.name)
+        }).collect();
+        assert_eq!(catalog_map, validated);
     }
     #[test] fn embedded_art_refuses_active_content_resources_and_oversized_images() {
         for body in ["<script/>","<rect onclick='x()'/>","<image href='https://example.com/a.png'/>","<rect style='fill:red'/>","<animate/>","<path fill='url(#a) url(https://example.com)'/>"] {
