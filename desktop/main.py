@@ -42,6 +42,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWebEngineQuick import QtWebEngineQuick
 from PySide6.QtWebEngineCore import QWebEngineProfile, QWebEngineUrlScheme
 from studio import Session, Studio, ROOT
+from external_open import ExternalOpenRouter
 from agent_live import create_qt_bridge
 from reader_assets import READER_SCHEME, ReaderAssetSchemeHandler, ReaderBundleSchemeHandler, SCHEME, reader_bundle_url, register_reader_schemes
 from instance import InstanceBroker
@@ -50,6 +51,7 @@ import native_frame
 
 class StudioApplication(QApplication):
     openRequested = Signal(str)
+    reopenRequested = Signal()
 
     def event(self, event):
         # Native macOS open events target the application. Do not install a
@@ -60,6 +62,8 @@ class StudioApplication(QApplication):
             if path:
                 self.openRequested.emit(path)
                 return True
+        elif sys.platform == "darwin" and event.type() == QEvent.Type.ApplicationActivate:
+            self.reopenRequested.emit()
         return super().event(event)
 
 def main():
@@ -118,22 +122,43 @@ def main():
         QFontDatabase.addApplicationFont(str(file))
     app.setFont(QFont("Noto Sans",11))
     app.setWindowIcon(QIcon(str(ROOT / "public" / "brand-mark-fixed.svg")))
+    global _TEARDOWN_COMPLETED
+    _TEARDOWN_COMPLETED = False
     broker = None if args.test_state else InstanceBroker(app)
-    if broker and not broker.claim_or_forward(args.note):
+    if broker and not broker.claim_or_forward(
+        args.note,
+        defer_listen=True,
+        open_existing=not (args.background and not args.note),
+    ):
         return 0
+    if broker:
+        try:
+            broker.hold_process_exit_lock()
+        except BaseException:
+            broker.close()
+            raise
     channel = QFile(":/qtwebchannel/qwebchannel.js")
     if not channel.open(QIODevice.OpenModeFlag.ReadOnly):
         raise RuntimeError("Qt WebChannel runtime is unavailable")
     channel_script = bytes(channel.readAll()).decode()
     engines, studios = [], []
     session = Session(args.test_state)
+    os.environ.pop("SUPERMD_FRESH_SERVICE_LOG", None)
+    cli_started_agent_access = bool(args.agent_access and not session.settings.get("agentAccessEnabled"))
     if args.agent_access:session.settings["agentAccessEnabled"]=True
     session.agent_bridge = create_qt_bridge(session, session.data)
     app.aboutToQuit.connect(session.agent_bridge.stop)
     asset_handler = ReaderAssetSchemeHandler(session.reader_assets, app)
     bundle_handler = ReaderBundleSchemeHandler(ROOT / "dist", app)
-    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
-    QWebEngineProfile.defaultProfile().installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
+    reader_profile_ready = {"initialized": False}
+    def ensure_reader_profile():
+        if reader_profile_ready["initialized"]:
+            return
+        profile = QWebEngineProfile.defaultProfile()
+        profile.installUrlSchemeHandler(SCHEME.encode("ascii"), asset_handler)
+        profile.installUrlSchemeHandler(READER_SCHEME.encode("ascii"), bundle_handler)
+        reader_profile_ready["initialized"] = True
+    session.ensure_reader_profile = ensure_reader_profile
     def detach_window(source_id, tab_id):
         source = session.windows.get(source_id)
         if not source or not source._can_move(): return
@@ -154,6 +179,10 @@ def main():
     def create_window(note=None, *, show_window=True):
         engine = QQmlApplicationEngine()
         studio = Studio(args.test_state,session)
+        if show_window:
+            ensure_reader_profile()
+        else:
+            studio._defer_reader_activation = True
         if args.smoke:
             studio.settings["welcomed"] = True
             studio.mode = "reader"
@@ -180,6 +209,7 @@ def main():
         if not engine.rootObjects():
             studio.stop()
             studio.pool.shutdown(wait=False, cancel_futures=True)
+            studio._search_pool.shutdown(wait=False, cancel_futures=True)
             engine.deleteLater()
             raise RuntimeError("Native QML window could not be loaded")
         # The user's laptop screen is preferred without changing active desktop focus.
@@ -197,12 +227,14 @@ def main():
                 studio.reader_gestures = ReaderGestures(window, reader, studio.readerCall.emit)
         window.readerViewChanged.connect(attach_reader_gestures)
         attach_reader_gestures(window.findChild(QObject, "documentReader"))
-        def retire_window():
-            if not window.isVisible() and not studio.retired and not studio.backgroundEnabled:
-                studio.stop()
-                if engine in engines: engines.remove(engine)
-                engine.deleteLater()
-        window.visibleChanged.connect(lambda: QTimer.singleShot(0, retire_window))
+        window.visibleChanged.connect(
+            lambda: QTimer.singleShot(
+                0,
+                lambda: session.background.handle_window_visibility(studio, engines=engines, studios=studios, engine=engine)
+                if getattr(session, "background", None) is not None
+                else None,
+            )
+        )
         remembered = session.settings.get("window") or {}
         if not args.smoke and isinstance(remembered, dict):
             try:
@@ -210,9 +242,12 @@ def main():
                 window.setHeight(max(520, int(remembered.get("height", window.height()))))
             except (TypeError, ValueError):
                 remembered = {}
-            available = (window.screen() or app.primaryScreen()).availableGeometry()
-            window.setWidth(min(window.width(), available.width()))
-            window.setHeight(min(window.height(), available.height()))
+            screen = window.screen() or app.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                if available.width() > 0 and available.height() > 0:
+                    window.setWidth(min(window.width(), available.width()))
+                    window.setHeight(min(window.height(), available.height()))
         laptop = next((s for s in app.screens() if s.name().startswith(("eDP", "LVDS"))), None)
         if laptop:
             window.setScreen(laptop)
@@ -235,6 +270,7 @@ def main():
             sync_frame()
         engines.append(engine)
         studios.append(studio)
+        external_router.register_window(studio, activated=show_window)
         if args.smoke:
             import time
             smoke_deadline = time.monotonic() + 30
@@ -483,55 +519,155 @@ def main():
         if note:
             studio.openPath(str(note))
         return studio
+    external_router = ExternalOpenRouter(studios, lambda note=None: create_window(note), app=app)
     app.aboutToQuit.connect(lambda:setattr(session,"quitting",True))
     def open_from_service(note=None):
+        if note:
+            external_router.open_requested(note)
+            return
         hidden=next((studio for studio in studios if not studio.retired and getattr(studio,"host_window",None) is not None and not studio.host_window.isVisible()),None)
         if hidden is not None:
-            hidden.host_window.show();hidden.host_window.raise_();hidden.host_window.requestActivate()
-            if note:hidden.openNote(str(note))
+            ensure_reader_profile()
+            hidden._defer_reader_activation = False
+            remembered = session.settings.get("window") or {}
+            if isinstance(remembered, dict) and remembered.get("maximized"):
+                hidden.host_window.showMaximized()
+            else:
+                hidden.host_window.show()
+            hidden.host_window.raise_();hidden.host_window.requestActivate()
+            if note:hidden.openPath(str(note))
             return
         create_window(note)
     from background_service import BackgroundService
-    session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
-    create_window(args.note,show_window=not args.background)
-    if not args.note and not args.smoke and session.settings.get("startup") == "restore":
-        while session.has_pending_startup_windows():
-            create_window(None, show_window=not args.background)
-    if session.settings.get("agentAccessEnabled"):
-        try:
-            session.agent_bridge.start()
-        except Exception as error:
-            session.settings["agentAccessEnabled"] = False
-            for studio in studios:
-                studio._agent_error = f"Could not enable live agent access ({type(error).__name__})."
-                studio._emit(False)
-    if broker:
-        broker.requested.connect(lambda note: open_from_service(note or None))
-    if broker:
-        def service_request(action):
-            if action=="quit":session.background.quit()
-            elif action=="start":
-                session.background.enabled=True;app.setQuitOnLastWindowClosed(False)
-                session.settings["agentAccessEnabled"]=True;session.agent_bridge.start()
-        broker.serviceRequested.connect(service_request)
+    try:
+        session.background=BackgroundService(app,session,ROOT,open_from_service,force=args.background)
+        session.background._cli_started_agent_access = cli_started_agent_access
+        create_window(args.note,show_window=not args.background)
+        if not args.note and not args.smoke and session.settings.get("startup") == "restore":
+            while session.has_pending_startup_windows():
+                create_window(None, show_window=not args.background)
+        if session.settings.get("agentAccessEnabled"):
+            try:
+                session.agent_bridge.start()
+            except Exception as error:
+                if args.background and args.agent_access:
+                    raise
+                session.settings["agentAccessEnabled"] = False
+                for studio in studios:
+                    studio._agent_error = f"Could not enable live agent access ({type(error).__name__})."
+                    studio._emit(False)
+        if broker:
+            app.aboutToQuit.connect(broker.stop_accepting)
+            broker.requested.connect(lambda note: open_from_service(note or None))
+            broker.set_service_handler(session.background.handle_service_request)
+            broker.start_listening()
+    except BaseException:
+        if broker:
+            broker.close()
+        raise
     app.openRequested.connect(open_from_service)
+    app.reopenRequested.connect(
+        lambda: open_from_service(None)
+        if getattr(session, "background", None) is not None and session.background.enabled and not session.background.forced and not session.background.quitting and not session.quitting and not session.background.visible_windows()
+        else None
+    )
     if args.quit_after:
         QTimer.singleShot(args.quit_after, app.quit)
     status = app.exec()
-    for studio in studios:
-        studio.stop()
-    # Destroy QML contexts while their Python backend objects are still alive.
-    for engine in engines:
-        engine.deleteLater()
-    app.sendPostedEvents(None,QEvent.Type.DeferredDelete)
-    for studio in studios:
-        studio.pool.shutdown(wait=False,cancel_futures=True)
-        studio._search_pool.shutdown(wait=False,cancel_futures=True)
-        # Don't cancel a user's pending save or final recovery write.
-    session.writes.shutdown(wait=True)
-    if broker:
-        broker.close()
+    _run_teardown(
+        app,
+        session,
+        studios,
+        engines,
+        asset_handler,
+        broker,
+        bundle_handler=bundle_handler,
+        reader_profile_initialized=reader_profile_ready["initialized"],
+    )
     return status
 
+
+_TEARDOWN_COMPLETED = False
+_DARWIN_EXIT_ANCHOR = []
+
+
+def _exit_process(status: int) -> None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if sys.platform == "darwin" and _TEARDOWN_COMPLETED:
+        os._exit(int(status))
+    else:
+        sys.exit(status)
+
+
+def _run_teardown(app, session, studios, engines, asset_handler, broker, *, bundle_handler=None, reader_profile_initialized=False):
+    global _TEARDOWN_COMPLETED
+    session.agent_bridge.stop()
+    for studio in list(studios):
+        studio.stop()
+        studio.pool.shutdown(wait=False, cancel_futures=True)
+        studio._search_pool.shutdown(wait=False, cancel_futures=True)
+    # Don't cancel a user's pending save or final recovery write.
+    session.writes.shutdown(wait=True)
+    if getattr(session, "background", None) is not None:
+        session.background._clear_quit_handlers()
+        session.background.open_window = None
+        if session.background.tray is not None:
+            session.background.tray.hide()
+    if sys.platform == "darwin":
+        # On macOS, destroying QQuickWebEngineView / WebEngineContext during
+        # rapid headless start->stop transitions can block indefinitely waiting
+        # on a mid-spawn QtWebEngineProcess Mach port. Flush all Python/disk
+        # state and release the broker lock first, keep Qt/WebEngine wrappers
+        # anchored against GC, and let _exit_process terminate via os._exit
+        # (which atomically releases native-instance.lifecycle in the kernel).
+        if broker:
+            broker.close()
+            broker.set_service_handler(None)
+        _DARWIN_EXIT_ANCHOR[:] = [app, session, list(studios), list(engines), asset_handler, bundle_handler, broker]
+        _TEARDOWN_COMPLETED = True
+        return
+    for engine in list(engines):
+        for root_obj in engine.rootObjects():
+            try:
+                root_obj.setProperty("intentionalShutdown", True)
+                root_obj.setProperty("closingAllowed", True)
+                root_obj.close()
+            except RuntimeError:
+                pass
+        engine.deleteLater()
+    engines.clear()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    if reader_profile_initialized:
+        try:
+            QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(asset_handler)
+            if bundle_handler is not None:
+                QWebEngineProfile.defaultProfile().removeUrlSchemeHandler(bundle_handler)
+        except RuntimeError:
+            pass
+    asset_handler.deleteLater()
+    if bundle_handler is not None:
+        bundle_handler.deleteLater()
+    for studio in list(studios):
+        studio.host_window = None
+    studios.clear()
+    if getattr(session, "background", None) is not None:
+        session.background.deleteLater()
+        session.background = None
+    if broker:
+        broker.close()
+        broker.set_service_handler(None)
+        broker.deleteLater()
+    for sig_name in ("aboutToQuit", "openRequested", "reopenRequested"):
+        sig = getattr(app, sig_name, None)
+        if sig is not None:
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    _TEARDOWN_COMPLETED = True
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _exit_process(main())

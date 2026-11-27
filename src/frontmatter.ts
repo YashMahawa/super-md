@@ -112,7 +112,9 @@ function parseDoubleQuoted(input: string): { value: string; rest: string } | nul
         case "u": {
           const hex = input.slice(i + 1, i + 5);
           if (!/^[0-9a-fA-F]{4}$/.test(hex)) return null;
-          out += String.fromCodePoint(Number.parseInt(hex, 16));
+          const cp = Number.parseInt(hex, 16);
+          if (cp >= 0xd800 && cp <= 0xdfff) return null;
+          out += String.fromCodePoint(cp);
           i += 4;
           break;
         }
@@ -120,7 +122,7 @@ function parseDoubleQuoted(input: string): { value: string; rest: string } | nul
           const hex = input.slice(i + 1, i + 9);
           if (!/^[0-9a-fA-F]{8}$/.test(hex)) return null;
           const cp = Number.parseInt(hex, 16);
-          if (cp > 0x10ffff) return null;
+          if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return null;
           out += String.fromCodePoint(cp);
           i += 8;
           break;
@@ -239,13 +241,12 @@ function splitKeyValue(
   if (trimmedLine.startsWith('"') || trimmedLine.startsWith("'")) {
     const parsed = trimmedLine.startsWith('"') ? parseDoubleQuoted(trimmedLine) : parseSingleQuoted(trimmedLine);
     if (!parsed) return null;
-    let idx = trimmedLine.length - parsed.rest.length;
-    while (idx < trimmedLine.length && (trimmedLine[idx] === " " || trimmedLine[idx] === "\t")) idx++;
-    if (trimmedLine[idx] !== ":") return null;
-    idx++;
-    if (!allowCompactFlowColon && idx < trimmedLine.length && trimmedLine[idx] !== " " && trimmedLine[idx] !== "\t") return null;
-    while (idx < trimmedLine.length && (trimmedLine[idx] === " " || trimmedLine[idx] === "\t")) idx++;
-    return { key: parsed.value, rest: trimmedLine.slice(idx), restIndex: idx };
+    const after = parsed.rest.trimStart();
+    if (!after.startsWith(":")) return null;
+    const postColon = after.slice(1);
+    if (!allowCompactFlowColon && postColon.length > 0 && postColon[0] !== " " && postColon[0] !== "\t") return null;
+    const rest = postColon.trimStart();
+    return { key: parsed.value, rest, restIndex: trimmedLine.length - rest.length };
   }
   if (/^[\[\]{}|>*&!%@]/.test(trimmedLine)) return null;
   for (let i = 0; i < trimmedLine.length; i++) {
@@ -254,22 +255,19 @@ function splitKeyValue(
     if (allowCompactFlowColon || next === undefined || next === " " || next === "\t") {
       const key = trimmedLine.slice(0, i).trim();
       if (!key || /[\[\]{}"']/.test(key)) return null;
-      let restIndex = i + 1;
-      while (restIndex < trimmedLine.length && (trimmedLine[restIndex] === " " || trimmedLine[restIndex] === "\t")) restIndex++;
-      return { key, rest: trimmedLine.slice(restIndex), restIndex };
+      const rest = trimmedLine.slice(i + 1).trimStart();
+      return { key, rest, restIndex: trimmedLine.length - rest.length };
     }
   }
   return null;
 }
 
 function parseFlowValue(raw: string, map: number[] | null): YamlNode | null {
-  let lead = 0;
-  while (lead < raw.length && (raw[lead] === " " || raw[lead] === "\t" || raw[lead] === "\r" || raw[lead] === "\n")) lead++;
-  let endIdx = raw.length;
-  while (endIdx > lead && (raw[endIdx - 1] === " " || raw[endIdx - 1] === "\t" || raw[endIdx - 1] === "\r" || raw[endIdx - 1] === "\n")) endIdx--;
-  const trimmed = raw.slice(lead, endIdx);
-  const subMap = map ? map.slice(lead, endIdx) : null;
-  if (!trimmed) return { value: null, spans: EMPTY_SPANS };
+  const leadTrimmed = raw.trimStart();
+  if (!leadTrimmed) return { value: null, spans: EMPTY_SPANS };
+  const lead = raw.length - leadTrimmed.length;
+  const trimmed = leadTrimmed.trimEnd();
+  const subMap = map ? map.slice(lead, lead + trimmed.length) : null;
 
   if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
     const parsed = trimmed.startsWith('"') ? parseDoubleQuoted(trimmed) : parseSingleQuoted(trimmed);
@@ -309,10 +307,10 @@ function parseFlowValue(raw: string, map: number[] | null): YamlNode | null {
     const out: Record<string, YamlValue> = {};
     const entries: Record<string, YamlNode> | undefined = innerMap ? {} : undefined;
     for (const { part, start } of pairs) {
-      if (!part.trim()) continue;
-      let pairLead = 0;
-      while (pairLead < part.length && (part[pairLead] === " " || part[pairLead] === "\t")) pairLead++;
-      const pairTrimmed = part.slice(pairLead).trimEnd();
+      const pairLeadTrimmed = part.trimStart();
+      if (!pairLeadTrimmed) continue;
+      const pairLead = part.length - pairLeadTrimmed.length;
+      const pairTrimmed = pairLeadTrimmed.trimEnd();
       const kv = splitKeyValue(pairTrimmed, true);
       if (!kv) return null;
       const valStartInInner = start + pairLead + kv.restIndex;
@@ -332,9 +330,9 @@ function parseFlowValue(raw: string, map: number[] | null): YamlNode | null {
   const scalar = parsePlainScalar(trimmed);
   if (!subMap || scalar === null) return { value: scalar, spans: EMPTY_SPANS };
   const withoutComment = stripInlineComment(trimmed);
-  let cleanLead = 0;
-  while (cleanLead < withoutComment.length && (withoutComment[cleanLead] === " " || withoutComment[cleanLead] === "\t")) cleanLead++;
-  const cleaned = withoutComment.slice(cleanLead).trimEnd();
+  const withoutLead = withoutComment.trimStart();
+  const cleanLead = withoutComment.length - withoutLead.length;
+  const cleaned = withoutLead.trimEnd();
   const span = cleaned.length > 0 ? mapSliceToSpan(subMap, cleanLead, cleanLead + cleaned.length) : null;
   return { value: scalar, spans: span ? [span] : EMPTY_SPANS };
 }
@@ -346,9 +344,9 @@ function isBlankOrComment(line: RawLine): boolean {
 function sequenceItemWithOffset(line: RawLine): { itemRest: string; itemOffset: number } | null {
   if (line.trimmed === "-") return { itemRest: "", itemOffset: line.trimmedOffset + 1 };
   if (line.trimmed.startsWith("- ") || line.trimmed.startsWith("-\t")) {
-    let idx = 1;
-    while (idx < line.trimmed.length && (line.trimmed[idx] === " " || line.trimmed[idx] === "\t")) idx++;
-    return { itemRest: line.trimmed.slice(idx), itemOffset: line.trimmedOffset + idx };
+    const itemRest = line.trimmed.slice(1).trimStart();
+    const idx = line.trimmed.length - itemRest.length;
+    return { itemRest, itemOffset: line.trimmedOffset + idx };
   }
   return null;
 }
@@ -572,9 +570,9 @@ function plainLineSpan(
   includeSpans: boolean,
 ): { stripped: string; span: { start: number; end: number } | null } {
   const withoutComment = stripInlineComment(text);
-  let lead = 0;
-  while (lead < withoutComment.length && (withoutComment[lead] === " " || withoutComment[lead] === "\t")) lead++;
-  const cleaned = withoutComment.slice(lead).trimEnd();
+  const withoutLead = withoutComment.trimStart();
+  const lead = withoutComment.length - withoutLead.length;
+  const cleaned = withoutLead.trimEnd();
   return {
     stripped: cleaned,
     span: includeSpans && cleaned.length > 0 ? { start: baseOffset + lead, end: baseOffset + lead + cleaned.length } : null,
@@ -792,8 +790,7 @@ function toRawLines(markdown: string, yamlStart: number, yamlEnd: number): RawLi
     }
     const trimmed = raw.trim();
     if (hasLeadingTab && trimmed !== "" && !trimmed.startsWith("#")) return null;
-    let leadWs = indent;
-    while (leadWs < raw.length && (raw[leadWs] === " " || raw[leadWs] === "\t")) leadWs++;
+    const leadWs = raw.length - raw.trimStart().length;
     lines.push({
       raw,
       indent,
@@ -832,35 +829,44 @@ function extractAuthorNameAndSpans(
   const direct = scalarToString(value);
   if (direct) return { name: direct, spans: node?.spans ?? EMPTY_SPANS };
   if (value && typeof value === "object" && !Array.isArray(value)) {
-    const nameVal = value.name ?? value.literal;
-    const nameNode = node?.entries ? (node.entries.name ?? node.entries.literal) : undefined;
+    const rawName = lookupCaseInsensitive(value, "name");
+    const useName = rawName !== undefined && rawName !== null;
+    const nameVal = useName ? rawName : lookupCaseInsensitive(value, "literal");
+    const nameNode = node?.entries ? lookupCaseInsensitive(node.entries, useName ? "name" : "literal") : undefined;
     const directName = scalarToString(nameVal);
     if (directName) return { name: directName, spans: nameNode?.spans ?? EMPTY_SPANS };
     if (nameVal && typeof nameVal === "object" && !Array.isArray(nameVal)) {
-      const literal = scalarToString(nameVal.literal);
-      if (literal) return { name: literal, spans: nameNode?.entries?.literal?.spans ?? EMPTY_SPANS };
-      const given = scalarToString(nameVal.given);
-      const family = scalarToString(nameVal.family);
+      const literal = scalarToString(lookupCaseInsensitive(nameVal, "literal"));
+      if (literal) {
+        const literalNode = nameNode?.entries ? lookupCaseInsensitive(nameNode.entries, "literal") : undefined;
+        return { name: literal, spans: literalNode?.spans ?? EMPTY_SPANS };
+      }
+      const given = scalarToString(lookupCaseInsensitive(nameVal, "given"));
+      const family = scalarToString(lookupCaseInsensitive(nameVal, "family"));
       const parts = [given, family].filter(Boolean);
       if (parts.length) {
+        const givenNode = nameNode?.entries ? lookupCaseInsensitive(nameNode.entries, "given") : undefined;
+        const familyNode = nameNode?.entries ? lookupCaseInsensitive(nameNode.entries, "family") : undefined;
         return {
           name: parts.join(" "),
           spans: [
-            ...(given && nameNode?.entries?.given ? nameNode.entries.given.spans : EMPTY_SPANS),
-            ...(family && nameNode?.entries?.family ? nameNode.entries.family.spans : EMPTY_SPANS),
+            ...(given && givenNode ? givenNode.spans : EMPTY_SPANS),
+            ...(family && familyNode ? familyNode.spans : EMPTY_SPANS),
           ],
         };
       }
     }
-    const given = scalarToString(value.given);
-    const family = scalarToString(value.family);
+    const given = scalarToString(lookupCaseInsensitive(value, "given"));
+    const family = scalarToString(lookupCaseInsensitive(value, "family"));
     const parts = [given, family].filter(Boolean);
     if (parts.length) {
+      const givenNode = node?.entries ? lookupCaseInsensitive(node.entries, "given") : undefined;
+      const familyNode = node?.entries ? lookupCaseInsensitive(node.entries, "family") : undefined;
       return {
         name: parts.join(" "),
         spans: [
-          ...(given && node?.entries?.given ? node.entries.given.spans : EMPTY_SPANS),
-          ...(family && node?.entries?.family ? node.entries.family.spans : EMPTY_SPANS),
+          ...(given && givenNode ? givenNode.spans : EMPTY_SPANS),
+          ...(family && familyNode ? familyNode.spans : EMPTY_SPANS),
         ],
       };
     }

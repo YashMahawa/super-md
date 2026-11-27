@@ -42,7 +42,13 @@ ApplicationWindow {
         self.assertFalse(self.component.isError(), str(self.component.errors()))
         self.window = self.component.create()
         self.assertIsNotNone(self.window)
+        self._activate_window()
         QTest.qWait(50)
+
+    def _activate_window(self):
+        self.window.requestActivate()
+        QTest.qWaitForWindowActive(self.window, 1000)
+        self.app.processEvents()
 
     def tearDown(self):
         self.window.close(); self.window.deleteLater()
@@ -237,7 +243,7 @@ ApplicationWindow {
         self._assert_active_tab_revealed("after widening active tab via folder renameEntry")
 
         # Verify TabStrip's renameDialog still selects only the dotted stem (without .md) from #87.
-        self.window.requestActivate()
+        self._activate_window()
         strip = self.window.findChild(QQuickItem, "tabStrip")
         self.assertTrue(
             QMetaObject.invokeMethod(
@@ -274,13 +280,15 @@ ApplicationWindow {
         self._assert_active_tab_revealed("after opening multi-note workspace drop")
 
     def _ordered_note_tabs(self):
+        self.app.processEvents()
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         strip = self.window.findChild(QQuickItem, "tabStrip")
         self.assertIsNotNone(strip)
         items = [strip]
         found = []
         while items:
             item = items.pop()
-            if item.objectName() == "noteTab":
+            if item.objectName() == "noteTab" and item.isVisible() and item.parentItem() is not None:
                 found.append(item)
             items.extend(item.childItems())
         found.sort(key=lambda it: int(it.property("index")))
@@ -329,10 +337,10 @@ ApplicationWindow {
 
         # Replace initial scratch tabs cleanly so tab order is deterministic.
         self.studio._open_dropped_notes([phys_note, unique_note, chem_note, arch_phys_note])
-        wait_until(lambda: self.studio.busy == 0 and any(t["name"] == "Roadmap.md" for t in self.studio.tabs))
+        wait_until(lambda: self.studio.busy == 0 and sum(1 for t in self.studio.tabs if t["path"]) == 4)
         for scratch_id in [t["id"] for t in list(self.studio.tabs) if not t["path"]]:
             self.studio.closeTabSafely(scratch_id)
-        QTest.qWait(60)
+        wait_until(lambda: len(self.studio.tabs) == 4 and len(self._ordered_note_tabs()[1]) == 4)
 
         # Exact open order is preserved; Chemistry uses depth 1 ("Chemistry") while colliding Physics folders expand to depth 2.
         expected_paths = [
@@ -349,6 +357,12 @@ ApplicationWindow {
         self.assertLess(note_tabs[1].x(), note_tabs[2].x())
         self.assertLess(note_tabs[2].x(), note_tabs[3].x())
 
+        surviving_destroyed = []
+        phys_tab_item = note_tabs[0]
+        roadmap_tab_item = note_tabs[1]
+        phys_tab_item.destroyed.connect(lambda *_args: surviving_destroyed.append("phys"))
+        roadmap_tab_item.destroyed.connect(lambda *_args: surviving_destroyed.append("roadmap"))
+
         expected_contexts = ["Courses/Physics", "", "Chemistry", "Archive/Physics"]
         expected_labels = [
             "Overview.md · Courses/Physics",
@@ -357,7 +371,7 @@ ApplicationWindow {
             "Overview.md · Archive/Physics",
         ]
         for tab_item, exp_ctx, exp_label, exp_path in zip(note_tabs, expected_contexts, expected_labels, expected_paths):
-            btn = self._find_descendant(tab_item, "noteTabButton")
+            btn = self._find_descendant(tab_item, "noteTabLabel")
             ctx_text = self._find_descendant(tab_item, "noteTabParentContext")
             hint = btn.findChild(QObject, "actionHint")
             self.assertIsNotNone(hint)
@@ -398,7 +412,7 @@ QtObject {
             )
 
         for tab_item, exp_label, exp_path in zip(note_tabs, expected_labels, expected_paths):
-            btn = self._find_descendant(tab_item, "noteTabButton")
+            btn = self._find_descendant(tab_item, "noteTabLabel")
             close_btn = self._find_descendant(tab_item, "noteTabCloseButton")
             self.assertEqual(acc_name(btn), exp_label)
             self.assertEqual(tip_text(btn), exp_path)
@@ -408,16 +422,23 @@ QtObject {
         # Dirty state updates both the visual bullet and accessible name while keeping parent context.
         phys_id = self.studio.tabs[0]["id"]
         self.studio.post("edit-phys", "document_changed", json.dumps({"id": phys_id, "content": "# Physics Updated\n"}))
-        QTest.qWait(40)
+        wait_until(
+            lambda: self._find_descendant(self._ordered_note_tabs()[1][0], "noteTabLabel").property("text")
+            == "• Overview.md · Courses/Physics"
+        )
         _, note_tabs = self._ordered_note_tabs()
-        dirty_btn = self._find_descendant(note_tabs[0], "noteTabButton")
+        dirty_btn = self._find_descendant(note_tabs[0], "noteTabLabel")
         self.assertEqual(dirty_btn.property("text"), "• Overview.md · Courses/Physics")
         self.assertEqual(acc_name(dirty_btn), "Overview.md · Courses/Physics, unsaved changes")
         # Revert edit so closeTabSafely below closes cleanly without unsaved prompt.
         self.studio.post("revert-phys", "document_changed", json.dumps({"id": phys_id, "content": "# Physics Overview\n"}))
-        QTest.qWait(40)
+        wait_until(
+            lambda: self._find_descendant(self._ordered_note_tabs()[1][0], "noteTabLabel").property("text")
+            == "Overview.md · Courses/Physics"
+        )
 
         # Rename dialog on a disambiguated tab still edits the raw filename (without parent context) and selects stem.
+        self._activate_window()
         strip, _ = self._ordered_note_tabs()
         self.assertTrue(
             QMetaObject.invokeMethod(
@@ -436,27 +457,27 @@ QtObject {
 
         # Closing Archive/Physics reduces Physics to depth 1 ("Physics"); closing Chemistry clears context on remaining Overview.md.
         self.studio.closeTabSafely(self.studio.tabs[3]["id"])
-        wait_until(lambda: len(self.studio.tabs) == 3)
-        QTest.qWait(40)
+        wait_until(lambda: len(self.studio.tabs) == 3 and len(self._ordered_note_tabs()[1]) == 3)
         _, note_tabs = self._ordered_note_tabs()
-        self.assertEqual(acc_name(self._find_descendant(note_tabs[0], "noteTabButton")), "Overview.md · Physics")
-        self.assertEqual(acc_name(self._find_descendant(note_tabs[2], "noteTabButton")), "Overview.md · Chemistry")
+        self.assertEqual(acc_name(self._find_descendant(note_tabs[0], "noteTabLabel")), "Overview.md · Physics")
+        self.assertEqual(acc_name(self._find_descendant(note_tabs[2], "noteTabLabel")), "Overview.md · Chemistry")
 
         self.studio.closeTabSafely(self.studio.tabs[2]["id"])
-        wait_until(lambda: len(self.studio.tabs) == 2)
-        QTest.qWait(40)
+        wait_until(lambda: len(self.studio.tabs) == 2 and len(self._ordered_note_tabs()[1]) == 2)
         _, note_tabs = self._ordered_note_tabs()
-        self.assertEqual(acc_name(self._find_descendant(note_tabs[0], "noteTabButton")), "Overview.md")
+        self.assertEqual(acc_name(self._find_descendant(note_tabs[0], "noteTabLabel")), "Overview.md")
         self.assertFalse(bool(self._find_descendant(note_tabs[0], "noteTabParentContext").property("visible")))
 
-        # Reopening restores parent disambiguation automatically.
+        # Reopening restores parent disambiguation automatically without recreating surviving ListModel delegates.
         self.studio.reopenTab()
-        wait_until(lambda: len(self.studio.tabs) == 3)
-        QTest.qWait(40)
+        wait_until(lambda: len(self.studio.tabs) == 3 and len(self._ordered_note_tabs()[1]) == 3)
         _, note_tabs = self._ordered_note_tabs()
-        labels_after_reopen = [acc_name(self._find_descendant(t, "noteTabButton")) for t in note_tabs]
+        labels_after_reopen = [acc_name(self._find_descendant(t, "noteTabLabel")) for t in note_tabs]
         self.assertIn("Overview.md · Physics", labels_after_reopen)
         self.assertIn("Overview.md · Chemistry", labels_after_reopen)
+        self.assertEqual(surviving_destroyed, [], "Surviving tab delegates must stay alive across dynamic parentContext updates")
+        self.assertIs(note_tabs[0], phys_tab_item)
+        self.assertIs(note_tabs[1], roadmap_tab_item)
         probe.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
@@ -489,13 +510,17 @@ QtObject {
         wait_until(lambda: self.studio.busy == 0 and sum(1 for t in self.studio.tabs if t["path"]) == 4)
         for scratch_id in [t["id"] for t in list(self.studio.tabs) if not t["path"]]:
             self.studio.closeTabSafely(scratch_id)
-        QTest.qWait(60)
+        wait_until(
+            lambda: len(self.studio.tabs) == 4
+            and len(self._ordered_note_tabs()[1]) == 4
+            and all(t.width() > 0 for t in self._ordered_note_tabs()[1])
+        )
 
         strip, note_tabs = self._ordered_note_tabs()
         self.assertEqual(len(note_tabs), 4)
         for tab_item, expected_folder in zip(note_tabs, ("client", "server", "gateway", "worker")):
             self.assertLessEqual(tab_item.width(), 260.5)
-            btn = self._find_descendant(tab_item, "noteTabButton")
+            btn = self._find_descendant(tab_item, "noteTabLabel")
             close_btn = self._find_descendant(tab_item, "noteTabCloseButton")
             title_text = self._find_descendant(tab_item, "noteTabTitle")
             ctx_text = self._find_descendant(tab_item, "noteTabParentContext")
@@ -520,11 +545,15 @@ QtObject {
 
         # Keyboard Tab focus on an offscreen non-active tab scrolls it into view without changing activeTabId.
         active_before = self.studio.active
+        self._activate_window()
         _, note_tabs = self._ordered_note_tabs()
-        first_btn = self._find_descendant(note_tabs[0], "noteTabButton")
+        first_btn = self._find_descendant(note_tabs[0], "noteTabLabel")
         first_btn.forceActiveFocus(Qt.FocusReason.TabFocusReason)
-        QTest.qWait(60)
         flickable = strip.property("contentItem")
+        wait_until(
+            lambda: bool(first_btn.property("activeFocus"))
+            and note_tabs[0].x() + 0.5 >= float(flickable.property("contentX"))
+        )
         viewport_w = float(strip.property("availableWidth") or strip.width())
         content_x = float(flickable.property("contentX"))
         self.assertGreaterEqual(note_tabs[0].x() + 0.5, content_x)
