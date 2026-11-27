@@ -7,7 +7,12 @@ from PyInstaller.utils.hooks import qt as qt_hooks
 from PyInstaller.utils.hooks.qt import add_qt6_dependencies, pyside6_library_info
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from package_runtime import qtwebengine_framework_entries, qtwebengine_framework_version
+try:
+    from scripts.package_runtime import qtwebengine_framework_entries, qtwebengine_framework_version
+except ModuleNotFoundError as _exc:
+    if _exc.name not in ("scripts", "scripts.package_runtime"):
+        raise
+    from desktop.scripts.package_runtime import qtwebengine_framework_entries, qtwebengine_framework_version
 
 
 if pyside6_library_info.version is not None:
