@@ -9,6 +9,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -190,9 +191,11 @@ private object NoMotionScheme : MotionScheme {
         .graphicsLayer {translationY=-size.height*(1f-chromeReveal);alpha=chromeReveal}
         .then(if(chromeShown) Modifier else Modifier.clearAndSetSemantics {})
         .background(palette.surfaceContainerLow).themeArtwork(state,"toolbar")) {
+        val activeNeedsAccess = state.writeNeedsAccess(state.active.id) || model.documentWriteNeedsAccess(state.active.id)
         StudioTopBar(
             noteName = state.active.name,
-            statusLabel = if (model.documentWriteNeedsAccess(state.active.id)) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
+            statusLabel = if (activeNeedsAccess) "Local draft · restore file access" else if (state.activeConflicted) "Changed on disk · autosave paused" else if (state.active.dirty) "Draft recovered automatically" else if (state.active.uri != null) "Saved" else "Local draft",
+            onRestoreAccess = if (activeNeedsAccess) ({ model.requestWriteAccessIfBlocked(state.active.id, explicit = true) }) else null,
             fullscreen = state.fullscreen, wide = wide, actualMode = actualMode, centerLock = state.centerLock,
             readerReady = readerReady, busy = state.busy, menuExpanded = menu, onMenuExpandedChange = onMenuChange,
             onNavigateIcon = {
@@ -227,14 +230,26 @@ private object NoMotionScheme : MotionScheme {
     onNavigateIcon: () -> Unit, onFind: () -> Unit, onSave: () -> Unit, onExport: () -> Unit,
     onToggleFullscreen: () -> Unit, onToggleCenterLock: () -> Unit, canReopenClosedTab: Boolean = false,
     onReopenClosedTab: () -> Unit = {}, onSaveAs: () -> Unit = {}, onNewWindow: () -> Unit, onShare: () -> Unit,
-    onInsertMedia: () -> Unit, onFixLatex: () -> Unit, onRename: () -> Unit, onSettings: () -> Unit, onFolderSearch: () -> Unit = {},
+    onInsertMedia: () -> Unit, onFixLatex: () -> Unit, onRename: () -> Unit, onSettings: () -> Unit,
+    onFolderSearch: () -> Unit = {}, onRestoreAccess: (() -> Unit)? = null,
 ) {
     val palette = MaterialTheme.colorScheme
     TopAppBar(
         windowInsets = WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal),
         colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
         title = {
-            Column(Modifier.fillMaxWidth()) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .then(
+                        if (onRestoreAccess != null) {
+                            Modifier.heightIn(min = 48.dp).clickable(onClick = onRestoreAccess)
+                        } else {
+                            Modifier
+                        },
+                    ),
+                verticalArrangement = Arrangement.Center,
+            ) {
                 Text(noteName, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
                 Text(statusLabel, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = palette.onSurfaceVariant)
             }
@@ -245,9 +260,6 @@ private object NoMotionScheme : MotionScheme {
             }
         },
         actions = {
-            if (wide && !fullscreen) {
-                IconButton(onClick = onFolderSearch, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_search), "Search across notes (Ctrl+Shift+F)") }
-            }
             StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
             IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
@@ -257,7 +269,6 @@ private object NoMotionScheme : MotionScheme {
             Box {
                 IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
-                    DropdownMenuItem(text = { Text("Search across notes") }, onClick = { onMenuExpandedChange(false); onFolderSearch() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                     DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = canReopenClosedTab, onClick = { onMenuExpandedChange(false); onReopenClosedTab() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
                     DropdownMenuItem(text = { Text("Save as") }, enabled = !busy, onClick = { onMenuExpandedChange(false); onSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
                     HorizontalDivider()
