@@ -25,7 +25,7 @@ import { isBuiltinReaderFont, resolveReaderFontStack } from "./readerFonts";
 import Editor, { editorReadingOffset, editorSelectedText, editorViewContext, editorHistory, exportEditorSession, formatEditorSession, importEditorSession, type PortableEditorSession } from "./components/Editor";
 import { extractSelectedText } from "./copySource";
 import {readingOffset} from "./readingPosition";
-import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,isProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
+import {applySharedAnchor,captureSharedAnchor,clearProgrammaticAnchorScroll,detectSplitPaneFromTarget,isProgrammaticAnchorScroll,markProgrammaticAnchorScroll,primeEditorAnchor,revealEditorOffset,type AnchorViewMode,type SharedSourceAnchor,type SplitAnchorPane} from "./sourceAnchor";
 import { exportRenderedViews, importRenderedViews, inspectCachedPythonOutput, safePythonFigure } from "./renderedOutputs";
 import { analyzeDocument } from "./documentAnalysis";
 import LiveEditor, { formatActiveLiveBlock, replayActiveLiveBlockHistory } from "./components/LiveEditor";
@@ -38,6 +38,7 @@ import { clampPreviewZoom } from "./zoom";
 import MediaTools from "./components/MediaTools";
 import { dismissReaderOverlay, hasReaderOverlay } from "./readerOverlays";
 import { prepareFmd } from "./documentMedia";
+import { NoteRemoteImageConsentStore } from "./remoteImageConsent";
 import { prepareMarkdownExport } from "./markdownExport";
 import ImageViewer from "./components/ImageViewer";
 import MathRepairPanel from "./components/MathRepairPanel";
@@ -163,9 +164,14 @@ export function Reader() {
   },[]);
   const [trustedHosts,setTrustedHosts] = useState<string[]>([]);
   const trustedHostsRef = useRef(trustedHosts); trustedHostsRef.current = trustedHosts;
+  const noteImageConsent = useRef(new NoteRemoteImageConsentStore());
+  const [imageConsentVersion, setImageConsentVersion] = useState(0);
   const documentAppearance=useMemo(()=>({dark:state?.dark??false,svgAppearance:state?.svgAppearance,ink:state?.colors.primary,text:state?.colors.text,colors:state?.colors}),[state?.dark,state?.svgAppearance,JSON.stringify(state?.colors)]);
   const trustHost = useCallback((host:string)=>setTrustedHosts(current=>{if(current.includes(host))return current;const next=[...current,host];trustedHostsRef.current=next;return next;}),[]);
   const reference = useRef(state); reference.current = state;
+  const approveImageUrl = useCallback((noteId:string|undefined,url:string)=>{if(noteId&&noteImageConsent.current.approve(noteId,url))setImageConsentVersion(value=>value+1);},[]);
+  const recordRemoteImageLoaded = useCallback((noteId:string|undefined,url:string,data:string)=>{if(noteId)noteImageConsent.current.recordLoaded(noteId,url,data);},[]);
+  const approvedImageUrls = useMemo(()=>noteImageConsent.current.approvedUrls(state?.id),[state?.id,imageConsentVersion]);
   const consumedHeadingToken = useRef<string | null>(null);
   const suppressedRestoreToken = useRef<string | null>(null);
   const suppressedRestoreKey = useRef<string | null>(null);
@@ -219,6 +225,26 @@ export function Reader() {
   const restoringSplit=useRef(false);
   const restoringSplitSeq=useRef(0);
   const splitScrollTops=useRef<{editor:number|null;preview:number|null}>({editor:null,preview:null});
+  const zoomSettleCleanup=useRef<(()=>void)|null>(null);
+  const isEditorOffsetVisible=(id:string,content:string,targetOffset:number):boolean=>{
+    const lineStart=content.lastIndexOf("\n",Math.max(0,targetOffset-1))+1;
+    const nextNewline=content.indexOf("\n",targetOffset);
+    const lineEnd=nextNewline===-1?content.length:nextNewline;
+    const topVisibleOffset=editorReadingOffset(id);
+    if(topVisibleOffset!==undefined&&topVisibleOffset>lineEnd)return false;
+    const ctx=editorViewContext(id);
+    if(!ctx||typeof ctx.visibleStart!=="number"||typeof ctx.visibleEnd!=="number")return true;
+    if(ctx.scroller&&ctx.scroller.clientHeight<=0)return true;
+    if(ctx.scroller&&ctx.scroller.scrollTop>ctx.scroller.clientHeight){
+      if(ctx.visibleStart===0)return true;
+      if(ctx.scroller.clientHeight>120&&content.includes("\n")&&!content.slice(ctx.visibleStart,ctx.visibleEnd).includes("\n"))return true;
+    }
+    if(lineStart<ctx.visibleStart)return false;
+    if(lineEnd>ctx.visibleEnd)return false;
+    const atBottom=Boolean(ctx.scroller&&ctx.scroller.scrollTop+ctx.scroller.clientHeight>=ctx.scroller.scrollHeight-4);
+    if(!atBottom&&ctx.visibleEnd>ctx.visibleStart&&lineEnd>=ctx.visibleEnd)return false;
+    return true;
+  };
   const anchors = (focus?:Point) => Array.from(document.querySelectorAll<HTMLElement>(".android-reading,.cm-scroller")).filter(root=>{const r=root.getBoundingClientRect();return !focus || focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom;}).map(root=>captureScrollAnchor(root,focus));
   const applyZoomStyle=(focus?:Point,previousFocus=focus,anchors?:Map<HTMLElement,Point|null>)=>{
     const sourceHost=document.querySelector<HTMLElement>(".android-source");
@@ -227,12 +253,22 @@ export function Reader() {
       if(sourceHost.style.getPropertyValue("--workspace-scale")!==nextScale){
         const cmScroller=sourceHost.querySelector<HTMLElement>(".cm-scroller");
         const cmFocus=focus&&cmScroller?(()=>{const r=cmScroller.getBoundingClientRect();return focus.x>=r.left&&focus.x<=r.right&&focus.y>=r.top&&focus.y<=r.bottom?focus:undefined;})():undefined;
-        const restoreCm=cmScroller?captureScrollAnchor(cmScroller,cmFocus):null;
+        const currentId=reference.current?.id;
+        const topOffset=!cmFocus&&currentId&&cmScroller&&cmScroller.scrollTop>1?editorReadingOffset(currentId):undefined;
+        const restoreCm=cmScroller&&(!topOffset||topOffset<=0)?captureScrollAnchor(cmScroller,cmFocus):null;
+        if(cmScroller)markProgrammaticAnchorScroll(cmScroller);
         sourceHost.style.setProperty("--workspace-scale",nextScale);
-        restoreCm?.();
+        if(topOffset!==undefined&&topOffset>0&&currentId){
+          revealEditorOffset(currentId,topOffset,{updateSelection:false});
+        }else{
+          restoreCm?.();
+        }
       }
     }
-    document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true));
+    document.querySelectorAll<HTMLElement>(".android-reading").forEach(root=>{
+      markProgrammaticAnchorScroll(root);
+      applyDocumentZoom(root,zoomReference.current,reference.current?.widthPercent??90,focus,previousFocus,anchors?.get(root),reference.current?.centerLock===true);
+    });
   };
   const currentPaintedZoom=()=>{
     const raw=document.querySelector<HTMLElement>(".document-page")?.dataset.scale||document.querySelector<HTMLElement>(".android-source")?.style.getPropertyValue("--workspace-scale")||"";
@@ -298,7 +334,7 @@ export function Reader() {
       if(old?.id===next.id&&!next.pendingHeading&&old.pendingHeading)next.pendingHeading=old.pendingHeading;
       const hasNewPendingHeading = Boolean(next.pendingHeading?.token && next.pendingHeading.token !== old?.pendingHeading?.token);
       if(old&&(old.id!==next.id||old.mode!==next.mode||old.fullscreen!==next.fullscreen))document.querySelectorAll('.android-reading').forEach(cancelHeadingNavigation);
-      if(old&&(old.id!==next.id||old.mode!==next.mode)){const history=histories.current.get(next.id);if(history)history.last=0;}
+      if(old&&(old.id!==next.id||old.mode!==next.mode)){zoomSettleCleanup.current?.();zoomSettleCleanup.current=null;const history=histories.current.get(next.id);if(history)history.last=0;}
       if(old&&old.id===next.id&&old.mode!==next.mode){
         if(hasNewPendingHeading){
           modeAnchor.current=null;
@@ -438,6 +474,7 @@ export function Reader() {
     };
     window.supermdZoomBy = (factor,focus=cursor.current) => {
       zoomGestureAt.current=Date.now();
+      zoomSettleCleanup.current?.();zoomSettleCleanup.current=null;
       if (document.querySelector(".image-viewer")) { window.dispatchEvent(new CustomEvent("supermd-image-zoom",{detail:{factor,point:focus}})); return; }
       cancelHeadingNavigation(document.querySelector('.android-reading'));
       const target=clampPreviewZoom((zoomTarget.current??zoomReference.current)*factor);zoomFocus.current=focus;
@@ -458,7 +495,47 @@ export function Reader() {
       if(!zoomFrame.current){zoomFrameTime.current=performance.now();zoomFrame.current=requestAnimationFrame(step);}
       window.clearTimeout(zoomTimer.current);const zoomNoteId=reference.current?.id;const fullscreen=reference.current?.fullscreen;zoomTimer.current=window.setTimeout(()=>{zoomTimer.current=0;void invoke("zoom_changed",{...(zoomNoteId?{id:zoomNoteId}:{}),zoom:target,fullscreen});},220);
     };
-    window.supermdSetZoom=(value,requestedAt)=>{if(requestedAt!==undefined&&requestedAt<zoomGestureAt.current)return;window.clearTimeout(zoomTimer.current);zoomTimer.current=0;cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;const next=clampPreviewZoom(value);if(Math.abs(next-zoomReference.current)<.01)return;cancelHeadingNavigation(document.querySelector('.android-reading'));const cmScroller=document.querySelector<HTMLElement>('.android-source .cm-scroller');const restoreCm=cmScroller?captureScrollAnchor(cmScroller):null;zoomReference.current=next;applyZoomStyle();if(restoreCm)requestAnimationFrame(restoreCm);settleSelection();};
+    window.supermdSetZoom=(value,requestedAt)=>{
+      if(requestedAt!==undefined&&requestedAt<zoomGestureAt.current)return;
+      zoomSettleCleanup.current?.();zoomSettleCleanup.current=null;
+      window.clearTimeout(zoomTimer.current);zoomTimer.current=0;
+      cancelAnimationFrame(zoomFrame.current);zoomFrame.current=0;zoomTarget.current=null;
+      const next=clampPreviewZoom(value);
+      if(Math.abs(next-zoomReference.current)<.01)return;
+      const readingRoot=document.querySelector<HTMLElement>('.android-reading');
+      cancelHeadingNavigation(readingRoot);
+      const current=reference.current;
+      const cmScroller=document.querySelector<HTMLElement>('.android-source .cm-scroller');
+      const preZoomAnchor=current&&(current.mode==='editor'||current.mode==='split')?captureSharedAnchor({id:current.id,mode:current.mode,zoom:zoomReference.current,readingRoot,preferredSplitPane:splitPane.current}):null;
+      const preZoomEditorOffset=current&&(current.mode==='editor'||current.mode==='split')&&cmScroller&&cmScroller.scrollTop>1?(editorReadingOffset(current.id)??preZoomAnchor?.offset):undefined;
+      zoomReference.current=next;
+      applyZoomStyle();
+      if(current&&current.mode==='split'&&preZoomAnchor&&preZoomAnchor.offset>0){
+        applySharedAnchor({id:current.id,targetMode:'split',targetZoom:next,anchor:preZoomAnchor,readingRoot,allowExactTop:false,updateSelection:false});
+      }else if(current&&preZoomEditorOffset!==undefined&&preZoomEditorOffset>0){
+        revealEditorOffset(current.id,preZoomEditorOffset,{updateSelection:false});
+      }
+      if(current&&((current.mode==='split'&&preZoomAnchor&&preZoomAnchor.offset>0)||(preZoomEditorOffset!==undefined&&preZoomEditorOffset>0))){
+        const zoomId=current.id,zoomMode=current.mode,startingInput=scrollInputVersion();
+        let stopped=false,innerFrame=0;
+        const stop=()=>{stopped=true;};
+        const inputs=['wheel','touchstart','pointerdown','keydown','supermd-goto-offset'] as const;
+        inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
+        const settle=()=>{
+          if(stopped||reference.current?.id!==zoomId||reference.current?.mode!==zoomMode||scrollInputVersion()!==startingInput)return;
+          if(zoomMode==='split'&&preZoomAnchor&&preZoomAnchor.offset>0){
+            applySharedAnchor({id:zoomId,targetMode:'split',targetZoom:zoomReference.current,anchor:preZoomAnchor,readingRoot:document.querySelector<HTMLElement>('.android-reading'),allowExactTop:false,updateSelection:false});
+          }else if(preZoomEditorOffset!==undefined&&preZoomEditorOffset>0){
+            revealEditorOffset(zoomId,preZoomEditorOffset,{updateSelection:false});
+          }
+        };
+        const outerFrame=requestAnimationFrame(()=>{settle();innerFrame=requestAnimationFrame(settle);});
+        const timer=window.setTimeout(()=>{settle();cleanup();},120);
+        const cleanup=()=>{stopped=true;cancelAnimationFrame(outerFrame);cancelAnimationFrame(innerFrame);window.clearTimeout(timer);inputs.forEach(name=>window.removeEventListener(name,stop,{capture:true}));if(zoomSettleCleanup.current===cleanup)zoomSettleCleanup.current=null;};
+        zoomSettleCleanup.current=cleanup;
+      }
+      settleSelection();
+    };
     window.supermdHeading=(id,offset)=>{
       markScrollInput();
       const current=reference.current;
@@ -586,7 +663,7 @@ export function Reader() {
       const current = reference.current; if (!current) return;
       try {
         const latest = await flushExportNote(current);
-        const prepared = await prepareFmd(latest.content, latest.path); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
+        const prepared = await prepareFmd(latest.content, latest.path, noteImageConsent.current.policy(latest.id, trustedHostsRef.current)); await invoke("export_fmd_native", { ...prepared, originalContent: latest.content, id: latest.id, save }); }
       catch (error) { await invoke("export_failed", { error: String(error) }); }
     };
     window.supermdExport = async (options) => {
@@ -596,7 +673,7 @@ export function Reader() {
       exportOwner.current=owner;setPdfExport({id:owner.id,phase:'preparing',completed:0,total:0});
       try {
         const latest = await flushExportNote(current);
-        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,trustedImageHosts:trustedHostsRef.current,onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
+        const prepared = await preparePdf(latest.content, latest.path, latest.python || "embedded",{signal:owner.controller.signal,...noteImageConsent.current.policy(latest.id, trustedHostsRef.current),onProgress:progress=>setPdfExport(value=>value?.id===owner.id?{...value,completed:progress.completed,total:progress.total}:value)});
         owner.controller.signal.throwIfAborted();
         owner.phase='typesetting';setPdfExport({id:owner.id,phase:'typesetting',completed:0,total:0});
         await invoke("export_pdf_native", { ...prepared, options: {...options, themeAccent: latest.colors.primary}, id: latest.id,jobId:owner.id }); }
@@ -613,7 +690,7 @@ export function Reader() {
       catch (error) { await invoke("export_failed", {error: String(error)}); }
     };
     void invoke("reader_ready");
-    return () => {nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; delete window.supermdFindStep; };
+    return () => {zoomSettleCleanup.current?.();zoomSettleCleanup.current=null;nativeScroll.clear();cancelAnimationFrame(zoomFrame.current);window.clearTimeout(zoomTimer.current);delete window.supermdSelectedText;delete window.supermdThemeGuide;delete window.supermdSavePosition;delete window.supermdBeforeNavigate;delete window.supermdChromeInset;delete window.supermdLoad; delete window.supermdExport; delete window.supermdExportMarkdown; delete window.supermdPortable; delete window.supermdZoomBy; delete window.supermdResetZoom; delete window.supermdRepairMath; delete window.supermdToggleTypewriter; delete window.supermdFlush; delete window.supermdSetZoom; delete window.supermdHeading; delete window.supermdFormat; delete window.supermdHistory; delete window.supermdDismiss; delete window.supermdFind; delete window.supermdFindStep; };
   }, []);
   useEffect(()=>{
     if(!state)return;
@@ -847,20 +924,26 @@ export function Reader() {
     const inputs=['wheel','touchstart','pointerdown','keydown','supermd-goto-offset'] as const;
     inputs.forEach(name=>window.addEventListener(name,stop,{capture:true,passive:true}));
     let firstPass=true;
+    let editorTopValid=true;
     const restore=()=>{
       if(stopped||shouldStop())return;
       const updateSelection=firstPass;
       firstPass=false;
       runGuarded(()=>{
+        const anchorForPass=editorTopValid?resolvedAnchor:{...resolvedAnchor,editorTop:undefined};
         applySharedAnchor({
           id:state.id,
           targetMode:state.mode,
           targetZoom:zoomReference.current,
-          anchor:resolvedAnchor,
+          anchor:anchorForPass,
           readingRoot:document.querySelector<HTMLElement>(".android-reading"),
-          allowExactTop:true,
+          allowExactTop:state.mode==="editor"?editorTopValid:true,
           updateSelection,
         });
+        if(editorTopValid&&(state.mode==="editor"||state.mode==="split")&&Math.abs(zoomReference.current-100)>=1&&resolvedAnchor.offset>0&&!isEditorOffsetVisible(state.id,state.content,resolvedAnchor.offset)){
+          editorTopValid=false;
+          revealEditorOffset(state.id,resolvedAnchor.offset,{caretOffset:resolvedAnchor.caretOffset,updateSelection:false});
+        }
       });
     };
     restore();
@@ -1410,7 +1493,8 @@ export function Reader() {
         const archive=format==='mdzip'||rawArchive===true;
         const hasSection=Object.prototype.hasOwnProperty.call(suppliedOptions,'section'),section=hasSection?agentSectionForExport(note.content,suppliedOptions.section):undefined;
         const exportContent=section?.text??note.content,{section:_section,archive:_archive,...exportOptions}=suppliedOptions;
-        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',{trustedImageHosts:trustedHostsRef.current}):format==='smd'?await prepareFmd(exportContent,note.path):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
+        const consentPolicy=noteImageConsent.current.policy(note.id,trustedHostsRef.current);
+        const prepared=format==='pdf'?await preparePdf(exportContent,note.path,note.python||'embedded',consentPolicy):format==='smd'?await prepareFmd(exportContent,note.path,consentPolicy):await prepareMarkdownExport(exportContent,note.path,{compatible:archive,python:note.python||'embedded'});
         if(reference.current?.id!==note.id||reference.current.content!==note.content)throw Error('Revision conflict: the note changed while preparing the export');
         const result=await invoke<Record<string,unknown>>('agent_export_native',{...prepared,id:note.id,expectedRevision:revision,requestId:request.requestId,format:archive?'mdzip':format,...(archive?{archive:true}:{}),filename:request.filename,options:exportOptions});
         return section?{...result,sectionStart:section.sectionStart,sectionEnd:section.sectionEnd,documentLength:section.documentLength}:result;
@@ -1471,8 +1555,8 @@ export function Reader() {
     {repairing && <MathRepairPanel content={state.content} apply={update} close={()=>setRepairing(false)} />}
     <MediaTools documentId={state.id} content={state.content} documentPath={state.path} onInsert={(text, point) => { const current = reference.current; if (!current || current.id !== state.id) return; const content = current.content; const from = Math.min(point?.from ?? content.length, content.length); const to = Math.max(from, Math.min(point?.to ?? from, content.length)); update(content.slice(0, from) + text + content.slice(to)); }} onNotice={(error) => { void invoke("export_failed", { error }); }} />
     {(state.mode === "editor" || state.mode === "split") && <section className="android-source" style={{ "--workspace-scale": String(zoomReference.current / 100) } as CSSProperties}><SourceEditor key={state.id} sessionId={state.id} documentPath={state.path === state.id ? null : state.path} value={state.content} onChange={update} dark={state.dark} focusMode={state.fullscreen} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} onTypewriterChange={changeTypewriter} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} /></section>}
-    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
-    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} onTrustImageHost={trustHost} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
+    {state.mode === "live" && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><LiveDocument key={state.id} noteId={state.id} latexAutofix={state.latexAutofix} typewriterScroll={state.typewriterScroll} spellCheck={state.spellCheck} grammarCheck={state.grammarCheck} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} /></div></div></section>}
+    {(state.mode === "reader" || state.mode === "split") && <section className="android-reading" data-full-document-accessibility={state.fullDocumentAccessibility ? "true" : undefined}><div className="reader-chrome-spacer" aria-hidden="true"/><div key={state.id} className="document-page-space"><div className="document-page"><DocumentPreview noteId={state.id} markdown={state.content} onChange={update} documentPath={state.path} savedDocumentPath={state.path === state.id ? null : state.path} python={state.python || "embedded"} dark={false} trustedImageHosts={trustedHosts} approvedImageUrls={approvedImageUrls} onTrustImageHost={trustHost} onApproveImageUrl={approveImageUrl} onRemoteImageLoaded={recordRemoteImageLoaded} fullDocumentAccessibility={state.fullDocumentAccessibility} sourceAnalysis={readerAnalysis?.source===state.content?readerAnalysis:undefined} /></div></div></section>}
   </div></DocumentAppearance.Provider>;
 }
 const rootElement = document.getElementById("root");

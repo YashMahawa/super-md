@@ -119,6 +119,13 @@ internal class ClosedNoteStore(
     fun loadForRecovery(reference: ClosedNoteReference, recovered: Note): Note =
         runCatching { load(reference) }.getOrDefault(recovered)
 
+    fun deleteUnindexedSnapshot(reference: ClosedNoteReference) {
+        val indexed = runCatching { loadIndexStrict() }.getOrNull() ?: return
+        if (indexed.none { it.snapshot == reference.snapshot }) {
+            runCatching { snapshotFile(reference.snapshot).delete() }
+        }
+    }
+
     fun saveIndex(references: List<ClosedNoteReference>) {
         require(references.size <= LIMIT) { "Too many closed-note references" }
         root.mkdirs()
