@@ -10,16 +10,16 @@ if _DESKTOP_DIR not in sys.path:
 
 if __package__:
     from .agent.mcp_http import BearerAuth, _token, main
-    from .agent.mcp_tools import build_mcp_server
+    from .agent.mcp_tools import _valid_diagram_id, build_mcp_server
 else:
     from agent.mcp_http import BearerAuth, _token, main
-    from agent.mcp_tools import build_mcp_server
+    from agent.mcp_tools import _valid_diagram_id, build_mcp_server
 
 if __name__ in ("mcp_server", "desktop.mcp_server"):
     sys.modules.setdefault("mcp_server", sys.modules[__name__])
     sys.modules.setdefault("desktop.mcp_server", sys.modules[__name__])
 
-__all__ = ["BearerAuth", "_token", "build_mcp_server", "main"]
+__all__ = ["BearerAuth", "_token", "_valid_diagram_id", "build_mcp_server", "main"]
 
 if __name__ == "__main__":
     raise SystemExit(main())

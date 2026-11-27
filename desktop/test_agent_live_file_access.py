@@ -995,7 +995,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
         tab_two = self._await_tab_path(self.studio, note_two)
         tab_three = self._await_tab_path(self.studio, note_three)
         deadline = time.monotonic() + 3.0
-        while self.studio.active != tab_three["id"] and time.monotonic() < deadline:
+        while (self.studio.active != tab_three["id"] or "Skipped" not in self.studio.message) and time.monotonic() < deadline:
             self.app.processEvents()
             time.sleep(0.005)
         opened_order = [
@@ -1075,11 +1075,19 @@ class AgentLiveFileAccessTests(unittest.TestCase):
         decoy_svg = decoy_note_dir / "decoy-fig.svg"
         selected_ws_smd = selected_ws_dir / "ws-approved.smd"
         selected_ws_svg = selected_ws_dir / "ws-approved.svg"
+        selected_ws_empty_sub = selected_ws_dir / "AssetsOnly"
+        selected_ws_notes_sub = selected_ws_dir / "NotesSub"
+        selected_ws_empty_sub.mkdir()
+        selected_ws_notes_sub.mkdir()
+        (selected_ws_empty_sub / "diagram.svg").write_bytes(SVG_BYTES)
+        selected_ws_sub_note = selected_ws_notes_sub / "nested-topic.md"
+        selected_ws_sub_note.write_text("# Nested topic\n\nOuter whitespace needle match\n", encoding="utf-8")
         decoy_ws_note = decoy_ws_dir / "ws-decoy.md"
         decoy_ws_svg = decoy_ws_dir / "ws-decoy.svg"
 
-        for note_file in (selected_note, decoy_note, decoy_ws_note):
+        for note_file in (selected_note, decoy_note):
             note_file.write_text(f"# {note_file.stem}\n", encoding="utf-8")
+        decoy_ws_note.write_text("# ws-decoy\n\nOuter whitespace needle match\n", encoding="utf-8")
         write_portable(
             selected_ws_smd,
             "# Approved workspace portable note\n",
@@ -1187,12 +1195,47 @@ class AgentLiveFileAccessTests(unittest.TestCase):
                 })
                 self.assertEqual(attached["assetName"], "assets/from-note-loc.svg")
 
+                # #151 folder sidebar filtering & folder search honor the exact outer-whitespace folder
+                # and both independent Boolean preferences (keepInBackground & hideNonNoteFolders).
+                self.assertIs(studio1.settings["keepInBackground"], False)
+                self.assertIs(studio1.settings["hideNonNoteFolders"], True)
+                deadline = time.monotonic() + 3.0
+                while [f["name"] for f in studio1.files] != ["NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertEqual([f["name"] for f in studio1.files], ["NotesSub", "ws-approved.smd"])
+
+                studio1.setting("keepInBackground", "true")
+                self.assertIs(studio1.settings["keepInBackground"], True)
+                self.assertIs(studio1.settings["hideNonNoteFolders"], True)
+
+                studio1.setting("hideNonNoteFolders", "false")
+                self.assertIs(studio1.settings["hideNonNoteFolders"], False)
+                self.assertIs(studio1.settings["keepInBackground"], True)
+                deadline = time.monotonic() + 3.0
+                while [f["name"] for f in studio1.files] != ["AssetsOnly", "NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertEqual([f["name"] for f in studio1.files], ["AssetsOnly", "NotesSub", "ws-approved.smd"])
+
+                studio1.openFolderSearch()
+                studio1.updateFolderSearch("Outer whitespace needle match", False, False)
+                deadline = time.monotonic() + 3.0
+                while studio1._folder_search_scanning and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                matched_paths = [m["path"] for m in studio1._folder_search_matches]
+                self.assertEqual(matched_paths, [str(selected_ws_sub_note.resolve(strict=True))])
+                self.assertNotIn(str(decoy_ws_note.resolve(strict=True)), matched_paths)
+                studio1.closeFolderSearch()
+
                 studio1._preferences()
                 studio1._recover()
         finally:
             bridge1.stop()
             studio1.stop()
             studio1.pool.shutdown(wait=True, cancel_futures=True)
+            studio1._search_pool.shutdown(wait=True, cancel_futures=True)
             session1.writes.shutdown(wait=True)
             studio1.deleteLater()
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
@@ -1200,6 +1243,8 @@ class AgentLiveFileAccessTests(unittest.TestCase):
 
         saved_settings_json = json.loads((app_data / "settings.json").read_text(encoding="utf-8"))
         self.assertEqual(saved_settings_json["settings"]["newNoteLocation"], expected_note_dir_str)
+        self.assertIs(saved_settings_json["settings"]["keepInBackground"], True)
+        self.assertIs(saved_settings_json["settings"]["hideNonNoteFolders"], False)
         self.assertEqual(
             os.fsencode(saved_settings_json["settings"]["newNoteLocation"]),
             os.fsencode(expected_note_dir_str),
@@ -1214,8 +1259,23 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             restored_tab = self._await_tab_path(studio2, selected_ws_smd)
             self.assertEqual(session2.settings["newNoteLocation"], expected_note_dir_str)
             self.assertEqual(studio2.settings["newNoteLocation"], expected_note_dir_str)
+            self.assertIs(studio2.settings["keepInBackground"], True)
+            self.assertIs(studio2.settings["hideNonNoteFolders"], False)
             self.assertEqual(studio2.folder, expected_ws_dir_str)
             self.assertEqual(studio2._agent_mcp_roots(), [expected_ws_dir_str, expected_note_dir_str])
+            deadline = time.monotonic() + 3.0
+            while [f["name"] for f in studio2.files] != ["AssetsOnly", "NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertEqual([f["name"] for f in studio2.files], ["AssetsOnly", "NotesSub", "ws-approved.smd"])
+            studio2.setting("hideNonNoteFolders", "true")
+            self.assertIs(studio2.settings["hideNonNoteFolders"], True)
+            self.assertIs(studio2.settings["keepInBackground"], True)
+            deadline = time.monotonic() + 3.0
+            while [f["name"] for f in studio2.files] != ["NotesSub", "ws-approved.smd"] and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertEqual([f["name"] for f in studio2.files], ["NotesSub", "ws-approved.smd"])
 
             self.assertTrue(studio2._agent_path_allowed(selected_note))
             self.assertTrue(studio2._agent_path_allowed(selected_ws_smd))
@@ -1273,6 +1333,7 @@ class AgentLiveFileAccessTests(unittest.TestCase):
         finally:
             studio2.stop()
             studio2.pool.shutdown(wait=True, cancel_futures=True)
+            studio2._search_pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)

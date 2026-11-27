@@ -155,7 +155,9 @@ def resolve_live_asset_path(store: DocumentStore, raw_path: str) -> str:
     if _v.is_hidden_name(cand.name) or (not cand.is_absolute() and any(_v.is_hidden_name(part) for part in cand.parts)):
         raise AgentDocumentError("Hidden files and directories are not allowed")
     if cand.is_absolute():
-        aliased = _v.rewrite_system_path_alias(cand)
+        if _v.is_link_or_junction(cand):
+            raise AgentDocumentError("Symbolic links are not allowed")
+        aliased = _v.rewrite_system_path_alias(Path(os.path.abspath(expanded)))
         if _v.is_link_or_junction(aliased) or _v.has_link_or_junction_component(aliased):
             raise AgentDocumentError("Symbolic links are not allowed")
         if store.roots:

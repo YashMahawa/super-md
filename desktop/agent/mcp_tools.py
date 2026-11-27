@@ -15,7 +15,11 @@ else:
 
 from . import mcp_live_helpers as _lh
 from . import validators as _v
-from .context_normalizer import bounded_properties
+from .context_normalizer import (
+    _normalize_reading_context,
+    _viewport_contexts,
+    bounded_properties,
+)
 
 AgentDocumentError, DocumentStore, RevisionConflict = _ad.AgentDocumentError, _ad.DocumentStore, _ad.RevisionConflict
 sys.modules.setdefault("agent.validators", _v)
@@ -25,6 +29,10 @@ _ASSET_KEYS = ("id", "name", "mime", "mime_type", "bytes", "sha256")
 
 def _pick(data: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     return {k: data[k] for k in keys if k in data}
+
+
+def _valid_diagram_id(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("diagram:") and 9 <= len(value) <= 128 and value.isprintable()
 
 
 def _require_safe_basename(filename: Any, *, message: str) -> None:
@@ -230,12 +238,12 @@ def build_mcp_server(roots: list[str], live_client=None):
             _v.require_bool_flags({"discard_changes": discard_changes}, ("discard_changes",), error_cls=AgentDocumentError)
             return _lh.bounded_result({**_call_dict("document_action", tab_id, "close_document", expected_revision=expected_revision, discard_changes=discard_changes, _error="Desktop returned invalid close status"), "target": path})
         if action in ("export", "export_document"):
-            if path is None or format not in ("pdf", "smd", "md"):
-                raise AgentDocumentError("export requires a source path and format pdf, smd, or md")
+            if path is None or format not in ("pdf", "smd", "md", "mdzip"):
+                raise AgentDocumentError("export requires a source path and format pdf, smd, md, or mdzip")
             if (tab_id := _lh.live_id(path)) is not None:
                 _v.require_sha256_revision(expected_revision, error_cls=AgentDocumentError, message="Live export requires expected_revision from document_inspect")
                 try:
-                    _v.require_export_params(format, options=options, error_cls=AgentDocumentError)
+                    _v.require_export_params(format, options=options, allowed_formats=("pdf", "smd", "md", "mdzip"), error_cls=AgentDocumentError)
                 except AgentDocumentError as exc:
                     raise (AgentDocumentError("Export options must be an object no larger than 8 KB") if "smaller than 8 KB" in str(exc) else exc) from exc
                 if format != "pdf" and options:
@@ -243,6 +251,8 @@ def build_mcp_server(roots: list[str], live_client=None):
                 _require_safe_basename(filename, message="filename must be a safe basename")
                 res = _call_dict("document_action", tab_id, "export_document", format=format, options=options, expected_revision=expected_revision, filename=filename, _error="Live export returned invalid status")
                 return _lh.bounded_result(_pick(res, ("jobId", "status", "filename", "format", "bytes", "sha256", "path")))
+            if format == "mdzip":
+                raise AgentDocumentError("Filesystem export supports pdf, smd, or md; mdzip requires a live tab")
             if output_path is None:
                 raise AgentDocumentError("Filesystem export requires output_path inside an allowed root")
             if format != "pdf" and options:
@@ -267,7 +277,8 @@ def build_mcp_server(roots: list[str], live_client=None):
             return _lh.bounded_result({**result, "target": path})
         if action == "get_diagram":
             tab_id, dlimit = _require_live_tab(path, "get_diagram requires an open desktop tab target"), (12_000 if limit is None else limit)
-            _v.require_diagram_id(diagram_id, max_len=200, require_prefix=False, error_cls=AgentDocumentError, message="diagram_id must come from list_diagrams")
+            if not _valid_diagram_id(diagram_id):
+                raise AgentDocumentError("diagram_id must come from list_diagrams")
             _v.require_sha256_revision(expected_revision, error_cls=AgentDocumentError, message="get_diagram requires expected_revision from list_diagrams or document_inspect")
             _require_page(offset, dlimit, 12_000, "diagram offset must be nonnegative and limit must be 1–12,000", max_offset=20_000_000)
             return _lh.bounded_result({**_call_dict("document_action", tab_id, "get_diagram", diagram_id=diagram_id, expected_revision=expected_revision, offset=offset, limit=dlimit, _error="Desktop returned invalid diagram source"), "target": path}, 64_000)
@@ -370,7 +381,8 @@ def build_mcp_server(roots: list[str], live_client=None):
             return [ImageContent(type="image", data=base64.b64encode(render_offline(store, path, width=width, expected_revision=expected_revision)).decode(), mimeType="image/png")]
         _v.require_viewport_width(width, min_width=64, max_width=1600, error_cls=AgentDocumentError)
         if diagram_id is not None:
-            _v.require_diagram_id(diagram_id, max_len=200, require_prefix=False, error_cls=AgentDocumentError, message="diagram_id must come from list_diagrams")
+            if not _valid_diagram_id(diagram_id):
+                raise AgentDocumentError("diagram_id must come from list_diagrams")
             _v.require_sha256_revision(expected_revision, error_cls=AgentDocumentError, message="Diagram image requires expected_revision from list_diagrams")
             image = _call_dict("document_action", tab_id, "get_diagram_image", diagram_id=diagram_id, expected_revision=expected_revision, width=width, _error="Live renderer returned invalid image data")
             rw, rh = image.get("width"), image.get("height")
@@ -395,6 +407,8 @@ def build_mcp_server(roots: list[str], live_client=None):
         return _lh.run_view_current(live_client, live_call, path=path, tabId=tabId, deviceId=deviceId,
                                     width=width, quality=quality, includeImage=includeImage, include_image=include_image)
 
+    server._normalize_reading_context = _normalize_reading_context  # type: ignore[attr-defined]
+    server._viewport_contexts = _viewport_contexts  # type: ignore[attr-defined]
     return server, store
 
 
