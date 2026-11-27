@@ -10,8 +10,8 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import org.json.JSONArray
 import org.json.JSONObject
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.random.Random
@@ -271,14 +271,10 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         if (request.has("jobId")) require(request.getString("jobId").length in 1..128) { "Invalid job id" }
         if (request.has("format")) require(request.getString("format") in setOf("pdf", "smd", "md")) { "Invalid export format" }
         if (request.has("repairIndices")) {
-            val indices = request.getJSONArray("repairIndices")
-            val values = (0 until indices.length()).map { indices.optInt(it, -1) }
-            require(values.size in 1..40 && values.all { it >= 0 } && values.distinct().size == values.size) { "Invalid repair indices" }
+            validateAgentRepairIndices(request.get("repairIndices"))
         }
         request.optJSONObject("options")?.takeIf { it.has("repairIndices") }?.let { options ->
-            val indices = options.getJSONArray("repairIndices")
-            val values = (0 until indices.length()).map { indices.optInt(it, -1) }
-            require(values.size in 1..40 && values.all { it >= 0 } && values.distinct().size == values.size) { "Invalid repair indices" }
+            validateAgentRepairIndices(options.get("repairIndices"))
         }
         if (request.has("assetName")) {
             require(request.get("assetName") is String) { "Invalid assetName" }
@@ -330,8 +326,7 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         state = value
         if (Looper.myLooper() == Looper.getMainLooper()) onState(value) else main.post { onState(value) }
     }
-    private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
-        .digest(value.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    private fun sha256(value: String): String = agentContentRevision(value)
 
     private companion object {
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
@@ -353,5 +348,21 @@ class AgentRelayClient(private val onState: (State) -> Unit = {}) {
         const val MAX_EXPORT_CHUNK_BYTES = 524_288
         val ASSET_MIMES = setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")
         val RPC_FIELDS = setOf("requestId", "action", "tabId", "offset", "limit", "query", "context", "expectedRevision", "operations", "width", "imageFormat", "documentAction", "content", "options", "diagramId", "format", "repairIndices", "jobId", "heading", "filename", "titleHint", "title", "windowId", "assetName", "assetPath", "assetAction", "mimeType", "body", "view", "caseSensitive", "wholeWord", "regex", "excludeDiagrams")
+    }
+}
+
+internal const val MAX_AGENT_REPAIR_INDICES = 40
+
+internal fun validateAgentRepairIndices(raw: Any?): List<Int> {
+    require(raw is JSONArray && raw.length() in 1..MAX_AGENT_REPAIR_INDICES) { "Invalid repair indices" }
+    val seen = HashSet<Int>(raw.length())
+    return List(raw.length()) { index ->
+        val parsed = when (val item = raw.opt(index)) {
+            is Int -> item
+            is Long -> if (item in 0L..Int.MAX_VALUE.toLong()) item.toInt() else -1
+            else -> -1
+        }
+        require(parsed >= 0 && seen.add(parsed)) { "Invalid repair indices" }
+        parsed
     }
 }
