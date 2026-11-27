@@ -538,7 +538,15 @@ def _qt_bridge_class():
                 pending = list(self._pending.values())
                 self._pending.clear()
                 self._dispatches.clear()
+                for item in pending:
+                    item["cancelled"] = True
             for item in pending:
+                cancel_cb = item.get("cancel")
+                if callable(cancel_cb):
+                    try:
+                        cancel_cb()
+                    except Exception:
+                        pass
                 item["error"] = "Live desktop session was disabled"
                 item["event"].set()
             self.token = ""
@@ -553,13 +561,20 @@ def _qt_bridge_class():
             self.cloudClient.stop()
             with self._lock:
                 cancelled = [(key, value) for key, value in self._pending.items() if value.get("cloud")]
-                for request_id, _ in cancelled:
+                for request_id, value in cancelled:
+                    value["cancelled"] = True
                     self._pending.pop(request_id, None)
                 cancelled_ids = {request_id for request_id, _ in cancelled}
                 for child_id, owner in list(self._dispatches.items()):
                     if owner[0] in cancelled_ids:
                         self._dispatches.pop(child_id, None)
             for _, value in cancelled:
+                cancel_cb = value.get("cancel")
+                if callable(cancel_cb):
+                    try:
+                        cancel_cb()
+                    except Exception:
+                        pass
                 value["error"] = "Cloud live access was disabled"
                 value["event"].set()
 
@@ -877,12 +892,26 @@ def _qt_bridge_class():
             self._dispatch.emit(request_id)
             wait_timeout = EXPORT_TIMEOUT if action == "export_document" else REQUEST_TIMEOUT
             if not event.wait(wait_timeout):
+                cancel_cb = None
                 with self._lock:
-                    self._pending.pop(request_id, None)
-                    for child_id, owner in list(self._dispatches.items()):
-                        if owner[0] == request_id:
-                            self._dispatches.pop(child_id, None)
-                raise TimeoutError
+                    timed_out_entry = self._pending.get(request_id)
+                    if timed_out_entry is not None:
+                        cancel_cb = timed_out_entry.get("cancel")
+                published = False
+                if callable(cancel_cb):
+                    try:
+                        published = bool(cancel_cb())
+                    except Exception:
+                        published = False
+                if not published or not event.wait(1.0):
+                    with self._lock:
+                        popped = self._pending.pop(request_id, None)
+                        if popped is not None:
+                            popped["cancelled"] = True
+                        for child_id, owner in list(self._dispatches.items()):
+                            if owner[0] == request_id:
+                                self._dispatches.pop(child_id, None)
+                    raise TimeoutError
             with self._lock:
                 result = self._pending.pop(request_id, None)
             if result is None:
@@ -1249,7 +1278,7 @@ def _qt_bridge_class():
         @staticmethod
         def _is_async_native_action(payload: dict[str, Any]) -> bool:
             action = payload.get("action")
-            return action in ("save_document", "replace_tab_asset") or (
+            return action in ("patch_tab", "save_document", "replace_tab_asset") or (
                 action == "asset_action" and payload.get("assetAction") == "attach"
             )
 
@@ -1350,17 +1379,39 @@ def _qt_bridge_class():
                     async_handler = getattr(studio, "_agent_document_action_async", None)
                     if self._is_async_native_action(payload) and callable(async_handler):
                         self._verify_native_write_revision(payload, studio)
+                        cancel_fn_holder = []
                         with self._lock:
                             parent_entry = self._pending.get(parent_id)
                             if parent_entry is None:
                                 return False
                             parent_entry["window_id"] = studio.window_id
-                        async_handler(
-                            payload,
-                            lambda async_result, async_error: self._finish_pending(
+                            parent_entry["cancel"] = lambda: cancel_fn_holder[0]() if cancel_fn_holder else False
+
+                        def finish_async(async_result, async_error):
+                            self._finish_pending(
                                 parent_id, async_result, async_error or "", expected_window=studio.window_id
-                            ),
-                        )
+                            )
+
+                        def check_cancelled():
+                            with self._lock:
+                                return bool(parent_entry.get("cancelled")) or parent_id not in self._pending
+
+                        try:
+                            async_handler(
+                                payload,
+                                finish_async,
+                                register_cancel=cancel_fn_holder.append,
+                                is_cancelled=check_cancelled,
+                            )
+                        except TypeError as exc:
+                            if "register_cancel" not in str(exc) and "is_cancelled" not in str(exc):
+                                raise
+                            async_handler(payload, finish_async)
+                        if check_cancelled() and cancel_fn_holder:
+                            try:
+                                cancel_fn_holder[0]()
+                            except Exception:
+                                pass
                         return True
                     native_result = self._native_result(payload, studio)
                 except Exception as failure:

@@ -2,7 +2,14 @@ import threading
 import time
 import unittest
 
-from latest_writes import LatestWriteExecutor
+from latest_writes import (
+    EXACT_ABORTED,
+    EXACT_COMMITTED,
+    EXACT_FAILED,
+    EXACT_SUPERSEDED,
+    ExactWriteAborted,
+    LatestWriteExecutor,
+)
 
 
 class LatestWriteExecutorTest(unittest.TestCase):
@@ -144,6 +151,78 @@ class LatestWriteExecutorTest(unittest.TestCase):
         future.result(timeout=1)
         writer.shutdown(wait=True)
         self.assertEqual(written, ["startup"])
+
+    def test_submit_latest_exact_reports_committed_superseded_and_failed(self):
+        writer = LatestWriteExecutor()
+        try:
+            # 1. Undisturbed exact write reports committed and updates committed_revision
+            rev1, fut1 = writer.submit_latest_exact("recovery", lambda: None)
+            status1, done_rev1, err1 = fut1.result(timeout=1)
+            self.assertEqual((status1, done_rev1, err1), (EXACT_COMMITTED, rev1, None))
+            self.assertEqual(writer.committed_revision("recovery"), rev1)
+            self.assertEqual(writer.latest_revision("recovery"), rev1)
+
+            # 2. Pending exact write replaced before execution reports superseded
+            block_started = threading.Event()
+            release_block = threading.Event()
+            blocker = writer.submit(lambda: (block_started.set(), release_block.wait(2)))
+            self.assertTrue(block_started.wait(1))
+
+            ran_displaced = []
+            rev2, fut2 = writer.submit_latest_exact("recovery", lambda: ran_displaced.append(True))
+            rev3, fut3 = writer.submit_latest_exact("recovery", lambda: None)
+            self.assertEqual(fut2.result(timeout=1), (EXACT_SUPERSEDED, rev2, None))
+            release_block.set()
+            blocker.result(timeout=1)
+            self.assertEqual(fut3.result(timeout=1), (EXACT_COMMITTED, rev3, None))
+            self.assertEqual(ran_displaced, [])
+            self.assertEqual(writer.committed_revision("recovery"), rev3)
+
+            # 3. Exact write superseded mid-execution reports superseded while successor commits
+            in_flight = threading.Event()
+            allow_finish = threading.Event()
+
+            def slow_recovery():
+                in_flight.set()
+                allow_finish.wait(2)
+
+            rev4, fut4 = writer.submit_latest_exact("recovery", slow_recovery)
+            self.assertTrue(in_flight.wait(1))
+            rev5 = writer.submit_latest("recovery", lambda: None)
+            allow_finish.set()
+            self.assertEqual(fut4.result(timeout=1), (EXACT_SUPERSEDED, rev4, None))
+            writer.flush(timeout=1)
+            self.assertEqual(writer.committed_revision("recovery"), rev5)
+
+            # 4. Failed exact write reports failed without advancing committed_revision
+            def fail_recovery():
+                raise OSError("disk full")
+
+            rev6, fut6 = writer.submit_latest_exact("recovery", fail_recovery)
+            status6, done_rev6, err6 = fut6.result(timeout=1)
+            self.assertEqual((status6, done_rev6), (EXACT_FAILED, rev6))
+            self.assertIsInstance(err6, OSError)
+            self.assertEqual(writer.committed_revision("recovery"), rev5)
+
+            # 5. Aborted exact write reports EXACT_ABORTED, skips on_done, and preserves committed_revision
+            enqueued_revs = []
+            done_calls = []
+
+            def abort_recovery():
+                raise ExactWriteAborted()
+
+            rev7, fut7 = writer.submit_latest_exact(
+                "recovery",
+                abort_recovery,
+                done_calls.append,
+                on_enqueued=enqueued_revs.append,
+            )
+            self.assertEqual(enqueued_revs, [rev7])
+            self.assertEqual(fut7.result(timeout=1), (EXACT_ABORTED, rev7, None))
+            self.assertEqual(done_calls, [])
+            self.assertEqual(writer.committed_revision("recovery"), rev5)
+        finally:
+            writer.shutdown(wait=True)
 
     def test_drain_finalizer_runs_after_fifo_and_latest_drains_on_flush_and_shutdown(self):
         writer = LatestWriteExecutor()
