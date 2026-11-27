@@ -1342,6 +1342,7 @@ class Studio(QObject):
 
     def _emit(self, load=True):
         if self.retired: return
+        self._preview_jobs.retain_tabs(tab["id"] for tab in self.tabs)
         self._watch_notes()
         self._notify_sidebar()
         self.changed.emit()
@@ -1650,6 +1651,7 @@ class Studio(QObject):
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
         self._python_jobs.cancel_all(retire=True)
+        self._preview_jobs.cancel_all(retire=True)
         for agent_export in tuple(self._agent_exports.values()):
             try:
                 reserved = Path(agent_export["path"])
@@ -1658,7 +1660,6 @@ class Studio(QObject):
             except (OSError, TypeError, KeyError):
                 pass
         self._agent_exports.clear()
-        self._preview_jobs.cancel_all(retire=True)
         if self.position_timer.isActive():self._save_positions()
         self.position_timer.stop()
         if self.preference_timer.isActive():self._preferences(False)

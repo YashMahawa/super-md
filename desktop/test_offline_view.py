@@ -20,7 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QObject, Signal
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QObject, QUrl, Signal
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QApplication
 
@@ -996,6 +996,238 @@ class OfflinePreviewContainmentTests(unittest.TestCase):
                         offline_view.render_live_snapshot(unassigned_content, {}, "", width=640, timeout=10)
                 self.assertFalse(never_ran_pid.exists(), "preview helper ran despite Windows Job Object assignment failure")
                 self.assertIsNone(unrelated.poll())
+
+    def test_open_path_existing_tab_routing_and_whitespace_paths_keep_preview_ownership(self):
+        unrelated = self._start_unrelated_process()
+        with (
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as data_dir,
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as notes_dir,
+        ):
+            previous_home = os.environ.get("SUPERMD_DATA_HOME")
+            os.environ["SUPERMD_DATA_HOME"] = data_dir
+            root = Path(notes_dir)
+            fake_cli = root / "fake_agent_cli.py"
+            _write_fake_agent_cli(fake_cli)
+
+            folder_name = "Study folder " if os.name != "nt" else " Study folder"
+            decoy_folder_name = "Study folder"
+            note_name = " Study note.md"
+            decoy_note_name = "Study note.md"
+
+            study_folder = root / folder_name
+            decoy_folder = root / decoy_folder_name
+            study_folder.mkdir()
+            decoy_folder.mkdir()
+
+            placeholder_helper = root / "placeholder_helper.pid"
+            placeholder_child = root / "placeholder_child.pid"
+            ws_helper = root / "ws_helper.pid"
+            ws_child = root / "ws_child.pid"
+            ws_release = root / "ws_release.txt"
+            win2_helper = root / "ws_win2_helper.pid"
+            win2_child = root / "ws_win2_child.pid"
+            win2_release = root / "ws_win2_release.txt"
+
+            ws_note = study_folder / note_name
+            decoy_note = decoy_folder / decoy_note_name
+            other_note = study_folder / "sibling.md"
+            win2_note = study_folder / "window2.md"
+
+            ws_note.write_text(
+                "# Outer Whitespace\nSPEC:" + json.dumps({
+                    "png_b64": self.png_b64,
+                    "helper_pid_file": str(ws_helper),
+                    "child_pid_file": str(ws_child),
+                    "release_file": str(ws_release),
+                }),
+                encoding="utf-8",
+            )
+            decoy_note.write_text("# Wrong Decoy\n", encoding="utf-8")
+            other_note.write_text("# Sibling\n", encoding="utf-8")
+            win2_note.write_text(
+                "# Win2\nSPEC:" + json.dumps({
+                    "png_b64": self.png_b64,
+                    "helper_pid_file": str(win2_helper),
+                    "child_pid_file": str(win2_child),
+                    "release_file": str(win2_release),
+                }),
+                encoding="utf-8",
+            )
+
+            expected_ws_folder = Path(str(study_folder.resolve()))
+            if os.name == "nt" and str(expected_ws_folder).startswith("\\\\?\\"):
+                expected_ws_folder = Path(str(expected_ws_folder)[4:])
+            expected_ws_note = expected_ws_folder / note_name
+            self.assertNotEqual(expected_ws_folder, decoy_folder.resolve())
+            self.assertFalse(same_path(ws_note, decoy_note))
+
+            # Offline DocumentStore preview preserves exact outer-whitespace path identity and rejects the decoy root.
+            offline_ws_helper = root / "offline_ws_helper.pid"
+            offline_ws_child = root / "offline_ws_child.pid"
+            offline_ws_note = study_folder / " Offline study.md"
+            offline_ws_note.write_text(
+                "# Offline\nSPEC:" + json.dumps({
+                    "png_b64": self.png_b64,
+                    "helper_pid_file": str(offline_ws_helper),
+                    "child_pid_file": str(offline_ws_child),
+                }),
+                encoding="utf-8",
+            )
+            store = DocumentStore([study_folder])
+            with mock.patch.object(offline_view, "_agent_cli_command", return_value=[sys.executable, str(fake_cli)]):
+                offline_bytes = offline_view.render_offline(store, offline_ws_note, width=640, timeout=15)
+                self.assertEqual(offline_bytes, base64.b64decode(self.png_b64))
+                off_h_pid = int(_await_file(offline_ws_helper))
+                off_c_pid = int(_await_file(offline_ws_child))
+                self.spawned_pids.extend([off_h_pid, off_c_pid])
+                self.assertTrue(_wait_until(lambda: not _pid_alive(off_c_pid), timeout=8.0))
+                with self.assertRaises(Exception):
+                    offline_view.render_offline(store, decoy_note, width=640, timeout=15)
+
+            session = Session(isolated=True)
+            session.settings["welcomed"] = True
+            bridge = _RecordingBridge()
+            session.agent_bridge = bridge
+            window1 = Studio(isolated=True, session=session)
+            window2 = Studio(isolated=True, session=session)
+            try:
+                placeholder_tab = window1.tabs[0]
+                placeholder_id = placeholder_tab["id"]
+                placeholder_tab["content"] = "# Placeholder\nSPEC:" + json.dumps({
+                    "mode": "sleep",
+                    "sleep": 60,
+                    "helper_pid_file": str(placeholder_helper),
+                    "child_pid_file": str(placeholder_child),
+                })
+                placeholder_tab["saved"] = placeholder_tab["content"]
+
+                window1.openPath(str(ws_note))
+                window1.openPath(str(other_note))
+                window2.openPath(str(win2_note))
+                self.assertTrue(
+                    _wait_until(
+                        lambda: any(same_path(t.get("path", ""), ws_note) for t in window1.tabs)
+                        and any(same_path(t.get("path", ""), other_note) for t in window1.tabs)
+                        and any(same_path(t.get("path", ""), win2_note) for t in window2.tabs),
+                        pump_app=self.app,
+                    )
+                )
+                tab_ws = next(t for t in window1.tabs if same_path(t.get("path", ""), ws_note))
+                tab_other = next(t for t in window1.tabs if same_path(t.get("path", ""), other_note))
+                tab_w2 = next(t for t in window2.tabs if same_path(t.get("path", ""), win2_note))
+
+                # Exact path identity and basename preserved without stripping outer whitespace.
+                self.assertEqual(tab_ws["name"], note_name)
+                self.assertEqual(Path(tab_ws["path"]).parent.name, folder_name)
+                self.assertEqual(tab_ws["path"], str(expected_ws_note))
+                self.assertEqual(os.fsencode(tab_ws["path"]), os.fsencode(expected_ws_note))
+                self.assertNotEqual(window1.active, tab_ws["id"])
+                self.assertEqual(window1.active, tab_other["id"])
+
+                window2.selectTab(tab_w2["id"])
+                rev_w2 = window2._agent_viewport_revision(tab_w2["id"])
+
+                with mock.patch.object(offline_view, "_agent_cli_command", return_value=[sys.executable, str(fake_cli)]):
+                    window1.selectTab(placeholder_id)
+                    rev_placeholder = window1._agent_viewport_revision(placeholder_id)
+                    window1._capture_background_preview("req-ph", placeholder_id, rev_placeholder, {"revision": rev_placeholder}, {"width": 800})
+
+                    window1.selectTab(tab_ws["id"])
+                    rev_ws = window1._agent_viewport_revision(tab_ws["id"])
+                    window1._capture_background_preview("req-ws", tab_ws["id"], rev_ws, {"revision": rev_ws}, {"width": 800})
+
+                    window1.selectTab(tab_other["id"])
+                    self.assertEqual(window1.active, tab_other["id"])
+                    window2._capture_background_preview("req-ws-w2", tab_w2["id"], rev_w2, {"revision": rev_w2}, {"width": 800})
+
+                    pid_ph = int(_await_file(placeholder_helper))
+                    pid_ph_child = int(_await_file(placeholder_child))
+                    pid_ws = int(_await_file(ws_helper))
+                    pid_ws_child = int(_await_file(ws_child))
+                    pid_w2 = int(_await_file(win2_helper))
+                    pid_w2_child = int(_await_file(win2_child))
+                    self.spawned_pids.extend([pid_ph, pid_ph_child, pid_ws, pid_ws_child, pid_w2, pid_w2_child])
+
+                    # Re-opening ws_note via Qt file URL routes to the existing tab without duplicating tabs
+                    # or disturbing its live owned preview helper tree.
+                    tab_count_before = len(window1.tabs)
+                    window1.openPath(QUrl.fromLocalFile(str(ws_note)).toString())
+                    self.assertTrue(_wait_until(lambda: window1.active == tab_ws["id"], pump_app=self.app))
+                    self.assertEqual(len(window1.tabs), tab_count_before)
+                    self.assertEqual(window1._current()["path"], str(expected_ws_note))
+                    self.assertTrue(_pid_alive(pid_ws))
+                    self.assertTrue(_pid_alive(pid_ws_child))
+
+                    # Removing placeholder_tab directly from self.tabs + _emit (matching startup-placeholder removal)
+                    # cancels only placeholder_tab's preview tree while keeping sibling tab_ws, window2, and unrelated alive.
+                    window1.tabs = [t for t in window1.tabs if t["id"] != placeholder_id]
+                    window1._emit(False)
+
+                    self.assertTrue(
+                        _wait_until(
+                            lambda: not _pid_alive(pid_ph)
+                            and not _pid_alive(pid_ph_child)
+                            and bridge.get("req-ph") is not None,
+                            pump_app=self.app,
+                        )
+                    )
+                    self.assertTrue(_pid_alive(pid_ws))
+                    self.assertTrue(_pid_alive(pid_ws_child))
+                    self.assertTrue(_pid_alive(pid_w2))
+                    self.assertTrue(_pid_alive(pid_w2_child))
+                    self.assertIsNone(unrelated.poll())
+                    self.assertIsNone(bridge.get("req-ws"))
+                    self.assertIsNone(bridge.get("req-ws-w2"))
+
+                    # Release ws_note's preview -> publishes valid PNG artifact on the routed existing tab.
+                    ws_release.write_text("done", encoding="utf-8")
+                    self.assertTrue(_wait_until(lambda: bridge.get("req-ws") is not None, pump_app=self.app))
+                    res_ws, err_ws, _ = bridge.get("req-ws")
+                    self.assertEqual(err_ws, "")
+                    self.assertEqual((res_ws["width"], res_ws["height"]), (64, 48))
+
+                    # Start one more active preview on tab_ws and shut down window1 via stop():
+                    # cancels window1's owned preview tree while window2 and unrelated subprocesses survive.
+                    ws_stop_helper = root / "ws_stop_helper.pid"
+                    ws_stop_child = root / "ws_stop_child.pid"
+                    tab_ws["content"] = "# Shutdown\nSPEC:" + json.dumps({
+                        "mode": "sleep",
+                        "sleep": 60,
+                        "helper_pid_file": str(ws_stop_helper),
+                        "child_pid_file": str(ws_stop_child),
+                    })
+                    rev_ws2 = window1._agent_viewport_revision(tab_ws["id"])
+                    window1._capture_background_preview("req-ws-stop", tab_ws["id"], rev_ws2, {"revision": rev_ws2}, {"width": 800})
+                    pid_ws_stop = int(_await_file(ws_stop_helper))
+                    pid_ws_stop_child = int(_await_file(ws_stop_child))
+                    self.spawned_pids.extend([pid_ws_stop, pid_ws_stop_child])
+
+                    window1.stop()
+                    self.assertTrue(
+                        _wait_until(
+                            lambda: not _pid_alive(pid_ws_stop) and not _pid_alive(pid_ws_stop_child),
+                            pump_app=self.app,
+                        )
+                    )
+                    self.assertTrue(_pid_alive(pid_w2))
+                    self.assertTrue(_pid_alive(pid_w2_child))
+                    self.assertIsNone(unrelated.poll())
+
+                    win2_release.write_text("done", encoding="utf-8")
+                    self.assertTrue(_wait_until(lambda: bridge.get("req-ws-w2") is not None, pump_app=self.app))
+                    res_w2, err_w2, _ = bridge.get("req-ws-w2")
+                    self.assertEqual(err_w2, "")
+                    self.assertEqual((res_w2["width"], res_w2["height"]), (64, 48))
+            finally:
+                for win in (window1, window2):
+                    win.stop()
+                    win.pool.shutdown(wait=True, cancel_futures=True)
+                    win._search_pool.shutdown(wait=True, cancel_futures=True)
+                session.writes.shutdown()
+                if previous_home is None:
+                    os.environ.pop("SUPERMD_DATA_HOME", None)
+                else:
+                    os.environ["SUPERMD_DATA_HOME"] = previous_home
 
 
 if __name__ == "__main__":

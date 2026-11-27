@@ -106,6 +106,18 @@ class PreviewJobRegistry:
                 cancelled += 1
         return cancelled
 
+    def retain_tabs(self, open_tab_ids) -> int:
+        with self._lock:
+            if not self._jobs:
+                return 0
+            keep = set(open_tab_ids)
+            targets = tuple(job for job in self._jobs if job.tab_id and job.tab_id not in keep)
+        cancelled = 0
+        for job in targets:
+            if job.cancel():
+                cancelled += 1
+        return cancelled
+
     def cancel_all(self, *, retire: bool = False) -> int:
         with self._lock:
             if retire:
