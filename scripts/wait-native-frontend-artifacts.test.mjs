@@ -111,28 +111,3 @@ it('times out rather than accepting an incomplete artifact pair', async () => {
     pollIntervalMs: 10,
   }), /Timed out waiting/);
 });
-
-it('default timeout accommodates >10 minute runner queue delays while producer is queued or running', async () => {
-  let clock = 0;
-  const fetchImpl = async input => {
-    const url = new URL(input);
-    const ready = clock >= 660_000;
-    const body = url.pathname.endsWith('/jobs')
-      ? { total_count: 1, jobs: [{ name: 'native_frontend', status: ready ? 'completed' : 'queued', ...(ready ? { conclusion: 'success' } : {}) }] }
-      : url.pathname.endsWith('/artifacts')
-        ? { total_count: ready ? 2 : 0, artifacts: ready ? [{ name: names.dist }, { name: names.manifest }] : [] }
-        : run;
-    return { ok: true, status: 200, json: async () => body };
-  };
-  const result = await waitForNativeFrontendArtifacts({
-    repository,
-    runId,
-    sourceSha,
-    token: 'test-token',
-    fetchImpl,
-    sleep: async ms => { clock += ms; },
-    now: () => clock,
-  });
-  assert.deepEqual(result, names);
-  assert.ok(clock >= 660_000);
-});

@@ -98,7 +98,7 @@ export async function waitForNativeFrontendArtifacts({
   apiUrl,
   fetchImpl = fetch,
   sleep = delay,
-  timeoutMs = 1_800_000,
+  timeoutMs = 600_000,
   pollIntervalMs = 5_000,
   now = Date.now,
 }) {
