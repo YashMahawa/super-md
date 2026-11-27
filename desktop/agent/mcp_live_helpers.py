@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import inspect
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -11,10 +12,20 @@ from typing import Any
 
 if __package__ and "." in __package__:
     from .. import documents
-    from ..agent_documents import AgentDocumentError, DocumentStore, RevisionConflict
+    from ..agent_documents import (
+        AgentDocumentError,
+        DocumentStore,
+        RevisionConflict,
+        _symlink_component,
+    )
 else:
     import documents
-    from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict
+    from agent_documents import (
+        AgentDocumentError,
+        DocumentStore,
+        RevisionConflict,
+        _symlink_component,
+    )
 
 from . import validators as _v
 from .context_normalizer import normalize_initial_reading_context, viewport_contexts
@@ -144,20 +155,23 @@ def svg_source_blocks(data: bytes, metadata: dict[str, Any], offset: int = 0, li
 
 
 def resolve_live_asset_path(store: DocumentStore, raw_path: str) -> str:
-    if not isinstance(raw_path, str) or not 1 <= len(raw_path.strip()) <= 4096 or "\0" in raw_path:
+    if not isinstance(raw_path, str) or not raw_path.strip() or len(raw_path) > 4096 or "\0" in raw_path:
         raise AgentDocumentError("asset_path must be a non-empty file path")
-    expanded = Path(raw_path).expanduser()
-    if not expanded.is_absolute() and any(part not in (".", "..") and part.startswith(".") for part in expanded.parts):
+    expanded = os.path.expanduser(raw_path)
+    cand = Path(expanded)
+    if (cand.name not in ("", ".", "..") and cand.name.startswith(".")) or (
+        not cand.is_absolute() and any(part not in (".", "..") and part.startswith(".") for part in cand.parts)
+    ):
         raise AgentDocumentError("Hidden files and directories are not allowed")
-    if expanded.is_symlink():
+    if cand.is_absolute() and (cand.is_symlink() or _symlink_component(cand) is not None):
         raise AgentDocumentError("Symbolic links are not allowed")
-    if store.roots:
+    if cand.is_absolute() and store.roots:
         try:
-            return str(store.resolve(raw_path))
+            store.resolve(expanded)
         except AgentDocumentError as error:
             if "outside the configured workspace roots" not in str(error):
                 raise
-    return str(expanded)
+    return expanded
 
 
 def run_view_current(live_client: Any, live_call: Callable[..., Any], *, path: str | None = None, tabId: str | None = None,

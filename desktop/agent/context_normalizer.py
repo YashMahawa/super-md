@@ -128,7 +128,7 @@ def viewport_contexts(image: dict[str, Any], tab_id: str, expected_revision: str
         ctx["viewport"] = {k: raw_vp[k] for k in vkeys if isinstance(raw_vp.get(k), (int, float)) and not isinstance(raw_vp.get(k), bool)}
     if (active_step := bounded_active_step(src.get("activeStep", meta.get("activeStep") if meta else None))) is not None:
         ctx["activeStep"] = active_step
-    if (props := bounded_properties(src.get("properties", meta.get("properties") if meta else None))) is not None and rev_ok:
+    if (props := bounded_properties(src.get("properties", meta.get("properties") if meta else None))) is not None:
         ctx["properties"] = props
     source_length, norm_src = _safe_int(src.get("sourceLength")), src.get("visibleSource")
     if source_length is not None and source_length >= 0 and isinstance(norm_src, dict):

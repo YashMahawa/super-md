@@ -47,14 +47,28 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as folder:
             base = Path(folder)
-            note_dir, outside_dir, ws_root = base / "note-folder", base / "outside-folder", base / "approved-workspace"
-            for d in (note_dir, outside_dir, ws_root):
+            note_dir, outside_dir, ws_root, other_ws = base / "note-folder", base / "outside-folder", base / "approved-workspace", base / "other-workspace"
+            ws_space, ws_decoy = base / "Study notes ", base / "Study notes"
+            for d in (note_dir, outside_dir, ws_root, other_ws, ws_space, ws_decoy):
                 d.mkdir()
-            smd_path, note_local, outside_svg = note_dir / "study.smd", note_dir / "fig3.svg", outside_dir / "secret.svg"
+            smd_path, sibling_md, ws_md = note_dir / "study.smd", note_dir / "sibling.md", ws_root / "ws-note.md"
+            note_local, outside_svg = note_dir / "fig3.svg", outside_dir / "secret.svg"
+            note_shared, ws_shared, note_repl, ws_repl = note_dir / "shared.svg", ws_root / "shared.svg", note_dir / "repl.svg", ws_root / "repl.svg"
+            space_svg, decoy_svg = ws_space / "spaced.svg", ws_decoy / "spaced.svg"
             write_portable(smd_path, "# Study note\n", {})
-            for p, body in ((note_local, b"<svg xmlns='http://www.w3.org/2000/svg'><polygon points='0,0 4,0 2,4'/></svg>"),
-                            (outside_svg, b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0'/></svg>"),
-                            (ws_root / "workspace-fig.svg", b"<svg xmlns='http://www.w3.org/2000/svg'><ellipse rx='3' ry='2'/></svg>")):
+            sibling_md.write_text("# Sibling private\n", encoding="utf-8")
+            ws_md.write_text("# Workspace note\n", encoding="utf-8")
+            for p, body in (
+                (note_local, b"<svg xmlns='http://www.w3.org/2000/svg'><polygon points='0,0 4,0 2,4'/></svg>"),
+                (outside_svg, b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0'/></svg>"),
+                (ws_root / "workspace-fig.svg", b"<svg xmlns='http://www.w3.org/2000/svg'><ellipse rx='3' ry='2'/></svg>"),
+                (note_shared, b"<svg xmlns='http://www.w3.org/2000/svg'><circle id='from-note-dir' r='11'/></svg>"),
+                (ws_shared, b"<svg xmlns='http://www.w3.org/2000/svg'><rect id='from-ws-root' width='99' height='99'/></svg>"),
+                (note_repl, b"<svg xmlns='http://www.w3.org/2000/svg'><circle id='repl-from-note-dir' r='7'/></svg>"),
+                (ws_repl, b"<svg xmlns='http://www.w3.org/2000/svg'><rect id='repl-from-ws-root' width='77' height='77'/></svg>"),
+                (space_svg, b"<svg xmlns='http://www.w3.org/2000/svg'><circle id='from-spaced-root' r='5'/></svg>"),
+                (decoy_svg, b"<svg xmlns='http://www.w3.org/2000/svg'><rect id='from-decoy-root' width='5' height='5'/></svg>"),
+            ):
                 p.write_bytes(body)
             escape_link = note_dir / "escape.svg"
             if os.name == "posix":
@@ -64,14 +78,26 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
             bridge = create_qt_bridge(session, session.data)
             session.agent_bridge = bridge
             studio = QuietStudio(True, session)
-            note = studio._note(smd_path.name, "# Study note\n", str(smd_path.resolve()), "# Study note\n", {}, True)
-            studio.tabs, studio.active, studio.mode, studio.folder = [note], note["id"], "live", str(ws_root)
+            studio.openFolder(str(ws_root))
+            studio.openNote(str(smd_path))
+            for _ in range(200):
+                app.processEvents()
+                if any(t.get("path") == str(smd_path.resolve()) for t in studio.tabs):
+                    break
+                await asyncio.sleep(0.01)
+            studio.mode = "live"
 
             def handle_native(raw):
                 req = json.loads(raw)
                 try:
-                    res = {"flushed": True} if req["action"] == "flush_current" else (
-                        studio._attach_tab_asset_native(req) if req["action"] == "asset_action" else studio._agent_document_action(req))
+                    if req["action"] == "flush_current":
+                        res = {"flushed": True}
+                    elif req["action"] == "asset_action":
+                        res = studio._attach_tab_asset_native(req)
+                    elif req["action"] == "replace_tab_asset":
+                        res = studio._replace_tab_asset_native(req)
+                    else:
+                        res = studio._agent_document_action(req)
                     bridge.complete(req["requestId"], res, window_id=studio.window_id)
                 except (ValueError, OSError, KeyError, RuntimeError) as err:
                     bridge.complete(req["requestId"], None, str(err), window_id=studio.window_id)
@@ -79,16 +105,58 @@ class AgentMCPSplitCoordinationTest(unittest.IsolatedAsyncioTestCase):
             studio.agentRequest.connect(handle_native)
             try:
                 studio.setAgentAccessEnabled(True)
-                rooted_server, _ = build_mcp_server([str(ws_root)], live_client=MultiSessionLiveClient(bridge.discovery_dir))
+                # User single-note grant never expands _agent_mcp_roots() to note_dir.
+                self.assertEqual(studio._agent_mcp_roots(), [str(ws_root.resolve())])
+                rooted_server, _ = build_mcp_server(studio._agent_mcp_roots(), live_client=MultiSessionLiveClient(bridge.discovery_dir))
                 async with Client(rooted_server) as client:
                     sessions = await call_with_qt(client.call_tool("list_sessions", {}))
                     entry = next(i for i in sessions.structured_content["sessions"] if i.get("path") == str(smd_path.resolve()))
                     target, rev = entry["target"], entry["revision"]
+                    # Sibling note in user-opened note's folder is rejected by open_document.
+                    self.assertTrue((await call_with_qt(client.call_tool("document_action", {"action": "open_document", "path": str(sibling_md)}))).is_error)
                     for bad in (".hidden.svg", str(outside_svg), *([str(escape_link)] if os.name == "posix" else [])):
                         self.assertTrue((await call_with_qt(client.call_tool("document_attach_asset", {"path": target, "asset_path": bad, "expected_revision": rev}))).is_error, bad)
                     for asset, name in ((str(note_local), "note-local.svg"), ("workspace-fig.svg", "ws-fig.svg")):
                         ok = await call_with_qt(client.call_tool("document_attach_asset", {"path": target, "asset_path": asset, "expected_revision": rev, "name": name}))
                         self.assertFalse(ok.is_error, ok.content[0].text if ok.content else "")
+                        rev = ok.structured_content["revision"]
+                    # Relative asset present in BOTH originating note folder and --root resolves from originating note folder first.
+                    attached_shared = await call_with_qt(client.call_tool("document_attach_asset", {"path": target, "asset_path": "shared.svg", "expected_revision": rev, "name": "shared.svg"}))
+                    self.assertFalse(attached_shared.is_error, attached_shared.content[0].text if attached_shared.content else "")
+                    rev, shared_id = attached_shared.structured_content["revision"], attached_shared.structured_content["asset"]["name"]
+                    extracted_shared = await call_with_qt(client.call_tool("document_assets", {"path": target, "action": "extract", "asset_name": shared_id, "expected_revision": rev}))
+                    self.assertIn("from-note-dir", json.loads(extracted_shared.content[0].text)["source"])
+                    replaced_shared = await call_with_qt(client.call_tool("document_assets", {"path": target, "action": "replace", "asset_id": shared_id, "asset_path": "repl.svg", "expected_revision": rev}))
+                    self.assertFalse(replaced_shared.is_error, replaced_shared.content[0].text if replaced_shared.content else "")
+                    rev = (replaced_shared.structured_content or json.loads(replaced_shared.content[0].text))["revision"]
+                    extracted_repl = await call_with_qt(client.call_tool("document_assets", {"path": target, "action": "extract", "asset_name": shared_id, "expected_revision": rev}))
+                    self.assertIn("repl-from-note-dir", json.loads(extracted_repl.content[0].text)["source"])
+                    # Automation-opened tab under ws_root is immediately revoked when Studio switches roots, while user-opened study.smd stays live.
+                    opened_ws = await call_with_qt(client.call_tool("document_action", {"action": "open_document", "path": "ws-note.md", "background": True}))
+                    self.assertFalse(opened_ws.is_error, opened_ws.content[0].text if opened_ws.content else "")
+                    for _ in range(200):
+                        app.processEvents()
+                        if any(t.get("path") == str(ws_md.resolve()) for t in studio.tabs):
+                            break
+                        await asyncio.sleep(0.01)
+                    before_switch = await call_with_qt(client.call_tool("list_sessions", {}))
+                    ws_target = next(s["target"] for s in before_switch.structured_content["sessions"] if s.get("path") == str(ws_md.resolve()))
+                    studio.openFolder(str(other_ws))
+                    after_switch = await call_with_qt(client.call_tool("list_sessions", {}))
+                    listed_targets = {s["target"] for s in after_switch.structured_content["sessions"]}
+                    self.assertIn(target, listed_targets)
+                    self.assertNotIn(ws_target, listed_targets)
+                    self.assertTrue((await call_with_qt(client.call_tool("document_read", {"path": ws_target}))).is_error)
+                    self.assertFalse((await call_with_qt(client.call_tool("document_read", {"path": target}))).is_error)
+                    # Outer-whitespace approved root preserves exact identity and rejects stripped-name decoy.
+                    if os.path.exists(ws_space) and not os.path.samefile(ws_space, ws_decoy):
+                        studio.openFolder(str(ws_space))
+                        spaced_server, _ = build_mcp_server(studio._agent_mcp_roots(), live_client=MultiSessionLiveClient(bridge.discovery_dir))
+                        async with Client(spaced_server) as spaced_client:
+                            self.assertTrue((await call_with_qt(spaced_client.call_tool("document_attach_asset", {"path": target, "asset_path": str(decoy_svg), "expected_revision": rev, "name": "decoy.svg"}))).is_error)
+                            ok_sp = await call_with_qt(spaced_client.call_tool("document_attach_asset", {"path": target, "asset_path": str(space_svg), "expected_revision": rev, "name": "spaced.svg"}))
+                            self.assertFalse(ok_sp.is_error, ok_sp.content[0].text if ok_sp.content else "")
+                            self.assertIn("from-spaced-root", json.loads((await call_with_qt(spaced_client.call_tool("document_assets", {"path": target, "action": "extract", "asset_name": ok_sp.structured_content["asset"]["name"], "expected_revision": ok_sp.structured_content["revision"]}))).content[0].text)["source"])
             finally:
                 studio.stop()
                 studio.pool.shutdown(wait=True, cancel_futures=True)
@@ -246,7 +314,7 @@ class AgentMCPExtractionUnitTest(unittest.TestCase):
         cap, cread = cn.viewport_contexts({"tabId": "raw", "revision": rev, "sourceLength": 20, "properties": {"title": "Doc", "subtitle": "h"}, "visibleSource": {"text": "hello", "start": 0, "end": 5}}, "s:w:raw", rev)
         self.assertEqual((cap["contextRevisionMatches"], cap["properties"], cread["properties"], cread["visibleSource"]["next_offset"]), (True, {"title": "Doc"}, {"title": "Doc"}, 5))
         mcap, mread = cn.viewport_contexts({"tabId": "raw", "revision": "b" * 64, "sourceLength": 20, "properties": {"title": "Stale"}, "visibleSource": {"text": "hello", "start": 0, "end": 5}}, "s:w:raw", rev)
-        self.assertEqual((mcap["contextRevisionMatches"], "properties" in mcap, mread), (False, False, None))
+        self.assertEqual((mcap["contextRevisionMatches"], mcap["properties"], mread), (False, {"title": "Stale"}, None))
 
 
 if __name__ == "__main__":
