@@ -213,7 +213,10 @@ class IntegrationTest(unittest.TestCase):
             home = root / 'home'
             older = self.package(home / '.local/opt/super-md-qt-1.2.2', '1.2.2', binary_text='keep-1.2.2', relative_dir='')
             current = self.package(home / '.local/opt/super-md-qt-1.2.3', '1.2.3', binary_text='local-1.2.3', relative_dir='')
-            (current / 'super-md').chmod(0o644)
+            helper = current / '_internal/resources/desktop/smd-engine'
+            helper.write_text('engine-1.2.3', encoding='utf-8')
+            (current / 'super-md').chmod(0o755)
+            helper.chmod(0o750)
             launcher = home / '.local/bin/super-md'
             launcher.parent.mkdir(parents=True)
             launcher.symlink_to(older / 'super-md')
@@ -241,7 +244,8 @@ class IntegrationTest(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in (home / '.local/opt').iterdir()), ['super-md-qt-1.2.2', 'super-md-qt-1.2.3'])
             self.assertEqual(launcher.resolve(), (current / 'super-md').resolve())
             self.assertEqual((older / 'super-md').read_text(encoding='utf-8'), 'keep-1.2.2')
-            self.assertEqual(stat.S_IMODE((current / 'super-md').stat().st_mode) & 0o700, 0o700)
+            self.assertEqual(stat.S_IMODE((current / 'super-md').stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE(helper.stat().st_mode), 0o750)
             self.assertEqual(spy.calls, [])
             self.assertEqual(spy.popen_calls, [])
 
@@ -396,3 +400,76 @@ class IntegrationTest(unittest.TestCase):
                         integration.integrate_current('1.2.3')
             self.assertEqual(spy.calls, [])
             self.assertEqual(spy.popen_calls, [])
+
+    def test_user_local_registration_failure_preserves_prior_launcher_registration_and_file_modes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / 'home'
+            older = self.package(home / '.local/opt/super-md-qt-1.2.2', '1.2.2', binary_text='#!/bin/sh\necho 1.2.2\n', relative_dir='')
+            (older / 'super-md').chmod(0o755)
+            (older / '_internal/resources/public/brand-mark-fixed.svg').write_text('<svg id="v1.2.2"/>', encoding='utf-8')
+            with patch.object(integration.shutil, 'which', return_value=None):
+                integration.register(older, home)
+
+            launcher = home / '.local/bin/super-md'
+            xdg_paths = (
+                home / '.local/share/applications/dev.supermd.studio.desktop',
+                home / '.local/share/icons/hicolor/scalable/apps/super-md.svg',
+                home / '.local/share/mime/packages/supermd.xml',
+            )
+            xdg_paths[0].chmod(0o640)
+            xdg_paths[1].chmod(0o644)
+            xdg_paths[2].chmod(0o600)
+            prior_xdg = {p: (p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in xdg_paths}
+
+            current = self.package(home / '.local/opt/super-md-qt-1.2.3', '1.2.3', binary_text='#!/bin/sh\necho ok-1.2.3\n', relative_dir='')
+            (current / '_internal/resources/public/brand-mark-fixed.svg').write_text('<svg id="v1.2.3"/>', encoding='utf-8')
+            helper = current / '_internal/resources/desktop/smd-engine'
+            helper.write_text('#!/bin/sh\necho engine\n', encoding='utf-8')
+            lib_real = current / '_internal/libQt6Core.so.6.8.0'
+            lib_real.write_text('elf-shared-lib', encoding='utf-8')
+            lib_link = current / '_internal/libQt6Core.so.6'
+            lib_link.symlink_to('libQt6Core.so.6.8.0')
+            current.chmod(0o755)
+            (current / '_internal').chmod(0o755)
+            (current / '_internal/resources').chmod(0o750)
+            (current / 'super-md').chmod(0o755)
+            helper.chmod(0o750)
+            lib_real.chmod(0o755)
+            (current / '_internal/resources/desktop/build-info.json').chmod(0o644)
+            (current / '_internal/resources/public/brand-mark-fixed.svg').chmod(0o640)
+
+            def snapshot_modes(pkg: Path) -> dict[Path, int]:
+                modes = {pkg: stat.S_IMODE(pkg.lstat().st_mode)}
+                for cur, dirs, files in os.walk(pkg, followlinks=False):
+                    cur_path = Path(cur)
+                    modes[cur_path] = stat.S_IMODE(cur_path.lstat().st_mode)
+                    for name in (*dirs, *files):
+                        entry = cur_path / name
+                        if not entry.is_symlink():
+                            modes[entry] = stat.S_IMODE(entry.lstat().st_mode)
+                return modes
+
+            expected_modes = snapshot_modes(current)
+            stack, spy = self.spy_subprocesses(which_map={'update-desktop-database': '/usr/bin/update-desktop-database'})
+            with stack, patch.object(integration, '_link', side_effect=OSError('simulated launcher replace failure')):
+                with self.assertRaisesRegex(OSError, 'simulated launcher replace failure'):
+                    integration.integrate_current('1.2.3', executable=current / 'super-md', home=home, frozen=True, platform='linux')
+
+            self.assertEqual(launcher.resolve(), (older / 'super-md').resolve())
+            self.assertEqual({p: (p.read_bytes(), stat.S_IMODE(p.lstat().st_mode)) for p in xdg_paths}, prior_xdg)
+            self.assertEqual(snapshot_modes(current), expected_modes)
+            self.assertEqual(os.readlink(lib_link), 'libQt6Core.so.6.8.0')
+            self.assertEqual(subprocess.check_output([str(current / 'super-md')], text=True).strip(), 'ok-1.2.3')
+            self.assertEqual(spy.calls, [])
+
+            xdg_paths[0].write_text('[Desktop Entry]\nName=Custom Unmanaged\nExec=/usr/bin/other\n', encoding='utf-8')
+            unmanaged_bytes = xdg_paths[0].read_bytes()
+            stack2, spy2 = self.spy_subprocesses()
+            with stack2:
+                with self.assertRaisesRegex(ValueError, 'not managed by Super MD'):
+                    integration.integrate_current('1.2.3', executable=current / 'super-md', home=home, frozen=True, platform='linux')
+            self.assertEqual(launcher.resolve(), (older / 'super-md').resolve())
+            self.assertEqual(xdg_paths[0].read_bytes(), unmanaged_bytes)
+            self.assertEqual(snapshot_modes(current), expected_modes)
+            self.assertEqual(spy2.calls, [])

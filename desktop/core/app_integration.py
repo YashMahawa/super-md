@@ -260,7 +260,7 @@ def register(package, home=None):
                 else:
                     data,mode=saved
                     atomic_write(path,data)
-                    os.chmod(path,(mode & 0o644) | 0o600)
+                    os.chmod(path,mode)
             except OSError:
                 pass
         raise
@@ -312,7 +312,6 @@ def integrate_current(current_version, *, executable=None, home=None, frozen=Non
     _validate_package(package,expected_version=current_version,require_user_owner=user_local)
     _preflight_registration(home_path)
     if user_local:
-        _normalize_permissions(package)
         register(package,home_path)
         return str(package)
     opt.mkdir(parents=True,exist_ok=True)
