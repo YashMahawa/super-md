@@ -26,6 +26,14 @@ class LatestWriteExecutor:
         self._scheduled = False
         self._shutdown = False
         self._worker_ids: set[int] = set()
+        self._drain_finalizers: list[Callable[[], None]] = []
+
+    def add_drain_finalizer(self, fn: Callable[[], None]) -> None:
+        """Register a callback to run after flush() or shutdown(wait=True) drains queued writes."""
+        if not callable(fn):
+            raise ValueError("drain finalizer must be callable")
+        with self._condition:
+            self._drain_finalizers.append(fn)
 
     def submit(self, fn, /, *args, **kwargs):
         """Submit an ordinary FIFO job and preserve Future/result semantics."""
@@ -76,6 +84,22 @@ class LatestWriteExecutor:
                 if remaining <= 0:
                     raise TimeoutError("timed out waiting for latest writer drains")
                 self._condition.wait(remaining)
+            finalizers = list(self._drain_finalizers)
+            if finalizers:
+                if self._shutdown:
+                    raise RuntimeError("cannot flush after writer shutdown")
+                finalizer_future = self._executor.submit(
+                    self._tracked, self._run_drain_finalizers, (finalizers,), {}
+                )
+            else:
+                finalizer_future = None
+
+        if finalizer_future is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                finalizer_future.result(timeout=remaining)
+            except concurrent.futures.TimeoutError as failure:
+                raise TimeoutError("timed out waiting for writer drain finalizers") from failure
 
     def _schedule_locked(self):
         self._scheduled = True
@@ -141,6 +165,14 @@ class LatestWriteExecutor:
         with self._condition:
             return len(self._pending)
 
+    @staticmethod
+    def _run_drain_finalizers(finalizers):
+        for fn in finalizers:
+            try:
+                fn()
+            except Exception:
+                pass
+
     def shutdown(self, wait=True, *, cancel_futures=False):
         """Flush latest slots, then close the serial executor.
 
@@ -164,3 +196,7 @@ class LatestWriteExecutor:
                     self._condition.wait()
 
         self._executor.shutdown(wait=wait and not worker_call, cancel_futures=False)
+        if wait and not worker_call:
+            with self._condition:
+                finalizers = list(self._drain_finalizers)
+            self._run_drain_finalizers(finalizers)

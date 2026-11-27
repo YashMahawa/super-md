@@ -1,9 +1,4 @@
 /** Flatten Super MD-only presentation blocks for Obsidian/CommonMark readers. */
-import {unified} from 'unified';
-import remarkParse from 'remark-parse';
-import remarkGfm from 'remark-gfm';
-import remarkMath from 'remark-math';
-import {remarkObsidianMath} from './obsidianMath';
 import {visit} from 'unist-util-visit';
 import {parseStepDeck} from './components/StepCards';
 import {parseDiagramSource} from './components/InlineDiagram';
@@ -11,7 +6,8 @@ import {parseBinaryTreeSource} from './components/BinaryTree';
 import {stepDiagramSvg} from './stepPdf';
 import {svgImage} from './svgImage';
 import {normalizeCalloutBlocks} from './markdownSource';
-import {maskFrontmatter,parseFrontmatter} from './frontmatter';
+import {parseFrontmatter} from './frontmatter';
+import {parseMaskedMarkdown} from './markdownExportParser';
 import {looksLikeSvg,remarkSvgBlocks} from './svgBlocks';
 import {parseBracedFenceLanguage} from './fenceLanguage';
 import {pythonOutput} from './renderedOutputs';
@@ -23,9 +19,8 @@ export async function compatibleMarkdown(markdown:string,documentPath:string|nul
  if(depth>5)throw Error('Nested step content is too deep to export.');
  markdown=normalizeCalloutBlocks(markdown).value;
  const frontmatterEnd=parseFrontmatter(markdown)?.end??0;
- const masked=maskFrontmatter(markdown);
- const processor=unified().use(remarkParse).use(remarkGfm,{singleTilde:false}).use(remarkMath).use(remarkObsidianMath);
- const tree=remarkSvgBlocks()(processor.parse(masked),{value:masked});
+ const {masked,tree:parsedTree}=parseMaskedMarkdown(markdown);
+ const tree=remarkSvgBlocks()(parsedTree,{value:masked});
  const blocks:any[]=[];
  visit(tree,(node:any)=>{if(node.position&&node.position.start.offset>=frontmatterEnd&&(node.type==='code'||node.type==='html'&&looksLikeSvg(node.value)))blocks.push(node);});
  const pythonOrdinals=new Map<string,number>();
