@@ -78,6 +78,49 @@ describe("toggleMarkdownFormat", () => {
     });
   });
 
+  it("handles inline_code double-backtick wrapping and space unwrapping, display-math $$ boundaries, underscores, and reversed selections", () => {
+    const withTick = toggleMarkdownFormat("a`b", [{ anchor: 3, head: 0 }], "inline_code");
+    expect(withTick).toMatchObject({
+      doc: "`` a`b ``",
+      ranges: [{ anchor: 6, head: 3 }],
+    });
+
+    expect(toggleMarkdownFormat("`` a`b ``", [{ anchor: 9, head: 0 }], "inline_code")).toMatchObject({
+      doc: "a`b",
+      ranges: [{ anchor: 3, head: 0 }],
+    });
+    expect(toggleMarkdownFormat("``code``", [{ anchor: 2, head: 6 }], "inline_code")).toMatchObject({
+      doc: "code",
+      ranges: [{ anchor: 0, head: 4 }],
+    });
+    expect(toggleMarkdownFormat("`` ``", [{ anchor: 0, head: 5 }], "inline_code")).toMatchObject({
+      doc: " ",
+      ranges: [{ anchor: 0, head: 1 }],
+    });
+
+    expect(toggleMarkdownFormat("$$x$$", [{ anchor: 2, head: 3 }], "inline_math")).toMatchObject({
+      doc: "$$$x$$$",
+      ranges: [{ anchor: 3, head: 4 }],
+    });
+    expect(toggleMarkdownFormat("$$x$$", [{ anchor: 0, head: 5 }], "inline_math")).toMatchObject({
+      doc: "$$$x$$$",
+      ranges: [{ anchor: 1, head: 6 }],
+    });
+    expect(toggleMarkdownFormat("$x$", [{ anchor: 0, head: 3 }], "inline_math")).toMatchObject({
+      doc: "x",
+      ranges: [{ anchor: 0, head: 1 }],
+    });
+
+    expect(toggleMarkdownFormat("__word__", [{ anchor: 2, head: 6 }], "bold")).toMatchObject({
+      doc: "word",
+      ranges: [{ anchor: 0, head: 4 }],
+    });
+    expect(toggleMarkdownFormat("___word___", [{ anchor: 3, head: 7 }], "italic")).toMatchObject({
+      doc: "__word__",
+      ranges: [{ anchor: 2, head: 6 }],
+    });
+  });
+
   it("toggles multiple cursors simultaneously in Source mode", () => {
     const initial = "alpha and beta";
     const ranges = [
