@@ -738,7 +738,18 @@ internal fun extractDroppedFileUris(clip: android.content.ClipData?): List<andro
                 payload.put("readingLocation",model.readingLocation(note.uri))
                 payload.put("customStyle",themeStyle(themeDocument(state.customTheme),if(state.fullscreen)state.fullscreenTheme else state.theme,dark,state.patternKind,state.patternOpacity,state.patternSize,state.patternSpacing))
                 if (matchingSeed != null) {
-                    payload.put("seededFind", JSONObject().put("query", matchingSeed.query).put("caseSensitive", matchingSeed.caseSensitive).put("nonce", matchingSeed.nonce))
+                    val seededJson = JSONObject()
+                        .put("query", matchingSeed.query)
+                        .put("caseSensitive", matchingSeed.caseSensitive)
+                        .put("nonce", matchingSeed.nonce)
+                    if (matchingSeed.sourceStart != null && matchingSeed.sourceEnd != null && matchingSeed.sourceStart >= 0 && matchingSeed.sourceEnd >= matchingSeed.sourceStart) {
+                        seededJson.put("sourceStart", matchingSeed.sourceStart)
+                        seededJson.put("sourceEnd", matchingSeed.sourceEnd)
+                        if (!matchingSeed.matchText.isNullOrEmpty()) {
+                            seededJson.put("matchText", matchingSeed.matchText)
+                        }
+                    }
+                    payload.put("seededFind", seededJson)
                 }
                 web?.evaluateJavascript("document.documentElement.dataset.platform='android';window.supermdLoad?.($payload)", null)
                 if (pendingHeading != null) model.consumePendingHeading(pendingHeading.token)
@@ -1445,9 +1456,6 @@ internal fun buildHighlightedSnippet(
             }
         },
         actions = {
-            if (wide && !fullscreen) {
-                IconButton(onClick = onFolderSearch, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_search), "Search across notes (Ctrl+Shift+F)") }
-            }
             StudyIcon("Find in note", R.drawable.symbol_search, enabled = readerReady, action = onFind)
             IconButton(onClick = onSave, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_save), "Save note") }
             IconButton(onClick = onExport, enabled = readerReady && !busy, modifier = Modifier.size(48.dp)) { Icon(painterResource(R.drawable.symbol_export), "Export") }
@@ -1458,7 +1466,6 @@ internal fun buildHighlightedSnippet(
             Box {
                 IconButton(onClick = { onMenuExpandedChange(true) }, modifier = Modifier.size(48.dp)) { Icon(Icons.Rounded.MoreVert, "More actions") }
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { onMenuExpandedChange(false) }) {
-                    DropdownMenuItem(text = { Text("Search across notes") }, onClick = { onMenuExpandedChange(false); onFolderSearch() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_search), null) })
                     DropdownMenuItem(text = { Text("Reopen closed tab") }, enabled = canReopenClosedTab, onClick = { onMenuExpandedChange(false); onReopenClosedTab() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_undo), null) })
                     DropdownMenuItem(text = { Text("Save as") }, enabled = !busy, onClick = { onMenuExpandedChange(false); onSaveAs() }, leadingIcon = { Icon(painterResource(R.drawable.symbol_save), null) })
                     HorizontalDivider()
