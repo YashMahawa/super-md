@@ -9,8 +9,9 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QCoreApplication
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QUrl
 from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlComponent, QQmlEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
 import folder_ops
@@ -165,8 +166,45 @@ class StudioWorkspaceTest(unittest.TestCase):
         self.studio.toggleDirectory(str(vault / "99_PinnedDrafts"))
         self.assertTrue(_wait_until(lambda: "99_PinnedDrafts" not in [e["name"] for e in self.studio.files]))
 
+        # FolderSidebar selection and active-note highlighting carry cleanly through the extracted helpers.
+        qml_dir = (Path(studio_mod.__file__).parent / "qml").resolve()
+        engine = QQmlEngine()
+        engine.rootContext().setContextProperty("studio", self.studio)
+        comp = QQmlComponent(engine)
+        comp.setData(
+            b"import QtQuick\nimport QtQuick.Controls\nApplicationWindow { id: window; visible: true; width: 300; height: 520\n"
+            b"property var viewState: JSON.parse(studio.snapshot)\n"
+            b"property var sidebarState: JSON.parse(studio.sidebarSnapshot)\n"
+            b"property var shortcutLabels: JSON.parse(studio.shortcutLabels || '{}')\n"
+            b"FolderSidebar { anchors.fill: parent; viewState: window.viewState; sidebarState: window.sidebarState; shortcutLabels: window.shortcutLabels } }\n",
+            QUrl.fromLocalFile(str(qml_dir / "workspace-selection-check.qml")),
+        )
+        win = comp.create()
+        self.assertIsNotNone(win, str(comp.errors()))
+        try:
+            sidebar = win.findChild(QObject, "folderSidebar")
+            self.studio.openNote(str(vault / "03_NotesMd" / "note.md"))
+            self.assertTrue(_wait_until(lambda: str(sidebar.property("activeTabPath")).endswith("note.md")))
+            self.studio.setting("hideNonNoteFolders", "false")
+            self.assertTrue(_wait_until(lambda: "00_Empty" in [e["name"] for e in json.loads(self.studio.sidebarSnapshot)["files"]]))
+            sidebar.setProperty("selectedPath", folder_ops.canonical_path_str(vault / "00_Empty"))
+            sidebar.setProperty("selectedDirectory", True)
+            self.studio.setting("hideNonNoteFolders", "true")
+            self.assertTrue(_wait_until(lambda: sidebar.property("selectedPath") == "" and not bool(sidebar.property("selectedDirectory"))))
+            self.studio.toggleDirectory(str(vault / "03_NotesMd"))
+            self.assertTrue(_wait_until(lambda: any(e["name"] == "note.md" for e in json.loads(self.studio.sidebarSnapshot)["files"])))
+            sidebar.setProperty("selectedPath", folder_ops.canonical_path_str(vault / "03_NotesMd" / "note.md"))
+            self.studio.toggleDirectory(str(vault / "03_NotesMd"))
+            self.assertTrue(_wait_until(lambda: sidebar.property("selectedPath") == ""))
+            sidebar.setProperty("selectedPath", folder_ops.canonical_path_str(vault / "03_NotesMd"))
+            sidebar.setProperty("selectedDirectory", True)
+            self.studio.closeFolder()
+            self.assertTrue(_wait_until(lambda: sidebar.property("selectedPath") == "" and not bool(sidebar.property("selectedDirectory"))))
+        finally:
+            win.close(); win.deleteLater(); engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
         # Closing folder releases folder directory watches; native picker signal stays intact.
-        self.studio.closeFolder()
         self.assertNotIn(
             folder_ops.canonical_path_str(vault),
             {folder_ops.canonical_path_str(d) for d in self.studio.note_watcher.directories()},
