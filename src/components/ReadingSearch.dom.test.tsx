@@ -664,4 +664,152 @@ describe("ReadingSearch DOM behavior", () => {
       host.remove();
     }
   });
+
+  it("shares the source-range index across offscreen reveals and keeps large-note Replace toggling sub-linear", async () => {
+    const { registerWindowedText } = await import("../windowedSearch");
+    const chapters = 1000;
+    const parts: string[] = [];
+    const starts: number[] = [];
+    const ends: number[] = [];
+    let cursor = 0;
+    for (let i = 0; i < chapters; i++) {
+      const chunk = `## Chapter ${i}\n\nReadable chapter ${i} with [ref](https://example.com/Readable-${i}) and Readable prose.\n\nConclusion ${i} Readable.`;
+      parts.push(chunk);
+      starts.push(cursor);
+      ends.push(cursor + chunk.length);
+      cursor += chunk.length + 2;
+    }
+    const content = parts.join("\n\n");
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    const cleanups: Array<() => void> = [];
+
+    await act(async () => {
+      root.render(
+        <div className="android-document mode-live">
+          <ReadingSearch content={content} close={() => {}} onChange={() => {}} />
+          <section className="android-reading">
+            <div className="document-page">
+              <div className="markdown-body">
+                {parts.map((_, i) => {
+                  const mounted = i < 8 || i === chapters - 1;
+                  const hEnd = starts[i] + `## Chapter ${i}`.length;
+                  const pStart = hEnd + 2;
+                  return (
+                    <section
+                      key={i}
+                      className="live-block"
+                      data-windowed-block=""
+                      data-windowed-mounted={mounted ? "true" : "false"}
+                      data-source-start={starts[i]}
+                      data-source-end={ends[i]}
+                    >
+                      {mounted ? (
+                        <>
+                          <h2 data-source-start={starts[i]} data-source-end={hEnd}>Chapter {i}</h2>
+                          <p data-source-start={pStart} data-source-end={ends[i]}>
+                            Readable chapter {i} with <a href={`https://example.com/Readable-${i}`}>ref</a> and Readable prose. Conclusion {i} Readable.
+                          </p>
+                        </>
+                      ) : (
+                        <span aria-hidden="true" />
+                      )}
+                    </section>
+                  );
+                })}
+              </div>
+            </div>
+          </section>
+        </div>
+      );
+    });
+
+    const readingEl = host.querySelector<HTMLElement>(".android-reading")!;
+    const blocks = Array.from(readingEl.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+    blocks.forEach((el, i) => {
+      cleanups.push(
+        registerWindowedText(
+          el,
+          `Chapter ${i}\nReadable chapter ${i} with ref and Readable prose.\nConclusion ${i} Readable.\n`,
+        ),
+      );
+      if (i === chapters - 2) {
+        el.addEventListener("supermd-reveal-window", () => {
+          const hEnd = starts[i] + `## Chapter ${i}`.length;
+          el.setAttribute("data-windowed-mounted", "true");
+          el.innerHTML = `<h2 data-source-start="${starts[i]}" data-source-end="${hEnd}">Chapter ${i}</h2><p data-source-start="${hEnd + 2}" data-source-end="${ends[i]}">Readable chapter ${i} with <a href="https://example.com/Readable-${i}">ref</a> and Readable prose. Conclusion ${i} Readable.</p>`;
+          readingEl.dispatchEvent(new Event("supermd-window-change"));
+        }, { once: true });
+      }
+    });
+
+    const flushFrame = () =>
+      act(async () => {
+        await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+      });
+
+    const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    act(() => setInputValue(searchInput, "Readable"));
+    await flushFrame();
+    // 1,000 chapters * 3 visible matches = 3,000 rendered matches (1,000 hidden link URLs excluded).
+    expect(host.querySelector("output")?.textContent).toBe("0 / 3000");
+
+    // Select final mounted match 3000 / 3000 (Chapter 999) via Previous wraparound.
+    const prevBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Previous match"]')!;
+    act(() => prevBtn.click());
+    await flushFrame();
+    expect(host.querySelector("output")?.textContent).toBe("3000 / 3000");
+
+    const qsaSpy = vi.spyOn(Element.prototype, "querySelectorAll");
+    const countCandidateScans = () =>
+      qsaSpy.mock.calls.filter(([sel]) => String(sel).includes("data-windowed-block") && String(sel).includes("data-source-start")).length;
+
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+    // First toggle ON builds the source-range index once and maps 3000 / 3000 -> 4000 / 4000 across 1,000 hidden URLs.
+    qsaSpy.mockClear();
+    act(() => replaceToggle.click());
+    await flushFrame();
+    expect(host.querySelector("output")?.textContent).toBe("4000 / 4000");
+    expect(countCandidateScans()).toBe(1);
+
+    // Subsequent Replace OFF -> ON round-trip reuses the warm index with 0 candidate-block DOM walks.
+    qsaSpy.mockClear();
+    const toggleStart = performance.now();
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("3000 / 3000");
+    act(() => replaceToggle.click());
+    expect(host.querySelector("output")?.textContent).toBe("4000 / 4000");
+    const toggleElapsed = performance.now() - toggleStart;
+    await flushFrame();
+    expect(countCandidateScans()).toBe(0);
+    expect(toggleElapsed).toBeLessThan(1500);
+
+    // Stepping backward in Replace mode across Chapter 999 into unmounted Chapter 998 reveals & mounts Chapter 998,
+    // invalidating the index once on mount and reusing it across settle frames.
+    qsaSpy.mockClear();
+    act(() => prevBtn.click()); // 3999 / 4000 (Chapter 999)
+    act(() => prevBtn.click()); // 3998 / 4000 (hidden URL in Chapter 999)
+    act(() => prevBtn.click()); // 3997 / 4000 (Chapter 999 first visible)
+    expect(countCandidateScans()).toBe(0);
+
+    act(() => prevBtn.click()); // 3996 / 4000 (unmounted Chapter 998 -> mounts & invalidates once!)
+    await flushFrame();
+    expect(blocks[chapters - 2].getAttribute("data-windowed-mounted")).toBe("true");
+    expect(host.querySelector("output")?.textContent).toBe("3996 / 4000");
+    expect(countCandidateScans()).toBe(1);
+
+    // Toggle Replace OFF on the newly revealed Chapter 998 match -> maps cleanly to 2997 / 3000 with 0 extra candidate scans.
+    qsaSpy.mockClear();
+    act(() => replaceToggle.click());
+    await flushFrame();
+    expect(host.querySelector("output")?.textContent).toBe("2997 / 3000");
+    expect(countCandidateScans()).toBe(0);
+
+    qsaSpy.mockRestore();
+    cleanups.forEach((fn) => fn());
+    act(() => root.unmount());
+    host.remove();
+  });
 });

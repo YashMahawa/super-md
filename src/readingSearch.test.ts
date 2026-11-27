@@ -556,5 +556,99 @@ describe("DOM-order windowed search and hidden subtree pruning",()=>{
     compareSpy.mockRestore();
     cleanups.forEach(fn=>fn());
   });
+
+  it("shares a bounded source-range index across repeated source-to-reader mappings and invalidates on document and windowed mount changes",()=>{
+    const part0="## Chapter 0\n\nAlpha [doc](https://example.com/Alpha-0) and Alpha one.";
+    const part1="## Chapter 1\n\n> [!NOTE]- Folded\n> Alpha two.";
+    const part2="## Chapter 2\n\nAlpha three.";
+    const content=`${part0}\n\n${part1}\n\n${part2}`;
+    const s0=0,e0=part0.length;
+    const s1=e0+2,e1=s1+part1.length;
+    const s2=e1+2,e2=s2+part2.length;
+
+    const scroller=document.createElement("section");
+    scroller.className="android-reading";
+    const host=document.createElement("article");
+    host.className="markdown-body";
+    host.innerHTML=[
+      `<section class="live-block" data-windowed-block="" data-windowed-mounted="true" data-source-start="${s0}" data-source-end="${e0}">`,
+      `  <h2 data-source-start="${s0}" data-source-end="${s0+12}">Chapter 0</h2>`,
+      `  <p data-source-start="${s0+14}" data-source-end="${e0}">Alpha <a data-source-start="${s0+20}" data-source-end="${s0+60}" href="https://example.com/Alpha-0">doc</a> and Alpha one.</p>`,
+      `</section>`,
+      `<section class="live-block" data-windowed-block="" data-windowed-mounted="true" data-source-start="${s1}" data-source-end="${e1}">`,
+      `  <h2 data-source-start="${s1}" data-source-end="${s1+12}">Chapter 1</h2>`,
+      `  <details class="callout" data-source-start="${s1+14}" data-source-end="${e1}"><summary>Folded</summary><p data-source-start="${s1+32}" data-source-end="${e1}">Alpha two.</p></details>`,
+      `</section>`,
+      `<section class="live-block" data-windowed-block="" data-windowed-mounted="false" data-source-start="${s2}" data-source-end="${e2}"><span aria-hidden="true"></span></section>`,
+    ].join("");
+    scroller.append(host);
+    document.body.append(scroller);
+
+    const ranges=sourceMatches(content,"Alpha");
+    // Ranges: 0 -> visible Alpha in ch0, 1 -> hidden URL Alpha-0, 2 -> visible Alpha one, 3 -> Alpha two in details, 4 -> unmounted ch2 Alpha three.
+    expect(ranges).toHaveLength(5);
+
+    const candidateQueries=()=>vi.mocked(Element.prototype.querySelectorAll).mock.calls.filter(([sel])=>String(sel).includes("data-windowed-block")&&String(sel).includes("data-source-start")).length;
+    const qsaSpy=vi.spyOn(Element.prototype,"querySelectorAll");
+
+    // Initial lookup builds the index once; 40 repeated source-to-reader mappings reuse it without walking candidates again.
+    expect(resolveSourceBlock(scroller,ranges[0],content)?.tagName).toBe("P");
+    expect(candidateQueries()).toBe(1);
+    for(let i=0;i<20;i++){
+      expect(resolveSourceHighlightRange(scroller,content,ranges,0,"Alpha")?.toString()).toBe("Alpha");
+      expect(resolveSourceHighlightRange(scroller,content,ranges,1,"Alpha")).toBeNull();
+      expect(resolveSourceHighlightRange(scroller,content,ranges,2,"Alpha")?.toString()).toBe("Alpha");
+      expect(resolveSourceHighlightRange(scroller,content,ranges,3,"Alpha")?.toString()).toBe("Alpha");
+      expect(resolveSourceHighlightRange(scroller,content,ranges,4,"Alpha")).toBeNull();
+      expect(resolveSourceBlock(scroller,ranges[4],content)?.getAttribute("data-windowed-mounted")).toBe("false");
+    }
+    expect(candidateQueries()).toBe(1);
+
+    // Gap fallback (between Chapter 0 and Chapter 1) and cross-block overlapping range use the same index without rescanning.
+    expect(resolveSourceBlock(scroller,{from:e0+1,to:e0+1},content)?.tagName).toBe("A");
+    expect(resolveSourceBlock(scroller,{from:s0+16,to:s1+10},content)?.tagName).toBe("P");
+    expect(candidateQueries()).toBe(1);
+
+    // Non-source mutations (opening <details>, scroller style.height, hover class) do NOT invalidate the index.
+    scroller.querySelector("details")!.open=true;
+    scroller.style.height="2400px";
+    host.firstElementChild!.classList.add("is-hovered");
+    expect(resolveSourceHighlightRange(scroller,content,ranges,3,"Alpha")?.toString()).toBe("Alpha");
+    expect(candidateQueries()).toBe(1);
+
+    // Windowed mount change (mounting Chapter 2 + supermd-window-change) invalidates and resolves the newly mounted match.
+    const block2=scroller.querySelectorAll<HTMLElement>("[data-windowed-block]")[2];
+    block2.setAttribute("data-windowed-mounted","true");
+    block2.innerHTML=`<h2 data-source-start="${s2}" data-source-end="${s2+12}">Chapter 2</h2><p data-source-start="${s2+14}" data-source-end="${e2}">Alpha three.</p>`;
+    scroller.dispatchEvent(new Event("supermd-window-change"));
+    expect(resolveSourceBlock(scroller,ranges[4],content)?.tagName).toBe("P");
+    expect(resolveSourceHighlightRange(scroller,content,ranges,4,"Alpha")?.toString()).toBe("Alpha");
+    const afterMountQueries=candidateQueries();
+    expect(afterMountQueries).toBe(2);
+    // Subsequent lookups reuse the rebuilt post-mount index.
+    expect(resolveSourceHighlightRange(scroller,content,ranges,4,"Alpha")?.toString()).toBe("Alpha");
+    expect(candidateQueries()).toBe(afterMountQueries);
+
+    // Document content change invalidates cached source spans and rebuilds cleanly.
+    const editedContent=content.replace("Alpha three.","Alpha edited.");
+    const editedRanges=sourceMatches(editedContent,"Alpha");
+    expect(resolveSourceHighlightRange(scroller,editedContent,editedRanges,4,"Alpha")?.toString()).toBe("Alpha");
+    expect(candidateQueries()).toBe(afterMountQueries+1);
+
+    // Bounded host cache (>8 distinct hosts) evicts oldest hosts cleanly without breaking lookups when revisited.
+    const extraHosts:HTMLElement[]=[];
+    for(let h=0;h<10;h++){
+      const extra=document.createElement("div");
+      extra.innerHTML=`<p data-source-start="0" data-source-end="11">Alpha ${h}</p>`;
+      document.body.append(extra);
+      extraHosts.push(extra);
+      expect(resolveSourceBlock(extra,{from:0,to:5},`Alpha ${h}`)?.tagName).toBe("P");
+    }
+    expect(resolveSourceHighlightRange(scroller,editedContent,editedRanges,2,"Alpha")?.toString()).toBe("Alpha");
+
+    qsaSpy.mockRestore();
+    extraHosts.forEach(el=>el.remove());
+    scroller.remove();
+  });
 });
 

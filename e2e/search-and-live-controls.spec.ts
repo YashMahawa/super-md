@@ -119,11 +119,31 @@ test("Read mode hides Replace, Previous wraps 0/N to N/N in standard and large v
   expect(content).toContain("Hidden Needle inside callout.");
   expect(content).toContain("Final Needle at the bottom of the note.");
 
-  // Acceptance Criterion 2 (large virtualized >80KB note): Previous at 0 / N wraps directly to N / N and mounts offscreen block.
+  // Acceptance Criterion 2 (large virtualized >80KB note): Previous at 0 / N wraps directly to N / N, mounts offscreen block,
+  // places the active highlight visibly in the viewport clear of the search bar, and preserves offscreen visibility across Live Replace toggling.
+  const assertActiveHighlightInViewport = () =>
+    expect.poll(() =>
+      page.evaluate(() => {
+        const scroller = document.querySelector<HTMLElement>(".android-reading")!.getBoundingClientRect();
+        const searchBar = document.querySelector<HTMLElement>(".reading-search")!.getBoundingClientRect();
+        const current = (CSS as any).highlights?.get("smd-search-current");
+        const range: Range | undefined = current ? Array.from(current as Iterable<Range>)[0] : undefined;
+        if (!range) return false;
+        const rect = range.getBoundingClientRect();
+        const overlapsSearch =
+          rect.right > searchBar.left &&
+          rect.left < searchBar.right &&
+          rect.bottom > searchBar.top &&
+          rect.top < searchBar.bottom;
+        return rect.height > 0 && rect.top >= scroller.top && rect.bottom <= scroller.bottom && !overlapsSearch;
+      })
+    ).toBe(true);
+
   const hugeNote =
     Array.from(
       { length: 900 },
-      (_, idx) => `## Section ${idx}\n\n${idx % 300 === 0 ? "TargetToken " : ""}${"Virtualized paragraph text for windowed rendering. ".repeat(3)}`
+      (_, idx) =>
+        `## Section ${idx}\n\n${idx % 300 === 0 ? "TargetToken " : ""}${idx === 350 || idx === 750 ? "OffscreenReplaceTarget " : ""}[Ref](https://example.com/TargetToken-${idx}) ${"Virtualized paragraph text for windowed rendering. ".repeat(3)}`
     ).join("\n\n") + "\n\n## Tail\n\nTargetToken at very end.";
   await page.evaluate((text) => window.supermdLoad?.({ id: "huge-wrap", content: text, path: null, mode: "reader", dark: false, fullscreen: false, colors: {}, font: "Manrope", size: 18, zoom: 100 }), hugeNote);
   await expect(page.locator('[data-windowed-mounted="false"]')).not.toHaveCount(0);
@@ -131,7 +151,51 @@ test("Read mode hides Replace, Previous wraps 0/N to N/N in standard and large v
   await expect(page.locator(".reading-search output")).toHaveText("0 / 4");
   await page.getByRole("button", { name: "Previous match" }).click();
   await expect(page.locator(".reading-search output")).toHaveText("4 / 4");
-  await expect(page.locator(".markdown-body")).toContainText("TargetToken at very end.");
+  const tailBlock = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "TargetToken at very end." });
+  await expect(tailBlock).toBeVisible();
+  await expect(tailBlock).toBeInViewport();
+  await assertActiveHighlightInViewport();
+
+  // Switch to Live mode on the same >80KB note: step to offscreen Tail (4 / 4), verify Replace toggle ON <-> OFF maps 4 / 4 <-> 904 / 904 across 900 hidden link URLs,
+  // and verify offscreen Find & Replace navigation + single Replace keep active highlights visibly inside the viewport.
+  await page.evaluate((text) => window.supermdLoad?.({ id: "huge-wrap", content: text, path: null, mode: "live", dark: false, fullscreen: false, colors: {}, font: "Manrope", size: 18, zoom: 100 }), hugeNote);
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 4");
+  await page.getByRole("button", { name: "Previous match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("4 / 4");
+  await assertActiveHighlightInViewport();
+
+  await page.getByRole("button", { name: "Replace in source" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("904 / 904");
+  await assertActiveHighlightInViewport();
+  await page.getByRole("button", { name: "Replace in source" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("4 / 4");
+  await assertActiveHighlightInViewport();
+
+  await page.getByRole("button", { name: "Previous match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("3 / 4");
+  const section600Block = page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Section 600" });
+  await expect(section600Block).toBeVisible();
+  await expect(section600Block).toBeInViewport();
+  await assertActiveHighlightInViewport();
+
+  await page.getByRole("button", { name: "Replace in source" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("603 / 904");
+  await assertActiveHighlightInViewport();
+
+  // Direct offscreen Replace navigation & single Replace advancement across unmounted blocks (Section 350 -> Section 750).
+  await searchbox.fill("OffscreenReplaceTarget");
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+  await page.getByRole("button", { name: "Next match" }).click();
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 2");
+  await expect(page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Section 350" })).toBeInViewport();
+  await assertActiveHighlightInViewport();
+
+  await page.getByRole("textbox", { name: "Replacement text" }).fill("ReplacedInSection350");
+  await replaceSingle.click();
+  await expect(page.locator(".reading-search output")).toHaveText("1 / 1");
+  await expect(page.locator('[data-windowed-mounted="true"]').filter({ hasText: "Section 750" })).toBeInViewport();
+  await assertActiveHighlightInViewport();
 });
 
 test("Live mode Edit block works via mouse, keyboard, and touch on media, diagrams, charts, standalone links, and collapsed blocks while stays unscaled under zoom", async ({ browser }) => {

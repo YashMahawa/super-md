@@ -19,6 +19,43 @@ const INLINE_HTML_HIDDEN_TOKEN = /<!--[\s\S]*?-->|<\/?(?:br|mark|sub|sup|kbd|u)(
 const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
 const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|is-offstage)(?:\s|$)/;
 const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
+const MAX_SOURCE_INDEX_HOSTS = 8;
+const SOURCE_CANDIDATE_SELECTOR = ".live-block,[data-windowed-block],[data-source-start],.code-container";
+const SOURCE_INDEX_ATTR_FILTER = ["data-source-start", "data-source-end", "data-windowed-mounted", "data-windowed-block", "class"];
+
+interface SourceIndexEntry {
+  el: HTMLElement;
+  start: number;
+  end: number;
+  domOrder: number;
+  subtreeEndDomOrder: number;
+  isTopBlock: boolean;
+  isOwnerCandidate: boolean;
+  hasSourceStartAttr: boolean;
+  prefixMaxEnd: number;
+  maxAttrDomEl: HTMLElement | null;
+}
+
+interface CachedOwnerSpans {
+  visible: { start: number; end: number } | null;
+  hidden: SourceRange[] | null;
+}
+
+interface SourceRangeIndex {
+  host: Element;
+  entries: SourceIndexEntry[];
+  byElement: WeakMap<HTMLElement, SourceIndexEntry>;
+  ownerSpans: WeakMap<HTMLElement, CachedOwnerSpans>;
+  lastContent: string | undefined;
+  needsContentBounds: boolean;
+  dirty: boolean;
+  observer: MutationObserver;
+  windowTarget: Element;
+  onWindowChange: () => void;
+  dispose: () => void;
+}
+
+const sourceRangeIndexCache = new Map<Element, SourceRangeIndex>();
 
 let cachedFrontmatterContent: string | null = null;
 let cachedFrontmatterResult: ParsedFrontmatter | null = null;
@@ -69,7 +106,7 @@ export function nextSearchIndex(index: number, direction: number, count: number)
 function revealMountedBlock(element: Element): void {
   if (!(element instanceof HTMLElement)) return;
   if (element.closest('[data-windowed-mounted="false"]')) flushSync(() => revealWindowed(element));
-  else revealWindowed(element);
+  else if (!element.closest('[data-windowed-mounted="true"]')) revealWindowed(element);
 }
 
 function scrollTargetIntoView(target: Element | null, host?: Element | null): void {
@@ -239,8 +276,8 @@ function openDisclosuresFor(target: Element | null, scope?: Element | null, rang
   return opened;
 }
 
-function visibleSourceSpan(owner: HTMLElement, content: string): { start: number; end: number } | null {
-  const bounds = sourceBounds(owner, content);
+function visibleSourceSpan(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): { start: number; end: number } | null {
+  const bounds = sourceBoundsForElement(owner, content, sharedIndex);
   if (!bounds) return null;
   const { start, end } = bounds;
   const raw = content.slice(start, end);
@@ -274,31 +311,276 @@ function ownerDomScope(owner: HTMLElement): Element {
   return owner;
 }
 
-function findContainingBlock(host: Element, range: SourceRange, content?: string): HTMLElement | null {
-  const candidates = host.querySelectorAll<HTMLElement>(".live-block,[data-windowed-block],[data-source-start],.code-container");
-  let best: HTMLElement | null = null, bestLen = Infinity;
-  let overlapping: HTMLElement | null = null, overlappingLen = Infinity;
-  for (const el of candidates) {
-    const bounds = sourceBounds(el, content);
-    if (!bounds) continue;
-    const len = bounds.end - bounds.start;
-    const isTopBlock = el.classList.contains("live-block") || el.hasAttribute("data-windowed-block");
-    if (bounds.start <= range.from && range.to <= bounds.end) {
-      if (isTopBlock) {
-        if (!best || (!best.classList.contains("live-block") && !best.hasAttribute("data-windowed-block")) || len < bestLen) {
-          best = el; bestLen = len;
-        }
-      } else if (!best && len <= bestLen) {
-        best = el; bestLen = len;
-      }
-    } else if (bounds.start <= range.from && range.from < bounds.end && len <= overlappingLen) {
-      overlapping = el; overlappingLen = len;
-    }
+function lowerBoundSourceRange(ranges: SourceRange[], minFrom: number): number {
+  let lo = 0, hi = ranges.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (ranges[mid].from < minFrom) lo = mid + 1;
+    else hi = mid;
   }
-  return best ?? overlapping;
+  return lo;
 }
 
-function deepestSourceOwner(block: HTMLElement, range: SourceRange, content?: string): HTMLElement | null {
+function upperBoundSourceStart(entries: SourceIndexEntry[], maxStart: number): number {
+  let lo = 0, hi = entries.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (entries[mid].start <= maxStart) {
+      ans = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return ans;
+}
+
+function rebuildSourceRangeIndex(record: SourceRangeIndex, content?: string): void {
+  record.observer.takeRecords();
+  const candidates = record.host.querySelectorAll<HTMLElement>(SOURCE_CANDIDATE_SELECTOR);
+  const entries: SourceIndexEntry[] = [];
+  const byElement = new WeakMap<HTMLElement, SourceIndexEntry>();
+  const stack: SourceIndexEntry[] = [];
+  let needsContentBounds = false;
+  let monotonic = true;
+  let prevStart = -Infinity;
+
+  for (let k = 0; k < candidates.length; k++) {
+    const el = candidates[k];
+    const hasSourceStartAttr = el.hasAttribute("data-source-start");
+    const isCodeContainer = el.classList.contains("code-container");
+    if (isCodeContainer && (!hasSourceStartAttr || !el.hasAttribute("data-source-end"))) {
+      needsContentBounds = true;
+    }
+    const bounds = sourceBounds(el, content);
+    if (!bounds) continue;
+    const domOrder = entries.length;
+    while (stack.length > 0 && !stack[stack.length - 1].el.contains(el)) {
+      stack.pop()!.subtreeEndDomOrder = domOrder - 1;
+    }
+    if (bounds.start < prevStart) monotonic = false;
+    prevStart = bounds.start;
+    const entry: SourceIndexEntry = {
+      el,
+      start: bounds.start,
+      end: bounds.end,
+      domOrder,
+      subtreeEndDomOrder: domOrder,
+      isTopBlock: el.classList.contains("live-block") || el.hasAttribute("data-windowed-block"),
+      isOwnerCandidate: hasSourceStartAttr || isCodeContainer,
+      hasSourceStartAttr,
+      prefixMaxEnd: bounds.end,
+      maxAttrDomEl: null,
+    };
+    entries.push(entry);
+    byElement.set(el, entry);
+    stack.push(entry);
+  }
+  const lastDomOrder = entries.length - 1;
+  while (stack.length > 0) {
+    stack.pop()!.subtreeEndDomOrder = lastDomOrder;
+  }
+
+  if (!monotonic) {
+    entries.sort((a, b) => (a.start - b.start) || (a.domOrder - b.domOrder));
+  }
+
+  let maxEnd = -Infinity;
+  let maxAttrOrder = -1;
+  let maxAttrEl: HTMLElement | null = null;
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    if (e.end > maxEnd) maxEnd = e.end;
+    e.prefixMaxEnd = maxEnd;
+    if (e.hasSourceStartAttr && e.domOrder > maxAttrOrder) {
+      maxAttrOrder = e.domOrder;
+      maxAttrEl = e.el;
+    }
+    e.maxAttrDomEl = maxAttrEl;
+  }
+
+  record.entries = entries;
+  record.byElement = byElement;
+  record.ownerSpans = new WeakMap<HTMLElement, CachedOwnerSpans>();
+  record.lastContent = content;
+  record.needsContentBounds = needsContentBounds;
+  record.dirty = false;
+}
+
+function invalidateSourceRangeIndex(host?: Element | null): void {
+  if (host) {
+    const rec = sourceRangeIndexCache.get(host);
+    if (rec) rec.dirty = true;
+    return;
+  }
+  for (const rec of sourceRangeIndexCache.values()) rec.dirty = true;
+}
+
+function hasSourceRelevantMutation(records: MutationRecord[]): boolean {
+  for (let i = 0; i < records.length; i++) {
+    const m = records[i];
+    if (m.type === "childList") return true;
+    if (m.attributeName !== "class") return true;
+    const cur = m.target instanceof Element ? m.target.className : "";
+    const prev = m.oldValue ?? "";
+    if (
+      cur.includes("live-block") !== prev.includes("live-block") ||
+      cur.includes("code-container") !== prev.includes("code-container")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function getSourceRangeIndex(host: Element, content?: string): SourceRangeIndex {
+  let record = sourceRangeIndexCache.get(host);
+  if (record) {
+    sourceRangeIndexCache.delete(host);
+    sourceRangeIndexCache.set(host, record);
+    const nextWindowTarget = host.closest(".android-reading") ?? host;
+    if (record.windowTarget !== nextWindowTarget) {
+      record.windowTarget.removeEventListener("supermd-window-change", record.onWindowChange);
+      record.windowTarget = nextWindowTarget;
+      record.windowTarget.addEventListener("supermd-window-change", record.onWindowChange);
+      record.dirty = true;
+    }
+    const pending = record.observer.takeRecords();
+    if (pending.length > 0 && hasSourceRelevantMutation(pending)) record.dirty = true;
+    if (content !== undefined && record.lastContent !== undefined && record.lastContent !== content) {
+      record.dirty = true;
+    } else if (record.needsContentBounds && content !== record.lastContent) {
+      record.dirty = true;
+    }
+    if (record.dirty) {
+      rebuildSourceRangeIndex(record, content);
+    } else if (content !== undefined && record.lastContent === undefined) {
+      record.lastContent = content;
+    }
+    return record;
+  }
+
+  for (const [cachedHost, cachedRec] of sourceRangeIndexCache) {
+    if (!cachedHost.isConnected) {
+      cachedRec.dispose();
+      sourceRangeIndexCache.delete(cachedHost);
+    }
+  }
+  while (sourceRangeIndexCache.size >= MAX_SOURCE_INDEX_HOSTS) {
+    const oldestKey = sourceRangeIndexCache.keys().next().value as Element | undefined;
+    if (!oldestKey) break;
+    sourceRangeIndexCache.get(oldestKey)?.dispose();
+    sourceRangeIndexCache.delete(oldestKey);
+  }
+
+  const windowTarget = host.closest(".android-reading") ?? host;
+  const created: SourceRangeIndex = {
+    host,
+    entries: [],
+    byElement: new WeakMap(),
+    ownerSpans: new WeakMap(),
+    lastContent: content,
+    needsContentBounds: false,
+    dirty: true,
+    observer: null as unknown as MutationObserver,
+    windowTarget,
+    onWindowChange: () => { created.dirty = true; },
+    dispose: () => {
+      created.observer.disconnect();
+      created.windowTarget.removeEventListener("supermd-window-change", created.onWindowChange);
+    },
+  };
+  created.observer = new MutationObserver((records) => {
+    if (hasSourceRelevantMutation(records)) created.dirty = true;
+  });
+  created.observer.observe(host, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeOldValue: true,
+    attributeFilter: SOURCE_INDEX_ATTR_FILTER,
+  });
+  windowTarget.addEventListener("supermd-window-change", created.onWindowChange);
+  rebuildSourceRangeIndex(created, content);
+  sourceRangeIndexCache.set(host, created);
+  return created;
+}
+
+function sourceBoundsForElement(el: Element, content?: string, sharedIndex?: SourceRangeIndex): { start: number; end: number } | null {
+  if (el instanceof HTMLElement && sharedIndex) {
+    const entry = sharedIndex.byElement.get(el);
+    if (entry) return { start: entry.start, end: entry.end };
+  }
+  return sourceBounds(el, content);
+}
+
+function findContainingBlockInIndex(index: SourceRangeIndex, range: SourceRange): HTMLElement | null {
+  const { entries } = index;
+  const hi = upperBoundSourceStart(entries, range.from);
+  if (hi < 0) return null;
+  let bestTop: HTMLElement | null = null, bestTopLen = Infinity, bestTopOrder = Infinity;
+  let bestOther: HTMLElement | null = null, bestOtherOrder = Infinity;
+  let overlapping: HTMLElement | null = null, overlappingLen = Infinity, overlappingOrder = -1;
+  for (let i = hi; i >= 0; i--) {
+    const e = entries[i];
+    if (e.prefixMaxEnd < range.to && (bestTop !== null || bestOther !== null || e.prefixMaxEnd <= range.from)) {
+      break;
+    }
+    const len = e.end - e.start;
+    if (range.to <= e.end) {
+      if (e.isTopBlock) {
+        if (len < bestTopLen || (len === bestTopLen && e.domOrder < bestTopOrder)) {
+          bestTop = e.el;
+          bestTopLen = len;
+          bestTopOrder = e.domOrder;
+        }
+      } else if (e.domOrder < bestOtherOrder) {
+        bestOther = e.el;
+        bestOtherOrder = e.domOrder;
+      }
+    } else if (range.from < e.end) {
+      if (len < overlappingLen || (len === overlappingLen && e.domOrder > overlappingOrder)) {
+        overlapping = e.el;
+        overlappingLen = len;
+        overlappingOrder = e.domOrder;
+      }
+    }
+  }
+  return bestTop ?? bestOther ?? overlapping;
+}
+
+function findContainingBlock(host: Element, range: SourceRange, content?: string, sharedIndex?: SourceRangeIndex): HTMLElement | null {
+  const index = sharedIndex ?? getSourceRangeIndex(host, content);
+  return findContainingBlockInIndex(index, range);
+}
+
+function deepestSourceOwner(block: HTMLElement, range: SourceRange, content?: string, sharedIndex?: SourceRangeIndex): HTMLElement | null {
+  const blockEntry = sharedIndex?.byElement.get(block);
+  if (sharedIndex && blockEntry) {
+    let owner: HTMLElement | null = null, ownerLen = Infinity, ownerOrder = -1;
+    if (blockEntry.start <= range.from && range.from <= blockEntry.end) {
+      owner = block;
+      ownerLen = blockEntry.end - blockEntry.start;
+      ownerOrder = blockEntry.domOrder;
+    }
+    if (blockEntry.subtreeEndDomOrder === blockEntry.domOrder) return owner;
+    const { entries } = sharedIndex;
+    const hi = upperBoundSourceStart(entries, range.from);
+    for (let i = hi; i >= 0; i--) {
+      const e = entries[i];
+      if (e.prefixMaxEnd < range.to) break;
+      if (!e.isOwnerCandidate || e.domOrder <= blockEntry.domOrder || e.domOrder > blockEntry.subtreeEndDomOrder) continue;
+      if (range.to <= e.end) {
+        const len = e.end - e.start;
+        if (len < ownerLen || (len === ownerLen && e.domOrder > ownerOrder)) {
+          owner = e.el;
+          ownerLen = len;
+          ownerOrder = e.domOrder;
+        }
+      }
+    }
+    return owner;
+  }
   let owner: HTMLElement | null = null, ownerLen = Infinity;
   const blockBounds = sourceBounds(block, content);
   if (blockBounds && blockBounds.start <= range.from && range.from <= blockBounds.end) {
@@ -315,14 +597,30 @@ function deepestSourceOwner(block: HTMLElement, range: SourceRange, content?: st
   return owner;
 }
 
-function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange): boolean {
-  const visible = visibleSourceSpan(owner, content);
-  if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
-  if (deepestSourceOwner(owner, candidate, content) !== owner) return false;
-  if (!owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= 200_000) {
-    const hidden = hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start);
-    if (hidden.some(h => candidate.from >= h.from && candidate.to <= h.to)) return false;
+function getCachedOwnerSpans(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): CachedOwnerSpans {
+  if (sharedIndex && sharedIndex.lastContent === content) {
+    const hit = sharedIndex.ownerSpans.get(owner);
+    if (hit) return hit;
+    const visible = visibleSourceSpan(owner, content, sharedIndex);
+    const hidden = visible && !owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= 200_000
+      ? hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start)
+      : null;
+    const computed: CachedOwnerSpans = { visible, hidden };
+    sharedIndex.ownerSpans.set(owner, computed);
+    return computed;
   }
+  const visible = visibleSourceSpan(owner, content, sharedIndex);
+  const hidden = visible && !owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= 200_000
+    ? hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start)
+    : null;
+  return { visible, hidden };
+}
+
+function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, sharedIndex?: SourceRangeIndex): boolean {
+  const { visible, hidden } = getCachedOwnerSpans(owner, content, sharedIndex);
+  if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
+  if (deepestSourceOwner(owner, candidate, content, sharedIndex) !== owner) return false;
+  if (hidden && hidden.some(h => candidate.from >= h.from && candidate.to <= h.to)) return false;
   return true;
 }
 
@@ -336,19 +634,29 @@ function directOwnerDomRanges(owner: HTMLElement, query: string, options: Search
   });
 }
 
-function mapSourceRangeToDomRange(block: HTMLElement, content: string, ranges: SourceRange[], activeIndex: number, query: string, options: SearchMatchConfig = false): Range | null {
+function mapSourceRangeToDomRange(
+  block: HTMLElement,
+  content: string,
+  ranges: SourceRange[],
+  activeIndex: number,
+  query: string,
+  options: SearchMatchConfig = false,
+  sharedIndex?: SourceRangeIndex,
+): Range | null {
   const target = ranges[activeIndex];
   if (!target || block.closest('[data-windowed-mounted="false"]')) return null;
-  const owner = deepestSourceOwner(block, target, content);
-  if (!owner || !isDirectVisibleMatch(owner, content, target)) return null;
+  const owner = deepestSourceOwner(block, target, content, sharedIndex);
+  if (!owner || !isDirectVisibleMatch(owner, content, target, sharedIndex)) return null;
   const domRanges = directOwnerDomRanges(owner, query, options);
   if (!domRanges.length) return null;
-  const ownerBounds = sourceBounds(owner, content);
+  const ownerBounds = sourceBoundsForElement(owner, content, sharedIndex);
   let ordinal = 0;
-  for (let i = 0; i < activeIndex; i++) {
+  const startIdx = ownerBounds ? lowerBoundSourceRange(ranges, ownerBounds.start) : 0;
+  for (let i = startIdx; i < activeIndex; i++) {
     const candidate = ranges[i];
-    if (ownerBounds && (candidate.from < ownerBounds.start || candidate.to > ownerBounds.end)) continue;
-    if (deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate)) ordinal++;
+    if (ownerBounds && candidate.from > ownerBounds.end) break;
+    if (ownerBounds && candidate.to > ownerBounds.end) continue;
+    if (deepestSourceOwner(block, candidate, content, sharedIndex) === owner && isDirectVisibleMatch(owner, content, candidate, sharedIndex)) ordinal++;
   }
   return domRanges[ordinal] ?? null;
 }
@@ -375,9 +683,10 @@ function orderedFrontmatterSourceIndices(
   const indices: number[] = [];
   for (const span of spans) {
     if (span.field !== field || span.fieldOrdinal !== fieldOrdinal) continue;
-    for (let i = 0; i < ranges.length; i++) {
+    for (let i = lowerBoundSourceRange(ranges, span.start); i < ranges.length; i++) {
       const candidate = ranges[i];
-      if (candidate.from >= span.start && candidate.to <= span.end && !indices.includes(i)) {
+      if (candidate.from > span.end) break;
+      if (candidate.to <= span.end && !indices.includes(i)) {
         indices.push(i);
       }
     }
@@ -408,7 +717,31 @@ function mapFrontmatterSourceRangeToDomRange(
   return ordinal >= 0 ? (domRanges[ordinal] ?? null) : null;
 }
 
-function mapDomRangeToSourceIndex(host: Element, content: string, ranges: SourceRange[], domRange: Range, query: string, options: SearchMatchConfig = false): number {
+function resolveSourceHighlightRangeWithIndex(
+  host: Element,
+  content: string,
+  ranges: SourceRange[],
+  activeIndex: number,
+  query: string,
+  options: SearchMatchConfig,
+  index: SourceRangeIndex,
+): Range | null {
+  const target = ranges[activeIndex];
+  if (!target) return null;
+  const block = findContainingBlockInIndex(index, target);
+  if (block) return mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options, index);
+  return mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
+}
+
+function mapDomRangeToSourceIndex(
+  host: Element,
+  content: string,
+  ranges: SourceRange[],
+  domRange: Range,
+  query: string,
+  options: SearchMatchConfig = false,
+  sharedIndex?: SourceRangeIndex,
+): number {
   const common = domRange.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? domRange.commonAncestorContainer as Element : domRange.commonAncestorContainer.parentElement;
   const fmFieldEl = common?.closest<HTMLElement>("[data-frontmatter-field]");
   if (fmFieldEl && isAllowedFrontmatterField(fmFieldEl)) {
@@ -428,49 +761,67 @@ function mapDomRangeToSourceIndex(host: Element, content: string, ranges: Source
       }
     }
   }
+  const index = sharedIndex ?? getSourceRangeIndex(host, content);
   const owner = common?.closest<HTMLElement>("[data-source-start],.code-container");
   if (owner) {
     const domRanges = directOwnerDomRanges(owner, query, options);
     const ordinal = domRanges.findIndex(r => sameDomRange(r, domRange));
     if (ordinal >= 0) {
-      const ownerBounds = sourceBounds(owner, content);
+      const ownerBounds = sourceBoundsForElement(owner, content, index);
       let seen = 0;
-      for (let i = 0; i < ranges.length; i++) {
+      const startIdx = ownerBounds ? lowerBoundSourceRange(ranges, ownerBounds.start) : 0;
+      for (let i = startIdx; i < ranges.length; i++) {
         const candidate = ranges[i];
-        if (ownerBounds && (candidate.from < ownerBounds.start || candidate.to > ownerBounds.end)) continue;
-        const block = findContainingBlock(host, candidate, content);
-        if (block && deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate)) {
+        if (ownerBounds && candidate.from > ownerBounds.end) break;
+        if (ownerBounds && candidate.to > ownerBounds.end) continue;
+        const block = findContainingBlockInIndex(index, candidate);
+        if (block && deepestSourceOwner(block, candidate, content, index) === owner && isDirectVisibleMatch(owner, content, candidate, index)) {
           if (seen === ordinal) return i;
           seen++;
         }
       }
     }
   }
-  for (let i = 0; i < ranges.length; i++) {
-    const resolved = resolveSourceHighlightRange(host, content, ranges, i, query, options);
+  const ancBlock = common?.closest<HTMLElement>(SOURCE_CANDIDATE_SELECTOR);
+  const ancBounds = ancBlock ? sourceBoundsForElement(ancBlock, content, index) : null;
+  const fallbackStart = ancBounds ? lowerBoundSourceRange(ranges, ancBounds.start) : 0;
+  for (let i = fallbackStart; i < ranges.length; i++) {
+    if (ancBounds && ranges[i].from > ancBounds.end) break;
+    const resolved = resolveSourceHighlightRangeWithIndex(host, content, ranges, i, query, options, index);
     if (resolved && sameDomRange(resolved, domRange)) return i;
   }
   return -1;
 }
 
-export function resolveSourceBlock(host: Element, range: SourceRange, content?: string): HTMLElement | null {
-  const containing = findContainingBlock(host, range, content);
-  if (containing) return deepestSourceOwner(containing, range, content) ?? containing;
-  const elements = host.querySelectorAll<HTMLElement>("[data-source-start]");
-  let fallback: HTMLElement | null = null;
-  for (const el of elements) {
-    const bounds = sourceBounds(el, content);
-    if (bounds && bounds.start <= range.from) fallback = el;
+function areWindowedMatchesLive(items: WindowedMatch[], host: Element): boolean {
+  let checkedEl: HTMLElement | null = null;
+  let checkedParent: Element | null = null;
+  for (let i = 0; i < items.length; i++) {
+    const el = items[i].element;
+    if (el === checkedEl) continue;
+    checkedEl = el;
+    if (!el.isConnected) return false;
+    const parent = el.parentElement;
+    if (parent && parent === checkedParent) continue;
+    if (!host.contains(el)) return false;
+    checkedParent = parent;
   }
-  return fallback;
+  return true;
+}
+
+export function resolveSourceBlock(host: Element, range: SourceRange, content?: string): HTMLElement | null {
+  const index = getSourceRangeIndex(host, content);
+  const containing = findContainingBlockInIndex(index, range);
+  if (containing) return deepestSourceOwner(containing, range, content, index) ?? containing;
+  const hi = upperBoundSourceStart(index.entries, range.from);
+  return hi >= 0 ? index.entries[hi].maxAttrDomEl : null;
 }
 
 export function resolveSourceHighlightRange(host: Element, content: string, ranges: SourceRange[], activeIndex: number, query: string, options: SearchMatchConfig = false): Range | null {
   const target = ranges[activeIndex];
   if (!target) return null;
-  const block = findContainingBlock(host, target, content);
-  if (block) return mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options);
-  return mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
+  const index = getSourceRangeIndex(host, content);
+  return resolveSourceHighlightRangeWithIndex(host, content, ranges, activeIndex, query, options, index);
 }
 
 function collectSearchText(
@@ -772,20 +1123,27 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const sr = activeSourceRanges[sourceIdx];
     const host = findReadingHost();
     if (!sr || !host) return -1;
-    const block = findContainingBlock(host, sr, content);
+    const index = getSourceRangeIndex(host, content);
+    const block = findContainingBlockInIndex(index, sr);
     const liveWindowed = knownWindowed !== undefined
       ? knownWindowed
-      : windowed && windowed.every(w => w.element.isConnected && host.contains(w.element))
+      : windowed && areWindowedMatchesLive(windowed, host)
         ? windowed
         : windowedMatches(host, query, filterOptions);
     if (!block) {
       const fmResolved = mapFrontmatterSourceRangeToDomRange(host, content, activeSourceRanges, sourceIdx, query, filterOptions);
       if (!fmResolved) return -1;
       if (liveWindowed) {
+        let cachedEl: HTMLElement | null = null;
+        let cachedRanges: Range[] = [];
         for (let i = 0; i < liveWindowed.length; i++) {
           const w = liveWindowed[i];
           if (w.element.contains(fmResolved.startContainer)) {
-            const wRange = readingMatches(w.element, query, filterOptions)[w.ordinal];
+            if (w.element !== cachedEl) {
+              cachedEl = w.element;
+              cachedRanges = readingMatches(w.element, query, filterOptions);
+            }
+            const wRange = cachedRanges[w.ordinal];
             if (wRange && sameDomRange(wRange, fmResolved)) return i;
           }
         }
@@ -801,25 +1159,45 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (liveWindowed) {
       if (!liveWindowed.length) return -1;
       if (!block.closest('[data-windowed-mounted="false"]')) {
-        const resolved = mapSourceRangeToDomRange(block, content, activeSourceRanges, sourceIdx, query, filterOptions);
+        const resolved = mapSourceRangeToDomRange(block, content, activeSourceRanges, sourceIdx, query, filterOptions, index);
         if (!resolved) return -1;
+        const targetWindowEl = block.closest<HTMLElement>("[data-windowed-block]");
+        let cachedEl: HTMLElement | null = null;
+        let cachedRanges: Range[] = [];
+        let checkedOverlapEl: HTMLElement | null = null;
+        let checkedOverlaps = false;
         for (let i = 0; i < liveWindowed.length; i++) {
           const w = liveWindowed[i];
-          if (w.element === block || w.element.contains(block) || block.contains(w.element)) {
-            const wRange = readingMatches(w.element, query, filterOptions)[w.ordinal];
+          let overlaps: boolean;
+          if (targetWindowEl) {
+            overlaps = w.element === targetWindowEl;
+          } else if (w.element === checkedOverlapEl) {
+            overlaps = checkedOverlaps;
+          } else {
+            checkedOverlapEl = w.element;
+            checkedOverlaps = w.element === block || w.element.contains(block) || block.contains(w.element);
+            overlaps = checkedOverlaps;
+          }
+          if (overlaps) {
+            if (w.element !== cachedEl) {
+              cachedEl = w.element;
+              cachedRanges = readingMatches(w.element, query, filterOptions);
+            }
+            const wRange = cachedRanges[w.ordinal];
             if (wRange && sameDomRange(wRange, resolved)) return i;
           }
         }
       }
-      const owner = deepestSourceOwner(block, sr, content);
-      if (owner && !isDirectVisibleMatch(owner, content, sr)) return -1;
+      const owner = deepestSourceOwner(block, sr, content, index);
+      if (owner && !isDirectVisibleMatch(owner, content, sr, index)) return -1;
       const wBlock = block.closest<HTMLElement>("[data-windowed-block]") ?? block;
-      const wBounds = sourceBounds(wBlock, content);
+      const wBounds = sourceBoundsForElement(wBlock, content, index);
       let targetOrdinal = 0;
       if (wBounds) {
-        for (let i = 0; i < sourceIdx; i++) {
+        for (let i = lowerBoundSourceRange(activeSourceRanges, wBounds.start); i < sourceIdx; i++) {
           const prev = activeSourceRanges[i];
-          if (prev.from >= wBounds.start && prev.to <= wBounds.end && isDirectVisibleMatch(wBlock, content, prev)) {
+          if (prev.from > wBounds.end) break;
+          if (prev.to <= wBounds.end && isDirectVisibleMatch(wBlock, content, prev, index)) {
             targetOrdinal++;
           }
         }
@@ -827,7 +1205,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const exactIdx = liveWindowed.findIndex(w => w.element === wBlock && w.ordinal === targetOrdinal);
       if (exactIdx >= 0) return exactIdx;
       return liveWindowed.findIndex(w => {
-        const b = sourceBounds(w.element, content);
+        const b = sourceBoundsForElement(w.element, content, index);
         return b !== null && sr.from >= b.start && sr.to <= b.end;
       });
     }
@@ -837,7 +1215,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         ? matches
         : readingMatches(host, query, filterOptions);
     if (!liveMatches.length) return -1;
-    const resolved = mapSourceRangeToDomRange(block, content, activeSourceRanges, sourceIdx, query, filterOptions);
+    const resolved = mapSourceRangeToDomRange(block, content, activeSourceRanges, sourceIdx, query, filterOptions, index);
     return resolved ? liveMatches.findIndex(m => sameDomRange(m, resolved)) : -1;
   };
 
@@ -869,7 +1247,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
     const host = findReadingHost();
     if (!host) return;
-    const initialBlock = findContainingBlock(host, range, sourceText);
+    let sourceIndex = getSourceRangeIndex(host, sourceText);
+    const initialBlock = findContainingBlockInIndex(sourceIndex, range);
     if (!initialBlock) {
       const fmDomRange = mapFrontmatterSourceRangeToDomRange(host, sourceText, ranges, targetIndex, query, filterOptions);
       if (registry && HighlightClass) {
@@ -888,10 +1267,11 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     }
     const wasUnmounted = !!initialBlock.closest('[data-windowed-mounted="false"]');
     if (scroll) revealMountedBlock(initialBlock);
-    const block = findContainingBlock(host, range, sourceText) ?? initialBlock;
-    const owner = deepestSourceOwner(block, range, sourceText) ?? block;
+    sourceIndex = getSourceRangeIndex(host, sourceText);
+    const block = findContainingBlockInIndex(sourceIndex, range) ?? initialBlock;
+    const owner = deepestSourceOwner(block, range, sourceText, sourceIndex) ?? block;
     if (scroll) openDisclosuresFor(owner, block, null, range);
-    const domRange = mapSourceRangeToDomRange(block, sourceText, ranges, targetIndex, query, filterOptions);
+    const domRange = mapSourceRangeToDomRange(block, sourceText, ranges, targetIndex, query, filterOptions, sourceIndex);
     if (scroll) {
       openDisclosuresFor(owner, block, domRange, range);
       const scrollEl = domRange ? (domRange.startContainer.nodeType === Node.ELEMENT_NODE ? domRange.startContainer as Element : domRange.startContainer.parentElement) : owner;
@@ -907,13 +1287,15 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         if (!sourceSearchRef.current || indexRef.current !== targetIndex) return false;
         const liveHost = findReadingHost();
         if (!liveHost) return false;
-        const currentBlock = findContainingBlock(liveHost, range, sourceText);
+        let settleIndex = getSourceRangeIndex(liveHost, sourceText);
+        const currentBlock = findContainingBlockInIndex(settleIndex, range);
         if (!currentBlock) return false;
         revealMountedBlock(currentBlock);
-        const settledBlock = findContainingBlock(liveHost, range, sourceText) ?? currentBlock;
-        const settledOwner = deepestSourceOwner(settledBlock, range, sourceText) ?? settledBlock;
+        settleIndex = getSourceRangeIndex(liveHost, sourceText);
+        const settledBlock = findContainingBlockInIndex(settleIndex, range) ?? currentBlock;
+        const settledOwner = deepestSourceOwner(settledBlock, range, sourceText, settleIndex) ?? settledBlock;
         openDisclosuresFor(settledOwner, settledBlock, null, range);
-        const settledDomRange = mapSourceRangeToDomRange(settledBlock, sourceText, ranges, targetIndex, query, filterOptions);
+        const settledDomRange = mapSourceRangeToDomRange(settledBlock, sourceText, ranges, targetIndex, query, filterOptions, settleIndex);
         openDisclosuresFor(settledOwner, settledBlock, settledDomRange, range);
         const settledScrollEl = settledDomRange
           ? (settledDomRange.startContainer.nodeType === Node.ELEMENT_NODE ? settledDomRange.startContainer as Element : settledDomRange.startContainer.parentElement)
@@ -985,7 +1367,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       setSourceRanges(activeSourceRanges);
       if (!sourceSession && nextIndex >= 0) {
         const host = findReadingHost();
-        const liveWindowed = windowed && windowed.every(w => w.element.isConnected && Boolean(host?.contains(w.element)))
+        const liveWindowed = host && windowed && areWindowedMatchesLive(windowed, host)
           ? windowed
           : (host && !regexError ? windowedMatches(host, query, filterOptions) : null);
         if (!activeSourceRanges.length || !host || regexError) nextIndex = -1;
@@ -993,16 +1375,19 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
           const active = liveWindowed[nextIndex];
           if (!active) nextIndex = -1;
           else if (!active.element.closest('[data-windowed-mounted="false"]')) {
+            const index = getSourceRangeIndex(host, content);
             const domRange = readingMatches(active.element, query, filterOptions)[active.ordinal];
-            const mapped = domRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, domRange, query, filterOptions) : -1;
+            const mapped = domRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, domRange, query, filterOptions, index) : -1;
             nextIndex = mapped >= 0 ? mapped : -1;
           } else {
-            const bounds = sourceBounds(active.element, content);
+            const index = getSourceRangeIndex(host, content);
+            const bounds = sourceBoundsForElement(active.element, content, index);
             let seen = 0, mapped = -1;
             if (bounds) {
-              for (let i = 0; i < activeSourceRanges.length; i++) {
+              for (let i = lowerBoundSourceRange(activeSourceRanges, bounds.start); i < activeSourceRanges.length; i++) {
                 const sr = activeSourceRanges[i];
-                if (sr.from >= bounds.start && sr.to <= bounds.end && isDirectVisibleMatch(active.element, content, sr)) {
+                if (sr.from > bounds.end) break;
+                if (sr.to <= bounds.end && isDirectVisibleMatch(active.element, content, sr, index)) {
                   if (seen === active.ordinal) { mapped = i; break; }
                   seen++;
                 }
@@ -1011,20 +1396,21 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             nextIndex = mapped >= 0 ? mapped : -1;
           }
         } else {
+          const index = getSourceRangeIndex(host, content);
           const m = matches[nextIndex];
           const liveDomRange = m && m.startContainer.nodeType === Node.TEXT_NODE && host.contains(m.startContainer)
             ? m
             : readingMatches(host, query, filterOptions)[nextIndex];
-          const mapped = liveDomRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, liveDomRange, query, filterOptions) : -1;
+          const mapped = liveDomRange ? mapDomRangeToSourceIndex(host, content, activeSourceRanges, liveDomRange, query, filterOptions, index) : -1;
           nextIndex = mapped >= 0 ? mapped : -1;
         }
       }
     } else if (!sourceSession) {
       const activeSourceRanges = regexError ? [] : (sourceRanges.length || !query ? sourceRanges : getSourceRanges());
       const host = findReadingHost();
-      if (nextIndex >= 0 && !regexError) {
+      if (nextIndex >= 0 && !regexError && host) {
         const sr = activeSourceRanges[nextIndex];
-        const block = sr && host ? findContainingBlock(host, sr, content) : null;
+        const block = sr ? findContainingBlock(host, sr, content) : null;
         if (block) revealMountedBlock(block);
       }
       const liveWindowed = host && !regexError ? windowedMatches(host, query, filterOptions) : null;
@@ -1142,6 +1528,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const prev = prevState.current;
     const criteriaChanged = prev.query !== query || prev.caseSensitive !== caseSensitive || prev.wholeWord !== wholeWord || prev.regexp !== regexp;
     const contentChanged = prev.content !== content;
+    if (contentChanged) invalidateSourceRangeIndex();
     prevState.current = { query, content, caseSensitive, wholeWord, regexp };
     // Only evaluate the source-search pipeline when Source/Split editor search or
     // Replace-in-source is active; rendered Read/Live Find skips scanning raw source.
