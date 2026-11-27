@@ -229,6 +229,29 @@ class StudioWatchersUnitTests(unittest.TestCase):
         self.assertEqual((len(open_calls), len(preserve_calls), tab["content"]), (1, 1, "# V2\n"))
         self.assertGreaterEqual(len(lp_calls), 2)
 
+    def test_palette_signal_decoupling_and_recovery_write_deduplication(self):
+        win = Studio(isolated=True)
+        try:
+            changed_events, palette_events = [], []
+            win.changed.connect(lambda: changed_events.append(True))
+            win.paletteChanged.connect(lambda: palette_events.append(True))
+            win.setZoom(125)
+            self.assertEqual((len(changed_events), len(palette_events)), (1, 0))
+            win.setting("theme", '"black"' if win.settings["theme"] != "black" else '"light"')
+            self.assertEqual(len(palette_events), 1)
+            target = self.temp_dir / "startup.json"
+            with patch.object(studio, "atomic_json", wraps=studio.atomic_json) as spy_json:
+                win.session._write_recovery_json("s", target, {"a": 1}, check_equal=True)
+                win.session._write_recovery_json("s", target, {"a": 1}, check_equal=True)
+                self.assertEqual(spy_json.call_count, 1)
+                target.unlink()
+                win.session._write_recovery_json("s", target, {"a": 1}, check_equal=True)
+                self.assertEqual(spy_json.call_count, 2)
+        finally:
+            win.stop()
+            win.session.writes.shutdown(wait=True)
+            shutil.rmtree(win.data, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
