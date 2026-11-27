@@ -127,6 +127,7 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
     studio_obj._files: list[dict] = []
     studio_obj._files_revision, studio_obj._outline_revision = 0, 0
     studio_obj.expanded: set[str] = set()
+    studio_obj._pinned_visible_dirs: set[str] = set()
     studio_obj.folder_filter, studio_obj._folder_searching = "", False
     studio_obj._search_generation, studio_obj._search_cancel = 0, None
     studio_obj.filter_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._start_subfolder_search)
