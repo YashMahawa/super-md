@@ -19,4 +19,35 @@ class PortableDetectionTest {
         assertThrows(java.io.IOException::class.java) { StrictGzipInputStream((gzip + gzip).inputStream()).readBytes() }
         assertThrows(java.io.IOException::class.java) { StrictGzipInputStream(gzip.inputStream(), 4).readBytes() }
     }
+    @Test fun enforces150CapForNewAssetNamesAnd159CompatRangeForExistingKeys() {
+        val maxNew = "${"a".repeat(146)}.svg"
+        val compatMin = "${"a".repeat(147)}.svg"
+        val compatMax = "${"a".repeat(155)}.svg"
+        val overCap = "${"a".repeat(156)}.svg"
+
+        assertTrue(isValidPortableAssetFilename(maxNew))
+        assertTrue(isValidPortableAssetKey("assets/$maxNew"))
+        assertTrue(isValidPortableAssetNameOrKey(maxNew))
+        assertTrue(isValidPortableAssetNameOrKey("assets/$maxNew"))
+
+        for (compat in listOf(compatMin, compatMax)) {
+            assertFalse(isValidPortableAssetFilename(compat))
+            assertFalse(isValidPortableAssetKey("assets/$compat"))
+            assertFalse(isValidPortableAssetNameOrKey(compat))
+            assertFalse(isValidPortableAssetNameOrKey("assets/$compat"))
+            assertTrue(isValidCompatPortableAssetFilename(compat))
+            assertTrue(isValidCompatPortableAssetKey("assets/$compat"))
+            assertTrue(isValidCompatPortableAssetNameOrKey(compat))
+            assertTrue(isValidCompatPortableAssetNameOrKey("assets/$compat"))
+        }
+
+        for (invalid in listOf("", ".", "..", "../evil.svg", "sub/evil.svg", overCap)) {
+            assertFalse(isValidPortableAssetFilename(invalid))
+            assertFalse(isValidCompatPortableAssetFilename(invalid))
+            assertFalse(isValidPortableAssetKey("assets/$invalid"))
+            assertFalse(isValidCompatPortableAssetKey("assets/$invalid"))
+            assertFalse(isValidPortableAssetNameOrKey(invalid))
+            assertFalse(isValidCompatPortableAssetNameOrKey(invalid))
+        }
+    }
 }
