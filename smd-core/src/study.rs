@@ -1,11 +1,74 @@
-mod inline_html;
-mod percent_comments;
-
-pub use percent_comments::strip_percent_comments;
-
-use crate::html_scan::{is_page_break_div, parse_html_images, strip_html_comments};
-use inline_html::{fold_html_tags, tokenize_raw_html};
 use pulldown_cmark::{CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
+use std::borrow::Cow;
+
+fn is_unescaped_percent_pair(bytes: &[u8], mask: &[bool], at: usize, floor: usize) -> bool {
+    if at + 1 >= bytes.len() || bytes[at] != b'%' || bytes[at + 1] != b'%' || mask[at] || mask[at + 1] {
+        return false;
+    }
+    let mut slashes = 0usize;
+    let mut k = at;
+    while k > floor && bytes[k - 1] == b'\\' && !mask[k - 1] {
+        slashes += 1;
+        k -= 1;
+    }
+    slashes % 2 == 0
+}
+
+/// Strip paired `%%...%%` Obsidian comments outside code spans/blocks and math.
+pub fn strip_percent_comments(input: &str) -> Cow<'_, str> {
+    let Some(first_percent) = input.find("%%") else {
+        return Cow::Borrowed(input);
+    };
+    let mut mask = vec![false; input.len()];
+    let mut in_code_block = false;
+    for (event, range) in Parser::new_ext(input, Options::ENABLE_MATH).into_offset_iter() {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => {
+                in_code_block = true;
+                mask[range].fill(true);
+            }
+            Event::End(TagEnd::CodeBlock) => in_code_block = false,
+            Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) => mask[range].fill(true),
+            _ if in_code_block => mask[range].fill(true),
+            _ => {}
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    let mut i = first_percent;
+    while let Some(rel) = input[i..].find("%%") {
+        let open = i + rel;
+        if !is_unescaped_percent_pair(bytes, &mask, open, cursor) {
+            i = open + 1;
+            continue;
+        }
+        let mut search = open + 2;
+        let mut close = None;
+        while let Some(end_rel) = input[search..].find("%%") {
+            let cand = search + end_rel;
+            if is_unescaped_percent_pair(bytes, &mask, cand, open + 2) {
+                close = Some(cand);
+                break;
+            }
+            search = cand + 1;
+        }
+        let Some(end) = close else {
+            break;
+        };
+        if cursor == 0 {
+            out.reserve(input.len());
+        }
+        out.push_str(&input[cursor..open]);
+        cursor = end + 2;
+        i = cursor;
+    }
+    if cursor == 0 {
+        return Cow::Borrowed(input);
+    }
+    out.push_str(&input[cursor..]);
+    Cow::Owned(out)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DelimKind {
@@ -14,11 +77,27 @@ enum DelimKind {
     Sup,
 }
 
+enum HtmlTok {
+    Br,
+    Tag { open: bool, name: &'static str },
+}
+
 enum Node<'a> {
     Text(CowStr<'a>, bool),
     Leaf(Event<'a>),
     HtmlTag { open: bool, name: &'static str, raw: String },
     Group { start: Event<'a>, end: Event<'a>, children: Vec<Node<'a>>, phrasing: bool },
+}
+
+fn allowed_tag(name: &str) -> Option<&'static str> {
+    match name {
+        "mark" => Some("mark"),
+        "sub" => Some("sub"),
+        "sup" => Some("sup"),
+        "kbd" => Some("kbd"),
+        "u" => Some("u"),
+        _ => None,
+    }
 }
 
 fn span_group<'a>(name: &'static str, children: Vec<Node<'a>>) -> Node<'a> {
@@ -31,6 +110,104 @@ fn span_group<'a>(name: &'static str, children: Vec<Node<'a>>) -> Node<'a> {
         _ => unreachable!(),
     };
     Node::Group { start, end, children, phrasing: true }
+}
+
+fn parse_html_tag(s: &str) -> Option<(HtmlTok, usize)> {
+    let b = s.as_bytes();
+    if b.len() < 3 || b[0] != b'<' {
+        return None;
+    }
+    let (closing, name_start) = if b[1] == b'/' { (true, 2) } else { (false, 1) };
+    let name_end = name_start + b[name_start..].iter().take_while(|c| c.is_ascii_alphabetic()).count();
+    if name_end == name_start {
+        return None;
+    }
+    let lower = s[name_start..name_end].to_ascii_lowercase();
+    if closing {
+        let name = allowed_tag(&lower)?;
+        let p = name_end + b[name_end..].iter().take_while(|c| c.is_ascii_whitespace()).count();
+        return (b.get(p) == Some(&b'>')).then_some((HtmlTok::Tag { open: false, name }, p + 1));
+    }
+    if lower != "br" && allowed_tag(&lower).is_none() {
+        return None;
+    }
+    if !b.get(name_end).is_some_and(|c| matches!(c, b'>' | b'/') || c.is_ascii_whitespace()) {
+        return None;
+    }
+    let mut p = name_end;
+    while p < b.len() && b[p] != b'>' {
+        if b[p] == b'"' || b[p] == b'\'' {
+            let quote = b[p];
+            p += 1 + b[p + 1..].iter().position(|&c| c == quote)?;
+        }
+        p += 1;
+    }
+    if p >= b.len() {
+        return None;
+    }
+    let self_closing = s[name_end..p].trim_end_matches(|c: char| c.is_ascii_whitespace()).ends_with('/');
+    if lower == "br" {
+        return Some((HtmlTok::Br, p + 1));
+    }
+    (!self_closing).then(|| (HtmlTok::Tag { open: true, name: allowed_tag(&lower).unwrap() }, p + 1))
+}
+
+fn tokenize_raw_html<'a>(raw: &str, out: &mut Vec<Node<'a>>) {
+    let mut literal = String::new();
+    let flush = |lit: &mut String, out: &mut Vec<Node<'a>>| {
+        if !lit.is_empty() {
+            out.push(Node::Text(CowStr::from(std::mem::take(lit)), false));
+        }
+    };
+    let mut i = 0usize;
+    while i < raw.len() {
+        let Some(rel) = raw[i..].find('<') else {
+            literal.push_str(&raw[i..]);
+            break;
+        };
+        let lt = i + rel;
+        literal.push_str(&raw[i..lt]);
+        if let Some(after_open) = raw[lt..].strip_prefix("<!--") {
+            if let Some(end_rel) = after_open.find("-->") {
+                flush(&mut literal, out);
+                i = lt + 4 + end_rel + 3;
+                continue;
+            }
+        } else if let Some((tok, len)) = parse_html_tag(&raw[lt..]) {
+            flush(&mut literal, out);
+            match tok {
+                HtmlTok::Br => out.push(Node::Leaf(Event::HardBreak)),
+                HtmlTok::Tag { open, name } => out.push(Node::HtmlTag { open, name, raw: raw[lt..lt + len].to_string() }),
+            }
+            i = lt + len;
+            continue;
+        } else if let Some(scanned) = crate::scan_html_tag(&raw[lt..], 0) {
+            let tag_slice = &raw[lt..lt + scanned.end];
+            if !scanned.closing && scanned.name.eq_ignore_ascii_case("img") && scanned.attr("src").is_some_and(|s| !s.trim().is_empty()) {
+                flush(&mut literal, out);
+                out.push(Node::Leaf(Event::InlineHtml(CowStr::from(tag_slice.to_string()))));
+                i = lt + scanned.end;
+                continue;
+            }
+            if !scanned.closing && crate::is_page_break_div(tag_slice) {
+                flush(&mut literal, out);
+                out.push(Node::Leaf(Event::InlineHtml(CowStr::from(tag_slice.to_string()))));
+                let mut next = lt + scanned.end;
+                let trimmed_after = raw[next..].trim_start_matches(char::is_whitespace);
+                let ws_len = raw[next..].len() - trimmed_after.len();
+                if let Some(close_tag) = crate::scan_html_tag(trimmed_after, 0) {
+                    if close_tag.closing && close_tag.name.eq_ignore_ascii_case("div") {
+                        next += ws_len + close_tag.end;
+                    }
+                }
+                i = next;
+                continue;
+            }
+        }
+        literal.push('<');
+        i = lt + 1;
+    }
+    flush(&mut literal, out);
 }
 
 fn slice_cow<'a>(cow: &CowStr<'a>, range: std::ops::Range<usize>) -> CowStr<'a> {
@@ -96,6 +273,41 @@ fn has_break(node: &Node<'_>, reject_spaces: bool) -> bool {
         Node::Group { children, .. } => children.iter().any(|c| has_break(c, reject_spaces)),
         _ => false,
     }
+}
+
+fn fold_html_tags<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
+    if !nodes.iter().any(|n| matches!(n, Node::HtmlTag { .. })) {
+        return nodes;
+    }
+    let mut out: Vec<Node<'a>> = Vec::with_capacity(nodes.len());
+    let mut stack: Vec<(&'static str, String, Vec<Node<'a>>)> = Vec::new();
+    let emit = |item: Node<'a>, stack: &mut Vec<(&'static str, String, Vec<Node<'a>>)>, out: &mut Vec<Node<'a>>| {
+        if let Some((_, _, top)) = stack.last_mut() { top.push(item); } else { out.push(item); }
+    };
+    for node in nodes {
+        match node {
+            Node::HtmlTag { open: true, name, raw } => stack.push((name, raw, Vec::new())),
+            Node::HtmlTag { open: false, name, raw } => {
+                if let Some(pos) = stack.iter().rposition(|(s, _, _)| *s == name) {
+                    while stack.len() - 1 > pos {
+                        let (_, unclosed_raw, unclosed_children) = stack.pop().unwrap();
+                        emit(Node::Text(CowStr::from(unclosed_raw), false), &mut stack, &mut out);
+                        for child in unclosed_children { emit(child, &mut stack, &mut out); }
+                    }
+                    let (matched, _, children) = stack.pop().unwrap();
+                    emit(span_group(matched, children), &mut stack, &mut out);
+                } else {
+                    emit(Node::Text(CowStr::from(raw), false), &mut stack, &mut out);
+                }
+            }
+            other => emit(other, &mut stack, &mut out),
+        }
+    }
+    while let Some((_, unclosed_raw, unclosed_children)) = stack.pop() {
+        emit(Node::Text(CowStr::from(unclosed_raw), false), &mut stack, &mut out);
+        for child in unclosed_children { emit(child, &mut stack, &mut out); }
+    }
+    out
 }
 
 fn merge_unescaped_text<'a>(nodes: Vec<Node<'a>>) -> Vec<Node<'a>> {
@@ -356,11 +568,11 @@ where
                     if inner == Event::End(TagEnd::HtmlBlock) { break; }
                     if let Event::Html(h) | Event::Text(h) = inner { raw.push_str(&h); }
                 }
-                let clean = strip_html_comments(&raw);
+                let clean = crate::strip_html_comments(&raw);
                 let trimmed = clean.trim();
                 if crate::diagram::looks_like_svg(trimmed)
-                    || is_page_break_div(&raw)
-                    || !parse_html_images(&raw).is_empty()
+                    || crate::is_page_break_div(&raw)
+                    || !crate::parse_html_images(&raw).is_empty()
                 {
                     out.push(Node::Leaf(Event::Html(CowStr::from(raw))));
                 } else {
@@ -412,7 +624,7 @@ where
             }
             Event::InlineHtml(html) | Event::Html(html) => {
                 if html.trim().eq_ignore_ascii_case("</div>")
-                    && matches!(out.last(), Some(Node::Leaf(Event::InlineHtml(prev))) if is_page_break_div(prev))
+                    && matches!(out.last(), Some(Node::Leaf(Event::InlineHtml(prev))) if crate::is_page_break_div(prev))
                 {
                     continue;
                 }
@@ -476,10 +688,34 @@ pub(crate) fn enrich_events<'a>(normalized: &'a str, options: Options) -> Vec<Ev
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{source, PdfOptions};
+    use std::collections::HashMap;
     use std::time::Instant;
 
     #[test]
-    fn enrich_trigger_fast_path_skips_plain_equations() {
+    fn study_delimiter_parity_covers_nested_unicode_overlapping_and_single_equals() {
+        let md = concat!(
+            "Nested ==**bold** and *italic* with H~2~O and 10^-3^== plus x~*i*~ and y^**2**^.\n\n",
+            "Unicode 🧪==emoji highlight==, ==trailing🧪==, 🧪~2~, x^🧪^, “==smart quotes==”, «==guillemets==», and \u{00a0}==nbsp open==.\n\n",
+            "Overlapping ~a==b~c==, ==outer ==inner==, ==outer ==~inner==, and intraword a~b c~d~e.\n\n",
+            "Equations A = L * U, x = 1, a == b, a === b, ~~struck~~, \\==escaped==, &#61;=entity==, \\\\==after slash==, and =<!-- c -->=joined==.\n",
+        );
+        let typst = source(md, &PdfOptions::default(), &HashMap::new()).unwrap();
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#strong[#text(\"bold\")]#text(\" and \")#emph[#text(\"italic\")]#text(\" with H\")#sub[#text(\"2\")]#text(\"O and 10\")#super[#text(\"-3\")]]"), "{typst}");
+        assert!(typst.contains("x\")#sub[#emph[#text(\"i\")]]") && typst.contains("y\")#super[#strong[#text(\"2\")]]"), "{typst}");
+        assert!(typst.contains("🧪\")#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"emoji highlight\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"trailing🧪\")]"), "{typst}");
+        assert!(typst.contains("🧪\")#sub[#text(\"2\")]") && typst.contains("x\")#super[#text(\"🧪\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"smart quotes\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"guillemets\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"nbsp open\")]"), "{typst}");
+        assert!(typst.contains("#sub[#text(\"a==b\")]#text(\"c==, ==outer \")#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"inner\")]#text(\", ==outer \")#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"~inner\")]"), "{typst}");
+        assert!(typst.contains("a~b c\")#sub[#text(\"d\")]#text(\"e."), "{typst}");
+        assert!(typst.contains("#strike[#text(\"struck\")]"), "{typst}");
+        assert!(!typst.contains("[#text(\"escaped\")]") && !typst.contains("[#text(\"entity\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"after slash\")]"), "{typst}");
+        assert!(typst.contains("#highlight(fill: smd-highlight, radius: 2pt, extent: 1pt)[#text(\"joined\")]"), "{typst}");
+
         let plain = "Plain equation A = L * U and y = mx + b without study markers.\n";
         assert!(!has_enrich_trigger(plain.as_bytes()));
     }
@@ -504,5 +740,37 @@ mod tests {
         assert_eq!(mark_opens, 1600);
         assert_eq!(sub_opens, 3200);
         assert_eq!(sup_opens, 800);
+    }
+
+    #[test]
+    fn strip_percent_comments_scales_with_interleaved_math_escapes_and_code_fences() {
+        let no_strip = "Inline `$a$` and `%%code_only%%` plus $x %% y$ and \\%%escaped\\%%:\n```python\n%%timeit x = 1\n```\n";
+        assert!(matches!(strip_percent_comments(no_strip), Cow::Borrowed(_)));
+
+        let mut doc = String::new();
+        for i in 0..400 {
+            doc.push_str(&format!(
+                "Item {i}: inline $a_{i} + b_{i} = 100\\%$ and $p_{i} %% kept_inline_{i}$ %%strip_inline_{i}%% costs $50 to $99 (\\$escaped, \\%%kept_lit_{i}\\%%) with $$m_{i} %% kept_compact_{i}$$.\n\
+                 $$\n%% kept_display_{i}\n\\sum_{{k=1}}^{{n}} x_k = {i}\n$$\n\
+                 ```python\n%%timeit total = {i}\n```\n\
+                 ~~~markdown\n%%kept_tilde_{i}%%\n~~~\n"
+            ));
+        }
+        for j in 0..1600 {
+            doc.push_str(&format!(
+                "Ledger {j}: budget $50 to $99 (\\$fee, \\%%lit_{j}\\%%) %%strip_ledger_{j}%%\n"
+            ));
+        }
+
+        let t0 = Instant::now();
+        let stripped = strip_percent_comments(&doc);
+        let elapsed = t0.elapsed();
+        assert!(elapsed.as_millis() < 1000, "strip_percent_comments took too long on ~260 KB interleaved note: {elapsed:?}");
+        assert!(stripped.contains("kept_inline_0") && stripped.contains("kept_inline_399"));
+        assert!(stripped.contains("kept_compact_399") && stripped.contains("kept_display_399"));
+        assert!(stripped.contains("%%timeit total = 399") && stripped.contains("%%kept_tilde_399%%"));
+        assert!(stripped.contains("\\%%kept_lit_200\\%%") && stripped.contains("\\%%lit_1599\\%%"));
+        assert!(!stripped.contains("strip_inline_0") && !stripped.contains("strip_inline_399"));
+        assert!(!stripped.contains("strip_ledger_0") && !stripped.contains("strip_ledger_1599"));
     }
 }

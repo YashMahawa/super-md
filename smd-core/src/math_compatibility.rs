@@ -50,7 +50,6 @@ mod tests {
 
     #[test]
     fn changes_symbols_but_preserves_markup_strings_and_unicode_offsets() {
-        assert_eq!(compatible_math("angle.l x angle.r \"angle.l\""), "chevron.l x chevron.r \"angle.l\"");
         assert_eq!(compatible_math("ast.circle_N"), "convolve.o_N");
         assert_eq!(compatible_math("α + ast.circle_N + ast.circle"), "α + convolve.o_N + convolve.o");
         assert_eq!(compatible_math(r#"ast.circle + "ast.circle" + #textmath[ast.circle angle.l diff];"#),

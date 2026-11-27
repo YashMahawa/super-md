@@ -169,7 +169,11 @@ fn inspect_destination_path(output_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)
     }
     Ok((current, missing_dirs))
 }
-fn ensure_absent_non_symlink(path: &Path) -> Result<()> {
+/// Portable no-overwrite publication: uses exclusive `create_new` (`O_CREAT | O_EXCL` on Unix,
+/// `CREATE_NEW` on Windows) directly at `path` instead of `hard_link` or overwriting `rename`.
+/// This supports removable FAT/exFAT output folders without hard-link support while refusing
+/// to overwrite existing files, and removes `path` immediately if writing or syncing fails.
+fn write_new_file(path: &Path, data: &[u8]) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -177,16 +181,9 @@ fn ensure_absent_non_symlink(path: &Path) -> Result<()> {
             }
             bail!("Output exists; choose an empty destination or another folder");
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
-}
-/// Portable no-overwrite publication: uses exclusive `create_new` (`O_CREAT | O_EXCL` on Unix,
-/// `CREATE_NEW` on Windows) directly at `path` instead of `hard_link` or overwriting `rename`.
-/// This supports removable FAT/exFAT output folders without hard-link support while refusing
-/// to overwrite existing files, and removes `path` immediately if writing or syncing fails.
-fn write_new_file(path: &Path, data: &[u8]) -> Result<()> {
-    ensure_absent_non_symlink(path)?;
     let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
@@ -219,7 +216,16 @@ fn unpack_note(input_path: &Path, note: &PortableDocument, output_dir: &Path) ->
     let md_target = output_dir.join(&md_name);
     let checked_md_target = checked_output_dir.join(&md_name);
     if out_existed {
-        ensure_absent_non_symlink(&checked_md_target)?;
+        match std::fs::symlink_metadata(&checked_md_target) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    bail!("Refusing to unpack through a symlink");
+                }
+                bail!("Output exists; choose an empty destination or another folder");
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
     let mut staged_assets: Vec<(PathBuf, Vec<u8>)> = Vec::with_capacity(note.assets.len());
     let mut seen_paths = std::collections::HashSet::new();
@@ -256,7 +262,16 @@ fn unpack_note(input_path: &Path, note: &PortableDocument, output_dir: &Path) ->
         if !seen_paths.insert(name.to_ascii_lowercase()) { bail!("Conflicting unpacked asset path: {name}"); }
         let target = checked_output_dir.join(rel);
         if assets_existed {
-            ensure_absent_non_symlink(&target)?;
+            match std::fs::symlink_metadata(&target) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        bail!("Refusing to unpack through a symlink");
+                    }
+                    bail!("Output exists; choose an empty destination or another folder");
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
         let (_mime, bytes) = portable::image_bytes(data)?;
         staged_assets.push((target, bytes));
@@ -449,5 +464,46 @@ mod tests {
         for ok_asset in ["image-1.svg", "AUXILIARY.svg", "CONSOLE.diagram.png", "com10.svg", "lpt10.webp"] {
             assert!(is_portable_filename_component(ok_asset), "expected acceptance for {ok_asset}");
         }
+    }
+
+    #[test]
+    fn preserves_existing_151_to_159_char_asset_bundles_across_read_unpack_export_and_resave() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("smd-engine-compat-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compat_basename = format!("{}.svg", "a".repeat(155));
+        assert_eq!(compat_basename.len(), 159);
+        let compat_key = format!("assets/{compat_basename}");
+        let svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><rect width='32' height='16' fill='#386a57'/></svg>";
+        let svg_url = format!("data:image/svg+xml;base64,{}", STANDARD.encode(svg_bytes));
+        let markdown = format!("# Existing Note\n\n![Figure](<{compat_key}>)\n");
+        let bundle = PortableDocument::new(markdown.clone(), std::collections::BTreeMap::from([(compat_key.clone(), svg_url)]));
+        let bundle_path = dir.join("legacy.smd");
+        atomic_write(&bundle_path, &bundle.encode_compressed().unwrap()).unwrap();
+
+        let (loaded_md, loaded_note) = read_note(&bundle_path).unwrap();
+        let mut note = loaded_note.expect("portable note");
+        assert_eq!(loaded_md, markdown);
+        assert!(note.assets.contains_key(&compat_key));
+
+        let unpacked_dir = dir.join("unpacked");
+        let unpacked_md = unpack_note(&bundle_path, &note, &unpacked_dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&unpacked_md).unwrap(), markdown);
+        assert_eq!(std::fs::read(unpacked_dir.join(&compat_key)).unwrap(), svg_bytes);
+
+        let pdf_assets = HashMap::from([(compat_key.clone(), portable::image_bytes(&note.assets[&compat_key]).unwrap().1)]);
+        let pdf_bytes = smd_core::export(&note.markdown, &PdfOptions::default(), &pdf_assets).unwrap();
+        assert!(pdf_bytes.starts_with(b"%PDF-"));
+
+        note.markdown.push_str("\nRe-saved paragraph.\n");
+        atomic_write(&bundle_path, &note.encode_compressed().unwrap()).unwrap();
+        let (resaved_md, resaved_note) = read_note(&bundle_path).unwrap();
+        let resaved_note = resaved_note.expect("portable note");
+        assert!(resaved_md.contains(&compat_key));
+        assert_eq!(portable::image_bytes(&resaved_note.assets[&compat_key]).unwrap().1, svg_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
