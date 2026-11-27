@@ -28,33 +28,45 @@ data class SavedThemeEntry(
     val sourceUri: String = "",
 )
 
-internal val BUNDLED_THEMES: List<BundledThemePreset> = listOf(
-    BundledThemePreset("apricot-glow", "Apricot glow"),
-    BundledThemePreset("avengers-assembly", "Avengers Assembly"),
-    BundledThemePreset("avengers-ink", "Avengers Ink"),
-    BundledThemePreset("blueprint", "Blueprint"),
-    BundledThemePreset("catnap-paws", "Catnap paws"),
-    BundledThemePreset("copper-grid", "Copper grid"),
-    BundledThemePreset("doctor-doom", "Doctor Doom"),
-    BundledThemePreset("gotham-midnight", "Gotham Midnight"),
-    BundledThemePreset("ink-dots", "Ink dots"),
-    BundledThemePreset("iron-man-reactor", "Iron Man Reactor"),
-    BundledThemePreset("lazy-sunday-cats", "Lazy Sunday cats"),
-    BundledThemePreset("midnight-paws", "Midnight paws"),
-    BundledThemePreset("plum-linen", "Plum linen"),
-    BundledThemePreset("rose-paper", "Rose paper"),
-    BundledThemePreset("spider-city", "Spider City"),
-    BundledThemePreset("study-desk", "Study desk"),
-)
-
 private val PRESET_ID_REGEX = Regex("^[a-z0-9-]+$")
 private val SAVED_ID_REGEX = Regex("^[0-9a-f]{8,64}$")
 
+private fun parseBundledThemeCatalog(raw: String): List<BundledThemePreset> {
+    val array = runCatching { JSONArray(raw) }.getOrNull() ?: return emptyList()
+    val seen = HashSet<String>(minOf(array.length(), 128))
+    val result = ArrayList<BundledThemePreset>(minOf(array.length(), 128))
+    for (index in 0 until minOf(array.length(), 128)) {
+        val item = array.optJSONObject(index) ?: continue
+        val id = item.optString("id")
+        val name = item.optString("name")
+        val filename = if (!item.has("filename") || item.isNull("filename")) "$id.supermd-theme.json" else item.optString("filename")
+        if (PRESET_ID_REGEX.matches(id) && name.isNotBlank() && filename == "$id.supermd-theme.json" && seen.add(id)) {
+            result += BundledThemePreset(id, name, filename)
+        }
+    }
+    return result
+}
+
+internal val BUNDLED_THEMES: List<BundledThemePreset> by lazy {
+    sequenceOf(
+        "src/main/assets/web/themes/index.json",
+        "../public/themes/index.json",
+        "../../public/themes/index.json",
+        "public/themes/index.json",
+    ).map(::File).firstOrNull(File::isFile)
+        ?.let { file -> runCatching { file.inputStream().use(::readBoundedThemeStream) }.getOrNull() }
+        ?.let(::parseBundledThemeCatalog)
+        .orEmpty()
+}
+
 internal fun bundledThemes(assets: AssetManager? = null): List<BundledThemePreset> {
+    val catalog = runCatching {
+        assets?.open("web/themes/index.json")?.use(::readBoundedThemeStream)
+    }.getOrNull()?.let(::parseBundledThemeCatalog)?.takeIf { it.isNotEmpty() } ?: BUNDLED_THEMES
     val files = runCatching { assets?.list("web/themes")?.toSet() }.getOrNull().orEmpty()
-    if (files.isEmpty()) return BUNDLED_THEMES
-    val known = BUNDLED_THEMES.associateBy { it.filename }
-    val matched = BUNDLED_THEMES.filter { it.filename in files }.toMutableList()
+    if (files.isEmpty()) return catalog
+    val known = catalog.associateBy { it.filename }
+    val matched = catalog.filter { it.filename in files }.toMutableList()
     for (filename in files.sorted()) {
         if (!filename.endsWith(".supermd-theme.json") || filename in known) continue
         val id = filename.removeSuffix(".supermd-theme.json")
@@ -65,7 +77,7 @@ internal fun bundledThemes(assets: AssetManager? = null): List<BundledThemePrese
         }.getOrNull() ?: id.replace('-', ' ').replaceFirstChar(Char::uppercase)
         matched += BundledThemePreset(id, label, filename)
     }
-    return matched.ifEmpty { BUNDLED_THEMES }
+    return matched.ifEmpty { catalog }
 }
 
 internal fun readBoundedThemeStream(input: InputStream): String {

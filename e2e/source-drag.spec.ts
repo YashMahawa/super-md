@@ -64,3 +64,89 @@ test('rendered text drags expose the same Markdown as Copy',async({page})=>{
   expect(result.crossBlocks.copy).toContain('$x^2$');
   expect(result.unrelatedLink).toEqual({uri:'https://example.test',plain:'https://example.test',prevented:false});
 });
+
+test('closed answer content stays out of ordinary copy and drag until opened while callout markers survive',async({page})=>{
+  await page.addInitScript(()=>{window.SuperMD={post:()=>{}};});
+  await page.goto('/android-reader.html');
+  await page.waitForFunction(()=>typeof window.supermdLoad==='function');
+
+  const content=[
+    '# Study check',
+    '',
+    '> [!question] Evaluate $\\int_0^1 2x\\,dx$',
+    '> State the antiderivative first.',
+    '',
+    '> [!answer] Worked **solution**',
+    '> Hidden antiderivative $x^2$ gives $1$.',
+    '',
+    '> [!note]- Extra hint',
+    '> Power rule backwards.',
+    '',
+    '> [!tip]+ Sanity check',
+    '> Area of triangle is $\\frac{1}{2} \\cdot 1 \\cdot 2 = 1$.',
+  ].join('\n');
+
+  for(const mode of ['reader','live'] as const){
+    await page.evaluate(({md,viewMode})=>window.supermdLoad?.({
+      id:`callout-copy-${viewMode}`,
+      path:null,
+      content:md,
+      mode:viewMode,
+      dark:false,
+      fullscreen:false,
+      colors:{},
+      font:'Manrope',
+      size:18,
+      zoom:100,
+    }),{md:content,viewMode:mode});
+
+    const answerDetails=page.locator('details.callout-answer');
+    await expect(answerDetails).toHaveCount(1);
+    await expect(answerDetails).not.toHaveAttribute('open','');
+
+    const copyAndDragAll=()=>page.locator('.markdown-body').evaluate(root=>{
+      const range=document.createRange();
+      range.selectNodeContents(root);
+      const selection=window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const target=root.querySelector('h1')!;
+      const copied=new DataTransfer();
+      target.dispatchEvent(new ClipboardEvent('copy',{bubbles:true,cancelable:true,clipboardData:copied}));
+      const rect=target.getBoundingClientRect();
+      const dragged=new DataTransfer();
+      dragged.setData('text/html','<p>override</p>');
+      target.dispatchEvent(new DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:dragged,clientX:rect.left+8,clientY:rect.top+rect.height/2}));
+      const selectedHook=window.supermdSelectedText?.()??'';
+      selection.removeAllRanges();
+      return {copy:copied.getData('text/plain'),drag:dragged.getData('text/plain'),selectedHook};
+    });
+
+    const whileClosed=await copyAndDragAll();
+    expect(whileClosed.copy).not.toContain('Hidden antiderivative');
+    expect(whileClosed.copy).not.toContain('Power rule backwards');
+    expect(whileClosed.copy).toContain('> [!question] Evaluate $\\int_0^1 2x\\,dx$');
+    expect(whileClosed.copy).toContain('> [!answer] Worked **solution**');
+    expect(whileClosed.copy).toContain('> [!note]- Extra hint');
+    expect(whileClosed.copy).toContain('> [!tip]+ Sanity check');
+    expect(whileClosed.drag).toBe(whileClosed.copy);
+    expect(whileClosed.selectedHook).toBe(whileClosed.copy);
+
+    // Open the answer disclosure by clicking its summary
+    await answerDetails.locator('summary.callout-title').click();
+    await expect(answerDetails).toHaveAttribute('open','');
+
+    const whileOpen=await copyAndDragAll();
+    expect(whileOpen.copy).toContain('> [!answer] Worked **solution**\n> Hidden antiderivative $x^2$ gives $1$.');
+    expect(whileOpen.copy).not.toContain('Power rule backwards');
+    expect(whileOpen.drag).toBe(whileOpen.copy);
+    expect(whileOpen.selectedHook).toBe(whileOpen.copy);
+
+    // Close the answer disclosure again and verify answer body is excluded once more
+    await answerDetails.locator('summary.callout-title').click();
+    await expect(answerDetails).not.toHaveAttribute('open','');
+    const afterReclose=await copyAndDragAll();
+    expect(afterReclose.copy).not.toContain('Hidden antiderivative');
+    expect(afterReclose.copy).toBe(whileClosed.copy);
+  }
+});
