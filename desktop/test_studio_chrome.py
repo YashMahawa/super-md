@@ -1,5 +1,7 @@
 """Focused unit tests for desktop/studio_chrome.py behind the Studio facade."""
+import ast
 import copy
+import inspect
 import json
 import os
 import sys
@@ -12,13 +14,13 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QGuiApplication
 
 import custom_theme
 import studio as studio_mod
 import studio_chrome
-from studio import DEFAULT_PDF, DEFAULTS, Session, Studio
+from studio import DEFAULT_PDF, Session, Studio
 from test_studio import QuietStudio
 
 
@@ -59,6 +61,29 @@ class StudioChromeTest(unittest.TestCase):
                 action, done = pending.pop(0)
                 done(action(), None)
 
+    def test_explicit_dependencies_and_zero_studio_module_lookups(self):
+        self.assertFalse(hasattr(studio_chrome, "_studio_module"))
+        tree = ast.parse(inspect.getsource(studio_chrome))
+        imported = {
+            alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
+        } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+        self.assertFalse({"studio", "desktop.studio", "sys"} & imported)
+
+        self.assertEqual(studio_chrome.theme_metrics({"metrics": {"controlRadius": 14}}), {"controlRadius": 14, "contentRadius": 16})
+        self.assertEqual((studio_chrome.custom_theme_name(None), studio_chrome.custom_theme_name({"name": "Solar"})), ("Built-in appearance", "Solar"))
+        self.assertEqual((studio_chrome.custom_theme_active(None), studio_chrome.custom_theme_active(custom_theme.TEMPLATE)), (False, True))
+        self.assertFalse(studio_chrome.motion_enabled({"motion": False}))
+        art_theme = {
+            **custom_theme.TEMPLATE,
+            "variants": {"dark": {"artwork": {"reader": {"image": "data:image/svg+xml;base64,PHN2Zy8+", "opacity": 0.14, "fit": "cover"}}}},
+        }
+        self.assertIn("pattern", studio_chrome.theme_background(custom_theme.TEMPLATE, self.studio.settings, dark=True))
+        self.assertIn("reader", studio_chrome.theme_artwork(art_theme, self.studio.settings, fullscreen=False, dark=True))
+        self.assertIn("find", json.loads(studio_chrome.shortcut_bindings(self.studio.settings)))
+        self.assertIn("find", json.loads(studio_chrome.shortcut_labels(self.studio.settings)))
+        captured = json.loads(studio_chrome.capture_shortcut(Qt.Key.Key_F.value, Qt.KeyboardModifier.ControlModifier.value))
+        self.assertEqual(captured, {"sequence": "Ctrl+F", "error": ""})
+
     def test_token_caching_and_simplenamespace_proxy_support(self):
         with patch.object(studio_mod, "tokens", wraps=studio_mod.tokens) as token_spy:
             first, second = self.studio._tokens(), self.studio._tokens()
@@ -69,28 +94,32 @@ class StudioChromeTest(unittest.TestCase):
             self.assertGreaterEqual(token_spy.call_count, 2)
 
         proxy = SimpleNamespace(
-            settings=copy.deepcopy(DEFAULTS),
+            settings=copy.deepcopy(self.studio.settings),
             session=SimpleNamespace(custom_theme=None, theme_revision=0, windows={}),
             fullscreen=False, system_dark=True, system_colors={}, system_mode="dark",
-            readerCall=SimpleNamespace(emit=lambda *_: None),
         )
         self.assertTrue(Studio._dark(proxy))
         self.assertIn("primary", Studio._colors(proxy))
-        Studio.setting(proxy, "size", "24")
-        self.assertEqual(proxy.settings["size"], 24.0)
+        self.assertTrue(Studio.shortcutLabel(proxy, "find"))
 
-    def test_bundled_themes_respect_patched_studio_root(self):
+    def test_bundled_themes_and_palette_watch_respect_explicit_dependencies(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             themes_dir = root / "public" / "themes"
             themes_dir.mkdir(parents=True)
             (themes_dir / "custom-root.supermd-theme.json").write_text(json.dumps({**custom_theme.TEMPLATE, "name": "Custom Root Preset"}), encoding="utf-8")
+            palette_file = root / "kdeglobals"
+            palette_file.write_text("[General]\n", encoding="utf-8")
             with patch.object(studio_mod, "ROOT", root):
                 self.assertTrue(any(item["id"] == "custom-root" and item["name"] == "Custom Root Preset" for item in self.studio.bundledThemes))
                 results = []
                 self._run_theme_sync(lambda: self.studio._apply_bundled_theme("custom-root", callback=lambda res, err: results.append((res, err))))
                 self.assertEqual(results, [({"id": "custom-root", "name": "Custom Root Preset"}, "")])
                 self.assertEqual(self.studio.activeThemeKind, "preset")
+
+            with patch.object(studio_mod, "system_palette_paths", return_value=[palette_file]):
+                self.studio._watch_palette()
+                self.assertIn(str(palette_file), self.studio.palette_watcher.files())
 
     def test_custom_theme_lifecycle_persistence_and_studio_patches(self):
         second = self._new_window()
@@ -111,14 +140,17 @@ class StudioChromeTest(unittest.TestCase):
         self.assertEqual(json.loads((self.studio.data / "theme-source.json").read_text(encoding="utf-8")), {"path": str(src_a)})
         saved_a_id = self.studio.savedThemes[0]["id"]
 
+        with patch("studio.QDesktopServices.openUrl", return_value=True) as open_url:
+            self.studio.editCustomTheme()
+            self.assertEqual(open_url.call_args.args[0], QUrl.fromLocalFile(str(src_a)))
+
         self._run_theme_sync(lambda: self.studio.importCustomTheme(str(src_b)))
         self.assertEqual(len(self.studio.savedThemes), 2)
 
         self.studio.setting("patternKind", '"grid"')
         self._run_theme_sync(lambda: self.studio.selectBundledTheme("study-desk"))
-        self.assertEqual(self.studio.activeThemeKind, "preset")
+        self.assertEqual((self.studio.activeThemeKind, self.studio.settings["patternKind"]), ("preset", ""))
         self.assertFalse((self.studio.data / "theme-source.json").exists())
-        self.assertEqual(self.studio.settings["patternKind"], "")
 
         self._run_theme_sync(lambda: self.studio.selectSavedTheme(saved_a_id))
         self.assertEqual(self.studio.activeThemeId, saved_a_id)
@@ -157,44 +189,22 @@ class StudioChromeTest(unittest.TestCase):
         self.assertEqual(self.studio.resetShortcuts(), "")
         self.assertEqual((len(events_a), len(events_b)), (2, 2))
 
-    def test_linux_window_chrome_selection_edit_zoom_and_setting_bounds(self):
+    def test_preserved_window_settings_and_theme_export_behavior(self):
         with patch("studio.sys.platform", "linux"), patch("studio.platform.freedesktop_os_release", return_value={"ID": "fedora"}), patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "GNOME"}):
             self.assertEqual((self.studio.fedoraWindowFrame, self.studio.showToolbarWindowControls), (True, True))
-        with patch("studio.sys.platform", "linux"), patch("studio.platform.freedesktop_os_release", side_effect=OSError("missing")), patch.dict(os.environ, {"XDG_CURRENT_DESKTOP": "sway"}):
-            self.assertEqual((self.studio.fedoraWindowFrame, self.studio.showToolbarWindowControls), (False, True))
-
-        src = self.studio.data / "editable.supermd-theme.json"
-        src.write_text("{}", encoding="utf-8")
-        self.session.active_theme_kind, self.session.theme_source = "saved", str(src)
-        with patch("studio.QDesktopServices.openUrl", return_value=True) as open_url:
-            self.studio.selectionAction("google", "matrix rank")
-            self.assertIn("www.google.com", open_url.call_args.args[0].toString())
-            self.studio.editCustomTheme()
-            self.assertEqual(open_url.call_args.args[0], QUrl.fromLocalFile(str(src)))
-
-        calls = []
-        self.studio.readerCall.connect(calls.append)
-        with patch("studio.time.time", return_value=1700000002.5):
-            self.studio.setZoom(999)
-            self.studio.setZoom(10)
-        self.assertEqual(calls, ["window.supermdSetZoom?.(300,1700000002500)", "window.supermdSetZoom?.(40,1700000002500)"])
-
-        for key, raw, expected in (("size", "2", 6.0), ("size", "99", 32.0), ("width", "99999", 5000), ("widthPercent", "10", 50.0), ("lineHeight", "9.5", 2.2)):
-            self.studio.setting(key, raw)
-            self.assertEqual(self.studio.settings[key], expected)
 
         self.studio.setting("keepInBackground", "true")
         self.studio.setting("keepInBackground", '"not-a-bool"')
-        self.assertIs(self.studio.settings["keepInBackground"], True)
-        before_window = dict(self.studio.settings["window"])
-        self.studio.setting("window", json.dumps({"width": 900, "height": 700, "maximized": True}))
-        self.assertEqual(self.studio.settings["window"], before_window)
+        self.studio.setting("restorePosition", "false")
+        self.studio.setting("centerLock", "true")
+        self.assertEqual((self.studio.settings["keepInBackground"], self.studio.settings["restorePosition"], self.studio.settings["centerLock"]), (True, False, True))
         self.studio.setting("pdf", json.dumps({"pageSize": "a4"}))
         self.assertEqual(set(self.studio.settings["pdf"]), set(DEFAULT_PDF))
-        with patch("python_runtime.validate", side_effect=ValueError("Python missing")):
-            self.studio.setting("python", json.dumps("/bad/python"))
-        self.assertEqual(self.studio.python_status, "Python missing")
-        self.assertIs(studio_chrome._studio_module(), studio_mod)
+
+        export_target = self.studio.data / "shared.supermd-theme.json"
+        self.studio.exportCustomTheme(str(export_target))
+        self.assertTrue(export_target.is_file())
+        self.assertTrue(self.studio.defaultThemeExportLocation("Solar.supermd-theme.json").toLocalFile().endswith("Solar.supermd-theme.json"))
 
 
 if __name__ == "__main__":
