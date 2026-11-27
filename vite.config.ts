@@ -124,8 +124,8 @@ export function mermaidSandboxPlugin(
         const script = typeof built === "string" ? built : built.script;
         const inputs = typeof built === "string" ? undefined : built.inputs;
         const html = renderSandboxDocument(script);
-        if (buildId === latestBuildId && cachedBundlePromise === buildPromise && inputs) {
-          watchedInputs = new Set(Array.from(inputs, normalizeWatchPath));
+        if (buildId === latestBuildId && cachedBundlePromise === buildPromise) {
+          watchedInputs = inputs ? new Set(Array.from(inputs, normalizeWatchPath)) : new Set();
         }
         return { script, html };
       })().catch((error) => {
@@ -134,7 +134,10 @@ export function mermaidSandboxPlugin(
         }
         throw error;
       });
-      cachedBundlePromise = buildPromise;
+      if (buildId === latestBuildId) {
+        cachedBundlePromise = buildPromise;
+      }
+      return buildPromise;
     }
     return cachedBundlePromise;
   };
@@ -274,6 +277,7 @@ export default defineConfig(({mode}) => ({
   // them before serving a page so first use cannot trigger an optimizer reload
   // and discard the native reader's in-memory workspace.
   optimizeDeps: {
+    entries: ["index.html", "android-reader.html", "qt-reader.html"],
     include: ["nspell", "retext-english", "retext-repeated-words", "retext-indefinite-article", "vfile", "pele/lazy", "dompurify"],
     exclude: ["mermaid"],
   },
@@ -285,7 +289,7 @@ export default defineConfig(({mode}) => ({
     port: 1420,
     strictPort: true,
     watch: {
-      ignored: ["**/dist/**", "**/src-tauri/target/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
+      ignored: ["**/dist/**", "**/coverage/**", "**/playwright-report/**", "**/test-results/**", "**/src-tauri/target/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
     },
   },
   envPrefix: ["VITE_", "TAURI_"]

@@ -364,5 +364,92 @@ it('keeps cached build B and recorded watch inputs when an invalidated in-flight
     expect(builds).toHaveLength(5);
     builds[4].resolve({ script: 'window.__sandboxGen = "E";' });
     expect(await pendingE).toBe('window.__sandboxGen = "E";');
+
+    // Prior watch inputs from build C are cleared once build E succeeds without inputs.
+    emitChange('/repo/src/currentDepC.ts');
+    expect(await requestRoute('/@mermaid-sandbox.js')).toBe('window.__sandboxGen = "E";');
+    expect(builds).toHaveLength(5);
+  }
+
+  // Case 3: Synchronous invalidation inside buildSandboxScript before returning its promise cannot cache obsolete build A.
+  {
+    let triggerSyncInvalidation = false;
+    let emitChangeRef: ((filePath: string) => void) | null = null;
+    const builds: DeferredBuild[] = [];
+    const plugin = mermaidSandboxPlugin(() => {
+      const deferred = createDeferred();
+      builds.push(deferred);
+      if (triggerSyncInvalidation) {
+        triggerSyncInvalidation = false;
+        emitChangeRef?.('/repo/src/mermaidSandboxEntry.ts');
+      }
+      return deferred.promise;
+    });
+    const watcherHandlers = new Map<string, Array<(filePath: string) => void>>();
+    let middleware:
+      | ((
+          req: { url?: string; method?: string },
+          res: Record<string, unknown>,
+          next: (err?: unknown) => void,
+        ) => Promise<void>)
+      | null = null;
+    const configureServer =
+      typeof plugin.configureServer === 'function' ? plugin.configureServer : plugin.configureServer?.handler;
+    configureServer?.call(
+      {} as never,
+      {
+        watcher: {
+          on(event: string, cb: (filePath: string) => void) {
+            watcherHandlers.set(event, [...(watcherHandlers.get(event) ?? []), cb]);
+          },
+        },
+        middlewares: {
+          use(fn: typeof middleware) {
+            middleware = fn;
+          },
+        },
+      } as never,
+    );
+    emitChangeRef = (filePath: string) => {
+      for (const cb of watcherHandlers.get('change') ?? []) {
+        cb(filePath);
+      }
+    };
+    const requestRoute = async (url: string) => {
+      let body = '';
+      await middleware!(
+        { url, method: 'GET' },
+        {
+          statusCode: 0,
+          setHeader() {},
+          end(chunk?: string) {
+            body = chunk ?? '';
+          },
+        },
+        (err) => {
+          if (err) throw err;
+        },
+      );
+      return body;
+    };
+
+    // Invalidate warm-up build 0, then trigger synchronous invalidation during build 1 setup.
+    emitChangeRef('/repo/src/mermaidSandboxEntry.ts');
+    builds[0].reject(new Error('warm-up cancelled'));
+    triggerSyncInvalidation = true;
+    const pendingSyncInvalidated = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(2);
+
+    // Because build 1 was synchronously invalidated, a concurrent request starts fresh build 2 and caches it.
+    const pendingFresh = requestRoute('/@mermaid-sandbox.js');
+    expect(builds).toHaveLength(3);
+    builds[2].resolve({ script: 'window.__sandboxGen = "fresh";', inputs: ['/repo/src/freshDep.ts'] });
+    expect(await pendingFresh).toBe('window.__sandboxGen = "fresh";');
+
+    builds[1].reject(new Error('obsolete sync-invalidated build failed'));
+    await expect(pendingSyncInvalidated).rejects.toThrow('obsolete sync-invalidated build failed');
+
+    expect(await requestRoute('/@mermaid-sandbox.js')).toBe('window.__sandboxGen = "fresh";');
+    expect(builds).toHaveLength(3);
   }
 });
