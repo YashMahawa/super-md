@@ -305,7 +305,10 @@ def _run_worker_command(
     if command == "export_fmd_native" and not args.get("save") and not save_as:
         return st.studio_exports.execute_export_smd_native(output, args, export_result)
     if command == "export_fmd_native":
-        return st.studio_saves.execute_portable_tab_save(output, args, captured, force_portable_overwrite=force_portable_overwrite, export_result=export_result)
+        return st.studio_saves.execute_portable_tab_save(
+            output, args, captured, force_portable_overwrite=force_portable_overwrite,
+            export_result=export_result, open_note_fn=st.open_note, write_portable_fn=st.write_portable,
+        )
     if command == "export_pdf_native":
         return st.studio_exports.execute_export_pdf_native(studio_obj, output, args, export_job, export_result)
     raise ValueError(f"Unsupported command: {command}")
@@ -339,7 +342,13 @@ def _finish_worker_command(
         studio_obj.autosave_timer.start(900)
         studio_obj._emit(False)
     if command == "export_fmd_native" and ((args.get("save") and target) or save_as):
-        st.studio_saves.finalize_portable_tab_save(studio_obj, args, captured, target, save_as=save_as, save_as_tab=save_as_tab)
+        st.studio_saves.finalize_portable_tab_save(
+            studio_obj, args, captured, target, save_as=save_as, save_as_tab=save_as_tab,
+            preserve_unchanged_assets_fn=st._preserve_unchanged_assets,
+            clear_agent_staging_fn=getattr(studio_obj, "_clear_agent_staging", None),
+            is_dirty_fn=getattr(studio_obj, "_is_dirty", None),
+            refresh_open_folder_trees_fn=getattr(studio_obj, "_refresh_open_folder_trees", None),
+        )
     elif command.startswith("export_"):
         st.studio_exports.finalize_standalone_export(studio_obj, result["path"])
     if agent_export_info:

@@ -1,7 +1,7 @@
 """Unit tests for extracted desktop/studio_saves.py conflict checks, staging guards, locations, and proxies."""
 from __future__ import annotations
 
-import base64, hashlib, json, os, shutil, sys, tempfile, time, unittest
+import ast, base64, hashlib, json, os, shutil, sys, tempfile, time, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -59,6 +59,31 @@ class StudioSavesTests(unittest.TestCase):
     @staticmethod
     def _rev(text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def test_module_boundary_has_no_studio_lookup_sys_modules_or_importerror_handlers(self):
+        source = Path(studio_saves.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        self.assertNotIn("_studio_module", source)
+        self.assertFalse(hasattr(studio_saves, "_studio_module"))
+        self.assertFalse(hasattr(studio_saves, "sys"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotIn(alias.name, ("studio", "desktop.studio", "importlib"))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertNotIn(node.module, ("studio", "desktop.studio", "importlib"))
+                for alias in node.names:
+                    self.assertNotIn(alias.name, ("studio", "importlib"))
+            elif isinstance(node, ast.Attribute):
+                self.assertFalse(
+                    isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "modules",
+                    "studio_saves must not inspect sys.modules",
+                )
+            elif isinstance(node, ast.ExceptHandler):
+                self.assertFalse(
+                    isinstance(node.type, ast.Name) and node.type.id == "ImportError",
+                    "studio_saves must use __package__ imports rather than ImportError handlers",
+                )
 
     def test_unified_disk_conflicts_across_save_text_prepare_save_and_portable_export(self):
         conflicts: list[str] = []
@@ -346,6 +371,23 @@ class StudioSavesTests(unittest.TestCase):
         self.assertEqual(proxy._agent_jump_tab_id, "")
         self.assertEqual((len(recovered), len(emitted)), (1, 1))
         self.assertTrue(folder_ops.same_path(studio_saves.note_save_directory(proxy), self.root))
+
+        # Studio facade wrappers forward explicit local_path and QTimer.singleShot collaborators
+        redirected_md = self.root / "redirected.md"
+        with patch("studio.local_path", return_value=redirected_md) as lp_mock:
+            self.studio.saveAs("ignored.md")
+            self._wait_until(lambda: not self.studio.saving)
+        lp_mock.assert_called_once_with("ignored.md")
+        self.assertEqual(self.studio._current()["path"], str(redirected_md))
+
+        scheduled: list[tuple[int, object]] = []
+        close_proxy = SimpleNamespace(
+            requestWindowClose=lambda: True, _recover=lambda: recovered.append(True),
+            allowClose=SimpleNamespace(emit=lambda: None),
+        )
+        with patch("studio.QTimer.singleShot", side_effect=lambda ms, cb: scheduled.append((ms, cb))):
+            Studio._after_flush(close_proxy, {"action": "close_window", "target": ""})
+        self.assertEqual(scheduled, [(0, close_proxy.allowClose.emit)])
 
 
 if __name__ == "__main__":
