@@ -466,9 +466,7 @@ class WebEngineContextMenuTest(unittest.TestCase):
         self.assertLess(run_tests.suite_watchdog_seconds("darwin", "arm64"), 480)
         self.assertEqual(run_tests.suite_watchdog_seconds("darwin", "x86_64"), 720)
         self.assertEqual(run_tests.suite_watchdog_seconds("linux", "x86_64"), 420)
-        self.assertLess(run_tests.suite_watchdog_seconds("linux", "x86_64"), 480)
         self.assertEqual(run_tests.suite_watchdog_seconds("win32", "AMD64"), 420)
-        self.assertLess(run_tests.suite_watchdog_seconds("win32", "AMD64"), 480)
 
     def test_real_webengine_right_click_menu_in_isolated_process(self):
         env = os.environ.copy()
