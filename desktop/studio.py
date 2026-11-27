@@ -42,6 +42,7 @@ from documents import (
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
+import offline_view
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
@@ -60,12 +61,24 @@ else:
 from latest_writes import LatestWriteExecutor
 import updates
 import app_integration
+if __package__:
+    from . import studio_runtime
+else:
+    import studio_runtime
 import python_runtime
 import pending_python
 from export_jobs import ExportJobRegistry
+if __package__:
+    from . import studio_paths_media
+else:
+    import studio_paths_media
 import file_events
 import custom_theme
 from selection_actions import ASSISTANTS, selection_target
+try:
+    from . import studio_chrome
+except ImportError:
+    import studio_chrome
 from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, default_shortcuts, native_label, normalize_shortcuts, parse_sequence
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
@@ -499,133 +512,7 @@ def _classify_drop_paths(paths: list[Path]) -> tuple[list[Path], list[Path], lis
     return folders, notes, images, unsupported
 
 
-class WorkspaceDropFilter(QObject):
-    """Window-level drag/drop router preserving TabStrip drags and WebEngine image drops."""
-
-    def __init__(self, studio: Studio, window: QObject, reader: QObject | None = None):
-        super().__init__(window)
-        self.studio = studio
-        self.window = window
-        self.reader = reader
-        self._intercepting_drag = False
-        self._forwarding = False
-        window.installEventFilter(self)
-
-    def set_reader(self, reader: QObject | None) -> None:
-        self.reader = reader
-
-    def _over_active_reader(self, scene_pos: QPointF) -> bool:
-        reader = self.reader
-        if (
-            reader is None
-            or not self.studio.settings.get("welcomed")
-            or not self.studio.ready
-            or self.studio.reader_overlay
-            or self.studio.image_overlay
-        ):
-            return False
-        try:
-            if not reader.isVisible() or reader.width() <= 0 or reader.height() <= 0:
-                return False
-            local = reader.mapFromScene(scene_pos)
-            return 0 <= local.x() <= reader.width() and 0 <= local.y() <= reader.height()
-        except RuntimeError:
-            return False
-
-    def _modal_blocked(self) -> bool:
-        if self.studio.dropBlocked:
-            return True
-        try:
-            count = self.window.property("modalDialogCount")
-            return bool(count and int(count) > 0)
-        except (RuntimeError, TypeError, ValueError):
-            return False
-
-    def _forward_enter_to_scene(self, event) -> None:
-        app = QGuiApplication.instance()
-        if app is None:
-            return
-        enter = QDragEnterEvent(
-            event.position().toPoint(),
-            event.possibleActions(),
-            event.mimeData(),
-            event.buttons(),
-            event.modifiers(),
-        )
-        self._forwarding = True
-        try:
-            app.sendEvent(self.window, enter)
-        finally:
-            self._forwarding = False
-
-    def _send_leave_to_scene(self) -> None:
-        app = QGuiApplication.instance()
-        if app is None:
-            return
-        leave = QDragLeaveEvent()
-        self._forwarding = True
-        try:
-            app.sendEvent(self.window, leave)
-        finally:
-            self._forwarding = False
-
-    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-        if watched is not self.window or self._forwarding:
-            return False
-        etype = event.type()
-        if etype not in (
-            QEvent.Type.DragEnter,
-            QEvent.Type.DragMove,
-            QEvent.Type.DragLeave,
-            QEvent.Type.Drop,
-        ):
-            return False
-
-        if etype == QEvent.Type.DragLeave:
-            if self._intercepting_drag:
-                self._intercepting_drag = False
-                event.accept()
-                return True
-            return False
-
-        mime = event.mimeData()
-        if mime is None or not mime.hasUrls() or mime.hasFormat("application/x-supermd-tab"):
-            return False
-
-        if self._modal_blocked():
-            if not self._intercepting_drag and etype == QEvent.Type.DragMove:
-                self._send_leave_to_scene()
-            self._intercepting_drag = etype != QEvent.Type.Drop
-            event.setDropAction(Qt.DropAction.IgnoreAction)
-            event.ignore()
-            return True
-
-        scene_pos = event.position()
-        over_reader = self._over_active_reader(scene_pos)
-        urls = mime.urls()
-        intercept = self.studio.shouldInterceptExternalDrop(urls, over_reader)
-
-        if not intercept:
-            if self._intercepting_drag:
-                self._intercepting_drag = False
-                if etype in (QEvent.Type.DragMove, QEvent.Type.Drop):
-                    self._forward_enter_to_scene(event)
-            return False
-
-        if not self._intercepting_drag and etype == QEvent.Type.DragMove:
-            self._send_leave_to_scene()
-
-        if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
-            self._intercepting_drag = True
-            event.setDropAction(Qt.DropAction.CopyAction)
-            event.accept()
-            return True
-
-        self._intercepting_drag = False
-        event.setDropAction(Qt.DropAction.CopyAction)
-        event.accept()
-        self.studio.handleExternalDrop(urls, over_reader)
-        return True
+WorkspaceDropFilter = studio_paths_media.WorkspaceDropFilter
 
 def export_destination(value: str, format: str) -> Path:
     return studio_exports.export_destination(value, format)
@@ -686,20 +573,7 @@ _STOPPED_WATCHER = _StoppedFileWatcher()
 
 
 def _matches_media_signature(mime: str, data: bytes) -> bool:
-    head = data[:4096]
-    if mime == "image/png":
-        return head.startswith(b"\x89PNG\r\n\x1a\n")
-    if mime == "image/jpeg":
-        return head.startswith(b"\xff\xd8\xff")
-    if mime == "image/webp":
-        return len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP"
-    if mime == "image/gif":
-        return head.startswith((b"GIF87a", b"GIF89a"))
-    if mime == "image/avif":
-        return len(head) >= 12 and head[4:8] == b"ftyp" and b"avif" in head[8:16]
-    if mime == "image/svg+xml":
-        return b"<svg" in head.lower()
-    return mime == "text/plain"
+    return studio_paths_media.matches_media_signature(mime, data)
 
 class Session(QObject):
     """One ordered persistence stream for every native window in the application."""
@@ -1037,6 +911,8 @@ class Session(QObject):
 class Studio(QObject):
     changed = Signal()
     sidebarChanged = Signal()
+    tabsChanged = Signal()
+    activeTabChanged = Signal()
     shortcutsChanged = Signal()
     workspaceSearchChanged = Signal()
     workspaceSearchBatch = Signal(int, object, int, bool, bool)
@@ -1106,6 +982,7 @@ class Studio(QObject):
         self._cloud_revocation_pending = False
         self.cloudRevocationFinished.connect(self._finish_cloud_revocation)
         self._agent_viewport_capture = None
+        self._preview_jobs = offline_view.PreviewJobRegistry()
         agent_bridge = getattr(self.session, "agent_bridge", None)
         if agent_bridge is not None:
             agent_bridge.enabledChanged.connect(lambda: self._emit(False))
@@ -1266,18 +1143,27 @@ class Studio(QObject):
             tab.setdefault("conflict", False)
         self._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in self.tabs if tab.get("path"))
         self.session.drafts[self.window_id] = [dict(t) for t in self.tabs]
+        self._startup_placeholder_ids = set()
+        self._welcome_placeholder_id = None
+        self._touched_tab_ids = set()
+        self._opening_paths: dict[str, int] = {}
         if not self.tabs:
-            self.tabs.append(self._note("Untitled.md") if self.settings["welcomed"] else self._note("Welcome.md", SAMPLE, saved=SAMPLE))
+            if self.settings["welcomed"]:
+                placeholder = self._note("Untitled.md")
+                self.tabs.append(placeholder)
+                self._startup_placeholder_ids.add(placeholder["id"])
+            else:
+                placeholder = self._note("Welcome.md", SAMPLE, saved=SAMPLE)
+                self.tabs.append(placeholder)
+                self._welcome_placeholder_id = placeholder["id"]
         elif self.settings["startup"]=="new":
-            self.tabs.insert(0,self._note("Untitled.md"))
+            placeholder = self._note("Untitled.md")
+            self.tabs.insert(0, placeholder)
+            self._startup_placeholder_ids.add(placeholder["id"])
         self.active = self.tabs[0]["id"]
         target_active_id = win_spec["activeId"] if win_spec is not None else self.session.startup_active_id
         if restore_enabled and any(t["id"]==target_active_id for t in self.tabs):self.active=target_active_id
         self._activation_generation = 0
-        self._startup_placeholder_ids = {
-            tab["id"] for tab in self.tabs
-            if tab["name"] == "Untitled.md" and not tab["path"] and not tab["content"] and not tab["saved"] and not tab["assets"]
-        }
         self._restoring_paths=set()
         self._startup_order=[]
         if win_spec is not None:
@@ -1309,6 +1195,8 @@ class Studio(QObject):
         if restore_enabled and restore_folder:
             self._restore_workspace_folder(restore_folder, restore_expanded)
         self._emitted_sidebar_key = self._sidebar_slice_key()
+        self._emitted_tabs_key = self._tabs_slice_key()
+        self._emitted_active_tab_id = self.active if self.tabs else ""
         self._refresh_theme()
         # Only the first real desktop window may restore the user's opted-in
         # cloud connection. The cloud client handles network retry/backoff.
@@ -1392,6 +1280,53 @@ class Studio(QObject):
             return True
         return False
 
+    def _mark_tab_touched(self, tab_id: str | None) -> None:
+        if not tab_id:
+            return
+        self._touched_tab_ids.add(tab_id)
+        self._startup_placeholder_ids.discard(tab_id)
+        if self._welcome_placeholder_id == tab_id:
+            self._welcome_placeholder_id = None
+
+    def _is_untouched_startup_placeholder(self, tab: dict, *, allow_welcome_sample: bool) -> bool:
+        tab_id = tab.get("id")
+        if not tab_id or tab_id in self._touched_tab_ids:
+            return False
+        if self._is_dirty(tab) or tab.get("path") or tab.get("assets") or tab.get("conflict"):
+            return False
+        session_entry = self.reader_edits.sessions.get(tab_id)
+        if session_entry is not None and session_entry[1] > 0:
+            return False
+        if tab_id in self._startup_placeholder_ids:
+            return tab.get("name") == "Untitled.md" and tab.get("content") == "" and tab.get("saved") == ""
+        if allow_welcome_sample and tab_id == self._welcome_placeholder_id:
+            return tab.get("name") == "Welcome.md" and tab.get("content") == SAMPLE and tab.get("saved") == SAMPLE
+        return False
+
+    def _remove_untouched_startup_placeholders(self, *, keep_tab_id: str, allow_welcome_sample: bool) -> bool:
+        removable_ids = {
+            tab["id"]
+            for tab in self.tabs
+            if tab.get("id") != keep_tab_id
+            and self._is_untouched_startup_placeholder(tab, allow_welcome_sample=allow_welcome_sample)
+        }
+        if not removable_ids:
+            return False
+        remaining = [tab for tab in self.tabs if tab["id"] not in removable_ids]
+        if not remaining:
+            return False
+        for removed_id in removable_ids:
+            self._python_jobs.cancel_tab(removed_id)
+            self.reader_edits.clear(removed_id)
+            self.session.reader_assets.revoke_tab(self.window_id, removed_id)
+            self._startup_placeholder_ids.discard(removed_id)
+            if self._welcome_placeholder_id == removed_id:
+                self._welcome_placeholder_id = None
+        self.tabs = remaining
+        if not any(tab["id"] == self.active for tab in self.tabs):
+            self.active = keep_tab_id if any(tab["id"] == keep_tab_id for tab in self.tabs) else self.tabs[0]["id"]
+        return True
+
     @Property("QStringList",notify=sidebarChanged)
     def pinnedRecent(self):return list(self.session.pinned)
 
@@ -1439,10 +1374,24 @@ class Studio(QObject):
             self._emitted_sidebar_key = key
             self.sidebarChanged.emit()
 
+    def _notify_tabs(self):
+        if self.retired:
+            return
+        tabs_key = self._tabs_slice_key()
+        if tabs_key != getattr(self, "_emitted_tabs_key", None):
+            self._emitted_tabs_key = tabs_key
+            self.tabsChanged.emit()
+        active_id = self.active if self.tabs else ""
+        if active_id != getattr(self, "_emitted_active_tab_id", None):
+            self._emitted_active_tab_id = active_id
+            self.activeTabChanged.emit()
+
     def _emit(self, load=True):
         if self.retired: return
+        self._preview_jobs.retain_tabs(tab["id"] for tab in self.tabs)
         self._watch_notes()
         self._notify_sidebar()
+        self._notify_tabs()
         self.changed.emit()
         if load and self.ready and self.tabs:
             tab = self._current()
@@ -1463,126 +1412,76 @@ class Studio(QObject):
             self._last_reader_text=(tab["id"],tab["content"])
             self.readerLoad.emit(json.dumps(payload))
 
-    def _tokens(self):
-        # Scheme generation is costly and QML reads colors from many bindings.
-        theme = self.settings["fullTheme" if self.fullscreen else "theme"]
-        selected=self.session.custom_theme
-        key = (theme,self.system_dark,json.dumps(self.system_colors,sort_keys=True),self.system_mode,self.settings["accent"],self.session.theme_revision)
-        if getattr(self,"_token_key",None) != key:
-            self._token_key = key
-            dark,colors=tokens(theme,self.system_dark,self.system_colors,self.system_mode,selected["accent"] if selected else self.settings["accent"])
-            self._token_value = (dark,custom_theme.palette(colors,custom_theme.variant(selected,theme,dark).get("colors",{}))) if selected else (dark,colors)
-        return self._token_value
+    def _tokens(self): return studio_chrome.tokens_for(self, tokens_fn=tokens)
 
-    def _dark(self):
-        return self._tokens()[0]
+    def _dark(self): return studio_chrome.dark_for(self)
 
-    def _colors(self):
-        return dict(self._tokens()[1])
+    def _colors(self): return studio_chrome.colors_for(self)
 
     @Property("QVariantMap", notify=changed)
-    def palette(self): return self._colors()
+    def palette(self): return studio_chrome.palette(self)
 
     @Property("QVariantMap",notify=changed)
-    def themeMetrics(self):return {"controlRadius":22,"contentRadius":16,**(self.session.custom_theme or {}).get("metrics",{})}
+    def themeMetrics(self): return studio_chrome.theme_metrics(self.session.custom_theme)
 
     @Property(str,notify=changed)
-    def customThemeName(self):return (self.session.custom_theme or {}).get("name","Built-in appearance")
+    def customThemeName(self): return studio_chrome.custom_theme_name(self.session.custom_theme)
 
     @Property(bool,notify=changed)
-    def customThemeActive(self):return self.session.custom_theme is not None
+    def customThemeActive(self): return studio_chrome.custom_theme_active(self.session.custom_theme)
 
     @Property("QVariantList",constant=True)
-    def bundledThemes(self):return custom_theme.bundled_themes(ROOT)
+    def bundledThemes(self): return studio_chrome.bundled_themes(ROOT)
 
     @Property("QVariantList",notify=changed)
-    def savedThemes(self):return copy.deepcopy(self.session.saved_themes)
+    def savedThemes(self): return studio_chrome.saved_themes(self.session)
 
     @Property(str,notify=changed)
-    def activeThemeKind(self):return self.session.active_theme_kind
+    def activeThemeKind(self): return studio_chrome.active_theme_kind(self.session)
 
     @Property(str,notify=changed)
-    def activeThemeId(self):return self.session.active_theme_id
+    def activeThemeId(self): return studio_chrome.active_theme_id(self.session)
 
     @Property(bool,notify=changed)
-    def customThemeHasSource(self):
-        return self.session.custom_theme is not None and self.session.active_theme_kind != "preset" and bool(self.session.theme_source)
+    def customThemeHasSource(self): return studio_chrome.custom_theme_has_source(self.session)
 
     @Property("QVariantMap",notify=changed)
-    def themeArtwork(self):
-        selected=custom_theme.variant(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark())
-        return custom_theme.artwork(self.session.custom_theme,selected)
+    def themeArtwork(self): return studio_chrome.theme_artwork(self.session.custom_theme, self.settings, fullscreen=self.fullscreen, dark=self._dark())
 
     @Property("QVariantMap",notify=changed)
-    def themeBackground(self):
-        style=custom_theme.reader(self.session.custom_theme,self.settings["theme"],self._dark(),self.settings)
-        return {"pattern":"none","opacity":.06,"size":24,"spacing":24,**(style["background"] or {})}
+    def themeBackground(self): return studio_chrome.theme_background(self.session.custom_theme, self.settings, dark=self._dark())
 
     @Slot()
-    def resetThemeBackground(self):
-        self.settings.update(patternKind="",patternOpacity=-1,patternSize=0,patternSpacing=0)
-        self._preferences();self._emit()
+    def resetThemeBackground(self): studio_chrome.reset_theme_background(self)
 
     @Property(bool, notify=changed)
-    def motionEnabled(self): return bool(self.settings["motion"])
+    def motionEnabled(self): return studio_chrome.motion_enabled(self.settings)
 
     @Property(str, constant=True)
-    def shortcutActions(self): return json.dumps(SHORTCUT_DEFINITIONS)
+    def shortcutActions(self): return studio_chrome.shortcut_actions()
 
     @Property(str, notify=shortcutsChanged)
-    def shortcutBindings(self): return json.dumps(self.settings.get("shortcuts", {}))
+    def shortcutBindings(self): return studio_chrome.shortcut_bindings(self.settings)
 
     @Property(str, notify=shortcutsChanged)
-    def shortcutLabels(self):
-        return json.dumps({action: self.shortcutLabel(action) for action in self.settings.get("shortcuts", {})})
+    def shortcutLabels(self): return studio_chrome.shortcut_labels(self.settings, label_fn=getattr(self, "shortcutLabel", None))
 
     @Slot(str, result="QVariantList")
-    def shortcutSequences(self, action):
-        return list(self.settings.get("shortcuts", {}).get(action, []))
+    def shortcutSequences(self, action): return studio_chrome.shortcut_sequences(self.settings, action)
 
     @Slot(str, result=str)
-    def shortcutLabel(self, action):
-        values = self.shortcutSequences(action)
-        return "  /  ".join(native_label(value) for value in values) if values else "Disabled"
+    def shortcutLabel(self, action): return studio_chrome.shortcut_label(self.settings, action, sequences_fn=getattr(self, "shortcutSequences", None))
 
     @Slot(int, int, result=str)
-    def captureShortcut(self, key, modifiers):
-        sequence, error = capture_sequence(key, modifiers)
-        return json.dumps({"sequence": sequence, "error": error})
+    def captureShortcut(self, key, modifiers): return studio_chrome.capture_shortcut(key, modifiers)
 
     @Slot(str, str, result=str)
-    def setShortcut(self, action, value):
-        if action not in self.settings.get("shortcuts", {}):
-            return "Unknown shortcut action."
-        sequence = parse_sequence(value) if value else None
-        if value and sequence is None:
-            return "Invalid key combination."
-        candidate = copy.deepcopy(self.settings["shortcuts"])
-        candidate[action] = [sequence] if sequence else []
-        validated, error = normalize_shortcuts(candidate, edited_action=action)
-        if error: return error
-        if validated == self.settings["shortcuts"]: return ""
-        self.settings["shortcuts"] = validated
-        self._notify_shortcuts()
-        self._preferences()
-        self._emit(False)
-        return ""
+    def setShortcut(self, action, value): return studio_chrome.set_shortcut(self, action, value)
 
     @Slot(result=str)
-    def resetShortcuts(self):
-        defaults = default_shortcuts()
-        if defaults == self.settings["shortcuts"]: return ""
-        self.settings["shortcuts"] = defaults
-        self._notify_shortcuts()
-        self._preferences()
-        self._emit(False)
-        return ""
+    def resetShortcuts(self): return studio_chrome.reset_shortcuts(self)
 
-    def _notify_shortcuts(self):
-        # Do not rebuild every QML Shortcut/recorder on each note edit, zoom or
-        # scroll update. Only an actual binding change invalidates these maps.
-        for window in tuple(self.session.windows.values()):
-            if not window.retired: window.shortcutsChanged.emit()
+    def _notify_shortcuts(self): studio_chrome.notify_shortcuts(self)
 
     def _active_watch_suspensions(self):
         return studio_assets_rename.active_watch_suspensions(self.session)
@@ -1830,41 +1729,15 @@ class Studio(QObject):
                 self._emit(load=id==self.active)
             self._submit(lambda path=path:open_note(Path(path)),finished,False)
 
-    def _schedule_theme(self,*_):
-        self.theme_debounce.start(150)
+    def _schedule_theme(self,*args): studio_chrome.schedule_theme(self, *args)
 
-    def _watch_palette(self):
-        if self.retired:return
-        watched = set(self.palette_watcher.files()+self.palette_watcher.directories())
-        for path in system_palette_paths():
-            for target in (path,path.parent):
-                if target.exists() and str(target) not in watched:
-                    self.palette_watcher.addPath(str(target))
+    def _watch_palette(self): studio_chrome.watch_palette(self, palette_paths_fn=system_palette_paths)
 
-    def _palette_changed(self,*_):
-        self._watch_palette()  # Atomic file replacement invalidates the old watch.
-        self._schedule_theme()
+    def _palette_changed(self,*args): studio_chrome.palette_changed(self, *args)
 
-    def _system_setting_changed(self):
-        self.system_preferences.readAllStandardOutput()
-        self._schedule_theme()
+    def _system_setting_changed(self): studio_chrome.system_setting_changed(self)
 
-    def _refresh_theme(self):
-        if self._theme_running:
-            self._theme_pending = True
-            return
-        self._theme_running = True
-        scheme = QGuiApplication.styleHints().colorScheme().name
-        def finished(result,error):
-            self._theme_running = False
-            if not error and result != self._theme_result:
-                self._theme_result = result
-                self.system_dark,(self.system_mode,self.system_colors) = result
-                self._emit()
-            if self._theme_pending:
-                self._theme_pending = False
-                self._schedule_theme()
-        self._submit(lambda:(detect_system_dark(scheme),read_system_palette()),finished,False)
+    def _refresh_theme(self): studio_chrome.refresh_theme(self, detect_dark_fn=detect_system_dark, read_palette_fn=read_system_palette)
 
     def stop(self):
         if self.retired: return
@@ -1874,6 +1747,7 @@ class Studio(QObject):
         self._search_pool.shutdown(wait=False, cancel_futures=True)
         self._export_jobs.cancel_all()
         self._python_jobs.cancel_all(retire=True)
+        self._preview_jobs.cancel_all(retire=True)
         for agent_export in tuple(self._agent_exports.values()):
             try:
                 reserved = Path(agent_export["path"])
@@ -1882,6 +1756,7 @@ class Studio(QObject):
             except (OSError, TypeError, KeyError):
                 pass
         self._agent_exports.clear()
+        self._opening_paths.clear()
         if self.position_timer.isActive():self._save_positions()
         self.position_timer.stop()
         if self.preference_timer.isActive():self._preferences(False)
@@ -2015,11 +1890,15 @@ class Studio(QObject):
         self._pinned_slice_cache = (pinned_tuple, encoded)
         return encoded
 
-    def _cached_tabs_slice_json(self):
-        tabs_key = tuple(
+    def _tabs_slice_key(self):
+        return tuple(
             (t["id"], t["name"], t["path"], self._is_dirty(t), bool(t.get("conflict")))
             for t in self.tabs
         )
+
+    def _cached_tabs_slice_json(self, tabs_key=None):
+        if tabs_key is None:
+            tabs_key = self._tabs_slice_key()
         cached = getattr(self, "_tabs_slice_cache", None)
         if cached is not None and cached[0] == tabs_key:
             return cached[1]
@@ -2029,6 +1908,14 @@ class Studio(QObject):
         ])
         self._tabs_slice_cache = (tabs_key, encoded)
         return encoded
+
+    @Property(str, notify=tabsChanged)
+    def tabsSnapshot(self):
+        return self._cached_tabs_slice_json()
+
+    @Property(str, notify=activeTabChanged)
+    def activeTabId(self):
+        return self.active if self.tabs else ""
 
     def _cached_colors_slice_json(self):
         dark, palette = self._tokens()
@@ -2719,9 +2606,7 @@ class Studio(QObject):
     def windowId(self): return self.window_id
 
     @Property(str,constant=True)
-    def appVersion(self):
-        metadata=ROOT/"desktop/build-info.json" if getattr(sys,"frozen",False) else ROOT/"package.json"
-        return json.loads(metadata.read_text(encoding="utf-8"))["version"]
+    def appVersion(self):return studio_runtime.app_version(self, root=ROOT, frozen=bool(getattr(sys, "frozen", False)))
 
     @Property(str,notify=changed)
     def updateStatus(self):return self.update_status
@@ -2748,133 +2633,34 @@ class Studio(QObject):
     def storageCleanupStatus(self):return self.storage_cleanup_status
 
     @Slot(str)
-    def clearStorageCategory(self, category):
-        if category not in ("execution-results", "update-state"):
-            self.storage_cleanup_status = "This storage category is protected."
-            self._emit(False)
-            return
-        if self.retired or self.storage_busy or self.storage_cleanup_busy or (category == "update-state" and (self.update_running or self.update_path)):
-            self.storage_cleanup_status = "Cleanup is unavailable while storage or updates are in use."
-            self._emit(False)
-            return
-        self.storage_cleanup_busy = True
-        self.storage_cleanup_status = ""
-        self._emit(False)
-        def done(result,error):
-            self.storage_cleanup_busy = False
-            self.storage_cleanup_status = ("Cleanup failed; app files were not intentionally changed." if error or not result else "Temporary app data cleared. Notes and recovery preserved.")
-            self._emit(False)
-            self.inspectStorage()
-        self._submit(lambda:clear_storage_category(self.data,category),done,False)
+    def clearStorageCategory(self, category):return studio_runtime.clear_storage_category_action(self, category, clear_storage_fn=clear_storage_category)
 
     @Slot()
-    def openLatestGitHubRelease(self):
-        if not QDesktopServices.openUrl(QUrl(updates.REPO + "/releases/latest")):
-            self.message = "Could not open the latest GitHub release in your browser."
-        self._emit(False)
+    def openLatestGitHubRelease(self):return studio_runtime.open_latest_github_release(self, updates_mod=updates, open_url_fn=QDesktopServices.openUrl)
 
     @Slot()
-    def inspectStorage(self):
-        if self.retired or self.storage_busy:return
-        cancel_event=threading.Event()
-        self._storage_cancel_event=cancel_event
-        self.storage_busy=True
-        self._storage_report=json.dumps({"status":"scanning","cancelled":False,"truncated":False,"scannedEntries":0,"categories":[]})
-        self._emit(False)
-        def done(report,error):
-            if self._storage_cancel_event is not cancel_event:return
-            self._storage_cancel_event=None
-            self.storage_busy=False
-            if error or not isinstance(report,dict):
-                # Keep exception text out of UI/report: filesystem errors may
-                # contain private local paths.
-                report={"status":"partial","cancelled":cancel_event.is_set(),"truncated":False,"scannedEntries":0,"categories":[],"message":"Some app data could not be inspected."}
-            self._storage_report=json.dumps(report,separators=(",",":"))
-            self._emit(False)
-        self._submit(lambda:inspect_storage(self.data,cancel_event),done,False)
+    def inspectStorage(self):return studio_runtime.inspect_storage_action(self, inspect_storage_fn=inspect_storage)
 
     @Slot()
-    def cancelStorageInspection(self):
-        if self._storage_cancel_event is not None:self._storage_cancel_event.set()
+    def cancelStorageInspection(self):return studio_runtime.cancel_storage_inspection(self)
 
     @Property(bool,constant=True)
-    def desktopIntegrationAvailable(self):return app_integration.available()
+    def desktopIntegrationAvailable(self):return studio_runtime.desktop_integration_available(self, app_integration_mod=app_integration)
 
-    def _restore_update(self):
-        self.update_running=True
-        def done(saved,error):
-            self.update_running=False
-            if saved:
-                self.update_info=saved['release'];self.update_path=saved['path'];self.update_status='Verified update ready in Downloads.'
-            if self.settings.get('checkUpdates'):QTimer.singleShot(6000,lambda:self.checkUpdates(True) if not self.retired else None)
-        self._submit(lambda:updates.load_ready(self.data/'updates',self.appVersion),done,False)
+    def _restore_update(self):return studio_runtime.restore_update(self, updates_mod=updates, single_shot_fn=QTimer.singleShot)
 
     @Slot(bool)
-    def setDesktopIntegration(self,enabled):
-        if not self.desktopIntegrationAvailable or self.update_running:return
-        if not enabled:
-            self.setting('desktopIntegration','false');return
-        self.update_running=True;self.update_status='Adding Super MD to your applications…';self._emit(False)
-        def done(path,error):
-            self.update_running=False
-            if error:self.update_status='Desktop integration failed: '+error;return
-            self.setting('desktopIntegration','true');self.update_status='Added to Applications and Open With. Your file defaults are unchanged.'
-        self._submit(lambda:app_integration.integrate_current(self.appVersion),done,False)
+    def setDesktopIntegration(self,enabled):return studio_runtime.set_desktop_integration(self, enabled, app_integration_mod=app_integration)
 
     @Slot()
-    def downloadUpdate(self):
-        if self.update_running or not self.update_info or self.update_path:return
-        self.update_running=True;self.update_status="Downloading and verifying update…";self._emit(False)
-        info=dict(self.update_info)
-        def done(path,error):
-            self.update_running=False
-            if error:self.update_status="Update download failed: "+error;return
-            self.update_path=path;self.update_status="Verified update ready. Save your work, then open the installer."
-        downloads=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home()/'Downloads'))/'Super MD Updates'
-        self._submit(lambda:updates.download(info,downloads,self.data/'updates'),done,False)
+    def downloadUpdate(self):return studio_runtime.download_update(self, updates_mod=updates, writable_location_fn=QStandardPaths.writableLocation)
 
     @Slot()
     @Slot(bool)
-    def checkUpdates(self,automatic=False):
-        if self.update_running:return
-        self.update_running=True;self.update_status="Checking published releases…";self._emit(False)
-        def done(info,error):
-            self.update_running=False
-            if error:
-                self.update_status=updates.check_failure(error)
-                if not automatic:self.message=self.update_status
-                return
-            # Offline/repeated checks must not forget a verified ready installer.
-            if info and self.update_info and info['version']==self.update_info['version'] and self.update_path:
-                self.update_status='Verified Super MD '+info['version']+' is already downloaded.';return
-            if not info and self.update_path:return
-            self.update_path=""
-            self.update_info=info
-            if not info:self.update_status="You're on the latest published version.";return
-            self.update_status="Super MD "+info["version"]+" is available."
-            self.message=self.update_status
-            if automatic:
-                try:
-                    from PySide6.QtWidgets import QApplication, QSystemTrayIcon
-                    from PySide6.QtGui import QIcon
-                    if isinstance(QGuiApplication.instance(),QApplication) and QSystemTrayIcon.isSystemTrayAvailable():
-                        self.update_tray=QSystemTrayIcon(QIcon(str(ROOT/"public/brand-mark-fixed.svg")),self)
-                        self.update_tray.setToolTip("Super MD updates");self.update_tray.show();self.update_tray.showMessage("Super MD update",self.update_status)
-                except RuntimeError:pass
-            if self.settings.get("autoUpdate"):self.downloadUpdate()
-        def check():
-            try:
-                linux_kind=updates.linux_install_kind() if sys.platform.startswith("linux") else "appimage"
-                return updates.release_info(updates.bounded_json(updates.API),self.appVersion,linux_kind=linux_kind),None
-            except Exception as failure:return None,failure
-        self._submit(check,lambda result,error:done(*(result or (None,error))),False)
+    def checkUpdates(self,automatic=False):return studio_runtime.check_updates(self, automatic, updates_mod=updates, root=ROOT, sys_platform=sys.platform, gui_app_cls=QGuiApplication)
 
     @Property(bool,notify=changed)
-    def backgroundEnabled(self):
-        if getattr(self.session, "update_installed", False):
-            return False
-        service=getattr(self.session,"background",None)
-        return bool(service and service.enabled and not service.quitting)
+    def backgroundEnabled(self):return studio_runtime.background_enabled(self)
 
     @Slot(result=bool)
     def hasOtherOpenWindows(self):
@@ -2899,82 +2685,24 @@ class Studio(QObject):
     def pythonBusy(self): return self.python_busy
 
     @Property(bool,constant=True)
-    def pythonBundled(self): return python_runtime.bundled_available()
+    def pythonBundled(self): return studio_runtime.python_bundled(self, python_runtime_mod=python_runtime)
 
-    def _python_folders(self):
-        return [p for p in [self.folder, *(str(Path(t["path"]).parent) for t in self.tabs if t.get("path"))] if p]
+    def _python_folders(self): return studio_runtime.python_folders(self)
 
-    def _choose_default_python(self, emit: bool = True):
-        if self.retired or self.settings.get("python"):
-            return
-        path = python_runtime.default_python(self.data / "python-env")
-        if path:
-            self.settings["python"] = path
-            self._preferences(notify=emit)
-        if emit:
-            self._emit(False)
+    def _choose_default_python(self, emit: bool = True): return studio_runtime.choose_default_python(self, emit, python_runtime_mod=python_runtime)
 
     @Slot(str)
-    def _python_progress(self, text):
-        self.python_status = text
-        self._emit(False)
+    def _python_progress(self, text): return studio_runtime.python_progress(self, text)
 
     @Slot()
-    def refreshPython(self):
-        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
-        managed = self.data / "python-env"
-        folders = tuple(self._python_folders())
-        self.python_busy = True
-        self.python_status = "Looking for Python installations"
-        self._emit(False)
-        def done(choices,error):
-            self.python_busy = False
-            self.python_choices = choices or []
-            if error: self.python_status = error
-            elif not self.python_choices: self.python_status = "No Python found. Use Set up Python to create one, or install Python 3."
-            elif not any(c["matplotlib"] for c in self.python_choices): self.python_status = "Python found, but numpy and matplotlib are missing. Set up Python installs both in a private environment."
-            else: self.python_status = ""
-            self._emit(False)
-        self._submit(lambda: python_runtime.discover(managed, folders), done, False)
+    def refreshPython(self): return studio_runtime.refresh_python(self, python_runtime_mod=python_runtime)
 
     @Slot(str)
-    def installPythonPackages(self, path):
-        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
-        self.python_busy = True
-        self.python_status = "Preparing to install numpy and matplotlib"
-        self._emit(False)
-        def done(result,error):
-            self.python_busy = False
-            if error:
-                self.python_status = error
-                self._emit(False)
-                return
-            self.settings["python"] = result
-            self._preferences()
-            self.refreshPython()
-        self._submit(lambda: python_runtime.install_packages(path, self.pythonProgress.emit), done, False)
+    def installPythonPackages(self, path): return studio_runtime.install_python_packages(self, path, python_runtime_mod=python_runtime)
 
     @Slot()
     def setupPython(self):
-        if self.retired or self.python_busy or getattr(self.pool, "_shutdown", False): return
-        managed = self.data / "python-env"
-        self.python_busy = True
-        self.python_status = "Preparing Python setup"
-        self._emit(False)
-        def done(path,error):
-            self.python_busy = False
-            if error:
-                self.python_status = error
-                self._emit(False)
-                return
-            self.settings["python"] = path
-            self._preferences()
-            self.python_status = "Python with numpy and matplotlib is ready"
-            self._emit()
-            self.python_busy = False
-            self.refreshPython()
-            self.python_status = "Python with numpy and matplotlib is ready"
-        self._submit(lambda: python_runtime.setup_environment(managed, self.pythonProgress.emit), done, False)
+        return studio_runtime.setup_python(self, python_runtime_mod=python_runtime)
 
     @Slot(int, int, bool)
     def rememberWindow(self, width, height, maximized):
@@ -2986,48 +2714,7 @@ class Studio(QObject):
 
     @Slot()
     def installUpdate(self):
-        if not self.update_path or self.update_running:return
-        try:
-            kind=updates.installer_kind(self.update_info)
-        except (TypeError,ValueError,KeyError):
-            self.update_status='Update information is invalid. Check for updates again.'
-            self._emit(False);return
-        if kind=='appimage' and not self.desktopIntegrationAvailable:
-            self.update_status='This installation is package-managed. Install the DEB/RPM from the release page using your package manager.'
-            QDesktopServices.openUrl(QUrl(updates.REPO+'/releases/latest'));self._emit(False);return
-        self.update_running=True;self.update_status='Verifying and preparing installation…';self._emit(False)
-        def prepare():
-            saved=updates.load_ready(self.data/'updates',self.appVersion)
-            if not saved or saved['path']!=self.update_path:raise ValueError('Installer changed or is missing. Download the update again.')
-            prepared_kind=updates.installer_kind(saved['release'])
-            if not self.update_info or saved['release']['version']!=self.update_info.get('version'):
-                raise ValueError('The verified installer no longer matches the selected update. Check for updates again.')
-            if prepared_kind=='appimage':
-                installed=app_integration.install_appimage(self.update_path,saved['release']['version'],self.settings.get('desktopIntegration',False))
-                return installed,prepared_kind
-            return self.update_path,prepared_kind
-        def done(prepared,error):
-            self.update_running=False
-            if error:self.update_status='Update installation failed: '+error;return
-            path,prepared_kind=prepared
-            if prepared_kind=='appimage':
-                self.session.update_installed=True;self.session.changed.emit()
-                self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
-            else:
-                opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-                if isinstance(opened,tuple):opened=opened[0]
-                if not opened:
-                    self.update_status='Could not open the verified installer. It is still available in Downloads.'
-                else:
-                    self.session.update_installed=True;self.session.changed.emit()
-                    if prepared_kind in ('deb','rpm'):
-                        self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
-                    elif prepared_kind=='macos':
-                        self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
-                    else:
-                        self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
-            self._emit(False)
-        self._submit(prepare,done,False)
+        return studio_runtime.install_update(self, updates_mod=updates, app_integration_mod=app_integration, open_url_fn=QDesktopServices.openUrl, start_detached_fn=QProcess.startDetached)
 
     def _can_move(self):
         return not (self.retired or self.busy or self.saving or self.pending_close or self.pending_save_as or self.pending_export or self.flush_operation)
@@ -3057,6 +2744,7 @@ class Studio(QObject):
         if not note: return False
         old = self.tabs.index(note)
         self.tabs.remove(note)
+        self._preview_jobs.cancel_tab(tab_id)
         self.session.reader_assets.revoke_tab(self.window_id, tab_id)
         target.tabs.insert(max(0, min(len(target.tabs), index)), note)
         target.active = tab_id
@@ -3125,249 +2813,49 @@ class Studio(QObject):
     def chooseFont(self): self.fontPickerRequested.emit()
 
     @Slot()
-    def chooseCustomTheme(self):self.themePickerRequested.emit()
+    def chooseCustomTheme(self): studio_chrome.choose_custom_theme(self)
 
     @Slot()
-    def chooseThemeExport(self):self.themeExportRequested.emit()
+    def chooseThemeExport(self): studio_chrome.choose_theme_export(self)
 
     @Slot()
-    def openThemeGuide(self):self.readerCall.emit("window.supermdThemeGuide?.()")
+    def openThemeGuide(self): studio_chrome.open_theme_guide(self)
 
-    def _save_theme_library(self):
-        atomic_json(
-            self.data / "theme-library.json",
-            {
-                "active": {"kind": self.session.active_theme_kind, "id": self.session.active_theme_id},
-                "saved": self.session.saved_themes,
-            },
-        )
+    def _save_theme_library(self): studio_chrome.save_theme_library(self, write_json=atomic_json)
 
-    def _clear_theme_background_overrides(self):
-        changed = any(
-            self.settings.get(key) != default
-            for key, default in (("patternKind", ""), ("patternOpacity", -1), ("patternSize", 0), ("patternSpacing", 0))
-        )
-        self.settings.update(patternKind="", patternOpacity=-1, patternSize=0, patternSpacing=0)
-        if changed:
-            self._preferences(False)
+    def _clear_theme_background_overrides(self): studio_chrome.clear_theme_background_overrides(self)
 
-    def _watch_custom_theme(self):
-        if self.retired:return
-        watcher=self.custom_theme_watcher
-        paths=watcher.files()+watcher.directories()
-        if paths:watcher.removePaths(paths)
-        source=Path(self.session.theme_source) if self.session.active_theme_kind!="preset" and self.session.theme_source else None
-        self.custom_theme_stamp=custom_theme.stamp(source) if source else None
-        if source:
-            watcher.addPaths([str(path) for path in (source,source.parent) if path.exists()])
+    def _watch_custom_theme(self): studio_chrome.watch_custom_theme(self)
 
-    def _custom_theme_event(self):
-        if self.retired or self.session.active_theme_kind=="preset" or not self.session.theme_source:return
-        value=custom_theme.stamp(Path(self.session.theme_source))
-        if value==self.custom_theme_stamp:return
-        self.custom_theme_stamp=value
-        self.reloadCustomTheme()
+    def _custom_theme_event(self): studio_chrome.custom_theme_event(self)
 
-    def _restore_custom_theme(self):
-        if self.retired:
-            return
-        self._watch_custom_theme()
-        if self.session.theme_restored:
-            return
-        self.session.theme_restored = True
-        kind = self.session.active_theme_kind
-        cached = self.data / "theme.json"
-        if kind == "preset":
-            try:
-                target = cached if cached.is_file() else custom_theme.bundled_theme_path(self.session.active_theme_id, ROOT)
-            except ValueError:
-                return
-            self._load_custom_theme(target, mode="restore")
-            return
-        if kind == "saved":
-            saved_file = self.data / "themes" / f"{self.session.active_theme_id}.json"
-            primary = saved_file if saved_file.is_file() else cached
-            source = Path(self.session.theme_source) if self.session.theme_source else None
-            follow = source if source and source.is_file() and source != primary else None
-            if primary.is_file():
-                self._load_custom_theme(primary, mode="restore", follow_source=follow)
-            elif follow:
-                self._load_custom_theme(follow, mode="restore")
-            return
-        source = Path(self.session.theme_source) if self.session.theme_source else cached
-        if not source.is_file():
-            source = cached
-        if self.session.custom_theme is None and cached.is_file() and cached != source:
-            self._load_custom_theme(cached, mode="restore", follow_source=source)
-        elif source.is_file():
-            self._load_custom_theme(source, mode="restore")
+    def _restore_custom_theme(self): studio_chrome.restore_custom_theme(self, root=ROOT)
 
     @Slot(str)
-    def importCustomTheme(self,value):self._load_custom_theme(local_path(value),mode="import")
+    def importCustomTheme(self,value): studio_chrome.import_custom_theme(self, local_path(value))
 
     @Slot(str)
-    def selectBundledTheme(self,preset_id):self._apply_bundled_theme(preset_id)
+    def selectBundledTheme(self,preset_id): studio_chrome.select_bundled_theme(self, preset_id, root=ROOT)
 
-    def _apply_bundled_theme(self,preset_id,callback=None):
-        if not isinstance(preset_id,str) or not preset_id:
-            if callback:callback(None,"Unknown bundled theme")
-            return
-        if preset_id=="builtin":
-            self.resetCustomTheme()
-            if callback:callback({"id":"builtin","name":"Built-in appearance"},"")
-            return
-        try:
-            path=custom_theme.bundled_theme_path(preset_id,ROOT)
-        except ValueError as error:
-            self.message="Theme not applied: "+str(error);self._emit(False)
-            if callback:callback(None,str(error))
-            return
-        self._load_custom_theme(path,mode="preset",preset_id=preset_id,callback=callback)
+    def _apply_bundled_theme(self,preset_id,callback=None): studio_chrome.apply_bundled_theme(self, preset_id, callback=callback, root=ROOT)
 
     @Slot(str)
-    def selectSavedTheme(self,entry_id):
-        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
-        if entry is None:return
-        path=self.data/"themes"/f"{entry_id}.json"
-        if not path.is_file():
-            self.message="Saved theme is unavailable.";self._emit(False);return
-        self._load_custom_theme(path,mode="saved",entry_id=entry_id)
+    def selectSavedTheme(self,entry_id): studio_chrome.select_saved_theme(self, entry_id)
 
     @Slot(str)
-    def deleteSavedTheme(self,entry_id):
-        entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
-        if entry is None:return
-        self.session.saved_themes=[item for item in self.session.saved_themes if item["id"]!=entry_id]
-        (self.data/"themes"/f"{entry_id}.json").unlink(missing_ok=True)
-        was_active=self.session.active_theme_kind=="saved" and self.session.active_theme_id==entry_id
-        if was_active:
-            self.session.theme_epoch+=1
-            self.session.custom_theme=None
-            self.session.theme_source=""
-            self.session.active_theme_kind="builtin"
-            self.session.active_theme_id=""
-            self.session.theme_revision+=1
-            for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
-            self._clear_theme_background_overrides()
-            for window in self.session.windows.values():window._watch_custom_theme()
-        try:self._save_theme_library()
-        except OSError:pass
-        self.message="Removed "+entry["name"]
-        self.session.changed.emit()
+    def deleteSavedTheme(self,entry_id): studio_chrome.delete_saved_theme(self, entry_id, write_json=atomic_json)
 
     @Slot()
-    def reloadCustomTheme(self):
-        if self.retired or self.session.active_theme_kind=="preset":return
-        if self.session.active_theme_kind=="saved" and not self.session.theme_source:return
-        source=Path(self.session.theme_source) if self.session.theme_source else self.data/"theme.json"
-        if not source.is_file():source=self.data/"theme.json"
-        self._watch_custom_theme()
-        cached=self.data/"theme.json"
-        if self.session.custom_theme is None and cached.is_file() and cached!=source:self._load_custom_theme(cached,mode="restore",follow_source=source,clear_overrides_on_follow=True)
-        elif source.is_file():self._load_custom_theme(source,mode="reload")
+    def reloadCustomTheme(self): studio_chrome.reload_custom_theme(self)
 
     def _load_custom_theme(self,path,mode="import",follow_source=None,preset_id="",entry_id="",callback=None,clear_overrides_on_follow=False):
-        self.session.theme_epoch+=1
-        epoch=self.session.theme_epoch
-        try:engine=self._engine()
-        except ValueError as error:
-            self.message=str(error);self._emit(False)
-            if callback:callback(None,str(error))
-            return
-        def finished(value,error):
-            if epoch!=self.session.theme_epoch:
-                if callback:callback(None,"Superseded by newer theme selection")
-                return
-            if error:
-                self.message="Theme not applied: "+str(error);self._emit(False)
-                if callback:callback(None,str(error))
-                if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
-                return
-            try:
-                changed=value!=self.session.custom_theme
-                if mode=="import":
-                    source_str=str(path)
-                    existing=next((item for item in self.session.saved_themes if item.get("source")==source_str),None)
-                    if existing is not None:
-                        target_id=existing["id"]
-                        existing["name"]=value["name"]
-                    else:
-                        target_id=uuid.uuid4().hex
-                        self.session.saved_themes.append({"id":target_id,"name":value["name"],"source":source_str})
-                    (self.data/"themes").mkdir(parents=True,exist_ok=True)
-                    atomic_json(self.data/"themes"/f"{target_id}.json",value)
-                    self.session.active_theme_kind="saved"
-                    self.session.active_theme_id=target_id
-                    self.session.theme_source=source_str
-                    atomic_json(self.data/"theme-source.json",{"path":source_str})
-                    atomic_json(self.data/"theme.json",value)
-                    self._save_theme_library()
-                    self._clear_theme_background_overrides()
-                elif mode=="preset":
-                    self.session.active_theme_kind="preset"
-                    self.session.active_theme_id=preset_id
-                    self.session.theme_source=""
-                    (self.data/"theme-source.json").unlink(missing_ok=True)
-                    atomic_json(self.data/"theme.json",value)
-                    self._save_theme_library()
-                    self._clear_theme_background_overrides()
-                elif mode=="saved":
-                    entry=next((item for item in self.session.saved_themes if item["id"]==entry_id),None)
-                    source_str=entry.get("source","") if entry else ""
-                    if entry is not None:entry["name"]=value["name"]
-                    self.session.active_theme_kind="saved"
-                    self.session.active_theme_id=entry_id
-                    self.session.theme_source=source_str
-                    if source_str:atomic_json(self.data/"theme-source.json",{"path":source_str})
-                    else:(self.data/"theme-source.json").unlink(missing_ok=True)
-                    atomic_json(self.data/"theme.json",value)
-                    self._save_theme_library()
-                    self._clear_theme_background_overrides()
-                elif mode=="reload":
-                    if self.session.active_theme_kind=="saved" and self.session.active_theme_id:
-                        (self.data/"themes").mkdir(parents=True,exist_ok=True)
-                        atomic_json(self.data/"themes"/f"{self.session.active_theme_id}.json",value)
-                        entry=next((item for item in self.session.saved_themes if item["id"]==self.session.active_theme_id),None)
-                        if entry is not None:entry["name"]=value["name"]
-                        self._save_theme_library()
-                    if changed:atomic_json(self.data/"theme.json",value)
-                    self._clear_theme_background_overrides()
-                else:
-                    if changed:atomic_json(self.data/"theme.json",value)
-                self.session.custom_theme=value
-                if changed:self.session.theme_revision+=1
-                for window in self.session.windows.values():window._watch_custom_theme()
-                if mode in ("import","preset","saved","reload") or (mode!="restore" and changed):
-                    self.message="Applied "+value["name"]
-                self.session.changed.emit()
-                if callback:callback({"id":preset_id or entry_id or self.session.active_theme_id,"name":value["name"]},"")
-            except OSError as failure:
-                self.message="Could not save theme: "+str(failure);self._emit(False)
-                if callback:callback(None,str(failure))
-            if follow_source:self._load_custom_theme(follow_source,mode="reload" if clear_overrides_on_follow else "restore")
-        def read():
-            try:return custom_theme.read(engine,path),None
-            except Exception as failure:return None,str(failure)
-        self._submit(read,lambda result,error:finished(*(result or (None,error))),False)
+        studio_chrome.load_custom_theme(self, path, mode=mode, follow_source=follow_source, preset_id=preset_id, entry_id=entry_id, callback=callback, clear_overrides_on_follow=clear_overrides_on_follow, write_json=atomic_json)
 
     @Slot()
-    def resetCustomTheme(self):
-        self.session.theme_epoch+=1
-        self.session.custom_theme=None;self.session.theme_source=""
-        self.session.active_theme_kind="builtin";self.session.active_theme_id=""
-        self.session.theme_revision+=1
-        for filename in ("theme.json","theme-source.json"):(self.data/filename).unlink(missing_ok=True)
-        try:self._save_theme_library()
-        except OSError:pass
-        self._clear_theme_background_overrides()
-        for window in self.session.windows.values():window._watch_custom_theme()
-        self.session.changed.emit()
+    def resetCustomTheme(self): studio_chrome.reset_custom_theme(self, write_json=atomic_json)
 
     @Slot()
-    def editCustomTheme(self):
-        if self.session.active_theme_kind=="preset" or not self.session.theme_source:return
-        source=Path(self.session.theme_source)
-        if source.is_file():QDesktopServices.openUrl(QUrl.fromLocalFile(str(source)))
+    def editCustomTheme(self): studio_chrome.edit_custom_theme(self, open_url=QDesktopServices.openUrl)
 
     @Slot(str)
     def exportCustomTheme(self,value):
@@ -3563,176 +3051,109 @@ class Studio(QObject):
 
     @Property(bool, notify=changed)
     def dropBlocked(self):
-        return bool(self.retired or self.pending_close or self.flush_operation)
+        return studio_paths_media.drop_blocked(self)
 
     @Slot(QObject)
     @Slot(QObject, QObject)
     def attachWindowDropFilter(self, window: QObject | None, reader: QObject | None = None):
-        if window is None or self.retired:
-            return
-        existing = getattr(self, "_workspace_drop_filter", None)
-        if existing is not None and existing.window is window:
-            existing.set_reader(reader)
-            return
-        if existing is not None:
-            try:
-                existing.window.removeEventFilter(existing)
-            except RuntimeError:
-                pass
-        self._workspace_drop_filter = WorkspaceDropFilter(self, window, reader)
+        studio_paths_media.attach_window_drop_filter(self, window, reader, filter_cls=WorkspaceDropFilter)
 
     @Slot("QVariantList", bool, result=bool)
     def shouldInterceptExternalDrop(self, urls, over_reader: bool = False) -> bool:
-        paths = _extract_local_drop_paths(urls)
-        if not paths:
-            return False
-        if self.dropBlocked:
-            return True
-        folders, notes, images, unsupported = _classify_drop_paths(paths)
-        if (
-            over_reader
-            and self.settings.get("welcomed")
-            and self.ready
-            and not self.reader_overlay
-            and not self.image_overlay
-            and images
-            and not folders
-            and not notes
-            and not unsupported
-        ):
-            return False
-        return True
+        return studio_paths_media.should_intercept_external_drop(
+            self, urls, over_reader, extract_paths_fn=_extract_local_drop_paths, classify_paths_fn=_classify_drop_paths
+        )
 
     @Slot("QVariantList")
     def openDroppedUrls(self, urls):
-        self.handleExternalDrop(urls, False)
+        studio_paths_media.open_dropped_urls(
+            self, urls, extract_paths_fn=_extract_local_drop_paths, classify_paths_fn=_classify_drop_paths
+        )
 
     @Slot("QVariantList", bool)
     def handleExternalDrop(self, urls, over_reader: bool = False):
-        del over_reader
-        if self.dropBlocked:
-            return
-        paths = _extract_local_drop_paths(urls)
-        if not paths:
-            return
-        folders, notes, images, unsupported = _classify_drop_paths(paths)
-        if not folders and not notes:
-            if images:
-                self.message = "Drop images inside an open note to insert them."
-            else:
-                self.message = "Only Markdown notes (.md, .smd, .fmd, .markdown, .txt) and folders can be opened by dropping."
-            self._emit(False)
-            return
-
-        notices: list[str] = []
-        if len(folders) > 1:
-            skipped_folders = len(folders) - 1
-            notices.append(f"opened folder {folders[-1].name} ({skipped_folders} other folder{'s' if skipped_folders != 1 else ''} skipped)")
-        skipped_files = len(images) + len(unsupported)
-        if skipped_files:
-            if images and not unsupported:
-                notices.append("drop images inside an open note separately to insert them")
-            else:
-                notices.append(f"skipped {skipped_files} unsupported item{'s' if skipped_files != 1 else ''}")
-
-        formatted_notice = ""
-        if notices:
-            joined = "; ".join(notices)
-            formatted_notice = joined[0].upper() + joined[1:] + "."
-
-        if folders:
-            self.openFolder(str(folders[-1]))
-            self.workspaceFolderDropped.emit()
-            if not notes and self.host_window is not None:
-                self.host_window.raise_()
-                self.host_window.requestActivate()
-
-        if notes:
-            self._open_dropped_notes(notes, notice=formatted_notice)
-        elif formatted_notice:
-            self.message = formatted_notice
-            self._emit(False)
+        studio_paths_media.handle_external_drop(
+            self, urls, over_reader, extract_paths_fn=_extract_local_drop_paths, classify_paths_fn=_classify_drop_paths
+        )
 
     def _open_dropped_notes(self, note_paths: list[Path], *, notice: str = ""):
-        if not note_paths or self.retired:
-            return
-        self._activation_generation += 1
-        batch_generation = self._activation_generation
-        highest_activated_index = -1
-        batch_new_tab_indices: dict[str, int] = {}
-        opened_paths_by_index: dict[int, str] = {}
-        errors: list[str] = []
-        remaining = len(note_paths)
-
-        def make_batch_insert(index: int):
-            def insert_note(note: dict):
-                batch_new_tab_indices[note["id"]] = index
-                insert_at = next(
-                    (
-                        pos
-                        for pos, existing in enumerate(self.tabs)
-                        if existing["id"] in batch_new_tab_indices and batch_new_tab_indices[existing["id"]] > index
-                    ),
-                    None,
-                )
-                if insert_at is None:
-                    self.tabs.append(note)
-                else:
-                    self.tabs.insert(insert_at, note)
-            return insert_note
-
-        def make_should_activate(index: int):
-            def check(_tab: dict) -> bool:
-                nonlocal highest_activated_index
-                if index >= highest_activated_index:
-                    highest_activated_index = index
-                    return True
-                return False
-            return check
-
-        def make_done(index: int, path: Path):
-            def done(tab: dict | None, error: str | None):
-                nonlocal remaining
-                if error:
-                    errors.append(f"{path.name}: {error}")
-                elif tab is not None:
-                    opened_paths_by_index[index] = folder_ops.canonical_path_str(path)
-                remaining -= 1
-                if remaining == 0 and not self.retired:
-                    if len(opened_paths_by_index) > 1:
-                        ordered = [opened_paths_by_index[i] for i in sorted(opened_paths_by_index, reverse=True)]
-                        self.recent = (
-                            ordered
-                            + [p for p in self.recent if not any(folder_ops.same_path(p, o) for o in ordered)]
-                        )[:30]
-                        self._preferences()
-                    parts: list[str] = []
-                    if errors:
-                        parts.append("Could not open " + "; ".join(errors))
-                    if notice:
-                        parts.append(notice)
-                    if parts:
-                        self.message = " ".join(parts)
-                    self._emit(False)
-            return done
-
-        for idx, note_path in enumerate(note_paths):
-            self._open_note(
-                str(note_path),
-                explicit=True,
-                activation_generation=batch_generation,
-                completion_callback=make_done(idx, note_path),
-                batch_insert=make_batch_insert(idx),
-                should_activate_fn=make_should_activate(idx),
-            )
+        studio_paths_media.open_dropped_notes(self, note_paths, notice=notice)
 
     @Slot(str)
     def openPath(self, value):
+        if self.retired:
+            return
         path = local_path(value)
         if path.is_dir():
             self.openFolder(str(path))
-        else:
-            self.openNote(str(path))
+            if self.folder and folder_ops.same_path(self.folder, path):
+                self.workspaceFolderDropped.emit()
+                if self.host_window is not None:
+                    self.host_window.raise_()
+                    self.host_window.requestActivate()
+            return
+        had_unwelcomed_placeholder = not bool(self.settings.get("welcomed"))
+        canon_opening = folder_ops.canonical_path_str(path)
+        if canon_opening:
+            self._opening_paths[canon_opening] = self._opening_paths.get(canon_opening, 0) + 1
+        open_generation = self._activation_generation + 1
+
+        def finish_open_path(opened_tab, error):
+            if canon_opening and canon_opening in self._opening_paths:
+                remaining_opens = self._opening_paths[canon_opening] - 1
+                if remaining_opens > 0:
+                    self._opening_paths[canon_opening] = remaining_opens
+                else:
+                    self._opening_paths.pop(canon_opening, None)
+            if error or opened_tab is None or self.retired:
+                return
+            previous_active = self.active
+            placeholder_removed = self._remove_untouched_startup_placeholders(
+                keep_tab_id=opened_tab["id"],
+                allow_welcome_sample=had_unwelcomed_placeholder,
+            )
+            active_changed = self.active != previous_active
+            was_unwelcomed = not bool(self.settings.get("welcomed"))
+            if was_unwelcomed:
+                self.settings["welcomed"] = True
+                self._preferences(notify=False)
+            if placeholder_removed:
+                self.recovery_timer.start(800)
+            if placeholder_removed or was_unwelcomed:
+                emit_load = active_changed or (
+                    was_unwelcomed
+                    and self.active == opened_tab["id"]
+                    and open_generation == self._activation_generation
+                )
+                self._emit(emit_load)
+
+        self._open_note(str(path), explicit=True, completion_callback=finish_open_path)
+
+    @staticmethod
+    def _same_open_tab_path(tab_path: str, path: Path) -> bool:
+        if not tab_path:
+            return False
+        if tab_path == str(path) or folder_ops.same_path(tab_path, path):
+            return True
+        try:
+            return not Path(tab_path).is_symlink() and os.path.samefile(tab_path, path)
+        except OSError:
+            return False
+
+    def has_open_tab_for_path(self, value) -> bool:
+        if self.retired:
+            return False
+        path = value if isinstance(value, Path) else local_path(str(value))
+        if path.is_dir():
+            return False
+        if any(self._same_open_tab_path(tab.get("path", ""), path) for tab in self.tabs):
+            return True
+        if any(folder_ops.same_path(restoring, path) for restoring in self._restoring_paths):
+            return True
+        return any(
+            count > 0 and folder_ops.same_path(opening, path)
+            for opening, count in self._opening_paths.items()
+        )
 
     @Slot()
     def chooseFolder(self):
@@ -4362,6 +3783,8 @@ class Studio(QObject):
         if key == "widthPercent": value = max(50,min(150,float(value)))
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
         self.settings[key] = value
+        if key == "welcomed" and value is True:
+            self._welcome_placeholder_id = None
         if key == "shortcuts": self._notify_shortcuts()
         if key == "hideNonNoteFolders":
             for win in list(self.session.windows.values()):
@@ -4793,8 +4216,9 @@ class Studio(QObject):
 
     @staticmethod
     def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
-        cleaned = folder_ops.strip_extended_length_prefix(str(raw_path or "").strip())
-        if not cleaned:
+        raw = os.fspath(raw_path) if isinstance(raw_path, os.PathLike) else str(raw_path or "")
+        cleaned = folder_ops.strip_extended_length_prefix(raw)
+        if not cleaned or not cleaned.strip():
             return None
         try:
             candidate = Path(cleaned).expanduser()
@@ -4816,7 +4240,8 @@ class Studio(QObject):
         home = cls._existing_save_directory(Path.home())
         if home is not None:
             return home
-        cleaned = folder_ops.strip_extended_length_prefix(str(raw_downloads or "").strip()) or str(Path.home())
+        raw = str(raw_downloads or "")
+        cleaned = folder_ops.strip_extended_length_prefix(raw) if raw.strip() else str(Path.home())
         return Path(cleaned).expanduser()
 
     def _default_output_directory(self) -> Path:
@@ -4825,7 +4250,8 @@ class Studio(QObject):
             or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
             or str(Path.home())
         )
-        cleaned = folder_ops.strip_extended_length_prefix(str(raw or "").strip()) or str(Path.home())
+        raw_str = str(raw or "")
+        cleaned = folder_ops.strip_extended_length_prefix(raw_str) if raw_str.strip() else str(Path.home())
         return Path(cleaned).expanduser()
 
     def _note_save_directory(self) -> Path:
@@ -4840,8 +4266,8 @@ class Studio(QObject):
     def _save_as_directory(self) -> Path:
         current_path = self._current().get("path") if self.tabs else ""
         if current_path:
-            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path).strip())
-            if cleaned_current:
+            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path))
+            if cleaned_current.strip():
                 parent = self._existing_save_directory(Path(cleaned_current).expanduser().parent)
                 if parent is not None:
                     return parent
@@ -4893,6 +4319,7 @@ class Studio(QObject):
         if removed["content"].strip() or removed["path"] or removed.get("assets"):
             if id in self._closing_tabs:return
             self._closing_tabs.add(id)
+            self._preview_jobs.cancel_tab(id)
             self._python_jobs.cancel_tab(id)
             # Strings and encoded assets are immutable; snapshot small mutable
             # metadata/asset mappings without walking large base64 strings.
@@ -4920,6 +4347,7 @@ class Studio(QObject):
         self._finish_remove_tab(id)
 
     def _finish_remove_tab(self,id):
+        self._preview_jobs.cancel_tab(id)
         self._python_jobs.cancel_tab(id)
         self.reader_edits.clear(id)
         current_index=next((i for i,tab in enumerate(self.tabs) if tab["id"]==id),None)
@@ -5461,108 +4889,19 @@ class Studio(QObject):
 
     @staticmethod
     def _parse_media_envelope(raw: str):
-        if len(raw) > 524_288:
-            key_pos = raw.find('"body"')
-            if key_pos >= 0:
-                colon_pos = raw.find(":", key_pos + 6)
-                if colon_pos >= 0:
-                    q_open = raw.find('"', colon_pos + 1)
-                    if q_open >= 0 and raw[colon_pos + 1:q_open].strip() == "":
-                        q_close = raw.find('"', q_open + 1)
-                        if q_close > q_open + 262_144:
-                            try:
-                                parsed = json.loads(raw[:q_open + 1] + raw[q_close:])
-                                if isinstance(parsed, dict) and parsed.get("body") == "":
-                                    return parsed, raw, q_open + 1, q_close
-                            except ValueError:
-                                pass
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            raise ValueError("Invalid media payload")
-        body = parsed.get("body")
-        if not isinstance(body, str):
-            raise ValueError("Media data is invalid or exceeds 25 MB")
-        return parsed, body, 0, len(body)
+        return studio_paths_media.parse_media_envelope(raw)
 
     @staticmethod
     def _validate_and_write_media(args: dict, directory: Path, *, source_str: str | None = None,
                                   body_start: int = 0, body_end: int | None = None) -> dict:
-        if not isinstance(args, dict):
-            raise ValueError("Invalid media payload")
-        mime_type, filename = args.get("mimeType"), args.get("filename", "")
-        if source_str is None:
-            body = args.get("body")
-            if not isinstance(body, str):
-                raise ValueError("Media data is invalid or exceeds 25 MB")
-            source_str = body
-            body_start = 0
-            body_end = len(body)
-        else:
-            assert body_end is not None
-        body_len = body_end - body_start
-        extensions = {"image/png": ".png", "image/svg+xml": ".svg", "image/jpeg": ".jpg",
-                      "image/webp": ".webp", "image/gif": ".gif", "image/avif": ".avif",
-                      "text/plain": ".mmd"}
-        if mime_type not in extensions:
-            raise ValueError("Unsupported media type")
-        if not isinstance(filename, str) or len(filename) > 160 or any(char in filename for char in ("/", "\\", "\0")):
-            raise ValueError("Media filename must be a short basename")
-        if body_len <= 0 or body_len > 36_000_000:
-            raise ValueError("Media data is invalid or exceeds 25 MB")
-        safe = re.sub(r"[^A-Za-z0-9._ -]", "", Path(str(filename)).stem).strip(" .")[:100] or "Super-MD-media"
-        extension = extensions[mime_type]
-        if not directory.is_dir():
-            raise ValueError("The media download folder is unavailable")
-
-        step = 262_144  # 256 KiB chars (multiple of 4)
-        first_end = min(body_start + step, body_end)
-        first_slice = source_str[body_start:first_end]
-        try:
-            if first_end < body_end and "=" in first_slice:
-                raise base64.binascii.Error("Excess data after padding")
-            first_chunk = base64.b64decode(first_slice, validate=True)
-        except (ValueError, base64.binascii.Error):
-            raise ValueError("Media data is not valid base64") from None
-        if not first_chunk or len(first_chunk) > 25_000_000:
-            raise ValueError("Media data is empty or exceeds 25 MB")
-        if not _matches_media_signature(mime_type, first_chunk):
-            raise ValueError("Media bytes do not match the declared type")
-
-        for suffix in range(1, 10000):
-            name = f"{safe}{'' if suffix == 1 else f' ({suffix})'}{extension}"
-            path = directory / name
-            try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                continue
-            try:
-                total_bytes = len(first_chunk)
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(first_chunk)
-                    for offset in range(first_end, body_end, step):
-                        end = min(offset + step, body_end)
-                        chunk = source_str[offset:end]
-                        try:
-                            if end < body_end and "=" in chunk:
-                                raise base64.binascii.Error("Excess data after padding")
-                            piece = base64.b64decode(chunk, validate=True)
-                        except (ValueError, base64.binascii.Error):
-                            raise ValueError("Media data is not valid base64") from None
-                        total_bytes += len(piece)
-                        if total_bytes > 25_000_000:
-                            raise ValueError("Media data is empty or exceeds 25 MB")
-                        if piece:
-                            stream.write(piece)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                return {"filename": name, "path": str(path), "bytes": total_bytes, "mimeType": mime_type}
-            except Exception:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                raise
-        raise ValueError("Could not find an unused media filename")
+        return studio_paths_media.validate_and_write_media(
+            args,
+            directory,
+            source_str=source_str,
+            body_start=body_start,
+            body_end=body_end,
+            matches_signature_fn=_matches_media_signature,
+        )
 
     def _media_download_directory(self) -> Path:
         directory = Path(self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
@@ -5655,23 +4994,44 @@ class Studio(QObject):
         QTimer.singleShot(200, lambda rid=request_id: self._agent_viewport_fallback(rid))
 
     def _capture_background_preview(self, request_id, tab_id, revision, context, args):
-        from offline_view import render_live_snapshot
-        tab=next(t for t in self.tabs if t["id"]==tab_id)
+        bridge=getattr(self.session,"agent_bridge",None)
+        tab=next((t for t in self.tabs if t["id"]==tab_id),None)
+        if self.retired or tab is None or tab_id in self._closing_tabs:
+            if bridge is not None:bridge.complete(request_id,None,"The note for this preview is no longer open",window_id=self.window_id)
+            return
         content,assets,path=tab["content"],dict(tab.get("assets",{})),tab.get("path","")
         width=max(320,min(1600,int(args.get("width",1200))))
         heading=context.get("reading",{}).get("heading") or None
         view={"dark":self._dark(),"colors":self._colors(),"font":self.settings["font"],"size":self.settings["size"],"svgAppearance":self.settings["svgAppearance"],"lineHeight":self.settings["lineHeight"]}
+        preview_job=self._preview_jobs.register(tab_id)
+        def work():
+            try:
+                return offline_view.render_live_snapshot(content,assets,path,width=width,heading=heading,view=view,job=preview_job)
+            except offline_view.PreviewCancelled:
+                return None
+            finally:
+                self._preview_jobs.discard(preview_job)
         def done(body,error):
             bridge=getattr(self.session,"agent_bridge",None)
             if bridge is None:return
+            if body is None and not error:
+                bridge.complete(request_id,None,"Background preview cancelled",window_id=self.window_id);return
             if error:bridge.complete(request_id,None,str(error),window_id=self.window_id);return
-            if self._agent_viewport_revision(tab_id)!=revision:
+            try:
+                current_revision=self._agent_viewport_revision(tab_id)
+            except ValueError as rev_error:
+                bridge.complete(request_id,None,str(rev_error),window_id=self.window_id);return
+            if current_revision!=revision:
                 bridge.complete(request_id,None,"The note changed during background preview; retry",window_id=self.window_id);return
             image=QImage.fromData(body,"PNG")
             mime="image/jpeg" if args.get("imageFormat")=="jpeg" else "image/png"
             encoded=QByteArray();buffer=QBuffer(encoded);buffer.open(QIODevice.OpenModeFlag.WriteOnly);image.save(buffer,"JPEG" if mime=="image/jpeg" else "PNG")
             bridge.complete(request_id,{"tabId":tab_id,"revision":revision,"mime_type":mime,"data":base64.b64encode(bytes(encoded)).decode(),"width":image.width(),"height":image.height(),"context":context,"renderedFrom":"background-preview"},window_id=self.window_id)
-        self._submit(lambda:render_live_snapshot(content,assets,path,width=width,heading=heading,view=view),done,False)
+        if self.retired or getattr(self.pool,"_shutdown",False):
+            self._preview_jobs.discard(preview_job)
+            if bridge is not None:bridge.complete(request_id,None,"Background preview cancelled",window_id=self.window_id)
+            return
+        self._submit(work,done,False)
 
     def _clear_agent_viewport_capture(self, pending):
         if self._agent_viewport_capture is not pending:
@@ -5906,6 +5266,7 @@ class Studio(QObject):
             if command in ("document_sync", "document_patch", "document_resync"):
                 target = next((t for t in self.tabs if t["id"] == args.get("id")), None)
                 def commit_edit(content):
+                    self._mark_tab_touched(target["id"])
                     was_dirty=target["content"]!=target["saved"]
                     target["content"] = content
                     if target["id"] == self.active:self._last_reader_text=(target["id"],content)
@@ -5927,7 +5288,9 @@ class Studio(QObject):
             if command == "document_changed":
                 target = next((t for t in self.tabs if t["id"] == args["id"]), None)
                 self.reader_edits.clear(args["id"])
-                if target: target["content"] = args["content"]
+                if target:
+                    self._mark_tab_touched(target["id"])
+                    target["content"] = args["content"]
                 if target and target["id"]==self.active:self._last_reader_text=(target["id"],target["content"])
                 self.recovery_timer.start(800)
                 self.autosave_timer.start(900)

@@ -33,6 +33,8 @@ ApplicationWindow {
     flags: (studio.fedoraWindowFrame || windowModes.immersive) ? Qt.Window | Qt.FramelessWindowHint : Qt.platform.os === "osx" || Qt.platform.os === "windows" ? Qt.Window | Qt.ExpandedClientAreaHint | Qt.NoTitleBarBackgroundHint : Qt.Window
     title: viewState.name + " - Super MD"
     property var viewState: JSON.parse(studio.snapshot)
+    property var tabsState: JSON.parse(studio.tabsSnapshot)
+    property string activeTabId: studio.activeTabId
     property var sidebarState: JSON.parse(studio.sidebarSnapshot)
     property var reader: readerLoader.item
     property bool sidebar: true
@@ -245,7 +247,7 @@ ApplicationWindow {
         case "find_next": window.focusReader(); studio.command("find_next"); break
         case "find_previous": window.focusReader(); studio.command("find_previous"); break
         case "search_folder": studio.openFolderSearch(); break
-        case "close_tab": studio.closeTabSafely(viewState.active); break
+        case "close_tab": studio.closeTabSafely(window.activeTabId || viewState.active); break
         case "next_tab": studio.cycleTab(1); break
         case "previous_tab": studio.cycleTab(-1); break
         case "move_tab_left": studio.moveActiveTab(-1); break
@@ -457,7 +459,7 @@ ApplicationWindow {
                         onDoubleTapped: window.visibility === Window.Maximized ? window.showNormal() : window.showMaximized()
                     }
                 }
-                ActionButton { glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
+                ActionButton { objectName: "findInNoteButton"; glyph: "MagnifyingGlass"; ToolTip.text: window.hintWithShortcut("Find in note", "find"); onClicked: window.openFind() }
                 ActionButton { visible: window.width >= 1060; glyph: "Image"; ToolTip.text: "Insert image or link"; onClicked: studio.command("insert") }
                 ActionButton { visible: window.width >= 1060; glyph: "Bug"; ToolTip.text: "Fix LaTeX"; onClicked: studio.command("repair") }
                 ActionButton { visible: window.width >= 1060; glyph: "ShareNetwork"; ToolTip.text: "Share note"; onClicked: window.showExport(true) }
@@ -482,6 +484,8 @@ ApplicationWindow {
         TabStrip {
             width: parent.width
             viewState: window.viewState
+            tabs: window.tabsState
+            activeTabId: window.activeTabId
             shortcutLabels: window.shortcutLabels
         }
         Rectangle { width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
@@ -508,6 +512,8 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     viewState: window.viewState
+                    tabs: window.tabsState
+                    activeTabId: window.activeTabId
                     sidebarState: window.sidebarState
                     shortcutLabels: window.shortcutLabels
                 }
