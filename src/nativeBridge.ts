@@ -1,5 +1,3 @@
-import { invoke as tauriInvoke } from "@tauri-apps/api/core";
-
 declare global {
   interface Window {
     SuperMD?: { post: (id: string, command: string, args: string) => void };
@@ -17,7 +15,7 @@ if (typeof window !== "undefined") window.supermdReply = (id, value, error) => {
   error ? task.reject(new Error(error)) : task.resolve(value);
 };
 export function invoke<T>(command: string, args: Record<string, unknown> = {}): Promise<T> {
-  if (!window.SuperMD) return tauriInvoke<T>(command, args);
+  if (typeof window === "undefined" || !window.SuperMD) return Promise.reject(new Error(`Native host bridge unavailable for ${command}`));
   return new Promise((resolve, reject) => {
     const id = `${bridgeEpoch}:${++sequence}`;
     const timeout = command === "export_pdf_native" ? 180_000 : command === "run_python" ? 120_000 : 60_000;
