@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { afterEach, expect, it } from 'vitest';
+import { expect, it } from 'vitest';
 import {
   buildHtmlEntries,
   htmlCspPlugin,
@@ -8,16 +8,6 @@ import {
   stripLegacyMathFontFallbacks,
   woff2MathFontsPlugin,
 } from './vite.config';
-
-const originalTauriPlatform = process.env.TAURI_ENV_PLATFORM;
-
-afterEach(() => {
-  if (originalTauriPlatform === undefined) {
-    delete process.env.TAURI_ENV_PLATFORM;
-  } else {
-    process.env.TAURI_ENV_PLATFORM = originalTauriPlatform;
-  }
-});
 
 function runHtmlCspTransform(html: string, filename: string, command: 'build' | 'serve') {
   const plugin = htmlCspPlugin();
@@ -58,30 +48,23 @@ it('embeds an HTML5-normalized SHA-256 CSP digest for the Mermaid sandbox bundle
   expect(doc).toContain(`script-src 'sha256-${expectedDigest}' 'wasm-unsafe-eval'`);
 });
 
-it('strips duplicate meta CSP only from index.html during Tauri platform builds', () => {
+it('preserves meta Content-Security-Policy across index, Qt and Android entrypoints during build', () => {
   const indexHtml = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
   const qtHtml = readFileSync(new URL('./qt-reader.html', import.meta.url), 'utf8');
   const androidHtml = readFileSync(new URL('./android-reader.html', import.meta.url), 'utf8');
 
-  delete process.env.TAURI_ENV_PLATFORM;
   expect(runHtmlCspTransform(indexHtml, '/repo/index.html', 'build')).toContain(
-    'http-equiv="Content-Security-Policy"',
+    '<meta http-equiv="Content-Security-Policy"',
   );
-
-  process.env.TAURI_ENV_PLATFORM = 'windows';
-  expect(runHtmlCspTransform(indexHtml, 'C:\\repo\\index.html', 'build')).not.toContain(
-    'Content-Security-Policy',
+  expect(runHtmlCspTransform(qtHtml, '/repo/qt-reader.html', 'build')).toContain(
+    '<meta http-equiv="Content-Security-Policy"',
   );
-  expect(runHtmlCspTransform(qtHtml, 'C:\\repo\\qt-reader.html', 'build')).toContain(
-    'http-equiv="Content-Security-Policy"',
-  );
-  expect(runHtmlCspTransform(androidHtml, 'C:\\repo\\android-reader.html', 'build')).toContain(
-    'http-equiv="Content-Security-Policy"',
+  expect(runHtmlCspTransform(androidHtml, '/repo/android-reader.html', 'build')).toContain(
+    '<meta http-equiv="Content-Security-Policy"',
   );
 });
 
 it('hashes CRLF inline preamble scripts with HTML5 LF normalization during vite serve', () => {
-  delete process.env.TAURI_ENV_PLATFORM;
   const sample = [
     '<!doctype html><html><head>',
     '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; script-src \'self\'; connect-src \'self\'">',
