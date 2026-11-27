@@ -227,9 +227,29 @@ export default defineConfig(({mode}) => ({
     port: 1420,
     strictPort: true,
     watch: {
-      ignored: ["**/dist/**", "**/src-tauri/target/**", "**/smd-core/target/**", "**/android/**/build/**", "**/desktop/.venv/**"],
+      ignored: [
+        "**/dist/**",
+        "**/coverage/**",
+        "**/test-results/**",
+        "**/playwright-report/**",
+        "**/*.tsbuildinfo",
+        "**/src-tauri/target/**",
+        "**/smd-core/target/**",
+        "**/android/**/build/**",
+        "**/desktop/.venv/**",
+      ],
     },
   },
-  envPrefix: ["VITE_", "TAURI_"]
-  ,build: { rollupOptions: { input: buildHtmlEntries(mode) } }
+  envPrefix: ["VITE_", "TAURI_"],
+  build: {
+    rollupOptions: {
+      input: buildHtmlEntries(mode),
+      output: {
+        manualChunks(id) {
+          if (/[\\/]node_modules[\\/]pele[\\/]/.test(id)) return "pele";
+          return undefined;
+        },
+      },
+    },
+  },
 }));

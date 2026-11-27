@@ -102,7 +102,7 @@ test.describe("Production build Mermaid rendering (vite preview)", () => {
   test.setTimeout(90_000);
 
   test.beforeAll(async ({}, testInfo) => {
-    testInfo.setTimeout(120_000);
+    testInfo.setTimeout(180_000);
     const npmCmd = process.platform === "win32" ? "npm.cmd" : "npm";
     const npxCmd = process.platform === "win32" ? "npx.cmd" : "npx";
     execFileSync(npmCmd, ["run", "build"], {

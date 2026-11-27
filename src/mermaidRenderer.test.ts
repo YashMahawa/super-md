@@ -4,8 +4,35 @@ const engine = vi.hoisted(() => ({ initialize: vi.fn(), render: vi.fn() }));
 const fast = vi.hoisted(() => ({renderAsync:vi.fn().mockRejectedValue(new Error('Use compatibility renderer'))}));
 vi.mock("mermaid", () => ({ default: engine }));
 vi.mock('pele/lazy',()=>fast);
-import { renderMermaid, sanitizeDiagram } from "./mermaidRenderer";
+import { importModuleWithRetry, renderMermaid, sanitizeDiagram } from "./mermaidRenderer";
 describe("isolated SVG diagrams", () => {
+  it("retries transient dynamic import fetch failures and immediately rethrows non-transient errors", async () => {
+    let attempts = 0;
+    const recovered = await importModuleWithRetry(
+      async () => {
+        attempts++;
+        if (attempts < 2) {
+          throw new TypeError("Failed to fetch dynamically imported module: http://127.0.0.1:4173/assets/chunk.js");
+        }
+        return { ok: true };
+      },
+      [1, 1],
+    );
+    expect(recovered).toEqual({ ok: true });
+    expect(attempts).toBe(2);
+
+    let syntaxAttempts = 0;
+    await expect(
+      importModuleWithRetry(
+        async () => {
+          syntaxAttempts++;
+          throw new SyntaxError("Unexpected token '<'");
+        },
+        [1, 1],
+      ),
+    ).rejects.toThrow("Unexpected token");
+    expect(syntaxAttempts).toBe(1);
+  });
   it("retains SVG geometry, text and styles but strips active content", () => {
     const svg = sanitizeDiagram('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 50" onload="evil()"><style>.node{fill:red}</style><g class="node" id="a"><path d="M0 0L50 50"/><text>Study</text></g><script>evil()</script><foreignObject><div>evil</div></foreignObject><a href="javascript:evil()">link</a></svg>');
     expect(svg).toContain('viewBox="0 0 50 50"'); expect(svg).toContain('<path'); expect(svg).toContain('Study'); expect(svg).toContain('<style>');
