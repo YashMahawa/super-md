@@ -171,12 +171,12 @@ def _run_webengine_quick_switcher_probe() -> None:
         assert _wait_until(lambda: studio.ready, timeout=20.0), "WebEngine reader did not become ready"
         initial_active_id = studio.active
 
-        # 1. Focus a QML TextField (folderFilterField), open Quick Switcher via Ctrl+P,
-        #    navigate with Down/Up, dismiss with Escape -> focus recovers to folderFilterField!
-        filter_field = window.findChild(QObject, "folderFilterField")
-        assert filter_field is not None, "folderFilterField not found"
-        filter_field.forceActiveFocus()
-        assert _wait_until(lambda: bool(filter_field.property("activeFocus"))), "folderFilterField did not gain focus"
+        # 1. Focus a QML TextField (zoomPercentage), open Quick Switcher via Ctrl+P,
+        #    navigate with Down/Up, dismiss with Escape -> focus recovers to zoomPercentage!
+        zoom_field = window.findChild(QObject, "zoomPercentage")
+        assert zoom_field is not None, "zoomPercentage not found"
+        zoom_field.forceActiveFocus()
+        assert _wait_until(lambda: bool(zoom_field.property("activeFocus"))), "zoomPercentage did not gain focus"
 
         qs_input = trigger_quick_switcher()
         assert int(window.property("modalDialogCount") or 0) == 1
@@ -189,10 +189,10 @@ def _run_webengine_quick_switcher_probe() -> None:
         assert _wait_until(
             lambda: not bool(qs_dialog.property("visible"))
             and int(window.property("modalDialogCount") or 0) == 0
-            and bool(filter_field.property("activeFocus")),
+            and bool(zoom_field.property("activeFocus")),
             timeout=8.0,
         ), (
-            f"Focus did not recover to folderFilterField after Escape: "
+            f"Focus did not recover to zoomPercentage after Escape: "
             f"visible={qs_dialog.property('visible')} modal={window.property('modalDialogCount')} "
             f"activeFocusItem={window.property('activeFocusItem')}"
         )
@@ -859,14 +859,15 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
             return bool(js_variant(result))
 
         try:
-            # 1. #104 remappable shortcuts: live update + disable hides menu hint without showing "Disabled"
+            # 1. #104 remappable shortcuts + #151 deduplicated search menu: live update + disable hides menu hint without showing "Disabled"
             compact_qs = window.findChild(QObject, "quickSwitcherAction")
-            compact_search = window.findChild(QObject, "compactSearchFolderAction")
+            compact_reopen = window.findChild(QObject, "reopenClosedTabAction")
             self.assertIsNotNone(compact_qs)
-            self.assertIsNotNone(compact_search)
+            self.assertIsNotNone(compact_reopen)
+            self.assertIsNone(window.findChild(QObject, "compactSearchFolderAction"))
             self.assertEqual(
-                compact_search.findChild(QObject, "menuShortcutHint").property("text"),
-                native_label("Ctrl+Shift+F"),
+                compact_reopen.findChild(QObject, "menuShortcutHint").property("text"),
+                native_label("Ctrl+Shift+T"),
             )
             self.assertEqual(self.studio.setShortcut("quick_switcher", "Ctrl+Alt+P"), "")
             self.assertTrue(
@@ -904,10 +905,10 @@ class QuickSwitcherDesktopTest(unittest.TestCase):
             self.assertTrue(shortcut_enabled("quick_switcher"))
 
             zoom_field = window.findChild(QObject, "zoomPercentage")
-            filter_field = window.findChild(QObject, "folderFilterField")
+            sidebar_search = window.findChild(QObject, "sidebarFolderSearchButton")
             dialog = window.findChild(QObject, "quickSwitcherDialog")
             self.assertIsNotNone(zoom_field)
-            self.assertIsNotNone(filter_field)
+            self.assertIsNotNone(sidebar_search)
             self.assertIsNotNone(dialog)
             zoom_field.forceActiveFocus()
             self.assertTrue(_wait_until(lambda: bool(zoom_field.property("activeFocus"))))

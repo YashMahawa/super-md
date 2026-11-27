@@ -37,13 +37,18 @@ from PySide6.QtCore import QEvent, QObject, Property, Signal, Slot, QStandardPat
 from PySide6.QtGui import QDesktopServices, QFontDatabase, QGuiApplication, QCursor, QImage, QDragEnterEvent, QDragLeaveEvent
 from documents import (
     atomic_write, atomic_json, bundle, decode_base64_chunked,
-    encode_base64_chunked, image_data, materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
+    encode_base64_chunked, image_data, is_valid_asset_filename,
+    materialize_assets, open_note, write_portable, MIMES, MAX_IMAGE,
 )
 import folder_ops
 from markdown_export import write_markdown_export, write_markdown_zip
 from theme import detect_system_dark, read_system_palette, system_palette_paths, tokens
 from fonts import FontStore
 from python_outputs import PythonOutputs
+try:
+    from . import studio_exports
+except ImportError:
+    import studio_exports
 from reader_edits import ReaderEdits
 from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
@@ -61,8 +66,115 @@ from shortcuts import DEFINITIONS as SHORTCUT_DEFINITIONS, capture_sequence, def
 from quick_switcher import FolderNoteIndex, build_quick_switcher_candidates, coalesce_walk_roots, normalize_workspace_roots, rank_quick_switcher_items
 from workspace_links import WorkspaceLinkCache, WorkspaceLinkError, resolve_workspace_link
 from workspace_search import KNOWN_NOTE_SUFFIXES, MAX_FOLDER_DEPTH, canonical_note_key, is_searchable_note_name, stream_text_search
+from core.paths import DESKTOP_DIR, resource_root
 
-ROOT = Path(sys._MEIPASS)/"resources" if getattr(sys,"frozen",False) else Path(__file__).resolve().parent.parent
+FOLDER_TREE_NOTE_SUFFIXES = frozenset({".md", ".smd", ".txt"})
+FOLDER_TREE_SCAN_BUDGET = 25000
+
+
+def _is_folder_tree_note_name(filename: str) -> bool:
+    return bool(filename) and not filename.startswith(".") and Path(filename).suffix.lower() in FOLDER_TREE_NOTE_SUFFIXES
+
+
+def _probe_directory_visible_note(
+    dir_path: Path,
+    *,
+    depth: int,
+    max_depth: int = MAX_FOLDER_DEPTH,
+    budget: list[int] | None = None,
+    memo: dict[str, bool] | None = None,
+) -> bool | None:
+    """Return True if a visible note exists, False if confirmed absent, or None if scan bounds stopped early."""
+    key = folder_ops.normalize_path_key(dir_path)
+    if memo is not None and key in memo:
+        return memo[key]
+    if depth > max_depth:
+        return None
+    if budget is not None and budget[0] <= 0:
+        return None
+    subdirs: list[Path] = []
+    found = False
+    unresolved = False
+    saw_entry = False
+    try:
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                saw_entry = True
+                if budget is not None:
+                    if budget[0] <= 0:
+                        unresolved = True
+                        break
+                    budget[0] -= 1
+                name = entry.name
+                if name.startswith("."):
+                    continue
+                try:
+                    entry_path = Path(entry.path)
+                    if entry.is_symlink() or folder_ops._is_link_or_junction(entry_path):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        subdirs.append(entry_path)
+                    elif entry.is_file(follow_symlinks=False) and _is_folder_tree_note_name(name):
+                        found = True
+                        break
+                except OSError:
+                    continue
+        if not saw_entry and budget is not None:
+            budget[0] -= 1
+    except OSError:
+        if memo is not None:
+            memo[key] = False
+        return False
+    if found:
+        if memo is not None:
+            memo[key] = True
+        return True
+    if unresolved:
+        return None
+    for subdir in subdirs:
+        sub_result = _probe_directory_visible_note(
+            subdir,
+            depth=depth + 1,
+            max_depth=max_depth,
+            budget=budget,
+            memo=memo,
+        )
+        if sub_result is True:
+            if memo is not None:
+                memo[key] = True
+            return True
+        if sub_result is None:
+            unresolved = True
+            if budget is not None and budget[0] <= 0:
+                break
+    if unresolved:
+        return None
+    if memo is not None:
+        memo[key] = False
+    return False
+
+
+def _directory_has_visible_note(
+    dir_path: Path,
+    *,
+    depth: int,
+    max_depth: int = MAX_FOLDER_DEPTH,
+    budget: list[int] | None = None,
+    memo: dict[str, bool] | None = None,
+) -> bool:
+    return (
+        _probe_directory_visible_note(
+            dir_path,
+            depth=depth,
+            max_depth=max_depth,
+            budget=budget,
+            memo=memo,
+        )
+        is not False
+    )
+
+
+ROOT = resource_root()
 DEFAULT_PDF = {"pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4, "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False}
 DEFAULTS = {"theme": "system", "fullTheme": "black", "motion": True, "font": "Manrope", "size": 18, "width": 0, "widthPercent":90, "lineHeight":1.65, "autosave":True, "normalZoom": 100, "fullZoom": 100, "python": "", "pdf": DEFAULT_PDF, "welcomed": False}
 DEFAULTS.update(widthMigrated=True, window={"width":1320,"height":880,"maximized":False}, spellCheck=False, grammarCheck=False, readingMode="live", newNoteLocation="", accent="system", checkUpdates=True, autoUpdate=False)
@@ -72,7 +184,8 @@ DEFAULTS.update(desktopIntegration=False)
 DEFAULTS.update(selectionAssistant="chatgpt")
 DEFAULTS.update(latexAutofix=False, typewriterScroll=False)
 DEFAULTS.update(shortcuts=default_shortcuts())
-DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False)
+DEFAULTS.update(agentAccessEnabled=False, cloudAgentEnabled=False, keepInBackground=False)
+DEFAULTS.update(hideNonNoteFolders=True)
 
 def _preserve_unchanged_assets(old_assets: dict[str, str], new_assets: dict[str, str]) -> dict[str, str]:
     """Keep existing Python string identities for unchanged data URLs so ReaderAssetStore grants stay valid."""
@@ -128,7 +241,7 @@ def agent_mcp_setup_config(discovery_dir, *, roots=None, executable=None, frozen
             console_python = executable_path.with_name("python.exe")
             if console_python.is_file():
                 executable_path = console_python
-        script = Path(cli_script or Path(__file__).with_name("agent_cli.py")).expanduser().resolve()
+        script = Path(cli_script or DESKTOP_DIR / "agent_cli.py").expanduser().resolve()
         command = str(executable_path)
         args = [str(script), "mcp"]
     for root_path in _normalize_mcp_roots(roots):
@@ -503,35 +616,7 @@ class WorkspaceDropFilter(QObject):
         return True
 
 def export_destination(value: str, format: str) -> Path:
-    suffixes = {"pdf": ".pdf", "smd": ".smd", "md": ".md", "mdzip": ".zip"}
-    # These are known payload extensions, not merely dotted stem names.  In
-    # particular, .fmd is an older portable format and must not be silently
-    # rewritten as .fmd.pdf/.fmd.smd.
-    payload_formats = {
-        ".pdf": "pdf",
-        ".smd": "smd",
-        ".md": "md",
-        ".markdown": "md",
-        ".txt": "md",
-        ".zip": "mdzip",
-    }
-    if format not in suffixes:
-        raise ValueError("Unsupported export format")
-    destination = local_path(value)
-    if not destination.name or destination.is_dir():
-        raise ValueError("Choose a file destination for the export")
-    expected = suffixes[format]
-    existing_suffix = destination.suffix.casefold()
-    if existing_suffix == ".fmd":
-        raise ValueError("Legacy .fmd files are not a supported export destination; choose .smd or a new filename")
-    if existing_suffix in payload_formats:
-        if payload_formats[existing_suffix] != format:
-            raise ValueError(f"Choose a filename ending in {expected} for this export")
-        return destination
-    target = destination.with_name(destination.name + expected)
-    if target.exists():
-        raise ValueError(f"The {expected} destination already exists; choose its full filename to confirm replacement")
-    return target
+    return studio_exports.export_destination(value, format)
 
 def _same_closed_revision(current: dict, captured: dict) -> bool:
     """Compare content-bearing fields after a background close snapshot."""
@@ -640,6 +725,7 @@ class Session(QObject):
         self.startup_windows = []
         self._pending_startup_windows = []
         self.quitting = False
+        self.update_installed = False
         self.locations = {}
         self.drafts = {}
         self.windows = {}
@@ -653,8 +739,14 @@ class Session(QObject):
         self.theme_restored = False
         self._load_theme_library()
         self.initial_recovery = []
+        settings_path = self.data / "settings.json"
+        stored_settings = None
+        can_persist_migration = not settings_path.exists()
         try:
-            stored = json.loads((self.data/"settings.json").read_text(encoding="utf-8"))
+            stored = json.loads(settings_path.read_text(encoding="utf-8"))
+            if isinstance(stored, dict) and isinstance(stored.get("settings"), dict):
+                stored_settings = stored["settings"]
+                can_persist_migration = True
             self.settings.update({k:v for k,v in stored["settings"].items() if k in DEFAULTS})
             if not stored["settings"].get("widthMigrated") and stored["settings"].get("widthPercent") == 80:
                 self.settings["widthPercent"] = 90  # 80% was the old default, not a choice.
@@ -662,12 +754,42 @@ class Session(QObject):
             self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
             self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
+        had_explicit_keep_in_background = isinstance(stored_settings, dict) and "keepInBackground" in stored_settings
+        fresh_service_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
+        migrated_keep_in_background = not had_explicit_keep_in_background and (
+            (isinstance(stored_settings, dict) and any(
+                stored_settings.get(key) is True
+                for key in ("agentAccessEnabled", "cloudAgentEnabled", "background", "backgroundEnabled")
+            ))
+            or (self.data / "agent-sessions").is_dir()
+            or (self.data / "agent-cloud.json").is_file()
+            or (
+                not fresh_service_log
+                and (
+                    (self.data / "background-service.log").is_file()
+                    or (self.data.name == "qt-studio" and (self.data.parent / "background-service.log").is_file())
+                )
+            )
+        )
         # Local MCP access and cloud relay reconnection are explicit, persisted
         # opt-ins; each desktop launch mints a fresh temporary loopback token.
         self.settings["agentAccessEnabled"] = self.settings.get("agentAccessEnabled") is True
         self.settings["cloudAgentEnabled"] = self.settings.get("cloudAgentEnabled") is True
+        self.settings["keepInBackground"] = (
+            stored_settings.get("keepInBackground") is True
+            if had_explicit_keep_in_background
+            else bool(migrated_keep_in_background)
+        )
         shortcuts, _ = normalize_shortcuts(self.settings.get("shortcuts"))
         self.settings["shortcuts"] = shortcuts or default_shortcuts()
+        if (migrated_keep_in_background or (fresh_service_log and not had_explicit_keep_in_background)) and can_persist_migration:
+            try:
+                atomic_write(
+                    settings_path,
+                    json.dumps({"settings": self.settings, "recent": self.recent, "pinned": self.pinned}, ensure_ascii=False).encode("utf-8"),
+                )
+            except OSError:
+                pass
         try:
             workspace=json.loads((self.data/"startup.json").read_text(encoding="utf-8"))
             self.startup_paths=list(dict.fromkeys(p for p in workspace.get("paths",[]) if isinstance(p,str)))[:100]
@@ -824,6 +946,7 @@ class Session(QObject):
 
 class Studio(QObject):
     changed = Signal()
+    sidebarChanged = Signal()
     shortcutsChanged = Signal()
     quickSwitcherChanged = Signal()
     quickSwitcherIndexed = Signal(int, object)
@@ -888,6 +1011,7 @@ class Studio(QObject):
         self.backgroundWriteCompleted.connect(self._complete_background_write)
         self.data = self.session.data
         self.settings = self.session.settings
+        self._defer_reader_activation = False
         self._agent_error = ""
         self._agent_cloud_error = ""
         self._agent_cloud_config_path = self.data / "agent-cloud.json"
@@ -930,8 +1054,11 @@ class Studio(QObject):
         self.external_timer.timeout.connect(self._refresh_external_notes)
         self.active = ""
         self.folder = ""
-        self.files: list[dict] = []
+        self._files: list[dict] = []
+        self._files_revision = 0
+        self._outline_revision = 0
         self.expanded: set[str] = set()
+        self._pinned_visible_dirs: set[str] = set()
         self.folder_filter = ""
         self._folder_searching = False
         self._search_generation = 0
@@ -1098,6 +1225,7 @@ class Studio(QObject):
             QTimer.singleShot(0,lambda:[self._open_note(path, explicit=False, activation_generation=restore_generation) for path in self._startup_order])
         if restore_enabled and restore_folder:
             self._restore_workspace_folder(restore_folder, restore_expanded)
+        self._emitted_sidebar_key = self._sidebar_slice_key()
         self._refresh_theme()
         # Only the first real desktop window may restore the user's opted-in
         # cloud connection. The cloud client handles network retry/backoff.
@@ -1127,6 +1255,17 @@ class Studio(QObject):
         self._emit(False)
 
     @property
+    def files(self): return getattr(self, "_files", [])
+
+    @files.setter
+    def files(self, value):
+        current = getattr(self, "_files", None)
+        if current is not None and value == current:
+            return
+        self._files = value
+        self._files_revision = getattr(self, "_files_revision", 0) + 1
+
+    @property
     def recent(self): return self.session.recent
 
     @recent.setter
@@ -1152,6 +1291,8 @@ class Studio(QObject):
             self.session.pinned.append(matched_recent)
         self.recent=self.recent
         self._preferences()
+        for window in tuple(self.session.windows.values()):
+            window._notify_sidebar()
 
     def _note(self, name: str, content: str = "", path: str = "", saved: str = "", assets: dict | None = None, portable: bool = False):
         assets = dict(assets) if assets else {}
@@ -1168,13 +1309,29 @@ class Studio(QObject):
             return True
         return False
 
-    @Property("QStringList",notify=changed)
-    def pinnedRecent(self):return self.session.pinned
+    @Property("QStringList",notify=sidebarChanged)
+    def pinnedRecent(self):return list(self.session.pinned)
 
     def _current(self):
         if not self.tabs:
             return {"id": "", "name": "Super MD", "content": "", "path": "", "saved": "", "assets": {}, "saved_assets": {}, "assets_dirty": False, "portable": False, "conflict": False, "outline": []}
         return next((t for t in self.tabs if t["id"] == self.active), self.tabs[0])
+
+    @staticmethod
+    def _seeded_find_bounds(data: dict) -> dict:
+        start = data.get("sourceStart")
+        end = data.get("sourceEnd")
+        if (
+            isinstance(start, int) and not isinstance(start, bool)
+            and isinstance(end, int) and not isinstance(end, bool)
+            and start >= 0 and end >= start
+        ):
+            bounds: dict[str, object] = {"sourceStart": start, "sourceEnd": end}
+            match_text = data.get("matchText")
+            if isinstance(match_text, str) and match_text:
+                bounds["matchText"] = match_text
+            return bounds
+        return {}
 
     def _consume_seeded_find(self, tab: dict) -> dict | None:
         pending = self._pending_seeded_find
@@ -1187,18 +1344,29 @@ class Studio(QObject):
         if not matches_id and not matches_path:
             return None
         self._pending_seeded_find = None
-        return {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+        seeded = {"query": pending["query"], "caseSensitive": bool(pending.get("caseSensitive", False))}
+        seeded.update(self._seeded_find_bounds(pending))
+        return seeded
+
+    def _notify_sidebar(self):
+        if self.retired:
+            return
+        key = self._sidebar_slice_key()
+        if key != getattr(self, "_emitted_sidebar_key", None):
+            self._emitted_sidebar_key = key
+            self.sidebarChanged.emit()
 
     def _emit(self, load=True):
         if self.retired: return
         self._watch_notes()
+        self._notify_sidebar()
         self.changed.emit()
         if load and self.ready and self.tabs:
             tab = self._current()
             colors = self._colors()
             reading_settings={key:self.settings[key] for key in ("restorePosition","centerLock","imageAppearance","svgAppearance","imageContrast","fullDocumentAccessibility","latexAutofix","typewriterScroll")}
             reading_settings["customStyle"]=custom_theme.reader(self.session.custom_theme,self.settings["fullTheme" if self.fullscreen else "theme"],self._dark(),self.settings)
-            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
+            payload={**reading_settings,"readingLocation":self.session.locations.get(tab["path"]),"id": tab["id"], "path": tab["path"] or tab["id"], "portable": bool(tab.get("portable", False)), "mode": self.mode, "dark": self._dark(), "fullscreen": self.fullscreen, "font": self.settings["font"], "size": self.settings["size"], "widthPercent": self.settings["widthPercent"], "lineHeight":self.settings["lineHeight"], "spellCheck":self.settings["spellCheck"], "grammarCheck":self.settings["grammarCheck"], "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "motion": self.settings["motion"], "python": self.settings["python"], "colors": colors, "viewState": tab.pop("viewState", None)}
             pending_heading = tab.pop("pendingHeading", None)
             if pending_heading:
                 payload["pendingHeading"] = pending_heading
@@ -1386,8 +1554,13 @@ class Studio(QObject):
             self._reload_changed_content(changed)
             for changed_path in changed:
                 self._invalidate_folder_index(changed_path)
-            if self.folder:self.session.workspace_links.invalidate(self.folder)
-            if self.folder and (self.folder in changed or set(self.expanded)&changed):self._load_tree()
+            if self.folder:
+                self.session.workspace_links.invalidate(self.folder)
+            if self.folder and any(
+                folder_ops.same_path(ch, self.folder) or folder_ops.matches_path_prefix(ch, self.folder, is_directory=True)
+                for ch in changed
+            ):
+                self._load_tree()
         self._submit(lambda:file_events.reconcile(known,changed),reconciled,False)
 
     def _location_changed(self,old,new):
@@ -1566,10 +1739,170 @@ class Studio(QObject):
                 self.system_preferences.kill()
                 self.system_preferences.waitForFinished(100)
 
+    def _folder_slice_key(self, files):
+        return (
+            self.folder,
+            self.folder_filter,
+            bool(self._folder_searching),
+            getattr(self, "_files_revision", 0),
+            id(files),
+            len(files),
+        )
+
+    _EMPTY_OUTLINE = ()
+
+    def _tab_outline(self, tab):
+        outline = tab.get("outline")
+        return outline if isinstance(outline, list) and outline else self._EMPTY_OUTLINE
+
+    def _outline_slice_key(self, active_id, outline):
+        return (
+            active_id,
+            getattr(self, "_outline_revision", 0),
+            id(outline),
+            len(outline),
+        )
+
+    def _sidebar_slice_key(self):
+        tab = self._current()
+        active_id = self.active if self.tabs else ""
+        outline = self._tab_outline(tab)
+        files = self.files
+        return (
+            self._folder_slice_key(files),
+            self._outline_slice_key(active_id, outline),
+            (tuple(self.recent), tuple(self.session.pinned)),
+        )
+
+    def _cached_folder_slice_json(self, folder_key, files):
+        cached = getattr(self, "_folder_slice_cache", None)
+        if cached is not None and cached[0] == folder_key:
+            return cached[1]
+        encoded = json.dumps({
+            "folder": self.folder,
+            "folderFilter": self.folder_filter,
+            "folderSearching": bool(self._folder_searching),
+            "files": files,
+        })[1:-1]
+        self._folder_slice_cache = (folder_key, encoded)
+        return encoded
+
+    def _cached_outline_slice_json(self, outline_key, outline):
+        cached = getattr(self, "_outline_slice_cache", None)
+        if cached is not None and cached[0] == outline_key:
+            return cached[1]
+        encoded = json.dumps(outline)
+        self._outline_slice_cache = (outline_key, encoded)
+        return encoded
+
+    def _cached_recent_slice_json(self, recent_tuple):
+        cached = getattr(self, "_recent_slice_cache", None)
+        if cached is not None and cached[0] == recent_tuple:
+            return cached[1]
+        encoded = json.dumps(list(recent_tuple))
+        self._recent_slice_cache = (recent_tuple, encoded)
+        return encoded
+
+    def _cached_pinned_slice_json(self, pinned_tuple):
+        cached = getattr(self, "_pinned_slice_cache", None)
+        if cached is not None and cached[0] == pinned_tuple:
+            return cached[1]
+        encoded = json.dumps(list(pinned_tuple))
+        self._pinned_slice_cache = (pinned_tuple, encoded)
+        return encoded
+
+    def _cached_tabs_slice_json(self):
+        tabs_key = tuple(
+            (t["id"], t["name"], t["path"], self._is_dirty(t), bool(t.get("conflict")))
+            for t in self.tabs
+        )
+        cached = getattr(self, "_tabs_slice_cache", None)
+        if cached is not None and cached[0] == tabs_key:
+            return cached[1]
+        encoded = json.dumps([
+            {"id": tid, "name": name, "path": path, "dirty": dirty, "conflict": conflict}
+            for tid, name, path, dirty, conflict in tabs_key
+        ])
+        self._tabs_slice_cache = (tabs_key, encoded)
+        return encoded
+
+    def _cached_colors_slice_json(self):
+        dark, palette = self._tokens()
+        token_key = getattr(self, "_token_key", None)
+        cached = getattr(self, "_colors_slice_cache", None)
+        if token_key is not None and cached is not None and cached[0] == token_key:
+            return dark, cached[1]
+        encoded = json.dumps(dict(palette))
+        self._colors_slice_cache = (token_key, encoded)
+        return dark, encoded
+
+    @Property(str, notify=sidebarChanged)
+    def sidebarSnapshot(self):
+        tab = self._current()
+        active_id = self.active if self.tabs else ""
+        outline = self._tab_outline(tab)
+        files = self.files
+        folder_key = self._folder_slice_key(files)
+        outline_key = self._outline_slice_key(active_id, outline)
+        recent_tuple = tuple(self.recent)
+        pinned_tuple = tuple(self.session.pinned)
+        sidebar_key = (folder_key, outline_key, (recent_tuple, pinned_tuple))
+        cached = getattr(self, "_sidebar_snapshot_cache", None)
+        if cached is not None and cached[0] == sidebar_key:
+            return cached[1]
+        folder_fragment = self._cached_folder_slice_json(folder_key, files)
+        outline_json = self._cached_outline_slice_json(outline_key, outline)
+        recent_json = self._cached_recent_slice_json(recent_tuple)
+        pinned_json = self._cached_pinned_slice_json(pinned_tuple)
+        encoded = (
+            '{"active": ' + json.dumps(active_id)
+            + ", " + folder_fragment
+            + ', "outline": ' + outline_json
+            + ', "recent": ' + recent_json
+            + ', "pinned": ' + pinned_json
+            + "}"
+        )
+        self._sidebar_snapshot_cache = (sidebar_key, encoded)
+        return encoded
+
     @Property(str, notify=changed)
     def snapshot(self):
         tab = self._current()
-        return json.dumps({"tabs": [{"id": t["id"], "name": t["name"], "path": t["path"], "dirty": self._is_dirty(t), "conflict": bool(t.get("conflict"))} for t in self.tabs], "active": self.active if self.tabs else "", "name": tab["name"], "outline": tab.get("outline", []), "portable": tab["portable"], "conflict": bool(tab.get("conflict")), "closedCount": len(self.closed_tabs), "folder": self.folder, "folderFilter": self.folder_filter, "folderSearching": self._folder_searching, "files": self.files, "recent": self.recent, "settings": self.settings, "mode": self.mode, "fullscreen": self.fullscreen, "readerOverlay": self.reader_overlay, "imageOverlay": self.image_overlay, "readerReady": self.ready, "dark": self._dark(), "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"], "busy": self.busy > 0, "message": self.message, "messageRevision": getattr(self, "_message_revision", 0), "colors": self._colors()})
+        active_id = self.active if self.tabs else ""
+        outline = self._tab_outline(tab)
+        files = self.files
+        tabs_json = self._cached_tabs_slice_json()
+        folder_fragment = self._cached_folder_slice_json(self._folder_slice_key(files), files)
+        outline_json = self._cached_outline_slice_json(self._outline_slice_key(active_id, outline), outline)
+        recent_json = self._cached_recent_slice_json(tuple(self.recent))
+        dark, colors_json = self._cached_colors_slice_json()
+        head_fragment = json.dumps({
+            "active": active_id,
+            "name": tab["name"],
+            "portable": tab["portable"],
+            "conflict": bool(tab.get("conflict")),
+            "closedCount": len(self.closed_tabs),
+            "settings": self.settings,
+            "mode": self.mode,
+            "fullscreen": self.fullscreen,
+            "readerOverlay": self.reader_overlay,
+            "imageOverlay": self.image_overlay,
+            "readerReady": self.ready,
+            "dark": dark,
+            "zoom": self.settings["fullZoom" if self.fullscreen else "normalZoom"],
+            "busy": self.busy > 0,
+            "message": self.message,
+            "messageRevision": getattr(self, "_message_revision", 0),
+        })[1:-1]
+        return (
+            '{"tabs": ' + tabs_json
+            + ", " + head_fragment
+            + ', "outline": ' + outline_json
+            + ", " + folder_fragment
+            + ', "recent": ' + recent_json
+            + ', "colors": ' + colors_json
+            + "}"
+        )
 
     @Property("QVariantMap", notify=workspaceSearchChanged)
     def folderSearchState(self):
@@ -1731,18 +2064,34 @@ class Studio(QObject):
             self.workspaceSearchChanged.emit()
 
     @Slot(str, str, str, bool)
-    def openFolderSearchMatch(self, tab_id: str, path: str, query: str, case_sensitive: bool = False):
+    @Slot(str, str, str, bool, int, int)
+    @Slot(str, str, str, bool, int, int, str)
+    def openFolderSearchMatch(
+        self,
+        tab_id: str,
+        path: str,
+        query: str,
+        case_sensitive: bool = False,
+        source_start: int = -1,
+        source_end: int = -1,
+        match_text: str = "",
+    ):
         if self.retired:
             return
         self._cancel_folder_search(close=True)
         self.workspaceSearchChanged.emit()
-        target_payload = json.dumps({
+        payload: dict[str, object] = {
             "tabId": tab_id or "",
             "path": path or "",
             "query": query or "",
             "caseSensitive": bool(case_sensitive),
-        })
-        self._flush("open_search_match", target_payload)
+        }
+        payload.update(self._seeded_find_bounds({
+            "sourceStart": source_start,
+            "sourceEnd": source_end,
+            "matchText": match_text,
+        }))
+        self._flush("open_search_match", json.dumps(payload))
 
     def _quick_switcher_roots(self) -> list[Path]:
         windows = [self]
@@ -1777,10 +2126,11 @@ class Studio(QObject):
         return tabs_snap, recent_paths, pinned_paths, roots, self.active
 
     def _invalidate_folder_index(self, target_path: str | Path | None = None):
-        index = getattr(self.session, "folder_note_index", None)
+        session = getattr(self, "session", None)
+        index = getattr(session, "folder_note_index", None)
         if index is not None:
             index.invalidate(target_path)
-        for win in list(getattr(self.session, "windows", {}).values()):
+        for win in list(getattr(session, "windows", {}).values()):
             if not getattr(win, "retired", False) and getattr(win, "_quick_switcher_open", False):
                 win._refresh_quick_switcher_candidates()
 
@@ -2288,6 +2638,9 @@ class Studio(QObject):
                 bridge.stop()
                 self.settings["cloudAgentEnabled"] = False
                 self._agent_error = ""
+            background = getattr(self.session, "background", None)
+            if background is not None:
+                background._cli_started_agent_access = False
             self.settings["agentAccessEnabled"] = bool(enabled)
             self._preferences()
             self._emit(False)
@@ -2329,12 +2682,10 @@ class Studio(QObject):
                      "It runs over stdio and reads the private, temporary discovery directory shown below.\n\n"
                      "## MCP client configuration\n\n```json\n" + self.agentSetupInstructions + "\n```\n\n"
                      "Live access is off by default. Enable it in Super MD Settings → AI agents before starting the MCP server. "
-                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n")
-            if self.cloudAgentConfigured and self.cloudConnectorUrl:
-                guide += ("\n## Cloud relay connector\n\n"
-                          "Use this Streamable HTTP MCP endpoint with the intended MCP client. It is a bearer capability; "
-                          "keep this guide private and share it only with that client.\n\n"
-                          "```text\n" + self.cloudConnectorUrl + "\n```\n")
+                     "Disabling access or closing Super MD revokes the temporary session token. The token is not included in this file.\n\n"
+                     "## Cloud relay connector\n\n"
+                     "Cloud relay connector URLs are secret bearer credentials and are not included in saved setup guides. "
+                     "To connect a cloud MCP client, open Super MD Settings → AI agents and use Copy MCP connector URL to get your own connector.\n")
             atomic_write(path, guide.encode("utf-8"))
             self._agent_error = ""
             self.message = f"Setup guide saved to {path}"
@@ -2538,8 +2889,23 @@ class Studio(QObject):
 
     @Property(bool,notify=changed)
     def backgroundEnabled(self):
+        if getattr(self.session, "update_installed", False):
+            return False
         service=getattr(self.session,"background",None)
         return bool(service and service.enabled and not service.quitting)
+
+    @Slot(result=bool)
+    def hasOtherOpenWindows(self):
+        return any(
+            other is not self
+            and not other.retired
+            and (getattr(other, "host_window", None) is None or other.host_window.isVisible())
+            for other in self.session.windows.values()
+        )
+
+    @Property(bool,notify=changed)
+    def deferReaderActivation(self):
+        return bool(getattr(self, "_defer_reader_activation", False))
 
     @Property(str,notify=changed)
     def pythonStatus(self): return self.python_status
@@ -2663,18 +3029,22 @@ class Studio(QObject):
             if error:self.update_status='Update installation failed: '+error;return
             path,prepared_kind=prepared
             if prepared_kind=='appimage':
+                self.session.update_installed=True;self.session.changed.emit()
                 self.update_status='Update installed. Close and reopen Super MD to use it. Your previous version and downloaded installer have been kept.'
             else:
                 opened=QProcess.startDetached(path,[]) if prepared_kind=='windows' else QDesktopServices.openUrl(QUrl.fromLocalFile(path))
                 if isinstance(opened,tuple):opened=opened[0]
                 if not opened:
                     self.update_status='Could not open the verified installer. It is still available in Downloads.'
-                elif prepared_kind in ('deb','rpm'):
-                    self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
-                elif prepared_kind=='macos':
-                    self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
                 else:
-                    self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+                    self.session.update_installed=True;self.session.changed.emit()
+                    if prepared_kind in ('deb','rpm'):
+                        self.update_status='Package installer opened. Confirm the update there; Super MD will not request elevated permissions automatically.'
+                    elif prepared_kind=='macos':
+                        self.update_status='Disk image opened. Drag Super MD into Applications and confirm replacement to update.'
+                    else:
+                        self.update_status='Installer opened. Follow its instructions; the download is kept in Downloads.'
+            self._emit(False)
         self._submit(prepare,done,False)
 
     def _can_move(self):
@@ -3147,7 +3517,10 @@ class Studio(QObject):
 
     def _preferences(self,notify=True):
         if self.retired or getattr(self.writes, "_shutdown", False): return
-        data = json.dumps({"settings": self.settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
+        persisted_settings = dict(self.settings)
+        if getattr(getattr(self.session, "background", None), "_cli_started_agent_access", False):
+            persisted_settings["agentAccessEnabled"] = False
+        data = json.dumps({"settings": persisted_settings, "recent": self.recent, "pinned":self.session.pinned}).encode()
         self._submit(lambda: atomic_write(self.data / "settings.json", data), _noop_done, False, self.writes)
         if notify:self.session.changed.emit()
 
@@ -3426,6 +3799,7 @@ class Studio(QObject):
         value,
         *,
         explicit,
+        background=False,
         activation_generation=None,
         completion_callback=None,
         batch_insert=None,
@@ -3440,14 +3814,14 @@ class Studio(QObject):
             self.openFolder(str(path))
             if completion_callback: completion_callback(None, "A folder cannot be opened as a document")
             return
-        if explicit and activation_generation is None:
+        if explicit and not background and activation_generation is None:
             self._activation_generation += 1
             activation_generation = self._activation_generation
         elif activation_generation is None:
             activation_generation = self._activation_generation
-        restoring = not explicit and str(path) in self._restoring_paths
+        restoring = not explicit and not background and str(path) in self._restoring_paths
         def activate_existing(target_tab):
-            if explicit and activation_generation == self._activation_generation:
+            if explicit and not background and activation_generation == self._activation_generation:
                 if should_activate_fn is None or should_activate_fn(target_tab):
                     if pending_heading:
                         target_tab["pendingHeading"] = pending_heading
@@ -3510,10 +3884,15 @@ class Studio(QObject):
                 keys=[entry["path"] or entry["id"] for entry in self._startup_entries] or self._startup_order
                 self.tabs.sort(key=lambda t:keys.index(t["path"] or t["id"]) if (t["path"] or t["id"]) in keys else -1)
             if should_activate_fn is not None:
-                should_activate = bool(explicit and activation_generation == self._activation_generation and should_activate_fn(note))
+                should_activate = bool(
+                    not background
+                    and explicit
+                    and activation_generation == self._activation_generation
+                    and should_activate_fn(note)
+                )
             else:
-                should_activate = (explicit and activation_generation == self._activation_generation)
-            if restoring and activation_generation == self._activation_generation:
+                should_activate = (not background and explicit and activation_generation == self._activation_generation)
+            if restoring and not background and activation_generation == self._activation_generation:
                 target_active = self._startup_active or self.session.startup_active
                 should_activate = str(path) == target_active or not any(t["id"] == self.active for t in self.tabs)
             if should_activate:
@@ -3525,12 +3904,12 @@ class Studio(QObject):
             self.recent = [canon_note_path] + [p for p in self.recent if not folder_ops.same_path(p, canon_note_path)][:29]
             self._preferences(notify=False)
             self.recovery_timer.start(800)
-            emit_load = should_activate if (should_activate_fn is not None or explicit) else True
+            emit_load = False if background else (should_activate if (should_activate_fn is not None or explicit) else True)
             for window in list(self.session.windows.values()):
                 if window is self:
                     window._emit(emit_load)
                 else:
-                    window._emit()
+                    window._emit(False if background else True)
             if explicit and should_activate:
                 self._focus_open_target(activation_generation)
             if completion_callback: completion_callback(note, None)
@@ -3631,6 +4010,7 @@ class Studio(QObject):
         if not root.is_dir():
             return
         root_str = folder_ops.canonical_path_str(root)
+        self._pinned_visible_dirs.clear()
         valid_expanded = {root_str}
         for raw in expanded_paths or []:
             if not raw:
@@ -3694,6 +4074,10 @@ class Studio(QObject):
     def _start_subfolder_search(self):
         if self.retired:
             return
+        self.filter_timer.stop()
+        if self._search_cancel is not None:
+            self._search_cancel.set()
+            self._search_cancel = None
         folder = self.folder
         needle = self.folder_filter.strip().casefold()
         if not folder or not needle:
@@ -3811,11 +4195,35 @@ class Studio(QObject):
             self._invalidate_folder_index(old_folder)
         self.session.workspace_links.invalidate(self.folder)
         self.settings["welcomed"] = True
+        self._pinned_visible_dirs.clear()
         self.expanded = {self.folder}
         self._preferences()
         self._recover()
         self._emit(False)
         self._load_tree()
+
+    def _is_within_open_folder(self, candidate) -> bool:
+        folder = getattr(self, "folder", "")
+        if not folder or not candidate:
+            return False
+        try:
+            return folder_ops.matches_path_prefix(str(candidate), folder, is_directory=True)
+        except (OSError, ValueError):
+            return False
+
+    def _refresh_open_folder_trees(self, *candidates) -> None:
+        if not candidates:
+            return
+        for candidate in candidates:
+            if candidate:
+                Studio._invalidate_folder_index(self, candidate)
+        session = getattr(self, "session", None)
+        windows = tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (self,)
+        for window in windows:
+            if getattr(window, "retired", False) or not hasattr(window, "_load_tree"):
+                continue
+            if any(Studio._is_within_open_folder(window, candidate) for candidate in candidates if candidate):
+                window._load_tree()
 
     def _load_tree(self):
         self._tree_generation = getattr(self, "_tree_generation", 0) + 1
@@ -3827,10 +4235,18 @@ class Studio(QObject):
             self._start_subfolder_search()
             return
         folder, expanded = self.folder, set(self.expanded)
+        hide_non_note = bool(self.settings.get("hideNonNoteFolders", True))
         expanded_keys = {folder_ops.normalize_path_key(item) for item in expanded if item}
+        pinned_visible_keys = {folder_ops.normalize_path_key(item) for item in getattr(self, "_pinned_visible_dirs", ()) if item}
+        custom_budget = getattr(self, "_folder_tree_scan_budget", None)
+        initial_budget = FOLDER_TREE_SCAN_BUDGET if custom_budget is None else max(0, int(custom_budget))
         def scan():
             entries: list[dict[str, object]] = []
+            note_memo: dict[str, bool] = {}
+            scan_budget = [initial_budget]
             def visit(path, depth):
+                if depth > 256:
+                    return
                 try:
                     children = sorted(Path(path).iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
                 except OSError:
@@ -3841,17 +4257,34 @@ class Studio(QObject):
                     if child.name.startswith(".") or folder_ops._is_link_or_junction(child):
                         continue
                     directory = child.is_dir()
-                    if directory or is_searchable_note_name(child.name):
+                    if directory:
                         child_str = folder_ops.canonical_path_str(child)
-                        is_expanded = folder_ops.normalize_path_key(child_str) in expanded_keys
-                        entries.append({"name": child.name, "path": child_str, "directory": directory, "depth": depth, "expanded": is_expanded})
-                        if directory and is_expanded:
+                        child_key = folder_ops.normalize_path_key(child_str)
+                        if (
+                            hide_non_note
+                            and child_key not in pinned_visible_keys
+                            and not _directory_has_visible_note(
+                                child,
+                                depth=depth + 1,
+                                max_depth=MAX_FOLDER_DEPTH,
+                                budget=scan_budget,
+                                memo=note_memo,
+                            )
+                        ):
+                            continue
+                        is_expanded = child_key in expanded_keys
+                        entries.append({"name": child.name, "path": child_str, "directory": True, "depth": depth, "expanded": is_expanded})
+                        if is_expanded:
                             visit(child, depth + 1)
+                    elif is_searchable_note_name(child.name):
+                        child_str = folder_ops.canonical_path_str(child)
+                        entries.append({"name": child.name, "path": child_str, "directory": False, "depth": depth, "expanded": False})
             visit(folder, 0)
             return entries
         def finished(result, error):
-            if not error and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder) and not self.folder_filter.strip():
+            if not error and result is not None and generation == getattr(self, "_tree_generation", 0) and folder_ops.same_path(folder, self.folder) and not self.folder_filter.strip():
                 self.files = result
+                self._watch_notes()
         self._submit(scan, finished, False)
 
     @Slot(str)
@@ -3865,6 +4298,8 @@ class Studio(QObject):
         if existing:
             for item in existing:
                 self.expanded.discard(item)
+            for item in [p for p in self._pinned_visible_dirs if folder_ops.same_path(p, canon)]:
+                self._pinned_visible_dirs.discard(item)
         else:
             self.expanded.add(canon)
         self._recover()
@@ -3880,9 +4315,11 @@ class Studio(QObject):
             self.session.workspace_links.invalidate(old_folder)
         self.folder = ""
         self.files = []
+        self._pinned_visible_dirs.clear()
         self.expanded.clear()
         if old_folder:
             self._invalidate_folder_index(old_folder)
+        self._watch_notes()
         self._recover()
         self._emit(False)
 
@@ -3938,7 +4375,7 @@ class Studio(QObject):
         if key in ("imageAppearance","svgAppearance") and value not in ("original","invert-dark","auto","monochrome","contrast"):return
         if key in ("restorePosition","centerLock") and not isinstance(value,bool):return
         if key=="imageContrast" and (not isinstance(value,(int,float)) or isinstance(value,bool) or not math.isfinite(value) or not 1<=value<=2):return
-        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility") and not isinstance(value,bool): return
+        if key in ("motion","welcomed","autosave","checkUpdates","autoUpdate","spellCheck","grammarCheck","latexAutofix","typewriterScroll","desktopIntegration","fullDocumentAccessibility","keepInBackground","hideNonNoteFolders") and not isinstance(value,bool): return
         if key in ("font","python") and (not isinstance(value,str) or not value.strip() or len(value)>2048): return
         if key == "python":
             try: value = python_runtime.validate(value.strip())
@@ -3957,6 +4394,12 @@ class Studio(QObject):
         if key == "lineHeight": value = max(1.15,min(2.2,float(value)))
         self.settings[key] = value
         if key == "shortcuts": self._notify_shortcuts()
+        if key == "hideNonNoteFolders":
+            for win in list(self.session.windows.values()):
+                if not win.retired and win.folder:
+                    if value:
+                        win._pinned_visible_dirs.clear()
+                    win._load_tree()
         self._preferences()
         self._emit()
 
@@ -3989,6 +4432,7 @@ class Studio(QObject):
             if self.tabs:
                 self.saveAsRequested.emit(self._current()["name"])
         elif operation["action"] == "overwrite_conflict": self._save_current(True)
+        elif operation["action"] == "reload_conflict": self._reload_current_from_disk()
         elif operation["action"] == "sync_for_search":
             if self._folder_search_open and self._folder_search_query.strip():
                 current_sig = [(t["id"], t["content"], self._is_dirty(t)) for t in self.tabs]
@@ -4002,6 +4446,7 @@ class Studio(QObject):
             path = request.get("path") or ""
             query = request.get("query") or ""
             case_sensitive = bool(request.get("caseSensitive", False))
+            bounds = self._seeded_find_bounds(request)
             existing = next((t for t in self.tabs if tab_id and t["id"] == tab_id), None)
             if existing is None and path:
                 resolved = os.path.normcase(str(Path(path).resolve(strict=False)))
@@ -4010,17 +4455,18 @@ class Studio(QObject):
                 if existing["id"] == self.active and self.ready:
                     self._pending_seeded_find = None
                     if query:
-                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps({'caseSensitive': case_sensitive})})")
+                        find_opts = {"caseSensitive": case_sensitive, **bounds}
+                        self.readerCall.emit(f"window.supermdFind?.({json.dumps(query)}, {json.dumps(find_opts)})")
                     self._focus_open_target(self._activation_generation)
                 else:
-                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive} if query else None
+                    self._pending_seeded_find = {"tabId": existing["id"], "path": existing.get("path") or "", "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
                     self.selectTab(existing["id"])
                     if existing["id"] == self.active and not self.ready:
                         pass
                     self._focus_open_target(self._activation_generation)
             elif path:
                 local = str(local_path(path))
-                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive} if query else None
+                self._pending_seeded_find = {"tabId": "", "path": local, "query": query, "caseSensitive": case_sensitive, **bounds} if query else None
                 def opened(_note, error):
                     if error and self._pending_seeded_find and self._pending_seeded_find.get("path") == local:
                         self._pending_seeded_find = None
@@ -4051,6 +4497,17 @@ class Studio(QObject):
             self.flush_operation = None
             self.workspaceSearchChanged.emit()
             return
+        bg = getattr(self.session, "background", None)
+        if (
+            self.flush_operation
+            and self.flush_operation["action"] == "close_window"
+            and bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        ):
+            self.resolveFlush("recover_close")
+            return
         self.flushFailed.emit(bool(self.flush_operation and self.flush_operation["action"] == "close_window"))
 
     def _flush(self,action,target=""):
@@ -4059,13 +4516,29 @@ class Studio(QObject):
         if not self.ready or not self.tabs:
             self._after_flush(operation)
             return
-        if self.flush_operation and (self.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"): return
+        bg = getattr(self.session, "background", None)
+        hidden_cli_close = (
+            action == "close_window"
+            and bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        )
+        if self.flush_operation and not hidden_cli_close and (self.flush_operation.get("action") != "sync_for_search" or action == "sync_for_search"): return
         self.flush_operation = operation
-        self.flush_timer.start(5000)
+        self.flush_timer.start(250 if hidden_cli_close else 5000)
         self.readerCall.emit(f"window.supermdFlush?.({json.dumps(operation)})")
 
     @Slot()
     def saveSafely(self): self._flush("save")
+
+    @Slot()
+    def ensureReaderProfile(self):
+        if getattr(self, "_defer_reader_activation", False):
+            self._defer_reader_activation = False
+        callback = getattr(self.session, "ensure_reader_profile", None)
+        if callable(callback):
+            callback()
 
     @Slot()
     def saveAsSafely(self): self._flush("save_as")
@@ -4086,7 +4559,10 @@ class Studio(QObject):
         operation,self.flush_operation = self.flush_operation,None
         self.flush_timer.stop()
         if not operation: return
-        if choice == "retry": self._flush(operation["action"],operation["target"])
+        if choice == "cancel" and operation["action"] == "close_window":
+            service = getattr(self.session, "background", None)
+            if service is not None: service.cancel_quit()
+        elif choice == "retry": self._flush(operation["action"],operation["target"])
         elif choice == "recover_close" and operation["action"] == "close_window":
             # Explicit emergency action: preserve the latest received drafts, not
             # a silent discard or a claim we can recover an unresponsive renderer.
@@ -4108,7 +4584,11 @@ class Studio(QObject):
     @Slot(str)
     def resolveConflict(self, choice):
         if choice == "cancel":
+            was_window = self.pending_close == "window"
             self.pending_close = ""
+            if was_window:
+                service = getattr(self.session, "background", None)
+                if service is not None: service.cancel_quit()
             return
         if choice == "save_as":
             self.saveAsSafely()
@@ -4117,40 +4597,103 @@ class Studio(QObject):
             self._flush("overwrite_conflict")
             return
         if choice == "reload":
-            tab = self._current()
-            if not tab.get("path"):
-                return
-            tab_id = tab["id"]
-            path = Path(tab["path"])
-            def done(result, error):
-                if error:
-                    return
-                target = next((t for t in self.tabs if t["id"] == tab_id), None)
-                if not target:
-                    return
-                content, assets, portable = result
+            self._flush("reload_conflict")
+            return
+
+    def _reload_current_from_disk(self):
+        tab = self._current()
+        if not tab.get("path"):
+            return
+        tab_id = tab["id"]
+        path = Path(tab["path"])
+        was_dirty = self._is_dirty(tab)
+        captured = _snapshot_tab_state(tab)
+        archived_draft = None
+        if was_dirty:
+            archived_assets = dict(captured.get("assets", {}))
+            raw_name = str(captured.get("name") or "Untitled.md")
+            archived_draft = dict(captured)
+            archived_draft.update(
+                id=uuid.uuid4().hex,
+                name=raw_name if raw_name.startswith("Recovered ") else f"Recovered {raw_name}",
+                path="",
+                saved="",
+                assets=archived_assets,
+                saved_assets={},
+                assets_dirty=bool(archived_assets),
+                portable=bool(captured.get("portable")),
+                conflict=False,
+            )
+
+        def work():
+            loaded = open_note(path)
+            reference = None
+            if archived_draft is not None:
                 try:
-                    st = path.stat()
-                    self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
-                except OSError:
-                    pass
-                self.reader_edits.clear(tab_id)
-                self.session.reader_assets.revoke_tab(self.window_id, tab_id)
-                if tab_id == self.active:
-                    self._last_reader_text = None
-                target.update(
-                    content=content,
-                    saved=content,
-                    assets=assets,
-                    saved_assets=dict(assets),
-                    assets_dirty=False,
-                    portable=portable,
-                    conflict=False,
-                )
-                self.message = "Reloaded note from disk"
+                    reference = self.session.closed_note_store.save(archived_draft)
+                except Exception as failure:
+                    raise RuntimeError(f"ARCHIVE_FAILED:{failure}") from failure
+            return loaded, reference
+
+        def done(outcome, error):
+            if error:
+                if str(error).startswith("ARCHIVE_FAILED:"):
+                    detail = str(error)[len("ARCHIVE_FAILED:"):]
+                    self.message = f"Could not archive draft before reloading: {detail}"
+                else:
+                    self.message = f"Could not reload note from disk: {error}"
                 self._recover()
-                self._emit(load=tab_id == self.active)
-            self._submit(lambda: open_note(path), done, True)
+                self._emit(False)
+                return
+            target = next((t for t in self.tabs if t["id"] == tab_id), None)
+            if not target:
+                return
+            if (
+                target.get("content") != captured.get("content")
+                or target.get("saved") != captured.get("saved")
+                or target.get("assets") != captured.get("assets")
+                or target.get("assets_dirty") != captured.get("assets_dirty")
+                or target.get("path") != captured.get("path")
+            ):
+                self.message = "The note changed while reloading from disk. It remains open with the latest draft."
+                self._recover()
+                self._emit(False)
+                return
+            loaded, reference = outcome
+            if reference is not None:
+                next_refs = ([reference] + self.closed_tabs)[:ClosedNoteStore.LIMIT]
+                try:
+                    self.session.closed_note_store.save_index(next_refs)
+                except Exception as failure:
+                    self.message = f"Could not update closed-note recovery before reloading: {failure}"
+                    self._recover()
+                    self._emit(False)
+                    return
+                self.closed_tabs[:] = next_refs
+            content, assets, portable = loaded
+            try:
+                st = path.stat()
+                self.note_file_stamps[str(path)] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+            self.reader_edits.clear(tab_id)
+            self.session.reader_assets.revoke_tab(self.window_id, tab_id)
+            if tab_id == self.active:
+                self._last_reader_text = None
+            target.update(
+                content=content,
+                saved=content,
+                assets=assets,
+                saved_assets=dict(assets),
+                assets_dirty=False,
+                portable=portable,
+                conflict=False,
+            )
+            self.message = "Reloaded note from disk"
+            self._recover()
+            self._emit(load=tab_id == self.active)
+
+        self._submit(work, done, True, self.writes)
 
     def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
@@ -4206,6 +4749,8 @@ class Studio(QObject):
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
+            if str(path) != original_path:
+                self._refresh_open_folder_trees(path, original_path)
             if self.pending_close:
                 self._finish_close()
         def write():
@@ -4245,10 +4790,18 @@ class Studio(QObject):
         for win in list(self.session.windows.values()):
             if win.retired:
                 continue
+            for stamp_key in list(win.note_file_stamps.keys()):
+                if folder_ops.matches_path_prefix(stamp_key, old_path, is_directory=is_dir):
+                    win.note_file_stamps.pop(stamp_key, None)
             for tab in win.tabs:
                 if tab["path"] and folder_ops.matches_path_prefix(tab["path"], old_path, is_directory=is_dir):
                     updated = folder_ops.remap_path_prefix(tab["path"], old_path, new_path, is_directory=is_dir)
                     tab.update(path=updated, name=Path(updated).name)
+                    try:
+                        st = Path(updated).stat()
+                        win.note_file_stamps[updated] = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        pass
         for path_set in (self._agent_open_paths, self._agent_owned_files):
             remapped = {folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir) for p in path_set}
             path_set.clear()
@@ -4320,6 +4873,10 @@ class Studio(QObject):
             win.expanded = {
                 folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
                 for p in win.expanded
+            }
+            win._pinned_visible_dirs = {
+                folder_ops.remap_path_prefix(p, old_path, new_path, is_directory=is_dir)
+                for p in getattr(win, "_pinned_visible_dirs", ())
             }
             if win._pending_seeded_find and win._pending_seeded_find.get("path"):
                 seeded_path = win._pending_seeded_find["path"]
@@ -4451,7 +5008,9 @@ class Studio(QObject):
                     try:
                         win_root = Path(folder_ops.canonical_path_str(win.folder))
                         if folder_ops.matches_path_prefix(created_dir, str(win_root), is_directory=True):
-                            win.expanded.update(folder_ops.ancestor_directories_in_folder(win_root, created))
+                            ancestors = folder_ops.ancestor_directories_in_folder(win_root, created)
+                            win.expanded.update(ancestors)
+                            win._pinned_visible_dirs.update(ancestors)
                             win._recover()
                             win._load_tree()
                     except OSError:
@@ -4562,24 +5121,88 @@ class Studio(QObject):
             self._sync_path_change(folder_ops.canonical_path_str(before), folder_ops.canonical_path_str(after), is_dir=False, message=f"Renamed to {final_name}")
         self._submit(work,finished,executor=self.writes)
 
-    @Slot(str,result=QUrl)
-    def defaultSaveLocation(self,name):
-        directory = self.settings.get("newNoteLocation") or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())
-        return QUrl.fromLocalFile(str(Path(directory)/Path(name).name))
+    @staticmethod
+    def _existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw_path or "").strip())
+        if not cleaned:
+            return None
+        try:
+            candidate = Path(cleaned).expanduser()
+            if reject_links and folder_ops._is_link_or_junction(candidate):
+                return None
+            if reject_links:
+                resolved = Path(folder_ops.strip_extended_length_prefix(str(candidate.resolve(strict=True))))
+                return Path(folder_ops.canonical_path_str(resolved)) if resolved.is_dir() else None
+            return candidate if candidate.is_dir() else None
+        except OSError:
+            return None
 
-    @Slot(str,result=QUrl)
-    def defaultSaveAsLocation(self,name):
-        current_path = self._current().get("path")
+    @classmethod
+    def _downloads_fallback_directory(cls) -> Path:
+        raw_downloads = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+        downloads = cls._existing_save_directory(raw_downloads)
+        if downloads is not None:
+            return downloads
+        home = cls._existing_save_directory(Path.home())
+        if home is not None:
+            return home
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw_downloads or "").strip()) or str(Path.home())
+        return Path(cleaned).expanduser()
+
+    def _default_output_directory(self) -> Path:
+        raw = (
+            self.settings.get("newNoteLocation")
+            or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+            or str(Path.home())
+        )
+        cleaned = folder_ops.strip_extended_length_prefix(str(raw or "").strip()) or str(Path.home())
+        return Path(cleaned).expanduser()
+
+    def _note_save_directory(self) -> Path:
+        configured = self._existing_save_directory(self.settings.get("newNoteLocation"))
+        if configured is not None:
+            return configured
+        open_folder = self._existing_save_directory(self.folder, reject_links=True)
+        if open_folder is not None:
+            return open_folder
+        return self._downloads_fallback_directory()
+
+    def _save_as_directory(self) -> Path:
+        current_path = self._current().get("path") if self.tabs else ""
         if current_path:
-            parent = Path(current_path).parent
-            if parent.is_dir():
-                return QUrl.fromLocalFile(str(parent / Path(name).name))
-        return self.defaultSaveLocation(name)
+            cleaned_current = folder_ops.strip_extended_length_prefix(str(current_path).strip())
+            if cleaned_current:
+                parent = self._existing_save_directory(Path(cleaned_current).expanduser().parent)
+                if parent is not None:
+                    return parent
+        return self._note_save_directory()
+
+    @Slot(result=QUrl)
+    def defaultSaveFolder(self):
+        return QUrl.fromLocalFile(str(self._note_save_directory()))
+
+    @Slot(str, result=QUrl)
+    def defaultSaveLocation(self, name):
+        leaf = folder_ops._pure_path(str(name or "")).name or "Untitled.md"
+        return QUrl.fromLocalFile(str(self._note_save_directory() / leaf))
+
+    @Slot(result=QUrl)
+    def defaultSaveAsFolder(self):
+        return QUrl.fromLocalFile(str(self._save_as_directory()))
+
+    @Slot(str, result=QUrl)
+    def defaultSaveAsLocation(self, name):
+        leaf = folder_ops._pure_path(str(name or "")).name or "Untitled.md"
+        return QUrl.fromLocalFile(str(self._save_as_directory() / leaf))
 
     @Slot(str, result=QUrl)
     def defaultExportLocation(self, format):
-        suffix = "zip" if format == "mdzip" else format
-        return self.defaultSaveLocation((folder_ops.note_stem(self._current()["name"]) or "Untitled") + "." + suffix)
+        return studio_exports.default_export_location(self, format)
+
+    @Slot(str, result=QUrl)
+    def defaultThemeExportLocation(self, name):
+        leaf = folder_ops._pure_path(str(name or "")).name or "My theme.supermd-theme.json"
+        return QUrl.fromLocalFile(str(self._default_output_directory() / leaf))
 
     @Slot(str)
     def closeTab(self, id):
@@ -4643,6 +5266,14 @@ class Studio(QObject):
 
     @Slot(result=bool)
     def requestWindowClose(self):
+        bg = getattr(self.session, "background", None)
+        if (
+            bg is not None
+            and getattr(bg, "_stopping_from_cli", False)
+            and getattr(self, "host_window", None) is not None
+            and not self.host_window.isVisible()
+        ):
+            return True
         dirty = next((t for t in self.tabs if self._is_dirty(t) and (t["path"] or t["content"].strip() or t["assets"])), None)
         if dirty:
             self.pending_close = "window"
@@ -4653,7 +5284,13 @@ class Studio(QObject):
 
     @Slot(str)
     def resolveClose(self, choice):
-        if choice == "cancel": self.pending_close = ""; return
+        if choice == "cancel":
+            was_window = self.pending_close == "window"
+            self.pending_close = ""
+            if was_window:
+                service = getattr(self.session, "background", None)
+                if service is not None: service.cancel_quit()
+            return
         if choice == "save": self.save(); return
         if choice == "discard":
             # For a single-tab close, "discard" confirms closing the dirty
@@ -4690,21 +5327,7 @@ class Studio(QObject):
 
     @Slot(str, str)
     def exportTo(self, value, format):
-        if self.pending_export:
-            self.message = "An export is already in progress; finish or cancel it before choosing another destination"
-            self._emit(False)
-            return
-        self.pending_save_as = ""
-        self.pending_export = ""
-        try:
-            self.pending_export = str(export_destination(value, format))
-        except ValueError as error:
-            self.message = str(error)
-            self._emit(False)
-            return
-        if format in ("md", "mdzip"): self.readerCall.emit(f"window.supermdExportMarkdown?.({str(format == 'mdzip').lower()})")
-        elif format == "smd": self.readerCall.emit("window.supermdPortable?.(false)")
-        else: self.readerCall.emit(f"window.supermdExport?.({json.dumps(self.settings['pdf'])})")
+        studio_exports.export_to(self, value, format)
 
     @Slot(str)
     def command(self, action):
@@ -4754,159 +5377,16 @@ class Studio(QObject):
 
     @staticmethod
     def _agent_export_metadata(path: Path, format: str) -> dict:
-        digest = hashlib.sha256()
-        size = 0
-        with path.open("rb") as source:
-            while True:
-                chunk = source.read(1024 * 1024)
-                if not chunk:
-                    break
-                size += len(chunk)
-                digest.update(chunk)
-        return {"path": str(path), "filename": path.name, "format": format,
-                "bytes": size, "sha256": digest.hexdigest()}
+        return studio_exports.agent_export_metadata(path, format)
 
     def _agent_export_native(self, request_id: str, args: dict):
-        tab_id = args.get("id")
-        target = next((tab for tab in self.tabs if tab["id"] == tab_id), None)
-        if target is None or target["id"] != self.active:
-            raise ValueError("Export the currently active live tab")
-        fmt = args.get("format")
-        if fmt not in ("pdf", "smd", "md"):
-            raise ValueError("Export format must be PDF, SMD or Markdown")
-        expected = args.get("expectedRevision")
-        current = hashlib.sha256(target["content"].encode("utf-8")).hexdigest()
-        if not isinstance(expected, str) or expected != current:
-            raise ValueError("Live tab revision changed; inspect it again before exporting")
-        if self.pending_export or self.pending_save_as:
-            raise ValueError("Finish the current save or export before starting another one")
-        content, assets = args.get("content"), args.get("assets", {})
-        if not isinstance(content, str) or len(content.encode("utf-8")) > 20_000_000:
-            raise ValueError("Prepared export content must be a string under 20 MB")
-        if not isinstance(assets, dict) or len(assets) > 512 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in assets.items()):
-            raise ValueError("Prepared export assets are invalid")
-        if sum(len(value) for value in assets.values()) > 110_000_000:
-            raise ValueError("Prepared export assets exceed the bounded total size")
-        options = args.get("options", {})
-        if fmt == "pdf":
-            from agent_exports import validate_pdf_options
-            if not isinstance(options, dict):
-                raise ValueError("PDF options must be an object")
-            supplied = dict(options)
-            options = {**DEFAULT_PDF, **self.settings.get("pdf", {}), **supplied}
-            options["themeAccent"] = supplied.get("themeAccent") or self._colors().get("primary", "#386a57")
-            options = validate_pdf_options(options)
-        output = self._agent_export_path(args.get("filename", ""), fmt, target)
-        self.pending_export = str(output)
-        job_id = uuid.uuid4().hex
-        while len(self._agent_job_records) >= 20:
-            removable = next((key for key, value in self._agent_job_records.items()
-                              if value.get("status") in ("completed", "failed", "cancelled")), None)
-            if removable is None:
-                self.pending_export = ""
-                output.unlink(missing_ok=True)
-                raise ValueError("The desktop already has 20 active agent export jobs")
-            self._agent_job_records.pop(removable, None)
-        self._agent_exports[request_id] = {"path": str(output), "format": fmt, "jobId": job_id}
-        self._agent_job_records[job_id] = {"jobId": job_id, "action": "export_document", "status": "running", "filename": output.name,
-                                           "format": fmt, "path": str(output), "bytes": 0}
-        command = {"pdf": "export_pdf_native", "smd": "export_fmd_native", "md": "export_markdown_native"}[fmt]
-        forwarded = {"id": tab_id, "content": content, "assets": assets, "options": options,
-                     "expectedRevision": expected, "save": False, "jobId": job_id}
-        try:
-            self.post(request_id, command, json.dumps(forwarded, ensure_ascii=False, separators=(",", ":")))
-            self.replied.emit(request_id, json.dumps({"jobId": job_id, "status": "running",
-                                                     "filename": output.name, "format": fmt}), "")
-        except Exception:
-            self._agent_exports.pop(request_id, None)
-            self.pending_export = ""
-            try:
-                output.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        studio_exports.agent_export_native(self, request_id, args)
 
     def _agent_job_status(self, job_id):
-        if not isinstance(job_id, str) or not job_id:
-            raise ValueError("jobId is required")
-        record = self._agent_job_records.get(job_id)
-        if not record:
-            raise ValueError("Export job is unavailable or expired")
-        result = {key: value for key, value in record.items() if key != "path" and not key.startswith("_")}
-        if record.get("status") == "completed":
-            if record.get("path"):
-                result["path"] = record["path"]
-            if record.get("action") == "export_document" and isinstance(record.get("_fingerprint"), dict):
-                result["downloadable"] = True
-        return result
+        return studio_exports.agent_job_status(self, job_id)
 
     def _agent_export_chunk(self, job_id, offset=0, limit=262_144):
-        """Read one bounded segment from a completed, registered export artifact."""
-        if not isinstance(job_id, str) or not job_id or len(job_id) > 128:
-            raise ValueError("jobId is required")
-        record = self._agent_job_records.get(job_id)
-        if not isinstance(record, dict) or record.get("action") != "export_document":
-            raise ValueError("Export artifact job is unavailable or is not an export")
-        if record.get("status") != "completed":
-            raise ValueError("Export artifact is not completed")
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise ValueError("offset must be a nonnegative byte offset")
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 524_288:
-            raise ValueError("limit must be between 1 and 524,288 bytes")
-        total = record.get("bytes")
-        fingerprint = record.get("_fingerprint")
-        expected_hash = record.get("sha256")
-        file_path = record.get("path")
-        fmt = record.get("format")
-        filename = record.get("filename")
-        if not isinstance(total, int) or isinstance(total, bool) or total < 0:
-            raise ValueError("Export artifact metadata is invalid or incomplete")
-        if offset > total:
-            raise ValueError("offset must be between 0 and the artifact byte count")
-        if (not isinstance(fingerprint, dict) or fmt not in ("pdf", "smd", "md")
-                or not isinstance(filename, str) or not filename
-                or not isinstance(file_path, str) or not isinstance(expected_hash, str)
-                or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)):
-            raise ValueError("Export artifact metadata is invalid or incomplete")
-        path = Path(file_path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-        try:
-            path_stat = path.stat(follow_symlinks=False)
-            registered_identity = (fingerprint.get("device"), fingerprint.get("inode"),
-                                   fingerprint.get("size"), fingerprint.get("mtimeNs"))
-            if (path.is_symlink() or not stat.S_ISREG(path_stat.st_mode)
-                    or (path_stat.st_dev, path_stat.st_ino, path_stat.st_size, path_stat.st_mtime_ns) != registered_identity):
-                raise ValueError("Export artifact changed after completion")
-            fd = os.open(path, flags)
-        except (OSError, ValueError) as error:
-            raise ValueError("Export artifact changed after completion") from error
-        try:
-            before = os.fstat(fd)
-            expected_identity = (fingerprint.get("device"), fingerprint.get("inode"),
-                                 fingerprint.get("size"), fingerprint.get("mtimeNs"))
-            actual_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            if not stat.S_ISREG(before.st_mode) or actual_identity != expected_identity:
-                raise ValueError("Export artifact changed after completion")
-            with os.fdopen(fd, "rb") as stream:
-                fd = -1
-                stream.seek(offset)
-                body = stream.read(min(limit, total - offset))
-                after = os.fstat(stream.fileno())
-                if ((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != actual_identity
-                        or len(body) != min(limit, total - offset)):
-                    raise ValueError("Export artifact changed during retrieval")
-        except OSError as error:
-            raise ValueError("Export artifact could not be read") from error
-        finally:
-            if fd >= 0:
-                os.close(fd)
-        mime = {"pdf": "application/pdf", "smd": "application/x-supermd",
-                "md": "text/markdown"}[fmt]
-        next_offset = offset + len(body)
-        return {"jobId": job_id, "filename": filename, "format": fmt, "mimeType": mime,
-                "bytes": total, "sha256": expected_hash, "offset": offset,
-                "nextOffset": next_offset if next_offset < total else None,
-                "body": base64.b64encode(body).decode("ascii")}
+        return studio_exports.agent_export_chunk(self, job_id, offset, limit)
 
     def _agent_document_action(self, args):
         action = args.get("action")
@@ -5039,7 +5519,7 @@ class Studio(QObject):
                 else:
                     metadata = self._agent_tab_result(result)
                     record.update(status="completed", **metadata)
-            self._open_note(resolved, explicit=not background, completion_callback=opened)
+            self._open_note(resolved, explicit=not background, background=background, completion_callback=opened)
             return {"status": "opening", "jobId": job_id, "path": resolved, "windowId": self.window_id,
                     "active": not background, "format": fmt}
         raise ValueError("Unsupported native document action")
@@ -5270,6 +5750,8 @@ class Studio(QObject):
             self._agent_open_paths.add(str(resolved_path))
             self._recover()
             self._emit()
+            if path_changed:
+                Studio._refresh_open_folder_trees(self, resolved_path, old_canonical_path or old_path)
             return {"tabId": tab_id, "windowId": self.window_id, "path": str(resolved_path),
                     "filename": resolved_path.name, "revision": revision, "format": fmt, "isDirty": is_dirty,
                     "pathChanged": path_changed, "oldPath": old_canonical_path or old_path,
@@ -5376,12 +5858,14 @@ class Studio(QObject):
                     raise ValueError("Asset exceeds 25 MB")
 
             filename = requested_name.removeprefix("assets/") if isinstance(requested_name, str) else ""
-            if not re.fullmatch(r"[A-Za-z0-9._-]{1,150}", filename) or filename in (".", ".."):
+            if not is_valid_asset_filename(filename):
                 raise ValueError("Asset name must be a simple filename")
             ext = Path(filename).suffix.lower().lstrip(".")
             if not ext:
                 ext = next((item for item, kind in MIMES.items() if kind == mime), "")
                 filename += "." + ext
+                if not is_valid_asset_filename(filename):
+                    raise ValueError("Asset name must be a simple filename")
             if MIMES.get(ext) != mime:
                 raise ValueError("Asset name extension must match the image type")
             if not _matches_media_signature(mime, raw):
@@ -5902,13 +6386,19 @@ class Studio(QObject):
                 headings = args.get("headings", [])
                 if not isinstance(headings, list) or len(headings) > 2000: raise ValueError("Invalid outline")
                 changed=bool(target and target.get("outline",[])!=headings)
+                name_changed=False
                 if target:
-                    target["outline"] = headings
+                    if changed:
+                        target["outline"] = headings
+                        self._outline_revision = getattr(self, "_outline_revision", 0) + 1
                     if not target["path"] and target["name"].startswith("Untitled") and headings:
                         title = str(headings[0].get("title", "")).strip()
                         title = "".join(c for c in title if c not in '/\\:*?"<>|' and ord(c) >= 32).strip(". ")[:120]
-                        if title: target["name"] = title + (".smd" if target["portable"] else ".md")
-                if changed:self._emit(False)
+                        if title:
+                            new_name = title + (".smd" if target["portable"] else ".md")
+                            name_changed = new_name != target["name"]
+                            target["name"] = new_name
+                if changed or name_changed:self._emit(False)
                 self.replied.emit(id,"true",""); return
             if command == "document_flushed":
                 operation = args.get("operation")
@@ -6170,13 +6660,9 @@ class Studio(QObject):
                             return {**result,"provenance":{"verified":False,"unsaved":True,"reason":f"Could not save execution output: {error}"}}
                     return result
                 if command == "export_markdown_native":
-                    if not output: raise ValueError("Choose a Markdown destination")
-                    if not isinstance(args.get("archive", False), bool): raise ValueError("archive must be a boolean")
-                    if captured.get("path") and Path(output).resolve() == Path(captured["path"]).resolve():
-                        raise ValueError("Markdown export must not overwrite the original note")
-                    if args.get("archive", False): write_markdown_zip(Path(output), args.get("content"), args.get("assets", {}))
-                    else: write_markdown_export(Path(output), args.get("content"), args.get("assets", {}))
-                    return export_result(output)
+                    return studio_exports.execute_export_markdown_native(output, args, captured, export_result)
+                if command == "export_fmd_native" and not args.get("save") and not save_as:
+                    return studio_exports.execute_export_smd_native(output, args, export_result)
                 if command == "export_fmd_native":
                     target_path = Path(captured["path"]) if args.get("save") else Path(output)
                     if args.get("save") and not force_portable_overwrite and target_path.exists():
@@ -6195,65 +6681,7 @@ class Studio(QObject):
                         pass
                     return result_data
                 if command == "export_pdf_native":
-                    job = export_job
-                    assert job is not None
-                    destination = Path(output)
-                    stage = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.stage.pdf")
-                    process = None
-                    rust_temp = None
-                    try:
-                        job.check()
-                        if not destination.parent.is_dir(): raise ValueError("The PDF destination folder is unavailable")
-                        engine = self._engine()
-                        args["assets"].update(self.session.font_store.pdf_assets(args["options"]["fontFamily"]))
-                        job.check()
-                        with tempfile.TemporaryFile() as request_file, tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-                            request_size = 0
-                            for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(args):
-                                encoded = chunk.encode("utf-8")
-                                request_size += len(encoded)
-                                request_file.write(encoded)
-                            request_file.flush()
-                            request_file.seek(0)
-                            job.check()
-                            process = subprocess.Popen(
-                                [str(engine), "export-json", str(stage)],
-                                stdin=request_file, stdout=stdout_file, stderr=stderr_file,
-                            )
-                            rust_temp = stage.with_name(f".{stage.name}.{process.pid}.tmp")
-                            job.attach_process(process)
-                            deadline=time.monotonic()+120
-                            while True:
-                                try:
-                                    process.wait(timeout=.1)
-                                    break
-                                except subprocess.TimeoutExpired:
-                                    if not job.cancelled.is_set() and time.monotonic()<deadline:continue
-                                    job.stop_process()
-                                    try: process.wait(timeout=2)
-                                    except subprocess.TimeoutExpired:
-                                        try: process.kill()
-                                        except OSError: pass
-                                        process.wait()
-                                    job.check()
-                                    raise ValueError("PDF export timed out")
-                            job.check()
-                            stderr_file.seek(0)
-                            error_text = stderr_file.read(64 * 1024).decode("utf-8", errors="replace").strip()
-                        if process.returncode:
-                            raise ValueError(error_text or "PDF export failed")
-                        if not stage.is_file() or stage.stat().st_size < 5:
-                            raise ValueError("PDF export produced an incomplete file")
-                        with stage.open("rb") as generated:
-                            if generated.read(5) != b"%PDF-": raise ValueError("PDF export produced an invalid file")
-                        job.promote(stage, destination,lambda:self.readerCall.emit("window.supermdExportPhase?.("+json.dumps(job.job_id)+",'publishing')"))
-                        return export_result(output)
-                    finally:
-                        for owned in (stage, rust_temp):
-                            if owned is not None:
-                                try: owned.unlink(missing_ok=True)
-                                except OSError: pass
-                        self._export_jobs.discard(job.job_id, job)
+                    return studio_exports.execute_export_pdf_native(self, output, args, export_job, export_result)
                 raise ValueError(f"Unsupported command: {command}")
             def finished(result,error):
                 if is_portable_tab_save:
@@ -6264,16 +6692,7 @@ class Studio(QObject):
                     self.pending_save_as_tab = ""
                 if error:
                     if agent_export_info:
-                        record = self._agent_job_records.get(agent_export_info.get("jobId"))
-                        if record:
-                            record.update(status="failed", error=str(error)[:1000])
-                        try:
-                            reserved = Path(agent_export_info["path"])
-                            if reserved.exists() and reserved.stat().st_size == 0:
-                                reserved.unlink()
-                        except OSError:
-                            pass
-                        self._agent_exports.pop(id, None)
+                        studio_exports.fail_agent_export(self, id, agent_export_info, error)
                     if not agent_export_info:
                         self.replied.emit(id,"null",error)
                     return
@@ -6351,35 +6770,15 @@ class Studio(QObject):
                         self.message = "Saved"
                         self._recover()
                         self._emit()
+                        if path_changed:
+                            self._refresh_open_folder_trees(save_as)
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
                     self.pending_save_as_tab = ""
-                elif command.startswith("export_"): self.message = f"Exported {Path(result['path']).name}"
+                elif command.startswith("export_"):
+                    studio_exports.finalize_standalone_export(self, result["path"])
                 if agent_export_info:
-                    record = self._agent_job_records.get(agent_export_info.get("jobId"))
-                    if record:
-                        artifact_path = Path(result.get("path", ""))
-                        try:
-                            artifact_stat = artifact_path.stat(follow_symlinks=False)
-                            artifact_bytes = result.get("bytes")
-                            artifact_hash = result.get("sha256")
-                            if (artifact_path.is_symlink() or not stat.S_ISREG(artifact_stat.st_mode)
-                                    or not isinstance(artifact_bytes, int) or isinstance(artifact_bytes, bool)
-                                    or artifact_bytes != artifact_stat.st_size
-                                    or not isinstance(artifact_hash, str)
-                                    or not re.fullmatch(r"[0-9a-f]{64}", artifact_hash)):
-                                raise ValueError("Export artifact metadata does not match the completed file")
-                            record.update(status="completed", bytes=artifact_bytes, sha256=artifact_hash,
-                                          path=str(artifact_path), filename=artifact_path.name,
-                                          _fingerprint={"device": artifact_stat.st_dev,
-                                                        "inode": artifact_stat.st_ino,
-                                                        "size": artifact_stat.st_size,
-                                                        "mtimeNs": artifact_stat.st_mtime_ns})
-                        except (OSError, ValueError) as failure:
-                            record.update(status="failed", error=str(failure)[:500])
-                    if result.get("path"):
-                        self._agent_owned_files.add(str(Path(result["path"]).resolve()))
-                    self._agent_exports.pop(id, None)
+                    studio_exports.complete_agent_export(self, id, agent_export_info, result)
                 if not agent_export_info:
                     self.replied.emit(id,json.dumps(result),"")
             if is_portable_tab_save and (self.retired or getattr(self.writes, "_shutdown", False)):
@@ -6392,16 +6791,7 @@ class Studio(QObject):
         except Exception as error:
             if python_job is not None:
                 self._python_jobs.discard(python_job)
-            agent_export = self._agent_exports.pop(id, None)
-            if agent_export:
-                if self.pending_export == agent_export.get("path"):
-                    self.pending_export = ""
-                try:
-                    reserved = Path(agent_export["path"])
-                    if reserved.exists() and reserved.stat().st_size == 0:
-                        reserved.unlink()
-                except (OSError, TypeError, KeyError):
-                    pass
+            studio_exports.cleanup_failed_post_agent_export(self, id)
             self.replied.emit(id,"null",str(error))
 
     @Slot()
