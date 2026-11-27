@@ -39,6 +39,25 @@ def _try_create_link(link: Path, target: Path, *, target_is_directory: bool = Fa
 
 
 class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
+    def test_scan_checks_aliases_only_for_notes_and_traversed_directories(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir).resolve()
+            directory = root / "assets"
+            directory.mkdir()
+            (directory / "note.MD").touch()
+            (directory / "diagram.png").touch()
+            (root / "attachment.pdf").touch()
+
+            with mock.patch.object(
+                workspace_links,
+                "_is_entry_link_or_junction",
+                wraps=workspace_links._is_entry_link_or_junction,
+            ) as probe:
+                notes = WorkspaceLinkCache().scan(root)
+
+            self.assertEqual([item.rel_posix for item in notes], ["assets/note.MD"])
+            self.assertEqual({call.args[0].name for call in probe.call_args_list}, {"assets", "note.MD"})
+
     def test_ranks_nested_wikilinks_deterministically_without_writing_index_files(self):
         with tempfile.TemporaryDirectory() as root_dir:
             root = Path(root_dir).resolve()

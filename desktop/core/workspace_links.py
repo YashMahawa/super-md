@@ -351,23 +351,24 @@ class WorkspaceLinkCache:
                 if not name or name.startswith("."):
                     continue
                 try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    suffix = Path(name).suffix.lower() if not is_dir else ""
+                    ext_rank = _EXTENSION_PRIORITY.get(suffix)
+                    if is_dir:
+                        if depth + 1 > self.max_depth:
+                            continue
+                    elif ext_rank is None or not entry.is_file(follow_symlinks=False):
+                        continue
                     if _is_entry_link_or_junction(entry):
                         continue
-                    is_dir = entry.is_dir(follow_symlinks=False)
-                    is_file = not is_dir and entry.is_file(follow_symlinks=False)
                 except OSError:
                     continue
 
                 child_path = current_dir / name
                 rel_posix = f"{rel_prefix}/{name}" if rel_prefix else name
                 if is_dir:
-                    if depth + 1 <= self.max_depth:
-                        subdirs.append((child_path, rel_posix, depth + 1))
-                elif is_file:
-                    suffix = Path(name).suffix.lower()
-                    ext_rank = _EXTENSION_PRIORITY.get(suffix)
-                    if ext_rank is None:
-                        continue
+                    subdirs.append((child_path, rel_posix, depth + 1))
+                elif ext_rank is not None:
                     if len(collected) >= self.max_files:
                         truncated = True
                         break
