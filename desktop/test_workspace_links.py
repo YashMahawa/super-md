@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import shutil
@@ -302,8 +303,8 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                     beta_topic,
                 )
 
-            # _snapshot_racy_entries avoids per-entry DirEntry.is_junction() syscalls on Windows
-            # while distinguishing regular directories from NTFS junctions (is_dir=False, is_file=False).
+            # _fingerprint_racy_entries avoids per-entry DirEntry.is_junction() syscalls on Windows,
+            # ignores attachments/dotfiles/symlinks/beyond-max_depth dirs, and distinguishes real dirs from junctions.
             class _FakeDirEntry:
                 def __init__(self, name: str, *, sym: bool, is_dir: bool, is_file: bool):
                     self.name, self._sym, self._dir, self._file = name, sym, is_dir, is_file
@@ -312,7 +313,7 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                     return self._sym
 
                 def is_junction(self) -> bool:
-                    raise AssertionError("DirEntry.is_junction() must not be called in _snapshot_racy_entries")
+                    raise AssertionError("DirEntry.is_junction() must not be called in _fingerprint_racy_entries")
 
                 def is_dir(self, *, follow_symlinks: bool = True) -> bool:
                     return self._dir
@@ -320,10 +321,234 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
                 def is_file(self, *, follow_symlinks: bool = True) -> bool:
                     return self._file
 
-            self.assertNotEqual(
-                workspace_links._snapshot_racy_entries([_FakeDirEntry("Sub", sym=False, is_dir=True, is_file=False)]),
-                workspace_links._snapshot_racy_entries([_FakeDirEntry("Sub", sym=False, is_dir=False, is_file=False)]),
+            real_dir_fp = workspace_links._fingerprint_racy_entries(
+                [_FakeDirEntry("Sub", sym=False, is_dir=True, is_file=False)]
             )
+            self.assertEqual(len(real_dir_fp), 16)
+            self.assertEqual(
+                workspace_links._fingerprint_racy_entries(
+                    [
+                        _FakeDirEntry("Sub", sym=False, is_dir=False, is_file=False),
+                        _FakeDirEntry("diagram.png", sym=False, is_dir=False, is_file=True),
+                        _FakeDirEntry("spec.pdf", sym=False, is_dir=False, is_file=True),
+                        _FakeDirEntry(".hidden.md", sym=False, is_dir=False, is_file=True),
+                        _FakeDirEntry("Link.md", sym=True, is_dir=False, is_file=True),
+                    ]
+                ),
+                b"",
+            )
+            self.assertEqual(
+                workspace_links._fingerprint_racy_entries(
+                    [_FakeDirEntry("Sub", sym=False, is_dir=True, is_file=False)],
+                    allow_subdirs=False,
+                ),
+                b"",
+            )
+
+    def test_large_mixed_attachment_racy_workspace_bounds_metadata_and_validates_unlocked(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            base = Path(root_dir).resolve()
+            root = base / "MixedVault"
+            assets = root / "Assets"
+            notes = root / "Notes"
+            archive = root / "Archive"
+            leaf = root / "Specs" / "Leaf"
+            for folder in (assets, notes, archive, leaf):
+                folder.mkdir(parents=True)
+            for idx in range(6):
+                extra_dir = root / f"Overflow-{idx:02d}"
+                extra_dir.mkdir()
+                (extra_dir / f"Overflow-{idx:02d}.md").write_text("# Overflow\n", encoding="utf-8")
+
+            source = notes / "Source.md"
+            source.write_text("# Source\n", encoding="utf-8")
+            leaf_topic = leaf / "Topic.md"
+            leaf_topic.write_text("# Leaf Topic\n", encoding="utf-8")
+            for idx in range(14):
+                (notes / f"Extra-{idx:02d}.md").write_text("# Extra\n", encoding="utf-8")
+
+            attachment_exts = (".png", ".pdf", ".jpg", ".mp4", ".zip", ".bin")
+            sample_attachment_names = set()
+            for idx in range(600):
+                ext = attachment_exts[idx % len(attachment_exts)]
+                a_name = f"asset-{idx:04d}{ext}"
+                n_name = f"note-media-{idx:04d}{ext}"
+                (assets / a_name).write_bytes(b"a")
+                (notes / n_name).write_bytes(b"n")
+                if idx < 25:
+                    sample_attachment_names.update({a_name, n_name})
+            for idx in range(50):
+                (archive / f"scan-{idx:03d}.png").write_bytes(b"s")
+                (leaf / f"diagram-{idx:03d}.pdf").write_bytes(b"d")
+            (assets / ".DS_Store").write_bytes(b"\x00")
+
+            root = root.resolve()
+            assets = assets.resolve()
+            notes = notes.resolve()
+            archive = archive.resolve()
+            leaf = leaf.resolve()
+            source = source.resolve()
+            leaf_topic = leaf_topic.resolve()
+
+            real_stat = Path.stat
+            base_tick_ns = (real_stat(root, follow_symlinks=False).st_mtime_ns // 1_000_000_000) * 1_000_000_000 + 15_625_000
+            clock = {"wall_ns": base_tick_ns + 20_000_000, "mono": 2_000.0}
+            pinned_dirs = {root, assets, notes, archive, root / "Specs", leaf}
+            pinned_stats = {
+                d: os.stat_result(
+                    tuple(real_stat(d, follow_symlinks=False)),
+                    {"st_mtime_ns": base_tick_ns, "st_ctime_ns": base_tick_ns},
+                )
+                for d in pinned_dirs
+            }
+
+            def pinned_dir_stat(self_path: Path, *, follow_symlinks: bool = True):
+                frozen = pinned_stats.get(self_path)
+                if frozen is not None:
+                    return frozen
+                return real_stat(self_path, follow_symlinks=follow_symlinks)
+
+            ws_b = base / "VaultB"
+            ws_c = base / "VaultC"
+            ws_b.mkdir()
+            ws_c.mkdir()
+            (ws_b / "B.md").write_text("# B\n", encoding="utf-8")
+            (ws_c / "C.md").write_text("# C\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(Path, "stat", pinned_dir_stat),
+                mock.patch.object(workspace_links.time, "time_ns", side_effect=lambda: clock["wall_ns"]),
+                mock.patch.object(workspace_links.time, "monotonic", side_effect=lambda: clock["mono"]),
+            ):
+                # 1. Per-workspace and cross-workspace metadata bounds with 1,300+ attachments present.
+                bounded = WorkspaceLinkCache(
+                    max_files=8, max_dirs=6, max_depth=2, max_workspaces=2, ttl_seconds=60.0
+                )
+                bounded_notes = bounded.scan(root)
+                self.assertEqual(len(bounded_notes), 8)
+                snap = next(iter(bounded._entries.values()))
+                self.assertLessEqual(len(snap.dir_stamps), bounded.max_dirs)
+                self.assertLessEqual(
+                    sum(len(s.racy_fingerprint or b"") for s in snap.dir_stamps),
+                    16 * bounded.max_dirs,
+                )
+                dir_bounded = WorkspaceLinkCache(max_files=100, max_dirs=5, max_depth=2, ttl_seconds=60.0)
+                dir_bounded.scan(root)
+                dir_snap = next(iter(dir_bounded._entries.values()))
+                self.assertEqual(len(dir_snap.dir_stamps), 5)
+                self.assertLessEqual(
+                    sum(len(s.racy_fingerprint or b"") for s in dir_snap.dir_stamps),
+                    16 * dir_bounded.max_dirs,
+                )
+
+                # Inspect object graph of dir_stamps: zero entry tuples, frozensets, or child filenames retained.
+                seen_ids: set[int] = set()
+                queue: list[object] = [snap.dir_stamps, dir_snap.dir_stamps]
+                retained_strings: set[str] = set()
+                while queue:
+                    obj = queue.pop()
+                    obj_id = id(obj)
+                    if obj_id in seen_ids or isinstance(obj, (type, Path)):
+                        continue
+                    seen_ids.add(obj_id)
+                    self.assertNotIsInstance(obj, frozenset)
+                    if isinstance(obj, str):
+                        retained_strings.add(obj)
+                        continue
+                    if isinstance(obj, (tuple, list, dict, set, workspace_links._DirStamp)):
+                        queue.extend(gc.get_referents(obj))
+                self.assertFalse(retained_strings & (sample_attachment_names | {"Source.md", "Topic.md", "Extra-00.md"}))
+
+                bounded.scan(ws_b)
+                bounded.scan(root)  # promote root in LRU order ahead of ws_b
+                bounded.scan(ws_c)
+                self.assertEqual(len(bounded._entries), 2)
+                self.assertEqual({item.root for item in bounded._entries.values()}, {root, ws_c.resolve()})
+
+                # 2. Full racy validation runs completely outside self._lock and ignores attachment churn.
+                cache = WorkspaceLinkCache(max_depth=2, ttl_seconds=60.0)
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("MissingNote", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                self.assertEqual(
+                    resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    leaf_topic,
+                )
+                full_snap = next(iter(cache._entries.values()))
+                stamps_by_path = {s.path: s for s in full_snap.dir_stamps}
+                self.assertEqual(stamps_by_path[assets].racy_fingerprint, b"")
+                self.assertEqual(len(stamps_by_path[notes].racy_fingerprint or b""), 16)
+                warm_tuple = full_snap.entries
+
+                clock["wall_ns"] += 25_000_000
+                clock["mono"] += 0.025
+                real_scandir = os.scandir
+                scandir_lock_states: list[bool] = []
+
+                def unlocked_scandir_probe(target_dir):
+                    scandir_lock_states.append(cache._lock.locked())
+                    return real_scandir(target_dir)
+
+                with mock.patch.object(os, "scandir", side_effect=unlocked_scandir_probe):
+                    self.assertIs(cache.scan(root), warm_tuple)
+                self.assertGreaterEqual(len(scandir_lock_states), len(pinned_dirs))
+                self.assertFalse(any(scandir_lock_states))
+
+                # Concurrent invalidate() mid-validation never deadlocks and prevents stale hit commit.
+                invalidated_once = {"done": False}
+
+                def invalidate_mid_validation(target_dir):
+                    if not invalidated_once["done"] and Path(target_dir) == notes:
+                        invalidated_once["done"] = True
+                        (archive / "MidInvalidation.md").write_text("# Fresh\n", encoding="utf-8")
+                        cache.invalidate(root)
+                    return real_scandir(target_dir)
+
+                with mock.patch.object(os, "scandir", side_effect=invalidate_mid_validation):
+                    refreshed_entries = cache.scan(root)
+                self.assertTrue(invalidated_once["done"])
+                self.assertTrue(any(item.name == "MidInvalidation.md" for item in refreshed_entries))
+                warm_tuple = cache.scan(root)
+
+                # Same-tick attachment churn, dotfiles, symlinks, and beyond-max_depth folders do not invalidate.
+                (assets / "burst-new.png").write_bytes(b"png")
+                (assets / "asset-0000.png").rename(assets / "asset-0000-renamed.png")
+                (assets / "asset-0001.pdf").unlink()
+                (notes / "inline-video.mp4").write_bytes(b"mp4")
+                (notes / "note-media-0000.png").unlink()
+                (archive / ".hidden-draft.md").write_text("# Hidden\n", encoding="utf-8")
+                _try_create_link(archive / "SymNote.md", source)
+                too_deep = leaf / "TooDeep"
+                too_deep.mkdir()
+                (too_deep / "IgnoredDeep.md").write_text("# Beyond max_depth\n", encoding="utf-8")
+
+                clock["wall_ns"] += 15_000_000
+                clock["mono"] += 0.015
+                self.assertIs(cache.scan(root), warm_tuple)
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("MissingNote", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+
+                # 3. Same-tick note or eligible directory addition inside attachment-heavy folders refreshes immediately.
+                assets_note = assets / "MissingNote.md"
+                assets_note.write_text("# Added beside 600 attachments\n", encoding="utf-8")
+                archive_topic = archive / "Topic.md"
+                archive_topic.write_text("# Higher-ranked Archive Topic\n", encoding="utf-8")
+                self.assertEqual(
+                    resolve_workspace_link("MissingNote", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    assets_note,
+                )
+                self.assertEqual(
+                    resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    archive_topic,
+                )
+
+                alpha = root / "Alpha"
+                alpha.mkdir()
+                alpha_topic = (alpha / "Topic.md").resolve()
+                alpha_topic.write_text("# Highest-ranked Alpha Topic\n", encoding="utf-8")
+                self.assertEqual(
+                    resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    alpha_topic,
+                )
 
     def test_cached_exact_nested_match_refreshes_when_higher_ranked_exact_target_added_externally(self):
         with tempfile.TemporaryDirectory() as root_dir:
