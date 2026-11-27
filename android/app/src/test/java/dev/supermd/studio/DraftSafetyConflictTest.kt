@@ -13,8 +13,13 @@ import java.nio.file.Files
 import java.time.Duration
 import java.util.UUID
 import javax.imageio.ImageIO
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -285,5 +290,145 @@ class DraftSafetyConflictTest {
         assertEquals("Draft copy.md", model.state.value.active.name)
         assertEquals("external v2\n", originalMd.readText(Charsets.UTF_8))
         assertEquals("local v2\n", copyMd.readText(Charsets.UTF_8))
+    }
+
+    @Test
+    fun closeAfterReaderBarrierEmptyTabDiscardClearsConflictPendingAndAutosaveState() = withWorkspace { _, temp, model ->
+        model.readerFlushRequester = { true }
+        val smdFile = File(temp, "LockHolder.smd")
+        smdFile.outputStream().use { out ->
+            model.media.writeFmd(out, "# Lock holder\n", JSONObject().put("assets/fig.png", pngOne))
+        }
+        model.open(Uri.fromFile(smdFile))
+        waitUntil { model.state.value.active.uri == Uri.fromFile(smdFile).toString() }
+        val lockHolderId = model.state.value.active.id
+        val lockHolderDir = model.state.value.active.assetDirectory
+
+        var createdNote: Note? = null
+        model.newNote(titleHint = "Transient", content = "Non-empty while barrier runs", background = true) { createdNote = it }
+        waitUntil { createdNote != null }
+        val targetId = createdNote!!.id
+
+        val postWriteEntered = CompletableDeferred<Unit>()
+        val postWriteRelease = CompletableDeferred<Unit>()
+        model.portablePostWriteObserver = {
+            postWriteEntered.complete(Unit)
+            postWriteRelease.await()
+        }
+        try {
+            model.edit(lockHolderId, "# Lock holder updated\n")
+            val saveJob = CoroutineScope(Dispatchers.Default).launch {
+                model.saveAgentPortable(lockHolderId, agentContentRevision("# Lock holder updated\n"))
+            }
+            waitUntil { postWriteEntered.isCompleted }
+
+            // Start closing targetId while its content is non-blank so close() enters closeAfterReaderBarrier(targetId)
+            // and suspends waiting on documentWrites.
+            var closeResult: String? = "pending"
+            model.close(targetId) { closeResult = it }
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(50))
+
+            // Before closeAfterReaderBarrier acquires documentWrites, clear the draft text with autosave enabled
+            // (populating autosavePending) and seed conflict/pending-dialog state for targetId.
+            model.reading(autosave = true)
+            model.edit(targetId, "   ")
+            @Suppress("UNCHECKED_CAST")
+            val autosavePending = StudioViewModel::class.java.getDeclaredField("autosavePending").apply { isAccessible = true }.get(model) as Set<String>
+            assertTrue("Expected targetId in autosavePending before closeAfterReaderBarrier resumes", targetId in autosavePending)
+
+            @Suppress("UNCHECKED_CAST")
+            val mutableFlow = StudioViewModel::class.java.getDeclaredField("mutable").apply { isAccessible = true }
+                .get(model) as kotlinx.coroutines.flow.MutableStateFlow<StudioState>
+            mutableFlow.value = mutableFlow.value.copy(
+                conflictedTabIds = mutableFlow.value.conflictedTabIds + targetId,
+                pendingCloseNoteId = targetId,
+                pendingSaveConflictNoteId = targetId,
+            )
+
+            model.portablePostWriteObserver = null
+            postWriteRelease.complete(Unit)
+            waitUntil { saveJob.isCompleted && closeResult != "pending" }
+
+            assertNull(closeResult)
+            assertEquals("Empty tab discarded", model.state.value.message)
+            assertFalse(model.state.value.tabs.any { it.id == targetId })
+            assertFalse("Empty tab discarded in closeAfterReaderBarrier must not be saved in closedTabs", model.state.value.closedTabs.any { it.id == targetId })
+            assertFalse(targetId in model.state.value.conflictedTabIds)
+            assertNull(model.state.value.pendingCloseNoteId)
+            assertNull(model.state.value.pendingSaveConflictNoteId)
+            assertFalse(targetId in autosavePending)
+        } finally {
+            model.portablePostWriteObserver = null
+            postWriteRelease.complete(Unit)
+            lockHolderDir?.let { File(RuntimeEnvironment.getApplication().filesDir, "portable-assets/$it").deleteRecursively() }
+        }
+    }
+
+    @Test
+    fun saveAndSaveAsHandoffPreservesDraftTitleAndSucceedsAcrossPreSupermdLoadReaderFlush() = withWorkspace { app, temp, model ->
+        val backgroundMd = File(temp, "Background.md").apply { writeText("v1\n", Charsets.UTF_8) }
+        model.open(Uri.fromFile(backgroundMd))
+        waitUntil { model.state.value.active.uri == Uri.fromFile(backgroundMd).toString() }
+        val backgroundId = model.state.value.active.id
+        model.edit(backgroundId, "v2\n")
+
+        model.newNote(format = "smd")
+        waitUntil { model.state.value.active.id != backgroundId && model.state.value.active.name == "Untitled.smd" }
+        val draftId = model.state.value.active.id
+        var draftAssetDir: String? = model.state.value.active.assetDirectory
+        val savedSmd = File(temp, "Derived Draft.smd")
+        try {
+            model.edit(draftId, "# Derived Draft\n\nBody\n")
+            model.outline(
+                draftId,
+                org.json.JSONArray().put(
+                    JSONObject().put("id", "h-0").put("title", "Derived Draft").put("level", 1).put("offset", 0),
+                ),
+            )
+            assertEquals("Derived Draft.smd", model.state.value.active.name)
+            assertEquals(draftId, model.lastOutlineNoteId)
+
+            // Pre-supermdLoad handoff (#130): readerFlushStatusRequester reports WRONG_ACTIVE_NOTE while native state is authoritative.
+            model.readerFlushStatusRequester = { ReaderFlushStatus.WRONG_ACTIVE_NOTE }
+            var requestedSaveAsName: String? = null
+            model.requestSaveAs = { note ->
+                requestedSaveAsName = note.name
+                model.completePortableSaveAs(Uri.fromFile(savedSmd), note.id)
+            }
+
+            model.requestClose(draftId)
+            waitUntil { model.state.value.pendingCloseNoteId == draftId }
+            model.resolveCloseConfirmation("save")
+            waitUntil { !model.state.value.tabs.any { it.id == draftId } && savedSmd.exists() && !model.state.value.busy }
+
+            assertEquals("Derived Draft.smd", requestedSaveAsName)
+            val savedPortable = savedSmd.inputStream().use(model.media::openFmd)
+            try {
+                assertEquals("# Derived Draft\n\nBody\n", savedPortable.markdown)
+            } finally {
+                File(app.filesDir, "portable-assets/${savedPortable.directory}").deleteRecursively()
+            }
+
+            // Make backgroundId inactive, then saveManual(noteId = backgroundId) across WRONG_ACTIVE_NOTE handoff.
+            model.newNote()
+            waitUntil { model.state.value.active.id != backgroundId }
+            model.saveManual(noteId = backgroundId)
+            waitUntil { model.state.value.active.id == backgroundId && !model.state.value.active.dirty && !model.state.value.busy }
+            assertEquals("v2\n", backgroundMd.readText(Charsets.UTF_8))
+
+            // Failed reader barrier aborts save-on-close cleanly and clears closeAfterSaveNoteId.
+            model.edit(backgroundId, "v3\n")
+            model.requestClose(backgroundId)
+            waitUntil { model.state.value.pendingCloseNoteId == backgroundId }
+            val closeAfterSaveField = StudioViewModel::class.java.getDeclaredField("closeAfterSaveNoteId").apply { isAccessible = true }
+            model.readerFlushStatusRequester = { ReaderFlushStatus.FAILED }
+            model.resolveCloseConfirmation("save")
+            waitUntil { closeAfterSaveField.get(model) == null && model.state.value.pendingCloseNoteId == null }
+            assertTrue(model.state.value.tabs.any { it.id == backgroundId })
+            assertEquals("v2\n", backgroundMd.readText(Charsets.UTF_8))
+        } finally {
+            draftAssetDir = draftAssetDir ?: model.state.value.tabs.find { it.id == draftId }?.assetDirectory
+            draftAssetDir?.let { File(app.filesDir, "portable-assets/$it").deleteRecursively() }
+        }
     }
 }
