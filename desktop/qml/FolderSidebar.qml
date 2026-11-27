@@ -164,7 +164,7 @@ ColumnLayout {
     ActionButton {
         objectName: "sidebarFolderSearchButton"
         text: "Search across notes"
-        glyph: "MagnifyingGlass"
+        glyph: "FolderSearch"
         compact: true
         tonal: true
         Layout.fillWidth: true
