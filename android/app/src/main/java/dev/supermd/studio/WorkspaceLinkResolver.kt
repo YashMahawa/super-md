@@ -338,10 +338,15 @@ internal class WorkspaceLinkCache(
      * or `null` if `noteUri` does not belong to `treeUri`.
      */
     fun noteRelativeInTree(treeUri: Uri, noteUri: Uri, knownRelative: String? = null): String? {
-        if (noteUri.scheme == "content" && treeUri.scheme == "content" && noteUri.authority == treeUri.authority) {
+        if (
+            noteUri.scheme == "content" &&
+            treeUri.scheme == "content" &&
+            noteUri.authority == treeUri.authority &&
+            isKnownPathDocumentProvider(treeUri.authority)
+        ) {
             val rootId = runCatching { lister.rootDocumentId(treeUri) }.getOrNull()
             val docId = runCatching { DocumentsContract.getDocumentId(noteUri) }.getOrNull()
-            if (rootId != null && docId != null) {
+            if (rootId != null && docId != null && isKnownPathContainedInTree(treeUri.authority, rootId, docId)) {
                 extractRelativeFromDocId(rootId, docId)?.takeIf { it.isNotEmpty() }?.let { return it }
             }
         }

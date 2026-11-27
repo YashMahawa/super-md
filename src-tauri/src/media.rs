@@ -40,7 +40,9 @@ pub fn store_image(name: String, data: String) -> Result<ImportedImage> {
     let mut file = tempfile::Builder::new().prefix("import-").suffix(&format!(".{extension}")).tempfile_in(&directory)?;
     file.write_all(&bytes)?; file.as_file().sync_all()?;
     let (_, path) = file.keep()?;
-    Ok(ImportedImage { source: format!("assets/{}", path.file_name().unwrap().to_string_lossy()), alt: name.chars().take(200).collect() })
+    let source = format!("assets/{}", path.file_name().unwrap().to_string_lossy());
+    if !smd_core::portable::new_asset_name(&source) { bail!("Unsafe FMD asset name: {source}"); }
+    Ok(ImportedImage { source, alt: name.chars().take(200).collect() })
 }
 #[tauri::command] pub async fn import_images(images: Vec<ImageInput>) -> Result<Vec<ImportedImage>, String> {
     tauri::async_runtime::spawn_blocking(move || {
