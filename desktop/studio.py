@@ -5271,7 +5271,7 @@ class Studio(QObject):
         return studio_agent_actions.command(self, action)
 
     def _agent_export_path(self, filename: str, format: str, tab: dict) -> Path:
-        return studio_agent_actions.agent_export_path(self, filename, format, tab)
+        return studio_agent_actions.agent_export_path(self, filename, format, tab, writable_location_fn=QStandardPaths.writableLocation)
 
     @staticmethod
     def _agent_export_metadata(path: Path, format: str) -> dict:
@@ -5779,10 +5779,10 @@ class Studio(QObject):
         self.session._enqueue_agent_stage(start_queued)
 
     def _agent_document_action(self, args):
-        return studio_agent_actions.agent_document_action(self, args)
+        return studio_agent_actions.agent_document_action(self, args, writable_location_fn=QStandardPaths.writableLocation, is_dirty_fn=Studio._is_dirty, run_prepared_write_sync_fn=Studio._run_prepared_write_sync, prepare_save_document_fn=Studio._prepare_save_document)
 
     def _agent_tab_result(self, tab, *, active=None, title=None):
-        return studio_agent_actions.agent_tab_result(self, tab, active=active, title=title)
+        return studio_agent_actions.agent_tab_result(self, tab, active=active, title=title, is_dirty_fn=Studio._is_dirty)
 
     def _agent_path_allowed(self, path: Path) -> bool:
         """Check open targets against user-selected note roots and session paths."""
@@ -6382,7 +6382,7 @@ class Studio(QObject):
         return studio_agent_actions.agent_viewport_revision(self, tab_id)
 
     def _begin_agent_viewport_capture(self, request_id, args):
-        return studio_agent_actions.begin_agent_viewport_capture(self, request_id, args)
+        return studio_agent_actions.begin_agent_viewport_capture(self, request_id, args, single_shot_fn=QTimer.singleShot)
 
     def _capture_background_preview(self, request_id, tab_id, revision, context, args):
         return studio_agent_actions.capture_background_preview(self, request_id, tab_id, revision, context, args)

@@ -1,22 +1,20 @@
 """Unit tests for desktop/studio_agent_actions.py extracted behind the Studio facade."""
 from __future__ import annotations
-import base64, hashlib, os, sys, tempfile, unittest
+import ast, base64, hashlib, os, sys, tempfile, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
-
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF
 from PySide6.QtGui import QColor, QGuiApplication, QImage
-import studio as studio_module
+import studio_agent_actions
 from studio import Session, Studio
 
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
 
 def _png_bytes(width: int = 80, height: int = 60, color: str = "#2255aa") -> bytes:
     img = QImage(width, height, QImage.Format.Format_ARGB32)
@@ -27,40 +25,28 @@ def _png_bytes(width: int = 80, height: int = 60, color: str = "#2255aa") -> byt
     img.save(buf, "PNG")
     return bytes(arr)
 
-
 class QuietStudio(Studio):
     def __init__(self, isolated: bool = True, session: Session | None = None):
         session = session or Session(isolated)
         session.settings.setdefault("python", sys.executable)
         super().__init__(isolated, session)
-
     def _refresh_theme(self):
         self.system_dark = True
-
 
 class _FakeBridge:
     def __init__(self, pending: set[tuple[str, str, str, str]] | None = None):
         self.pending = pending if pending is not None else set()
         self.completed: list[tuple[str, object, str, str]] = []
-
     def has_pending(self, req_id: str, win_id: str, action: str, tab_id: str) -> bool:
         return (req_id, win_id, action, tab_id) in self.pending
-
     def complete(self, req_id: str, result: object = None, error: str = "", *, window_id: str = "") -> None:
         self.pending = {item for item in self.pending if item[0] != req_id}
         self.completed.append((req_id, result, error, window_id))
 
-
 class _FakeSignal:
-    def __init__(self):
-        self.connected: list = []
-
-    def connect(self, fn, *_args):
-        self.connected.append(fn)
-
-    def disconnect(self, fn):
-        self.connected.remove(fn)
-
+    def __init__(self): self.connected: list = []
+    def connect(self, fn, *_args): self.connected.append(fn)
+    def disconnect(self, fn): self.connected.remove(fn)
 
 class _FakeReader:
     def __init__(self, w: float = 800, h: float = 600, offset: tuple[float, float] = (20, 40)):
@@ -68,7 +54,6 @@ class _FakeReader:
     def width(self) -> float: return self._w
     def height(self) -> float: return self._h
     def mapToScene(self, pt: QPointF) -> QPointF: return QPointF(pt.x() + self._ox, pt.y() + self._oy)
-
 
 class _FakeWindow:
     def __init__(self, *, visible: bool = True, reader: object = None, image: QImage | None = None, w: int = 1000, h: int = 800):
@@ -104,6 +89,19 @@ class StudioAgentActionsTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_command_routes_reader_actions_window_signal_and_unknown_noop(self):
+        src = Path(studio_agent_actions.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("_studio_module", src)
+        self.assertFalse(hasattr(studio_agent_actions, "_studio_module"))
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Import):
+                self.assertTrue(all(a.name not in ("studio", "desktop.studio", "importlib") for a in node.names))
+            elif isinstance(node, ast.ImportFrom):
+                self.assertNotIn(node.module, ("studio", "desktop.studio", "importlib"))
+                self.assertTrue(all(a.name != "studio" for a in node.names))
+            elif isinstance(node, ast.Attribute):
+                self.assertFalse(isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "modules")
+            elif isinstance(node, ast.ExceptHandler):
+                self.assertFalse(isinstance(node.type, ast.Name) and node.type.id == "ImportError")
         calls, windows = [], []
         self.studio.readerCall.connect(calls.append)
         self.studio.newWindowRequested.connect(lambda: windows.append(True))
@@ -118,10 +116,8 @@ class StudioAgentActionsTests(unittest.TestCase):
         ])
         self.assertEqual(len(windows), 1)
         proxy_calls = []
-        proxy = SimpleNamespace(
-            readerCall=SimpleNamespace(emit=proxy_calls.append),
-            newWindowRequested=SimpleNamespace(emit=lambda: proxy_calls.append("win")),
-        )
+        proxy = SimpleNamespace(readerCall=SimpleNamespace(emit=proxy_calls.append),
+                                newWindowRequested=SimpleNamespace(emit=lambda: proxy_calls.append("win")))
         Studio.command(proxy, "replace")
         Studio.command(proxy, "window")
         self.assertEqual(proxy_calls, ["window.supermdFind?.(true)", "win"])
@@ -152,13 +148,10 @@ class StudioAgentActionsTests(unittest.TestCase):
         active_id = self.studio.active
         fg = self.studio._agent_document_action({"action": "create_document", "title": "Spec.md", "content": "# Spec\n"})
         self.assertEqual((fg["active"], fg["format"], fg["title"], self.studio.active), (True, "md", "Spec.md", fg["tabId"]))
-        bg = self.studio._agent_document_action(
-            {"action": "create_document", "filename": "Deck.md", "format": "smd", "content": "# Deck\n", "background": True}
-        )
+        bg = self.studio._agent_document_action({"action": "create_document", "filename": "Deck.md", "format": "smd", "content": "# Deck\n", "background": True})
         self.assertEqual((bg["active"], bg["format"], bg["title"], self.studio.active), (False, "smd", "Deck.smd", fg["tabId"]))
         activated = self.studio._agent_document_action({"action": "activate_document", "tabId": active_id})
         self.assertEqual((activated["active"], self.studio.active), (True, active_id))
-
         spec_tab = next(t for t in self.studio.tabs if t["id"] == fg["tabId"])
         spec_rev = _sha(spec_tab["content"])
         self.studio._staging_tabs.add(spec_tab["id"])
@@ -171,9 +164,7 @@ class StudioAgentActionsTests(unittest.TestCase):
             self.studio._agent_document_action({"action": "close_document", "tabId": spec_tab["id"], "expectedRevision": "0" * 64})
         with self.assertRaisesRegex(ValueError, "unsaved changes"):
             self.studio._agent_document_action({"action": "close_document", "tabId": spec_tab["id"], "expectedRevision": spec_rev})
-        closed = self.studio._agent_document_action(
-            {"action": "close_document", "tabId": spec_tab["id"], "expectedRevision": spec_rev, "discardChanges": True}
-        )
+        closed = self.studio._agent_document_action({"action": "close_document", "tabId": spec_tab["id"], "expectedRevision": spec_rev, "discardChanges": True})
         self.assertIn(closed["status"], ("closing", "closed"))
 
         outside = Path(self.temp.name).parent / f"{self.root.name}-outside.md"
@@ -221,6 +212,10 @@ class StudioAgentActionsTests(unittest.TestCase):
             })
         self.assertEqual(staged, {"staged": True})
         stage_mock.assert_called_once()
+        proxy_saved = SimpleNamespace(saving=set(), _prepare_save_document=lambda a: (a["tabId"], lambda: "ok", lambda v, _e: {"saved": v}, lambda: None))
+        self.assertEqual(studio_agent_actions.agent_document_action(proxy_saved, {"action": "save_document", "tabId": "t1"}), {"saved": "ok"})
+        with patch.object(Studio, "_prepare_save_document", return_value=("t2", lambda: "s", lambda v, _e: {"via": v}, lambda: None)):
+            self.assertEqual(self.studio._agent_document_action({"action": "save_document", "tabId": "t2"}), {"via": "s"})
 
     def test_viewport_capture_guards_background_fallback_live_crop_encoding_and_revision_race(self):
         tab = self.studio._current()
@@ -258,7 +253,7 @@ class StudioAgentActionsTests(unittest.TestCase):
         timers = []
         for fmt, expected_mime in (("png", "image/png"), ("jpeg", "image/jpeg")):
             bridge.pending.add((req_id, self.studio.window_id, "render_tab", tab["id"]))
-            with patch.object(studio_module.QTimer, "singleShot", side_effect=lambda ms, cb: timers.append((ms, cb))):
+            with patch("studio.QTimer.singleShot", side_effect=lambda ms, cb: timers.append((ms, cb))):
                 self.studio._begin_agent_viewport_capture(req_id, {**base, "width": 200, "imageFormat": fmt})
             self.assertEqual((self.studio._agent_viewport_capture is not None, len(win.frameSwapped.connected)), (True, 1))
             timers.pop()[1]()
@@ -273,7 +268,7 @@ class StudioAgentActionsTests(unittest.TestCase):
 
         win.grabWindow = mutating_grab
         bridge.pending.add((req_id, self.studio.window_id, "render_tab", tab["id"]))
-        with patch.object(studio_module.QTimer, "singleShot"):
+        with patch("studio.QTimer.singleShot"):
             self.studio._begin_agent_viewport_capture(req_id, base)
         self.studio._clear_agent_viewport_capture({"requestId": "other"})
         self.assertIsNotNone(self.studio._agent_viewport_capture)
@@ -285,7 +280,7 @@ class StudioAgentActionsTests(unittest.TestCase):
         base2 = {**base, "revision": rev2, "context": {"revision": rev2, "viewport": valid_vp}}
         win.grabWindow = lambda: frame
         bridge.pending.add((req_id, self.studio.window_id, "render_tab", tab["id"]))
-        with patch.object(studio_module.QTimer, "singleShot"), patch.object(QImage, "save", return_value=False):
+        with patch("studio.QTimer.singleShot"), patch.object(QImage, "save", return_value=False):
             self.studio._begin_agent_viewport_capture(req_id, base2)
             self.studio._agent_viewport_frame_swapped()
         self.assertEqual(bridge.completed[-1][2], "Could not encode the live viewport as PNG")

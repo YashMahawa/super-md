@@ -1,9 +1,10 @@
 """Reader command routing, agent document actions, export path reservation, and viewport capture for Studio."""
 from __future__ import annotations
-import base64, hashlib, math, os, sys, uuid
+import base64, hashlib, math, os, uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QPointF, QRect, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QPointF, QRect, QStandardPaths, QTimer, Qt
 from PySide6.QtGui import QImage
 
 _READER_COMMAND_CALLS = {
@@ -18,52 +19,44 @@ _READER_COMMAND_CALLS = {
 }
 
 
-def _studio_module():
-    module = sys.modules.get("studio") or sys.modules.get("desktop.studio")
-    if module is not None:
-        return module
-    if __package__:
-        from . import studio as module
-    else:
-        import studio as module
-    return module
+def _default_is_dirty(_studio_obj: Any, tab: dict) -> bool:
+    return bool(tab.get("content") != tab.get("saved") or tab.get("assets_dirty")
+                or (tab.get("path") and "saved_assets" in tab and tab.get("assets", {}) != tab.get("saved_assets", {})))
 
+def _default_prepare_save_document(studio_obj: Any, args: dict):
+    return studio_obj._prepare_save_document(args)
 
-def _offline_view_module():
-    module = sys.modules.get("offline_view") or sys.modules.get("desktop.offline_view")
-    if module is not None:
-        return module
-    if __package__:
-        from . import offline_view as module
-    else:
-        import offline_view as module
-    return module
+def _default_run_prepared_write_sync(studio_obj: Any, prepared: Any):
+    tab_id, work, finalize, _abort = prepared
+    saving = getattr(studio_obj, "saving", None)
+    if saving is not None: saving.add(tab_id)
+    try:
+        value = work()
+    except Exception as error:
+        if saving is not None: saving.discard(tab_id)
+        finalize(None, str(error))
+        raise
+    if saving is not None: saving.discard(tab_id)
+    return finalize(value, None)
 
+def _default_agent_directory(studio_obj: Any, *, writable_location_fn: Callable = QStandardPaths.writableLocation) -> Path:
+    return Path(studio_obj.settings.get("newNoteLocation")
+                or writable_location_fn(QStandardPaths.StandardLocation.DownloadLocation) or str(Path.home())).expanduser()
 
-def _default_agent_directory(studio_obj: Any) -> Path:
-    qsp = _studio_module().QStandardPaths
-    return Path(
-        studio_obj.settings.get("newNoteLocation")
-        or qsp.writableLocation(qsp.StandardLocation.DownloadLocation)
-        or str(Path.home())
-    ).expanduser()
+def _tab_result(studio_obj: Any, tab: dict, *, is_dirty_fn: Callable = _default_is_dirty, **kwargs) -> dict:
+    fn = getattr(studio_obj, "_agent_tab_result", None)
+    return fn(tab, **kwargs) if callable(fn) else agent_tab_result(studio_obj, tab, is_dirty_fn=is_dirty_fn, **kwargs)
 
-
-def _encode_viewport_image(
-    image: QImage, image_format: str, *, jpeg_quality: int | None = None, require_saved: bool = False
-) -> tuple[str, str]:
+def _encode_viewport_image(image: QImage, image_format: str, *, jpeg_quality: int | None = None, require_saved: bool = False) -> tuple[str, str]:
     is_jpeg = image_format == "jpeg"
     mime_type, encoder = ("image/jpeg", "JPEG") if is_jpeg else ("image/png", "PNG")
     encoded = QByteArray()
     buffer = QBuffer(encoded)
-    saved = (
-        (image.save(buffer, encoder, jpeg_quality) if is_jpeg and jpeg_quality is not None else image.save(buffer, encoder))
-        if buffer.open(QIODevice.OpenModeFlag.WriteOnly) else False
-    )
+    saved = ((image.save(buffer, encoder, jpeg_quality) if is_jpeg and jpeg_quality is not None else image.save(buffer, encoder))
+             if buffer.open(QIODevice.OpenModeFlag.WriteOnly) else False)
     if require_saved and not saved:
         raise ValueError(f"Could not encode the live viewport as {encoder}")
     return mime_type, base64.b64encode(bytes(encoded)).decode("ascii")
-
 
 def command(studio_obj: Any, action: str) -> None:
     if action in _READER_COMMAND_CALLS:
@@ -71,8 +64,7 @@ def command(studio_obj: Any, action: str) -> None:
     elif action == "window":
         studio_obj.newWindowRequested.emit()
 
-
-def agent_export_path(studio_obj: Any, filename: str, format: str, tab: dict) -> Path:
+def agent_export_path(studio_obj: Any, filename: str, format: str, tab: dict, *, writable_location_fn: Callable = QStandardPaths.writableLocation) -> Path:
     extension = {"pdf": ".pdf", "smd": ".smd", "md": ".md"}[format]
     selected = filename or Path(tab["name"]).stem or "Super MD export"
     if Path(selected).name != selected or any(char in selected for char in ("/", "\\", "\0")):
@@ -81,7 +73,7 @@ def agent_export_path(studio_obj: Any, filename: str, format: str, tab: dict) ->
     stem = "".join(char for char in stem if char.isalnum() or char in " ._()-").strip(" .")[:100]
     if not stem or stem in (".", ".."):
         stem = "Super MD export"
-    directory = _default_agent_directory(studio_obj)
+    directory = _default_agent_directory(studio_obj, writable_location_fn=writable_location_fn)
     if not directory.is_dir():
         raise ValueError("The configured export folder is unavailable")
     for index in range(1, 10_001):
@@ -95,9 +87,11 @@ def agent_export_path(studio_obj: Any, filename: str, format: str, tab: dict) ->
         return candidate
     raise ValueError("Could not choose a unique export filename")
 
-
-def agent_document_action(studio_obj: Any, args: dict) -> dict:
-    studio_cls = _studio_module().Studio
+def agent_document_action(
+    studio_obj: Any, args: dict, *, writable_location_fn: Callable = QStandardPaths.writableLocation,
+    is_dirty_fn: Callable = _default_is_dirty, run_prepared_write_sync_fn: Callable = _default_run_prepared_write_sync,
+    prepare_save_document_fn: Callable = _default_prepare_save_document,
+) -> dict:
     action = args.get("action")
     if action == "patch_tab":
         tab, tab_id, previous, revision, edited, operation_results, changed = studio_obj._validate_and_compute_patch_tab(args)
@@ -114,7 +108,7 @@ def agent_document_action(studio_obj: Any, args: dict) -> dict:
                     "sourceLength": len(edited), "changed": changed,
                     "applied": len(operation_results), "operation_results": operation_results,
                     "isDirty": edited != tab["saved"]}
-        if not changed and not (studio_cls._is_dirty(studio_obj, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
+        if not changed and not (is_dirty_fn(studio_obj, tab) or tab.get("agent_staged") or tab.get("agent_unreviewed")):
             return {"tabId": tab_id, "windowId": studio_obj.window_id, "revision": revision,
                     "sourceLength": len(edited), "changed": False,
                     "applied": len(operation_results), "operation_results": operation_results, "isDirty": False}
@@ -145,16 +139,16 @@ def agent_document_action(studio_obj: Any, args: dict) -> dict:
             studio_obj.active = note["id"]
         studio_obj.recovery_timer.start(800)
         studio_obj._emit(load=not background)
-        return studio_obj._agent_tab_result(note, active=not background, title=title)
+        return _tab_result(studio_obj, note, is_dirty_fn=is_dirty_fn, active=not background, title=title)
     if action == "save_document":
-        return studio_cls._run_prepared_write_sync(studio_obj, studio_cls._prepare_save_document(studio_obj, args))
+        return run_prepared_write_sync_fn(studio_obj, prepare_save_document_fn(studio_obj, args))
     if action == "activate_document":
         tab_id = args.get("tabId")
         tab = next((item for item in studio_obj.tabs if item["id"] == tab_id), None)
         if tab is None:
             raise ValueError("The requested live tab is no longer open")
         studio_obj.selectTab(tab_id)
-        return studio_obj._agent_tab_result(tab, active=True)
+        return _tab_result(studio_obj, tab, is_dirty_fn=is_dirty_fn, active=True)
     if action == "close_document":
         tab_id = args.get("tabId")
         tab = next((item for item in studio_obj.tabs if item["id"] == tab_id), None)
@@ -170,7 +164,7 @@ def agent_document_action(studio_obj: Any, args: dict) -> dict:
         discard = args.get("discardChanges", False)
         if not isinstance(discard, bool):
             raise ValueError("discardChanges must be a boolean")
-        if studio_cls._is_dirty(studio_obj, tab) and not discard:
+        if is_dirty_fn(studio_obj, tab) and not discard:
             raise ValueError("The document has unsaved changes; pass discardChanges:true to close and preserve it in closed-note recovery")
         studio_obj._remove_tab(tab_id)
         status = "closing" if any(item["id"] == tab_id for item in studio_obj.tabs) else "closed"
@@ -188,10 +182,10 @@ def agent_document_action(studio_obj: Any, args: dict) -> dict:
                 raise ValueError("The requested live tab is no longer open")
             if not background:
                 studio_obj.selectTab(existing["id"])
-            return studio_obj._agent_tab_result(existing, active=not background)
+            return _tab_result(studio_obj, existing, is_dirty_fn=is_dirty_fn, active=not background)
         candidate = Path(filename).expanduser()
         if not candidate.is_absolute():
-            candidate = _default_agent_directory(studio_obj) / candidate.name
+            candidate = _default_agent_directory(studio_obj, writable_location_fn=writable_location_fn) / candidate.name
         if not studio_obj._agent_path_allowed(candidate):
             raise ValueError("The file is outside the approved agent note roots")
         resolved = str(candidate.resolve())
@@ -199,7 +193,7 @@ def agent_document_action(studio_obj: Any, args: dict) -> dict:
         if existing:
             if not background:
                 studio_obj.selectTab(existing["id"])
-            return studio_obj._agent_tab_result(existing, active=not background)
+            return _tab_result(studio_obj, existing, is_dirty_fn=is_dirty_fn, active=not background)
         while len(studio_obj._agent_job_records) >= 20:
             removable = next((key for key, value in studio_obj._agent_job_records.items()
                               if value.get("status") in ("completed", "failed", "cancelled")), None)
@@ -220,28 +214,25 @@ def agent_document_action(studio_obj: Any, args: dict) -> dict:
             if error:
                 record.update(status="failed", error=str(error)[:1000])
             else:
-                record.update(status="completed", **studio_obj._agent_tab_result(result))
+                record.update(status="completed", **_tab_result(studio_obj, result, is_dirty_fn=is_dirty_fn))
 
         studio_obj._open_note(resolved, explicit=not background, background=background, completion_callback=opened)
         return {"status": "opening", "jobId": job_id, "path": resolved, "windowId": studio_obj.window_id,
                 "active": not background, "format": fmt}
     raise ValueError("Unsupported native document action")
 
-
-def agent_tab_result(studio_obj: Any, tab: dict, *, active: bool | None = None, title: str | None = None) -> dict:
+def agent_tab_result(studio_obj: Any, tab: dict, *, active: bool | None = None, title: str | None = None, is_dirty_fn: Callable = _default_is_dirty) -> dict:
     content, path = tab["content"], tab["path"]
     fmt = "smd" if tab.get("portable") or Path(path or tab["name"]).suffix.lower() == ".smd" else "md"
     return {"tabId": tab["id"], "windowId": studio_obj.window_id,
             "revision": hashlib.sha256(content.encode("utf-8")).hexdigest(),
             "path": path, "title": title or tab["name"],
             "active": studio_obj.active == tab["id"] if active is None else active,
-            "sourceLength": len(content), "format": fmt, "isDirty": _studio_module().Studio._is_dirty(studio_obj, tab)}
-
+            "sourceLength": len(content), "format": fmt, "isDirty": is_dirty_fn(studio_obj, tab)}
 
 def agent_viewport_pending(studio_obj: Any, request_id: str, tab_id: str) -> bool:
     bridge = getattr(studio_obj.session, "agent_bridge", None)
     return bool(bridge and bridge.has_pending(request_id, studio_obj.window_id, "render_tab", tab_id))
-
 
 def agent_viewport_revision(studio_obj: Any, tab_id: str) -> str:
     if studio_obj.retired or studio_obj.active != tab_id:
@@ -251,8 +242,7 @@ def agent_viewport_revision(studio_obj: Any, tab_id: str) -> str:
         raise ValueError("The requested live tab is no longer open")
     return hashlib.sha256(tab["content"].encode("utf-8")).hexdigest()
 
-
-def begin_agent_viewport_capture(studio_obj: Any, request_id: str, args: dict) -> None:
+def begin_agent_viewport_capture(studio_obj: Any, request_id: str, args: dict, *, single_shot_fn: Callable = QTimer.singleShot) -> None:
     if not isinstance(args, dict) or args.get("requestId") != request_id:
         raise ValueError("Viewport capture request is invalid")
     tab_id, revision, context = args.get("tabId"), args.get("revision"), args.get("context")
@@ -297,11 +287,13 @@ def begin_agent_viewport_capture(studio_obj: Any, request_id: str, args: dict) -
     except (AttributeError, RuntimeError, TypeError):
         pass
     window.update()
-    _studio_module().QTimer.singleShot(200, lambda rid=request_id: studio_obj._agent_viewport_fallback(rid))
-
+    single_shot_fn(200, lambda rid=request_id: studio_obj._agent_viewport_fallback(rid))
 
 def capture_background_preview(studio_obj: Any, request_id: str, tab_id: str, revision: str, context: dict, args: dict) -> None:
-    render_live_snapshot = _offline_view_module().render_live_snapshot
+    if __package__:
+        from .offline_view import render_live_snapshot
+    else:
+        from offline_view import render_live_snapshot
     tab = next(t for t in studio_obj.tabs if t["id"] == tab_id)
     content, assets, path = tab["content"], dict(tab.get("assets", {})), tab.get("path", "")
     width = max(320, min(1600, int(args.get("width", 1200))))
@@ -328,7 +320,6 @@ def capture_background_preview(studio_obj: Any, request_id: str, tab_id: str, re
 
     studio_obj._submit(lambda: render_live_snapshot(content, assets, path, width=width, heading=heading, view=view), done, False)
 
-
 def clear_agent_viewport_capture(studio_obj: Any, pending: dict) -> None:
     if studio_obj._agent_viewport_capture is not pending:
         return
@@ -338,18 +329,15 @@ def clear_agent_viewport_capture(studio_obj: Any, pending: dict) -> None:
     except (AttributeError, RuntimeError, TypeError):
         pass
 
-
 def agent_viewport_fallback(studio_obj: Any, request_id: str) -> None:
     pending = studio_obj._agent_viewport_capture
     if pending is not None and pending["requestId"] == request_id:
         studio_obj._capture_agent_viewport(pending)
 
-
 def agent_viewport_frame_swapped(studio_obj: Any) -> None:
     pending = studio_obj._agent_viewport_capture
     if pending is not None:
         studio_obj._capture_agent_viewport(pending)
-
 
 def capture_agent_viewport(studio_obj: Any, pending: dict) -> None:
     if studio_obj._agent_viewport_capture is not pending:
