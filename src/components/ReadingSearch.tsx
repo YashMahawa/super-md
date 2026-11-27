@@ -6,8 +6,9 @@ import { windowedMatches, compileSearchPattern, type WindowedMatch, type SearchM
 import {
   cancelSettlingHeading, deepestSourceOwner, findContainingBlock, findMatchingSourceRangeIndex, findReadingHost,
   firstSourceRangeFrom, getSearchDomVersion, insertDomRangeInOrder, nextSearchIndex, openDisclosuresFor,
-  rangeStartElement, readingMatches, replaceSourceMatches, resolveActiveHighlightRange, resolveSourceBlock,
-  resolveSourceHighlightRange, revealMountedBlock, scrollTargetIntoView, sourceMatches, syncSearchHighlights,
+  ownerScrollTarget, rangeStartElement, readingMatches, replaceSourceMatches, resolveActiveHighlightRange,
+  resolveSourceBlock, resolveSourceHighlightRange, resolveWindowedMatchTarget, revealMountedBlock,
+  revealStepCardsForRange, scrollTargetIntoView, sourceMatches, syncSearchHighlights,
   translateRenderedIndexToSource, translateSourceIndexToRendered, type SourceRange,
 } from "../readingSearchDom";
 export type { SearchMatchConfig, SearchMatchOptions } from "../readingSearchDom";
@@ -23,14 +24,7 @@ const UNICODE_SEARCH_FOLDS = new Map<number, string>([
   [0xfb13, "\u0574\u0576"], [0xfb14, "\u0574\u0565"], [0xfb15, "\u0574\u056b"], [0xfb16, "\u057e\u0576"], [0xfb17, "\u0574\u056d"],
 ]);
 
-export interface ReadingSearchSeed {
-  query: string;
-  caseSensitive?: boolean;
-  sourceStart?: number;
-  sourceEnd?: number;
-  matchText?: string;
-  nonce: number;
-}
+export interface ReadingSearchSeed { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number; }
 
 function extractSeedRange(seed?: ReadingSearchSeed | null): SourceRange | null {
   if (!seed) return null;
@@ -38,7 +32,6 @@ function extractSeedRange(seed?: ReadingSearchSeed | null): SourceRange | null {
   return typeof sourceStart === "number" && typeof sourceEnd === "number" && Number.isInteger(sourceStart) && Number.isInteger(sourceEnd) && sourceStart >= 0 && sourceEnd >= sourceStart
     ? { from: sourceStart, to: sourceEnd } : null;
 }
-
 const extractSeedMatchText = (seed?: ReadingSearchSeed | null): string | undefined =>
   typeof seed?.matchText === "string" && seed.matchText.length > 0 ? seed.matchText : undefined;
 
@@ -51,13 +44,11 @@ export function foldUnicodeForSearch(text: string): string {
   }
   return out;
 }
-
 function isSplitUtf16Surrogate(text: string, index: number): boolean {
   if (index <= 0 || index >= text.length) return false;
   const prev = text.charCodeAt(index - 1), curr = text.charCodeAt(index);
   return prev >= 0xd800 && prev <= 0xdbff && curr >= 0xdc00 && curr <= 0xdfff;
 }
-
 export function isValidSeedOccurrence(content: string, seedRange: SourceRange, query: string, caseSensitive: boolean, expectedMatchText?: string): boolean {
   if (!query || seedRange.from < 0 || seedRange.to <= seedRange.from || seedRange.to > content.length) return false;
   if (isSplitUtf16Surrogate(content, seedRange.from) || isSplitUtf16Surrogate(content, seedRange.to)) return false;
@@ -120,7 +111,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     pendingSeedMatchText.current = undefined; customCurrentRangeRef.current = null;
   };
 
-  const scheduleSearchSettle = (anchorHost: Element | null, step: () => boolean) => {
+  const scheduleSearchSettle = (anchorHost: Element | null, step: () => boolean, observedTarget?: Element | null) => {
     clearSettleFrames();
     const scroller = anchorHost?.matches(".android-reading,.reading-scroll")
       ? (anchorHost as HTMLElement)
@@ -167,18 +158,23 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       if (Math.abs(scroller.scrollTop - recordedScrollTop) > 2) stop();
     };
     const page = scroller?.querySelector<HTMLElement>(".document-page,.preview-page,.live-document,.markdown-body") ?? (eventHost instanceof HTMLElement ? eventHost : null);
-    let lastPageHeight = page?.getBoundingClientRect().height ?? 0;
-    const observer = page && typeof ResizeObserver !== "undefined"
+    const lastHeights = new Map<Element, number>();
+    if (page) lastHeights.set(page, page.getBoundingClientRect().height);
+    if (observedTarget && observedTarget !== page) lastHeights.set(observedTarget, observedTarget.getBoundingClientRect().height);
+    const observer = lastHeights.size && typeof ResizeObserver !== "undefined"
       ? new ResizeObserver(entries => {
           if (!active) return;
-          const nextHeight = entries[0]?.borderBoxSize?.[0]?.blockSize ?? entries[0]?.contentRect.height ?? page.getBoundingClientRect().height;
-          if (Math.abs(nextHeight - lastPageHeight) <= 0.5) return;
-          lastPageHeight = nextHeight;
+          let changed = false;
+          for (const entry of entries) {
+            const el = entry.target as HTMLElement, nextHeight = entry.borderBoxSize?.[0]?.blockSize ?? entry.contentRect.height ?? el.getBoundingClientRect().height;
+            if (Math.abs(nextHeight - (lastHeights.get(el) ?? 0)) > 0.5) { lastHeights.set(el, nextHeight); changed = true; }
+          }
+          if (!changed) return;
           if (scroller && scroller.scrollHeight !== recordedScrollHeight) recordScrollerState();
           schedulePass();
         })
       : undefined;
-    if (page && observer) observer.observe(page);
+    if (observer) for (const el of lastHeights.keys()) observer.observe(el);
     eventHost.addEventListener("supermd-window-change", onWindowChange);
     scroller?.addEventListener("scroll", onScroll, { passive: true });
     window.addEventListener("wheel", onUserGesture, { capture: true, passive: true });
@@ -211,15 +207,13 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const host = findReadingHost();
       if (revealActiveBlock && nextIndex >= 0 && !regexError) {
         const sr = activeSourceRanges[nextIndex], block = sr && host ? findContainingBlock(host, sr, content) : null;
-        if (block) revealMountedBlock(block);
+        if (block && sr) { revealMountedBlock(block); revealStepCardsForRange(deepestSourceOwner(block, sr, content) ?? block, content, sr); }
       }
       const liveWindowed = host && !regexError ? windowedMatches(host, query, filterOptions) : null;
       const liveMatches = host && !liveWindowed && !regexError ? readingMatches(host, query, filterOptions) : [];
       setWindowed(liveWindowed);
       setMatches(liveMatches);
-      if (nextIndex >= 0) {
-        nextIndex = regexError ? -1 : translateSourceIndexToRendered(host, content, activeSourceRanges, nextIndex, query, filterOptions, liveWindowed, liveMatches);
-      }
+      if (nextIndex >= 0) nextIndex = regexError ? -1 : translateSourceIndexToRendered(host, content, activeSourceRanges, nextIndex, query, filterOptions, liveWindowed, liveMatches);
     }
     setReplacing(false);
     if (nextIndex < 0) setHiddenSourceHit(false);
@@ -248,25 +242,19 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const fmDomRange = resolveSourceHighlightRange(host, sourceText, ranges, targetIndex, matchQuery, matchOptions, null);
       if (customSliceMatch) customCurrentRangeRef.current = fmDomRange;
       syncSearchHighlights({ all: scroll ? allForHost(host, fmDomRange) : undefined, current: fmDomRange });
-      if (scroll) {
-        const fallback = rangeStartElement(fmDomRange) ?? host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText);
-        scrollTargetIntoView(fallback, host);
-      }
+      if (scroll) scrollTargetIntoView(rangeStartElement(fmDomRange) ?? host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, range, sourceText), host);
       return;
     }
     const wasUnmounted = !!initialBlock.closest('[data-windowed-mounted="false"]');
     if (scroll) revealMountedBlock(initialBlock);
-    const block = findContainingBlock(host, range, sourceText) ?? initialBlock;
-    const owner = deepestSourceOwner(block, range, sourceText) ?? block;
-    if (scroll) openDisclosuresFor(owner, block, null, range);
-    const domRange = resolveSourceHighlightRange(host, sourceText, ranges, targetIndex, matchQuery, matchOptions, block);
-    if (customSliceMatch) customCurrentRangeRef.current = domRange;
-    let cachedScrollTarget: Element = (domRange ? rangeStartElement(domRange) : owner) ?? block;
-    if (scroll) {
-      openDisclosuresFor(owner, block, domRange, range);
-      scrollTargetIntoView(cachedScrollTarget, host);
-    }
-    syncSearchHighlights({ all: wasUnmounted || scroll ? allForHost(host, domRange) : undefined, current: domRange });
+    const block = findContainingBlock(host, range, sourceText) ?? initialBlock, owner = deepestSourceOwner(block, range, sourceText) ?? block;
+    let stepReveal = { changed: false, card: null as HTMLElement | null };
+    if (scroll) { openDisclosuresFor(owner, block, null, range); stepReveal = revealStepCardsForRange(owner, sourceText, range); }
+    let activeDomRange = resolveSourceHighlightRange(host, sourceText, ranges, targetIndex, matchQuery, matchOptions, block);
+    if (customSliceMatch) customCurrentRangeRef.current = activeDomRange;
+    let cachedScrollTarget: Element = (activeDomRange ? rangeStartElement(activeDomRange) : ownerScrollTarget(owner)) ?? block, currentOwner: HTMLElement = owner;
+    if (scroll) { openDisclosuresFor(owner, block, activeDomRange, range); scrollTargetIntoView(cachedScrollTarget, host); }
+    syncSearchHighlights({ all: wasUnmounted || scroll || stepReveal.changed ? allForHost(host, activeDomRange) : undefined, current: activeDomRange });
     if (scroll) {
       const expectedIndex = indexRef.current;
       let settledHost: Element = host, settledVersion = getSearchDomVersion(host).version, settledBlock: HTMLElement = block;
@@ -276,25 +264,25 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         if (!liveHost) return false;
         const nextVersion = getSearchDomVersion(liveHost).version;
         if (liveHost === settledHost && nextVersion === settledVersion && cachedScrollTarget.isConnected && !settledBlock.closest('[data-windowed-mounted="false"]')) {
-          scrollTargetIntoView(cachedScrollTarget, liveHost);
+          scrollTargetIntoView(activeDomRange ? cachedScrollTarget : ownerScrollTarget(currentOwner), liveHost);
           return true;
         }
         const currentBlock = findContainingBlock(liveHost, range, sourceText);
         if (!currentBlock) return false;
         revealMountedBlock(currentBlock);
         settledBlock = findContainingBlock(liveHost, range, sourceText) ?? currentBlock;
-        const settledOwner = deepestSourceOwner(settledBlock, range, sourceText) ?? settledBlock;
-        openDisclosuresFor(settledOwner, settledBlock, null, range);
-        const settledDomRange = resolveSourceHighlightRange(liveHost, sourceText, ranges, targetIndex, matchQuery, matchOptions, settledBlock);
-        if (customSliceMatch) customCurrentRangeRef.current = settledDomRange;
-        openDisclosuresFor(settledOwner, settledBlock, settledDomRange, range);
-        cachedScrollTarget = (settledDomRange ? rangeStartElement(settledDomRange) : settledOwner) ?? settledBlock;
-        settledHost = liveHost;
-        settledVersion = getSearchDomVersion(liveHost).version;
+        currentOwner = deepestSourceOwner(settledBlock, range, sourceText) ?? settledBlock;
+        openDisclosuresFor(currentOwner, settledBlock, null, range);
+        revealStepCardsForRange(currentOwner, sourceText, range);
+        activeDomRange = resolveSourceHighlightRange(liveHost, sourceText, ranges, targetIndex, matchQuery, matchOptions, settledBlock);
+        if (customSliceMatch) customCurrentRangeRef.current = activeDomRange;
+        openDisclosuresFor(currentOwner, settledBlock, activeDomRange, range);
+        cachedScrollTarget = (activeDomRange ? rangeStartElement(activeDomRange) : ownerScrollTarget(currentOwner)) ?? settledBlock;
+        settledHost = liveHost; settledVersion = getSearchDomVersion(liveHost).version;
         scrollTargetIntoView(cachedScrollTarget, liveHost);
-        syncSearchHighlights({ all: allForHost(liveHost, settledDomRange), current: settledDomRange });
+        syncSearchHighlights({ all: allForHost(liveHost, activeDomRange), current: activeDomRange });
         return true;
-      });
+      }, stepReveal.card ?? owner);
     }
   };
 
@@ -303,33 +291,26 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!match) return;
     clearSettleFrames();
     revealMountedBlock(match.element);
-    openDisclosuresFor(match.element, match.element);
-    let range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-    if (openDisclosuresFor(match.element, match.element, range)) range = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-    let cachedScrollTarget: Element = (range ? rangeStartElement(range) : match.element) ?? match.element;
-    scrollTargetIntoView(cachedScrollTarget, host);
+    let current = resolveWindowedMatchTarget(match.element, match.ordinal, content, query, filterOptions);
+    scrollTargetIntoView(current.scrollEl, host);
     updateIndex(next);
     const initialRoot = host ?? match.element;
-    syncSearchHighlights({ all: () => readingMatches(initialRoot, query, filterOptions), current: range });
+    syncSearchHighlights({ all: () => readingMatches(initialRoot, query, filterOptions), current: current.range });
     let settledRoot: Element = initialRoot, settledVersion = getSearchDomVersion(initialRoot).version;
     scheduleSearchSettle(initialRoot, () => {
       if (sourceSearchRef.current || indexRef.current !== next || !match.element.isConnected) return false;
       revealMountedBlock(match.element);
       const liveHost = findReadingHost(), targetRoot = liveHost ?? match.element, nextVersion = getSearchDomVersion(targetRoot).version;
-      if (targetRoot === settledRoot && nextVersion === settledVersion && cachedScrollTarget.isConnected && !match.element.closest('[data-windowed-mounted="false"]')) {
-        scrollTargetIntoView(cachedScrollTarget, liveHost);
+      if (targetRoot === settledRoot && nextVersion === settledVersion && current.scrollEl.isConnected && !match.element.closest('[data-windowed-mounted="false"]')) {
+        scrollTargetIntoView(current.range ? current.scrollEl : ownerScrollTarget(current.observed as HTMLElement), liveHost);
         return true;
       }
-      openDisclosuresFor(match.element, match.element);
-      let liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-      if (openDisclosuresFor(match.element, match.element, liveRange)) liveRange = readingMatches(match.element, query, filterOptions)[match.ordinal] ?? null;
-      cachedScrollTarget = (liveRange ? rangeStartElement(liveRange) : match.element) ?? match.element;
-      settledRoot = targetRoot;
-      settledVersion = getSearchDomVersion(targetRoot).version;
-      scrollTargetIntoView(cachedScrollTarget, liveHost);
-      syncSearchHighlights({ all: () => readingMatches(targetRoot, query, filterOptions), current: liveRange });
+      current = resolveWindowedMatchTarget(match.element, match.ordinal, content, query, filterOptions);
+      settledRoot = targetRoot; settledVersion = getSearchDomVersion(targetRoot).version;
+      scrollTargetIntoView(current.scrollEl, liveHost);
+      syncSearchHighlights({ all: () => readingMatches(targetRoot, query, filterOptions), current: current.range });
       return true;
-    });
+    }, current.observed);
   };
 
   const selectDomMatch = (next: number, activeMatches: Range[], host: HTMLElement | null) => {
@@ -341,6 +322,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     scrollTargetIntoView(element, host);
     updateIndex(next);
     syncSearchHighlights({ current: range });
+    const observed = element?.closest(".step-cards,.interactive-chart");
+    if (observed || host?.querySelector(".step-cards,.mermaid,.svg-figure,.interactive-chart,[data-windowed-block]")) {
+      scheduleSearchSettle(host ?? element, () => {
+        if (sourceSearchRef.current || indexRef.current !== next || !range.startContainer.isConnected) return false;
+        const liveHost = findReadingHost(), liveEl = rangeStartElement(range);
+        openDisclosuresFor(liveEl, liveEl?.closest(".code-container,details") ?? liveEl, range);
+        scrollTargetIntoView(liveEl, liveHost);
+        syncSearchHighlights({ current: range });
+        return true;
+      }, observed ?? element);
+    }
   };
 
   const toggleReplacing = (nextReplacing = !activeReplacing) => {
@@ -352,10 +344,8 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (!sourceSession && indexRef.current < 0 && hiddenSourceAnchorRef.current && activeSourceRanges.length) {
       const mappedHidden = findMatchingSourceRangeIndex(activeSourceRanges, hiddenSourceAnchorRef.current);
       if (mappedHidden >= 0) {
-        setHiddenSourceHit(false);
-        hiddenSourceAnchorRef.current = null;
-        setReplacing(true);
-        updateIndex(mappedHidden);
+        setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null;
+        setReplacing(true); updateIndex(mappedHidden);
         revealAndHighlightSource(mappedHidden, activeSourceRanges, content, true);
         return;
       }
@@ -370,8 +360,6 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
   const toggleReplacingRef = useRef(toggleReplacing); toggleReplacingRef.current = toggleReplacing;
 
   const move = (direction: number) => {
-    // Search is a new deliberate navigation, just like pan/zoom. A briefly
-    // observing heading jump must not pull the viewport back after this move.
     cancelSettlingHeading();
     clearPendingSeed();
     if (regexError) return;
@@ -409,15 +397,13 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
           }
           if (anchoredRendered < 0) anchoredRendered = renderedTotal - 1;
         }
-        if (activeWindowed) selectWindowedMatch(anchoredRendered, activeWindowed, host);
-        else selectDomMatch(anchoredRendered, activeMatches, host);
+        if (activeWindowed) selectWindowedMatch(anchoredRendered, activeWindowed, host); else selectDomMatch(anchoredRendered, activeMatches, host);
         return;
       }
     }
     const next = nextSearchIndex(current, direction, renderedTotal);
     if (next < 0) return;
-    if (activeWindowed) selectWindowedMatch(next, activeWindowed, host);
-    else selectDomMatch(next, activeMatches, host);
+    if (activeWindowed) selectWindowedMatch(next, activeWindowed, host); else selectDomMatch(next, activeMatches, host);
   };
   const moveRef = useRef(move); moveRef.current = move;
 
@@ -439,8 +425,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const foundNext = nextRanges.findIndex(r => r.from >= replacedEnd);
     const nextIndex = !nextRanges.length ? -1 : (foundNext >= 0 ? foundNext : 0);
     if (nextContent === content) {
-      pendingReplaceIndex.current = null;
-      updateIndex(nextIndex);
+      pendingReplaceIndex.current = null; updateIndex(nextIndex);
       if (nextIndex >= 0) revealAndHighlightSource(nextIndex, nextRanges, nextContent, true);
       return;
     }
@@ -469,9 +454,6 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         focusFrame = 0;
         const field = input.current;
         if (field) { field.focus({ preventScroll: true }); field.select(); }
-        // Native menus/toolbars can retain host focus while React mounts this
-        // overlay. Reassert focus across the mount frames so the very next key
-        // reaches the search field, including when Find is opened repeatedly.
         if (document.activeElement !== field && attempts++ < 4) focusFrame = requestAnimationFrame(focusInput);
       };
       cancelAnimationFrame(focusFrame);
@@ -480,16 +462,14 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const step = (event: Event) => moveRef.current((event as CustomEvent<number>).detail < 0 ? -1 : 1);
     focus();
     const key = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (document.querySelector(".media-save-menu,.image-viewer,.math-repair-panel,.media-dialog,.theme-guide-dialog")) return;
+      if (event.key !== "Escape" || document.querySelector(".media-save-menu,.image-viewer,.math-repair-panel,.media-dialog,.theme-guide-dialog")) return;
       event.preventDefault(); event.stopImmediatePropagation(); closeRef.current();
     };
     document.addEventListener("keydown", key, true);
     window.addEventListener("supermd-find-focus", focus);
     window.addEventListener("supermd-find-step", step);
     return () => {
-      cancelAnimationFrame(focusFrame);
-      clearSettleFrames();
+      cancelAnimationFrame(focusFrame); clearSettleFrames();
       syncSearchHighlights({ all: null, current: null });
       setReaderOverlay("search", false);
       document.removeEventListener("keydown", key, true);
@@ -504,8 +484,6 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     const criteriaChanged = prev.query !== query || prev.caseSensitive !== caseSensitive || prev.wholeWord !== wholeWord || prev.regexp !== regexp;
     const contentChanged = prev.content !== content;
     prevState.current = { query, content, caseSensitive, wholeWord, regexp };
-    // Only evaluate the source-search pipeline when Source/Split editor search or
-    // Replace-in-source is active; rendered Read/Live Find skips scanning raw source.
     const nextSourceRanges = regexError || !sourceSearch ? [] : getSourceRanges();
     setSourceRanges(prevRanges => (prevRanges.length === 0 && nextSourceRanges.length === 0 ? prevRanges : nextSourceRanges));
     if (sourceSession) editorFindQuery(sourceSession, regexError ? "" : query, caseSensitive, { wholeWord, regexp });
@@ -514,23 +492,16 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     if (autoSelect && !regexError) {
       pendingReplaceIndex.current = null;
     } else if (criteriaChanged || regexError) {
-      clearPendingSeed();
-      pendingReplaceIndex.current = null;
-      setHiddenSourceHit(false);
-      hiddenSourceAnchorRef.current = null;
+      clearPendingSeed(); pendingReplaceIndex.current = null; setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null;
       targetIndex = -1;
       if (indexRef.current !== -1) updateIndex(-1);
     } else if (pendingReplaceIndex.current !== null) {
-      setHiddenSourceHit(false);
-      hiddenSourceAnchorRef.current = null;
-      targetIndex = pendingReplaceIndex.current;
-      pendingReplaceIndex.current = null;
+      setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null;
+      targetIndex = pendingReplaceIndex.current; pendingReplaceIndex.current = null;
       shouldScrollReplaced = targetIndex >= 0;
       updateIndex(targetIndex);
     } else if (contentChanged) {
-      setHiddenSourceHit(false);
-      hiddenSourceAnchorRef.current = null;
-      customCurrentRangeRef.current = null;
+      setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null; customCurrentRangeRef.current = null;
       targetIndex = -1;
       if (indexRef.current !== -1) updateIndex(-1);
     } else if (sourceSearch && indexRef.current >= nextSourceRanges.length) {
@@ -543,13 +514,9 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       const seedMatchText = runAutoSelect ? pendingSeedMatchText.current : undefined;
       const hasValidSeedRange = Boolean(seedRange && isValidSeedOccurrence(content, seedRange, query, caseSensitive, seedMatchText));
       const hasStaleSeedRange = Boolean(seedRange && !hasValidSeedRange);
-      pendingAutoSelect.current = false;
-      pendingSeedRange.current = null;
-      pendingSeedMatchText.current = undefined;
+      pendingAutoSelect.current = false; pendingSeedRange.current = null; pendingSeedMatchText.current = undefined;
       if (sourceSession) editorFindQuery(sourceSession, regexError ? "" : query, caseSensitive, { wholeWord, regexp });
-      if (!runAutoSelect && shouldScrollReplaced && targetIndex >= 0 && nextSourceRanges[targetIndex]) {
-        revealAndHighlightSource(targetIndex, nextSourceRanges, content, true);
-      }
+      if (!runAutoSelect && shouldScrollReplaced && targetIndex >= 0 && nextSourceRanges[targetIndex]) revealAndHighlightSource(targetIndex, nextSourceRanges, content, true);
       const host = findReadingHost();
       if (regexError) {
         setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
@@ -562,46 +529,31 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         setWindowed(prevWindowed => (prevWindowed === null ? prevWindowed : null));
         setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
         if (runAutoSelect) {
-          setHiddenSourceHit(false);
-          hiddenSourceAnchorRef.current = null;
+          setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null;
           if (hasValidSeedRange && seedRange) {
             const seedSourceIndex = findMatchingSourceRangeIndex(activeRanges, seedRange);
-            if (seedSourceIndex >= 0) {
-              updateIndex(seedSourceIndex);
-              revealAndHighlightSource(seedSourceIndex, activeRanges, content, true);
-              return;
-            }
+            if (seedSourceIndex >= 0) { updateIndex(seedSourceIndex); revealAndHighlightSource(seedSourceIndex, activeRanges, content, true); return; }
             updateIndex(-1, true);
             if (sourceSession) editorFindRange(sourceSession, seedRange.from, seedRange.to);
-            const sliceText = content.slice(seedRange.from, seedRange.to);
-            const sliceRanges = sourceMatches(content, sliceText, true);
+            const sliceText = content.slice(seedRange.from, seedRange.to), sliceRanges = sourceMatches(content, sliceText, true);
             const sliceIdx = findMatchingSourceRangeIndex(sliceRanges, seedRange);
             if (sliceIdx >= 0) revealAndHighlightSource(sliceIdx, sliceRanges, content, true, sliceText, true);
             return;
           }
-          if (!hasStaleSeedRange && activeRanges.length) {
-            updateIndex(0);
-            revealAndHighlightSource(0, activeRanges, content, true);
-            return;
-          }
+          if (!hasStaleSeedRange && activeRanges.length) { updateIndex(0); revealAndHighlightSource(0, activeRanges, content, true); return; }
           updateIndex(-1);
         }
         if (host) {
           syncSearchHighlights({
             all: () => (activeRanges.length ? readingMatches(host, query, filterOptions) : []),
-            current: shouldScrollReplaced && targetIndex >= 0
-              ? () => resolveSourceHighlightRange(host, content, activeRanges, targetIndex, query, filterOptions)
-              : indexRef.current < 0 ? null : undefined,
+            current: shouldScrollReplaced && targetIndex >= 0 ? () => resolveSourceHighlightRange(host, content, activeRanges, targetIndex, query, filterOptions) : indexRef.current < 0 ? null : undefined,
           });
-        } else {
-          syncSearchHighlights({ all: null, current: null });
-        }
+        } else syncSearchHighlights({ all: null, current: null });
         return;
       }
       const nextWindowed = host ? windowedMatches(host, query, filterOptions) : null;
       if (runAutoSelect && hasValidSeedRange && seedRange && host) {
-        const seedSourceRanges = getSourceRanges();
-        const seedSourceIndex = findMatchingSourceRangeIndex(seedSourceRanges, seedRange);
+        const seedSourceRanges = getSourceRanges(), seedSourceIndex = findMatchingSourceRangeIndex(seedSourceRanges, seedRange);
         const targetRange = seedSourceIndex >= 0 ? seedSourceRanges[seedSourceIndex] : seedRange;
         const sliceText = seedSourceIndex < 0 ? content.slice(targetRange.from, targetRange.to) : "";
         const sliceRanges = sliceText ? sourceMatches(content, sliceText, true) : [];
@@ -613,16 +565,17 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         const block = initialBlock ? (findContainingBlock(host, targetRange, content) ?? initialBlock) : null;
         const owner = block ? (deepestSourceOwner(block, targetRange, content) ?? block) : null;
         const openedDisclosures = block ? openDisclosuresFor(owner, block, null, targetRange) : false;
-        const activeWindowed = wasUnmounted || openedDisclosures ? windowedMatches(host, query, filterOptions) : nextWindowed;
-        const activeResult = activeWindowed !== null ? [] : (wasUnmounted || openedDisclosures ? readingMatches(host, query, filterOptions) : initialResult);
+        const stepReveal = owner ? revealStepCardsForRange(owner, content, targetRange) : { changed: false, card: null };
+        const domChanged = wasUnmounted || openedDisclosures || stepReveal.changed;
+        const activeWindowed = domChanged ? windowedMatches(host, query, filterOptions) : nextWindowed;
+        const activeResult = activeWindowed !== null ? [] : (domChanged ? readingMatches(host, query, filterOptions) : initialResult);
         setWindowed(activeWindowed);
         setMatches(activeResult);
         const domRange = seedSourceIndex >= 0
           ? resolveSourceHighlightRange(host, content, seedSourceRanges, seedSourceIndex, query, filterOptions, block)
           : (sliceIdx >= 0 ? resolveSourceHighlightRange(host, content, sliceRanges, sliceIdx, sliceText, true, block) : null);
         if (domRange) {
-          setHiddenSourceHit(false);
-          hiddenSourceAnchorRef.current = null;
+          setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null;
           if (seedSourceIndex >= 0) {
             const renderedIdx = translateSourceIndexToRendered(host, content, seedSourceRanges, seedSourceIndex, query, filterOptions, activeWindowed, activeResult);
             if (renderedIdx >= 0) {
@@ -640,56 +593,44 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             clearSettleFrames();
             const scrollEl = rangeStartElement(domRange);
             if (block) openDisclosuresFor(scrollEl, block, domRange, targetRange);
-            scrollTargetIntoView(scrollEl ?? owner, host);
+            scrollTargetIntoView(scrollEl ?? (owner ? ownerScrollTarget(owner) : null), host);
             customCurrentRangeRef.current = domRange;
             updateIndex(-1, true);
-            syncSearchHighlights({
-              all: () => [...(activeWindowed.length ? readingMatches(host, query, filterOptions) : []), domRange],
-              current: domRange,
-            });
-            if (wasUnmounted) {
+            syncSearchHighlights({ all: () => [...(activeWindowed.length ? readingMatches(host, query, filterOptions) : []), domRange], current: domRange });
+            if (wasUnmounted || owner?.matches(".step-cards,.step-cards-placeholder")) {
               scheduleSearchSettle(host, () => {
                 if (sourceSearchRef.current || indexRef.current !== -1 || customCurrentRangeRef.current === null) return false;
-                const liveHost = findReadingHost();
-                const initialLiveBlock = liveHost?.isConnected ? findContainingBlock(liveHost, targetRange, content) : null;
+                const liveHost = findReadingHost(), initialLiveBlock = liveHost?.isConnected ? findContainingBlock(liveHost, targetRange, content) : null;
                 if (!liveHost || !initialLiveBlock?.isConnected) return false;
                 revealMountedBlock(initialLiveBlock);
                 const liveBlock = findContainingBlock(liveHost, targetRange, content) ?? initialLiveBlock;
                 const liveOwner = deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock;
                 openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
+                revealStepCardsForRange(liveOwner, content, targetRange);
                 const liveDomRange = sliceIdx >= 0 ? resolveSourceHighlightRange(liveHost, content, sliceRanges, sliceIdx, sliceText, true, liveBlock) : null;
-                const liveScrollEl = (liveDomRange ? rangeStartElement(liveDomRange) : liveOwner) ?? liveOwner;
+                const liveScrollEl = (liveDomRange ? rangeStartElement(liveDomRange) : ownerScrollTarget(liveOwner)) ?? liveOwner;
                 openDisclosuresFor(liveScrollEl, liveBlock, liveDomRange, targetRange);
                 scrollTargetIntoView(liveScrollEl, liveHost);
                 if (liveDomRange) {
                   customCurrentRangeRef.current = liveDomRange;
-                  syncSearchHighlights({
-                    all: () => [...(activeWindowed.length ? readingMatches(liveHost, query, filterOptions) : []), liveDomRange],
-                    current: liveDomRange,
-                  });
+                  syncSearchHighlights({ all: () => [...(activeWindowed.length ? readingMatches(liveHost, query, filterOptions) : []), liveDomRange], current: liveDomRange });
                 }
                 return true;
-              });
+              }, stepReveal.card ?? owner);
             }
             return;
           }
         }
         clearSettleFrames();
-        if (block) {
-          openDisclosuresFor(owner, block, null, targetRange);
-          scrollTargetIntoView(owner ?? block, host);
-        } else {
+        const scrollTarget = owner ? ownerScrollTarget(owner) : null;
+        if (block) { openDisclosuresFor(owner, block, null, targetRange); scrollTargetIntoView(scrollTarget ?? block, host); }
+        else {
           const fallback = host.querySelector("[data-frontmatter-properties],.document-properties") ?? resolveSourceBlock(host, targetRange, content);
           if (fallback) { revealMountedBlock(fallback); scrollTargetIntoView(fallback, host); }
         }
-        updateIndex(-1);
-        setHiddenSourceHit(true);
-        hiddenSourceAnchorRef.current = targetRange;
-        syncSearchHighlights({
-          all: activeWindowed !== null ? () => (activeWindowed.length ? readingMatches(host, query, filterOptions) : []) : activeResult,
-          current: null,
-        });
-        if (wasUnmounted) {
+        updateIndex(-1); setHiddenSourceHit(true); hiddenSourceAnchorRef.current = targetRange;
+        syncSearchHighlights({ all: activeWindowed !== null ? () => (activeWindowed.length ? readingMatches(host, query, filterOptions) : []) : activeResult, current: null });
+        if (wasUnmounted || owner?.matches(".mermaid,.step-cards,.step-cards-placeholder,.svg-figure")) {
           scheduleSearchSettle(host, () => {
             if (sourceSearchRef.current || indexRef.current !== -1 || hiddenSourceAnchorRef.current !== targetRange) return false;
             const liveHost = findReadingHost();
@@ -698,32 +639,22 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
             if (initialLiveBlock) revealMountedBlock(initialLiveBlock);
             const liveBlock = (initialLiveBlock ? findContainingBlock(liveHost, targetRange, content) : null) ?? initialLiveBlock;
             const liveOwner = liveBlock ? (deepestSourceOwner(liveBlock, targetRange, content) ?? liveBlock) : null;
-            if (liveBlock) openDisclosuresFor(liveOwner, liveBlock, null, targetRange);
-            scrollTargetIntoView(liveOwner ?? liveBlock ?? owner ?? block, liveHost);
+            if (liveBlock && liveOwner) { openDisclosuresFor(liveOwner, liveBlock, null, targetRange); revealStepCardsForRange(liveOwner, content, targetRange); }
+            scrollTargetIntoView((liveOwner ? ownerScrollTarget(liveOwner) : null) ?? liveBlock ?? scrollTarget ?? block, liveHost);
             return true;
-          });
+          }, stepReveal.card ?? owner);
         }
         return;
       }
-      if (runAutoSelect) {
-        setHiddenSourceHit(false);
-        hiddenSourceAnchorRef.current = null;
-      }
+      if (runAutoSelect) { setHiddenSourceHit(false); hiddenSourceAnchorRef.current = null; }
       if (nextWindowed !== null) {
         setWindowed(nextWindowed);
         setMatches(prevMatches => (prevMatches.length === 0 ? prevMatches : []));
         if (runAutoSelect) {
           if (!hasStaleSeedRange && nextWindowed.length) { selectWindowedMatch(0, nextWindowed, host); return; }
           updateIndex(-1);
-        } else if (!criteriaChanged && !contentChanged && indexRef.current >= nextWindowed.length) {
-          updateIndex(nextWindowed.length - 1);
-        }
-        if (host) {
-          syncSearchHighlights({
-            all: () => (nextWindowed.length ? readingMatches(host, query, filterOptions) : []),
-            current: indexRef.current < 0 ? null : undefined,
-          });
-        }
+        } else if (!criteriaChanged && !contentChanged && indexRef.current >= nextWindowed.length) updateIndex(nextWindowed.length - 1);
+        if (host) syncSearchHighlights({ all: () => (nextWindowed.length ? readingMatches(host, query, filterOptions) : []), current: indexRef.current < 0 ? null : undefined });
         return;
       }
       const result = host ? readingMatches(host, query, filterOptions) : [];
@@ -732,16 +663,10 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
       if (runAutoSelect) {
         if (!hasStaleSeedRange && result.length) { syncSearchHighlights({ all: result }); selectDomMatch(0, result, host); return; }
         updateIndex(-1);
-      } else if (!criteriaChanged && !contentChanged && indexRef.current >= result.length) {
-        updateIndex(result.length - 1);
-      }
+      } else if (!criteriaChanged && !contentChanged && indexRef.current >= result.length) updateIndex(result.length - 1);
       syncSearchHighlights({ all: result, current: indexRef.current < 0 ? null : undefined });
     });
-    return () => {
-      cancelAnimationFrame(frame);
-      clearSettleFrames();
-      if (sourceSession) editorFindQuery(sourceSession, "", false);
-    };
+    return () => { cancelAnimationFrame(frame); clearSettleFrames(); if (sourceSession) editorFindQuery(sourceSession, "", false); };
   }, [query, content, caseSensitive, wholeWord, regexp, sourceSearch, sourceSession, canReplace, seed?.nonce]);
 
   useEffect(() => {
@@ -760,10 +685,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
         frame = 0;
         const active = indexRef.current, customCurrent = active < 0 ? customCurrentRangeRef.current : null;
         syncSearchHighlights({
-          all: () => {
-            const visible = readingMatches(host, query, filterOptions);
-            return customCurrent?.startContainer.isConnected ? [...visible, customCurrent] : visible;
-          },
+          all: () => { const visible = readingMatches(host, query, filterOptions); return customCurrent?.startContainer.isConnected ? [...visible, customCurrent] : visible; },
           current: active < 0 ? (customCurrent?.startContainer.isConnected ? customCurrent : undefined)
             : () => resolveActiveHighlightRange(host, active, { sourceSearch, content, sourceRanges, windowed, matches: [], query, filterOptions }),
         });
@@ -778,7 +700,7 @@ export default function ReadingSearch({ content, close, onChange, sourceSession,
     : hiddenStatus ? (count ? `In source · 0 / ${count}${count >= 5000 ? "+" : ""}` : "In Markdown source")
     : count ? `${index < 0 ? 0 : index + 1} / ${count}${count >= 5000 ? "+" : ""}` : query ? "No matches" : "";
   const statusTitle = regexError ? regexError
-    : hiddenStatus ? "Selected match is in hidden Markdown syntax (such as a link URL, comment, or frontmatter)."
+    : hiddenStatus ? "Selected match is in hidden Markdown or diagram syntax (such as a link URL, comment, frontmatter, or diagram spec)."
     : count >= 5000 ? "Showing the first 5,000 matches. Narrow your search to find later results." : undefined;
 
   return <aside className="reading-search" data-independent-zoom role="search" aria-label="Find in note">

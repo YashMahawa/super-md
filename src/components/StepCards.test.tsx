@@ -6,6 +6,13 @@ import {renderToStaticMarkup} from "react-dom/server";
 import StepCards,{parseStepDeck} from "./StepCards";
 import MarkdownPreview from "./MarkdownPreview";
 import {stepIndices} from "../renderedOutputs";
+import {
+  STEP_REVEAL_EVENT,
+  classifyStepDeckOccurrence,
+  inspectChartSource,
+  inspectStepDeckSource,
+  type StepRevealDetail,
+} from "../stepDeckSource";
 const deck=JSON.stringify({title:"Heap insertion",steps:[
   {label:"Initial",image:"assets/one.svg",description:"Start with a valid heap."},
   {label:"Bubble up",image:"assets/two.svg",description:"Compare against the parent."},
@@ -162,5 +169,85 @@ describe("step cards",()=>{
     expect(viewer()).toBeTruthy();
     expect(viewer().querySelector(".step-cards-progress")?.textContent).toBe("3 / 3");
     expect(viewer().textContent).toContain("Live edited slide notes.");
+  });
+
+  it("classifies raw JSON spans across escapes and reveals matching slides inline and in Slide viewer",async()=>{
+    const rawFence=[
+      "```smd-steps",
+      "{",
+      '  "title": "  Wave \\"Packet\\" Deck  ",',
+      '  "steps": [',
+      '    { "label": "  First \\u03bb  ", "diagram": { "values": [9, 3, 12] }, "description": "Legacy note\\nwith Photon token." },',
+      '    { "label": "Chart slide", "chart": { "title": "  Dispersion Curve  ", "series": [{ "expression": "cos(x)" }] }, "markdown": "Second slide **Photon** prose." }',
+      "  ]",
+      "}",
+      "```",
+    ].join("\n");
+    const baseOffset=42;
+    const info=inspectStepDeckSource(rawFence,baseOffset);
+    expect(info).not.toBeNull();
+    expect(info!.steps).toHaveLength(2);
+
+    const spanOf=(needle:string,after=0)=>{
+      const idx=rawFence.indexOf(needle,after);
+      expect(idx).toBeGreaterThanOrEqual(0);
+      return {from:baseOffset+idx,to:baseOffset+idx+needle.length};
+    };
+
+    // Deck title maps to first markdown-bearing slide (step 1) when active slide 0 lacks markdown.
+    const titleOcc=classifyStepDeckOccurrence(info!,spanOf("Packet"),0);
+    expect(titleOcc.stepIndex).toBe(1);
+    expect(titleOcc.visibleRegion).toBe("deck-title");
+
+    // Step 0 label with \u03bb escape maps accurately while leading/trailing whitespace is excluded.
+    const labelOcc=classifyStepDeckOccurrence(info!,spanOf("First"),0);
+    expect(labelOcc.stepIndex).toBe(0);
+    expect(labelOcc.visibleRegion).toBe("step-label");
+
+    // Step 0 diagram spec maps to step 0 with visibleRegion === null.
+    const diagOcc=classifyStepDeckOccurrence(info!,spanOf("12"),0);
+    expect(diagOcc.stepIndex).toBe(0);
+    expect(diagOcc.visibleRegion).toBeNull();
+    expect(diagOcc.openLegacyNote).toBe(false);
+
+    // Step 0 legacy description after \n escape maps to step-legacy-description with openLegacyNote: true.
+    const legacyOcc=classifyStepDeckOccurrence(info!,spanOf("Photon"),0);
+    expect(legacyOcc.stepIndex).toBe(0);
+    expect(legacyOcc.visibleRegion).toBe("step-legacy-description");
+    expect(legacyOcc.openLegacyNote).toBe(true);
+
+    // Step 1 chart title vs chart expression:
+    const chartTitleOcc=classifyStepDeckOccurrence(info!,spanOf("Dispersion"),0);
+    expect(chartTitleOcc.stepIndex).toBe(1);
+    expect(chartTitleOcc.visibleRegion).toBe("chart-title");
+    const chartExprOcc=classifyStepDeckOccurrence(info!,spanOf("cos(x)"),0);
+    expect(chartExprOcc.stepIndex).toBe(1);
+    expect(chartExprOcc.visibleRegion).toBeNull();
+
+    // Standalone smd-chart title vs expression:
+    const chartFence='```smd-chart\n{"title":"  Harmonic Fit  ","series":[{"expression":"sin(x)"}]}\n```';
+    const chartInfo=inspectChartSource(chartFence,10);
+    expect(chartInfo?.titleSpan?.decoded).toBe("  Harmonic Fit  ");
+
+    // STEP_REVEAL_EVENT synchronously switches slides, opens legacy notes, and works through placeholder when enlarged.
+    const host=document.createElement("div");document.body.append(host);root=createRoot(host);
+    await act(async()=>root?.render(<MarkdownPreview markdown={rawFence} documentPath={null} python="" dark={false}/>));
+    const card=()=>document.body.querySelector<HTMLElement>(".step-cards")!;
+    expect(card().getAttribute("data-step-index")).toBe("0");
+    expect(card().querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open).toBe(false);
+
+    act(()=>{
+      card().dispatchEvent(new CustomEvent<StepRevealDetail>(STEP_REVEAL_EVENT,{detail:{stepIndex:0,openLegacyNote:true}}));
+    });
+    expect(card().querySelector<HTMLDetailsElement>(".step-cards-legacy-note")?.open).toBe(true);
+
+    await act(async()=>card().querySelector<HTMLButtonElement>('[aria-label="Enlarge slide"]')!.click());
+    const placeholder=host.querySelector<HTMLElement>(".step-cards-placeholder")!;
+    expect(placeholder).toBeTruthy();
+    act(()=>{
+      placeholder.dispatchEvent(new CustomEvent<StepRevealDetail>(STEP_REVEAL_EVENT,{detail:{stepIndex:1}}));
+    });
+    expect(card().getAttribute("data-step-index")).toBe("1");
+    expect(card().querySelector(".step-cards-progress")?.textContent).toBe("2 / 2");
   });
 });

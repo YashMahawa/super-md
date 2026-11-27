@@ -345,6 +345,148 @@ test("Desktop workspace (App.tsx) hides Replace in Read view, wraps Previous 0/N
   await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue(`![Chart figure](${tinyPng})`);
 });
 
+test("Seeded source occurrences reveal matching offscreen StepCards slides and standalone diagrams while stale offsets fall back cleanly", async ({ page }) => {
+  await page.setViewportSize({ width: 1024, height: 760 });
+  const deckJson = JSON.stringify({
+    title: " Eigenvalue Walkthrough",
+    steps: [
+      { label: "Matrix setup", markdown: "Start with symmetric matrix $A$ and initial vector." },
+      { label: " Krylov graph", diagram: { width: 340, height: 150, nodes: [{ id: "k1", label: "Lanczos Krylov Pivot", x: 100, y: 75 }, { id: "k2", label: "Residual", x: 250, y: 75 }], edges: [{ from: "k1", to: "k2" }] } },
+      { label: "Rayleigh quotient", markdown: "Converges rapidly to the dominant **Rayleigh Spectrum** eigenvalue." },
+    ],
+  });
+  const filler = Array.from(
+    { length: 45 },
+    (_, idx) => `## Background Section ${idx + 1}\n\n${"Detailed numerical linear algebra background paragraph for virtualized windowing coverage. ".repeat(22)}`
+  ).join("\n\n");
+  const standaloneDiagram = '```smd-diagram\n{"width":360,"height":150,"nodes":[{"id":"d1","label":"Householder Tridiagonal Core","x":110,"y":75},{"id":"d2","label":"QR Step","x":260,"y":75}],"edges":[{"from":"d1","to":"d2"}]}\n```';
+  const note = [
+    "# Numerical Methods",
+    "",
+    "Introductory Rayleigh Spectrum mention near the top.",
+    "",
+    filler,
+    "",
+    "```smd-steps\n" + deckJson + "\n```",
+    "",
+    filler,
+    "",
+    standaloneDiagram,
+  ].join("\n\n");
+
+  const slide3Text = "Rayleigh Spectrum";
+  const slide3Start = note.indexOf(slide3Text, note.indexOf("```smd-steps"));
+  const slide3End = slide3Start + slide3Text.length;
+
+  const slide2DiagramText = "Lanczos Krylov Pivot";
+  const slide2Start = note.indexOf(slide2DiagramText);
+  const slide2End = slide2Start + slide2DiagramText.length;
+
+  const diagText = "Householder Tridiagonal Core";
+  const diagStart = note.indexOf(diagText);
+  const diagEnd = diagStart + diagText.length;
+
+  await page.addInitScript(() => { window.SuperMD = { post: () => {} }; });
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+  await page.evaluate(
+    (content) =>
+      window.supermdLoad?.({
+        id: "step-diagram-seed",
+        content,
+        path: null,
+        mode: "reader",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+      }),
+    note
+  );
+  await expect(page.locator('[data-windowed-mounted="false"]')).not.toHaveCount(0);
+
+  // 1. Seeded verified occurrence on offscreen StepCards Slide 3 prose: mounts block, switches to 3 / 3, scrolls into viewport, and highlights match.
+  await page.evaluate(
+    ({ start, end, text }) =>
+      window.supermdFind?.(text, {
+        caseSensitive: true,
+        sourceStart: start,
+        sourceEnd: end,
+        matchText: text,
+      }),
+    { start: slide3Start, end: slide3End, text: slide3Text }
+  );
+  const stepCards = page.locator(".step-cards");
+  await expect(stepCards).toBeVisible();
+  await expect(stepCards).toHaveAttribute("data-step-index", "2");
+  await expect(stepCards.locator(".step-cards-progress")).toHaveText("3 / 3");
+  await expect(stepCards.locator(".step-cards-description")).toBeInViewport();
+  await expect(page.locator(".reading-search output")).toHaveText("2 / 2");
+
+  // 2. Seeded verified occurrence inside Slide 2's diagram JSON: switches StepCards to 2 / 3 and keeps diagram stage in viewport with source-only status.
+  await page.evaluate(
+    ({ start, end, text }) =>
+      window.supermdFind?.(text, {
+        caseSensitive: true,
+        sourceStart: start,
+        sourceEnd: end,
+        matchText: text,
+      }),
+    { start: slide2Start, end: slide2End, text: slide2DiagramText }
+  );
+  await expect(stepCards).toHaveAttribute("data-step-index", "1");
+  await expect(stepCards.locator(".step-cards-progress")).toHaveText("2 / 3");
+  await expect(stepCards.locator(".step-cards-inline-figure svg")).toBeInViewport();
+  await expect(page.locator(".reading-search output")).toContainText("In source");
+
+  // 3. Seeded verified occurrence inside offscreen standalone smd-diagram: mounts block and scrolls diagram into viewport.
+  await page.evaluate(
+    ({ start, end, text }) =>
+      window.supermdFind?.(text, {
+        caseSensitive: true,
+        sourceStart: start,
+        sourceEnd: end,
+        matchText: text,
+      }),
+    { start: diagStart, end: diagEnd, text: diagText }
+  );
+  const lastDiagram = page.locator(".inline-diagram").last();
+  await expect(lastDiagram).toBeInViewport();
+  await expect(page.locator(".reading-search output")).toContainText("In source");
+
+  // 4. Stale source offsets after note edit stay passive at 0 / 2 without jumping or advancing a fresh StepCards deck off Slide 1.
+  const editedNote = "Prepended paragraph shifting every character offset in the note.\n\n" + note.replace("Eigenvalue Walkthrough", "Shifted Eigenvalue Walkthrough");
+  await page.evaluate(
+    ({ content, start, end, text }) => {
+      window.supermdLoad?.({
+        id: "step-diagram-stale",
+        content,
+        path: null,
+        mode: "reader",
+        dark: false,
+        fullscreen: false,
+        colors: {},
+        font: "Manrope",
+        size: 18,
+        zoom: 100,
+        seededFind: {
+          query: text,
+          caseSensitive: true,
+          sourceStart: start,
+          sourceEnd: end,
+          matchText: text,
+        },
+      });
+    },
+    { content: editedNote, start: slide3Start, end: slide3End, text: slide3Text }
+  );
+  await expect(page.locator(".reading-search output")).toHaveText("0 / 2");
+  expect(await page.evaluate(() => CSS.highlights.has("smd-search-current"))).toBe(false);
+  await expect(page.locator("p", { hasText: "Introductory Rayleigh Spectrum mention near the top." })).toBeInViewport();
+});
+
 test("Seeded folder-search handoff reveals exact offscreen windowed occurrences into the viewport and falls back cleanly on stale ranges", async ({ page }) => {
   await page.addInitScript(() => {
     window.SuperMD = { post: () => {} };

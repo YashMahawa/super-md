@@ -12,7 +12,7 @@ const palette = ["#6750a4", "#006a6a", "#b3261e", "#7d5700", "#3f6374"];
 const darkPalette = ["#d0bcff", "#72d6d6", "#ffb4ab", "#efd18a", "#a1cce0"];
 const featureNames: Record<ChartFeature["kind"], string> = {root:"Root", maximum:"Maximum", minimum:"Minimum", intersection:"Intersection"};
 
-export default function InteractiveChart({source,dark=false,appearance,colors:themeColors}:{source:string;dark?:boolean;appearance?:MediaAppearance;colors?:Record<string,string>}) {
+export default function InteractiveChart({source,dark=false,appearance,colors:themeColors,sourceStart,sourceEnd}:{source:string;dark?:boolean;appearance?:MediaAppearance;colors?:Record<string,string>;sourceStart?:number;sourceEnd?:number}) {
   const clipId = useId().replace(/:/g,"_");
   const plot = useChartZoom(source);
   const parsed = useMemo(()=>{try{return {spec:parseChartSpec(source),error:""};}catch(error){return {spec:null,error:String(error)};}},[source]);
@@ -63,7 +63,7 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
     return {xMin,xMax,yMin,yMax,hasSamples:allY.length>0,visibleSeries};
   },[spec,rawSeries,curves,plot.zoom,plot.center]);
   const features = useMemo(()=>geometry&&spec?chartFeatures(geometry.visibleSeries,spec.series.map((series,index)=>series.points?null:curves[index]),geometry.yMax-geometry.yMin):[],[geometry,curves,spec]);
-  if(!spec || !geometry) return <div className="render-error" role="status">Invalid smd-chart: {parsed.error}</div>;
+  if(!spec || !geometry) return <div className="render-error" role="status" data-source-start={sourceStart} data-source-end={sourceEnd}>Invalid smd-chart: {parsed.error}</div>;
   const {xMin,xMax,yMin,yMax,visibleSeries}=geometry;
   const colors=spec.series.map((series,i)=>{
     const original=series.color||(dark?darkPalette:palette)[i%palette.length];
@@ -81,7 +81,7 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
   const clamp=(value:number,low:number,high:number)=>Math.max(low,Math.min(high,value));
   const px=(x:number)=>clamp(left+(x-xMin)/(xMax-xMin)*plotWidth,-1e6,1e6);
   const py=(y:number)=>clamp(top+(1-(y-yMin)/(yMax-yMin))*plotHeight,-1e6,1e6);
-  if(!(xMax>xMin) || !Number.isFinite(xMax-xMin) || !Number.isFinite(yMax-yMin)) return <div className="render-error">Chart limits are outside a usable numeric range. Specify finite axis limits.</div>;
+  if(!(xMax>xMin) || !Number.isFinite(xMax-xMin) || !Number.isFinite(yMax-yMin)) return <div className="render-error" data-source-start={sourceStart} data-source-end={sourceEnd}>Chart limits are outside a usable numeric range. Specify finite axis limits.</div>;
   const axisY=clamp(py(0),top,height-bottom),axisX=clamp(px(0),left,width-right);
   // Name each curve where it leaves the plot, like a hand-labelled graph.
   const endLabels=spec.series.length>6?[]:visibleSeries.map((points,index)=>{
@@ -118,7 +118,7 @@ export default function InteractiveChart({source,dark=false,appearance,colors:th
   const slidersMoved=Boolean(spec.sliders?.some(slider=>Math.abs(effectiveValues[slider.name]-slider.value)>1e-12));
   const resetSliders=()=>{remember(chartValues,source,defaultValues);setValues(defaultValues);};
   const emptySeries=visibleSeries.flatMap((points,index)=>points.some(([,y])=>Number.isFinite(y))?[]:[labels[index]]);
-  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y} onDoubleClick={moved?event=>{if(!(event.target as Element).closest('button,input')){event.stopPropagation();plot.reset();}}:undefined}>
+  return <figure ref={plot.host} className="interactive-chart" data-plot-zoom={plot.zoom} data-center-x={plot.center.x} data-center-y={plot.center.y} data-source-start={sourceStart} data-source-end={sourceEnd} onDoubleClick={moved?event=>{if(!(event.target as Element).closest('button,input')){event.stopPropagation();plot.reset();}}:undefined}>
     {spec.title && <figcaption>{spec.title}</figcaption>}
     <div className="chart-toolbar">
       <div className="chart-legend" role="list" aria-label="Equations">{spec.series.map((series,index)=><span role="listitem" key={index} style={{"--series-color":colors[index]} as CSSProperties}><i aria-hidden="true"/>{labels[index]}{series.name&&series.expression?<small>y = {series.expression.replace(/\bMath\./g,"")}</small>:null}</span>)}</div>
