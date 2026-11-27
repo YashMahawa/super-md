@@ -4523,11 +4523,12 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
             require(note.portable && note.uri != null && note.saved == note.content) { "Attaching an image requires a saved, unchanged portable .smd note" }
             val rawName = request.getString("assetName")
             val filename = rawName.removePrefix("assets/")
-            require(Regex("[A-Za-z0-9_.-]{1,150}").matches(filename) && filename !in setOf(".", "..")) { "Asset name must be a simple filename" }
+            require(isValidPortableAssetFilename(filename)) { "Asset name must be a simple filename" }
             val mime = request.getString("mimeType").substringBefore(';').lowercase()
             require(mime in setOf("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "image/svg+xml")) { "Unsupported image type" }
             val extension = filename.substringAfterLast('.', "").lowercase()
             val normalizedName = if (extension.isEmpty()) "$filename.${when(mime) { "image/png" -> "png"; "image/jpeg" -> "jpg"; "image/gif" -> "gif"; "image/webp" -> "webp"; "image/avif" -> "avif"; else -> "svg" }}" else filename
+            require(isValidPortableAssetFilename(normalizedName)) { "Asset name must be a simple filename" }
             require(media.assetMime(normalizedName) == mime) { "Asset extension must match its image type" }
             val encoded = request.getString("body")
             require(encoded.length <= 1_400_000 && encoded.length % 4 == 0) { "Asset body must be at most 1 MiB" }
