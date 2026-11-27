@@ -990,7 +990,13 @@ class Studio(QObject):
 
     def __init__(self, isolated: bool = False, session: Session | None = None):
         super().__init__()
-        studio_snapshots.init_studio_window(self, isolated=isolated, session=session)
+        studio_snapshots.init_studio_window(
+            self, isolated=isolated, session=session, root=ROOT, session_cls=Session, sample=SAMPLE,
+            timer_cls=QTimer, watcher_cls=QFileSystemWatcher, export_jobs_cls=ExportJobRegistry,
+            reader_edits_cls=ReaderEdits, python_runtime_mod=python_runtime,
+            read_system_palette_fn=read_system_palette, gui_app_cls=QGuiApplication,
+            process_cls=QProcess, sys_platform=sys.platform, which_fn=shutil.which,
+        )
 
     def _restore_cloud_connection(self):
         if self.retired or not self.settings.get("cloudAgentEnabled") or self._cloud_revocation_pending:
@@ -1175,7 +1181,7 @@ class Studio(QObject):
         return studio_snapshots.notify_sidebar(self)
 
     def _emit(self, load=True):
-        return studio_snapshots.emit_state(self, load=load)
+        return studio_snapshots.emit_state(self, load=load, custom_theme_mod=custom_theme)
 
     def _tokens(self):
         # Scheme generation is costly and QML reads colors from many bindings.
@@ -1456,7 +1462,10 @@ class Studio(QObject):
         self._submit(lambda:(detect_system_dark(scheme),read_system_palette()),finished,False)
 
     def stop(self):
-        return studio_snapshots.stop_window(self)
+        return studio_snapshots.stop_window(
+            self, stopped_watcher=_STOPPED_WATCHER, shiboken_mod=shiboken6,
+            gui_app_cls=QGuiApplication, process_cls=QProcess,
+        )
 
     def _folder_slice_key(self, files):
         return studio_snapshots.folder_slice_key(self, files)

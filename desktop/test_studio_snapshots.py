@@ -1,6 +1,6 @@
 """Focused unit tests for desktop/studio_snapshots.py behind the Studio facade."""
 from __future__ import annotations
-import json, os, shutil, tempfile, threading, unittest
+import ast, json, os, shutil, tempfile, threading, unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +8,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
+from PySide6.QtCore import QFileSystemWatcher, QTimer
 from PySide6.QtGui import QGuiApplication
 import studio, studio_snapshots
 from studio import Session, Studio
@@ -21,6 +22,15 @@ class _SignalSpy:
         self.calls = []
     def emit(self, *args):
         self.calls.append(args)
+
+def _exception_names(handler_type: ast.expr | None) -> set[str]:
+    if isinstance(handler_type, ast.Name):
+        return {handler_type.id}
+    if isinstance(handler_type, ast.Attribute):
+        return {handler_type.attr}
+    if isinstance(handler_type, ast.Tuple):
+        return {n for elt in handler_type.elts for n in _exception_names(elt)}
+    return set()
 
 class StudioSnapshotsTests(unittest.TestCase):
     @classmethod
@@ -41,6 +51,34 @@ class StudioSnapshotsTests(unittest.TestCase):
         session.writes.shutdown(wait=True)
         self.app.processEvents()
         shutil.rmtree(data_dir, ignore_errors=True)
+
+    def test_ast_module_boundary_has_zero_studio_back_imports_or_dynamic_shims(self):
+        path = Path(studio_snapshots.__file__).resolve()
+        source = path.read_text(encoding="utf-8")
+        self.assertLess(len(source.splitlines()), 600)
+        self.assertFalse(hasattr(studio_snapshots, "_studio_module"))
+        tree = ast.parse(source, filename=str(path))
+        forbidden_modules = {"studio", "desktop.studio", "importlib", "shiboken6"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotIn(alias.name, forbidden_modules)
+                    self.assertNotIn(alias.name.split(".", 1)[0], forbidden_modules)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    self.assertNotIn(node.module, forbidden_modules)
+                    self.assertNotIn(node.module.split(".", 1)[0], {"studio", "importlib", "shiboken6"})
+                for alias in node.names:
+                    self.assertNotIn(alias.name, forbidden_modules)
+            elif isinstance(node, ast.Attribute):
+                self.assertFalse(isinstance(node.value, ast.Name) and node.value.id == "sys" and node.attr == "modules")
+            elif isinstance(node, ast.Name):
+                self.assertNotEqual(node.id, "_studio_module")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                self.assertNotEqual(node.name, "_studio_module")
+            elif isinstance(node, ast.Try):
+                for handler in node.handlers:
+                    self.assertFalse(_exception_names(handler.type) & {"ImportError", "ModuleNotFoundError"})
 
     def test_slice_memoization_and_selective_invalidation_across_sidebar_and_snapshot(self):
         session, win = self._make_window()
@@ -127,31 +165,90 @@ class StudioSnapshotsTests(unittest.TestCase):
         finally:
             self._dispose(session, win, peer)
 
-    def test_simple_namespace_proxy_calls_and_patched_studio_root(self):
+    def test_simple_namespace_unbound_calls_and_patched_studio_collaborators(self):
         palette_box = [{"surface": "#111111", "primary": "#3366ff"}]
         sidebar_sig, changed_sig = _SignalSpy(), _SignalSpy()
+        deleted_later = []
+        fake_watcher = SimpleNamespace(files=lambda: [], directories=lambda: [], deleteLater=lambda: deleted_later.append(True))
         ns = SimpleNamespace(
             retired=False, active="t1", folder="", folder_filter="", _folder_searching=False,
             tabs=[{"id": "t1", "name": "Doc.md", "path": "", "content": "x", "saved": "x", "portable": False}],
             files=[], recent=["/a.md"], closed_tabs=[], settings={"normalZoom": 100, "fullZoom": 110},
             mode="live", fullscreen=False, reader_overlay=False, image_overlay=False, ready=False,
-            busy=0, message="", session=SimpleNamespace(pinned=["/a.md"]),
+            busy=0, message="", session=SimpleNamespace(pinned=["/a.md"]), note_watcher=fake_watcher,
             sidebarChanged=sidebar_sig, changed=changed_sig, _tokens=lambda: (True, palette_box[0]),
         )
-        studio_snapshots.emit_state(ns, load=False)
-        studio_snapshots.notify_sidebar(ns)
+        Studio._emit(ns, False)
+        Studio._notify_sidebar(ns)
         self.assertEqual((len(sidebar_sig.calls), len(changed_sig.calls)), (1, 1))
         palette_box[0] = {"surface": "#222222", "primary": "#ff6633"}
-        self.assertEqual(json.loads(studio_snapshots.window_snapshot(ns))["colors"]["surface"], "#222222")
-        self.assertEqual(json.loads(studio_snapshots.sidebar_snapshot(ns))["pinned"], ["/a.md"])
+        self.assertEqual(json.loads(Studio.snapshot.fget(ns))["colors"]["surface"], "#222222")
+        self.assertEqual(json.loads(Studio.sidebarSnapshot.fget(ns))["pinned"], ["/a.md"])
+        studio_snapshots.stop_window(ns)
+        self.assertTrue(ns._retired and deleted_later)
+        self.assertIs(ns.note_watcher, studio_snapshots._DEFAULT_STOPPED_WATCHER)
 
         with tempfile.TemporaryDirectory(prefix="supermd-root-") as tmp:
             fake_root = Path(tmp)
             (fake_root / "public").mkdir(parents=True)
             (fake_root / "public/brand-mark-fixed.svg").write_text("<svg id='patched'/>", encoding="utf-8")
-            with patch.object(studio, "ROOT", fake_root):
-                session, win = self._make_window()
+            created_timers, created_watchers, deleted_watchers, py_jobs = [], [], [], []
+            base_session = Session(True, data=fake_root / "data")
+            base_session.settings.update(welcomed=True, autosave=False, theme="dark")
+
+            class ProxyTimer(QTimer):
+                def __init__(self, *args):
+                    super().__init__(*args)
+                    created_timers.append(self)
+
+            class ProxyWatcher(QFileSystemWatcher):
+                def __init__(self, *args):
+                    super().__init__(*args)
+                    created_watchers.append(self)
+
+            class FakePyRuntime:
+                default_python = staticmethod(lambda _env_dir: "")
+                @staticmethod
+                def PythonJobRegistry():
+                    reg = studio_snapshots.python_runtime.PythonJobRegistry()
+                    py_jobs.append(reg)
+                    return reg
+
+            class FakeCustomTheme:
+                @staticmethod
+                def reader(*_args):
+                    return {"marker": "patched-theme"}
+
+            class FakeShiboken:
+                @staticmethod
+                def isValid(_obj):
+                    return True
+                @staticmethod
+                def delete(obj):
+                    deleted_watchers.append(obj)
+                    obj.deleteLater()
+
+            with (
+                patch.object(studio, "ROOT", fake_root),
+                patch("studio.Session", side_effect=lambda _iso: base_session) as session_mock,
+                patch("studio.QTimer", ProxyTimer),
+                patch("studio.QFileSystemWatcher", ProxyWatcher),
+                patch("studio.read_system_palette", return_value=("dark", {"primary": "#123456"})) as palette_mock,
+                patch("studio.python_runtime", FakePyRuntime),
+                patch("studio.custom_theme", FakeCustomTheme),
+                patch("studio.shiboken6", FakeShiboken),
+            ):
+                win = QuietStudio(True)
                 try:
-                    self.assertEqual(win._brand_svg, "<svg id='patched'/>")
+                    self.assertEqual((win._brand_svg, session_mock.call_count, palette_mock.call_count), ("<svg id='patched'/>", 1, 1))
+                    self.assertEqual((win.system_mode, win.system_colors, len(created_watchers), len(py_jobs)), ("dark", {"primary": "#123456"}, 3, 1))
+                    self.assertGreaterEqual(len(created_timers), 9)
+                    loads = []
+                    win.readerLoad.connect(lambda raw: loads.append(json.loads(raw)))
+                    win.ready = True
+                    win._emit(True)
+                    self.assertEqual(loads[-1]["customStyle"], {"marker": "patched-theme"})
+                    win.stop()
+                    self.assertEqual(len(deleted_watchers), 3)
                 finally:
-                    self._dispose(session, win)
+                    self._dispose(base_session, win)

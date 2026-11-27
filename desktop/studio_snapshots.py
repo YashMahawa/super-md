@@ -1,10 +1,26 @@
 """Window initialization/teardown, state emission, and memoized snapshot slice helpers for Studio."""
 from __future__ import annotations
-import concurrent.futures, json, threading, uuid, weakref
+import concurrent.futures, json, shutil, sys, threading, uuid, weakref
 from pathlib import Path
 from typing import Any
+from PySide6.QtCore import QFileSystemWatcher, QProcess, QTimer
+from PySide6.QtGui import QGuiApplication
+
+if __package__:
+    from . import custom_theme, python_runtime
+    from .core.paths import DESKTOP_DIR
+    from .export_jobs import ExportJobRegistry
+    from .reader_edits import ReaderEdits
+    from .theme import read_system_palette
+else:
+    import custom_theme, python_runtime
+    from core.paths import DESKTOP_DIR
+    from export_jobs import ExportJobRegistry
+    from reader_edits import ReaderEdits
+    from theme import read_system_palette
 
 EMPTY_OUTLINE = ()
+_DEFAULT_STOPPED_WATCHER = object()
 _READING_SETTING_KEYS = (
     "restorePosition", "centerLock", "imageAppearance", "svgAppearance",
     "imageContrast", "fullDocumentAccessibility", "latexAutofix", "typewriterScroll",
@@ -15,13 +31,6 @@ _STOP_TIMERS = (
 )
 _WATCHER_ATTRS = ("note_watcher", "palette_watcher", "custom_theme_watcher")
 
-def _studio_module():
-    if __package__:
-        from . import studio
-    else:
-        import studio
-    return studio
-
 def _call_optional(obj, attr: str, *args):
     fn = getattr(obj, attr, None)
     return fn(*args) if callable(fn) else None
@@ -30,8 +39,8 @@ def _call_method(studio_obj, attr: str, fallback_fn, *args):
     fn = getattr(studio_obj, attr, None)
     return fn(*args) if callable(fn) else fallback_fn(studio_obj, *args)
 
-def _single_shot_timer(studio_mod, studio_obj, slot, interval: int | None = None):
-    timer = studio_mod.QTimer(studio_obj)
+def _single_shot_timer(timer_cls, studio_obj, slot, interval: int | None = None):
+    timer = timer_cls(studio_obj)
     timer.setSingleShot(True)
     if interval is not None:
         timer.setInterval(interval)
@@ -58,14 +67,23 @@ def _cached_slice(studio_obj, cache_attr: str, key: Any, encode) -> str:
     setattr(studio_obj, cache_attr, (key, encoded))
     return encoded
 
-def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None:
-    studio_mod = _studio_module()
+def init_studio_window(
+    studio_obj, isolated: bool = False, session=None, *, root: Path = DESKTOP_DIR.parent,
+    session_cls=None, sample: str = "", timer_cls=QTimer, watcher_cls=QFileSystemWatcher,
+    export_jobs_cls=ExportJobRegistry, reader_edits_cls=ReaderEdits, python_runtime_mod=python_runtime,
+    read_system_palette_fn=read_system_palette, gui_app_cls=QGuiApplication, process_cls=QProcess,
+    sys_platform: str | None = None, which_fn=shutil.which,
+) -> None:
     studio_obj.setObjectName("studio")
-    studio_obj._brand_svg = (studio_mod.ROOT / "public/brand-mark-fixed.svg").read_text(encoding="utf-8")
+    studio_obj._brand_svg = (Path(root) / "public/brand-mark-fixed.svg").read_text(encoding="utf-8")
     studio_obj.pool = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="supermd")
     studio_obj._search_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="supermd-search")
     studio_obj.workspaceSearchBatch.connect(studio_obj._on_workspace_search_batch)
-    studio_obj.session = session or studio_mod.Session(isolated)
+    if session is None:
+        if session_cls is None:
+            raise TypeError("init_studio_window requires session or session_cls")
+        session = session_cls(isolated)
+    studio_obj.session = session
     weak_self = weakref.ref(studio_obj)
 
     def _on_session_changed():
@@ -113,16 +131,16 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
     if not studio_obj.settings.get("python"):
         studio_obj._choose_default_python(emit=False)
     if not isolated and len(studio_obj.session.windows) == 1:
-        studio_mod.QTimer.singleShot(0, studio_obj._restore_update)
+        timer_cls.singleShot(0, studio_obj._restore_update)
     studio_obj.tabs: list[dict] = []
     studio_obj.closed_tabs = studio_obj.session.closed_tabs
     studio_obj._closing_tabs, studio_obj._staging_tabs = set(), set()
     studio_obj._max_agent_stage_attempts = 3
-    studio_obj.note_watcher = studio_mod.QFileSystemWatcher(studio_obj)
+    studio_obj.note_watcher = watcher_cls(studio_obj)
     studio_obj.note_watcher.fileChanged.connect(studio_obj._external_note_changed)
     studio_obj.note_watcher.directoryChanged.connect(studio_obj._external_note_changed)
     studio_obj.external_paths, studio_obj.note_watch_paths, studio_obj.note_file_stamps, studio_obj.note_identities = set(), None, {}, {}
-    studio_obj.external_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._refresh_external_notes)
+    studio_obj.external_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._refresh_external_notes)
     studio_obj.active, studio_obj.folder = "", ""
     studio_obj._files: list[dict] = []
     studio_obj._files_revision, studio_obj._outline_revision = 0, 0
@@ -130,7 +148,7 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
     studio_obj._pinned_visible_dirs: set[str] = set()
     studio_obj.folder_filter, studio_obj._folder_searching = "", False
     studio_obj._search_generation, studio_obj._search_cancel = 0, None
-    studio_obj.filter_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._start_subfolder_search)
+    studio_obj.filter_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._start_subfolder_search)
     studio_obj._folder_search_open, studio_obj._folder_search_query = False, ""
     studio_obj._folder_search_case_sensitive, studio_obj._folder_search_include_diagrams = False, False
     studio_obj._folder_search_matches: list[dict] = []
@@ -145,19 +163,19 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
     studio_obj.ready, studio_obj._last_reader_text = False, None
     studio_obj._last_reader_agent_seq: dict[str, int] = {}
     studio_obj._agent_edit_seq, studio_obj._agent_jump_tab_id = 0, ""
-    studio_obj._export_jobs = studio_mod.ExportJobRegistry()
-    studio_obj._python_jobs = studio_mod.python_runtime.PythonJobRegistry()
+    studio_obj._export_jobs = export_jobs_cls()
+    studio_obj._python_jobs = python_runtime_mod.PythonJobRegistry()
     studio_obj._agent_exports: dict[str, dict] = {}
     studio_obj._agent_owned_files: set[str] = getattr(studio_obj.session, "agent_owned_files", None) or set()
     studio_obj.session.agent_owned_files = studio_obj._agent_owned_files
     studio_obj._agent_open_paths: set[str] = getattr(studio_obj.session, "agent_open_paths", None) or set()
     studio_obj.session.agent_open_paths = studio_obj._agent_open_paths
     studio_obj._agent_job_records = {}
-    studio_obj.reader_edits = studio_mod.ReaderEdits()
+    studio_obj.reader_edits = reader_edits_cls()
     studio_obj.system_dark = None
-    studio_obj.system_mode, studio_obj.system_colors = studio_mod.read_system_palette()
+    studio_obj.system_mode, studio_obj.system_colors = read_system_palette_fn()
     studio_obj._theme_result, studio_obj._theme_running, studio_obj._theme_pending = None, False, False
-    studio_obj.theme_debounce = _single_shot_timer(studio_mod, studio_obj, studio_obj._refresh_theme)
+    studio_obj.theme_debounce = _single_shot_timer(timer_cls, studio_obj, studio_obj._refresh_theme)
 
     def _on_color_scheme_changed(*args):
         inst = weak_self()
@@ -165,33 +183,34 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
             inst._schedule_theme(*args)
 
     studio_obj._color_scheme_slot = _on_color_scheme_changed
-    studio_mod.QGuiApplication.styleHints().colorSchemeChanged.connect(studio_obj._color_scheme_slot)
-    studio_obj.palette_watcher = studio_mod.QFileSystemWatcher(studio_obj)
+    gui_app_cls.styleHints().colorSchemeChanged.connect(studio_obj._color_scheme_slot)
+    studio_obj.palette_watcher = watcher_cls(studio_obj)
     studio_obj.palette_watcher.fileChanged.connect(studio_obj._palette_changed)
     studio_obj.palette_watcher.directoryChanged.connect(studio_obj._palette_changed)
     studio_obj._watch_palette()
-    studio_obj.custom_theme_watcher = studio_mod.QFileSystemWatcher(studio_obj)
-    studio_obj.custom_theme_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._custom_theme_event, 250)
+    studio_obj.custom_theme_watcher = watcher_cls(studio_obj)
+    studio_obj.custom_theme_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._custom_theme_event, 250)
     studio_obj.custom_theme_stamp = None
     studio_obj.custom_theme_watcher.fileChanged.connect(lambda *_: studio_obj.custom_theme_timer.start())
     studio_obj.custom_theme_watcher.directoryChanged.connect(lambda *_: studio_obj.custom_theme_timer.start())
-    studio_mod.QTimer.singleShot(0, studio_obj._restore_custom_theme)
-    studio_obj.system_preferences = studio_mod.QProcess(studio_obj)
-    if studio_mod.sys.platform.startswith("linux") and studio_mod.shutil.which("gsettings"):
+    timer_cls.singleShot(0, studio_obj._restore_custom_theme)
+    studio_obj.system_preferences = process_cls(studio_obj)
+    platform_name = sys.platform if sys_platform is None else sys_platform
+    if platform_name.startswith("linux") and which_fn("gsettings"):
         studio_obj.system_preferences.readyReadStandardOutput.connect(studio_obj._system_setting_changed)
         studio_obj.system_preferences.start("gsettings", ["monitor", "org.gnome.desktop.interface"])
-    studio_obj.theme_timer = studio_mod.QTimer(studio_obj)
+    studio_obj.theme_timer = timer_cls(studio_obj)
     studio_obj.theme_timer.setInterval(60000)
     studio_obj.theme_timer.timeout.connect(studio_obj._refresh_theme)
     studio_obj.theme_timer.start()
     studio_obj.pending_close, studio_obj.pending_export, studio_obj.pending_save_as, studio_obj.pending_save_as_tab = "", "", "", ""
     studio_obj._force_overwrite_ids: set[str] = set()
     studio_obj.flush_operation = None
-    studio_obj.flush_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._on_flush_timeout)
-    studio_obj.recovery_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._recover)
-    studio_obj.autosave_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._autosave)
-    studio_obj.preference_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._preferences)
-    studio_obj.position_timer = _single_shot_timer(studio_mod, studio_obj, studio_obj._save_positions)
+    studio_obj.flush_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._on_flush_timeout)
+    studio_obj.recovery_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._recover)
+    studio_obj.autosave_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._autosave)
+    studio_obj.preference_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._preferences)
+    studio_obj.position_timer = _single_shot_timer(timer_cls, studio_obj, studio_obj._save_positions)
     studio_obj.saving = set()
     restore_enabled = studio_obj.settings.get("startup", "restore") == "restore"
     if not restore_enabled:
@@ -225,7 +244,6 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
     studio_obj._agent_open_paths.update(str(Path(tab["path"]).resolve()) for tab in studio_obj.tabs if tab.get("path"))
     studio_obj.session.drafts[studio_obj.window_id] = [dict(t) for t in studio_obj.tabs]
     if not studio_obj.tabs:
-        sample = studio_mod.SAMPLE
         studio_obj.tabs.append(studio_obj._note("Untitled.md") if studio_obj.settings["welcomed"] else studio_obj._note("Welcome.md", sample, saved=sample))
     elif studio_obj.settings["startup"] == "new":
         studio_obj.tabs.insert(0, studio_obj._note("Untitled.md"))
@@ -256,13 +274,13 @@ def init_studio_window(studio_obj, isolated: bool = False, session=None) -> None
         studio_obj._startup_order = restore_paths
         studio_obj._restoring_paths = set(studio_obj._startup_order)
         restore_generation = studio_obj._activation_generation
-        studio_mod.QTimer.singleShot(0, lambda: [studio_obj._open_note(p, explicit=False, activation_generation=restore_generation) for p in studio_obj._startup_order])
+        timer_cls.singleShot(0, lambda: [studio_obj._open_note(p, explicit=False, activation_generation=restore_generation) for p in studio_obj._startup_order])
     if restore_enabled and restore_folder:
         studio_obj._restore_workspace_folder(restore_folder, restore_expanded)
     studio_obj._emitted_sidebar_key = studio_obj._sidebar_slice_key()
     studio_obj._refresh_theme()
     if not isolated and len(studio_obj.session.windows) == 1 and studio_obj.settings.get("cloudAgentEnabled"):
-        studio_mod.QTimer.singleShot(0, studio_obj._restore_cloud_connection)
+        timer_cls.singleShot(0, studio_obj._restore_cloud_connection)
 
 def notify_sidebar(studio_obj) -> None:
     if getattr(studio_obj, "retired", False):
@@ -272,20 +290,19 @@ def notify_sidebar(studio_obj) -> None:
         studio_obj._emitted_sidebar_key = key
         studio_obj.sidebarChanged.emit()
 
-def emit_state(studio_obj, load: bool = True) -> None:
+def emit_state(studio_obj, load: bool = True, *, custom_theme_mod=custom_theme) -> None:
     if getattr(studio_obj, "retired", False):
         return
     _call_optional(studio_obj, "_watch_notes")
     _call_method(studio_obj, "_notify_sidebar", notify_sidebar)
     studio_obj.changed.emit()
     if load and studio_obj.ready and studio_obj.tabs:
-        studio_mod = _studio_module()
         tab = _call_method(studio_obj, "_current", _current_tab)
         dark = _call_method(studio_obj, "_dark", lambda s: s._tokens()[0])
         colors = _call_method(studio_obj, "_colors", lambda s: dict(s._tokens()[1]))
         s = studio_obj.settings
         reading_settings = {key: s[key] for key in _READING_SETTING_KEYS}
-        reading_settings["customStyle"] = studio_mod.custom_theme.reader(
+        reading_settings["customStyle"] = custom_theme_mod.reader(
             studio_obj.session.custom_theme, s["fullTheme" if studio_obj.fullscreen else "theme"], dark, s,
         )
         payload = {
@@ -321,38 +338,49 @@ def emit_state(studio_obj, load: bool = True) -> None:
         studio_obj._last_reader_text = (tab["id"], tab["content"])
         studio_obj.readerLoad.emit(json.dumps(payload))
 
-def stop_window(studio_obj) -> None:
+def stop_window(
+    studio_obj, *, stopped_watcher=None, shiboken_mod=None,
+    gui_app_cls=QGuiApplication, process_cls=QProcess,
+) -> None:
     if getattr(studio_obj, "retired", False):
         return
-    studio_mod = _studio_module()
     if getattr(studio_obj, "_storage_cancel_event", None) is not None:
         studio_obj._storage_cancel_event.set()
     _call_optional(studio_obj, "_cancel_subfolder_search")
     if getattr(studio_obj, "_folder_search_cancel", None) is not None:
         studio_obj._folder_search_cancel.set()
-    studio_obj._search_pool.shutdown(wait=False, cancel_futures=True)
-    studio_obj._export_jobs.cancel_all()
-    studio_obj._python_jobs.cancel_all(retire=True)
-    for agent_export in tuple(studio_obj._agent_exports.values()):
-        try:
-            reserved = Path(agent_export["path"])
-            if reserved.exists() and reserved.stat().st_size == 0:
-                reserved.unlink()
-        except (OSError, TypeError, KeyError):
-            pass
-    studio_obj._agent_exports.clear()
-    if studio_obj.position_timer.isActive():
-        _call_optional(studio_obj, "_save_positions")
-    studio_obj.position_timer.stop()
-    if studio_obj.preference_timer.isActive():
-        _call_optional(studio_obj, "_preferences", False)
-    studio_obj.preference_timer.stop()
+    if (search_pool := getattr(studio_obj, "_search_pool", None)) is not None:
+        search_pool.shutdown(wait=False, cancel_futures=True)
+    if (export_jobs := getattr(studio_obj, "_export_jobs", None)) is not None:
+        export_jobs.cancel_all()
+    if (python_jobs := getattr(studio_obj, "_python_jobs", None)) is not None:
+        python_jobs.cancel_all(retire=True)
+    agent_exports = getattr(studio_obj, "_agent_exports", None)
+    if agent_exports:
+        for agent_export in tuple(agent_exports.values()):
+            try:
+                reserved = Path(agent_export["path"])
+                if reserved.exists() and reserved.stat().st_size == 0:
+                    reserved.unlink()
+            except (OSError, TypeError, KeyError):
+                pass
+        agent_exports.clear()
+    pos_timer = getattr(studio_obj, "position_timer", None)
+    if pos_timer is not None:
+        if pos_timer.isActive():
+            _call_optional(studio_obj, "_save_positions")
+        pos_timer.stop()
+    pref_timer = getattr(studio_obj, "preference_timer", None)
+    if pref_timer is not None:
+        if pref_timer.isActive():
+            _call_optional(studio_obj, "_preferences", False)
+        pref_timer.stop()
     for timer_attr in _STOP_TIMERS:
         timer = getattr(studio_obj, timer_attr, None)
         if timer is not None:
             timer.stop()
-    stopped_watcher = studio_mod._STOPPED_WATCHER
-    shiboken = studio_mod.shiboken6
+    if stopped_watcher is None:
+        stopped_watcher = _DEFAULT_STOPPED_WATCHER
     for attr in _WATCHER_ATTRS:
         watcher = getattr(studio_obj, attr, None)
         if watcher is None or watcher is stopped_watcher:
@@ -361,18 +389,19 @@ def stop_window(studio_obj) -> None:
         if watched:
             watcher.removePaths(watched)
         setattr(studio_obj, attr, stopped_watcher)
-        if shiboken is not None and shiboken.isValid(watcher):
+        if shiboken_mod is not None and shiboken_mod.isValid(watcher):
             watcher.setParent(None)
-            shiboken.delete(watcher)
+            shiboken_mod.delete(watcher)
         else:
             watcher.deleteLater()
+    session = getattr(studio_obj, "session", None)
     color_slot = getattr(studio_obj, "_color_scheme_slot", None)
     signal_pairs = [
-        (getattr(studio_obj.session, "changed", None), getattr(studio_obj, "_session_changed_slot", None)),
-        (getattr(studio_obj.session, "locationChanged", None), getattr(studio_obj, "_location_changed_slot", None)),
+        (getattr(session, "changed", None), getattr(studio_obj, "_session_changed_slot", None)),
+        (getattr(session, "locationChanged", None), getattr(studio_obj, "_location_changed_slot", None)),
     ]
     if color_slot is not None:
-        signal_pairs.insert(0, (studio_mod.QGuiApplication.styleHints().colorSchemeChanged, color_slot))
+        signal_pairs.insert(0, (gui_app_cls.styleHints().colorSchemeChanged, color_slot))
     for signal, slot in signal_pairs:
         if signal is not None and slot is not None:
             try:
@@ -380,24 +409,38 @@ def stop_window(studio_obj) -> None:
             except (RuntimeError, TypeError):
                 pass
     _call_optional(studio_obj, "_recover")
-    studio_obj.session.reader_assets.revoke_owner(studio_obj.window_id)
+    if session is not None and getattr(session, "reader_assets", None) is not None:
+        session.reader_assets.revoke_owner(studio_obj.window_id)
     studio_obj._retired = True
-    with studio_obj._write_callback_lock:
-        retired_callbacks = list(studio_obj._pending_write_retirements.values())
-        studio_obj._pending_write_retirements.clear()
-    for callback in retired_callbacks:
-        try:
-            callback()
-        except Exception:
-            pass
-    studio_obj.session.windows.pop(studio_obj.window_id, None)
-    if not studio_obj.session.is_quitting() and studio_obj.session.windows:
-        studio_obj.session.workspace.pop(studio_obj.window_id, None)
-        studio_obj.session.window_workspaces.pop(studio_obj.window_id, None)
-        _call_optional(next(iter(studio_obj.session.windows.values())), "_recover")
-    if studio_obj.system_preferences.state() != studio_mod.QProcess.ProcessState.NotRunning:
-        studio_obj.system_preferences.terminate()
-        studio_obj.system_preferences.waitForFinished(300)
+    pending_retirements = getattr(studio_obj, "_pending_write_retirements", None)
+    if pending_retirements is not None:
+        lock = getattr(studio_obj, "_write_callback_lock", None)
+        if lock is not None:
+            with lock:
+                retired_callbacks = list(pending_retirements.values())
+                pending_retirements.clear()
+        else:
+            retired_callbacks = list(pending_retirements.values())
+            pending_retirements.clear()
+        for callback in retired_callbacks:
+            try:
+                callback()
+            except Exception:
+                pass
+    if session is not None:
+        windows = getattr(session, "windows", None)
+        if windows is not None:
+            windows.pop(getattr(studio_obj, "window_id", None), None)
+        if windows and not _call_optional(session, "is_quitting"):
+            if getattr(session, "workspace", None) is not None:
+                session.workspace.pop(studio_obj.window_id, None)
+            if getattr(session, "window_workspaces", None) is not None:
+                session.window_workspaces.pop(studio_obj.window_id, None)
+            _call_optional(next(iter(windows.values())), "_recover")
+    sys_prefs = getattr(studio_obj, "system_preferences", None)
+    if sys_prefs is not None and sys_prefs.state() != process_cls.ProcessState.NotRunning:
+        sys_prefs.terminate()
+        sys_prefs.waitForFinished(300)
 
 def folder_slice_key(studio_obj, files):
     return (studio_obj.folder, studio_obj.folder_filter, bool(studio_obj._folder_searching), getattr(studio_obj, "_files_revision", 0), id(files), len(files))
