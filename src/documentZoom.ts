@@ -3,6 +3,7 @@ import { captureScrollAnchor } from "./scrollAnchor";
 type Geometry={page:HTMLElement;space:HTMLElement;width:number;height:number;viewport:number;bounds:DOMRect;originX:number;originY:number;left:number;spaceWidth:number;locked:boolean};
 const geometry=new WeakMap<HTMLElement,Geometry>();
 export function invalidateDocumentZoom(root:HTMLElement):void {geometry.delete(root);}
+export function shiftDocumentOriginY(root:HTMLElement, deltaY:number):void {const measured=geometry.get(root);if(measured&&deltaY)measured.originY+=deltaY;}
 /** Uses cached geometry only: a horizontal lock must never fight vertical
  * momentum, remeasure a large note, or alter independent image/plot cameras. */
 export function enforceDocumentCenter(root:HTMLElement):void {

@@ -1352,6 +1352,204 @@ describe("ReadingSearch DOM behavior", () => {
     }
   });
 
+  it("scrolls precise Range coordinates into the unobstructed band below .reading-search in tall blocks and top lines", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const tallLines = Array.from({ length: 120 }, (_, i) => (i === 0 ? "Line 0 TopToken" : i === 115 ? "Line 115 DeepToken" : `Line ${i} filler`));
+    const content = `# TopToken Heading\n\n\`\`\`txt\n${tallLines.join("\n")}\n\`\`\``;
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={content} close={() => {}} onChange={() => {}} />
+          <section className="android-reading">
+            <div className="markdown-body">
+              <h1 data-source-start="0" data-source-end="18">TopToken Heading</h1>
+              <pre data-source-start="20" data-source-end={String(content.length)}><code>{tallLines.join("\n")}</code></pre>
+            </div>
+          </section>
+        </div>,
+      );
+    });
+
+    const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+    const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+    const heading = host.querySelector<HTMLElement>("h1")!;
+    const codeEl = host.querySelector<HTMLElement>("code")!;
+
+    let barHeight = 76;
+    const getClearance = () => parseFloat(scroller.style.paddingTop || "0") || 0;
+    searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, barHeight);
+    scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+    heading.getBoundingClientRect = () => new DOMRect(40, 24 + getClearance() - scroller.scrollTop, 400, 32);
+    // Code block is 2,400px tall; centering the element would leave line 0 and line 115 offscreen.
+    codeEl.getBoundingClientRect = () => new DOMRect(40, 100 + getClearance() - scroller.scrollTop, 600, 2400);
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+    const computeRangeRect = (range: Range): DOMRect => {
+      const text = range.startContainer.textContent || "";
+      if (heading.contains(range.startContainer)) {
+        return new DOMRect(40, 24 + getClearance() - scroller.scrollTop, 90, 28);
+      }
+      const lineIdx = text.slice(0, range.startOffset).split("\n").length - 1;
+      return new DOMRect(40, 100 + getClearance() + lineIdx * 20 - scroller.scrollTop, 110, 20);
+    };
+    Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+    Range.prototype.getClientRects = function () {
+      const r = computeRangeRect(this);
+      return Object.assign([r], { item: (idx: number) => (idx === 0 ? r : null) }) as unknown as DOMRectList;
+    };
+
+    try {
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      act(() => setInputValue(searchInput, "DeepToken"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 1");
+
+      // Line 115 sits at document y = 100 + 2300 = 2400px; precise Range scroll brings it into [100, 584], not element center (1300px).
+      const deepRectY = 100 + getClearance() + 115 * 20 - scroller.scrollTop;
+      expect(deepRectY).toBeGreaterThanOrEqual(12 + barHeight + 12);
+      expect(deepRectY + 20).toBeLessThanOrEqual(600 - 16);
+
+      // Now search TopToken at the very top of the note (y = 24px < searchBar.bottom = 88px).
+      act(() => setInputValue(searchInput, "TopToken"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("1 / 2");
+
+      const topMatchY = 24 + getClearance() - scroller.scrollTop;
+      expect(topMatchY).toBeGreaterThanOrEqual(12 + barHeight + 12);
+
+      // Expanding Replace increases .reading-search height and keeps the selected top match unobstructed.
+      barHeight = 148;
+      const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+      act(() => replaceToggle.click());
+      const expandedTopMatchY = 24 + getClearance() - scroller.scrollTop;
+      expect(expandedTopMatchY).toBeGreaterThanOrEqual(12 + barHeight + 12);
+
+      // Stepping to the second TopToken match deeper in the code block (if deeper than visibleTop) or searching DeepToken releases temporary top clearance automatically.
+      act(() => setInputValue(searchInput, "DeepToken"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(scroller.style.paddingTop).toBe("");
+
+      // Unmounting ReadingSearch leaves scroller clean.
+      act(() => root.unmount());
+      expect(scroller.style.paddingTop).toBe("");
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      host.remove();
+    }
+  });
+
+  it("scrolls nested scrollable Python source containers and isolates .android-reading clearance onto .reader-chrome-spacer", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const pyLines = Array.from({ length: 100 }, (_, i) => (i === 99 ? "print('PYTHON-END-99')" : `x_${i} = ${i}`));
+    const content = `# TopHeader\n\n\`\`\`python\n${pyLines.join("\n")}\n\`\`\``;
+
+    await act(async () => {
+      root.render(
+        <div className="android-document">
+          <ReadingSearch content={content} close={() => {}} onChange={() => {}} />
+          <section className="android-reading">
+            <div className="reader-chrome-spacer" aria-hidden="true" />
+            <div className="document-page-space">
+              <div className="document-page">
+                <div className="markdown-body">
+                  <h1>TopHeader</h1>
+                  <pre className="python-source" aria-label="Python source" style={{ overflowY: "auto" }}>
+                    {pyLines.join("\n")}
+                  </pre>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>,
+      );
+    });
+
+    const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+    const spacer = host.querySelector<HTMLElement>(".reader-chrome-spacer")!;
+    const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+    const heading = host.querySelector<HTMLElement>("h1")!;
+    const pySource = host.querySelector<HTMLElement>("pre.python-source")!;
+
+    Object.defineProperty(pySource, "clientHeight", { configurable: true, value: 240 });
+    Object.defineProperty(pySource, "scrollHeight", { configurable: true, value: 2000 });
+
+    const getSpacerMargin = () => parseFloat(spacer.style.marginBottom || "0") || 0;
+    searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 76);
+    scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+    heading.getBoundingClientRect = () => new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 400, 32);
+    pySource.getBoundingClientRect = () => new DOMRect(40, 500 + getSpacerMargin() - scroller.scrollTop, 600, 240);
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+    const computeRangeRect = (range: Range): DOMRect => {
+      if (heading.contains(range.startContainer)) {
+        return new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 120, 28);
+      }
+      const text = range.startContainer.textContent || "";
+      const lineIdx = text.slice(0, range.startOffset).split("\n").length - 1;
+      const pyTop = 500 + getSpacerMargin() - scroller.scrollTop;
+      return new DOMRect(48, pyTop + lineIdx * 20 - pySource.scrollTop, 160, 20);
+    };
+    Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+    Range.prototype.getClientRects = function () {
+      const r = computeRangeRect(this);
+      return Object.assign([r], { item: (idx: number) => (idx === 0 ? r : null) }) as unknown as DOMRectList;
+    };
+
+    try {
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+
+      // Top match uses .reader-chrome-spacer margin-bottom without mutating .android-reading paddingTop.
+      act(() => setInputValue(searchInput, "TopHeader"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(scroller.style.paddingTop).toBe("");
+      expect(getSpacerMargin()).toBeGreaterThan(0);
+
+      // Stepping to nested Python source match releases spacer clearance and scrolls BOTH pre.python-source and .android-reading.
+      act(() => setInputValue(searchInput, "PYTHON-END-99"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      act(() => nextBtn.click());
+      expect(getSpacerMargin()).toBe(0);
+      expect(pySource.scrollTop).toBeGreaterThan(0);
+      expect(scroller.scrollTop).toBeGreaterThan(0);
+
+      const finalRect = computeRangeRect(
+        (() => {
+          const r = document.createRange();
+          const tn = pySource.firstChild!;
+          const idx = (tn.textContent || "").indexOf("PYTHON-END-99");
+          r.setStart(tn, idx);
+          r.setEnd(tn, idx + 13);
+          return r;
+        })(),
+      );
+      expect(finalRect.top).toBeGreaterThanOrEqual(12 + 76 + 12);
+      expect(finalRect.bottom).toBeLessThanOrEqual(600 - 16);
+
+      act(() => root.unmount());
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      host.remove();
+    }
+  });
+
   it("re-aligns offscreen source reveals across multi-wave window layout changes and cancels on newer selection or manual scroll", async () => {
     const host = document.createElement("div");
     document.body.append(host);
@@ -1516,6 +1714,573 @@ describe("ReadingSearch DOM behavior", () => {
       expect(scrollTargets.length).toBe(0);
     } finally {
       Element.prototype.scrollIntoView = origScrollIntoView;
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("keeps rendered Range inside .reading-scroll unobstructed viewport when adjacent WindowedBlocks shrink after initial frames", async () => {
+    const { default: WindowedBlock } = await import("./WindowedBlock");
+    class TestIntersectionObserver {
+      static instances: TestIntersectionObserver[] = [];
+      constructor(readonly callback: IntersectionObserverCallback) { TestIntersectionObserver.instances.push(this); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      emitBatch(entries: Array<{ target: Element; isIntersecting: boolean }>) {
+        this.callback(entries as unknown as IntersectionObserverEntry[], this as unknown as IntersectionObserver);
+      }
+    }
+    class NoopResizeObserver {
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+    vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const blocks = Array.from({ length: 12 }, (_, idx) =>
+      idx === 0
+        ? "## Intro\n\ntoken-01 intro."
+        : idx === 8
+          ? "## Section 25\n\ntoken-25 target."
+          : idx === 11
+            ? "## Section 45\n\ntoken-45 tail."
+            : `## Filler ${idx}\n\nParagraph ${idx}.`,
+    );
+    const content = blocks.join("\n\n");
+    const offsets: Array<{ start: number; end: number }> = [];
+    let cursor = 0;
+    for (const chunk of blocks) {
+      offsets.push({ start: cursor, end: cursor + chunk.length });
+      cursor += chunk.length + 2;
+    }
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+
+    try {
+      await act(async () => {
+        root.render(
+          <div className="workspace">
+            <ReadingSearch content={content} close={() => {}} initialReplace onChange={() => {}} />
+            <div className="reading-scroll">
+              <div className="live-document">
+                <div className="markdown-body">
+                  {blocks.map((chunk, idx) => (
+                    <WindowedBlock
+                      key={idx}
+                      enabled
+                      estimate={120}
+                      text={chunk}
+                      data-source-start={offsets[idx].start}
+                      data-source-end={offsets[idx].end}
+                    >
+                      <p>{chunk.split("\n\n")[1]}</p>
+                    </WindowedBlock>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>,
+        );
+      });
+
+      const scroller = host.querySelector<HTMLElement>(".reading-scroll")!;
+      const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+      const getBlocks = () => Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      const blockHeight = (el: HTMLElement) => (el.getAttribute("data-windowed-mounted") === "true" ? 44 : 120);
+      const blockTopDoc = (targetIdx: number) => {
+        const list = getBlocks();
+        let y = 0;
+        for (let i = 0; i < targetIdx; i++) y += blockHeight(list[i]);
+        return y;
+      };
+      const totalDocHeight = () => getBlocks().reduce((sum, el) => sum + blockHeight(el), 0);
+
+      let simulatedScrollTop = 0;
+      Object.defineProperty(scroller, "scrollTop", {
+        configurable: true,
+        get: () => simulatedScrollTop,
+        set: (v: number) => { simulatedScrollTop = Math.max(0, v); },
+      });
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => totalDocHeight() });
+      searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 88);
+      scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+      getBlocks().forEach((el, idx) => {
+        el.getBoundingClientRect = () => {
+          const top = blockTopDoc(idx) - scroller.scrollTop;
+          return new DOMRect(40, top, 680, blockHeight(el));
+        };
+      });
+
+      const computeRangeRect = (range: Range): DOMRect => {
+        const list = getBlocks();
+        const ownerIdx = list.findIndex((el) => el.contains(range.startContainer));
+        const top = (ownerIdx >= 0 ? blockTopDoc(ownerIdx) : 0) + 12 - scroller.scrollTop;
+        return new DOMRect(48, top, 100, 20);
+      };
+      Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+      Range.prototype.getClientRects = function () {
+        const r = computeRangeRect(this);
+        return Object.assign([r], { item: (i: number) => (i === 0 ? r : null) }) as unknown as DOMRectList;
+      };
+
+      // Mount block 0 initially.
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch([{ target: getBlocks()[0], isIntersecting: true }]);
+      });
+
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => regexBtn.click());
+      act(() => setInputValue(searchInput, "token-\\d+"));
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+
+      // Step to 1 / 3 (token-01), then 2 / 3 (offscreen token-25 in block 8).
+      act(() => nextBtn.click());
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("2 / 3");
+      expect(getBlocks()[8].getAttribute("data-windowed-mounted")).toBe("true");
+
+      // Drain initial 4 rAF passes while blocks 1..7 above block 8 are still 120px placeholders.
+      for (let i = 0; i < 6; i++) {
+        await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      }
+
+      // Now IntersectionObserver mounts blocks 1..7 in .reading-scroll, shrinking height above block 8 by 7 * 76 = 532px
+      // (which would pull token-25 above the viewport without .reading-scroll supermd-window-change settling).
+      await act(async () => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(1, 8).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+
+      const settledTop = blockTopDoc(8) + 12 - scroller.scrollTop;
+      expect(settledTop).toBeGreaterThanOrEqual(12 + 88 + 12);
+      expect(settledTop + 20).toBeLessThanOrEqual(600 - 16);
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      vi.unstubAllGlobals();
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("composes #96 seeded exact occurrences, Unicode case-folded ranges, and passive stale-offset fallback with #110 unobstructed search-bar scrolling", async () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const tallLines = Array.from({ length: 90 }, (_, i) =>
+      i === 2 ? "Early BeaconHit in code" : i === 85 ? "Late BeaconHit in code" : `Line ${i} filler`,
+    );
+    const headingText = "Hauptstraße BeaconHit Top";
+    const content = `# ${headingText}\n\n\`\`\`txt\n${tallLines.join("\n")}\n\`\`\``;
+    const h1End = 2 + headingText.length;
+    const codeStart = h1End + 2;
+
+    const origHighlight = (window as unknown as { Highlight?: unknown }).Highlight;
+    const origCss = globalThis.CSS;
+    const highlightMap = new Map<string, { ranges: Range[] }>();
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) { this.ranges = ranges; }
+    }
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { ...(origCss ?? {}), highlights: highlightMap }, configurable: true, writable: true });
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+
+    const renderWithSeed = (seed: { query: string; caseSensitive?: boolean; sourceStart?: number; sourceEnd?: number; matchText?: string; nonce: number } | null) =>
+      act(async () => {
+        root.render(
+          <div className="android-document">
+            <ReadingSearch content={content} close={() => {}} onChange={() => {}} seed={seed} />
+            <section className="android-reading">
+              <div className="reader-chrome-spacer" aria-hidden="true" />
+              <div className="document-page-space">
+                <div className="document-page">
+                  <div className="markdown-body">
+                    <h1 data-source-start="0" data-source-end={String(h1End)}>{headingText}</h1>
+                    <pre data-source-start={String(codeStart)} data-source-end={String(content.length)}><code>{tallLines.join("\n")}</code></pre>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>,
+        );
+      });
+
+    try {
+      await renderWithSeed(null);
+      const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+      const spacer = host.querySelector<HTMLElement>(".reader-chrome-spacer")!;
+      const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+      const heading = host.querySelector<HTMLElement>("h1")!;
+      const codeEl = host.querySelector<HTMLElement>("code")!;
+
+      const getSpacerMargin = () => parseFloat(spacer.style.marginBottom || "0") || 0;
+      searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 76);
+      scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+      heading.getBoundingClientRect = () => new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 420, 32);
+      codeEl.getBoundingClientRect = () => new DOMRect(40, 100 + getSpacerMargin() - scroller.scrollTop, 600, 1800);
+
+      const computeRangeRect = (range: Range): DOMRect => {
+        if (heading.contains(range.startContainer)) {
+          return new DOMRect(40, 24 + getSpacerMargin() - scroller.scrollTop, 100, 28);
+        }
+        const text = range.startContainer.textContent || "";
+        const lineIdx = text.slice(0, range.startOffset).split("\n").length - 1;
+        return new DOMRect(40, 100 + getSpacerMargin() + lineIdx * 20 - scroller.scrollTop, 110, 20);
+      };
+      Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+      Range.prototype.getClientRects = function () {
+        const r = computeRangeRect(this);
+        return Object.assign([r], { item: (idx: number) => (idx === 0 ? r : null) }) as unknown as DOMRectList;
+      };
+
+      // 1. Seeded 3rd occurrence ("Late BeaconHit" at line 85 of tall block) scrolls exact Range into unobstructed band.
+      const hits = sourceMatches(content, "BeaconHit", true);
+      expect(hits).toHaveLength(3);
+      await renderWithSeed({
+        query: "BeaconHit",
+        caseSensitive: true,
+        sourceStart: hits[2].from,
+        sourceEnd: hits[2].to,
+        matchText: "BeaconHit",
+        nonce: 301,
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+      const lateRect = computeRangeRect(highlightMap.get("smd-search-current")!.ranges[0]);
+      expect(lateRect.top).toBeGreaterThanOrEqual(12 + 76 + 12);
+      expect(lateRect.bottom).toBeLessThanOrEqual(600 - 16);
+
+      // 2. Stale seeded occurrence preserves current scroll position and passive 0 / 3 without scrolling to occurrence 1.
+      const savedScrollTop = scroller.scrollTop;
+      await renderWithSeed({
+        query: "BeaconHit",
+        caseSensitive: true,
+        sourceStart: hits[2].from + 5,
+        sourceEnd: hits[2].to + 5,
+        matchText: "BeaconHit",
+        nonce: 302,
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      expect(host.querySelector("output")?.textContent).toBe("0 / 3");
+      expect(scroller.scrollTop).toBe(savedScrollTop);
+      expect(highlightMap.get("smd-search-current")).toBeUndefined();
+
+      // 3. Seeded Unicode case-folded "strasse" -> "straße" on line 1 applies .reader-chrome-spacer clearance below .reading-search.
+      const unicodeStart = content.indexOf("straße");
+      await renderWithSeed({
+        query: "strasse",
+        caseSensitive: false,
+        sourceStart: unicodeStart,
+        sourceEnd: unicodeStart + "straße".length,
+        matchText: "straße",
+        nonce: 303,
+      });
+      await act(async () => { await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined))); });
+      const unicodeRange = highlightMap.get("smd-search-current")?.ranges[0];
+      expect(unicodeRange?.toString()).toBe("straße");
+      const unicodeRect = computeRangeRect(unicodeRange!);
+      expect(unicodeRect.top).toBeGreaterThanOrEqual(12 + 76 + 12);
+      expect(getSpacerMargin()).toBeGreaterThan(0);
+    } finally {
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
+      act(() => root.unmount());
+      host.remove();
+    }
+  });
+
+  it("verifies rendered Range inside .android-reading after multi-wave WindowedBlock settling without rogue preserveWindowedScroll cancellation", async () => {
+    const { default: WindowedBlock } = await import("./WindowedBlock");
+    class TestIntersectionObserver {
+      static instances: TestIntersectionObserver[] = [];
+      constructor(readonly callback: IntersectionObserverCallback) { TestIntersectionObserver.instances.push(this); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      emitBatch(entries: Array<{ target: Element; isIntersecting: boolean }>) {
+        this.callback(entries as unknown as IntersectionObserverEntry[], this as unknown as IntersectionObserver);
+      }
+    }
+    class NoopResizeObserver {
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("IntersectionObserver", TestIntersectionObserver);
+    vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+    let nextRafId = 1;
+    const pendingRafs = new Map<number, FrameRequestCallback>();
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      const id = nextRafId++;
+      pendingRafs.set(id, cb);
+      return id;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => {
+      pendingRafs.delete(id);
+    });
+    const stepFrame = async () => {
+      await Promise.resolve();
+      act(() => {
+        const batch = Array.from(pendingRafs.entries());
+        pendingRafs.clear();
+        const ts = performance.now();
+        for (const [, cb] of batch) cb(ts);
+      });
+      await Promise.resolve();
+    };
+
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+
+    const makeBlocks = (replaced25: boolean) =>
+      Array.from({ length: 24 }, (_, idx) =>
+        idx === 0
+          ? "Read [Docs](https://example.org/token-00) and token-01."
+          : idx === 12
+            ? replaced25
+              ? "Offscreen item-25 match."
+              : "Offscreen token-25 match."
+            : idx === 20
+              ? "Distant token-45 match."
+              : `Readable windowed study paragraph ${idx}.`,
+      );
+
+    let currentContent = makeBlocks(false).join("\n\n");
+    const computeOffsets = (chunks: string[]) => {
+      const list: Array<{ start: number; end: number }> = [];
+      let cur = 0;
+      for (const chunk of chunks) {
+        list.push({ start: cur, end: cur + chunk.length });
+        cur += chunk.length + 2;
+      }
+      return list;
+    };
+
+    const origHighlight = (window as unknown as { Highlight?: unknown }).Highlight;
+    const origCss = globalThis.CSS;
+    const highlightMap = new Map<string, { ranges: Range[] }>();
+    class MockHighlight {
+      ranges: Range[];
+      constructor(...ranges: Range[]) { this.ranges = ranges; }
+    }
+    Object.defineProperty(window, "Highlight", { value: MockHighlight, configurable: true, writable: true });
+    Object.defineProperty(globalThis, "CSS", { value: { ...(origCss ?? {}), highlights: highlightMap }, configurable: true, writable: true });
+
+    const origGetClientRects = Range.prototype.getClientRects;
+    const origGetBoundingRect = Range.prototype.getBoundingClientRect;
+    const origElementFromPoint = document.elementFromPoint;
+
+    let silentUpperDriftPx = 0;
+    let simulatedScrollTop = 0;
+
+    const renderScene = (text: string) => {
+      const chunks = text.split("\n\n");
+      const offsets = computeOffsets(chunks);
+      root.render(
+        <div className="android-document">
+          <ReadingSearch
+            content={text}
+            close={() => {}}
+            initialReplace
+            onChange={(next) => {
+              currentContent = next;
+              renderScene(next);
+            }}
+          />
+          <section className="android-reading">
+            <div className="reader-chrome-spacer" aria-hidden="true" />
+            <div className="document-page-space">
+              <div className="document-page">
+                <div className="markdown-body">
+                  {chunks.map((chunk, idx) => (
+                    <WindowedBlock
+                      key={idx}
+                      enabled
+                      estimate={120}
+                      text={chunk}
+                      data-source-start={offsets[idx].start}
+                      data-source-end={offsets[idx].end}
+                    >
+                      <p>{chunk.replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")}</p>
+                    </WindowedBlock>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>,
+      );
+    };
+
+    try {
+      await act(async () => { renderScene(currentContent); });
+      const scroller = host.querySelector<HTMLElement>(".android-reading")!;
+      const spacer = host.querySelector<HTMLElement>(".reader-chrome-spacer")!;
+      const searchBar = host.querySelector<HTMLElement>(".reading-search")!;
+      const getSpacerMargin = () => parseFloat(spacer.style.marginBottom || "0") || 0;
+      const getBlocks = () => Array.from(host.querySelectorAll<HTMLElement>("[data-windowed-block]"));
+      const blockHeight = (el: HTMLElement) => (el.getAttribute("data-windowed-mounted") === "true" ? 48 : 120);
+      const blockTopDoc = (targetIdx: number) => {
+        const list = getBlocks();
+        let y = getSpacerMargin() + (targetIdx > 0 ? silentUpperDriftPx : 0);
+        for (let i = 0; i < targetIdx; i++) y += blockHeight(list[i]);
+        return y;
+      };
+      const totalDocHeight = () =>
+        Math.max(600, getSpacerMargin() + getBlocks().reduce((sum, el) => sum + blockHeight(el), 0) + silentUpperDriftPx);
+
+      Object.defineProperty(scroller, "scrollTop", {
+        configurable: true,
+        get: () => simulatedScrollTop,
+        set: (v: number) => {
+          const next = Math.max(0, v);
+          if (next !== simulatedScrollTop) {
+            simulatedScrollTop = next;
+            queueMicrotask(() => scroller.dispatchEvent(new Event("scroll")));
+          }
+        },
+      });
+      Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => totalDocHeight() });
+      searchBar.getBoundingClientRect = () => new DOMRect(24, 12, 720, 88);
+      scroller.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+      const bindBlockRects = () => {
+        getBlocks().forEach((el, idx) => {
+          el.getBoundingClientRect = () => new DOMRect(40, blockTopDoc(idx) - scroller.scrollTop, 680, blockHeight(el));
+        });
+      };
+      bindBlockRects();
+
+      // Simulate elementFromPoint hitting an upper placeholder block (e.g. y=160) when scrolled deep,
+      // which would arm preserveWindowedScroll if revealMountedBlock fired supermd-reveal-window unguarded.
+      document.elementFromPoint = (_x: number, y: number) => {
+        const list = getBlocks();
+        for (let i = 0; i < list.length; i++) {
+          const top = blockTopDoc(i) - scroller.scrollTop;
+          if (y >= top && y <= top + blockHeight(list[i])) return list[i];
+        }
+        return scroller;
+      };
+
+      const computeRangeRect = (range: Range): DOMRect => {
+        const list = getBlocks();
+        const ownerIdx = list.findIndex((el) => el.contains(range.startContainer));
+        const top = (ownerIdx >= 0 ? blockTopDoc(ownerIdx) : getSpacerMargin()) + 10 - scroller.scrollTop;
+        return new DOMRect(48, top, 110, 20);
+      };
+      Range.prototype.getBoundingClientRect = function () { return computeRangeRect(this); };
+      Range.prototype.getClientRects = function () {
+        const r = computeRangeRect(this);
+        return Object.assign([r], { item: (i: number) => (i === 0 ? r : null) }) as unknown as DOMRectList;
+      };
+
+      act(() => {
+        TestIntersectionObserver.instances[0]?.emitBatch([{ target: getBlocks()[0], isIntersecting: true }]);
+      });
+
+      const searchInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+      const wholeWordBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Match whole word"]')!;
+      const regexBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Regular expression"]')!;
+      const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+      act(() => wholeWordBtn.click());
+      act(() => regexBtn.click());
+      act(() => setInputValue(searchInput, "(token)-(\\d+)"));
+      await stepFrame();
+      expect(host.querySelector("output")?.textContent).toBe("0 / 4");
+
+      // Advance 1 / 4 (URL) -> 2 / 4 (token-01) -> 3 / 4 (offscreen token-25 in block 12).
+      act(() => nextBtn.click());
+      act(() => nextBtn.click());
+      act(() => nextBtn.click());
+      expect(host.querySelector("output")?.textContent).toBe("3 / 4");
+      expect(getBlocks()[12].getAttribute("data-windowed-mounted")).toBe("true");
+
+      // Wave 1 after 2 frames, Wave 2 after 2 more frames, plus silent post-wave margin drift on verification frame.
+      await stepFrame();
+      await stepFrame();
+      act(() => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(6, 12).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await stepFrame();
+      await stepFrame();
+      act(() => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(1, 6).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      // Drain active layout pass so next queued frame is verifyOnly, then shift geometry above block 12 without events.
+      await stepFrame();
+      silentUpperDriftPx = -240;
+      await stepFrame();
+      await stepFrame();
+
+      expect(scroller.scrollTop).toBeGreaterThan(0);
+      const current25 = highlightMap.get("smd-search-current")?.ranges[0];
+      expect(current25?.toString()).toBe("token-25");
+      const rect25 = computeRangeRect(current25!);
+      expect(rect25.top).toBeGreaterThanOrEqual(12 + 88 + 12 - 1);
+      expect(rect25.bottom).toBeLessThanOrEqual(600 - 16 + 1);
+
+      // Single Replace expands $2 -> item-25 and advances to 3 / 3 (token-45 in block 20), keeping it in band.
+      const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+      act(() => setInputValue(replaceInput, "item-$2"));
+      const replaceSingle = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0];
+      act(() => { replaceSingle.click(); });
+      bindBlockRects();
+      await stepFrame();
+      expect(currentContent).toContain("Offscreen item-25 match.");
+      expect(host.querySelector("output")?.textContent).toBe("3 / 3");
+      expect(getBlocks()[20].getAttribute("data-windowed-mounted")).toBe("true");
+
+      act(() => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(13, 17).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await stepFrame();
+      await stepFrame();
+
+      const current45 = highlightMap.get("smd-search-current")?.ranges[0];
+      expect(current45?.toString()).toBe("token-45");
+      const rect45 = computeRangeRect(current45!);
+      expect(rect45.top).toBeGreaterThanOrEqual(12 + 88 + 12 - 1);
+      expect(rect45.bottom).toBeLessThanOrEqual(600 - 16 + 1);
+
+      // Manual scroll cancels any remaining verification/settle passes so subsequent block mounts do not snap scrollTop back.
+      scroller.scrollTop = 180;
+      await Promise.resolve();
+      act(() => {
+        TestIntersectionObserver.instances[0]?.emitBatch(
+          getBlocks().slice(17, 20).map((target) => ({ target, isIntersecting: true })),
+        );
+      });
+      await stepFrame();
+      expect(scroller.scrollTop).toBe(180);
+    } finally {
+      document.elementFromPoint = origElementFromPoint;
+      Range.prototype.getClientRects = origGetClientRects;
+      Range.prototype.getBoundingClientRect = origGetBoundingRect;
+      Object.defineProperty(window, "Highlight", { value: origHighlight, configurable: true, writable: true });
+      Object.defineProperty(globalThis, "CSS", { value: origCss, configurable: true, writable: true });
+      vi.unstubAllGlobals();
       act(() => root.unmount());
       host.remove();
     }

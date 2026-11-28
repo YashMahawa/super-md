@@ -82,10 +82,10 @@ function isHiddenOrExcludedSearchElement(el: Element): boolean {
 export const nextSearchIndex = (index: number, direction: number, count: number): number =>
   count <= 0 ? -1 : index < 0 ? (direction < 0 ? count - 1 : 0) : ((index + direction) % count + count) % count;
 export function revealMountedBlock(element: Element): void {
-  if (!(element instanceof HTMLElement)) return;
-  const w = element.closest<HTMLElement>("[data-windowed-block]");
-  if (w?.getAttribute("data-windowed-mounted") === "true") return;
-  if (w?.getAttribute("data-windowed-mounted") === "false") flushSync(() => revealWindowed(element)); else revealWindowed(element);
+  if (!(element instanceof HTMLElement) || !element.closest('[data-windowed-mounted="false"]')) return;
+  const root = element.closest<HTMLElement>(".android-reading"), hadNav = Boolean(root?.dataset.navigating);
+  if (root && !hadNav) root.dataset.navigating = "true";
+  try { flushSync(() => revealWindowed(element)); } finally { if (root && !hadNav) delete root.dataset.navigating; }
 }
 export function scrollTargetIntoView(target: Element | null, host?: Element | null): void {
   if (!target) return;
@@ -209,6 +209,10 @@ function sourceBounds(el: Element, content?: string): { start: number; end: numb
     }
   }
   return null;
+}
+export function proportionalSourceOffset(el: Element | null | undefined, from: number, content?: string): number | undefined {
+  const b = el ? sourceBounds(el, content) : null;
+  return b && b.end > b.start ? (from - b.start) / (b.end - b.start) : undefined;
 }
 export function openDisclosuresFor(target: Element | null, scope?: Element | null, range?: Range | null, sourceRange?: SourceRange): boolean {
   let opened = false;

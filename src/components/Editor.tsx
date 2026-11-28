@@ -342,13 +342,34 @@ export function cachedEditorHistory(id:string,direction:'undo'|'redo',content:st
   const changed=(direction==='undo'?undo:redo)({state:cached.state,dispatch:transaction=>{cached.state=transaction.state;}});
   return changed?cached.state.doc.toString():undefined;
 }
+import { scrollRectIntoSearchScroller, type VerticalBandRect } from "../searchScroll";
 export function editorFindQuery(id:string,query:string,caseSensitive:boolean,options?:{wholeWord?:boolean;regexp?:boolean}) {
   const wholeWord=!!options?.wholeWord,regexp=!!options?.regexp;
   visibleEditors.get(id)?.dispatch({effects:setSearchQuery.of(new SearchQuery({search:query,caseSensitive,wholeWord,regexp,literal:!regexp}))});
 }
+function readEditorMatchRect(view:EditorView,from:number,to:number):VerticalBandRect|null {
+  try {
+    const docLen=view.state.doc.length;
+    const safeFrom=Math.max(0,Math.min(from,docLen));
+    const safeTo=Math.max(safeFrom,Math.min(to,docLen));
+    const start=view.coordsAtPos(safeFrom);
+    if(!start)return null;
+    const end=safeTo>safeFrom?view.coordsAtPos(safeTo):null;
+    return {top:end?Math.min(start.top,end.top):start.top,bottom:end?Math.max(start.bottom,end.bottom):start.bottom};
+  } catch {
+    return null;
+  }
+}
 export function editorFindRange(id:string,from:number,to:number) {
   const view=visibleEditors.get(id);if(!view)return;
   view.dispatch({selection:{anchor:from,head:to},effects:EditorView.scrollIntoView(from,{y:"center"})});
+  const rect=readEditorMatchRect(view,from,to);
+  if(rect)scrollRectIntoSearchScroller(view.scrollDOM,rect,()=>readEditorMatchRect(view,from,to),"center");
+}
+export function ensureEditorSearchRangeVisible(id:string,from:number,to:number) {
+  const view=visibleEditors.get(id);if(!view)return;
+  const rect=readEditorMatchRect(view,from,to);
+  if(rect)scrollRectIntoSearchScroller(view.scrollDOM,rect,()=>readEditorMatchRect(view,from,to),"ensure-visible");
 }
 export interface PortableEditorSession { state: unknown; top: number; wrapped: boolean; typewriter?: boolean }
 const incomingSessions = new Map<string, PortableEditorSession>();

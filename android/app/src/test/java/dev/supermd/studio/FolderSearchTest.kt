@@ -14,16 +14,22 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isPopup
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performKeyInput
+import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.unit.dp
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -592,6 +598,98 @@ class FolderSearchTest {
 
         composeRule.onNodeWithContentDescription("More actions").performClick()
         assertEquals(0, composeRule.onAllNodes(hasText("Search across notes") and hasAnyAncestor(isPopup())).fetchSemanticsNodes().size)
+    }
+
+    @OptIn(ExperimentalTestApi::class)
+    @Test
+    fun folderSearchModalScrollsResultsIntoViewportOnKeyboardStepping() {
+        var selectedMatch: FolderSearchMatch? = null
+        val manyMatches = (0 until 18).map { idx ->
+            val snippet = "Result line %02d with needle context".format(idx)
+            val start = snippet.indexOf("needle")
+            val sourceStart = idx * 100 + start
+            FolderSearchMatch(
+                key = "m-$idx",
+                tabId = null,
+                uri = "file:///notes/doc_$idx.md",
+                name = "doc_$idx.md",
+                relative = "chapter/doc_$idx.md",
+                line = idx + 1,
+                column = start + 1,
+                snippet = snippet,
+                matchStart = start,
+                matchEnd = start + 6,
+                sourceStart = sourceStart,
+                sourceEnd = sourceStart + 6,
+                matchText = "needle",
+                dirty = false,
+                isOpen = false,
+            )
+        }
+        val searchState = FolderSearchState(
+            visible = true,
+            query = "needle",
+            matches = manyMatches,
+            scannedFiles = 18,
+        )
+
+        composeRule.setContent {
+            MaterialTheme {
+                Surface(Modifier.width(420.dp).height(620.dp)) {
+                    FolderSearchModal(
+                        state = searchState,
+                        hasFolder = true,
+                        onUpdate = { _, _, _ -> },
+                        onSelect = { selectedMatch = it },
+                        onDismiss = {},
+                    )
+                }
+            }
+        }
+        composeRule.waitForIdle()
+
+        val inputNode = composeRule.onNodeWithText("needle")
+        composeRule.onNodeWithTag("folderSearchMatch:0").assertIsDisplayed().assertIsSelected()
+
+        // Step down 12 times past the initially visible viewport rows.
+        repeat(12) {
+            inputNode.performKeyInput { pressKey(Key.DirectionDown) }
+            composeRule.waitForIdle()
+        }
+
+        val listBounds = composeRule.onNodeWithTag("folderSearchResults").fetchSemanticsNode().boundsInRoot
+        val steppedNode = composeRule.onNodeWithTag("folderSearchMatch:12")
+        steppedNode.assertIsDisplayed().assertIsSelected()
+        val steppedBounds = steppedNode.fetchSemanticsNode().boundsInRoot
+        assertTrue(
+            "Stepped item top (${steppedBounds.top}) must be within LazyColumn top (${listBounds.top})",
+            steppedBounds.top >= listBounds.top - 1f,
+        )
+        assertTrue(
+            "Stepped item bottom (${steppedBounds.bottom}) must be within LazyColumn bottom (${listBounds.bottom})",
+            steppedBounds.bottom <= listBounds.bottom + 1f,
+        )
+
+        // Step back up to index 0 and verify it scrolls back into full view, then step to 12 and press Enter.
+        repeat(12) {
+            inputNode.performKeyInput { pressKey(Key.DirectionUp) }
+            composeRule.waitForIdle()
+        }
+        val topNode = composeRule.onNodeWithTag("folderSearchMatch:0")
+        topNode.assertIsDisplayed().assertIsSelected()
+        val topBounds = topNode.fetchSemanticsNode().boundsInRoot
+        assertTrue(topBounds.top >= listBounds.top - 1f && topBounds.bottom <= listBounds.bottom + 1f)
+
+        repeat(12) {
+            inputNode.performKeyInput { pressKey(Key.DirectionDown) }
+            composeRule.waitForIdle()
+        }
+        inputNode.performKeyInput { pressKey(Key.Enter) }
+        composeRule.waitForIdle()
+        assertEquals("m-12", selectedMatch?.key)
+        assertEquals(12 * 100 + manyMatches[12].matchStart, selectedMatch?.sourceStart)
+        assertEquals(12 * 100 + manyMatches[12].matchEnd, selectedMatch?.sourceEnd)
+        assertEquals("needle", selectedMatch?.matchText)
     }
 
     @Test

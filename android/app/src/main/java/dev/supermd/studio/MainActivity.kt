@@ -24,10 +24,13 @@ import androidx.compose.animation.core.FiniteAnimationSpec
 import androidx.compose.animation.core.snap
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -45,7 +48,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
@@ -1532,6 +1538,46 @@ internal fun buildHighlightedSnippet(
     }
 }
 
+internal suspend fun scrollFolderSearchItemIntoView(listState: LazyListState, targetIndex: Int, itemSpacingPx: Int) {
+    if (targetIndex < 0) return
+    val layoutInfo = listState.layoutInfo
+    val visibleItems = layoutInfo.visibleItemsInfo
+    if (visibleItems.isEmpty()) {
+        listState.scrollToItem(targetIndex)
+        return
+    }
+    val startOffset = layoutInfo.viewportStartOffset
+    val endOffset = layoutInfo.viewportEndOffset
+    val existing = visibleItems.firstOrNull { it.index == targetIndex }
+    if (existing != null) {
+        if (existing.offset < startOffset) {
+            listState.scrollBy((existing.offset - startOffset).toFloat())
+        } else if (existing.offset + existing.size > endOffset) {
+            listState.scrollBy(((existing.offset + existing.size) - endOffset).toFloat())
+        }
+        return
+    }
+    val firstVisible = visibleItems.first()
+    val lastVisible = visibleItems.last()
+    if (targetIndex < firstVisible.index) {
+        listState.scrollToItem(targetIndex)
+        return
+    }
+    if (targetIndex == lastVisible.index + 1 && endOffset > startOffset) {
+        val clipDelta = (lastVisible.offset + lastVisible.size - endOffset).coerceAtLeast(0)
+        listState.scrollBy((clipDelta + lastVisible.size + itemSpacingPx).toFloat())
+        val after = listState.layoutInfo.visibleItemsInfo.firstOrNull { it.index == targetIndex }
+        if (after != null) {
+            val afterEnd = listState.layoutInfo.viewportEndOffset
+            if (after.offset + after.size > afterEnd) {
+                listState.scrollBy(((after.offset + after.size) - afterEnd).toFloat())
+            }
+            return
+        }
+    }
+    listState.scrollToItem(targetIndex)
+}
+
 @Composable internal fun FolderSearchModal(
     state: FolderSearchState,
     hasFolder: Boolean,
@@ -1540,9 +1586,27 @@ internal fun buildHighlightedSnippet(
     onDismiss: () -> Unit,
 ) {
     val focusRequester = remember { FocusRequester() }
-    var selectedIndex by remember(state.matches) { mutableIntStateOf(0) }
+    val listState = rememberLazyListState()
+    val density = LocalDensity.current
+    val itemSpacingPx = with(density) { 6.dp.roundToPx() }
+    var selectedIndex by remember(state.query, state.caseSensitive, state.includeDiagrams) { mutableIntStateOf(0) }
+    var stepNonce by remember { mutableIntStateOf(0) }
+    val activeSelectedIndex = if (state.matches.isEmpty()) 0 else selectedIndex.coerceIn(0, state.matches.lastIndex)
+    if (state.matches.isNotEmpty() && selectedIndex != activeSelectedIndex) {
+        selectedIndex = activeSelectedIndex
+    }
     val highlightColor = MaterialTheme.colorScheme.primary
     LaunchedEffect(Unit) { runCatching { focusRequester.requestFocus() } }
+    LaunchedEffect(state.query, state.caseSensitive, state.includeDiagrams) {
+        if (listState.firstVisibleItemIndex != 0 || listState.firstVisibleItemScrollOffset != 0) {
+            listState.scrollToItem(0)
+        }
+    }
+    LaunchedEffect(stepNonce) {
+        if (stepNonce > 0 && state.matches.isNotEmpty()) {
+            scrollFolderSearchItemIntoView(listState, activeSelectedIndex, itemSpacingPx)
+        }
+    }
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -1560,15 +1624,21 @@ internal fun buildHighlightedSnippet(
                     when (event.key) {
                         Key.Escape -> { onDismiss(); true }
                         Key.DirectionDown -> {
-                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex + 1).coerceAtMost(state.matches.lastIndex)
+                            if (state.matches.isNotEmpty()) {
+                                selectedIndex = (activeSelectedIndex + 1).coerceAtMost(state.matches.lastIndex)
+                                stepNonce++
+                            }
                             true
                         }
                         Key.DirectionUp -> {
-                            if (state.matches.isNotEmpty()) selectedIndex = (selectedIndex - 1).coerceAtLeast(0)
+                            if (state.matches.isNotEmpty()) {
+                                selectedIndex = (activeSelectedIndex - 1).coerceAtLeast(0)
+                                stepNonce++
+                            }
                             true
                         }
                         Key.Enter, Key.NumPadEnter -> {
-                            state.matches.getOrNull(selectedIndex)?.let(onSelect)
+                            state.matches.getOrNull(activeSelectedIndex)?.let(onSelect)
                             true
                         }
                         else -> false
@@ -1644,17 +1714,25 @@ internal fun buildHighlightedSnippet(
                         modifier = Modifier.padding(vertical = 16.dp),
                     )
                 } else {
-                    LazyColumn(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.weight(1f, fill = false).testTag("folderSearchResults"),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
                         items(state.matches.size, key = { state.matches[it].key }) { index ->
                             val match = state.matches[index]
-                            val selected = index == selectedIndex
+                            val isSelected = index == activeSelectedIndex
                             val annotatedSnippet = remember(match.snippet, match.matchStart, match.matchEnd, highlightColor) {
                                 buildHighlightedSnippet(match.snippet, match.matchStart, match.matchEnd, highlightColor)
                             }
                             Surface(
                                 shape = RoundedCornerShape(16.dp),
-                                color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
-                                modifier = Modifier.fillMaxWidth().clickable { onSelect(match) },
+                                color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerLow,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("folderSearchMatch:$index")
+                                    .semantics { selected = isSelected }
+                                    .clickable { onSelect(match) },
                             ) {
                                 Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
