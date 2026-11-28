@@ -10,6 +10,12 @@ import { normalizeCallouts } from "./components/MarkdownPreview";
 import { parseFrontmatter } from "./frontmatter";
 import { invoke } from "./nativeBridge";
 import {
+  isMermaidSourcePath,
+  loadLocalMermaidSource,
+  normalizeLocalMermaidSource,
+  validateLocalMermaidSourcePath,
+} from "./markdownExport";
+import {
   isRemoteImageApproved,
   loadedReaderImageData,
   normalizeApprovedImageUrls,
@@ -309,6 +315,7 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
   const referenceDefinitions=new Map<string,any>();
   visit(tree,"definition",(node:any)=>{if(!referenceDefinitions.has(node.identifier))referenceDefinitions.set(node.identifier,node);});
   const chartTitles = new Map<any,string>();
+  const mermaidSources = new Map<string,Promise<string>>();
   const pythonCells=analyzeDocument(markdown).pythonCells;
   const pythonOrdinals=new Map<string,number>();
   const add = (url: string, name: string) => { assets[name] = url.slice(url.indexOf(",") + 1); return name; };
@@ -365,54 +372,101 @@ export async function preparePdf(markdown: string, documentPath: string | null, 
     }
     if (node.type === "image") {
       const fromHtmlImg = Boolean(node.data?.htmlImage);
-      let preloadedHtmlData: string | null = null;
-      if (fromHtmlImg) {
-        const rawUrl = String(node.url || "").trim();
-        if (/^data:/i.test(rawUrl)) {
-          if (!/^data:image\//i.test(rawUrl)) throw new Error("Unsupported PDF image type.");
-        } else if (/^https?:\/\//i.test(rawUrl)) {
-          preloadedHtmlData = loadedReaderImageData(rawUrl, {
-            noteId,
-            loadedImageData,
-            trustedHosts,
-            approvedUrls,
-            enforcePolicy: hasConsentPolicy,
-          });
-          if (!preloadedHtmlData && !isRemoteImageApproved(rawUrl, trustedHosts, approvedUrls)) {
-            const host = remoteImageHost(rawUrl);
-            throw new Error(`Remote image from ${host || rawUrl} requires explicit consent in the reader before exporting PDF.`);
+      const sourceUrl = String(node.url || "");
+      if (isMermaidSourcePath(sourceUrl)) {
+        if (/^https?:/i.test(sourceUrl) || sourceUrl.startsWith("//")) {
+          if (!isRemoteImageApproved(sourceUrl, trustedHosts, approvedUrls)) {
+            const host = remoteImageHost(sourceUrl);
+            throw new Error(
+              host
+                ? `Remote image from ${host} requires explicit consent in the reader before exporting PDF.`
+                : `Remote image ${sourceUrl} requires explicit consent in the reader before exporting PDF.`,
+            );
           }
-        } else if (rawUrl.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(rawUrl)) {
-          throw new Error(`Remote image ${rawUrl} requires explicit consent in the reader before exporting PDF.`);
+          throw new Error(`Mermaid source must be a local .mmd or .mermaid file: ${sourceUrl}`);
         }
+        const relative = validateLocalMermaidSourcePath(sourceUrl);
+        if (!documentPath) {
+          throw new Error(`Save your note before exporting relative Mermaid diagram ${sourceUrl}.`);
+        }
+        const normalizedSource = normalizeLocalMermaidSource(relative);
+        work.push(async () => {
+          checkCurrent();
+          let pending = mermaidSources.get(normalizedSource);
+          if (!pending) {
+            pending = loadLocalMermaidSource(documentPath, sourceUrl);
+            pending.catch(() => {});
+            mermaidSources.set(normalizedSource, pending);
+          }
+          const mermaidText = await pending;
+          checkCurrent();
+          if (!mermaidText.trim()) {
+            throw new Error(`Mermaid source is empty: ${sourceUrl}`);
+          }
+          let svg: string;
+          try {
+            svg = await renderMermaid(mermaidText, false, signal);
+          } catch (error) {
+            if (signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw error;
+            const detail = error instanceof Error ? error.message : String(error);
+            throw new Error(`Invalid Mermaid diagram in ${sourceUrl}: ${detail}`);
+          }
+          checkCurrent();
+          const url = await data(new Blob([svg], { type: "image/svg+xml" }));
+          checkCurrent();
+          if (!node.alt) node.alt = "Diagram";
+          node.url = add(url, `diagram-${++count}.svg`);
+        });
+      } else {
+        let preloadedHtmlData: string | null = null;
+        if (fromHtmlImg) {
+          const rawUrl = sourceUrl.trim();
+          if (/^data:/i.test(rawUrl)) {
+            if (!/^data:image\//i.test(rawUrl)) throw new Error("Unsupported PDF image type.");
+          } else if (/^https?:\/\//i.test(rawUrl)) {
+            preloadedHtmlData = loadedReaderImageData(rawUrl, {
+              noteId,
+              loadedImageData,
+              trustedHosts,
+              approvedUrls,
+              enforcePolicy: hasConsentPolicy,
+            });
+            if (!preloadedHtmlData && !isRemoteImageApproved(rawUrl, trustedHosts, approvedUrls)) {
+              const host = remoteImageHost(rawUrl);
+              throw new Error(`Remote image from ${host || rawUrl} requires explicit consent in the reader before exporting PDF.`);
+            }
+          } else if (rawUrl.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(rawUrl)) {
+            throw new Error(`Remote image ${rawUrl} requires explicit consent in the reader before exporting PDF.`);
+          }
+        }
+        work.push(async () => {
+          checkCurrent();
+          let url: string = preloadedHtmlData ?? node.url;
+          if (!/^data:/i.test(url)) {
+            if (fromHtmlImg ? /^https?:\/\//i.test(url) : /^https?:/i.test(url)) {
+              if (fromHtmlImg && !isRemoteImageApproved(url, trustedHosts, approvedUrls)) {
+                const host = remoteImageHost(url);
+                throw new Error(`Remote image from ${host || url} requires explicit consent in the reader before exporting PDF.`);
+              }
+              const fetched = await invoke<{ body: string }>("fetch_resource", { url, image: true });
+              checkCurrent();
+              url = fetched.body;
+            } else {
+              if (fromHtmlImg && (url.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(url))) {
+                throw new Error(`Remote image ${url} requires explicit consent in the reader before exporting PDF.`);
+              }
+              if (!documentPath && !/^assets\/import-[\w-]+\./.test(url)) throw new Error(`Save your note before exporting relative image ${url}.`);
+              url = await invoke<string>("load_asset", { documentPath: documentPath || "", source: url });
+              checkCurrent();
+            }
+          }
+          checkCurrent();
+          if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) { url = await rasterImage(url); checkCurrent(); }
+          const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
+          checkCurrent();
+          node.url = add(url, `asset-${++count}.${extension}`);
+        });
       }
-      work.push(async () => {
-        checkCurrent();
-        let url: string = preloadedHtmlData ?? node.url;
-        if (!/^data:/i.test(url)) {
-          if (fromHtmlImg ? /^https?:\/\//i.test(url) : /^https?:/i.test(url)) {
-            if (fromHtmlImg && !isRemoteImageApproved(url, trustedHosts, approvedUrls)) {
-              const host = remoteImageHost(url);
-              throw new Error(`Remote image from ${host || url} requires explicit consent in the reader before exporting PDF.`);
-            }
-            const fetched = await invoke<{ body: string }>("fetch_resource", { url, image: true });
-            checkCurrent();
-            url = fetched.body;
-          } else {
-            if (fromHtmlImg && (url.startsWith("//") || /^[a-z][a-z\d+.-]*:/i.test(url))) {
-              throw new Error(`Remote image ${url} requires explicit consent in the reader before exporting PDF.`);
-            }
-            if (!documentPath && !/^assets\/import-[\w-]+\./.test(url)) throw new Error(`Save your note before exporting relative image ${url}.`);
-            url = await invoke<string>("load_asset", { documentPath: documentPath || "", source: url });
-            checkCurrent();
-          }
-        }
-        checkCurrent();
-        if (!/^data:image\/(?:svg\+xml|png|jpeg);base64,/i.test(url)) { url = await rasterImage(url); checkCurrent(); }
-        const extension = url.startsWith("data:image/svg") ? "svg" : url.startsWith("data:image/jpeg") ? "jpg" : "png";
-        checkCurrent();
-        node.url = add(url, `asset-${++count}.${extension}`);
-      });
     }
     if (exportCell) work.push(async () => {
       checkCurrent();

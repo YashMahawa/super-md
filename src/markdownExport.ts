@@ -64,11 +64,11 @@ function refs(markdown: string): ImageRef[] {
           definition: { start: definition.position.start.offset, end: definition.position.end.offset } });
       }
     }
-    if (node.type === "link" && /\.(?:svg|mmd|mermaid)(?:[?#]|$)/i.test(node.url))
+    if (node.type === "link" && isCompanionLinkPath(node.url))
       result.push({ source: node.url, start: node.position.start.offset, end: node.position.end.offset, image: false });
     if (node.type === "linkReference") {
       const definition = definitions.get(node.identifier);
-      if (definition?.position && /\.(?:svg|mmd|mermaid)(?:[?#]|$)/i.test(definition.url))
+      if (definition?.position && isCompanionLinkPath(definition.url))
         result.push({ source: definition.url, start: node.position.start.offset, end: node.position.end.offset, image: false,
           definition: { start: definition.position.start.offset, end: definition.position.end.offset } });
     }
@@ -99,15 +99,110 @@ function decodeDataUrl(value: string): { mime: string; dataUrl: string; text?: s
   return { mime, dataUrl, text };
 }
 
-function cleanRelativePath(source: string): string | null {
-  if (!source || source.startsWith("/") || source.startsWith("\\") || /^[a-z][a-z\d+.-]*:/i.test(source) || source.startsWith("//")) return null;
+export const MERMAID_SOURCE_LIMIT = 2_000_000;
+const MERMAID_FILENAME_RE = /^(?!\.+$)[^/]+\.(?:mmd|mermaid)$/i;
+const COMPANION_FILENAME_RE = /^(?!\.+$)[^/]+\.(?:svg|mmd|mermaid)$/i;
+
+function decodeSafePath(source: string, allowAuthorityPath = false): string | null {
+  if (!source || /^data:/i.test(source)) return null;
+  const withoutSuffix = source.split(/[?#]/, 1)[0];
+  if (!withoutSuffix || /%2f|%5c/i.test(withoutSuffix)) return null;
+  let rawPath = withoutSuffix;
+  const authorityMatch = /^(?:[a-z][a-z\d+.-]*:)?\/\/(.*)$/i.exec(withoutSuffix);
+  if (authorityMatch) {
+    if (!allowAuthorityPath) return null;
+    const slash = authorityMatch[1].indexOf("/");
+    if (slash < 0) return null;
+    rawPath = authorityMatch[1].slice(slash);
+  }
   let decoded: string;
-  try { decoded = decodeURIComponent(source.split(/[?#]/, 1)[0]); } catch { return null; }
-  if (decoded.includes("\\") || decoded.includes("\0")) return null;
+  try {
+    decoded = decodeURIComponent(rawPath);
+  } catch {
+    return null;
+  }
+  if (!decoded || decoded.includes("\\") || decoded.includes("\0")) return null;
+  return decoded;
+}
+
+function decodedPathFilename(source: string): string | null {
+  const decoded = decodeSafePath(source, true);
+  if (!decoded) return null;
+  const parts = decoded.split("/").filter(part => part && part !== ".");
+  if (!parts.length) return null;
+  const filename = parts[parts.length - 1];
+  if (!filename || filename === ".." || /[<>:"|?*\x00-\x1f]/.test(filename) || /[. ]$/.test(filename)) {
+    return null;
+  }
+  return filename;
+}
+
+function hasDecodedMermaidExtension(decodedPath: string): boolean {
+  const slash = decodedPath.lastIndexOf("/");
+  const filename = slash >= 0 ? decodedPath.slice(slash + 1) : decodedPath;
+  return MERMAID_FILENAME_RE.test(filename);
+}
+
+function isCompanionLinkPath(source: string): boolean {
+  const filename = decodedPathFilename(source);
+  return filename !== null && COMPANION_FILENAME_RE.test(filename);
+}
+
+export function isMermaidSourcePath(source: string): boolean {
+  const filename = decodedPathFilename(source);
+  return filename !== null && MERMAID_FILENAME_RE.test(filename);
+}
+
+export function cleanRelativePath(source: string): string | null {
+  if (!source || source.startsWith("/") || source.startsWith("\\") || /^[a-z][a-z\d+.-]*:/i.test(source) || source.startsWith("//")) return null;
+  const decoded = decodeSafePath(source, false);
+  if (!decoded || decoded.startsWith("/")) return null;
   const parts = decoded.split("/").filter(part => part && part !== ".");
   if (!parts.length || parts.some(part => part === ".." || /[<>:"|?*\x00-\x1f]/.test(part)
       || /[. ]$/.test(part) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) return null;
   return parts.join("/");
+}
+
+export function validateLocalMermaidSourcePath(source: string): string {
+  if (/^(?:data|https?):|^\/\//i.test(source)) {
+    throw Error(`Mermaid source must be a local .mmd or .mermaid file: ${source}`);
+  }
+  const relative = cleanRelativePath(source);
+  if (!relative || !hasDecodedMermaidExtension(relative)) {
+    throw Error(`Cannot safely resolve Mermaid source ${source}`);
+  }
+  return relative;
+}
+
+export function normalizeLocalMermaidSource(relativePath: string): string {
+  return relativePath
+    .split("/")
+    .map(segment => encodeURIComponent(segment))
+    .join("/");
+}
+
+export async function loadLocalMermaidSource(documentPath: string | null, source: string): Promise<string> {
+  const relative = validateLocalMermaidSourcePath(source);
+  const normalizedSource = normalizeLocalMermaidSource(relative);
+  let loaded: string | { text: string };
+  try {
+    loaded = await invoke<string | { text: string }>("load_text_asset", {
+      documentPath: documentPath || "",
+      source: normalizedSource,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw Error(
+      detail.includes(source) || detail.includes(relative) || detail.includes(normalizedSource)
+        ? detail
+        : `Cannot load Mermaid source ${source}: ${detail}`,
+    );
+  }
+  const text = typeof loaded === "string" ? loaded : loaded?.text;
+  if (typeof text !== "string" || text.length > MERMAID_SOURCE_LIMIT) {
+    throw Error(`Mermaid source is unavailable or too large: ${source}`);
+  }
+  return text;
 }
 
 function sourceFence(source: string, language: "mermaid"): string {
@@ -155,21 +250,25 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
     const references = refs(markdown);
     report({ phase: "prepare", completed: 1, total: 1 });
     const seenSources = new Set<string>();
+    const mermaidLoads = new Map<string, Promise<string>>();
     const tasks: Array<() => Promise<void>> = [];
     for (const ref of references) {
       checkCurrent();
       if (/^https?:|^\/\//i.test(ref.source) || seenSources.has(ref.source)) continue;
       seenSources.add(ref.source);
-      if (/\.(?:mmd|mermaid)(?:[?#]|$)/i.test(ref.source)) {
-        if (ref.source.startsWith("data:")) throw Error("Mermaid source must be a local .mmd or .mermaid file");
-        const relative = cleanRelativePath(ref.source);
-        if (!relative) throw Error(`Cannot safely resolve Mermaid source ${ref.source}`);
+      if (isMermaidSourcePath(ref.source)) {
+        const relative = validateLocalMermaidSourcePath(ref.source);
+        const normalizedSource = normalizeLocalMermaidSource(relative);
         const source = ref.source;
         tasks.push(async () => {
-          const loaded = await invoke<string | { text: string }>("load_text_asset", { documentPath: documentPath || "", source });
+          let pending = mermaidLoads.get(normalizedSource);
+          if (!pending) {
+            pending = loadLocalMermaidSource(documentPath, source);
+            pending.catch(() => {});
+            mermaidLoads.set(normalizedSource, pending);
+          }
+          const text = await pending;
           checkCurrent();
-          const text = typeof loaded === "string" ? loaded : loaded?.text;
-          if (typeof text !== "string" || text.length > 2_000_000) throw Error(`Mermaid source is unavailable or too large: ${source}`);
           resolvedBySource.set(source, { kind: "mermaid", mermaid: text });
         });
         continue;
@@ -229,7 +328,7 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
     const keptDefinitions = new Set<number>();
     const reservedPaths = new Set(references.flatMap(({ source }) => {
       const path = cleanRelativePath(source);
-      return path && !APP_GENERATED.test(path) && !/\.(?:mmd|mermaid)$/i.test(path) ? [path] : [];
+      return path && !APP_GENERATED.test(path) && !hasDecodedMermaidExtension(path) ? [path] : [];
     }));
     const generatedPaths = new Map<string, string>();
     const usedPaths = new Set(reservedPaths);

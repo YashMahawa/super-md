@@ -143,6 +143,61 @@ describe("plain Markdown export assets", () => {
     expect(result.assets).toEqual({});
     expect(native).toHaveBeenCalledTimes(1);
   });
+
+  it("resolves local Mermaid filenames containing literal '#' and '%' characters once without double-decoding", async () => {
+    native.mockImplementation(async (command: string, args: { documentPath?: string; source?: string }) => {
+      if (command === "load_text_asset" && args.source === "diagrams/Flow%231.mmd") {
+        return "flowchart LR\n  Hash[\"Flow#1\"] --> Ready\n";
+      }
+      if (command === "load_text_asset" && args.source === "diagrams/Flow%25Complete.mmd") {
+        return { text: "flowchart TD\n  Percent[\"100% Complete\"] --> Done\n" };
+      }
+      throw new Error(`Unexpected native call: ${command} ${JSON.stringify(args)}`);
+    });
+
+    const markdown = [
+      "![Hash Image](diagrams/Flow%231.mmd)",
+      "[Hash Source](diagrams/Flow%231%2Emmd?view=raw#top)",
+      "![Percent Image][pct]",
+      "[Percent Link](diagrams/Flow%25Complete.mmd)",
+      "",
+      "[pct]: diagrams/Flow%25Complete.mmd",
+      "",
+    ].join("\n\n");
+
+    const plain = await prepareMarkdownExport(markdown, "/notes/source.md");
+    expect(plain.assets).toEqual({});
+    expect(native.mock.calls.map(([cmd, a]) => [cmd, a.source])).toEqual([
+      ["load_text_asset", "diagrams/Flow%231.mmd"],
+      ["load_text_asset", "diagrams/Flow%25Complete.mmd"],
+    ]);
+    expect(plain.content.match(/```mermaid\nflowchart LR\n  Hash\["Flow#1"\] --> Ready\n```/g)).toHaveLength(2);
+    expect(plain.content.match(/```mermaid\nflowchart TD\n  Percent\["100% Complete"\] --> Done\n```/g)).toHaveLength(2);
+    expect(plain.content).not.toContain("[pct]:");
+
+    native.mockClear();
+    const compatible = await prepareMarkdownExport(
+      [
+        "```smd-steps",
+        JSON.stringify({
+          title: "Literal Filename Steps",
+          steps: [
+            { label: "Step #1", image: "diagrams/Flow%231.mmd" },
+            { label: "Step 100%", image: "diagrams/Flow%25Complete.mmd" },
+          ],
+        }),
+        "```",
+      ].join("\n"),
+      "/notes/source.smd",
+      { compatible: true },
+    );
+    expect(native.mock.calls.map(([cmd, a]) => [cmd, a.source])).toEqual([
+      ["load_text_asset", "diagrams/Flow%231.mmd"],
+      ["load_text_asset", "diagrams/Flow%25Complete.mmd"],
+    ]);
+    expect(compatible.content).toContain('```mermaid\nflowchart LR\n  Hash["Flow#1"] --> Ready\n```');
+    expect(compatible.content).toContain('```mermaid\nflowchart TD\n  Percent["100% Complete"] --> Done\n```');
+  });
 });
 
 describe('compatible Markdown ZIP preparation',()=>{
