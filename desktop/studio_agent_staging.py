@@ -18,8 +18,8 @@ MAX_AGENT_EDIT_BYTES = 2_000_000
 MAX_PATCH_OPERATIONS = 100
 MAX_PATCH_PAYLOAD_BYTES = 64_000
 
-RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot for the agent patch; retry the patch"
-RECOVERY_ERROR_SUPERSEDED = "Could not confirm draft recovery snapshot for the agent patch because the recovery write was superseded; retry the patch"
+RECOVERY_ERROR_FAILED = "Could not save draft recovery snapshot; the edit was not applied. Retry patch_tab."
+RECOVERY_ERROR_SUPERSEDED = "Draft recovery write was superseded before staging completed; retry patch_tab."
 RECOVERY_NOTICE = "Couldn't save draft recovery data. Keep Super MD open and retry."
 WINDOW_CLOSED_ERROR = "The target desktop window was closed"
 TAB_CLOSED_ERROR = "The requested live tab is no longer open"
@@ -235,7 +235,7 @@ def dismiss_agent_jump(studio_obj) -> None:
         if callable(emit_fn := getattr(studio_obj, "_emit", None)):
             emit_fn(False)
 
-def validate_and_compute_patch_tab(studio_obj, args, *, bridge_revision_json: bool = False, apply_patch_fn=apply_patch_operations_detailed):
+def validate_and_compute_patch_tab(studio_obj, args: dict, *, bridge_revision_json: bool = False, apply_patch_fn=apply_patch_operations_detailed):
     tab_id = args.get("tabId")
     if (tab := _find_open_tab(studio_obj, tab_id)) is None:
         raise ValueError(TAB_CLOSED_ERROR)

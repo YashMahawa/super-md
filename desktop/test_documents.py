@@ -321,7 +321,6 @@ class DocumentsTest(unittest.TestCase):
             self.assertEqual(bad_smd.read_bytes(), bad_gzip_bytes)
 
     def test_repeat_portable_saves_skip_repeat_base64_decoding_and_preserve_caps(self):
-        import documents
         from unittest.mock import patch
 
         png = (
