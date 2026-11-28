@@ -418,17 +418,39 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     private val windowPrefs = app.getSharedPreferences("studio-window-$workspaceKey", 0)
-    private val themesDir = File(app.filesDir, "themes")
-    internal var themeValidator: (String) -> String = { PdfEngine.validateTheme(it) }
-    internal var bundledThemeReader: ((BundledThemePreset) -> String)? = null
-    internal var isObservingCustomTheme: Boolean = false
-        private set
     val media = MediaStorage(app)
     val fonts = FontLibrary(app)
     val updates = AppUpdates(app)
     private fun loadRecent()=runCatching { val list=JSONArray(prefs.getString("recent","[]"));orderedRecents((0 until minOf(list.length(),100)).map {i->val n=list.getJSONObject(i);RecentNote(n.getString("name"),n.getString("uri"),n.optString("relative").takeIf {it.isNotBlank()},n.optBoolean("pinned"))}) }.getOrDefault(emptyList())
     private val recentMutable = MutableStateFlow(loadRecent())
     val recent = recentMutable.asStateFlow()
+    private val themeLibrary = ThemeLibraryController(
+        app = app,
+        prefs = prefs,
+        scope = viewModelScope,
+        readState = { mutable.value },
+        updateState = { mutable.value = it },
+        readRecent = { recentMutable.value },
+        applyReadingPreferences = ::readingPreferences,
+        sameDocumentUri = ::sameDocumentUri,
+        onFail = ::fail,
+    )
+    internal var themeValidator: (String) -> String
+        get() = themeLibrary.themeValidator
+        set(value) { themeLibrary.themeValidator = value }
+    internal var bundledThemeReader: ((BundledThemePreset) -> String)?
+        get() = themeLibrary.bundledThemeReader
+        set(value) { themeLibrary.bundledThemeReader = value }
+    internal val isObservingCustomTheme: Boolean get() = themeLibrary.isObservingCustomTheme
+    fun reloadCustomTheme() = themeLibrary.reloadCustomTheme()
+    fun resetCustomTheme() = themeLibrary.resetCustomTheme()
+    suspend fun applyBundledTheme(presetId: String): JSONObject = themeLibrary.applyBundledTheme(presetId)
+    fun selectBundledTheme(presetId: String) = themeLibrary.selectBundledTheme(presetId)
+    fun selectSavedTheme(entryId: String) = themeLibrary.selectSavedTheme(entryId)
+    fun deleteSavedTheme(entryId: String) = themeLibrary.deleteSavedTheme(entryId)
+    fun importCustomTheme(uri: Uri, remember: Boolean = true) = themeLibrary.importCustomTheme(uri, remember)
+    fun exportCustomTheme(uri: Uri) = themeLibrary.exportCustomTheme(uri)
+    fun shareCustomTheme(ready: (Intent) -> Unit) = themeLibrary.shareCustomTheme(ready)
     data class PortableWriteRequest(
         val save: Boolean,
         val noteId: String,
@@ -665,10 +687,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         if(key=="latexAutofix")mutable.value=mutable.value.copy(latexAutofix=prefs.getBoolean("latexAutofix",false))
         if(key=="typewriterScroll")mutable.value=mutable.value.copy(typewriterScroll=prefs.getBoolean("typewriterScroll",false))
         if(key=="selectionAssistant")mutable.value=mutable.value.copy(selectionAssistant=SelectionActions.provider(prefs.getString("selectionAssistant",null)))
-        if(key in setOf("customTheme","customThemeSource","savedThemes","activeThemeKind","activeThemeId")){
-            mutable.value=themePreferences(mutable.value)
-            if(key in setOf("customThemeSource","activeThemeKind"))observeCustomTheme()
-        }
+        themeLibrary.handlePreferenceChanged(key)
         if (key == "recent") {recentMutable.value=loadRecent();observeActive()}
         if(key in setOf("restorePosition","fullDocumentAccessibility","centerLock","startup","imageAppearance","svgAppearance","imageContrast","patternKind","patternOpacity","patternSize","patternSpacing"))mutable.value=readingPreferences(mutable.value)
         if (key in setOf("accent", "theme", "fullTheme", "motion", "font", "size", "pdf", "welcomed", "widthPercent", "lineHeight", "autosave", "fonts", "spellCheck", "grammarCheck")) {
@@ -677,284 +696,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         }
     }
     private var observedUris=emptySet<String>()
-    private var themeJob:Job?=null
-    private var themeReloadPending=false
-    private val themeObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
-        override fun onChange(selfChange:Boolean){reloadCustomTheme()}
-    }
-    private fun android.content.SharedPreferences.Editor.clearBackgroundOverrides(): android.content.SharedPreferences.Editor =
-        remove("patternKind").remove("patternOpacity").remove("patternSize").remove("patternSpacing")
-    private fun migrateLegacyCustomTheme() {
-        if (prefs.getBoolean("themeLibraryMigrated", false)) return
-        val legacyRaw = prefs.getString("customTheme", "") ?: ""
-        val legacySource = prefs.getString("customThemeSource", "") ?: ""
-        if (legacyRaw.isNotBlank() && parseSavedThemes(prefs.getString("savedThemes", null), themesDir).isEmpty()) {
-            val name = themeDocument(legacyRaw)?.optString("name")?.takeIf { it.isNotBlank() } ?: "Imported theme"
-            val id = UUID.randomUUID().toString().replace("-", "")
-            runCatching { writeSavedThemeFile(themesDir, id, legacyRaw) }.onSuccess {
-                val saved = listOf(SavedThemeEntry(id, name, legacySource))
-                prefs.edit()
-                    .putBoolean("themeLibraryMigrated", true)
-                    .putString("savedThemes", encodeSavedThemes(saved))
-                    .putString("activeThemeKind", "saved")
-                    .putString("activeThemeId", id)
-                    .apply()
-                return
-            }
-        }
-        prefs.edit().putBoolean("themeLibraryMigrated", true).apply()
-    }
-    private fun themePreferences(s: StudioState): StudioState {
-        val saved = parseSavedThemes(prefs.getString("savedThemes", null), themesDir)
-        val rawTheme = prefs.getString("customTheme", "") ?: ""
-        val rawKind = prefs.getString("activeThemeKind", null)
-        val rawId = prefs.getString("activeThemeId", "") ?: ""
-        val rawSource = prefs.getString("customThemeSource", "") ?: ""
-        val (kind, id, source) = when {
-            rawTheme.isBlank() -> Triple("builtin", "", "")
-            rawKind == "preset" && rawId.isNotBlank() -> Triple("preset", rawId, "")
-            rawKind == "saved" && saved.any { it.id == rawId } -> {
-                val entry = saved.first { it.id == rawId }
-                Triple("saved", entry.id, entry.sourceUri)
-            }
-            else -> Triple(rawKind ?: "saved", rawId, if (rawKind == "preset") "" else rawSource)
-        }
-        return s.copy(
-            customTheme = rawTheme,
-            activeThemeKind = kind,
-            activeThemeId = id,
-            customThemeSource = source,
-            savedThemes = saved,
-        )
-    }
-    private fun openBundledThemeRaw(preset: BundledThemePreset): String {
-        bundledThemeReader?.let { return it(preset) }
-        return runCatching {
-            getApplication<Application>().assets.open(preset.assetPath).use(::readBoundedThemeStream)
-        }.getOrElse { error ->
-            for (candidate in listOf(
-                File("../public/themes/${preset.filename}"),
-                File("../../public/themes/${preset.filename}"),
-                File("public/themes/${preset.filename}"),
-            )) {
-                if (candidate.isFile) return candidate.inputStream().use(::readBoundedThemeStream)
-            }
-            throw error
-        }
-    }
-    private fun linkedAssetGrantUris(): List<String> = runCatching {
-        val grants = JSONArray(prefs.getString("linkedAssetGrants", "[]"))
-        (0 until minOf(grants.length(), 256)).mapNotNull { grants.optJSONObject(it)?.optString("uri")?.takeIf(String::isNotBlank) }
-    }.getOrDefault(emptyList())
-    private fun isUriStillReferenced(targetUri: String, remainingThemes: List<SavedThemeEntry>): Boolean {
-        if (remainingThemes.any { it.sourceUri.isNotBlank() && sameDocumentUri(it.sourceUri, targetUri) }) return true
-        if (mutable.value.tabs.any { it.uri != null && sameDocumentUri(it.uri, targetUri) }) return true
-        if (mutable.value.closedTabs.any { it.uri != null && sameDocumentUri(it.uri, targetUri) }) return true
-        if (recentMutable.value.any { sameDocumentUri(it.uri, targetUri) }) return true
-        if (mutable.value.folder?.let { sameDocumentUri(it, targetUri) } == true) return true
-        if (linkedAssetGrantUris().any { sameDocumentUri(it, targetUri) }) return true
-        return false
-    }
-    private fun observeCustomTheme(){
-        resolver.unregisterContentObserver(themeObserver)
-        isObservingCustomTheme = false
-        val kind = prefs.getString("activeThemeKind", "builtin")
-        val source = prefs.getString("customThemeSource", null)?.takeIf { it.isNotBlank() }
-        if (kind != "preset" && source != null) {
-            runCatching {
-                resolver.registerContentObserver(Uri.parse(source), true, themeObserver)
-                isObservingCustomTheme = true
-            }
-        }
-    }
-    fun reloadCustomTheme(){
-        if (prefs.getString("activeThemeKind", "builtin") == "preset") return
-        val source = prefs.getString("customThemeSource", null)?.takeIf { it.isNotBlank() } ?: return
-        if(themeJob?.isActive==true){themeReloadPending=true;return}
-        importCustomTheme(Uri.parse(source),false)
-    }
-    fun resetCustomTheme(){
-        themeReloadPending=false
-        themeJob?.cancel()
-        prefs.edit()
-            .remove("customTheme")
-            .remove("customThemeSource")
-            .putString("activeThemeKind", "builtin")
-            .remove("activeThemeId")
-            .clearBackgroundOverrides()
-            .apply()
-        observeCustomTheme()
-        mutable.value = themePreferences(readingPreferences(mutable.value))
-    }
-    suspend fun applyBundledTheme(presetId: String): JSONObject {
-        if (presetId == "builtin") {
-            resetCustomTheme()
-            return JSONObject().put("id", "builtin").put("name", "Built-in appearance")
-        }
-        val preset = bundledThemes(getApplication<Application>().assets).firstOrNull { it.id == presetId }
-            ?: error("Unknown bundled theme")
-        themeReloadPending = false
-        themeJob?.cancel()
-        val canonical = withContext(Dispatchers.IO) {
-            validateThemeRaw(openBundledThemeRaw(preset), themeValidator)
-        }
-        val name = JSONObject(canonical).getString("name")
-        prefs.edit()
-            .putBoolean("themeLibraryMigrated", true)
-            .putString("customTheme", canonical)
-            .remove("customThemeSource")
-            .putString("activeThemeKind", "preset")
-            .putString("activeThemeId", preset.id)
-            .clearBackgroundOverrides()
-            .apply()
-        observeCustomTheme()
-        mutable.value = themePreferences(readingPreferences(mutable.value)).copy(message = "Applied $name")
-        return JSONObject().put("id", preset.id).put("name", name)
-    }
-    fun selectBundledTheme(presetId: String) {
-        themeReloadPending = false
-        themeJob?.cancel()
-        themeJob = viewModelScope.launch {
-            try {
-                applyBundledTheme(presetId)
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                fail("Theme not applied; previous appearance kept. ${error.message}")
-            }
-        }
-    }
-    fun selectSavedTheme(entryId: String) {
-        themeReloadPending = false
-        themeJob?.cancel()
-        themeJob = viewModelScope.launch {
-            try {
-                val entry = parseSavedThemes(prefs.getString("savedThemes", null), themesDir).firstOrNull { it.id == entryId }
-                    ?: error("Saved theme is unavailable")
-                val canonical = withContext(Dispatchers.IO) {
-                    val file = File(themesDir, "${entry.id}.json")
-                    require(file.isFile) { "Saved theme file is missing" }
-                    validateThemeRaw(file.inputStream().use(::readBoundedThemeStream), themeValidator)
-                }
-                val name = JSONObject(canonical).getString("name")
-                prefs.edit()
-                    .putString("customTheme", canonical)
-                    .apply {
-                        if (entry.sourceUri.isNotBlank()) putString("customThemeSource", entry.sourceUri)
-                        else remove("customThemeSource")
-                    }
-                    .putString("activeThemeKind", "saved")
-                    .putString("activeThemeId", entry.id)
-                    .clearBackgroundOverrides()
-                    .apply()
-                observeCustomTheme()
-                mutable.value = themePreferences(readingPreferences(mutable.value)).copy(message = "Applied $name")
-            } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                throw cancelled
-            } catch (error: Exception) {
-                fail("Theme not applied; previous appearance kept. ${error.message}")
-            }
-        }
-    }
-    fun deleteSavedTheme(entryId: String) {
-        val saved = parseSavedThemes(prefs.getString("savedThemes", null), themesDir)
-        val removed = saved.firstOrNull { it.id == entryId } ?: return
-        val remaining = saved.filterNot { it.id == entryId }
-        File(themesDir, "${removed.id}.json").delete()
-        val wasActive = prefs.getString("activeThemeKind", null) == "saved" && prefs.getString("activeThemeId", null) == entryId
-        if (wasActive) {
-            themeReloadPending = false
-            themeJob?.cancel()
-        }
-        prefs.edit()
-            .putString("savedThemes", encodeSavedThemes(remaining))
-            .apply {
-                if (wasActive) {
-                    remove("customTheme")
-                    remove("customThemeSource")
-                    putString("activeThemeKind", "builtin")
-                    remove("activeThemeId")
-                    clearBackgroundOverrides()
-                }
-            }
-            .apply()
-        if (wasActive) observeCustomTheme()
-        if (removed.sourceUri.isNotBlank() && !isUriStillReferenced(removed.sourceUri, remaining)) {
-            runCatching { resolver.releasePersistableUriPermission(Uri.parse(removed.sourceUri), Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-        }
-        mutable.value = themePreferences(readingPreferences(mutable.value)).copy(message = "Removed ${removed.name}")
-    }
-    fun importCustomTheme(uri:Uri,remember:Boolean=true){
-        themeJob?.cancel()
-        themeJob=viewModelScope.launch {
-            if(!remember)delay(250)
-            try {
-                val canonical=withContext(Dispatchers.IO){
-                    val raw = resolver.openInputStream(uri)?.use(::readBoundedThemeStream) ?: error("Cannot read theme")
-                    validateThemeRaw(raw, themeValidator)
-                }
-                val name = JSONObject(canonical).getString("name")
-                if (remember) {
-                    runCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-                    val saved = parseSavedThemes(prefs.getString("savedThemes", null), themesDir)
-                    val existing = saved.firstOrNull { it.sourceUri.isNotBlank() && sameDocumentUri(it.sourceUri, uri.toString()) }
-                    val entryId = existing?.id ?: UUID.randomUUID().toString().replace("-", "")
-                    withContext(Dispatchers.IO) { writeSavedThemeFile(themesDir, entryId, canonical) }
-                    val updatedSaved = if (existing != null) {
-                        saved.map { if (it.id == entryId) SavedThemeEntry(entryId, name, uri.toString()) else it }
-                    } else {
-                        saved + SavedThemeEntry(entryId, name, uri.toString())
-                    }
-                    prefs.edit()
-                        .putBoolean("themeLibraryMigrated", true)
-                        .putString("savedThemes", encodeSavedThemes(updatedSaved))
-                        .putString("activeThemeKind", "saved")
-                        .putString("activeThemeId", entryId)
-                        .putString("customTheme", canonical)
-                        .putString("customThemeSource", uri.toString())
-                        .clearBackgroundOverrides()
-                        .apply()
-                    observeCustomTheme()
-                    mutable.value = themePreferences(readingPreferences(mutable.value)).copy(message = "Applied $name")
-                } else {
-                    val changed = canonical != mutable.value.customTheme
-                    val activeId = prefs.getString("activeThemeId", "") ?: ""
-                    val saved = parseSavedThemes(prefs.getString("savedThemes", null), themesDir)
-                    val updatedSaved = if (activeId.isNotBlank() && saved.any { it.id == activeId }) {
-                        withContext(Dispatchers.IO) { writeSavedThemeFile(themesDir, activeId, canonical) }
-                        saved.map { if (it.id == activeId) it.copy(name = name) else it }
-                    } else saved
-                    prefs.edit()
-                        .putString("customTheme", canonical)
-                        .apply { if (updatedSaved != saved) putString("savedThemes", encodeSavedThemes(updatedSaved)) }
-                        .clearBackgroundOverrides()
-                        .apply()
-                    val next = themePreferences(readingPreferences(mutable.value))
-                    mutable.value = if (changed) next.copy(message = "Applied $name") else next
-                }
-            }catch(cancelled:kotlinx.coroutines.CancellationException){throw cancelled}
-            catch(error:Exception){val message="Theme not applied; previous appearance kept. ${error.message}";if(remember)fail(message)else mutable.value=mutable.value.copy(message=message)}
-        }
-        themeJob?.invokeOnCompletion {viewModelScope.launch {if(themeReloadPending){themeReloadPending=false;reloadCustomTheme()}}}
-    }
-    fun exportCustomTheme(uri:Uri)=viewModelScope.launch {
-        val raw=themeForSharing(mutable.value)
-        try{withContext(Dispatchers.IO){resolver.openOutputStream(uri,"wt")?.use {it.write(raw.toByteArray(Charsets.UTF_8))}?:error("Cannot write theme")};mutable.value=mutable.value.copy(message="Theme exported. Edit the JSON and import it to apply.")}
-        catch(error:Exception){fail("Could not export theme: ${error.message}")}
-    }
     private var metadataJob:Job?=null
-    fun shareCustomTheme(ready:(Intent)->Unit)=viewModelScope.launch {
-        try {
-            val raw=themeForSharing(mutable.value)
-            val file=withContext(Dispatchers.IO) {
-                val folder=File(getApplication<Application>().cacheDir,"share/${UUID.randomUUID()}").apply {mkdirs()}
-                File(folder,"Super MD theme.supermd-theme.json").apply {writeText(raw,Charsets.UTF_8)}
-            }
-            val app=getApplication<Application>()
-            val uri=androidx.core.content.FileProvider.getUriForFile(app,"${app.packageName}.share",file)
-            ready(Intent(Intent.ACTION_SEND).setType("application/json").putExtra(Intent.EXTRA_STREAM,uri).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION).apply {clipData=android.content.ClipData.newUri(resolver,file.name,uri)})
-        } catch(error:Exception){fail("Could not share theme: ${error.message}")}
-    }
     private val deletedDrafts=DeletedDraftStore(File(app.filesDir,"deleted-drafts/$workspaceKey"))
     private val documentObserver=object:android.database.ContentObserver(android.os.Handler(android.os.Looper.getMainLooper())) {
         override fun onChange(selfChange:Boolean){readerFolderIndex.clear();refreshMetadata();refreshExternal()}
@@ -1095,7 +837,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         mutable.value.tabs.filter { it.portable && it.uri != null && !it.assetsDirty }.forEach { recordPortableBaseline(it.id, it.assetDirectory) }
         prefs.registerOnSharedPreferenceChangeListener(preferencesChanged)
         observeActive()
-        observeCustomTheme()
+        themeLibrary.observeCustomTheme()
         migrateLegacyClosedNotes()
         val initialFolderJob = mutable.value.folder?.let { listFolder(Uri.parse(it), mutable.value.folderRelative) }
         initialFolderLoadJob = initialFolderJob
@@ -1173,7 +915,7 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         recoveryWriter.closeAfterLatest(mutable.value)
         prefs.unregisterOnSharedPreferenceChangeListener(preferencesChanged)
         resolver.unregisterContentObserver(documentObserver)
-        resolver.unregisterContentObserver(themeObserver)
+        themeLibrary.unregisterObserver()
         super.onCleared()
     }
     val state = mutable.asStateFlow()
@@ -1402,8 +1144,8 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         try {
             if (snapshot.isFile) s=snapshot.bufferedReader().use {NoteRecovery.read(it,s)}
         } catch (_: Exception) { s = s.copy(error = "The recovery snapshot could not be read. Your original files are untouched.") }
-        migrateLegacyCustomTheme()
-        s=themePreferences(readingPreferences(s)).copy(selectionAssistant=SelectionActions.provider(prefs.getString("selectionAssistant",null)),latexAutofix=prefs.getBoolean("latexAutofix",false),typewriterScroll=prefs.getBoolean("typewriterScroll",false))
+        themeLibrary.migrateLegacyCustomTheme()
+        s=themeLibrary.themePreferences(readingPreferences(s)).copy(selectionAssistant=SelectionActions.provider(prefs.getString("selectionAssistant",null)),latexAutofix=prefs.getBoolean("latexAutofix",false),typewriterScroll=prefs.getBoolean("typewriterScroll",false))
         if(s.welcomed) {
             val kept=s.tabs.filter {it.dirty || s.startup=="restore"&&!(it.uri==null&&it.name=="Welcome.md")}
             val tabs=if(s.startup=="new")listOf(Note())+kept else kept.ifEmpty {listOf(Note())}
