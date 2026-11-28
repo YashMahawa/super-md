@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import subprocess
@@ -17,10 +18,11 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
 
-from PySide6.QtCore import QCoreApplication, QMetaObject, QObject, QUrl, Qt, Q_ARG, Q_RETURN_ARG
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtCore import QCoreApplication, QEvent, QMetaObject, QObject, QPointF, QUrl, Qt, Q_ARG, Q_RETURN_ARG
+from PySide6.QtGui import QGuiApplication, QKeyEvent
+from PySide6.QtQml import QQmlApplicationEngine, QQmlComponent, QQmlEngine
 from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtTest import QTest
 
 import documents
 from shortcuts import default_shortcuts, native_label, normalize_shortcuts
@@ -48,7 +50,7 @@ def _wait_until(predicate, timeout: float = 5.0) -> bool:
             app.processEvents()
         if predicate():
             return True
-        time.sleep(0.015)
+        time.sleep(0.005)
     return bool(predicate())
 
 
@@ -63,6 +65,7 @@ def _webengine_e2e_probe() -> int:
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuick import QQuickItem, QQuickWindow  # noqa: F401
     from PySide6.QtQuickControls2 import QQuickStyle
+    from PySide6.QtSvg import QSvgRenderer
     from PySide6.QtTest import QTest
     from PySide6.QtWebEngineCore import QWebEngineProfile
     from PySide6.QtWebEngineQuick import QtWebEngineQuick
@@ -92,7 +95,7 @@ def _webengine_e2e_probe() -> int:
         portable_note = folder / "research" / "deep" / "quantum-field.smd"
         documents.write_portable(
             portable_note,
-            "# Quantum Field\n\n```mermaid\ngraph TD\n  A[AuroraSignal] --> B\n```\n\nReal prose with AuroraSignal inside portable bundle.\nSecond AuroraSignal line.\n",
+            "# Quantum Field\n\n```mermaid\ngraph TD\n  A[AuroraSignal] --> B\n```\n\nİstanbul 📓 prose with AuroraSignal inside portable bundle.\nSecond AuroraSignal line with [reference](https://example.com/HiddenUrlSignal).\n",
             {"assets/pixel.png": TINY_PNG},
         )
 
@@ -127,6 +130,15 @@ def _webengine_e2e_probe() -> int:
 
         search_dialog = window.findChild(QObject, "folderSearchDialog")
         assert search_dialog is not None
+
+        note_find = window.findChild(QObject, "findInNoteButton")
+        folder_search = window.findChild(QObject, "sidebarFolderSearchButton")
+        assert note_find is not None and folder_search is not None
+        assert note_find.property("glyph") == "MagnifyingGlass"
+        assert folder_search.property("glyph") == "FolderSearch"
+        for button in (note_find, folder_search):
+            glyph = button.property("glyph")
+            assert QSvgRenderer(str(root / "icons" / f"{glyph}.svg")).isValid()
 
         def send_window_shortcut(action_id: str) -> None:
             assert _wait_until(lambda: int(window.property("modalDialogCount") or 0) == 0), (
@@ -220,7 +232,43 @@ def _webengine_e2e_probe() -> int:
             ).get("value")
             == {"open": True, "query": "AuroraSignal", "status": "1 / 2", "highlighted": True},
             timeout=15.0,
-        ), "Expected seeded in-note ReadingSearch highlighting 2 matches"
+        ), "Expected seeded in-note ReadingSearch highlighting occurrence 1 / 2"
+
+        # 3. Reopen Ctrl+Shift+F, move Down to the 2nd occurrence of "AuroraSignal" (after İstanbul 📓), press Return -> reveals 2 / 2!
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen for 2nd occurrence"
+        window.requestActivate()
+        search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus for 2nd occurrence"
+        assert _wait_until(
+            lambda: not studio.folderSearchState["scanning"] and len(studio.folderSearchState["matches"]) == 2,
+            timeout=10.0,
+        ), f"Expected 2 matches for AuroraSignal on reopen, got {studio.folderSearchState}"
+        QTest.keyClick(window, Qt.Key.Key_Down)
+        QTest.keyClick(window, Qt.Key.Key_Return)
+        assert _wait_until(lambda: not bool(search_dialog.property("visible")), timeout=8.0)
+        assert _wait_until(
+            lambda: eval_reader("document.querySelector('.reading-search output')?.textContent || ''").get("value") == "2 / 2",
+            timeout=15.0,
+        ), f"Expected 2nd folder-search occurrence to reveal 2 / 2, got {eval_reader('document.querySelector(\".reading-search output\")?.textContent || \"\"')}"
+
+        # 4. Hidden Markdown URL hit reveals block separately as "In Markdown source" instead of "No matches".
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen for hidden URL"
+        window.requestActivate()
+        search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus for hidden URL"
+        search_input.setProperty("text", "HiddenUrlSignal")
+        assert _wait_until(
+            lambda: not studio.folderSearchState["scanning"] and len(studio.folderSearchState["matches"]) == 1,
+            timeout=10.0,
+        ), f"Expected 1 match for HiddenUrlSignal, got {studio.folderSearchState}"
+        QTest.keyClick(window, Qt.Key.Key_Return)
+        assert _wait_until(lambda: not bool(search_dialog.property("visible")), timeout=8.0)
+        assert _wait_until(
+            lambda: eval_reader("document.querySelector('.reading-search output')?.textContent || ''").get("value") == "In Markdown source",
+            timeout=15.0,
+        ), f"Expected hidden URL hit status 'In Markdown source', got {eval_reader('document.querySelector(\".reading-search output\")?.textContent || \"\"')}"
 
         print(json.dumps({"ok": True, "lines": lines}), flush=True)
         window.setProperty("closingAllowed", True)
@@ -234,10 +282,36 @@ def _webengine_e2e_probe() -> int:
     os._exit(0)
 
 
+FOLDER_SEARCH_HOST_QML = b"""
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Controls.Material
+
+ApplicationWindow {
+    id: window; width: 960; height: 680; visible: true; color: viewState.colors.surface
+    property var viewState: JSON.parse(studio.snapshot)
+    property int modalDialogCount: 0
+    function focusReader() {}
+    Material.theme: viewState.dark ? Material.Dark : Material.Light
+    Material.primary: viewState.colors.primary; Material.accent: viewState.colors.primary
+    Material.background: viewState.colors.surface; Material.foreground: viewState.colors.text
+    Connections {
+        target: studio
+        function onWorkspaceSearchChanged() {
+            if (studio.folderSearchState.open && !folderSearchDialog.visible) folderSearchDialog.open()
+            else if (!studio.folderSearchState.open && folderSearchDialog.visible) folderSearchDialog.close()
+        }
+    }
+    FolderSearchDialog { id: folderSearchDialog }
+}
+"""
+
+
 class WorkspaceSearchDesktopTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        QQuickStyle.setStyle("Material")
+        if QGuiApplication.instance() is None:
+            QQuickStyle.setStyle("Material")
         cls.app = QGuiApplication.instance() or QGuiApplication(["Workspace search desktop tests"])
 
     def setUp(self):
@@ -252,6 +326,7 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.studio.pool.shutdown(wait=True)
         self.session.writes.shutdown(wait=True)
+        self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.temp.cleanup()
 
     def test_shortcuts_register_ctrl_shift_f_portably_and_customize(self):
@@ -307,6 +382,11 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         # Line 4: "Straße: note" -> 'ß' expands to "ss" in casefold, original UTF-16 [8, 12)
         self.assertEqual((m_strasse["snippet"], m_strasse["matchStart"], m_strasse["matchEnd"]), ("Straße: note", 8, 12))
 
+        u16_bytes = markdown.encode("utf-16-le")
+        for hit, expected_text in zip(res["matches"], ["note", "note", "NOTE", "note", "NOTE"]):
+            s, e = hit["sourceStart"], hit["sourceEnd"]
+            self.assertEqual(u16_bytes[2 * s : 2 * e].decode("utf-16-le"), expected_text)
+
         # Verify actual QML JS String.prototype.slice highlighting inside FolderSearchDialog.qml!
         qml_root = Path(__file__).resolve().parent / "qml"
         engine = QQmlApplicationEngine()
@@ -350,7 +430,11 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
             self.assertIn("<b>📓</b>", qml_highlight(emoji_q["matches"][0]))
         finally:
             for obj in engine.rootObjects():
+                if hasattr(obj, "close"):
+                    obj.close()
                 obj.deleteLater()
+            engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
             del engine
 
     def test_portable_smd_and_renamed_bundle_search_never_decodes_embedded_images(self):
@@ -901,6 +985,64 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         self.studio.openFolderSearchMatch("", str(target), "Needle", True)
         self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
 
+    def test_repeated_matches_crlf_unicode_offsets_and_studio_handoff(self):
+        crlf_markdown = (
+            "# İstanbul 📓\r\n"
+            "First 📓 EchoToken and second EchoToken on same line.\r\n"
+            "Straße precedes third ECHOTOKEN here.\r\n"
+        )
+        tabs = [{
+            "id": "tab-repeat",
+            "name": "repeat.md",
+            "path": "",
+            "content": crlf_markdown,
+            "dirty": True,
+        }]
+        res = stream_text_search("echotoken", tabs, [], None, case_sensitive=False)
+        self.assertEqual(len(res["matches"]), 3)
+        u16 = crlf_markdown.encode("utf-16-le")
+        sliced = [u16[2 * m["sourceStart"] : 2 * m["sourceEnd"]].decode("utf-16-le") for m in res["matches"]]
+        self.assertEqual(sliced, ["EchoToken", "EchoToken", "ECHOTOKEN"])
+        self.assertEqual([m["matchText"] for m in res["matches"]], ["EchoToken", "EchoToken", "ECHOTOKEN"])
+        self.assertLess(res["matches"][0]["sourceStart"], res["matches"][1]["sourceStart"])
+        self.assertLess(res["matches"][1]["sourceStart"], res["matches"][2]["sourceStart"])
+
+        # Handoff to closed disk note preserves exact 2nd occurrence sourceStart/sourceEnd/matchText in seededFind.
+        disk_note = self.root / "handoff.md"
+        disk_content = "# İstanbul 📓\nFirst Needle.\nSecond Needle after 📓.\n"
+        disk_note.write_text(disk_content, encoding="utf-8")
+        disk_hits = stream_text_search("Needle", [], [], self.root, case_sensitive=True)["matches"]
+        self.assertEqual(len(disk_hits), 2)
+        second = disk_hits[1]
+        disk_u16 = disk_content.encode("utf-16-le")
+        self.assertEqual(disk_u16[2 * second["sourceStart"] : 2 * second["sourceEnd"]].decode("utf-16-le"), "Needle")
+        self.assertEqual(second["matchText"], "Needle")
+
+        active_tab = self.studio.tabs[0]
+        self.studio.ready = True
+        self.studio.openFolderSearchMatch("", str(disk_note), "Needle", True, second["sourceStart"], second["sourceEnd"], second["matchText"])
+        op = self.studio.flush_operation
+        self.assertIsNotNone(op)
+        self.studio.post("f-open", "document_flushed", json.dumps({"operation": op, "id": active_tab["id"], "content": active_tab["content"]}))
+        self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "handoff.md"))
+        # Also verify active-tab re-seed passes sourceStart/sourceEnd/matchText into window.supermdFind.
+        calls: list[str] = []
+        self.studio.readerCall.connect(calls.append)
+        opened_tab = self.studio._current()
+        self.studio.openFolderSearchMatch(opened_tab["id"], opened_tab["path"], "Needle", True, second["sourceStart"], second["sourceEnd"], second["matchText"])
+        op_active = self.studio.flush_operation
+        self.assertIsNotNone(op_active)
+        self.studio.post("f-active", "document_flushed", json.dumps({"operation": op_active, "id": opened_tab["id"], "content": opened_tab["content"]}))
+        self.assertTrue(
+            any(
+                f'"sourceStart": {second["sourceStart"]}' in call
+                and f'"sourceEnd": {second["sourceEnd"]}' in call
+                and '"matchText": "Needle"' in call
+                for call in calls
+            ),
+            calls,
+        )
+
     def test_sync_for_search_preserves_matches_when_unchanged_and_rescans_when_flushed_edits_arrive(self):
         note = self.root / "synced.md"
         note.write_text("# Synced\n\nDiskMatch line.\n", encoding="utf-8")
@@ -951,6 +1093,283 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         )
         self.assertEqual(self.studio.folderSearchState["matches"][0]["line"], 3)
         self.assertTrue(self.studio.folderSearchState["matches"][0]["dirty"])
+
+    @contextlib.contextmanager
+    def _real_folder_search_dialog(self):
+        self.session.settings.update(theme="dark", accent="blue", motion=False, welcomed=True)
+        qml_dir = Path(__file__).resolve().parent / "qml"
+        engine = QQmlEngine()
+        engine.rootContext().setContextProperty("studio", self.studio)
+        component = QQmlComponent(engine)
+        component.setData(FOLDER_SEARCH_HOST_QML, QUrl.fromLocalFile(str(qml_dir / "folder-search-dialog-host.qml")))
+        self.assertFalse(component.isError(), str(component.errors()))
+        window = component.create()
+        self.assertIsNotNone(window, str(component.errors()))
+        self.studio.host_window = window
+        try:
+            window.show(); window.requestActivate()
+            QTest.qWaitForWindowExposed(window, 300)
+            QTest.qWait(15)
+            dialog = window.findChild(QObject, "folderSearchDialog")
+            search_input = window.findChild(QObject, "folderSearchInput")
+            debounce_timer = window.findChild(QObject, "folderSearchDebounce")
+            self.assertTrue(dialog is not None and search_input is not None and debounce_timer is not None)
+            yield window, dialog, search_input, debounce_timer
+        finally:
+            self.studio.host_window = None
+            window.close(); window.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            engine.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+    @staticmethod
+    def _find_named_item(root_obj: QObject, object_name: str) -> QObject | None:
+        def walk(item):
+            if item is None: return None
+            if item.objectName() == object_name: return item
+            if (found := item.findChild(QObject, object_name)) is not None: return found
+            for ch in (item.childItems() if callable(getattr(item, "childItems", None)) else ()):
+                if (hit := walk(ch)) is not None: return hit
+            return None
+        return root_obj.findChild(QObject, object_name) or walk(root_obj.contentItem())
+
+    @staticmethod
+    def _type_keys(window, text: str, delay_ms: int = 0) -> None:
+        for ch in text:
+            mods = Qt.KeyboardModifier.ShiftModifier if ch.isupper() else Qt.KeyboardModifier.NoModifier
+            key = int(Qt.Key(ord(ch.upper()))) if ch.isascii() and ch.isalpha() else 0
+            QGuiApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyPress, key, mods, ch))
+            QGuiApplication.sendEvent(window, QKeyEvent(QEvent.Type.KeyRelease, key, mods, ch))
+            if delay_ms > 0:
+                QTest.qWait(delay_ms)
+
+    def test_real_dialog_debounces_typing_bursts_and_cancels_previous_generation_immediately(self):
+        (self.root / "alpha.md").write_text("# Alpha\n\nRocketToken in alpha.\n", encoding="utf-8")
+        (self.root / "beta.md").write_text("# Beta\n\nRocketToken in beta.\nSlowQueryx settled hit.\n", encoding="utf-8")
+        self.studio.openFolder(str(self.root))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) == 2))
+
+        with self._real_folder_search_dialog() as (window, dialog, search_input, debounce_timer):
+            self.assertEqual(dialog.property("debounceInterval"), 120)
+            self.studio.openFolderSearch()
+            self.assertTrue(_wait_until(lambda: bool(dialog.property("opened"))))
+            window.requestActivate(); search_input.forceActiveFocus()
+            self.assertTrue(_wait_until(lambda: bool(search_input.property("activeFocus"))))
+
+            # 1. Rapid keystroke burst coalesces into a single workspace scan for the settled query.
+            queries_run: list[str] = []
+            with patch("studio.stream_text_search", side_effect=lambda q, *a, **kw: (queries_run.append(q), stream_text_search(q, *a, **kw))[1]):
+                self._type_keys(window, "RocketToken", delay_ms=2)
+                self.app.processEvents()
+                self.assertEqual(search_input.property("text"), "RocketToken")
+                self.assertTrue(bool(debounce_timer.property("running")) and bool(dialog.property("queryPending")))
+                self.assertTrue(self.studio.folderSearchState["pending"] and self.studio.folderSearchState["scanning"])
+                self.assertEqual(queries_run, [], "Workspace scan must not start before debounce settles")
+                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
+                self.assertEqual(queries_run, ["RocketToken"])
+                self.assertFalse(bool(dialog.property("queryPending")))
+                self.assertEqual({m["name"] for m in self.studio.folderSearchState["matches"]}, {"alpha.md", "beta.md"})
+
+            # 2. Editing while a previous generation is scanning cancels & invalidates immediately.
+            scan_started, cancel_observed = threading.Event(), threading.Event()
+            captured: dict[str, object] = {}
+            stale_hit = [{"name": "stale.md", "relative": "stale.md", "path": "", "tabId": "", "line": 1, "column": 1,
+                          "snippet": "SlowQuery", "matchStart": 0, "matchEnd": 9, "sourceStart": 0, "sourceEnd": 9,
+                          "matchText": "SlowQuery", "dirty": False, "isOpen": False}]
+
+            def blocking_then_real_search(query, *args, **kwargs):
+                cancel_event, on_batch = kwargs.get("cancel_event"), kwargs.get("on_batch")
+                if query != "SlowQuery":
+                    return stream_text_search(query, *args, **kwargs)
+                captured["cancel_event"] = cancel_event
+                scan_started.set()
+                if cancel_event is not None and cancel_event.wait(timeout=3.0):
+                    cancel_observed.set()
+                if callable(on_batch):
+                    on_batch(stale_hit, 1, False, True)
+                return {"matches": [], "scannedFiles": 0, "truncated": False}
+
+            with patch("studio.stream_text_search", side_effect=blocking_then_real_search):
+                QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+                self._type_keys(window, "SlowQuery")
+                self.assertTrue(_wait_until(scan_started.is_set))
+                prev_generation, prev_cancel = self.studio._folder_search_generation, captured["cancel_event"]
+                self.assertFalse(prev_cancel.is_set())
+
+                dialog.setProperty("debounceInterval", 220)
+                QTest.keyClick(window, Qt.Key.Key_X)
+                self.app.processEvents()
+                self.assertEqual(search_input.property("text"), "SlowQueryx")
+                self.assertTrue(prev_cancel.is_set(), "Previous cancel_event must be set immediately on edit")
+                self.assertGreater(self.studio._folder_search_generation, prev_generation)
+                self.assertTrue(bool(debounce_timer.property("running")) and self.studio.folderSearchState["pending"])
+                state = self.studio.folderSearchState
+                self.assertEqual((state["matches"], state["scannedFiles"], state["truncated"]), ([], 0, False))
+                self.assertTrue(cancel_observed.wait(timeout=1.0))
+
+                # Late batch signal from the superseded generation on the GUI thread is dropped.
+                self.studio.workspaceSearchBatch.emit(prev_generation, stale_hit, 1, False, True)
+                self.app.processEvents()
+                self.assertTrue(all(m["name"] != "stale.md" for m in self.studio.folderSearchState["matches"]))
+                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
+                self.assertEqual(self.studio.folderSearchState["matches"][0]["name"], "beta.md")
+                self.assertEqual(self.studio.folderSearchState["matches"][0]["matchText"], "SlowQueryx")
+
+    def test_real_dialog_blocks_stale_enter_while_pending_and_covers_clear_escape_and_activation(self):
+        first_note, second_note = self.root / "first.md", self.root / "second.md"
+        first_note.write_text("# First\n\nAlphaHit in first note.\n```mermaid\ngraph TD\n  A[DiagramHit]\n```\n", encoding="utf-8")
+        second_note.write_text("# Second\n\nOmegaHit line three.\nFiller.\nOmegaHit line five.\n", encoding="utf-8")
+        self.studio.openFolder(str(self.root))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) == 2))
+        active_tab = self.studio.tabs[0]
+        self.studio.ready = True
+
+        with self._real_folder_search_dialog() as (window, dialog, search_input, debounce_timer):
+            status_label = window.findChild(QObject, "folderSearchStatus")
+            self.assertIsNotNone(status_label)
+
+            def select_all_and_clear(key=Qt.Key.Key_Backspace):
+                QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+                QTest.keyClick(window, key)
+                self.app.processEvents()
+
+            def open_and_ack_sync():
+                self.studio.openFolderSearch()
+                self.assertTrue(_wait_until(lambda: bool(dialog.property("opened"))))
+                if self.studio.flush_operation and self.studio.flush_operation.get("action") == "sync_for_search":
+                    self.studio.post("sync-ack", "document_flushed", json.dumps({
+                        "operation": self.studio.flush_operation, "id": active_tab["id"], "content": active_tab["content"],
+                    }))
+                window.requestActivate(); search_input.forceActiveFocus()
+                self.assertTrue(_wait_until(lambda: bool(search_input.property("activeFocus"))))
+
+            open_and_ack_sync()
+            self._type_keys(window, "AlphaHit")
+            self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
+            self.assertEqual(self.studio.folderSearchState["matches"][0]["name"], "first.md")
+            self.assertIsNone(self.studio.flush_operation)
+
+            # Type "OmegaHit" and immediately press Down, Return, and Keypad Enter while pending (plus direct slot guard).
+            dialog.setProperty("debounceInterval", 300)
+            QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+            self._type_keys(window, "OmegaHit")
+            self.app.processEvents()
+            self.assertTrue(bool(dialog.property("queryPending")) and bool(debounce_timer.property("running")))
+            QTest.keyClick(window, Qt.Key.Key_Down)
+            self.assertEqual(dialog.property("selectedIndex"), 0)
+            QTest.keyClick(window, Qt.Key.Key_Return)
+            QTest.keyClick(window, Qt.Key.Key_Enter, Qt.KeyboardModifier.KeypadModifier)
+            self.studio.openFolderSearchMatch("", str(first_note), "AlphaHit", False)
+            self.app.processEvents()
+            self.assertTrue(bool(dialog.property("visible")) and self.studio.folderSearchState["open"])
+            self.assertIsNone(self.studio.flush_operation, "Enter while pending must not open stale match")
+
+            # External updateFolderSearch while pending stops debounce and syncs controls without stale timer overwrite.
+            self.studio.updateFolderSearch("AlphaHit", False, False)
+            self.app.processEvents()
+            self.assertFalse(bool(debounce_timer.property("running")) or bool(dialog.property("queryPending")))
+            self.assertEqual(search_input.property("text"), "AlphaHit")
+            self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
+
+            # Clear input while pending: stops debounce immediately, launches no scan, resets state cleanly.
+            dialog.setProperty("debounceInterval", 160)
+            with patch("studio.stream_text_search", wraps=stream_text_search) as spy_clear_pending:
+                QTest.keyClick(window, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+                self._type_keys(window, "z")
+                self.app.processEvents()
+                self.assertTrue(bool(debounce_timer.property("running")))
+                select_all_and_clear(Qt.Key.Key_Backspace)
+                self.assertEqual(search_input.property("text"), "")
+                self.assertFalse(bool(debounce_timer.property("running")) or bool(dialog.property("queryPending")))
+                self.assertFalse(self.studio.folderSearchState["pending"] or self.studio.folderSearchState["scanning"])
+                self.assertEqual(self.studio.folderSearchState["matches"], [])
+                self.assertIn("Streams live matches", str(status_label.property("text")))
+                QTest.qWait(180)
+                spy_clear_pending.assert_not_called()
+
+            # Settle "OmegaHit", clear settled results, and verify Enter on empty input is a no-op.
+            dialog.setProperty("debounceInterval", 120)
+            self._type_keys(window, "OmegaHit")
+            self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
+            select_all_and_clear(Qt.Key.Key_Delete)
+            self.assertEqual(self.studio.folderSearchState["matches"], [])
+            self.assertFalse(self.studio.folderSearchState["scanning"])
+            QTest.keyClick(window, Qt.Key.Key_Return)
+            self.app.processEvents()
+            self.assertTrue(bool(dialog.property("visible")) and self.studio.flush_operation is None)
+
+            # Toggling Diagrams / Match case while pending stops debounce, keeps input focus, and runs once immediately.
+            case_toggle = window.findChild(QObject, "folderSearchCaseToggle")
+            diag_toggle = window.findChild(QObject, "folderSearchDiagramsToggle")
+            self.assertTrue(case_toggle is not None and diag_toggle is not None)
+            self.assertTrue(_wait_until(lambda: diag_toggle.width() > 0 and case_toggle.width() > 0))
+            diag_pt = diag_toggle.mapToScene(QPointF(diag_toggle.width() / 2.0, diag_toggle.height() / 2.0)).toPoint()
+            toggle_pt = case_toggle.mapToScene(QPointF(case_toggle.width() / 2.0, case_toggle.height() / 2.0)).toPoint()
+            dialog.setProperty("debounceInterval", 220)
+            toggle_queries: list[tuple[str, bool, bool]] = []
+            with patch("studio.stream_text_search", side_effect=lambda q, *a, **kw: (toggle_queries.append((q, bool(kw.get("case_sensitive")), not bool(kw.get("exclude_diagrams", True)))), stream_text_search(q, *a, **kw))[1]):
+                self._type_keys(window, "diagramhit")
+                self.app.processEvents()
+                self.assertTrue(bool(debounce_timer.property("running")))
+                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, diag_pt)
+                self.assertTrue(bool(search_input.property("activeFocus")) and not bool(debounce_timer.property("running")))
+                self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 1))
+                QTest.qWait(240)
+                self.assertEqual(toggle_queries, [("diagramhit", False, True)])
+                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, toggle_pt)
+                self.assertTrue(_wait_until(lambda: bool(case_toggle.property("checked")) and not self.studio.folderSearchState["scanning"]))
+                self.assertEqual(self.studio.folderSearchState["matches"], [])
+                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, toggle_pt)
+                self.assertTrue(_wait_until(lambda: not bool(case_toggle.property("checked")) and not self.studio.folderSearchState["scanning"]))
+                QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, diag_pt)
+                self.assertTrue(_wait_until(lambda: not bool(diag_toggle.property("checked")) and not self.studio.folderSearchState["scanning"]))
+
+            select_all_and_clear(Qt.Key.Key_Delete)
+
+            # Escape while pending cancels debounce cleanly and never runs after closing.
+            dialog.setProperty("debounceInterval", 160)
+            with patch("studio.stream_text_search", wraps=stream_text_search) as spy_escape_pending:
+                self._type_keys(window, "AlphaHit")
+                self.app.processEvents()
+                self.assertTrue(bool(debounce_timer.property("running")))
+                QTest.keyClick(window, Qt.Key.Key_Escape)
+                self.assertTrue(_wait_until(lambda: not bool(dialog.property("visible"))))
+                self.assertFalse(self.studio.folderSearchState["open"] or bool(debounce_timer.property("running")))
+                QTest.qWait(180)
+                spy_escape_pending.assert_not_called()
+
+            # Reopen, search "OmegaHit", step Down to 2nd occurrence, and press Return to activate current result.
+            dialog.setProperty("debounceInterval", 120)
+            open_and_ack_sync()
+            self._type_keys(window, "OmegaHit")
+            self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
+            settled_matches = list(self.studio.folderSearchState["matches"])
+            self.assertEqual([m["line"] for m in settled_matches], [3, 5])
+            QTest.keyClick(window, Qt.Key.Key_Down)
+            self.assertEqual(dialog.property("selectedIndex"), 1)
+            QTest.keyClick(window, Qt.Key.Key_Return)
+            self.assertTrue(_wait_until(lambda: not bool(dialog.property("visible"))))
+            self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
+            activated_payload = json.loads(self.studio.flush_operation["target"])
+            self.assertEqual(
+                (activated_payload["path"], activated_payload["query"], activated_payload["sourceStart"], activated_payload["sourceEnd"], activated_payload["matchText"]),
+                (str(second_note), "OmegaHit", settled_matches[1]["sourceStart"], settled_matches[1]["sourceEnd"], "OmegaHit"),
+            )
+
+            # Complete flush, reopen, and verify clicking a current result row also activates it cleanly.
+            self.studio.post("open-ack", "document_flushed", json.dumps({
+                "operation": self.studio.flush_operation, "id": active_tab["id"], "content": active_tab["content"],
+            }))
+            self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "second.md"))
+            open_and_ack_sync()
+            self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"] and len(self.studio.folderSearchState["matches"]) == 2))
+            self.assertTrue(_wait_until(lambda: (r := self._find_named_item(window, "folderSearchRow_0")) is not None and r.width() > 0 and r.height() > 0))
+            row0 = self._find_named_item(window, "folderSearchRow_0")
+            center = row0.mapToScene(QPointF(row0.width() / 2.0, row0.height() / 2.0)).toPoint()
+            QTest.mouseClick(window, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, center)
+            self.assertTrue(_wait_until(lambda: not bool(dialog.property("visible"))))
+            self.assertEqual(self.studio.flush_operation["action"], "open_search_match")
+            self.assertEqual(json.loads(self.studio.flush_operation["target"])["sourceStart"], settled_matches[0]["sourceStart"])
 
     def test_qml_and_webengine_folder_search_escape_and_seeded_reader_search(self):
         if "--webengine-probe" in sys.argv:

@@ -20,7 +20,6 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.zip.Deflater
 import java.util.zip.GZIPOutputStream
 
 internal const val PORTABLE_GZIP_LEVEL = 3
@@ -268,11 +267,10 @@ class MediaStorage(private val context: Context) {
         check(File(bundles, id).mkdirs()) { "Could not prepare the portable note's local asset directory" }
         return id
     }
-    private val key = Regex("assets/[a-zA-Z0-9_.-]{1,150}")
     private fun gzip(output: java.io.OutputStream) = object : GZIPOutputStream(output, 8192) {
         init { def.setLevel(PORTABLE_GZIP_LEVEL) }
     }
-    fun validKey(source: String) = key.matches(source) && source.substringAfter('/') !in listOf(".", "..")
+    fun validKey(source: String): Boolean = isValidCompatPortableAssetKey(source)
     private fun mime(name: String) = when(name.substringAfterLast('.').lowercase()) {
         "png" -> "image/png"; "jpg", "jpeg" -> "image/jpeg"; "gif" -> "image/gif"; "webp" -> "image/webp"; "avif" -> "image/avif"; "svg" -> "image/svg+xml"; else -> error("Choose a supported image (PNG, JPEG, GIF, WebP, AVIF or SVG)")
     }
@@ -433,21 +431,6 @@ class MediaStorage(private val context: Context) {
             }
             else -> false
         }
-    }
-
-    fun importUris(uris: List<Uri>): JSONArray {
-        require(uris.size in 1..32)
-        var total = 0L; val result = JSONArray()
-        for (uri in uris) {
-            require(isSafeExternalUri(uri)) { "Unsupported image URI" }
-            val name = resolveUriDisplayName(uri) ?: "Image"
-            val type = imageMime(name, context.contentResolver.getType(uri))
-            val bytes = context.contentResolver.openInputStream(uri)?.use { readLimited(it, 25_000_000) } ?: error("Image permission is unavailable")
-            requireMediaSignature(type, bytes)
-            total += bytes.size; require(total <= 75_000_000) { "Insert at most 75 MB at a time" }
-            result.put(store(name, type, bytes))
-        }
-        return result
     }
 
     fun importDroppedUris(uris: List<Uri>): DroppedImageBatch {

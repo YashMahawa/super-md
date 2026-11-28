@@ -60,6 +60,24 @@ describe("portable media", () => {
     const result = await prepareFmd("# Keep\n\n![Proof][p]\n\n[p]: proof.png \"A title\"\n", "/notes/a.md");
     expect(result.content).toContain("![Proof][p]"); expect(result.content).toMatch(/\[p\]: <assets\/image-.*\.png> "A title"/);
   });
+  it("preserves existing 151 to 159 character safe portable asset names across .smd paths, opaque SAF URIs, and smd-steps", async () => {
+    native.mockReset().mockResolvedValue("data:image/svg+xml;base64,PHN2Zy8+");
+    const compatKey = `assets/${"a".repeat(155)}.svg`;
+    const md = `# Existing Portable\n\n![Legacy](<${compatKey}>)\n\n\`\`\`smd-steps\n${JSON.stringify({ steps: [{ title: "Step 1", markdown: `![Deck](<${compatKey}>)` }] })}\n\`\`\`\n`;
+    const fromExt = await prepareFmd(md, "/notes/existing.smd");
+    expect(fromExt.content).toContain(`![Legacy](<${compatKey}>)`);
+    expect(fromExt.content).toContain(`![Deck](<${compatKey}>)`);
+    expect(fromExt.assets).toEqual({ [compatKey]: "data:image/svg+xml;base64,PHN2Zy8+" });
+
+    const fromOpaqueUri = await prepareFmd(md, "content://com.example.provider/document/doc-42", { portable: true });
+    expect(fromOpaqueUri.content).toBe(fromExt.content);
+    expect(fromOpaqueUri.assets).toEqual({ [compatKey]: "data:image/svg+xml;base64,PHN2Zy8+" });
+
+    const overCapKey = `assets/${"a".repeat(156)}.svg`;
+    const overCap = await prepareFmd(`![TooLong](<${overCapKey}>)\n`, "content://com.example.provider/document/doc-42", { portable: true });
+    expect(overCap.content).toMatch(/!\[TooLong\]\(<assets\/image-.*\.svg>\)/);
+    expect(Object.keys(overCap.assets)).not.toContain(overCapKey);
+  });
   it("uses the first duplicate reference definition in imageRanges and prepareFmd while preserving source offsets", async () => {
     const firstPng = `data:image/png;base64,${btoa("first-png")}`;
     const earlySvg = `data:image/svg+xml;base64,${btoa('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0L4 4"/></svg>')}`;

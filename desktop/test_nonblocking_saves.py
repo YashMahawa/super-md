@@ -17,7 +17,6 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("QT_QUICK_BACKEND", "software")
-from PySide6.QtCore import QTimer
 from PySide6.QtGui import QGuiApplication
 
 import agent_live

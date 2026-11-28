@@ -1,12 +1,8 @@
 /** Prepare a portable Markdown copy without changing the note in the editor. */
-import { unified } from "unified";
-import remarkParse from "remark-parse";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import { visit } from "unist-util-visit";
 import { invoke } from "./nativeBridge";
-import { maskFrontmatter, parseFrontmatter } from "./frontmatter";
-import { remarkObsidianMath } from "./obsidianMath";
+import { parseFrontmatter } from "./frontmatter";
+import { parseMaskedMarkdown } from "./markdownExportParser";
 import { svgImage } from "./svgImage";
 
 type ImageRef = { source: string; start: number; end: number; image: boolean; definition?: { start: number; end: number } };
@@ -52,7 +48,7 @@ function raceSignal<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 
 function refs(markdown: string): ImageRef[] {
   const frontmatterEnd = parseFrontmatter(markdown)?.end ?? 0;
-  const tree = unified().use(remarkParse).use(remarkGfm, { singleTilde: false }).use(remarkMath).use(remarkObsidianMath).parse(maskFrontmatter(markdown));
+  const { tree } = parseMaskedMarkdown(markdown);
   const definitions = new Map<string, any>();
   const result: ImageRef[] = [];
   visit(tree, "definition", (node: any) => {
