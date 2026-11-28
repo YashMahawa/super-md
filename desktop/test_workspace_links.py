@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import shutil
@@ -117,6 +118,519 @@ class WorkspaceLinkRankingAndCacheTest(unittest.TestCase):
             added.write_text("# Fresh\n", encoding="utf-8")
             bounded.invalidate(vault_ref)
             self.assertTrue(any(item.name == "Note-00-Fresh.md" for item in bounded.scan(vault_ref)))
+
+    def test_warm_missing_links_stay_cached_while_same_tick_external_targets_refresh(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir) / "Vault"
+            notes = root / "Notes"
+            archive = root / "Archive"
+            deep = root / "Specs" / "Deep"
+            notes.mkdir(parents=True)
+            archive.mkdir(parents=True)
+            deep.mkdir(parents=True)
+            for idx in range(10):
+                section = root / f"Section-{idx:02d}"
+                section.mkdir()
+                for note_idx in range(3):
+                    (section / f"Doc-{idx:02d}-{note_idx}.md").write_text("# Doc\n", encoding="utf-8")
+            root = root.resolve()
+            notes = notes.resolve()
+            archive = archive.resolve()
+            deep = deep.resolve()
+
+            source = notes / "Source.md"
+            source.write_text("# Source\n", encoding="utf-8")
+            deep_topic = deep / "Topic.md"
+            deep_topic.write_text("# Deep Exact Topic\n", encoding="utf-8")
+
+            cache = WorkspaceLinkCache(ttl_seconds=60.0)
+
+            # 1. Cold missing-link lookup populates the cache once; repeated broken-link misses
+            # stay warm and never invalidate or re-walk the workspace tree.
+            with mock.patch.object(
+                workspace_links,
+                "_is_entry_link_or_junction",
+                wraps=workspace_links._is_entry_link_or_junction,
+            ) as guard_probe:
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("MissingTarget", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                self.assertGreater(guard_probe.call_count, 40)
+                cached_entries = cache.scan(root)
+
+                guard_probe.reset_mock()
+                with mock.patch.object(cache, "invalidate", wraps=cache.invalidate) as invalidate_spy:
+                    for broken in ("MissingTarget", "SecondBrokenLink", "MissingTarget"):
+                        with self.assertRaises(workspace_links.WorkspaceLinkError):
+                            resolve_workspace_link(broken, wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                    self.assertEqual(invalidate_spy.call_count, 0)
+                self.assertIs(cache.scan(root), cached_entries)
+                self.assertEqual(
+                    {call.args[0].name for call in guard_probe.call_args_list},
+                    {"Notes"},
+                )
+
+            # 2. Real unmocked same-tick addition after warming both a missing link and a nested hit:
+            # align to the start of a fresh filesystem clock tick on a compact vault so scan() and
+            # external file creations complete well inside a single 4-20ms OS clock tick without mocks.
+            compact = Path(root_dir) / "CompactVault"
+            compact_notes = compact / "Notes"
+            compact_archive = compact / "Archive"
+            compact_deep = compact / "Specs" / "Deep"
+            compact_notes.mkdir(parents=True)
+            compact_archive.mkdir(parents=True)
+            compact_deep.mkdir(parents=True)
+            compact = compact.resolve()
+            compact_notes = compact_notes.resolve()
+            compact_archive = compact_archive.resolve()
+            compact_deep = compact_deep.resolve()
+            compact_source = compact_notes / "Source.md"
+            compact_source.write_text("# Source\n", encoding="utf-8")
+            compact_deep_topic = compact_deep / "Topic.md"
+            compact_deep_topic.write_text("# Deep Exact Topic\n", encoding="utf-8")
+
+            tick_probe = Path(root_dir) / "tick_probe"
+            tick_probe.write_bytes(b"0")
+            initial_tick_ns = tick_probe.stat().st_mtime_ns
+            deadline = time.perf_counter() + 0.025
+            while time.perf_counter() < deadline:
+                tick_probe.write_bytes(b"1")
+                if tick_probe.stat().st_mtime_ns != initial_tick_ns:
+                    break
+                time.sleep(0.001)
+            (compact_archive / ".keep").write_text("", encoding="utf-8")
+            compact_cache = WorkspaceLinkCache(ttl_seconds=60.0)
+            with self.assertRaises(workspace_links.WorkspaceLinkError):
+                resolve_workspace_link(
+                    "MissingTarget", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
+                )
+            self.assertEqual(
+                resolve_workspace_link(
+                    "Topic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
+                ),
+                compact_deep_topic,
+            )
+            archive_missing = compact_archive / "MissingTarget.md"
+            archive_missing.write_text("# Created right after warm miss\n", encoding="utf-8")
+            archive_topic = compact_archive / "Topic.md"
+            archive_topic.write_text("# Higher-ranked Archive Topic\n", encoding="utf-8")
+
+            self.assertEqual(
+                resolve_workspace_link(
+                    "MissingTarget", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
+                ),
+                archive_missing,
+            )
+            self.assertEqual(
+                resolve_workspace_link(
+                    "Topic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=compact_cache
+                ),
+                archive_topic,
+            )
+
+            # 3. Once wall time advances past the coarse clock tick window, racy directory snapshots
+            # settle so cache.scan() performs zero os.scandir calls and warm misses never touch subtrees.
+            time.sleep(0.12)
+            with self.assertRaises(workspace_links.WorkspaceLinkError):
+                resolve_workspace_link("StillMissing", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+            settled_entries = cache.scan(root)
+            with mock.patch.object(os, "scandir", wraps=os.scandir) as scandir_spy:
+                self.assertIs(cache.scan(root), settled_entries)
+                self.assertEqual(scandir_spy.call_count, 0)
+                for broken in ("StillMissing", "AnotherMissing", "StillMissing"):
+                    with self.assertRaises(workspace_links.WorkspaceLinkError):
+                        resolve_workspace_link(broken, wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                scanned_dirs = {Path(call.args[0]).resolve() for call in scandir_spy.call_args_list}
+                self.assertLessEqual(scanned_dirs, {root, notes})
+            self.assertIs(cache.scan(root), settled_entries)
+
+            # 4. Deterministic pinned-stat & slow-Windows-scan coarse-tick fixture (reproduces 100%
+            # regardless of OS clock granularity or CI VM pauses): simulate a scan spanning 140ms
+            # (>100ms sub-second racy window), verify warm broken-link misses stay cached inside the
+            # post-scan window, and verify external writes with frozen Beta stat resolve immediately.
+            beta = compact / "Beta"
+            beta.mkdir()
+            beta = beta.resolve()
+            deep_pinned = compact_deep / "PinnedTopic.md"
+            deep_pinned.write_text("# Deep Pinned\n", encoding="utf-8")
+
+            raw_beta_stat = beta.stat(follow_symlinks=False)
+            base_tick_ns = (raw_beta_stat.st_mtime_ns // 1_000_000_000) * 1_000_000_000 + 15_625_000
+            frozen_beta_stat = os.stat_result(
+                tuple(raw_beta_stat), {"st_mtime_ns": base_tick_ns, "st_ctime_ns": base_tick_ns}
+            )
+            real_stat = Path.stat
+            clock = {"wall_ns": base_tick_ns + 10_000_000, "mono": 1_000.0}
+
+            def stale_beta_stat(self_path: Path, *, follow_symlinks: bool = True):
+                if self_path == beta:
+                    if clock["wall_ns"] == base_tick_ns + 10_000_000:
+                        clock["wall_ns"] = base_tick_ns + 150_000_000
+                        clock["mono"] = 1_000.140
+                    return frozen_beta_stat
+                return real_stat(self_path, follow_symlinks=follow_symlinks)
+
+            pinned_cache = WorkspaceLinkCache(ttl_seconds=60.0)
+            with (
+                mock.patch.object(Path, "stat", stale_beta_stat),
+                mock.patch.object(workspace_links.time, "time_ns", side_effect=lambda: clock["wall_ns"]),
+                mock.patch.object(workspace_links.time, "monotonic", side_effect=lambda: clock["mono"]),
+            ):
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("PinnedMissing", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache)
+                clock["wall_ns"], clock["mono"] = base_tick_ns + 170_000_000, 1_000.160
+                self.assertEqual(
+                    resolve_workspace_link("PinnedTopic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache),
+                    deep_pinned,
+                )
+                pinned_entries = pinned_cache.scan(compact)
+                for broken in ("PinnedMissing", "OtherPinnedMissing"):
+                    clock["wall_ns"] += 15_000_000
+                    clock["mono"] += 0.015
+                    with self.assertRaises(workspace_links.WorkspaceLinkError):
+                        resolve_workspace_link(broken, wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache)
+                self.assertIs(pinned_cache.scan(compact), pinned_entries)
+
+                beta_missing = beta / "PinnedMissing.md"
+                beta_missing.write_text("# Beta Pinned Missing\n", encoding="utf-8")
+                beta_topic = beta / "PinnedTopic.md"
+                beta_topic.write_text("# Beta Pinned Topic\n", encoding="utf-8")
+                self.assertEqual(
+                    resolve_workspace_link("PinnedMissing", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache),
+                    beta_missing,
+                )
+                self.assertEqual(
+                    resolve_workspace_link("PinnedTopic", wikilink=True, note_path=compact_source, workspace_folder=compact, cache=pinned_cache),
+                    beta_topic,
+                )
+
+            # _fingerprint_racy_entries avoids per-entry DirEntry.is_junction() syscalls on Windows,
+            # ignores attachments/dotfiles/symlinks/beyond-max_depth dirs, and distinguishes real dirs from junctions.
+            class _FakeDirEntry:
+                def __init__(self, name: str, *, sym: bool, is_dir: bool, is_file: bool):
+                    self.name, self._sym, self._dir, self._file = name, sym, is_dir, is_file
+
+                def is_symlink(self) -> bool:
+                    return self._sym
+
+                def is_junction(self) -> bool:
+                    raise AssertionError("DirEntry.is_junction() must not be called in _fingerprint_racy_entries")
+
+                def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+                    return self._dir
+
+                def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                    return self._file
+
+            real_dir_fp = workspace_links._fingerprint_racy_entries(
+                [_FakeDirEntry("Sub", sym=False, is_dir=True, is_file=False)]
+            )
+            self.assertEqual(len(real_dir_fp), 16)
+            self.assertEqual(
+                workspace_links._fingerprint_racy_entries(
+                    [
+                        _FakeDirEntry("Sub", sym=False, is_dir=False, is_file=False),
+                        _FakeDirEntry("diagram.png", sym=False, is_dir=False, is_file=True),
+                        _FakeDirEntry("spec.pdf", sym=False, is_dir=False, is_file=True),
+                        _FakeDirEntry(".hidden.md", sym=False, is_dir=False, is_file=True),
+                        _FakeDirEntry("Link.md", sym=True, is_dir=False, is_file=True),
+                    ]
+                ),
+                b"",
+            )
+            self.assertEqual(
+                workspace_links._fingerprint_racy_entries(
+                    [_FakeDirEntry("Sub", sym=False, is_dir=True, is_file=False)],
+                    allow_subdirs=False,
+                ),
+                b"",
+            )
+
+    def test_large_mixed_attachment_racy_workspace_bounds_metadata_and_validates_unlocked(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            base = Path(root_dir).resolve()
+            root = base / "MixedVault"
+            assets = root / "Assets"
+            notes = root / "Notes"
+            archive = root / "Archive"
+            leaf = root / "Specs" / "Leaf"
+            for folder in (assets, notes, archive, leaf):
+                folder.mkdir(parents=True)
+            for idx in range(6):
+                extra_dir = root / f"Overflow-{idx:02d}"
+                extra_dir.mkdir()
+                (extra_dir / f"Overflow-{idx:02d}.md").write_text("# Overflow\n", encoding="utf-8")
+
+            source = notes / "Source.md"
+            source.write_text("# Source\n", encoding="utf-8")
+            leaf_topic = leaf / "Topic.md"
+            leaf_topic.write_text("# Leaf Topic\n", encoding="utf-8")
+            for idx in range(14):
+                (notes / f"Extra-{idx:02d}.md").write_text("# Extra\n", encoding="utf-8")
+
+            attachment_exts = (".png", ".pdf", ".jpg", ".mp4", ".zip", ".bin")
+            sample_attachment_names = set()
+            for idx in range(600):
+                ext = attachment_exts[idx % len(attachment_exts)]
+                a_name = f"asset-{idx:04d}{ext}"
+                n_name = f"note-media-{idx:04d}{ext}"
+                (assets / a_name).write_bytes(b"a")
+                (notes / n_name).write_bytes(b"n")
+                if idx < 25:
+                    sample_attachment_names.update({a_name, n_name})
+            for idx in range(50):
+                (archive / f"scan-{idx:03d}.png").write_bytes(b"s")
+                (leaf / f"diagram-{idx:03d}.pdf").write_bytes(b"d")
+            (assets / ".DS_Store").write_bytes(b"\x00")
+
+            root = root.resolve()
+            assets = assets.resolve()
+            notes = notes.resolve()
+            archive = archive.resolve()
+            leaf = leaf.resolve()
+            source = source.resolve()
+            leaf_topic = leaf_topic.resolve()
+
+            real_stat = Path.stat
+            base_tick_ns = (real_stat(root, follow_symlinks=False).st_mtime_ns // 1_000_000_000) * 1_000_000_000 + 15_625_000
+            clock = {"wall_ns": base_tick_ns + 20_000_000, "mono": 2_000.0}
+            pinned_dirs = {root, assets, notes, archive, root / "Specs", leaf}
+            pinned_stats = {
+                d: os.stat_result(
+                    tuple(real_stat(d, follow_symlinks=False)),
+                    {"st_mtime_ns": base_tick_ns, "st_ctime_ns": base_tick_ns},
+                )
+                for d in pinned_dirs
+            }
+
+            def pinned_dir_stat(self_path: Path, *, follow_symlinks: bool = True):
+                frozen = pinned_stats.get(self_path)
+                if frozen is not None:
+                    return frozen
+                return real_stat(self_path, follow_symlinks=follow_symlinks)
+
+            ws_b = base / "VaultB"
+            ws_c = base / "VaultC"
+            ws_b.mkdir()
+            ws_c.mkdir()
+            (ws_b / "B.md").write_text("# B\n", encoding="utf-8")
+            (ws_c / "C.md").write_text("# C\n", encoding="utf-8")
+
+            with (
+                mock.patch.object(Path, "stat", pinned_dir_stat),
+                mock.patch.object(workspace_links.time, "time_ns", side_effect=lambda: clock["wall_ns"]),
+                mock.patch.object(workspace_links.time, "monotonic", side_effect=lambda: clock["mono"]),
+            ):
+                # 1. Per-workspace and cross-workspace metadata bounds with 1,300+ attachments present.
+                bounded = WorkspaceLinkCache(
+                    max_files=8, max_dirs=6, max_depth=2, max_workspaces=2, ttl_seconds=60.0
+                )
+                bounded_notes = bounded.scan(root)
+                self.assertEqual(len(bounded_notes), 8)
+                snap = next(iter(bounded._entries.values()))
+                self.assertLessEqual(len(snap.dir_stamps), bounded.max_dirs)
+                self.assertLessEqual(
+                    sum(len(s.racy_fingerprint or b"") for s in snap.dir_stamps),
+                    16 * bounded.max_dirs,
+                )
+                dir_bounded = WorkspaceLinkCache(max_files=100, max_dirs=5, max_depth=2, ttl_seconds=60.0)
+                dir_bounded.scan(root)
+                dir_snap = next(iter(dir_bounded._entries.values()))
+                self.assertEqual(len(dir_snap.dir_stamps), 5)
+                self.assertLessEqual(
+                    sum(len(s.racy_fingerprint or b"") for s in dir_snap.dir_stamps),
+                    16 * dir_bounded.max_dirs,
+                )
+
+                # Inspect object graph of dir_stamps: zero entry tuples, frozensets, or child filenames retained.
+                seen_ids: set[int] = set()
+                queue: list[object] = [snap.dir_stamps, dir_snap.dir_stamps]
+                retained_strings: set[str] = set()
+                while queue:
+                    obj = queue.pop()
+                    obj_id = id(obj)
+                    if obj_id in seen_ids or isinstance(obj, (type, Path)):
+                        continue
+                    seen_ids.add(obj_id)
+                    self.assertNotIsInstance(obj, frozenset)
+                    if isinstance(obj, str):
+                        retained_strings.add(obj)
+                        continue
+                    if isinstance(obj, (tuple, list, dict, set, workspace_links._DirStamp)):
+                        queue.extend(gc.get_referents(obj))
+                self.assertFalse(retained_strings & (sample_attachment_names | {"Source.md", "Topic.md", "Extra-00.md"}))
+
+                bounded.scan(ws_b)
+                bounded.scan(root)  # promote root in LRU order ahead of ws_b
+                bounded.scan(ws_c)
+                self.assertEqual(len(bounded._entries), 2)
+                self.assertEqual({item.root for item in bounded._entries.values()}, {root, ws_c.resolve()})
+
+                # 2. Full racy validation runs completely outside self._lock and ignores attachment churn.
+                cache = WorkspaceLinkCache(max_depth=2, ttl_seconds=60.0)
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("MissingNote", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+                self.assertEqual(
+                    resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    leaf_topic,
+                )
+                full_snap = next(iter(cache._entries.values()))
+                stamps_by_path = {s.path: s for s in full_snap.dir_stamps}
+                self.assertEqual(stamps_by_path[assets].racy_fingerprint, b"")
+                self.assertEqual(len(stamps_by_path[notes].racy_fingerprint or b""), 16)
+                warm_tuple = full_snap.entries
+
+                clock["wall_ns"] += 25_000_000
+                clock["mono"] += 0.025
+                real_scandir = os.scandir
+                scandir_lock_states: list[bool] = []
+
+                def unlocked_scandir_probe(target_dir):
+                    scandir_lock_states.append(cache._lock.locked())
+                    return real_scandir(target_dir)
+
+                with mock.patch.object(os, "scandir", side_effect=unlocked_scandir_probe):
+                    self.assertIs(cache.scan(root), warm_tuple)
+                self.assertGreaterEqual(len(scandir_lock_states), len(pinned_dirs))
+                self.assertFalse(any(scandir_lock_states))
+
+                # Concurrent invalidate() mid-validation never deadlocks and prevents stale hit commit.
+                invalidated_once = {"done": False}
+
+                def invalidate_mid_validation(target_dir):
+                    if not invalidated_once["done"] and Path(target_dir) == notes:
+                        invalidated_once["done"] = True
+                        (archive / "MidInvalidation.md").write_text("# Fresh\n", encoding="utf-8")
+                        cache.invalidate(root)
+                    return real_scandir(target_dir)
+
+                with mock.patch.object(os, "scandir", side_effect=invalidate_mid_validation):
+                    refreshed_entries = cache.scan(root)
+                self.assertTrue(invalidated_once["done"])
+                self.assertTrue(any(item.name == "MidInvalidation.md" for item in refreshed_entries))
+                warm_tuple = cache.scan(root)
+
+                # Same-tick attachment churn, dotfiles, symlinks, and beyond-max_depth folders do not invalidate.
+                (assets / "burst-new.png").write_bytes(b"png")
+                (assets / "asset-0000.png").rename(assets / "asset-0000-renamed.png")
+                (assets / "asset-0001.pdf").unlink()
+                (notes / "inline-video.mp4").write_bytes(b"mp4")
+                (notes / "note-media-0000.png").unlink()
+                (archive / ".hidden-draft.md").write_text("# Hidden\n", encoding="utf-8")
+                _try_create_link(archive / "SymNote.md", source)
+                too_deep = leaf / "TooDeep"
+                too_deep.mkdir()
+                (too_deep / "IgnoredDeep.md").write_text("# Beyond max_depth\n", encoding="utf-8")
+
+                clock["wall_ns"] += 15_000_000
+                clock["mono"] += 0.015
+                self.assertIs(cache.scan(root), warm_tuple)
+                with self.assertRaises(workspace_links.WorkspaceLinkError):
+                    resolve_workspace_link("MissingNote", wikilink=True, note_path=source, workspace_folder=root, cache=cache)
+
+                # 3. Same-tick note or eligible directory addition inside attachment-heavy folders refreshes immediately.
+                assets_note = assets / "MissingNote.md"
+                assets_note.write_text("# Added beside 600 attachments\n", encoding="utf-8")
+                archive_topic = archive / "Topic.md"
+                archive_topic.write_text("# Higher-ranked Archive Topic\n", encoding="utf-8")
+                self.assertEqual(
+                    resolve_workspace_link("MissingNote", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    assets_note,
+                )
+                self.assertEqual(
+                    resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    archive_topic,
+                )
+
+                alpha = root / "Alpha"
+                alpha.mkdir()
+                alpha_topic = (alpha / "Topic.md").resolve()
+                alpha_topic.write_text("# Highest-ranked Alpha Topic\n", encoding="utf-8")
+                self.assertEqual(
+                    resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                    alpha_topic,
+                )
+
+    def test_cached_exact_nested_match_refreshes_when_higher_ranked_exact_target_added_externally(self):
+        with tempfile.TemporaryDirectory() as root_dir:
+            root = Path(root_dir) / "Vault"
+            notes = root / "Notes"
+            archive = root / "Archive"
+            deep = root / "Specs" / "Deep"
+            notes.mkdir(parents=True)
+            archive.mkdir(parents=True)
+            deep.mkdir(parents=True)
+            root = root.resolve()
+            notes = notes.resolve()
+            archive = archive.resolve()
+            deep = deep.resolve()
+
+            source = notes / "Source.md"
+            source.write_text("# Source\n", encoding="utf-8")
+            deep_topic = deep / "Topic.md"
+            deep_topic.write_text("# Deep Exact Topic\n", encoding="utf-8")
+            deep_ext_smd = deep / "ExtRank.smd"
+            deep_ext_smd.write_text("# Deep Exact SMD\n", encoding="utf-8")
+
+            cache = WorkspaceLinkCache(ttl_seconds=60.0)
+
+            # Warm cache with exact nested match at depth 2 and confirm warm-hit behavior.
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_topic,
+            )
+            with mock.patch.object(
+                workspace_links,
+                "_is_entry_link_or_junction",
+                wraps=workspace_links._is_entry_link_or_junction,
+            ) as guard_probe:
+                self.assertEqual(cache.scan(root)[0].path.parent.parent, root)
+                self.assertEqual(guard_probe.call_count, 0)
+
+            # 1. Shallower exact match added externally in an existing folder beats cached depth-2 exact match.
+            specs_topic = root / "Specs" / "Topic.md"
+            specs_topic.write_text("# Shallower Specs Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                specs_topic.resolve(),
+            )
+
+            # 2. Alphabetically earlier exact match at same depth in an existing folder wins within TTL.
+            archive_topic = archive / "Topic.md"
+            archive_topic.write_text("# Archive Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                archive_topic,
+            )
+
+            # 3. Brand-new folder created externally with a higher-ranked exact target wins within TTL.
+            alpha = root / "Alpha"
+            alpha.mkdir()
+            alpha_topic = alpha / "Topic.md"
+            alpha_topic.write_text("# Alpha Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                alpha_topic.resolve(),
+            )
+
+            # 4. Higher-priority extension (.md ahead of cached .smd) in the same nested folder wins within TTL.
+            self.assertEqual(
+                resolve_workspace_link("ExtRank", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_ext_smd,
+            )
+            deep_ext_md = deep / "ExtRank.md"
+            deep_ext_md.write_text("# Deep Exact MD\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("ExtRank", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                deep_ext_md,
+            )
+
+            # 5. Same-directory exact target added externally beats all cross-folder matches.
+            same_dir_topic = notes / "Topic.md"
+            same_dir_topic.write_text("# Same Dir Topic\n", encoding="utf-8")
+            self.assertEqual(
+                resolve_workspace_link("Topic", wikilink=True, note_path=source, workspace_folder=root, cache=cache),
+                same_dir_topic,
+            )
 
     def test_case_insensitive_fs_preserves_exact_case_ranking_and_invalidates_across_case_variants(self):
         with tempfile.TemporaryDirectory() as root_dir:
@@ -423,8 +937,9 @@ class StudioOpenTabJumpTest(unittest.TestCase):
         shutil.rmtree(self.session.data, ignore_errors=True)
 
     def test_nested_wikilink_and_open_tab_jump_retain_drafts_update_recent_and_invalidate_on_rename(self):
-        vault = (self.studio.data / "vault").resolve()
+        vault = self.studio.data / "vault"
         vault.mkdir(parents=True, exist_ok=True)
+        vault = vault.resolve()
         first = vault / "First.md"
         first.write_text("# First\n\nSee [[Second Note#Architecture]]\n", encoding="utf-8")
         nested = vault / "Specs"
@@ -516,11 +1031,88 @@ class StudioOpenTabJumpTest(unittest.TestCase):
         self.assertEqual(studio.active, first_tab_id)
         self.assertEqual(studio._current()["content"], "# First (unsaved draft)\n")
 
+    def test_external_higher_ranked_exact_target_supersedes_cached_nested_tab_without_losing_dirty_draft(self):
+        vault = self.studio.data / "ranked_vault"
+        notes = vault / "Notes"
+        archive = vault / "Archive"
+        deep = vault / "Specs" / "Deep"
+        notes.mkdir(parents=True, exist_ok=True)
+        archive.mkdir(parents=True, exist_ok=True)
+        deep.mkdir(parents=True, exist_ok=True)
+        vault = vault.resolve()
+        notes = notes.resolve()
+        archive = archive.resolve()
+        deep = deep.resolve()
+
+        index_note = notes / "Index.md"
+        index_note.write_text("# Index\n\nSee [[Topic]]\n", encoding="utf-8")
+        deep_topic = deep / "Topic.md"
+        deep_topic.write_text("# Deep Topic\n", encoding="utf-8")
+
+        studio = self.studio
+        studio.ready = True
+        studio.settings["autosave"] = False
+        replies = []
+        studio.replied.connect(lambda req_id, res, err: replies.append((req_id, res, err)))
+
+        studio.openFolder(str(vault))
+        studio.openNote(str(index_note))
+        self._wait_until(lambda: studio._current()["path"] == str(index_note))
+
+        # Populate warm cache with nested exact match Specs/Deep/Topic.md and mark its open tab dirty.
+        replies.clear()
+        studio.post("rank-1", "open_workspace_link", json.dumps({
+            "documentPath": str(index_note),
+            "target": "Topic",
+            "wikilink": True,
+        }))
+        self._wait_until(lambda: any(r[0] == "rank-1" for r in replies))
+        self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == "rank-1"))["opened"])
+        self.assertEqual(studio._current()["path"], str(deep_topic))
+        deep_tab_id = studio.active
+        studio.post("dirty-deep", "document_changed", json.dumps({
+            "id": deep_tab_id,
+            "content": "# Deep Topic (unsaved draft)\n",
+        }))
+
+        # Externally add a higher-ranked shallower exact target Archive/Topic.md without calling invalidate().
+        archive_topic = archive / "Topic.md"
+        archive_topic.write_text("# Archive Topic\n", encoding="utf-8")
+
+        replies.clear()
+        studio.post("rank-2", "open_workspace_link", json.dumps({
+            "documentPath": str(index_note),
+            "target": "Topic",
+            "wikilink": True,
+        }))
+        self._wait_until(lambda: any(r[0] == "rank-2" for r in replies))
+        self.assertTrue(json.loads(next(r[1] for r in replies if r[0] == "rank-2"))["opened"])
+        self.assertEqual(studio._current()["path"], str(archive_topic))
+        self.assertEqual(studio.recent[0], str(archive_topic))
+
+        # Previously open Specs/Deep/Topic.md tab retains its dirty draft and can still be focused by subpath.
+        deep_tab = next(t for t in studio.tabs if t["id"] == deep_tab_id)
+        self.assertEqual(deep_tab["content"], "# Deep Topic (unsaved draft)\n")
+
+        tab_count = len(studio.tabs)
+        replies.clear()
+        studio.post("rank-3", "open_workspace_link", json.dumps({
+            "documentPath": str(index_note),
+            "target": "Specs/Deep/Topic",
+            "wikilink": True,
+        }))
+        self._wait_until(lambda: any(r[0] == "rank-3" for r in replies))
+        self.assertEqual(len(studio.tabs), tab_count)
+        self.assertEqual(studio.active, deep_tab_id)
+        self.assertEqual(studio._current()["content"], "# Deep Topic (unsaved draft)\n")
+
     @unittest.skipIf(workspace_links._fcntl is None, "POSIX fcntl.fcntl FCNTL_BUFSZ test")
     def test_darwin_studio_rejects_traversal_and_symlinks_and_runs_folder_hooks_without_fcntl_error(self):
-        sandbox = (self.studio.data / "darwin_containment").resolve()
+        sandbox = self.studio.data / "darwin_containment"
         folder = sandbox / "guarded"
         folder.mkdir(parents=True, exist_ok=True)
+        sandbox = sandbox.resolve()
+        folder = folder.resolve()
         outside = sandbox / "outside.md"
         outside.write_text("# Secret\n", encoding="utf-8")
         inside = folder / "Inside.md"
