@@ -49,7 +49,7 @@ import {rememberWindowedScrollSource} from './windowedSearch';
 import ReadingSearch, { isValidSeedOccurrence, type ReadingSearchSeed } from "./components/ReadingSearch";
 import type { Point } from "./focalZoom";
 import { applyDocumentZoom,documentPoint,invalidateDocumentZoom,settleDocumentZoom,refreshDocumentExtent,enforceDocumentCenter } from "./documentZoom";
-import { documentOutline, navigateToHeading, cancelHeadingNavigation, resolveHeadingOffset } from "./documentNavigation";
+import { documentOutline, navigateToHeading, cancelHeadingNavigation, readingKeyboardScrollDelta, resolveHeadingOffset } from "./documentNavigation";
 import { readerSourceAnalysis } from "./readerSourceAnalysis";
 import {OutlineWorkerClient} from './outlineWorker';
 import {applyHistoryEdit,replayHistory,transferHistory,trimHistoryCache,tryLiveTextareaHistory,validHistory,type LiveHistoryEditMeta,type NoteHistory} from './noteHistory';
@@ -810,13 +810,13 @@ export function Reader() {
       else if(root instanceof HTMLElement&&!event.ctrlKey&&!event.metaKey&&!target.closest('textarea,input,.interactive-chart,.note-image,[data-independent-zoom]')){rememberWindowedScrollSource(root,event.deltaY*(event.deltaMode===1?16:event.deltaMode===2?root.clientHeight:1));if(Math.abs(event.deltaY)>2)requestChrome('hide');}
     };
     const scrollKey=(event:KeyboardEvent)=>{
-      const target=event.target as Element;
-      if(event.defaultPrevented||event.ctrlKey||event.metaKey||event.altKey||target.closest('input,textarea,button,summary,[contenteditable="true"],.image-viewer,.media-dialog,.reading-search'))return;
-      const root=target.closest<HTMLElement>('.android-reading')||(target===document.body?document.querySelector<HTMLElement>('.android-reading'):null);
+      const target=event.target instanceof Element?event.target:null;
+      const root=target?.closest<HTMLElement>('.android-reading')||(!target||target===document.body||target===document.documentElement?document.querySelector<HTMLElement>('.android-reading'):null);
       if(!root)return;
-      const page=root.clientHeight*.875;
-      const delta=event.key==='ArrowUp'?-40:event.key==='ArrowDown'?40:event.key==='PageUp'?-page:event.key==='PageDown'?page:event.key===' '?(event.shiftKey?-page:page):0;
-      if(delta)rememberWindowedScrollSource(root,delta);
+      const delta=readingKeyboardScrollDelta(event,root);
+      if(delta===null)return;
+      cancelHeadingNavigation(root);
+      rememberWindowedScrollSource(root,delta);
     };
     document.addEventListener("wheel",wheel,{passive:false});
     document.addEventListener('keydown',scrollKey);
