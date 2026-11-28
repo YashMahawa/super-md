@@ -85,6 +85,21 @@ def _is_link_or_junction(path: Path) -> bool:
     return bool(callable(is_junction) and is_junction())
 
 
+def is_hidden_name(name: str) -> bool:
+    """Return True when a filesystem entry basename is hidden (dot-prefixed)."""
+    return bool(name and name not in (".", "..") and name.startswith("."))
+
+
+def has_hidden_relative_segment(path: Path, root: Path) -> bool:
+    """Return True if any path segment of *path* relative to *root* is dot-prefixed."""
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        rel = normalized_relpath(path, root)
+        rel_parts = () if rel == "." else PurePosixPath(rel).parts
+    return any(is_hidden_name(part) for part in rel_parts)
+
+
 def strip_extended_length_prefix(raw: str) -> str:
     """Strip Win32 extended-length path prefixes (\\\\?\\) while preserving standard paths."""
     if raw.startswith("\\\\?\\UNC\\"):

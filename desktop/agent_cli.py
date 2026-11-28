@@ -4,31 +4,32 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
+
+_DESKTOP_DIR = str(Path(__file__).resolve().parent)
+if _DESKTOP_DIR not in sys.path:
+    sys.path.insert(0, _DESKTOP_DIR)
 
 try:
+    from .agent.cli_common import emit_json, heading_selector, make_json_argument_parser
     from .agent_documents import AgentDocumentError, DocumentStore
     from .agent_stdio import configure_stdio
 except ImportError:  # python desktop/agent_cli.py
+    from agent.cli_common import emit_json, heading_selector, make_json_argument_parser
     from agent_documents import AgentDocumentError, DocumentStore
     from agent_stdio import configure_stdio
+
+if __name__ in ("agent_cli", "desktop.agent_cli"):
+    sys.modules.setdefault("agent_cli", sys.modules[__name__])
+    sys.modules.setdefault("desktop.agent_cli", sys.modules[__name__])
 
 
 class _UsageError(Exception):
     pass
 
 
-class _JSONArgumentParser(argparse.ArgumentParser):
-    def error(self, message):
-        sys.stdout.write(json.dumps({"ok": False, "error": {"type": "UsageError", "message": message[:1000]}},
-                                     separators=(",", ":")) + "\n")
-        raise _UsageError(message)
-
-
-def _heading_selector(value: str) -> int | str:
-    try:
-        return int(value)
-    except ValueError:
-        return value
+_JSONArgumentParser = make_json_argument_parser(_UsageError, emit_error=True)
+_heading_selector = heading_selector
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -102,12 +103,14 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _emit(value: dict) -> None:
-    # Exactly one bounded JSON record is written to stdout on success or failure.
-    configure_stdio(stdin=False, stderr=False)
-    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if len(encoded.encode("utf-8")) > 64_000:
-        raise AgentDocumentError("Response exceeded the 64 KB output limit; request a smaller page")
-    sys.stdout.write(encoded + "\n")
+    emit_json(value, error_cls=AgentDocumentError, message="Response exceeded the 64 KB output limit; request a smaller page")
+
+
+def _load_attr(module: str, attr: str):
+    try:
+        return getattr(__import__(f"{__package__}.{module}", fromlist=[attr]), attr) if __package__ else getattr(__import__(module, fromlist=[attr]), attr)
+    except ImportError:
+        return getattr(__import__(module, fromlist=[attr]), attr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -118,32 +121,15 @@ def main(argv: list[str] | None = None) -> int:
     # without importing Qt; stdio remains reserved for MCP protocol traffic.
     if argv and argv[0] in ("install-skill", "service"):
         try:
-            if argv[0] == "install-skill":
-                try:
-                    from .install_skill import main as extension_main
-                except ImportError:
-                    from install_skill import main as extension_main
-            else:
-                try:
-                    from .background_cli import main as extension_main
-                except ImportError:
-                    from background_cli import main as extension_main
-            return extension_main(argv[1:])
+            mod = "install_skill" if argv[0] == "install-skill" else "background_cli"
+            return _load_attr(mod, "main")(argv[1:])
         except (ValueError, OSError, ImportError) as error:
             _emit({"ok": False, "error": {"type": type(error).__name__, "message": str(error)[:1000]}})
             return 2
     if argv and argv[0] == "mcp":
-        try:
-            from .mcp_server import main as mcp_main
-        except ImportError:
-            from mcp_server import main as mcp_main
-        return mcp_main(argv[1:])
+        return _load_attr("mcp_server", "main")(argv[1:])
     if argv and argv[0] == "live":
-        try:
-            from .agent_live_cli import main as live_main
-        except ImportError:
-            from agent_live_cli import main as live_main
-        return live_main(argv[1:])
+        return _load_attr("agent_live_cli", "main")(argv[1:])
     parser = _parser()
     try:
         args = parser.parse_args(argv)
@@ -195,12 +181,18 @@ def main(argv: list[str] | None = None) -> int:
                 raise AgentDocumentError(f"Invalid patch JSON at character {exc.pos}") from exc
             result = store.patch(args.path, expected_revision=args.revision, operations=operations)
         elif args.command == "call":
-            from agent_call import call
+            try:
+                from .agent_call import call
+            except ImportError:
+                from agent_call import call
             result=call(args.root,args.tool,json.loads(args.arguments_json),sessions=args.live_sessions_dir,output=args.output)
             _emit({"ok":not result.get("is_error",False),"result":result})
             return 2 if result.get("is_error",False) else 0
         elif args.command == "preview":
-            from agent_preview import preview
+            try:
+                from .agent_preview import preview
+            except ImportError:
+                from agent_preview import preview
             result=preview(store,args.path,args.output_path,width=args.width,height=args.height,heading=args.heading,dark=args.dark,snapshot_value=args.snapshot)
         elif args.command == "assets":
             result = store.assets(args.path, offset=args.offset, limit=args.limit)
