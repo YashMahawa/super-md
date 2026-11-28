@@ -68,4 +68,3 @@ it('preserves full intrinsic vector markup for media export and PDF preparation 
     expect(atob(svgAssets[1][1])).toContain('width="1284"');
   }finally{act(()=>root.unmount());host.remove();}
 });
-

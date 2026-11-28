@@ -299,4 +299,3 @@ export function svgSizingStyle(dimensions: SvgDimensions | null | undefined): Re
     "--svg-min-width": `${panFloor}px`,
   };
 }
-
