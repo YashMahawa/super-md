@@ -81,10 +81,10 @@ class WorkspaceFolderAndRenameTest {
 
     @Test
     fun parentFolderRelativeStepsUpOneDirectoryAtATime() {
-        assertEquals("courses/math", parentFolderRelative("courses/math/algebra"))
-        assertEquals("courses", parentFolderRelative("courses/math"))
-        assertEquals("", parentFolderRelative("courses"))
-        assertEquals("", parentFolderRelative(""))
+        assertEquals("courses/math", parentRelativePath("courses/math/algebra"))
+        assertEquals("courses", parentRelativePath("courses/math"))
+        assertEquals("", parentRelativePath("courses"))
+        assertEquals("", parentRelativePath(""))
     }
 
     @Test

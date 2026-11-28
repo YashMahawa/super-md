@@ -389,7 +389,6 @@ sys.exit(code)
         self.assertEqual(result["openedExternal"], [])
 
     def test_opening_smd_and_streaming_embedded_raster_decodes_once_and_evicts_on_invalidation(self):
-        import time
         import documents
 
         session = Session(True)
