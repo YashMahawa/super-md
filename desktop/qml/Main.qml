@@ -470,56 +470,81 @@ ApplicationWindow {
                         color: viewState.colors["surface-high"]
                         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: viewState.colors.outline; opacity: .55 }
                     }
-                    contentItem: RowLayout {
-                        spacing: 10
-                        ToolButton {
-                            enabled: false
-                            focusPolicy: Qt.NoFocus
-                            padding: 0
-                            background: null
-                            icon.source: "../icons/Warning.svg"
-                            icon.color: viewState.colors.primary
-                            icon.width: 20
-                            icon.height: 20
-                            Layout.preferredWidth: 24
-                            Layout.preferredHeight: 24
-                            Layout.alignment: Qt.AlignVCenter
+                    contentItem: GridLayout {
+                        id: conflictBannerLayout
+                        readonly property bool compactBanner: conflictBanner.availableWidth < 780
+                        readonly property bool activeDirty: {
+                            const list = typeof tabsState !== "undefined" && tabsState ? tabsState : (viewState && viewState.tabs ? viewState.tabs : [])
+                            const currentId = typeof activeTabId !== "undefined" && activeTabId ? String(activeTabId) : (viewState && viewState.active ? String(viewState.active) : "")
+                            for (let index = 0; index < list.length; index += 1) {
+                                if (list[index] && String(list[index].id) === currentId) return Boolean(list[index].dirty)
+                            }
+                            return false
                         }
-                        Label {
-                            objectName: "conflictBannerLabel"
-                            text: "This file changed on disk. Autosave is paused so your draft isn't overwritten."
-                            color: viewState.colors.text
-                            font.pixelSize: 13
-                            font.weight: Font.Medium
-                            wrapMode: Text.WordWrap
+                        columns: compactBanner ? 1 : 2
+                        columnSpacing: 12
+                        rowSpacing: 8
+                        RowLayout {
                             Layout.fillWidth: true
-                            Layout.alignment: Qt.AlignVCenter
+                            spacing: 10
+                            ToolButton {
+                                enabled: false
+                                focusPolicy: Qt.NoFocus
+                                padding: 0
+                                background: null
+                                icon.source: "../icons/Warning.svg"
+                                icon.color: viewState.colors.primary
+                                icon.width: 20
+                                icon.height: 20
+                                Layout.preferredWidth: 24
+                                Layout.preferredHeight: 24
+                                Layout.alignment: Qt.AlignVCenter
+                            }
+                            Label {
+                                objectName: "conflictBannerLabel"
+                                text: conflictBannerLayout.activeDirty
+                                    ? "This file changed on disk. Autosave is paused — Reload from disk keeps your draft in closed tabs."
+                                    : "This file changed on disk. Autosave is paused so your draft isn't overwritten."
+                                color: viewState.colors.text
+                                font.pixelSize: 13
+                                font.weight: Font.Medium
+                                wrapMode: Text.WordWrap
+                                Layout.fillWidth: true
+                                Layout.alignment: Qt.AlignVCenter
+                            }
                         }
-                        ActionButton {
-                            objectName: "conflictSaveAsButton"
-                            text: "Save as"
-                            glyph: "FloppyDisk"
-                            compact: true
-                            prominent: true
-                            enabled: !viewState.busy
-                            onClicked: studio.resolveConflict("save_as")
-                        }
-                        ActionButton {
-                            objectName: "conflictReloadButton"
-                            text: "Reload from disk"
-                            glyph: "ArrowClockwise"
-                            compact: true
-                            tonal: true
-                            enabled: !viewState.busy
-                            onClicked: studio.resolveConflict("reload")
-                        }
-                        ActionButton {
-                            objectName: "conflictOverwriteButton"
-                            text: "Overwrite"
-                            compact: true
-                            tonal: true
-                            enabled: !viewState.busy
-                            onClicked: studio.resolveConflict("overwrite")
+                        Flow {
+                            objectName: "conflictBannerActions"
+                            spacing: 8
+                            Layout.fillWidth: conflictBannerLayout.compactBanner
+                            Layout.maximumWidth: conflictBanner.availableWidth
+                            Layout.alignment: conflictBannerLayout.compactBanner ? Qt.AlignLeft : (Qt.AlignRight | Qt.AlignVCenter)
+                            ActionButton {
+                                objectName: "conflictSaveAsButton"
+                                text: "Save as"
+                                glyph: "FloppyDisk"
+                                compact: true
+                                prominent: true
+                                enabled: !viewState.busy
+                                onClicked: studio.resolveConflict("save_as")
+                            }
+                            ActionButton {
+                                objectName: "conflictReloadButton"
+                                text: "Reload from disk"
+                                glyph: "ArrowClockwise"
+                                compact: true
+                                tonal: true
+                                enabled: !viewState.busy
+                                onClicked: studio.resolveConflict("reload")
+                            }
+                            ActionButton {
+                                objectName: "conflictOverwriteButton"
+                                text: "Overwrite"
+                                compact: true
+                                tonal: true
+                                enabled: !viewState.busy
+                                onClicked: studio.resolveConflict("overwrite")
+                            }
                         }
                     }
                 }
@@ -761,7 +786,7 @@ ApplicationWindow {
     AppDialog {
         id: saveConflictDialog
         objectName: "saveConflictDialog"
-        width: 480
+        width: Math.min(480, window.width - 48)
         closePolicy: Popup.NoAutoClose
         ColumnLayout {
             width: parent.width

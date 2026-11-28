@@ -242,15 +242,18 @@ ScrollView {
                 required property bool tabDirty
                 required property bool tabConflict
                 readonly property bool isActive: tabId === strip.activeTabId
-                width: Math.min(260, label.implicitWidth + 64)
+                width: Math.min(tab.tabConflict ? 284 : 260, label.implicitWidth + (tab.tabConflict ? 88 : 64))
                 height: 40
                 y: (strip.height - height) / 2
                 onXChanged: if (isActive) strip.scheduleRevealActiveTab()
                 onWidthChanged: if (isActive) strip.scheduleRevealActiveTab()
+                onTabConflictChanged: strip.scheduleRevealActiveTab()
                 objectName: "noteTab"
                 radius: 18
                 antialiasing: true
                 color: tab.isActive ? strip.viewState.colors["surface-high"] : strip.viewState.colors.surface
+                border.width: tab.tabConflict ? 1 : 0
+                border.color: strip.viewState.colors.primary
                 Drag.dragType: Drag.Automatic
                 Drag.supportedActions: Qt.MoveAction
                 Drag.proposedAction: Qt.MoveAction
@@ -296,7 +299,26 @@ ScrollView {
                 RowLayout {
                     anchors.fill: parent
                     spacing: 0
-                    ActionButton { id: label; objectName: "noteTabLabel"; compact: true; text: (tab.tabDirty ? "• " : "") + tab.tabName; Layout.fillWidth: true; ToolTip.text: tab.tabPath || tab.tabName; onClicked: studio.selectTab(tab.tabId) }
+                    ActionButton { id: label; objectName: "noteTabLabel"; compact: true; text: (tab.tabDirty ? "• " : "") + tab.tabName; Layout.fillWidth: true; ToolTip.text: (tab.tabConflict ? "Changed on disk · " : "") + (tab.tabPath || tab.tabName); onClicked: studio.selectTab(tab.tabId) }
+                    ToolButton {
+                        objectName: "tabConflictIndicator"
+                        visible: tab.tabConflict
+                        focusPolicy: Qt.NoFocus
+                        padding: 0
+                        implicitWidth: 24
+                        implicitHeight: 36
+                        Layout.preferredWidth: 24
+                        Layout.preferredHeight: 36
+                        Layout.alignment: Qt.AlignVCenter
+                        background: null
+                        icon.source: "../icons/Warning.svg"
+                        icon.width: 16
+                        icon.height: 16
+                        icon.color: strip.viewState.colors.primary
+                        Accessible.name: tab.tabName + " changed on disk"
+                        onClicked: studio.selectTab(tab.tabId)
+                        Hint { objectName: "conflictTabHint"; colors: strip.viewState.colors; requested: parent.hovered; text: "Changed on disk · select tab to resolve" }
+                    }
                     ActionButton { objectName: "noteTabCloseButton"; glyph: "X"; compact: true; implicitWidth: 36; Accessible.name: "Close " + tab.tabName; ToolTip.text: tab.isActive ? strip.shortcutHint("Close " + tab.tabName, "close_tab", "") : "Close " + tab.tabName; onClicked: { const id = tab.tabId; Qt.callLater(function() { studio.closeTabSafely(id) }) } }
                 }
                 DropArea {

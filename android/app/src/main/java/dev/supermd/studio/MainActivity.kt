@@ -22,6 +22,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.FiniteAnimationSpec
 import androidx.compose.animation.core.snap
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -51,6 +52,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -1160,7 +1162,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                             onRename = { renaming = true },
                             onSettings = { settingsSection = null; settings = true },
                         )
-                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::requestClose, model::reorder, model::newNote)
+                        if(!state.fullscreen) NoteTabs(state.tabs, state.active.id, motion, model::select, model::requestClose, model::reorder, model::newNote, conflictedIds = state.conflictedTabIds)
                         if(!state.fullscreen) StudioModeBar(
                             wide = wide,
                             actualMode = actualMode,
@@ -1179,6 +1181,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
                                 onSaveAs = { model.beginSaveAs() },
                                 onReload = { model.reloadFromDisk() },
                                 onOverwrite = { model.saveManual(forceOverwrite = true) },
+                                dirty = state.active.dirty,
                             )
                         }
                         HorizontalDivider(color = palette.outlineVariant.copy(alpha = .55f))
@@ -1704,31 +1707,83 @@ internal fun buildHighlightedSnippet(
         dismissButton = { if (step > 0) TextButton(onClick = { if (step == 2) open() else step-- }) { Text(if (step == 2) "Open a note" else "Back") } })
 }
 
-@Composable private fun ConflictBanner(
+@Composable internal fun ConflictBanner(
     busy: Boolean,
     onSaveAs: () -> Unit,
     onReload: () -> Unit,
     onOverwrite: () -> Unit,
+    dirty: Boolean = false,
 ) {
     val palette = MaterialTheme.colorScheme
+    val actionPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
     Surface(
         color = palette.errorContainer,
         contentColor = palette.onErrorContainer,
-        shape = RoundedCornerShape(16.dp),
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+        shape = RoundedCornerShape(14.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .testTag("conflictBanner"),
     ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(painterResource(R.drawable.symbol_warning), null, Modifier.size(20.dp), tint = palette.onErrorContainer)
+        Column(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    painterResource(R.drawable.symbol_warning),
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = palette.onErrorContainer,
+                )
                 Column(Modifier.weight(1f)) {
-                    Text("Changed on disk", style = MaterialTheme.typography.titleSmall)
-                    Text("This file was modified outside Super MD. Autosave is paused for this tab.", style = MaterialTheme.typography.bodySmall)
+                    Text("Changed on disk", style = MaterialTheme.typography.labelLarge)
+                    Text(
+                        text = if (dirty) {
+                            "Modified outside Super MD · autosave paused. Reloading keeps your draft in closed tabs."
+                        } else {
+                            "Modified outside Super MD · autosave paused for this tab."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                FilledTonalButton(onClick = onSaveAs, enabled = !busy) { Text("Save as") }
-                OutlinedButton(onClick = onReload, enabled = !busy) { Text("Reload from disk") }
-                TextButton(onClick = onOverwrite, enabled = !busy) { Text("Overwrite") }
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                FilledTonalButton(
+                    onClick = onSaveAs,
+                    enabled = !busy,
+                    contentPadding = actionPadding,
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = palette.onErrorContainer,
+                        contentColor = palette.errorContainer,
+                    ),
+                ) {
+                    Text("Save as", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                }
+                OutlinedButton(
+                    onClick = onReload,
+                    enabled = !busy,
+                    contentPadding = actionPadding,
+                    border = BorderStroke(1.dp, palette.onErrorContainer.copy(alpha = 0.55f)),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = palette.onErrorContainer),
+                ) {
+                    Text("Reload from disk", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                }
+                TextButton(
+                    onClick = onOverwrite,
+                    enabled = !busy,
+                    contentPadding = actionPadding,
+                    colors = ButtonDefaults.textButtonColors(contentColor = palette.onErrorContainer),
+                ) {
+                    Text("Overwrite", style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                }
             }
         }
     }
