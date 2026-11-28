@@ -1,7 +1,6 @@
 """Portable SMD compatibility and bounded asset access, without Qt dependencies."""
 import base64
 from collections import OrderedDict
-import gzip
 import hashlib
 import json
 import os

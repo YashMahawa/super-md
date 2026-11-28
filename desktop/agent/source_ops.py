@@ -308,16 +308,6 @@ def resolve_heading(headings: list[dict], selector: int | str) -> dict:
     raise AgentDocumentError(f"No heading matches '{query[:80]}'; use an exact title, slug, or outline index")
 
 
-def section_source(source: str, selector: int | str) -> dict:
-    """Return the exact source range for one heading and its nested subsections."""
-    if not isinstance(source, str):
-        raise AgentDocumentError("source must be text")
-    heading = resolve_heading(_headings(source, include_internal=True), selector)
-    start, end = heading["sectionStart"], heading["sectionEnd"]
-    return {"text": source[start:end], "sectionStart": start, "sectionEnd": end,
-            "documentLength": len(source)}
-
-
 def _word_character(value: str) -> bool:
     return value == "_" or (bool(value) and unicodedata.category(value)[0] in ("L", "N"))
 
