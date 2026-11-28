@@ -158,7 +158,7 @@ def init_studio_window(
     studio_obj._folder_search_open, studio_obj._folder_search_query = False, ""
     studio_obj._folder_search_case_sensitive, studio_obj._folder_search_include_diagrams = False, False
     studio_obj._folder_search_matches: list[dict] = []
-    studio_obj._folder_search_scanning, studio_obj._folder_search_scanned_files, studio_obj._folder_search_truncated = False, 0, False
+    studio_obj._folder_search_scanning, studio_obj._folder_search_pending, studio_obj._folder_search_scanned_files, studio_obj._folder_search_truncated = False, False, 0, False
     studio_obj._folder_search_generation, studio_obj._folder_search_cancel, studio_obj._folder_search_tabs_sig = 0, None, None
     studio_obj._pending_seeded_find: dict | None = None
     studio_obj.mode = studio_obj.settings.get("readingMode", "live")
@@ -389,6 +389,7 @@ def stop_window(
     _call_optional(studio_obj, "_cancel_subfolder_search")
     if getattr(studio_obj, "_folder_search_cancel", None) is not None:
         studio_obj._folder_search_cancel.set()
+    studio_obj._folder_search_pending = False
     if (search_pool := getattr(studio_obj, "_search_pool", None)) is not None:
         search_pool.shutdown(wait=False, cancel_futures=True)
     if (python_pool := getattr(studio_obj, "_python_pool", None)) is not None:

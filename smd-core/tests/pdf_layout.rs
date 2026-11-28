@@ -715,3 +715,36 @@ fn explicit_equation_tags_and_resolved_references_render_in_headless_pdf() {
         );
     }
 }
+
+#[test]
+fn stacked_inline_fractions_leave_clearance_between_lines() {
+    let markdown = "$\\dfrac{111}{222}$  \n$\\dfrac{333}{444}$";
+    // Exercise a saved compact preset so the regression cannot pass simply
+    // because fresh installations use a more generous default.
+    let options = PdfOptions { line_height: 1.4, ..PdfOptions::default() };
+    let pdf = export(markdown, &options, &HashMap::new()).unwrap();
+    assert_eq!(count_pdf_pages(&pdf), 1);
+    let path = std::env::temp_dir().join(format!("supermd-inline-math-{}.pdf", std::process::id()));
+    std::fs::write(&path, pdf).unwrap();
+    let output = std::process::Command::new("pdftotext")
+        .arg("-bbox").arg(&path).arg("-").output();
+    let _ = std::fs::remove_file(&path);
+    if require_poppler() {
+        assert!(output.as_ref().is_ok_and(|out| out.status.success()), "PDF bounding boxes are required on Linux CI");
+    }
+    if let Ok(output) = output {
+        if !output.status.success() { return; }
+        let xml = std::str::from_utf8(&output.stdout).unwrap();
+        let html = &xml[xml.find("<html").expect("missing PDF bounding box document")..];
+        let document = roxmltree::Document::parse(html).unwrap();
+        let vertical_edge = |text, attribute| {
+            document.descendants()
+                .find(|node| node.has_tag_name("word") && node.text() == Some(text))
+                .and_then(|node| node.attribute(attribute))
+                .unwrap_or_else(|| panic!("missing {attribute} for {text}"))
+                .parse::<f64>().unwrap()
+        };
+        let gap = vertical_edge("333", "yMin") - vertical_edge("222", "yMax");
+        assert!(gap >= 7., "consecutive inline fractions must have clearance, got {gap:.2}pt");
+    }
+}

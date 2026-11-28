@@ -150,6 +150,8 @@ class StudioSnapshotsTests(unittest.TestCase):
         try:
             storage_cancel, folder_cancel = threading.Event(), threading.Event()
             win._storage_cancel_event, win._folder_search_cancel = storage_cancel, folder_cancel
+            self.assertFalse(win._folder_search_pending)
+            win._folder_search_pending = True
             self.assertIsNone(win._python_pool)
             python_pool_calls = []
             win._python_pool = SimpleNamespace(shutdown=lambda *, wait=True, cancel_futures=False: python_pool_calls.append((wait, cancel_futures)))
@@ -169,7 +171,7 @@ class StudioSnapshotsTests(unittest.TestCase):
                 self.assertEqual((save_pos.call_count, peer_recover.call_count), (1, 1))
                 prefs.assert_called_once_with(False)
 
-            self.assertTrue(win.retired and storage_cancel.is_set() and folder_cancel.is_set())
+            self.assertTrue(win.retired and storage_cancel.is_set() and folder_cancel.is_set() and not win._folder_search_pending)
             self.assertEqual(python_pool_calls, [(False, True)])
             self.assertEqual((empty_export.exists(), nonempty_export.exists(), retired_calls, win._opening_paths, rename_cleanups), (False, True, [False], {}, []))
             self.assertEqual((win.note_watcher, win.palette_watcher, win.custom_theme_watcher), (studio._STOPPED_WATCHER,) * 3)

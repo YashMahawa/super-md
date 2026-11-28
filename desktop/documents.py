@@ -1,7 +1,6 @@
 """Portable SMD compatibility and bounded asset access, without Qt dependencies."""
 import base64
 from collections import OrderedDict
-import gzip
 import hashlib
 import json
 import os
@@ -295,37 +294,11 @@ def validate(value: dict) -> None:
 
 def _gzip_json_input(path: Path, raw: bytes | None = None, hasher=None) -> bytearray:
     """Inflate one gzip member, bounding output and rejecting trailing members/data."""
-    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    output = bytearray()
-    compressed_size = 0
     import io
+    output = bytearray()
     with (io.BytesIO(raw) if raw is not None else path.open("rb")) as source:
-        while chunk := source.read(64 * 1024):
-            compressed_size += len(chunk)
-            if compressed_size > MAX_FILE:
-                raise ValueError("Compressed SMD exceeds 120 MB")
-            if hasher is not None:
-                hasher.update(chunk)
-            pending = chunk
-            while pending:
-                remaining = MAX_FILE - len(output)
-                decoded = decoder.decompress(pending, remaining + 1)
-                output.extend(decoded)
-                if len(output) > MAX_FILE:
-                    raise ValueError("Inflated SMD exceeds 120 MB")
-                if decoder.unused_data:
-                    raise ValueError("SMD gzip stream contains trailing or concatenated data")
-                pending = decoder.unconsumed_tail
-                if pending and not decoded:
-                    raise ValueError("Inflated SMD exceeds 120 MB")
-        if not decoder.eof:
-            raise ValueError("SMD gzip stream is truncated")
-        tail = decoder.flush(MAX_FILE - len(output) + 1)
-        output.extend(tail)
-        if len(output) > MAX_FILE:
-            raise ValueError("Inflated SMD exceeds 120 MB")
-        if decoder.unused_data or decoder.unconsumed_tail:
-            raise ValueError("SMD gzip stream contains trailing or concatenated data")
+        for chunk in iter_single_member_gzip_chunks(source, max_bytes=MAX_FILE, hasher=hasher, label="SMD"):
+            output.extend(chunk)
     return output
 
 def _write_gzip_json(target, value: dict, *, _trusted_ascii_assets: bool = False) -> None:
@@ -565,197 +538,27 @@ def _decode_text_note(raw: str, path: Path, *, decode_assets: bool = True) -> tu
     return raw, {}, False
 
 
-MAX_SEARCH_MARKDOWN_BYTES = 20_000_000
-_PORTABLE_FORMATS = ("supermd-smd", "supermd-fmd")
-_PORTABLE_ENVELOPE_RE = re.compile(r'^\ufeff?\s*\{\s*"format"\s*:\s*"supermd-(?:smd|fmd)"')
+if __package__:
+    from . import portable_search
+    from .portable_search import MAX_SEARCH_MARKDOWN_BYTES, _PORTABLE_ENVELOPE_RE, _PORTABLE_FORMATS, _extract_portable_markdown, iter_single_member_gzip_chunks
+else:
+    import portable_search
+    from portable_search import MAX_SEARCH_MARKDOWN_BYTES, _PORTABLE_ENVELOPE_RE, _PORTABLE_FORMATS, _extract_portable_markdown, iter_single_member_gzip_chunks
 
+def _lookup_cached_portable_markdown(stat_key: tuple[int, int, int, int]) -> str | None:
+    if not _RECENT_PORTABLE_FILES:
+        return None
+    with _VALIDATED_LOCK:
+        cached = _RECENT_PORTABLE_FILES.get(stat_key)
+    return cached[1] if cached is not None else None
 
 def _read_bounded_utf8_stream(path: Path, *, is_gzip: bool):
-    import codecs
-    utf8 = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    if not is_gzip:
-        total = 0
-        with path.open("rb") as source:
-            while chunk := source.read(65536):
-                total += len(chunk)
-                if total > MAX_FILE:
-                    raise ValueError("Portable note exceeds size limit")
-                yield utf8.decode(chunk, final=False)
-            tail = utf8.decode(b"", final=True)
-            if tail:
-                yield tail
-        return
-    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    compressed_total = inflated_total = 0
-    with path.open("rb") as source:
-        while chunk := source.read(32768):
-            compressed_total += len(chunk)
-            if compressed_total > MAX_FILE:
-                raise ValueError("Compressed portable note exceeds size limit")
-            pending = chunk
-            while pending:
-                decoded = decoder.decompress(pending, min(65536, MAX_FILE - inflated_total + 1))
-                inflated_total += len(decoded)
-                if inflated_total > MAX_FILE or decoder.unused_data or (decoder.unconsumed_tail and not decoded):
-                    raise ValueError("Invalid or oversized compressed portable stream")
-                if decoded:
-                    yield utf8.decode(decoded, final=False)
-                pending = decoder.unconsumed_tail
-        tail_bytes = decoder.flush(65536)
-        inflated_total += len(tail_bytes)
-        if inflated_total > MAX_FILE:
-            raise ValueError("Inflated portable note exceeds size limit")
-        tail_text = utf8.decode(tail_bytes, final=True)
-        if tail_text:
-            yield tail_text
-
-
-def _extract_portable_markdown(chunks, max_markdown_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
-    """Extract `markdown` from a v1 portable JSON envelope and stop before `assets` payloads."""
-    decoder = json.JSONDecoder()
-    iterator = iter(chunks)
-    buf = ""
-    idx = 0
-
-    def pull(min_extra: int = 1) -> bool:
-        nonlocal buf, idx
-        if idx > 65536:
-            buf = buf[idx:]
-            idx = 0
-        added = 0
-        pieces: list[str] = []
-        for piece in iterator:
-            if piece:
-                pieces.append(piece)
-                added += len(piece)
-                if added >= min_extra:
-                    break
-        if not pieces:
-            return False
-        buf += "".join(pieces)
-        return True
-
-    def decode_next():
-        nonlocal idx
-        while True:
-            while idx < len(buf) and buf[idx] in " \t\r\n":
-                idx += 1
-            if idx >= len(buf) and not pull():
-                raise ValueError("Unexpected EOF in portable JSON")
-            try:
-                val, idx = decoder.raw_decode(buf, idx)
-                return val
-            except json.JSONDecodeError:
-                if not pull(max(65536, len(buf) - idx)):
-                    raise
-
-    if not pull():
-        return None
-    while idx < len(buf) and buf[idx] in "\ufeff \t\r\n":
-        idx += 1
-    if idx >= len(buf) or buf[idx] != "{":
-        return None
-    idx += 1
-    fmt = version = markdown = None
-    while True:
-        while idx < len(buf) and buf[idx] in " \t\r\n":
-            idx += 1
-        if idx >= len(buf) and not pull():
-            return None
-        if buf[idx] == "}":
-            break
-        key = decode_next()
-        if not isinstance(key, str):
-            return None
-        while idx < len(buf) and buf[idx] in " \t\r\n":
-            idx += 1
-        if (idx >= len(buf) and not pull()) or buf[idx] != ":":
-            return None
-        idx += 1
-        val = decode_next()
-        if key == "format":
-            if val not in _PORTABLE_FORMATS:
-                return None
-            fmt = val
-        elif key == "version":
-            if isinstance(val, bool) or val != 1:
-                return None
-            version = val
-        elif key == "markdown":
-            if not isinstance(val, str) or len(val.encode("utf-8")) > max_markdown_bytes:
-                return None
-            markdown = val
-        if fmt in _PORTABLE_FORMATS and version == 1 and isinstance(markdown, str):
-            return markdown
-        while idx < len(buf) and buf[idx] in " \t\r\n":
-            idx += 1
-        if idx >= len(buf) and not pull():
-            return None
-        sep = buf[idx]
-        idx += 1
-        if sep == "}":
-            break
-        if sep != ",":
-            return None
-    return markdown if fmt in _PORTABLE_FORMATS and version == 1 and isinstance(markdown, str) else None
-
+    return portable_search._read_bounded_utf8_stream(path, is_gzip=is_gzip, max_file_bytes=MAX_FILE)
 
 def read_searchable_markdown(path: str | os.PathLike[str], max_text_bytes: int = MAX_SEARCH_MARKDOWN_BYTES) -> str | None:
-    """Read searchable Markdown from plain or portable (.smd/.fmd) notes by content without decoding images."""
-    raw_path = os.fspath(path)
-    try:
-        info = os.lstat(raw_path)
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
-            return None
-        stat_key = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-        if _RECENT_PORTABLE_FILES:
-            with _VALIDATED_LOCK:
-                cached = _RECENT_PORTABLE_FILES.get(stat_key)
-            if cached is not None and len(cached[1].encode("utf-8")) <= max_text_bytes:
-                return cached[1]
-        with open(raw_path, "rb") as handle:
-            head = handle.read(8192)
-            if not head:
-                return ""
-            if not head.startswith(GZIP_MAGIC):
-                if b"\x00" in head:
-                    return None
-                leading = head.lstrip(b"\xef\xbb\xbf \t\r\n")
-                if leading and not leading.startswith(b"{"):
-                    if info.st_size > max_text_bytes:
-                        return None
-                    raw = head if info.st_size <= len(head) else head + handle.read(max_text_bytes + 1 - len(head))
-                    if len(raw) > max_text_bytes or (len(raw) > len(head) and b"\x00" in raw[len(head):]):
-                        return None
-                    text = raw.decode("utf-8-sig", errors="replace")
-                    return text.replace("\r\n", "\n").replace("\r", "\n") if "\r" in text else text
-    except OSError:
-        return None
-    path_obj = path if isinstance(path, Path) else Path(raw_path)
-    if head.startswith(GZIP_MAGIC):
-        try:
-            return _extract_portable_markdown(_read_bounded_utf8_stream(path_obj, is_gzip=True), max_text_bytes)
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError, zlib.error, OSError, EOFError):
-            return None
-    head_text = head.decode("utf-8-sig", errors="replace")
-    if head_text.lstrip().startswith("{"):
-        try:
-            extracted = _extract_portable_markdown(_read_bounded_utf8_stream(path_obj, is_gzip=False), max_text_bytes)
-        except (ValueError, json.JSONDecodeError, UnicodeDecodeError, OSError):
-            if _PORTABLE_ENVELOPE_RE.match(head_text):
-                return None
-        else:
-            if extracted is not None:
-                return extracted
-            if _PORTABLE_ENVELOPE_RE.match(head_text):
-                return None
-    if info.st_size > max_text_bytes:
-        return None
-    try:
-        with open(raw_path, encoding="utf-8-sig", errors="replace") as text_handle:
-            return text_handle.read()
-    except OSError:
-        return None
+    return portable_search.read_searchable_markdown(
+        path, max_text_bytes, max_file_bytes=MAX_FILE, cache_lookup=_lookup_cached_portable_markdown
+    )
 
 def atomic_write(path: Path, data: bytes) -> None:
     # Same-filesystem replace is atomic; a cancelled/failed write leaves the old note intact.
