@@ -111,23 +111,29 @@ test.describe("native Split view settled bidirectional scroll alignment", () => 
     });
     expect(targetPreviewTop).toBeGreaterThan(1500);
 
-    // Emit realistic multi-step wheel + scroll in Preview, checking Source waits for settle.
-    await page.evaluate((top) => {
-      const root = document.querySelector<HTMLElement>(".android-reading")!;
-      root.dispatchEvent(new WheelEvent("wheel", { deltaY: 240, bubbles: true }));
-      root.scrollTop = Math.round(top * 0.5);
-      root.dispatchEvent(new Event("scroll"));
-    }, targetPreviewTop);
-    await page.waitForTimeout(40);
+    // Emit realistic multi-step wheel + scroll in Preview inside a single page
+    // turn so the +35ms mid-gesture check (< 120ms settle window) is strictly
+    // ordered before settle in Blink's timer queue without CDP roundtrip jitter.
+    const midEditorTop = await page.evaluate(
+      (top) =>
+        new Promise<number>((resolve) => {
+          const root = document.querySelector<HTMLElement>(".android-reading")!;
+          const scroller = document.querySelector<HTMLElement>(".cm-scroller")!;
+          root.dispatchEvent(new WheelEvent("wheel", { deltaY: 240, bubbles: true }));
+          root.scrollTop = Math.round(top * 0.5);
+          root.dispatchEvent(new Event("scroll"));
+          window.setTimeout(() => {
+            const midTop = scroller.scrollTop;
+            root.dispatchEvent(new WheelEvent("wheel", { deltaY: 240, bubbles: true }));
+            root.scrollTop = top;
+            root.dispatchEvent(new Event("scroll"));
+            resolve(midTop);
+          }, 35);
+        }),
+      targetPreviewTop,
+    );
     // Mid-gesture: Source has not synced yet because scrolling has not settled.
-    expect(await cmScroller.evaluate((el) => el.scrollTop)).toBeLessThan(100);
-
-    await page.evaluate((top) => {
-      const root = document.querySelector<HTMLElement>(".android-reading")!;
-      root.dispatchEvent(new WheelEvent("wheel", { deltaY: 240, bubbles: true }));
-      root.scrollTop = top;
-      root.dispatchEvent(new Event("scroll"));
-    }, targetPreviewTop);
+    expect(midEditorTop).toBeLessThan(100);
 
     // Once settled (> 120ms), Source aligns to Section 18 without moving selection/caret or bouncing back!
     const section18Source = page.locator(".cm-line", { hasText: "## Section 18: Architecture Milestone 18" });
@@ -147,15 +153,10 @@ test.describe("native Split view settled bidirectional scroll alignment", () => 
     await page.evaluate(() => {
       const scroller = document.querySelector<HTMLElement>(".cm-scroller")!;
       scroller.dispatchEvent(new WheelEvent("wheel", { deltaY: -400, bubbles: true }));
-    });
-    // Find pixel scrollTop in CodeMirror that puts Section 8 at top.
-    await page.evaluate(( targetText ) => {
-      const scroller = document.querySelector<HTMLElement>(".cm-scroller")!;
       scroller.scrollTop = Math.round(scroller.scrollTop * 0.38);
       scroller.dispatchEvent(new Event("scroll"));
-      void targetText;
-    }, "## Section 8: Architecture Milestone 8");
-    await page.waitForTimeout(30);
+    });
+    await expect(page.locator(".cm-line", { hasText: "## Section 8: Architecture Milestone 8" })).toBeVisible();
     const exactEditorTopForSec8 = await page.evaluate(() => {
       const scroller = document.querySelector<HTMLElement>(".cm-scroller")!;
       const lines = Array.from(scroller.querySelectorAll<HTMLElement>(".cm-line"));

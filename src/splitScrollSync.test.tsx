@@ -269,6 +269,53 @@ describe("native Split view settled scroll alignment", () => {
     controller.dispose();
   });
 
+  it("suppresses delayed editor scroll echoes when CodeMirror refines scrollTop on the next animation frame", () => {
+    const { cmScroller, readingRoot } = buildSplitDom();
+    Object.defineProperty(cmScroller, "scrollTop", { value: 0, writable: true, configurable: true });
+    Object.defineProperty(readingRoot, "scrollTop", { value: 0, writable: true, configurable: true });
+
+    registerEditorAnchorAdapter("split-note", {
+      readingOffset: () => 450,
+      caretOffset: () => undefined,
+      scrollTop: () => cmScroller.scrollTop,
+      applyAnchor: () => {
+        // First synchronous pass uses estimated wrapped height; follow-up rAF refines scrollTop.
+        cmScroller.scrollTop = 520;
+        window.requestAnimationFrame(() => {
+          cmScroller.scrollTop = 695;
+        });
+      },
+    });
+
+    let selectedPane: SplitAnchorPane | null = null;
+    const controller = createSplitScrollSyncController({
+      getState: () => ({ id: "split-note", mode: "split" }),
+      isRestoring: () => false,
+      onPaneSelected: (pane) => {
+        selectedPane = pane;
+      },
+    });
+    controller.primeScrollTops({ editor: 0, preview: 0 });
+
+    const wheelOnPreview = new WheelEvent("wheel", { deltaY: 240, bubbles: true });
+    Object.defineProperty(wheelOnPreview, "target", { value: readingRoot });
+    controller.handleInput(wheelOnPreview);
+    readingRoot.scrollTop = 844;
+    controller.handleScroll({ target: readingRoot } as unknown as Event);
+
+    // Advance past settle + rAF refinement, then stall > 220ms before the browser delivers cmScroller's scroll event.
+    vi.advanceTimersByTime(SPLIT_SCROLL_SETTLE_MS + 320);
+    expect(cmScroller.scrollTop).toBe(695);
+
+    const previewTopBeforeEcho = readingRoot.scrollTop;
+    controller.handleScroll({ target: cmScroller } as unknown as Event);
+    vi.advanceTimersByTime(SPLIT_SCROLL_SETTLE_MS * 3);
+    expect(selectedPane).toBe("preview");
+    expect(readingRoot.scrollTop).toBe(previewTopBeforeEcho);
+
+    controller.dispose();
+  });
+
   it("ignores independent inner scrollers (<pre>, <table>) while allowing chained root scrolling", () => {
     const { cmScroller, readingRoot } = buildSplitDom();
     const pre = readingRoot.querySelector<HTMLElement>("pre")!;

@@ -119,13 +119,22 @@ export function createSplitScrollSyncController(
     preview: null,
   };
   let settleTimer: ReturnType<typeof setTimeout> | null = null;
+  let editorRefinementFrame: number | null = null;
   let pendingSync: { tabId: string; sourcePane: SplitAnchorPane; token: number } | null = null;
   let activePane: SplitAnchorPane | null = null;
   let syncToken = 0;
 
+  const cancelEditorRefinementFrame = () => {
+    if (editorRefinementFrame !== null) {
+      doc.defaultView?.cancelAnimationFrame?.(editorRefinementFrame);
+      editorRefinementFrame = null;
+    }
+  };
+
   const cancelPending = () => {
     ++syncToken;
     pendingSync = null;
+    cancelEditorRefinementFrame();
     if (settleTimer !== null) {
       clearTimeout(settleTimer);
       settleTimer = null;
@@ -139,6 +148,9 @@ export function createSplitScrollSyncController(
     if (getState()?.mode !== "split") return;
     if (pendingSync && pendingSync.sourcePane !== pane) {
       cancelPending();
+    }
+    if (pane === "editor") {
+      cancelEditorRefinementFrame();
     }
     activePane = pane;
     suppressedTargets[pane] = null;
@@ -201,6 +213,26 @@ export function createSplitScrollSyncController(
       recordedTops.editor = nextEditorTop;
       markProgrammaticAnchorScroll(cmScroller);
       suppressedTargets.editor = { top: nextEditorTop };
+      cancelEditorRefinementFrame();
+      const view = doc.defaultView;
+      if (view && typeof view.requestAnimationFrame === "function") {
+        editorRefinementFrame = view.requestAnimationFrame(() => {
+          editorRefinementFrame = null;
+          if (
+            activePane !== "preview" ||
+            suppressedTargets.editor === null ||
+            getState()?.id !== scheduledTabId ||
+            getState()?.mode !== "split" ||
+            !cmScroller.isConnected
+          ) {
+            return;
+          }
+          const refinedTop = cmScroller.scrollTop;
+          recordedTops.editor = refinedTop;
+          markProgrammaticAnchorScroll(cmScroller);
+          suppressedTargets.editor = { top: refinedTop };
+        });
+      }
     }
   };
 
