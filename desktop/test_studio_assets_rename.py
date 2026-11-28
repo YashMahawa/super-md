@@ -29,6 +29,12 @@ class QuietStudio(Studio):
     def _refresh_theme(self):
         self.system_dark = True
 
+    def _choose_default_python(self, emit=True):
+        self.python_status = "No Python interpreter configured."
+
+    def _refresh_python_choices(self):
+        pass
+
 
 class MinimalQtStudio(QObject):
     """Lightweight QObject without folder/settings/session attributes, matching QtStudio test doubles."""
@@ -53,7 +59,9 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
     def tearDown(self):
         self.studio.stop()
         self.studio.pool.shutdown(wait=True, cancel_futures=True)
+        self.studio._search_pool.shutdown(wait=True, cancel_futures=True)
         self.session.writes.shutdown(wait=True)
+        self.app.sendPostedEvents(None, 0)
         self.studio.deleteLater()
         self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         self.app.processEvents()
@@ -129,14 +137,16 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
 
         orig_exists, orig_stat = Path.exists, Path.stat
         case_target = sub / "Topic.md"
+        should_redirect_case = lambda p: p == case_target and not os.path.exists(p) and os.path.exists(note_path)
         with (
-            patch.object(Path, "exists", lambda p, *a, **kw: True if p == case_target else orig_exists(p, *a, **kw)),
-            patch.object(Path, "stat", lambda p, *a, **kw: orig_stat(note_path if p == case_target else p, *a, **kw)),
+            patch.object(Path, "exists", lambda p, *a, **kw: True if should_redirect_case(p) else orig_exists(p, *a, **kw)),
+            patch.object(Path, "stat", lambda p, *a, **kw: orig_stat(note_path if should_redirect_case(p) else p, *a, **kw)),
             patch("studio_assets_rename.os.path.samestat", wraps=os.path.samestat) as spy_samestat,
         ):
             self.studio.renameEntry(str(note_path), "Topic")
             self._wait_for(lambda: self.studio.busy == 0 and self.studio.message == "Renamed to Topic.md")
         self.assertGreaterEqual(spy_samestat.call_count, 1)
+        self.assertIn(self.studio._current()["path"], self.studio.note_file_stamps)
 
         self.studio.renameEntry(str(sub), "Published")
         renamed_note = folder_ops.canonical_path_str(self.open_root / "Published" / "Topic.md")
@@ -180,9 +190,10 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
 
         orig_exists, orig_stat = Path.exists, Path.stat
         case_after = self.outside_root / "Lecture.md"
+        should_redirect_after = lambda p: p == case_after and not os.path.exists(p) and os.path.exists(standalone)
         with (
-            patch.object(Path, "exists", lambda p, *a, **kw: True if p == case_after else orig_exists(p, *a, **kw)),
-            patch.object(Path, "stat", lambda p, *a, **kw: orig_stat(standalone if p == case_after else p, *a, **kw)),
+            patch.object(Path, "exists", lambda p, *a, **kw: True if should_redirect_after(p) else orig_exists(p, *a, **kw)),
+            patch.object(Path, "stat", lambda p, *a, **kw: orig_stat(standalone if should_redirect_after(p) else p, *a, **kw)),
             patch("studio_assets_rename.os.path.samestat", wraps=os.path.samestat) as spy_samestat,
         ):
             self.studio.renameNote(tab_id, "Lecture")
@@ -192,6 +203,7 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
                 and self.studio._current()["name"] == "Lecture.md"
             )
         self.assertGreaterEqual(spy_samestat.call_count, 1)
+        self.assertIn(self.studio._current()["path"], self.studio.note_file_stamps)
 
     def test_portable_asset_staging_conflicts_dirty_noop_patches_and_unbound_proxies(self):
         smd_path = self.open_root / "study.smd"
@@ -293,7 +305,12 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
             })
 
         self.studio.openFolder(str(self.open_root))
-        self._wait_for(lambda: folder_ops.same_path(self.studio.folder, self.open_root))
+        self._wait_for(
+            lambda: folder_ops.same_path(self.studio.folder, self.open_root)
+            and any(item["name"] == "study.smd" for item in self.studio.files)
+        )
+        self.studio.external_timer.stop()
+        self.studio.external_paths.clear()
         real_atomic_write = documents.atomic_write
         atomic_calls: list[Path] = []
         invalidations: list[object] = []
@@ -301,6 +318,7 @@ class StudioAssetsRenameUnitTests(unittest.TestCase):
         orig_invalidate = self.session.workspace_links.invalidate
         orig_index_invalidate = self.session.folder_note_index.invalidate
         with (
+            patch.object(self.studio, "_external_note_changed", lambda *_a: None),
             patch("studio.atomic_write", side_effect=lambda p, data: (atomic_calls.append(Path(p)), real_atomic_write(p, data))[1]),
             patch.object(self.session.workspace_links, "invalidate", side_effect=lambda root=None: (invalidations.append(root), orig_invalidate(root))[1]),
             patch.object(self.session.folder_note_index, "invalidate", side_effect=lambda root=None: (index_invalidations.append(root), orig_index_invalidate(root))[1]),
