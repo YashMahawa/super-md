@@ -58,12 +58,12 @@ from closed_notes import ClosedNoteStore
 from reader_assets import ReaderAssetStore, note_file_path, resolve_source
 from storage_inspector import inspect_storage, clear_storage_category
 from latest_writes import ExactWriteAborted, LatestWriteExecutor
-import updates
-import app_integration
 if __package__:
     from . import studio_runtime
+    from .core import app_integration, updates
 else:
     import studio_runtime
+    from core import app_integration, updates
 import python_runtime
 import pending_python
 from export_jobs import ExportJobRegistry
