@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 import uuid
 from pathlib import Path
@@ -23,6 +25,7 @@ from PySide6.QtTest import QTest
 ROOT = Path(__file__).resolve().parent
 QML_DIR = ROOT / "qml"
 MAIN_QML = QML_DIR / "Main.qml"
+_EXIT_ANCHOR: list[object] = []
 
 
 def _production_wheel_overlay() -> str:
@@ -229,24 +232,39 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             },
         ],
     }
+    compact_table = "| Metric | Value |\n| --- | --- |\n| alpha | 0.05 |\n| power | 0.92 |"
     headers = " | ".join(f"Series_{i + 1}_Header" for i in range(12))
     sep = " | ".join("---" for _ in range(12))
     row = " | ".join(f"value_{i + 1}_wide_entry" for i in range(12))
-    py_lines = "\n".join(f"acc_{i} = {i} * 3  # {'wide_comment_' * 10}" for i in range(44))
+    wide_code = "const pipeline = " + " + ".join(f"stage_{i}_metric" for i in range(26)) + ";"
+    py_lines = "\n".join(
+        [*(f"acc_{i} = {i} * 3  # {'wide_comment_' * 10}" for i in range(44)),
+         'print("py_output_digest_" + "_".join(f"segment_{i:02d}" for i in range(32)))']
+    )
     filler = ("\n\n".join(f"Filler paragraph {i + 1}: " + ("scrollable note body text " * 14) for i in range(24)))
     markdown = (
         f"# Qt Touchpad Nested Scroll\n\n"
-        f"```python {{.run}}\n{py_lines}\n```\n\n"
+        f"{compact_table}\n\n"
         f"| {headers} |\n| {sep} |\n| {row} |\n| {row} |\n\n"
+        f"```ts\n{wide_code}\n```\n\n"
+        f"```python {{.run}}\n{py_lines}\n```\n\n"
         f"```smd-steps\n{json.dumps(deck)}\n```\n\n"
         f"{filler}\n"
     )
 
-    with tempfile.TemporaryDirectory(prefix="supermd-touchpad-qt-") as temp_dir:
-        session = Session(True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="supermd-touchpad-qt-"))
+    session_dir = Path(tempfile.mkdtemp(prefix="supermd-touchpad-session-"))
+    session = None
+    studio = None
+    engine = None
+    window = None
+    touchpad = None
+    exit_code = 1
+    try:
+        session = Session(True, data=session_dir)
         session.settings["welcomed"] = True
         session.settings["python"] = sys.executable
-        session.settings["newNoteLocation"] = temp_dir
+        session.settings["newNoteLocation"] = str(temp_dir)
         studio = Studio(True, session)
         tab = studio.tabs[0]
         tab["name"] = "Touchpad scroll.md"
@@ -268,8 +286,8 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
             raise RuntimeError("Production Main.qml did not load")
 
         window = engine.rootObjects()[0]
-        window.setProperty("width", 1120)
-        window.setProperty("height", 760)
+        window.setProperty("width", 1220)
+        window.setProperty("height", 1080)
         studio.host_window = window
         window.show()
         studio._emit()
@@ -299,9 +317,10 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
                 + json.dumps(request)
                 + ",error:String(error)})}})()"
             )
+            last_pending = None
             while time.monotonic() < deadline:
                 QMetaObject.invokeMethod(window, "runDocumentScript", Qt.ConnectionType.DirectConnection, Q_ARG("QVariant", wrapped))
-                attempt_deadline = min(deadline, time.monotonic() + 0.5)
+                attempt_deadline = min(deadline, time.monotonic() + 0.25)
                 while time.monotonic() < attempt_deadline:
                     app.processEvents()
                     QTest.qWait(10)
@@ -316,14 +335,25 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
                     value = response["value"]
                     if value.get("ready") is not False:
                         return value
+                    last_pending = value
                     break
-            raise AssertionError(f"WebEngine reader did not return probe result: title={reader.property('title')!r}")
+            raise AssertionError(
+                f"WebEngine reader did not return probe result: last={last_pending!r} title={reader.property('title')!r}"
+            )
 
-        def send_touchpad(local_x: float, local_y: float, px_dx: int, px_dy: int, modifiers=Qt.KeyboardModifier.NoModifier):
+        def send_touchpad(
+            local_x: float,
+            local_y: float,
+            px_dx: int,
+            px_dy: int,
+            modifiers=Qt.KeyboardModifier.NoModifier,
+            wait_steps: int = 5,
+        ):
             scene_pt = reader.mapToScene(QPointF(local_x, local_y))
+            global_pt = QPointF(window.mapToGlobal(scene_pt.toPoint()))
             ev = QWheelEvent(
                 scene_pt,
-                scene_pt,
+                global_pt,
                 QPoint(px_dx, px_dy),
                 QPoint(px_dx * 8, px_dy * 8),
                 Qt.MouseButton.NoButton,
@@ -334,92 +364,520 @@ def _webengine_probe(screenshot_dir: str | None = None) -> int:
                 touchpad,
             )
             QGuiApplication.sendEvent(window, ev)
-            for _ in range(6):
+            for _ in range(wait_steps):
                 app.processEvents()
-                QTest.qWait(15)
+                QTest.qWait(10)
 
-        geom = run_script(
-            "(()=>{const py=document.querySelector('.python-source'),tb=document.querySelector('.markdown-body table'),"
-            "st=document.querySelector('.step-cards-notes'),rd=document.querySelector('.android-reading');"
-            "if(!py||!tb||!st||!rd||py.scrollHeight<=py.clientHeight||tb.scrollWidth<=tb.clientWidth){document.title=JSON.stringify({ready:false});return;}"
-            "const pr=py.getBoundingClientRect();"
-            "document.title=JSON.stringify({ready:true,py:{x:pr.left+80,y:pr.top+60,maxTop:py.scrollHeight-py.clientHeight}});})()"
-        )
+        def arm_and_scroll_target(
+            target_expr: str,
+            offset_x: float,
+            offset_y: float,
+            px_dx: int,
+            px_dy: int,
+            min_left: float = 0,
+            min_top: float = 0,
+            min_rd_delta: float = 0,
+            scroll_into_view: bool = False,
+        ) -> dict:
+            prep = run_script(
+                f"(()=>{{const rd=document.querySelector('.android-reading'),compactTb=rd?.querySelectorAll('.markdown-body table')?.[0],"
+                f"el=({target_expr});"
+                f"if(!rd||!compactTb||!el){{document.title=JSON.stringify({{ready:false}});return;}}"
+                f"document.body.dispatchEvent(new WheelEvent('wheel',{{bubbles:true,deltaX:0,deltaY:0}}));"
+                f"let r=el.getBoundingClientRect(),rr=rd.getBoundingClientRect();"
+                f"if({json.dumps(scroll_into_view)}||r.top>rr.bottom-90||r.bottom<rr.top+40){{"
+                f"const targetCenter=r.top+Math.min(r.height,rr.height*0.6)/2,rdCenter=rr.top+rr.height/2;"
+                f"rd.scrollTop=Math.max(0,rd.scrollTop+(targetCenter-rdCenter));"
+                f"r=el.getBoundingClientRect();rr=rd.getBoundingClientRect();}}"
+                f"window.__smdIndicatorProbe?.cleanup?.();"
+                f"const activeBefore=el.classList.contains('scroll-indicator-active');"
+                f"const state={{scrollEvents:0,leftOnScroll:0,topOnScroll:0,activeOnScroll:false,"
+                f"activeAfterScroll:false,compactActiveOnScroll:false,rdTopOnScroll:rd.scrollTop,rdLeftOnScroll:rd.scrollLeft,settled:false}};"
+                f"const onScroll=()=>{{if(el.scrollLeft<{min_left}||el.scrollTop<{min_top})return;"
+                f"state.scrollEvents+=1;state.leftOnScroll=el.scrollLeft;state.topOnScroll=el.scrollTop;"
+                f"state.activeOnScroll=state.activeOnScroll||el.classList.contains('scroll-indicator-active');"
+                f"state.compactActiveOnScroll=state.compactActiveOnScroll||compactTb.classList.contains('scroll-indicator-active');"
+                f"state.rdTopOnScroll=rd.scrollTop;state.rdLeftOnScroll=rd.scrollLeft;"
+                f"queueMicrotask(()=>{{state.activeAfterScroll=state.activeAfterScroll||el.classList.contains('scroll-indicator-active');"
+                f"state.compactActiveOnScroll=state.compactActiveOnScroll||compactTb.classList.contains('scroll-indicator-active');"
+                f"state.settled=true;}});}};"
+                f"el.addEventListener('scroll',onScroll);"
+                f"window.__smdIndicatorProbe={{state,cleanup:()=>el.removeEventListener('scroll',onScroll)}};"
+                f"const minX=Math.max(r.left,rr.left,0)+12,maxX=Math.min(r.right,rr.right,window.innerWidth)-20;"
+                f"const minY=Math.max(r.top,rr.top,0)+12,maxY=Math.min(r.bottom,rr.bottom,window.innerHeight)-20;"
+                f"const x=Math.min(Math.max(r.left+{offset_x},minX),Math.max(minX,maxX));"
+                f"const y=Math.min(Math.max(r.top+{offset_y},minY),Math.max(minY,maxY));"
+                f"document.title=JSON.stringify({{ready:true,x,y,activeBefore,"
+                f"rdTopBefore:rd.scrollTop,rdLeftBefore:rd.scrollLeft,"
+                f"maxTop:el.scrollHeight-el.clientHeight,maxLeft:el.scrollWidth-el.clientWidth}});}})()"
+            )
+            send_touchpad(prep["x"], prep["y"], px_dx, px_dy)
+            observed = run_script(
+                f"(()=>{{const rd=document.querySelector('.android-reading'),compactTb=rd?.querySelectorAll('.markdown-body table')?.[0],"
+                f"el=({target_expr}),probe=window.__smdIndicatorProbe;"
+                f"if(!rd||!compactTb||!el||el.scrollLeft<{min_left}||el.scrollTop<{min_top}"
+                f"||rd.scrollTop<{prep['rdTopBefore']}+{min_rd_delta}||!probe?.state?.settled)"
+                f"{{document.title=JSON.stringify({{ready:false,left:el?.scrollLeft,top:el?.scrollTop,"
+                f"rdTop:rd?.scrollTop,scrollEvents:probe?.state?.scrollEvents??0,settled:Boolean(probe?.state?.settled),"
+                f"liveActive:el?.classList?.contains('scroll-indicator-active')??false}});return;}}"
+                f"const liveActive=el.classList.contains('scroll-indicator-active');"
+                f"const activeOnScroll=Boolean(probe.state.activeOnScroll);"
+                f"const activeAfterScroll=Boolean(probe.state.activeAfterScroll);"
+                f"const compactActive=compactTb.classList.contains('scroll-indicator-active')||Boolean(probe.state.compactActiveOnScroll);"
+                f"probe.cleanup();"
+                f"document.title=JSON.stringify({{ready:true,left:el.scrollLeft,top:el.scrollTop,"
+                f"leftOnScroll:probe.state.leftOnScroll,topOnScroll:probe.state.topOnScroll,"
+                f"activeBefore:{json.dumps(prep['activeBefore'])},activeOnScroll,activeAfterScroll,"
+                f"active:activeOnScroll&&activeAfterScroll,liveActive,"
+                f"scrollEvents:probe.state.scrollEvents,compactActive,"
+                f"rdTop:rd.scrollTop,rdLeft:rd.scrollLeft,rdTopBefore:{prep['rdTopBefore']}}});}})()"
+            )
+            observed["maxTop"] = prep["maxTop"]
+            observed["x"] = prep["x"]
+            observed["y"] = prep["y"]
+            return observed
 
-        # 1. Touchpad scroll inside .python-source scrolls inner code without moving outer .android-reading, then chains at bottom.
-        send_touchpad(geom["py"]["x"], geom["py"]["y"], -60, -70)
-        py_mid = run_script(
-            "(()=>{const py=document.querySelector('.python-source'),rd=document.querySelector('.android-reading');"
-            "document.title=JSON.stringify({ready:true,pyLeft:py.scrollLeft,pyTop:py.scrollTop,rdTop:rd.scrollTop});})()"
-        )
-        if py_mid["pyLeft"] < 40 or py_mid["pyTop"] < 50 or py_mid["rdTop"] != 0:
-            raise AssertionError(f"Expected inner python scroll without outer scroll: {py_mid}")
+        def verify_mode_geometry_and_semantics(mode_label: str, width_ratio_cap: float) -> dict:
+            info = run_script(
+                "(()=>{const rd=document.querySelector('.android-reading'),tables=rd?.querySelectorAll('.markdown-body table'),"
+                "pre=rd?.querySelector('.code-disclosure pre'),py=rd?.querySelector('.python-source'),"
+                "pyOut=rd?.querySelector('.python-cell .cell-output pre');"
+                "if(!rd||!tables||tables.length<2||!pre||!py||!pyOut){document.title=JSON.stringify({ready:false});return;}"
+                "const c=tables[0],w=tables[1],cr=c.getBoundingClientRect(),br=c.closest('.markdown-body').getBoundingClientRect(),"
+                "th=c.querySelector('thead tr th:last-child')?.getBoundingClientRect(),"
+                "cs=getComputedStyle(c),ws=getComputedStyle(w);"
+                "if(!th||w.scrollWidth-w.clientWidth<=80||pre.scrollWidth-pre.clientWidth<=80||py.scrollHeight<=py.clientHeight||py.scrollWidth<=py.clientWidth||pyOut.scrollWidth-pyOut.clientWidth<=80)"
+                "{document.title=JSON.stringify({ready:false});return;}"
+                "document.title=JSON.stringify({ready:true,"
+                "semantics:{compactTag:c.tagName,wideTag:w.tagName,compactDisplay:cs.display,wideDisplay:ws.display,"
+                "compactOverflowStyle:cs.overflowX,wideOverflowStyle:ws.overflowX,"
+                "compactHeaders:c.querySelectorAll('thead th').length,compactRows:c.querySelectorAll('tbody tr').length,"
+                "compactCells:c.querySelectorAll('tbody td').length,wideHeaders:w.querySelectorAll('thead th').length,"
+                "wideRows:w.querySelectorAll('tbody tr').length},"
+                "compact:{width:cr.width,bodyWidth:br.width,rightGap:Math.abs(cr.right-th.right),"
+                "overflowX:c.scrollWidth-c.clientWidth,scrollbarH:c.offsetHeight-c.clientHeight},"
+                "overflow:{wideLeft:w.scrollWidth-w.clientWidth,wideScrollbarH:w.offsetHeight-w.clientHeight,"
+                "preLeft:pre.scrollWidth-pre.clientWidth,preScrollbarH:pre.offsetHeight-pre.clientHeight,"
+                "pyLeft:py.scrollWidth-py.clientWidth,pyTop:py.scrollHeight-py.clientHeight,"
+                "pyScrollbarW:py.offsetWidth-py.clientWidth,pyScrollbarH:py.offsetHeight-py.clientHeight,"
+                "pyOutLeft:pyOut.scrollWidth-pyOut.clientWidth,pyOutScrollbarH:pyOut.offsetHeight-pyOut.clientHeight}});})()"
+            )
+            sem = info["semantics"]
+            if (
+                sem["compactTag"] != "TABLE"
+                or sem["wideTag"] != "TABLE"
+                or sem["compactDisplay"] != "block"
+                or sem["wideDisplay"] != "block"
+                or sem["compactOverflowStyle"] != "auto"
+                or sem["wideOverflowStyle"] != "auto"
+                or sem["compactHeaders"] != 2
+                or sem["compactRows"] != 2
+                or sem["compactCells"] != 4
+                or sem["wideHeaders"] != 12
+                or sem["wideRows"] != 2
+            ):
+                raise AssertionError(f"Expected preserved native table semantics in {mode_label}: {sem}")
+            comp = info["compact"]
+            if (
+                comp["width"] >= comp["bodyWidth"] * width_ratio_cap
+                or comp["rightGap"] > 2
+                or comp["overflowX"] > 1
+                or comp["scrollbarH"] > 1
+            ):
+                raise AssertionError(f"Expected compact table shrink-wrap without empty width or gutter in {mode_label}: {comp}")
+            ov = info["overflow"]
+            if (
+                abs(ov["wideScrollbarH"] - 16) > 1
+                or abs(ov["preScrollbarH"] - 16) > 1
+                or abs(ov["pyScrollbarW"] - 16) > 1
+                or abs(ov["pyScrollbarH"] - 16) > 1
+                or abs(ov["pyOutScrollbarH"] - 16) > 1
+            ):
+                raise AssertionError(f"Expected 16px native Qt scrollbar lanes on overflowing table/code/python regions in {mode_label}: {ov}")
+            return info
 
-        send_touchpad(geom["py"]["x"], geom["py"]["y"], 0, -(int(geom["py"]["maxTop"]) + 180))
-        py_chained = run_script(
-            "(()=>{const py=document.querySelector('.python-source'),rd=document.querySelector('.android-reading');"
-            "document.title=JSON.stringify({ready:true,pyRem:Math.abs(py.scrollHeight-py.clientHeight-py.scrollTop),rdTop:rd.scrollTop});})()"
-        )
-        if py_chained["pyRem"] > 2 or py_chained["rdTop"] < 100:
-            raise AssertionError(f"Expected python boundary chaining to .android-reading: {py_chained}")
-
-        # 2. Diagonal touchpad scroll over wide table scrolls table horizontally and chains vertical delta to .android-reading.
-        tb_geom = run_script(
-            "(()=>{const tb=document.querySelector('.markdown-body table'),rd=document.querySelector('.android-reading');"
-            "tb.scrollIntoView({block:'center'});const tr=tb.getBoundingClientRect();"
-            "document.title=JSON.stringify({ready:true,x:tr.left+80,y:tr.top+30,rdTop:rd.scrollTop});})()"
-        )
-        send_touchpad(tb_geom["x"], tb_geom["y"], -120, -90)
-        tb_after = run_script(
-            "(()=>{const tb=document.querySelector('.markdown-body table'),rd=document.querySelector('.android-reading');"
-            "document.title=JSON.stringify({ready:true,tbLeft:tb.scrollLeft,rdTop:rd.scrollTop,rdLeft:rd.scrollLeft});})()"
-        )
-        if tb_after["tbLeft"] < 90 or tb_after["rdTop"] <= tb_geom["rdTop"] + 50 or tb_after["rdLeft"] != 0:
-            raise AssertionError(f"Expected wide table horizontal scroll + vertical chain under centerLock: {tb_after}")
-
-        if screenshot_dir:
-            out_dir = Path(screenshot_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            for _ in range(6):
+        def verify_presented_frame(mode_label: str, screenshot_name: str | None = None) -> int:
+            # Re-arm the scrolled nested regions right before grabbing so active indicator thumbs are painted in the captured frame.
+            run_script(
+                "(()=>{const rd=document.querySelector('.android-reading'),tb=rd?.querySelectorAll('.markdown-body table')?.[1],"
+                "pre=rd?.querySelector('.code-disclosure pre'),py=rd?.querySelector('.python-source'),"
+                "pyOut=rd?.querySelector('.python-cell .cell-output pre');"
+                "if(!rd||!tb||!pre||!py||!pyOut){document.title=JSON.stringify({ready:false});return;}"
+                "document.body.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaX:0,deltaY:0}));"
+                "rd.scrollTop=0;"
+                "[tb,pre,py,pyOut].forEach(el=>el.dispatchEvent(new Event('scroll')));"
+                "document.title=JSON.stringify({ready:rd.scrollTop<=2&&tb.classList.contains('scroll-indicator-active')&&"
+                "pre.classList.contains('scroll-indicator-active')&&py.classList.contains('scroll-indicator-active')&&"
+                "pyOut.classList.contains('scroll-indicator-active')});})()"
+            )
+            for _ in range(4):
                 app.processEvents()
                 QTest.qWait(20)
-            window.grabWindow().save(str(out_dir / "qt-touchpad-code-table-scroll.png"))
+            frame = window.grabWindow()
+            if frame.isNull() or frame.width() < 1200 or frame.height() < 1000:
+                raise AssertionError(f"Expected presented QtWebEngine frame in {mode_label}: {frame.width()}x{frame.height()}")
+            origin = reader.mapToScene(QPointF(0, 0))
+            ratio = frame.width() / max(1, int(window.property("width")))
+            left = max(0, int(origin.x() * ratio)) + 12
+            top = max(0, int(origin.y() * ratio)) + 12
+            right = min(frame.width(), int((origin.x() + float(reader.property("width"))) * ratio)) - 12
+            bottom = min(frame.height(), int((origin.y() + float(reader.property("height"))) * ratio)) - 12
+            colors = set()
+            for y in range(top, max(top + 1, bottom), 8):
+                for x in range(left, max(left + 1, right), 8):
+                    colors.add(frame.pixelColor(x, y).rgb())
+            if len(colors) <= 20:
+                raise AssertionError(f"Expected painted WebEngine reader surface in {mode_label}, got {len(colors)} distinct colors")
+            if screenshot_dir and screenshot_name:
+                out_dir = Path(screenshot_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                frame.save(str(out_dir / screenshot_name))
+            return len(colors)
 
-        # 3. Study step-cards notes scroll internally first, then chain at boundary, and Ctrl+wheel zooms note without scrolling notes.
+        run_script(
+            "(()=>{const py=document.querySelector('.python-source'),runBtn=document.querySelector('.python-cell button.python-run'),"
+            "tables=document.querySelectorAll('.markdown-body table'),st=document.querySelector('.step-cards-notes'),"
+            "rd=document.querySelector('.android-reading'),pyOut=document.querySelector('.python-cell .cell-output pre');"
+            "if(!py||!runBtn||tables.length<2||!st||!rd||py.scrollHeight<=py.clientHeight||tables[1].scrollWidth<=tables[1].clientWidth)"
+            "{document.title=JSON.stringify({ready:false});return;}"
+            "if(!pyOut){if(!window.__smdPyRunClicked){window.__smdPyRunClicked=true;runBtn.click();}document.title=JSON.stringify({ready:false});return;}"
+            "if(pyOut.scrollWidth-pyOut.clientWidth<=80){document.title=JSON.stringify({ready:false});return;}"
+            "document.body.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaX:0,deltaY:0}));"
+            "rd.scrollTop=0;document.title=JSON.stringify({ready:true});})()"
+        )
+        verify_mode_geometry_and_semantics("reader", 0.55)
+
+        # 1. Read mode: observe .python-source movement + active indicator together immediately at its own input, then chain at bottom.
+        py_mid = arm_and_scroll_target(
+            "document.querySelector('.python-source')",
+            80,
+            40,
+            -60,
+            -70,
+            min_left=40,
+            min_top=50,
+            scroll_into_view=True,
+        )
+        if (
+            py_mid["activeBefore"]
+            or py_mid["left"] < 40
+            or py_mid["top"] < 50
+            or py_mid["leftOnScroll"] < 40
+            or py_mid["topOnScroll"] < 50
+            or not py_mid["active"]
+            or py_mid["compactActive"]
+            or abs(py_mid["rdTop"] - py_mid["rdTopBefore"]) > 1
+        ):
+            raise AssertionError(f"Expected inner python scroll + immediate active indicator without outer scroll: {py_mid}")
+
+        send_touchpad(py_mid["x"], py_mid["y"], 0, -(int(py_mid["maxTop"]) + 180), wait_steps=5)
+        py_chained = run_script(
+            f"(()=>{{const py=document.querySelector('.python-source'),rd=document.querySelector('.android-reading');"
+            f"if(rd.scrollTop<{py_mid['rdTopBefore']}+100){{document.title=JSON.stringify({{ready:false}});return;}}"
+            f"document.title=JSON.stringify({{ready:true,pyRem:Math.abs(py.scrollHeight-py.clientHeight-py.scrollTop),rdTop:rd.scrollTop}});}})()"
+        )
+        if py_chained["pyRem"] > 2 or py_chained["rdTop"] < py_mid["rdTopBefore"] + 100:
+            raise AssertionError(f"Expected python boundary chaining to .android-reading: {py_chained}")
+
+        # 2. Read mode: observe .cell-output pre (Python output) horizontal movement + active indicator + vertical chain immediately at its own input.
+        py_out_after = arm_and_scroll_target(
+            "document.querySelector('.python-cell .cell-output pre')",
+            80,
+            18,
+            -115,
+            -70,
+            min_left=80,
+            min_rd_delta=40,
+            scroll_into_view=True,
+        )
+        if (
+            py_out_after["activeBefore"]
+            or py_out_after["left"] < 80
+            or py_out_after["leftOnScroll"] < 80
+            or not py_out_after["active"]
+            or py_out_after["compactActive"]
+            or py_out_after["rdTop"] <= py_out_after["rdTopBefore"] + 40
+            or py_out_after["rdLeft"] != 0
+        ):
+            raise AssertionError(f"Expected Python output horizontal scroll + immediate active indicator + vertical chain: {py_out_after}")
+
+        # 3. Read mode: observe fenced <pre> movement + active indicator + vertical chain together immediately at its own input.
+        pre_after = arm_and_scroll_target(
+            "document.querySelector('.code-disclosure pre')",
+            80,
+            24,
+            -115,
+            -75,
+            min_left=80,
+            min_rd_delta=45,
+            scroll_into_view=True,
+        )
+        if (
+            pre_after["activeBefore"]
+            or pre_after["left"] < 80
+            or pre_after["leftOnScroll"] < 80
+            or not pre_after["active"]
+            or pre_after["compactActive"]
+            or pre_after["rdTop"] <= pre_after["rdTopBefore"] + 45
+            or pre_after["rdLeft"] != 0
+        ):
+            raise AssertionError(f"Expected fenced pre horizontal scroll + immediate active indicator + vertical chain: {pre_after}")
+
+        # 4. Read mode: observe wide table movement + active indicator + vertical chain together immediately at its own input.
+        tb_after = arm_and_scroll_target(
+            "document.querySelectorAll('.markdown-body table')[1]",
+            80,
+            30,
+            -120,
+            -90,
+            min_left=90,
+            min_rd_delta=50,
+            scroll_into_view=True,
+        )
+        if (
+            tb_after["activeBefore"]
+            or tb_after["left"] < 90
+            or tb_after["leftOnScroll"] < 90
+            or not tb_after["active"]
+            or tb_after["compactActive"]
+            or tb_after["rdTop"] <= tb_after["rdTopBefore"] + 50
+            or tb_after["rdLeft"] != 0
+        ):
+            raise AssertionError(f"Expected wide table horizontal scroll + immediate active indicator + vertical chain under centerLock: {tb_after}")
+
+        # Verify the 650ms transient marker expires cleanly when idle while preserving the table's scroll offset.
+        QTest.qWait(700)
+        tb_idle = run_script(
+            "(()=>{const tb=document.querySelectorAll('.markdown-body table')[1];"
+            "if(!tb||tb.classList.contains('scroll-indicator-active')){document.title=JSON.stringify({ready:false});return;}"
+            "document.title=JSON.stringify({ready:true,left:tb.scrollLeft,active:tb.classList.contains('scroll-indicator-active')});})()"
+        )
+        if tb_idle["active"] or tb_idle["left"] < 90:
+            raise AssertionError(f"Expected wide table indicator to expire after 650ms idle window without losing scrollLeft: {tb_idle}")
+
+        if screenshot_dir:
+            vis_pts = run_script(
+                "(()=>{const rd=document.querySelector('.android-reading'),tb=document.querySelectorAll('.markdown-body table')[1],"
+                "pre=document.querySelector('.code-disclosure pre'),py=document.querySelector('.python-source'),"
+                "pyOut=document.querySelector('.python-cell .cell-output pre');"
+                "rd.scrollTop=0;tb.scrollLeft=0;pre.scrollLeft=0;py.scrollTop=0;py.scrollLeft=0;pyOut.scrollLeft=85;"
+                "const rr=rd.getBoundingClientRect(),tr=tb.getBoundingClientRect(),cr=pre.getBoundingClientRect(),pr=py.getBoundingClientRect();"
+                "document.title=JSON.stringify({ready:true,tx:tr.left+80,ty:tr.top+28,cx:cr.left+80,cy:cr.top+24,"
+                "px:pr.left+80,py:Math.min(pr.top+40,rr.bottom-20)});})()"
+            )
+            send_touchpad(vis_pts["tx"], vis_pts["ty"], -120, 0)
+            send_touchpad(vis_pts["cx"], vis_pts["cy"], -120, 0)
+            send_touchpad(vis_pts["px"], vis_pts["py"], -60, -70)
+        reader_colors = verify_presented_frame("reader", "qt-reader-table-width-and-scroll-indicators.png")
+
+        # 4. Study step-cards notes scroll internally first, then chain at boundary, and Ctrl+wheel zooms note without scrolling notes.
         st_geom = run_script(
             "(()=>{const st=document.querySelector('.step-cards-notes'),rd=document.querySelector('.android-reading');"
-            "st.scrollIntoView({block:'center'});const sr=st.getBoundingClientRect();"
-            "document.title=JSON.stringify({ready:true,x:sr.left+60,y:sr.top+60,maxTop:st.scrollHeight-st.clientHeight,rdTop:rd.scrollTop});})()"
+            "if(!st||!rd||st.scrollHeight<=st.clientHeight){document.title=JSON.stringify({ready:false});return;}"
+            "document.body.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaX:0,deltaY:0}));"
+            "const sr0=st.getBoundingClientRect(),rr=rd.getBoundingClientRect();"
+            "rd.scrollTop=Math.max(0,rd.scrollTop+(sr0.top+sr0.height/2-(rr.top+rr.height/2)));"
+            "const sr=st.getBoundingClientRect(),rr2=rd.getBoundingClientRect();"
+            "const minX=Math.max(sr.left,rr2.left,0)+12,maxX=Math.min(sr.right,rr2.right,window.innerWidth)-20;"
+            "const minY=Math.max(sr.top,rr2.top,0)+12,maxY=Math.min(sr.bottom,rr2.bottom,window.innerHeight)-20;"
+            "const x=Math.min(Math.max(sr.left+60,minX),Math.max(minX,maxX));"
+            "const y=Math.min(Math.max(sr.top+60,minY),Math.max(minY,maxY));"
+            "document.title=JSON.stringify({ready:true,x,y,maxTop:st.scrollHeight-st.clientHeight,rdTop:rd.scrollTop});})()"
         )
-        send_touchpad(st_geom["x"], st_geom["y"], 0, -55)
+        send_touchpad(st_geom["x"], st_geom["y"], 0, -55, wait_steps=5)
         st_mid = run_script(
             "(()=>{const st=document.querySelector('.step-cards-notes'),rd=document.querySelector('.android-reading');"
+            "if(st.scrollTop<35){document.title=JSON.stringify({ready:false});return;}"
             "document.title=JSON.stringify({ready:true,stTop:st.scrollTop,rdTop:rd.scrollTop});})()"
         )
         if st_mid["stTop"] < 35 or abs(st_mid["rdTop"] - st_geom["rdTop"]) > 2:
             raise AssertionError(f"Expected study notes interior scroll before chaining: {st_mid} vs {st_geom}")
 
-        send_touchpad(st_geom["x"], st_geom["y"], 0, 120, modifiers=Qt.KeyboardModifier.ControlModifier)
+        send_touchpad(st_geom["x"], st_geom["y"], 0, 120, modifiers=Qt.KeyboardModifier.ControlModifier, wait_steps=5)
         zoomed = run_script(
             "(()=>{const page=document.querySelector('.document-page'),st=document.querySelector('.step-cards-notes');"
+            "if(Number(page.dataset.scale)<=1.15){document.title=JSON.stringify({ready:false});return;}"
             "document.title=JSON.stringify({ready:true,scale:Number(page.dataset.scale),stTop:st.scrollTop});})()"
         )
         if zoomed["scale"] <= 1.15 or abs(zoomed["stTop"] - st_mid["stTop"]) > 2:
             raise AssertionError(f"Expected Ctrl+touchpad over study region to zoom note without scrolling study notes: {zoomed}")
 
-        if screenshot_dir:
-            for _ in range(6):
+        # 5. Reset zoom and scroll anchor to top, then verify compact table shrink-wrap, semantics, and per-gesture
+        # nested overflow indicators immediately at each target's own input in Live and Split modes.
+        studio.setZoom(100)
+        run_script(
+            "(()=>{const rd=document.querySelector('.android-reading'),page=document.querySelector('.document-page');"
+            "if(!rd||!page||Math.abs(Number(page.dataset.scale||1)-1)>0.05){document.title=JSON.stringify({ready:false});return;}"
+            "document.body.dispatchEvent(new WheelEvent('wheel',{bubbles:true,deltaX:0,deltaY:0}));"
+            "rd.scrollTop=0;document.title=JSON.stringify({ready:true});})()"
+        )
+        for _ in range(4):
+            app.processEvents()
+            QTest.qWait(20)
+        mode_results = {}
+        for mode_name in ("live", "split"):
+            studio.setMode(mode_name)
+            for _ in range(4):
                 app.processEvents()
                 QTest.qWait(20)
-            window.grabWindow().save(str( Path(screenshot_dir) / "qt-touchpad-study-and-zoom.png"))
+            # Wait until the target mode DOM is mounted and cancel post-load anchor restoration cleanly without rAF barriers.
+            run_script(
+                f"(()=>{{const rd=document.querySelector('.android-reading'),tables=rd?.querySelectorAll('.markdown-body table'),"
+                f"pre=rd?.querySelector('.code-disclosure pre'),py=rd?.querySelector('.python-source'),"
+                f"pyOut=rd?.querySelector('.python-cell .cell-output pre'),needCm={json.dumps(mode_name == 'split')},"
+                f"needLive={json.dumps(mode_name == 'live')};"
+                f"if(!rd||!tables||tables.length<2||!pre||!py||!pyOut||(needCm&&(!document.querySelector('.cm-scroller')||rd.querySelector('.live-document')))||(needLive&&!rd.querySelector('.live-document'))||tables[1].scrollWidth-tables[1].clientWidth<=80||pre.scrollWidth-pre.clientWidth<=80||py.scrollHeight<=py.clientHeight||pyOut.scrollWidth-pyOut.clientWidth<=80)"
+                f"{{document.title=JSON.stringify({{ready:false}});return;}}"
+                f"document.body.dispatchEvent(new WheelEvent('wheel',{{bubbles:true,deltaX:0,deltaY:0}}));"
+                f"rd.scrollTop=0;tables[1].scrollLeft=0;pre.scrollLeft=0;py.scrollTop=0;py.scrollLeft=0;pyOut.scrollLeft=0;"
+                f"[tables[0],tables[1],pre,py,pyOut].forEach(el=>el.classList.remove('scroll-indicator-active','scroll-indicator-hover'));"
+                f"document.title=JSON.stringify({{ready:true}});}})()"
+            )
+            verify_mode_geometry_and_semantics(mode_name, 0.65 if mode_name == "split" else 0.6)
 
-        print(json.dumps({"ok": True, "pyMid": py_mid, "tbAfter": tb_after, "zoomScale": zoomed["scale"]}), flush=True)
-        window.close()
-        del engine
-        studio.stop()
-        studio.pool.shutdown(wait=False, cancel_futures=True)
-        session.writes.shutdown(wait=False)
-    os._exit(0)
+            mode_tb = arm_and_scroll_target(
+                "document.querySelector('.android-reading').querySelectorAll('.markdown-body table')[1]",
+                60,
+                26,
+                -110,
+                0,
+                min_left=70,
+                scroll_into_view=True,
+            )
+            if (
+                mode_tb["activeBefore"]
+                or mode_tb["left"] < 70
+                or mode_tb["leftOnScroll"] < 70
+                or not mode_tb["active"]
+                or mode_tb["compactActive"]
+            ):
+                raise AssertionError(f"Expected wide table scroll + immediate active indicator in {mode_name}: {mode_tb}")
+
+            mode_pre = arm_and_scroll_target(
+                "document.querySelector('.android-reading .code-disclosure pre')",
+                60,
+                24,
+                -110,
+                0,
+                min_left=70,
+                scroll_into_view=True,
+            )
+            if (
+                mode_pre["activeBefore"]
+                or mode_pre["left"] < 70
+                or mode_pre["leftOnScroll"] < 70
+                or not mode_pre["active"]
+                or mode_pre["compactActive"]
+            ):
+                raise AssertionError(f"Expected fenced pre scroll + immediate active indicator in {mode_name}: {mode_pre}")
+
+            mode_py = arm_and_scroll_target(
+                "document.querySelector('.android-reading .python-source')",
+                60,
+                36,
+                -55,
+                -65,
+                min_left=35,
+                min_top=40,
+                scroll_into_view=True,
+            )
+            if (
+                mode_py["activeBefore"]
+                or mode_py["left"] < 35
+                or mode_py["top"] < 40
+                or mode_py["leftOnScroll"] < 35
+                or mode_py["topOnScroll"] < 40
+                or not mode_py["active"]
+                or mode_py["compactActive"]
+            ):
+                raise AssertionError(f"Expected python source scroll + immediate active indicator in {mode_name}: {mode_py}")
+
+            mode_py_out = arm_and_scroll_target(
+                "document.querySelector('.android-reading .python-cell .cell-output pre')",
+                60,
+                18,
+                -110,
+                0,
+                min_left=70,
+                scroll_into_view=True,
+            )
+            if (
+                mode_py_out["activeBefore"]
+                or mode_py_out["left"] < 70
+                or mode_py_out["leftOnScroll"] < 70
+                or not mode_py_out["active"]
+                or mode_py_out["compactActive"]
+            ):
+                raise AssertionError(f"Expected Python output scroll + immediate active indicator in {mode_name}: {mode_py_out}")
+
+            mode_colors = verify_presented_frame(mode_name, f"qt-{mode_name}-table-width-and-scroll-indicators.png")
+            mode_results[mode_name] = {
+                "tbLeft": mode_tb["left"],
+                "tbLeftOnScroll": mode_tb["leftOnScroll"],
+                "tbActive": mode_tb["active"],
+                "tbActiveOnScroll": mode_tb["activeOnScroll"],
+                "tbActiveAfterScroll": mode_tb["activeAfterScroll"],
+                "preLeft": mode_pre["left"],
+                "preLeftOnScroll": mode_pre["leftOnScroll"],
+                "preActive": mode_pre["active"],
+                "preActiveOnScroll": mode_pre["activeOnScroll"],
+                "preActiveAfterScroll": mode_pre["activeAfterScroll"],
+                "pyLeft": mode_py["left"],
+                "pyTop": mode_py["top"],
+                "pyLeftOnScroll": mode_py["leftOnScroll"],
+                "pyTopOnScroll": mode_py["topOnScroll"],
+                "pyActive": mode_py["active"],
+                "pyActiveOnScroll": mode_py["activeOnScroll"],
+                "pyActiveAfterScroll": mode_py["activeAfterScroll"],
+                "pyOutLeft": mode_py_out["left"],
+                "pyOutLeftOnScroll": mode_py_out["leftOnScroll"],
+                "pyOutActive": mode_py_out["active"],
+                "pyOutActiveOnScroll": mode_py_out["activeOnScroll"],
+                "pyOutActiveAfterScroll": mode_py_out["activeAfterScroll"],
+                "compactActive": (
+                    mode_tb["compactActive"]
+                    or mode_pre["compactActive"]
+                    or mode_py["compactActive"]
+                    or mode_py_out["compactActive"]
+                ),
+                "paintedColors": mode_colors,
+            }
+
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "pyMid": py_mid,
+                    "pyOutAfter": py_out_after,
+                    "preAfter": pre_after,
+                    "tbAfter": tb_after,
+                    "tbIdleExpired": not tb_idle["active"],
+                    "readerColors": reader_colors,
+                    "zoomScale": zoomed["scale"],
+                    "modes": mode_results,
+                }
+            ),
+            flush=True,
+        )
+        exit_code = 0
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+    finally:
+        if getattr(session, "agent_bridge", None) is not None:
+            session.agent_bridge.stop()
+        if studio is not None:
+            studio.stop()
+            studio.pool.shutdown(wait=False, cancel_futures=True)
+            if getattr(studio, "_search_pool", None) is not None:
+                studio._search_pool.shutdown(wait=False, cancel_futures=True)
+        if session is not None:
+            session.writes.shutdown(wait=True)
+        _EXIT_ANCHOR[:] = [app, touchpad, session, studio, engine, window, bundle_handler]
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(session_dir, ignore_errors=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(exit_code)
 
 
 class TouchpadScrollQtWebEngineTest(unittest.TestCase):
@@ -429,19 +887,68 @@ class TouchpadScrollQtWebEngineTest(unittest.TestCase):
         if not (ROOT.parent / "dist" / "qt-reader.html").is_file():
             raise unittest.SkipTest("dist/qt-reader.html not built")
         env = dict(os.environ, QT_QPA_PLATFORM="offscreen", QT_QUICK_BACKEND="software")
-        completed = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "--probe"],
-            cwd=ROOT,
-            env=env,
-            text=True,
-            encoding="utf-8",
-            errors="strict",
-            capture_output=True,
-            timeout=60,
-        )
-        self.assertEqual(completed.returncode, 0, f"{completed.stdout}{completed.stderr}")
-        result = json.loads(completed.stdout.strip().splitlines()[-1])
+        io_dir = Path(tempfile.mkdtemp(prefix="supermd-touchpad-probe-io-"))
+        try:
+            stdout_path = io_dir / "probe-stdout.log"
+            stderr_path = io_dir / "probe-stderr.log"
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as stderr_file:
+                completed = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), "--probe"],
+                    cwd=ROOT,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    timeout=90,
+                )
+            stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace")
+            stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")
+        finally:
+            shutil.rmtree(io_dir, ignore_errors=True)
+        self.assertEqual(completed.returncode, 0, f"{stdout_text}{stderr_text}")
+        result = json.loads(stdout_text.strip().splitlines()[-1])
         self.assertTrue(result.get("ok"), result)
+        self.assertGreaterEqual(result["tbAfter"]["left"], 90, result)
+        self.assertGreaterEqual(result["tbAfter"]["leftOnScroll"], 90, result)
+        self.assertTrue(result["tbAfter"]["active"] and result["tbAfter"]["activeOnScroll"] and result["tbAfter"]["activeAfterScroll"], result)
+        self.assertFalse(result["tbAfter"]["activeBefore"] or result["tbAfter"]["compactActive"], result)
+        self.assertTrue(result["tbIdleExpired"], result)
+        self.assertGreaterEqual(result["preAfter"]["left"], 80, result)
+        self.assertGreaterEqual(result["preAfter"]["leftOnScroll"], 80, result)
+        self.assertTrue(result["preAfter"]["active"] and result["preAfter"]["activeOnScroll"] and result["preAfter"]["activeAfterScroll"], result)
+        self.assertFalse(result["preAfter"]["activeBefore"] or result["preAfter"]["compactActive"], result)
+        self.assertGreaterEqual(result["pyOutAfter"]["left"], 80, result)
+        self.assertGreaterEqual(result["pyOutAfter"]["leftOnScroll"], 80, result)
+        self.assertTrue(result["pyOutAfter"]["active"] and result["pyOutAfter"]["activeOnScroll"] and result["pyOutAfter"]["activeAfterScroll"], result)
+        self.assertFalse(result["pyOutAfter"]["activeBefore"] or result["pyOutAfter"]["compactActive"], result)
+        self.assertGreaterEqual(result["pyMid"]["left"], 40, result)
+        self.assertGreaterEqual(result["pyMid"]["top"], 50, result)
+        self.assertGreaterEqual(result["pyMid"]["leftOnScroll"], 40, result)
+        self.assertGreaterEqual(result["pyMid"]["topOnScroll"], 50, result)
+        self.assertTrue(result["pyMid"]["active"] and result["pyMid"]["activeOnScroll"] and result["pyMid"]["activeAfterScroll"], result)
+        self.assertFalse(result["pyMid"]["activeBefore"] or result["pyMid"]["compactActive"], result)
+        self.assertGreater(result["readerColors"], 20, result)
+        self.assertGreater(result["zoomScale"], 1.15, result)
+        for mode_name in ("live", "split"):
+            mode_data = result["modes"][mode_name]
+            self.assertGreaterEqual(mode_data["tbLeft"], 70, (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["tbLeftOnScroll"], 70, (mode_name, mode_data))
+            self.assertTrue(mode_data["tbActive"] and mode_data["tbActiveOnScroll"] and mode_data["tbActiveAfterScroll"], (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["preLeft"], 70, (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["preLeftOnScroll"], 70, (mode_name, mode_data))
+            self.assertTrue(mode_data["preActive"] and mode_data["preActiveOnScroll"] and mode_data["preActiveAfterScroll"], (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyLeft"], 35, (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyTop"], 40, (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyLeftOnScroll"], 35, (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyTopOnScroll"], 40, (mode_name, mode_data))
+            self.assertTrue(mode_data["pyActive"] and mode_data["pyActiveOnScroll"] and mode_data["pyActiveAfterScroll"], (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyOutLeft"], 70, (mode_name, mode_data))
+            self.assertGreaterEqual(mode_data["pyOutLeftOnScroll"], 70, (mode_name, mode_data))
+            self.assertTrue(mode_data["pyOutActive"] and mode_data["pyOutActiveOnScroll"] and mode_data["pyOutActiveAfterScroll"], (mode_name, mode_data))
+            self.assertFalse(mode_data["compactActive"], (mode_name, mode_data))
+            self.assertGreater(mode_data["paintedColors"], 20, (mode_name, mode_data))
 
 
 if __name__ == "__main__" and "--probe" in sys.argv:

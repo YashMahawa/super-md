@@ -1,6 +1,6 @@
 """Outbound client for the Super MD ephemeral cloud relay."""
 from __future__ import annotations
-import hashlib, json, logging, os, secrets, threading, time, urllib.error, urllib.request, uuid
+import hashlib, json, logging, os, secrets, threading, urllib.error, urllib.request, uuid
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from typing import Any, Callable
