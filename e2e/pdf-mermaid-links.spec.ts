@@ -21,6 +21,14 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
         "flowchart TD",
         '  Encoded["Flow%2Emmd Path"] --> Cleaned["Decoded Flow.mmd"]',
       ].join("\n"),
+      "diagrams/Flow#1.mmd": [
+        "flowchart LR",
+        '  HashFile["Flow#1.mmd"] --> HashOut["Encoded %23"]',
+      ].join("\n"),
+      "diagrams/Flow%Complete.mmd": [
+        "flowchart TD",
+        '  PctFile["Flow%Complete.mmd"] --> PctOut["Encoded %25"]',
+      ].join("\n"),
       "diagrams/broken.mmd": "flowchart TD\n  A -->\n  invalid syntax ???\n",
     };
     const pngDataUrl =
@@ -35,19 +43,20 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
         queueMicrotask(() => {
           if (command === "load_text_asset") {
             const source = String(args.source || "");
-            if (source === "diagrams/symlink-outside.mmd") {
+            const relative = decodeURIComponent(source.split("#", 1)[0].split("?", 1)[0]);
+            if (relative === "diagrams/symlink-outside.mmd") {
               window.supermdReply?.(id, null, "Diagram source is outside the note folder");
               return;
             }
-            if (source === "diagrams/oversized.mmd") {
+            if (relative === "diagrams/oversized.mmd") {
               window.supermdReply?.(id, { text: "a".repeat(2_000_005) }, null);
               return;
             }
-            if (!(source in mermaidFiles)) {
+            if (!(relative in mermaidFiles)) {
               window.supermdReply?.(id, null, "No such file or directory");
               return;
             }
-            window.supermdReply?.(id, { text: mermaidFiles[source] }, null);
+            window.supermdReply?.(id, { text: mermaidFiles[relative] }, null);
             return;
           }
           if (command === "load_asset") {
@@ -95,6 +104,10 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
         "",
         "![Encoded Flow](figures/Flow%2Emmd?label=photo.png#top)",
         "",
+        "![Hash Filename](diagrams/Flow%231.mmd)",
+        "",
+        "![Percent Filename](diagrams/Flow%25Complete.mmd)",
+        "",
         "![Query Photo](figures/photo.png?label=flow.mmd)",
         "",
         "![Fragment Photo](figures/photo.png#flow.mmd)",
@@ -135,6 +148,8 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
     "diagrams/architecture.mmd",
     "diagrams/handshake.mermaid",
     "figures/Flow.mmd",
+    "diagrams/Flow%231.mmd",
+    "diagrams/Flow%25Complete.mmd",
   ]);
 
   const pdfExportCall = okCaptures.find((c: any) => c.command === "export_pdf_native");
@@ -148,17 +163,19 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
   expect(preparedContent).toMatch(/!\[Handshake Sequence\]\(diagram-\d+\.svg\)/);
   expect(preparedContent).toMatch(/!\[diagrams\/architecture\.mmd\]\(diagram-\d+\.svg\)\{width=320\}/);
   expect(preparedContent).toMatch(/!\[Encoded Flow\]\(diagram-\d+\.svg\)/);
+  expect(preparedContent).toMatch(/!\[Hash Filename\]\(diagram-\d+\.svg\)/);
+  expect(preparedContent).toMatch(/!\[Percent Filename\]\(diagram-\d+\.svg\)/);
   expect(preparedContent).toMatch(/!\[Query Photo\]\(asset-\d+\.png\)/);
   expect(preparedContent).toMatch(/!\[Fragment Photo\]\(asset-\d+\.png\)/);
   expect(preparedContent).toContain("[Source file](diagrams/architecture.mmd)");
 
   const assetNames = Object.keys(preparedAssets);
-  expect(assetNames).toHaveLength(6);
+  expect(assetNames).toHaveLength(8);
   const svgAssets = Object.fromEntries(
     Object.entries(preparedAssets).filter(([name]) => name.endsWith(".svg")),
   );
   const pngAssets = Object.entries(preparedAssets).filter(([name]) => name.endsWith(".png"));
-  expect(Object.keys(svgAssets)).toHaveLength(4);
+  expect(Object.keys(svgAssets)).toHaveLength(6);
   expect(pngAssets).toHaveLength(2);
 
   const verifiedSvgs = await page.evaluate((assets: Record<string, string>) => {
@@ -194,6 +211,12 @@ test("Chromium PDF preparation renders relative .mmd and .mermaid image links to
   expect(verifiedSvgs.some(svg => svg.text.includes("Flow%2Emmd Path") && svg.text.includes("Decoded Flow.mmd"))).toBe(
     true,
   );
+  expect(
+    verifiedSvgs.some(svg => svg.text.includes("Flow#1.mmd") && svg.text.includes("Encoded %23")),
+  ).toBe(true);
+  expect(
+    verifiedSvgs.some(svg => svg.text.includes("Flow%Complete.mmd") && svg.text.includes("Encoded %25")),
+  ).toBe(true);
 
   // 2. Missing, path-traversal, host-rejected outside-root, oversized, unconsented remote, and invalid-Mermaid files report readable errors.
   const errorCases: Array<{

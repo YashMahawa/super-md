@@ -104,6 +104,8 @@ function decodeDataUrl(value: string): { mime: string; dataUrl: string; text?: s
 }
 
 export const MERMAID_SOURCE_LIMIT = 2_000_000;
+const MERMAID_FILENAME_RE = /^(?!\.+$)[^/]+\.(?:mmd|mermaid)$/i;
+const COMPANION_FILENAME_RE = /^(?!\.+$)[^/]+\.(?:svg|mmd|mermaid)$/i;
 
 function decodeSafePath(source: string, allowAuthorityPath = false): string | null {
   if (!source || /^data:/i.test(source)) return null;
@@ -139,14 +141,20 @@ function decodedPathFilename(source: string): string | null {
   return filename;
 }
 
+function hasDecodedMermaidExtension(decodedPath: string): boolean {
+  const slash = decodedPath.lastIndexOf("/");
+  const filename = slash >= 0 ? decodedPath.slice(slash + 1) : decodedPath;
+  return MERMAID_FILENAME_RE.test(filename);
+}
+
 function isCompanionLinkPath(source: string): boolean {
   const filename = decodedPathFilename(source);
-  return filename !== null && /^(?!\.+$)[^/]+\.(?:svg|mmd|mermaid)$/i.test(filename);
+  return filename !== null && COMPANION_FILENAME_RE.test(filename);
 }
 
 export function isMermaidSourcePath(source: string): boolean {
   const filename = decodedPathFilename(source);
-  return filename !== null && /^(?!\.+$)[^/]+\.(?:mmd|mermaid)$/i.test(filename);
+  return filename !== null && MERMAID_FILENAME_RE.test(filename);
 }
 
 export function cleanRelativePath(source: string): string | null {
@@ -164,12 +172,17 @@ export function validateLocalMermaidSourcePath(source: string): string {
     throw Error(`Mermaid source must be a local .mmd or .mermaid file: ${source}`);
   }
   const relative = cleanRelativePath(source);
-  if (!relative || !isMermaidSourcePath(relative)) throw Error(`Cannot safely resolve Mermaid source ${source}`);
+  if (!relative || !hasDecodedMermaidExtension(relative)) {
+    throw Error(`Cannot safely resolve Mermaid source ${source}`);
+  }
   return relative;
 }
 
 export function normalizeLocalMermaidSource(relativePath: string): string {
-  return encodeURI(relativePath).replace(/#/g, "%23");
+  return relativePath
+    .split("/")
+    .map(segment => encodeURIComponent(segment))
+    .join("/");
 }
 
 export async function loadLocalMermaidSource(documentPath: string | null, source: string): Promise<string> {
@@ -241,16 +254,24 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
     const references = refs(markdown);
     report({ phase: "prepare", completed: 1, total: 1 });
     const seenSources = new Set<string>();
+    const mermaidLoads = new Map<string, Promise<string>>();
     const tasks: Array<() => Promise<void>> = [];
     for (const ref of references) {
       checkCurrent();
       if (/^https?:|^\/\//i.test(ref.source) || seenSources.has(ref.source)) continue;
       seenSources.add(ref.source);
       if (isMermaidSourcePath(ref.source)) {
-        validateLocalMermaidSourcePath(ref.source);
+        const relative = validateLocalMermaidSourcePath(ref.source);
+        const normalizedSource = normalizeLocalMermaidSource(relative);
         const source = ref.source;
         tasks.push(async () => {
-          const text = await loadLocalMermaidSource(documentPath, source);
+          let pending = mermaidLoads.get(normalizedSource);
+          if (!pending) {
+            pending = loadLocalMermaidSource(documentPath, source);
+            pending.catch(() => {});
+            mermaidLoads.set(normalizedSource, pending);
+          }
+          const text = await pending;
           checkCurrent();
           resolvedBySource.set(source, { kind: "mermaid", mermaid: text });
         });
@@ -311,7 +332,7 @@ export async function prepareMarkdownExport(markdown: string, documentPath: stri
     const keptDefinitions = new Set<number>();
     const reservedPaths = new Set(references.flatMap(({ source }) => {
       const path = cleanRelativePath(source);
-      return path && !APP_GENERATED.test(path) && !/\.(?:mmd|mermaid)$/i.test(path) ? [path] : [];
+      return path && !APP_GENERATED.test(path) && !hasDecodedMermaidExtension(path) ? [path] : [];
     }));
     const generatedPaths = new Map<string, string>();
     const usedPaths = new Set(reservedPaths);
