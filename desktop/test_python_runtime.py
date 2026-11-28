@@ -1098,6 +1098,104 @@ print("sibling cell ordinary output")
             self.assertEqual(created, str(fake_env_py))
             self.assertEqual(len(calls), 2)
 
+    def test_cancel_job_stops_only_specific_cell_leaving_same_tab_sibling_and_other_window_intact(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+            root = Path(folder)
+            win1_jobs = python_runtime.PythonJobRegistry()
+            win2_jobs = python_runtime.PythonJobRegistry()
+
+            with self.assertRaisesRegex(ValueError, "Invalid Python cell job id"):
+                win1_jobs.register("tab-a", job_id="x" * 129)
+            job_cell0 = win1_jobs.register("tab-a", job_id="job-cell-0")
+            with self.assertRaisesRegex(ValueError, "already in use"):
+                win1_jobs.register("tab-a", job_id="job-cell-0")
+            job_cell1 = win1_jobs.register("tab-a", job_id="job-cell-1")
+            job_tab_b = win1_jobs.register("tab-b", job_id="job-tab-b")
+            job_win2 = win2_jobs.register("tab-w2", job_id="job-win-2")
+
+            pid0_file = root / "cell0.pid"
+            ready1 = root / "cell1.ready"
+            release1 = root / "cell1.release"
+            ready_b = root / "tabb.ready"
+            release_b = root / "tabb.release"
+            ready_w2 = root / "win2.ready"
+            release_w2 = root / "win2.release"
+
+            code0 = f"""
+import pathlib, subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+pathlib.Path({str(pid0_file)!r}).write_text(str(child.pid), encoding="utf-8")
+child.wait()
+"""
+            wait_tpl = """
+import pathlib, time
+pathlib.Path({ready!r}).write_text("ready", encoding="utf-8")
+deadline = time.monotonic() + 20
+while not pathlib.Path({release!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.02)
+print({msg!r})
+"""
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                fut0 = pool.submit(python_runtime.run, sys.executable, code0, 30, str(root), job=job_cell0)
+                fut1 = pool.submit(
+                    python_runtime.run,
+                    sys.executable,
+                    wait_tpl.format(ready=str(ready1), release=str(release1), msg="same tab cell 1 ok"),
+                    30,
+                    str(root),
+                    job=job_cell1,
+                )
+                fut_b = pool.submit(
+                    python_runtime.run,
+                    sys.executable,
+                    wait_tpl.format(ready=str(ready_b), release=str(release_b), msg="tab b ok"),
+                    30,
+                    str(root),
+                    job=job_tab_b,
+                )
+                fut_w2 = pool.submit(
+                    python_runtime.run,
+                    sys.executable,
+                    wait_tpl.format(ready=str(ready_w2), release=str(release_w2), msg="window 2 ok"),
+                    30,
+                    str(root),
+                    job=job_win2,
+                )
+
+                pid0_text, _, _, _ = _await_files(pid0_file, ready1, ready_b, ready_w2, timeout=25.0)
+                pid0 = int(pid0_text)
+                self.addCleanup(_best_effort_kill, pid0)
+
+                # Mismatched tab filter or cross-window job id never cancels anything.
+                self.assertFalse(win1_jobs.cancel_job("job-cell-0", tab_id="tab-b"))
+                self.assertFalse(win1_jobs.cancel_job("job-win-2"))
+
+                t0 = time.monotonic()
+                self.assertTrue(win1_jobs.cancel_job("job-cell-0", tab_id="tab-a"))
+                self.assertLess(time.monotonic() - t0, 0.25)
+                self.assertFalse(win1_jobs.cancel_job("job-cell-0"))
+
+                with self.assertRaises(python_runtime.PythonCellCancelled):
+                    fut0.result(timeout=15)
+                win1_jobs.discard(job_cell0)
+                self.assertTrue(_wait_pid_exit(pid0, timeout=6.0))
+
+                # Independent cell in same tab, sibling tab, and other window stay active and finish cleanly.
+                self.assertFalse(job_cell1.cancelled.is_set())
+                self.assertFalse(job_tab_b.cancelled.is_set())
+                self.assertFalse(job_win2.cancelled.is_set())
+
+                release1.write_text("go", encoding="utf-8")
+                release_b.write_text("go", encoding="utf-8")
+                release_w2.write_text("go", encoding="utf-8")
+
+                self.assertEqual(fut1.result(timeout=15)["stdout"], "same tab cell 1 ok\n")
+                self.assertEqual(fut_b.result(timeout=15)["stdout"], "tab b ok\n")
+                self.assertEqual(fut_w2.result(timeout=15)["stdout"], "window 2 ok\n")
+                win1_jobs.discard(job_cell1)
+                win1_jobs.discard(job_tab_b)
+                win2_jobs.discard(job_win2)
+
 
 if __name__ == "__main__":
     unittest.main()

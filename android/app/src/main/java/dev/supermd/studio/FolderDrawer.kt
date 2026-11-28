@@ -58,7 +58,7 @@ internal fun FolderDrawerHeader(
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 if (folderRelative.isNotEmpty()) {
-                    IconButton(onClick = { onNavigateRelative(parentFolderRelative(folderRelative)) }, modifier = Modifier.size(36.dp)) {
+                    IconButton(onClick = { onNavigateRelative(parentRelativePath(folderRelative)) }, modifier = Modifier.size(36.dp)) {
                         Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Navigate up")
                     }
                 } else {
@@ -97,7 +97,7 @@ internal fun FolderDrawerHeader(
                 }
             }
             if (folderRelative.isNotEmpty()) {
-                val parentRel = parentFolderRelative(folderRelative)
+                val parentRel = parentRelativePath(folderRelative)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (parentRel.isNotEmpty()) {
                         TextButton(

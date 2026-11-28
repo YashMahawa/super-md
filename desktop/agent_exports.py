@@ -26,7 +26,7 @@ except ImportError:
     from frontmatter import strip_frontmatter
 
 DEFAULT_PDF_OPTIONS = {
-    "pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4,
+    "pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.5,
     "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True,
     "themed": False, "themeAccent": "#386a57",
 }
