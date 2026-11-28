@@ -45,10 +45,14 @@ internal fun isSupportedFolderNoteFile(name: String): Boolean =
     !name.startsWith('.') && '.' in name && name.substringAfterLast('.', "").lowercase() in FOLDER_NOTE_EXTENSIONS
 
 internal fun normalizeRelativePath(relative: String?): String =
-    normalizeFolderRelative(relative.orEmpty())
+    relative.orEmpty().split('/').map { it.trim() }
+        .filter { it.isNotEmpty() && it != "." && it != ".." }
+        .joinToString("/")
 
-internal fun parentRelativePath(relative: String): String =
-    parentFolderRelative(relative)
+internal fun parentRelativePath(relative: String): String {
+    val normalized = normalizeRelativePath(relative)
+    return if ('/' in normalized) normalized.substringBeforeLast('/') else ""
+}
 
 internal fun childRelativePath(parentRelative: String, name: String): String {
     val parent = normalizeRelativePath(parentRelative)
@@ -172,14 +176,14 @@ internal fun resolveSafParentDirectory(
 ): ResolvedSafParentDirectory {
     require(!hasInvalidSafFolderRelative(parentRelative)) { "Invalid folder path" }
     val (treeUri, rootDocumentId) = documentAccess.resolveReadableTreeRoot(folderUri)
-        ?: error("Choose the folder again to restore access")
+        ?: throw SecurityException("Choose the folder again to restore access")
     val segments = normalizeRelativePath(parentRelative).split('/').filter { it.isNotEmpty() }
     var currentDocumentId = rootDocumentId
     for (segment in segments) {
         require(segment != "." && segment != ".." && !segment.startsWith('.')) { "Invalid folder path" }
         val children = when (val projection = pass.projectDirectory(treeUri, currentDocumentId)) {
             is SafProjectionPass.DirectoryProjection.Loaded -> projection.children
-            SafProjectionPass.DirectoryProjection.Denied -> error("Choose the folder again to restore access")
+            SafProjectionPass.DirectoryProjection.Denied -> throw SecurityException("Choose the folder again to restore access")
             SafProjectionPass.DirectoryProjection.Missing,
             SafProjectionPass.DirectoryProjection.Unavailable -> error("Open folder is not accessible")
         }
@@ -190,7 +194,7 @@ internal fun resolveSafParentDirectory(
     }
     val finalChildren = when (val projection = pass.projectDirectory(treeUri, currentDocumentId)) {
         is SafProjectionPass.DirectoryProjection.Loaded -> projection.children
-        SafProjectionPass.DirectoryProjection.Denied -> error("Choose the folder again to restore access")
+        SafProjectionPass.DirectoryProjection.Denied -> throw SecurityException("Choose the folder again to restore access")
         SafProjectionPass.DirectoryProjection.Missing,
         SafProjectionPass.DirectoryProjection.Unavailable -> error("Open folder is not accessible")
     }
