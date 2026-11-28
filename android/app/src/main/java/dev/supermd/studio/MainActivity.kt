@@ -51,6 +51,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -80,6 +81,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.first
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
@@ -500,6 +502,7 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
     val chromeTapJob=remember {arrayOfNulls<kotlinx.coroutines.Job>(1)}
     DisposableEffect(Unit){onDispose{chromeTapJob[0]?.cancel()}}
     var web by remember { mutableStateOf<WebView?>(null) }
+    val focusManager = LocalFocusManager.current
     var chromeHeight by remember { mutableIntStateOf(0) }
     val readerNote = remember { arrayOfNulls<String>(1) }
     // WebView timer controls are process-wide. Track every reader so a stopped
@@ -579,22 +582,39 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
         if (menu || requested != findRequest || reader !== web) return@LaunchedEffect
         findRequest = 0
         findReplace = false
+        focusManager.clearFocus(force = true)
         reader.requestFocus(View.FOCUS_DOWN)
-        reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
-            reader.post {
-                reader.requestFocus(View.FOCUS_DOWN)
-                val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
-                val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
-                val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                if (!hasHardwareKeyboard || showImeWithHardware) {
-                    inputMethod?.showSoftInput(reader, InputMethodManager.SHOW_IMPLICIT)
-                } else {
-                    // WebView.focus() can itself open the software keyboard
-                    // after an input receives focus. Honor the hardware-keyboard
-                    // preference even when DOM focus was restored natively.
-                    inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
-                }
+        suspendCancellableCoroutine<Unit> { cont ->
+            reader.evaluateJavascript("window.supermdFind?.(${if (replace) "true" else ""}); true") {
+                if (cont.isActive) cont.resume(Unit)
             }
+        }
+        if (reader !== web) return@LaunchedEffect
+        withTimeoutOrNull(350) {
+            while (!reader.hasFocus() || !reader.onCheckIsTextEditor() || !model.state.value.readerOverlay) {
+                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+                delay(16)
+            }
+        }
+        withFrameNanos { }
+        if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+        val hasHardwareKeyboard = activity.resources.configuration.keyboard != android.content.res.Configuration.KEYBOARD_NOKEYS
+        val showImeWithHardware = android.provider.Settings.Secure.getInt(activity.contentResolver, "show_ime_with_hard_keyboard", 0) == 1
+        val inputMethod = activity.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        if (!hasHardwareKeyboard || showImeWithHardware) {
+            inputMethod?.showSoftInput(reader, 0)
+            delay(200)
+            val rootInsets = reader.rootWindowInsets
+            val imeShown = rootInsets != null && WindowInsetsCompat.toWindowInsetsCompat(rootInsets).isVisible(WindowInsetsCompat.Type.ime())
+            if (!imeShown && reader === web && model.state.value.readerOverlay) {
+                if (!reader.hasFocus()) reader.requestFocus(View.FOCUS_DOWN)
+                inputMethod?.showSoftInput(reader, 0)
+            }
+        } else {
+            // WebView.focus() can itself open the software keyboard
+            // after an input receives focus. Honor the hardware-keyboard
+            // preference even when DOM focus was restored natively.
+            inputMethod?.hideSoftInputFromWindow(reader.windowToken, 0)
         }
     }
     var readerReady by remember { mutableStateOf(false) }
@@ -1456,7 +1476,12 @@ internal fun noteOpenMimeTypes(): Array<String> = arrayOf("text/*", "application
             state = folderSearch,
             hasFolder = state.folder != null,
             onUpdate = model::updateFolderSearch,
-            onSelect = model::openSearchMatch,
+            onSelect = { match ->
+                if (match.isFileMatch) {
+                    web?.evaluateJavascript("if(document.querySelector('.reading-search')&&!document.querySelector('.image-viewer,.theme-guide-dialog'))window.supermdDismiss?.();true", null)
+                }
+                model.openSearchMatch(match)
+            },
             onDismiss = model::cancelWorkspaceSearch,
         )
     }

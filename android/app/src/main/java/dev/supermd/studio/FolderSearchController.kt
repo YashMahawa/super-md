@@ -42,10 +42,12 @@ internal class FolderSearchController(
     internal val seededFindMutable = MutableStateFlow<PendingSeededFind?>(null)
     val seededFind: StateFlow<PendingSeededFind?> = seededFindMutable.asStateFlow()
     private var folderSearchJob: Job? = null
+    private var activeReaderFlushedForSession = false
 
     fun cancel() {
         folderSearchJob?.cancel()
         folderSearchJob = null
+        activeReaderFlushedForSession = false
     }
 
     private suspend fun flushActiveIfNeeded() {
@@ -63,6 +65,7 @@ internal class FolderSearchController(
 
     fun openFolderSearch(initialQuery: String? = null, initialMode: FolderSearchMode? = null) {
         folderSearchJob?.cancel()
+        activeReaderFlushedForSession = false
         val previous = folderSearchMutable.value
         val nextQuery = initialQuery ?: previous.query
         val nextMode = initialMode ?: previous.mode
@@ -77,7 +80,10 @@ internal class FolderSearchController(
             truncated = false,
         )
         folderSearchJob = scope.launch {
-            if (nextMode == FolderSearchMode.TEXT) flushActiveIfNeeded()
+            if (nextMode == FolderSearchMode.TEXT && !activeReaderFlushedForSession) {
+                flushActiveIfNeeded()
+                activeReaderFlushedForSession = true
+            }
             if (nextQuery.isNotEmpty()) {
                 runFolderSearchScan(nextQuery, previous.caseSensitive, previous.includeDiagrams, nextMode)
             }
@@ -94,14 +100,22 @@ internal class FolderSearchController(
         folderSearchJob = null
         val previous = folderSearchMutable.value
         val visible = previous.visible
-        val flushBeforeTextScan = visible && previous.mode == FolderSearchMode.FILES && mode == FolderSearchMode.TEXT
         if (query.isEmpty() || !visible) {
             folderSearchMutable.value = FolderSearchState(visible = visible, mode = mode, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams, scanning = false)
+            if (visible && mode == FolderSearchMode.TEXT && !activeReaderFlushedForSession) {
+                folderSearchJob = scope.launch {
+                    flushActiveIfNeeded()
+                    activeReaderFlushedForSession = true
+                }
+            }
             return
         }
         folderSearchMutable.value = FolderSearchState(visible = visible, mode = mode, query = query, caseSensitive = caseSensitive, includeDiagrams = includeDiagrams, scanning = true)
         folderSearchJob = scope.launch {
-            if (flushBeforeTextScan) flushActiveIfNeeded()
+            if (mode == FolderSearchMode.TEXT && !activeReaderFlushedForSession) {
+                flushActiveIfNeeded()
+                activeReaderFlushedForSession = true
+            }
             runFolderSearchScan(query, caseSensitive, includeDiagrams, mode)
         }
     }
@@ -170,6 +184,7 @@ internal class FolderSearchController(
     fun closeFolderSearch() {
         folderSearchJob?.cancel()
         folderSearchJob = null
+        activeReaderFlushedForSession = false
         if (folderSearchMutable.value.visible || folderSearchMutable.value.scanning) {
             folderSearchMutable.value = folderSearchMutable.value.copy(visible = false, scanning = false)
         }

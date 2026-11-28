@@ -39,13 +39,18 @@ class StudioUiTest {
             // used by the existing end-to-end rendering/Python/PDF checks.
             compose.runOnIdle {
                 model.edit(before.active.id, before.active.content)
-                model.mode(before.mode)
                 model.zoom(before.normalZoom)
                 model.centerLock(before.centerLock)
                 model.typewriterScroll(before.typewriterScroll)
+            }
+            compose.waitForIdle()
+            runCatching { evaluateJavascriptOnce("true", 3_000) }
+            compose.runOnIdle {
+                model.mode(before.mode)
                 model.flush()
                 assertEquals(before.active.content, model.state.value.active.content)
             }
+            compose.waitUntil(5_000) { model.state.value.mode == before.mode }
             val snapshot = java.io.File(compose.activity.filesDir,
                 if (model.workspaceKey == "main") "workspace.json" else "workspaces/${model.workspaceKey}.json")
             compose.waitUntil(5000) {
@@ -272,11 +277,16 @@ class StudioUiTest {
         // First-use-only Welcome is product behavior. Tests that exercise the
         // sample must provide their own fixture on subsequent Activity starts.
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
-        compose.runOnIdle {if(model.state.value.active.content.isBlank())model.edit(model.state.value.active.id,sample)}
+        var seededSample = false
+        compose.runOnIdle {if(model.state.value.active.content.isBlank()){model.edit(model.state.value.active.id,sample);seededSample=true}}
         // Native controls intentionally stay disabled until reader_ready; test
         // setup must await that bridge handshake rather than race first render.
         compose.waitUntil(15_000) {
             compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty()
+        }
+        if (seededSample) {
+            compose.waitForIdle()
+            evaluateJavascriptOnce("true")
         }
     }
     @Test fun settingsUseDistinctCategoryPagesAndBackReturnsToSectionHome() {
@@ -482,13 +492,23 @@ class StudioUiTest {
         theme.getJSONObject("metrics").put("headingWeight",800)
         try {
             compose.runOnIdle {model.appearance(theme="light",motion=false);model.fullscreen(false);model.mode("reader");model.zoom(140f)}
+            compose.waitUntil(15_000) { model.state.value.mode == "reader" }
             file.writeText(theme.toString())
             compose.runOnIdle {model.importCustomTheme(android.net.Uri.fromFile(file))}
             compose.waitUntil(10_000){model.state.value.customTheme.isNotBlank()}
             javascriptUntil("(()=>{const root=document.documentElement;return root.dataset.customTheme==='true'&&root.style.getPropertyValue('--custom-heading-weight')==='800'&&getComputedStyle(document.querySelector('.android-reading')).backgroundImage.includes('radial-gradient');})()") {it=="true"}
             javascriptUntil("document.querySelector('.document-page').dataset.scale") {it=="\"1.4\""}
-            val bitmap=compose.onRoot().captureToImage().asAndroidBitmap();var colored=0
-            for(y in 0 until bitmap.height step 4)for(x in 0 until bitmap.width step 4)if(bitmap.getPixel(x,y) and 0xffffff==0x63351f)colored++
+            awaitActivityPresenterReady()
+            var colored=0; var themePaintAttempts=0
+            compose.waitUntil(10_000) {
+                if (themePaintAttempts++ > 0) {
+                    androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync { compose.activity.window.decorView.postInvalidateOnAnimation() }
+                    android.os.SystemClock.sleep(80)
+                }
+                val bitmap=compose.onRoot().captureToImage().asAndroidBitmap(); var count=0
+                for(y in 0 until bitmap.height step 4)for(x in 0 until bitmap.width step 4)if(bitmap.getPixel(x,y) and 0xffffff==0x63351f)count++
+                colored=count; colored>10
+            }
             assertTrue("The selected native control must paint the imported accent",colored>10)
             val accepted=model.state.value.customTheme
             file.writeText(theme.put("css","@import url(https://example.com)").toString())
@@ -523,13 +543,17 @@ class StudioUiTest {
         val body="Accessible full-document fixture. ".repeat(2_700).trimEnd()
         val content="# Full document accessibility\n\n$body"
         try {
-            compose.runOnIdle {model.edit(before.active.id,content);model.mode("reader");model.zoom(100f);model.fullDocumentAccessibility(true)}
-            compose.waitUntil(5_000){model.state.value.fullDocumentAccessibility&&prefs.getBoolean("fullDocumentAccessibility",false)}
+            compose.runOnIdle {model.edit(before.active.id,content);model.zoom(100f);model.fullDocumentAccessibility(true)}
+            compose.waitForIdle(); evaluateJavascriptOnce("true")
+            compose.runOnIdle {model.mode("reader")}
+            compose.waitUntil(15_000){model.state.value.mode=="reader"&&model.state.value.fullDocumentAccessibility&&prefs.getBoolean("fullDocumentAccessibility",false)}
             val expectedLength=body.length
             javascriptUntil("(()=>{const root=document.querySelector('.android-reading'),paragraph=document.querySelector('.markdown-body p');return root?.dataset.fullDocumentAccessibility==='true'&&!document.querySelector('[data-windowed-block]')&&paragraph?.textContent?.length===$expectedLength;})()") {it=="true"}
             assertTrue("The opt-in preference is saved",prefs.getBoolean("fullDocumentAccessibility",false))
         } finally {
-            compose.runOnIdle {model.fullDocumentAccessibility(previous);model.edit(before.active.id,before.active.content);model.mode(before.mode);model.zoom(before.normalZoom)}
+            compose.runOnIdle {model.fullDocumentAccessibility(previous);model.edit(before.active.id,before.active.content);model.zoom(before.normalZoom)}
+            compose.waitForIdle(); runCatching { evaluateJavascriptOnce("true", 3_000) }
+            compose.runOnIdle {model.mode(before.mode)}
             // This fixture disables virtualization and can leave a large DOM
             // pending after the test method returns. Let both preference state
             // and the replacement document reach the reader before the next
@@ -552,6 +576,8 @@ class StudioUiTest {
         try {
             compose.runOnIdle {model.fullscreen(false);model.appearance(accent="blue",theme="dark",motion=false);model.centerLock(true);model.readingPreference("svgAppearance","auto");model.edit(model.state.value.active.id,content);model.zoom(100f)}
             compose.waitUntil(15_000) { model.state.value.active.content == content }
+            compose.waitForIdle()
+            evaluateJavascriptOnce("true")
             compose.runOnIdle { model.mode("reader") }
             compose.waitUntil(15_000) { model.state.value.mode == "reader" }
             javascriptUntil("document.querySelector('h1#accent-media')!==null") {it=="true"}
@@ -737,10 +763,18 @@ class StudioUiTest {
                 bounds.width > 0f && bounds.height > 0f
             }
             compose.waitForIdle()
-            val icon=compose.onNodeWithContentDescription("New tab").captureToImage().asAndroidBitmap()
+            awaitActivityPresenterReady()
             val allowed=listOf(colors.onSurface,colors.onSurfaceVariant).map {it.toArgb() and 0xffffff}
-            var visible=0
-            for(y in 0 until icon.height)for(x in 0 until icon.width){if(icon.getPixel(x,y) and 0xffffff in allowed)visible++}
+            var visible=0; var darkIconAttempts=0
+            compose.waitUntil(10_000) {
+                if (darkIconAttempts++ > 0) {
+                    androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync { compose.activity.window.decorView.postInvalidateOnAnimation() }
+                    android.os.SystemClock.sleep(80)
+                }
+                val icon=compose.onNodeWithContentDescription("New tab").captureToImage().asAndroidBitmap(); var count=0
+                for(y in 0 until icon.height)for(x in 0 until icon.width){if(icon.getPixel(x,y) and 0xffffff in allowed)count++}
+                visible=count; visible>5
+            }
             assertTrue("The native plus must paint a high-contrast manual-scheme foreground, not the default black ambient",visible>5)
             java.io.File(compose.activity.getExternalFilesDir(null),"manual-blue-dark.png").outputStream().use {compose.onRoot().captureToImage().asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it)}
         } finally {compose.runOnIdle {model.appearance(accent=before.accent,theme=before.theme)}}
@@ -779,7 +813,7 @@ class StudioUiTest {
         val content=(0 until 600).joinToString("\n") { index ->
             "## Chapter $index\n\nUnique-$index ${"Readable **study text**. ".repeat(6)} \$x_$index=\\frac{a+b}{c+d}\$\n\n\$\$\\int_0^1 x^2 dx=\\frac13\$\$\n"
         }
-        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+        loadReaderFixture(model, content, zoom = 100f)
         javascriptUntil("document.querySelectorAll('[data-windowed-mounted=true]').length") {(it.toIntOrNull()?:0)>0}
         val math=javascriptUntil("document.querySelectorAll('.katex').length") {(it.toIntOrNull()?:0)>0}.toInt()
         assertTrue("Large notes must not keep every equation mounted",math<80)
@@ -810,7 +844,7 @@ class StudioUiTest {
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
         val content="# Immediate Find Focus\n\nHardware typing should land here without tapping the search field. FocusNeedle appears in this paragraph.\n"
-        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader")}
+        loadReaderFixture(model, content)
         javascriptUntil("document.querySelector('.android-reading')?.textContent.includes('FocusNeedle')") {it=="true"}
         compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
@@ -872,6 +906,8 @@ class StudioUiTest {
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState=model.state.value
         compose.runOnIdle { model.mode("reader") }
+        compose.waitUntil(15_000) { model.state.value.mode == "reader" }
+        javascriptUntil("!!document.querySelector('.android-document.mode-reader')") { it == "true" }
         compose.onNodeWithContentDescription("Find in note").performClick()
         javascriptUntil("(()=>{const input=document.querySelector('.reading-search input');return !!input&&document.activeElement===input})()") {it=="true"}
         compose.waitUntil(3_000) { web(compose.activity.window.decorView)?.hasFocus() == true }
@@ -890,7 +926,9 @@ class StudioUiTest {
         compose.waitUntil(5_000) {!model.state.value.restorePosition}
         compose.runOnIdle {model.edit(model.state.value.active.id,content)}
         compose.waitUntil(5_000) {model.state.value.active.content==content}
+        compose.waitForIdle(); evaluateJavascriptOnce("true")
         compose.runOnIdle {model.mode("reader");model.zoom(175f)}
+        compose.waitUntil(15_000) {model.state.value.mode=="reader"}
         javascriptUntil("document.querySelector('.document-page')?.dataset.selectionScale"){it=="\"1.75\""}
         javascriptUntil("(()=>{window.supermdDismiss?.();return !document.querySelector('.reading-search');})()") {it=="true"}
         awaitActivityPresenterReady(requireNoIme = true)
@@ -997,7 +1035,7 @@ class StudioUiTest {
 {"series":[{"expression":"sin(x)"}],"x":{"min":-2,"max":2,"steps":12},"y":{"min":-2,"max":2}}
 ```
 """
-        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+        loadReaderFixture(model, content, zoom = 100f)
         // The welcome note also contains one graph. Wait for THIS fixture and
         // its settled native scale, otherwise a slow bridge can replace the
         // welcome graph after we measure it but before the two-finger gesture.
@@ -1039,7 +1077,7 @@ ax.plot_surface(x, y, x*x + y*y, cmap="viridis")
 ax.set_title("Matplotlib 3D figure")
 ```
 """
-        compose.runOnIdle {model.edit(model.state.value.active.id,content);model.mode("reader");model.zoom(100f)}
+        loadReaderFixture(model, content, zoom = 100f)
         javascriptUntil("(() => { const b = [...document.querySelectorAll('.python-cell button')].find(button => button.textContent.includes('Run')); if (b && !b.disabled) b.click(); return !!document.querySelector('.cell-output img'); })()") {it=="true"}
         javascriptUntil("document.querySelector('.cell-output img')?.naturalWidth") {(it.toIntOrNull()?:0)>100}
         assertEquals("0",javascriptUntil("document.querySelectorAll('.surface-chart').length"){it=="0"})
@@ -1083,7 +1121,10 @@ ax.set_title("Matplotlib 3D figure")
         val model=androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState = model.state.value
         val original="Given \\frac{a}{b} = c, continue."
-        compose.runOnIdle {model.edit(model.state.value.active.id,original);model.mode("live")}
+        compose.runOnIdle {model.edit(model.state.value.active.id,original)}
+        compose.waitForIdle(); evaluateJavascriptOnce("true")
+        compose.runOnIdle {model.mode("live")}
+        compose.waitUntil(15_000) {model.state.value.mode=="live"}
         javascriptUntil("document.querySelector('.markdown-body')?.textContent") {it.contains("Given")}
         compose.onNodeWithContentDescription("More actions").performClick();compose.onNodeWithText("Fix LaTeX").performClick()
         javascriptUntil("(()=>{const b=document.querySelector('.math-repair-panel footer button');if(b&&!b.disabled)b.click();return document.querySelectorAll('.katex').length;})()") {it=="1"}
@@ -1165,7 +1206,7 @@ ax.set_title("Matplotlib 3D figure")
         val model = androidx.lifecycle.ViewModelProvider(compose.activity)[StudioViewModel::class.java]
         temporaryNoteState = model.state.value
         val content = "# Renderer recovery\n\nAcknowledged draft survives.\n\n```python\nprint('must not auto-run')\n```"
-        compose.runOnIdle { model.edit(model.state.value.active.id, content); model.mode("reader") }
+        loadReaderFixture(model, content)
         compose.waitUntil(15_000) { compose.onAllNodes(hasContentDescription("Export") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
 
         val originalReader = AtomicReference<WebView>()
@@ -1319,16 +1360,44 @@ ax.set_title("Matplotlib 3D figure")
         android.graphics.pdf.PdfRenderer(android.os.ParcelFileDescriptor.open(exported, android.os.ParcelFileDescriptor.MODE_READ_ONLY)).use { assertTrue(it.pageCount > 0) }
         compose.runOnIdle { model.zoom(100f) }
         javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it == "\"1\"" }
-        val screenshot = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()!!
-        java.io.File(compose.activity.cacheDir, "reader-ui-test.png").outputStream().use { screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
-        val painted = mutableSetOf<Int>()
+        awaitReaderVisualStateReady()
         val readerTop = AtomicReference(0)
         compose.runOnIdle { val view = web(compose.activity.window.decorView)!!; val xy = IntArray(2); view.getLocationOnScreen(xy); readerTop.set(xy[1]) }
-        for (y in readerTop.get() + 30 until screenshot.height - 100 step 12) for (x in 40 until screenshot.width - 40 step 8) painted.add(screenshot.getPixel(x, y))
-        assertTrue("Reader must actually paint, not just expose semantic nodes", painted.size > 40)
         val more = compose.onNodeWithContentDescription("More actions").fetchSemanticsNode().boundsInRoot.center
-        val nativeIcon = screenshot.getPixel(more.x.toInt(), more.y.toInt())
         val paletteIcon = android.graphics.Color.parseColor(org.json.JSONArray("[${javascriptUntil("getComputedStyle(document.documentElement).getPropertyValue('--muted')") { it.startsWith("\"#") }}]").getString(0))
+        val painted = mutableSetOf<Int>()
+        var nativeIcon = 0
+        var latestScreenshot: android.graphics.Bitmap? = null
+        var readerPaintAttempts = 0
+        try {
+            compose.waitUntil(15_000) {
+                if (readerPaintAttempts++ > 0) {
+                    androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                        web(compose.activity.window.decorView)?.postInvalidateOnAnimation()
+                        compose.activity.window.decorView.postInvalidateOnAnimation()
+                    }
+                    android.os.SystemClock.sleep(100)
+                }
+                latestScreenshot?.recycle()
+                val shot = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
+                latestScreenshot = shot
+                if (shot == null) false else {
+                    painted.clear()
+                    for (y in readerTop.get() + 30 until shot.height - 100 step 12) for (x in 40 until shot.width - 40 step 8) painted.add(shot.getPixel(x, y))
+                    nativeIcon = shot.getPixel(more.x.toInt(), more.y.toInt())
+                    painted.size > 40 &&
+                        kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 &&
+                        kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 &&
+                        kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15
+                }
+            }
+        } finally {
+            latestScreenshot?.let { shot ->
+                java.io.File(compose.activity.cacheDir, "reader-ui-test.png").outputStream().use { shot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+                shot.recycle()
+            }
+        }
+        assertTrue("Reader must actually paint, not just expose semantic nodes", painted.size > 40)
         assertTrue("Reader must not overpaint the native toolbar", kotlin.math.abs(android.graphics.Color.red(nativeIcon) - android.graphics.Color.red(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.green(nativeIcon) - android.graphics.Color.green(paletteIcon)) < 15 && kotlin.math.abs(android.graphics.Color.blue(nativeIcon) - android.graphics.Color.blue(paletteIcon)) < 15)
         val normalScale = javascriptUntil("document.querySelector('.document-page')?.dataset.scale") { it.isNotBlank() && it != "null" && it != "\"\"" }
         compose.onNodeWithContentDescription("Show contents").assertIsDisplayed()
@@ -1465,6 +1534,9 @@ ax.set_title("Matplotlib 3D figure")
         fun currentVisibleChromeInset():Float = javascriptUntil("parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--native-visible-chrome-inset'))||0") {it.trim('"').toFloatOrNull()!=null}.trim('"').toFloat()
         compose.runOnIdle {
             model.edit(model.state.value.active.id,"# Immersive reading\n\n"+("A paragraph to scroll and read comfortably. ".repeat(12)+"\n\n").repeat(80))
+        }
+        compose.waitForIdle(); evaluateJavascriptOnce("true")
+        compose.runOnIdle {
             model.mode("reader");model.zoom(170f)
             compose.activity.requestedOrientation=android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
         }

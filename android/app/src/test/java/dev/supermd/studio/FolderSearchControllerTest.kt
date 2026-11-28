@@ -649,9 +649,11 @@ class FolderSearchControllerTest {
         flushCalls = 0
         model.openFolderSearch("", FolderSearchMode.FILES)
         assertEquals(0, flushCalls)
+        model.updateFolderSearch(query = "", mode = FolderSearchMode.TEXT)
+        await { flushCalls == 1 }
         model.updateFolderSearch(query = "SecretBodyHit", mode = FolderSearchMode.TEXT)
         await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
-        assertEquals("Switching Files -> Text must flush active reader", 1, flushCalls)
+        assertEquals("Switching Files -> Text must flush active reader once per session", 1, flushCalls)
     }
 
     private fun grantTreeReadWrite(treeUri: Uri) {

@@ -16,14 +16,41 @@ class PaintControlTest {
     // A renderer calibration must not race the real app's welcome Dialog,
     // WebView startup or state restoration. StudioUiTest covers MainActivity.
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
-    private fun assertPaintedStripes(name: String) {
+    private fun awaitActivityFramePresented() {
         compose.waitForIdle()
+        val instrument = InstrumentationRegistry.getInstrumentation()
+        compose.waitUntil(10_000) {
+            val ready = java.util.concurrent.atomic.AtomicBoolean(false)
+            instrument.runOnMainSync {
+                val activity = compose.activity
+                val decor = activity.window.decorView
+                ready.set(activity.hasWindowFocus() && decor.isAttachedToWindow && decor.isShown && decor.width > 0 && decor.height > 0)
+            }
+            ready.get()
+        }
+        val committed = java.util.concurrent.CountDownLatch(1)
+        instrument.runOnMainSync {
+            val decor = compose.activity.window.decorView
+            decor.viewTreeObserver.registerFrameCommitCallback { committed.countDown() }
+            decor.postInvalidateOnAnimation()
+        }
+        committed.await(3, java.util.concurrent.TimeUnit.SECONDS)
+    }
+    private fun assertPaintedStripes(name: String) {
+        awaitActivityFramePresented()
         var latest: android.graphics.Bitmap? = null
         var observed = "no screenshot"
+        var attempts = 0
         try {
             // Compose idleness does not guarantee that SurfaceFlinger has
             // presented a frame. Wait for actual pixels, not a fixed sleep.
             compose.waitUntil(15_000) {
+                if (attempts++ > 0) {
+                    InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                        compose.activity.window.decorView.postInvalidateOnAnimation()
+                    }
+                    android.os.SystemClock.sleep(100)
+                }
                 latest?.recycle()
                 val bitmap = InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
                 latest = bitmap

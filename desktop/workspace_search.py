@@ -14,7 +14,6 @@ from agent_documents import diagram_spans
 import documents
 
 KNOWN_NOTE_SUFFIXES = (".markdown", ".smd", ".fmd", ".md", ".txt")
-SEARCH_MODES = ("text", "files")
 MAX_WALK_ENTRIES = 10_000
 MAX_FOLDER_DEPTH = 32
 MAX_SEARCH_MATCHES = 500
@@ -25,10 +24,6 @@ SEARCH_WORKERS = 4
 SEARCH_CHUNK_SIZE = 16
 SEARCH_WINDOW_CHUNKS = 4
 _SEARCH_EXECUTOR = ThreadPoolExecutor(max_workers=SEARCH_WORKERS, thread_name_prefix="supermd-search")
-
-
-def normalize_search_mode(mode: str | None) -> str:
-    return "files" if isinstance(mode, str) and mode.strip().lower() == "files" else "text"
 
 
 def is_searchable_note_name(name: str) -> bool:
@@ -366,15 +361,19 @@ def _note_meta(
     }
 
 
-def _iter_open_note_targets(
+def _iter_searchable_notes(
     tabs_snapshot: list[dict],
+    recent_snapshot: list[dict],
     resolved_root: Path | None,
     *,
     active_id: str,
-    seen_paths: set[str],
     cancel_event: threading.Event | None = None,
 ) -> Iterator[tuple[str, dict]]:
-    for tab in sorted(tabs_snapshot, key=lambda t: (0 if t.get("id") == active_id else 1)):
+    """Yield `(markdown, note_meta)` in search precedence order: active tab, open tabs, then folder or recents."""
+    ordered_tabs = sorted(tabs_snapshot, key=lambda t: (0 if t.get("id") == active_id else 1))
+    seen_paths: set[str] = set()
+
+    for tab in ordered_tabs:
         if cancel_event is not None and cancel_event.is_set():
             return
         path = tab.get("path") or ""
@@ -396,65 +395,39 @@ def _iter_open_note_targets(
             ),
         )
 
+    if cancel_event is not None and cancel_event.is_set():
+        return
 
-def _collect_disk_targets(
-    recent_snapshot: list[dict],
-    resolved_root: Path | None,
-    *,
-    seen_paths: set[str],
-    cancel_event: threading.Event | None = None,
-    stat_recents: bool = False,
-) -> list[dict]:
+    disk_candidates: list[dict] = []
     if resolved_root is not None:
         disk_candidates = walk_folder_notes(resolved_root, cancel_event=cancel_event)
     else:
-        disk_candidates = []
         for recent in sorted(recent_snapshot, key=lambda x: (0 if x.get("pinned") else 1)):
             rpath = recent.get("path") or ""
-            if not rpath:
-                continue
-            rname = recent.get("name") or Path(rpath).name
-            if stat_recents:
-                if not is_searchable_note_name(rname):
-                    continue
-                try:
-                    rp = Path(rpath)
-                    if rp.is_symlink() or getattr(rp, "is_junction", lambda: False)() or not rp.is_file():
-                        continue
-                except OSError:
-                    continue
-            disk_candidates.append({"path": rpath, "name": rname, "relative": Path(rpath).name})
-    deduped: list[dict] = []
+            if rpath:
+                disk_candidates.append({
+                    "path": rpath,
+                    "name": recent.get("name") or Path(rpath).name,
+                    "relative": Path(rpath).name,
+                })
+
+    deduped_candidates: list[dict] = []
     for entry in disk_candidates:
         if cancel_event is not None and cancel_event.is_set():
-            return deduped
+            return
         epath = entry["path"]
         key = entry.get("canonicalKey") or canonical_note_key(epath)
         if key in seen_paths:
             continue
         seen_paths.add(key)
-        deduped.append(_note_meta(key=key, path=epath, name=entry["name"], relative=entry.get("relative") or entry["name"]))
-    return deduped
-
-
-def _iter_searchable_notes(
-    tabs_snapshot: list[dict],
-    recent_snapshot: list[dict],
-    resolved_root: Path | None,
-    *,
-    active_id: str,
-    cancel_event: threading.Event | None = None,
-) -> Iterator[tuple[str, dict]]:
-    """Yield `(markdown, note_meta)` in search precedence order: active tab, open tabs, then folder or recents."""
-    seen_paths: set[str] = set()
-    yield from _iter_open_note_targets(
-        tabs_snapshot, resolved_root, active_id=active_id, seen_paths=seen_paths, cancel_event=cancel_event
-    )
-    if cancel_event is not None and cancel_event.is_set():
-        return
-    deduped_candidates = _collect_disk_targets(
-        recent_snapshot, resolved_root, seen_paths=seen_paths, cancel_event=cancel_event
-    )
+        deduped_candidates.append(
+            _note_meta(
+                key=key,
+                path=epath,
+                name=entry["name"],
+                relative=entry.get("relative") or entry["name"],
+            )
+        )
 
     if not deduped_candidates:
         return
@@ -569,28 +542,6 @@ class _SearchStream:
             return True
         return False
 
-    def scan_file_name(self, note_meta: dict, *, match_relative: bool) -> bool:
-        self.scanned_files += 1
-        target = note_meta["relative"] if match_relative else note_meta["name"]
-        spans = _find_line_matches(target, self.query, folded_needle=self.folded_needle, case_sensitive=self.case_sensitive)
-        if not spans:
-            return False
-        orig_start, orig_end = spans[0]
-        snippet, u16_start, u16_end = _build_snippet(target, orig_start, orig_end)
-        hit = {
-            **note_meta, "key": f"{note_meta['key']}:file", "line": 0, "column": utf16_offset(target, orig_start) + 1,
-            "snippet": snippet, "matchStart": u16_start, "matchEnd": u16_end,
-            "sourceStart": -1, "sourceEnd": -1, "matchText": "", "kind": "file",
-        }
-        self.all_matches.append(hit)
-        self.pending_batch.append(hit)
-        if len(self.pending_batch) >= BATCH_SIZE:
-            self.flush(done=False)
-        if len(self.all_matches) >= self.max_matches:
-            self.truncated = True
-            return True
-        return False
-
     def finish(self, *, cancelled: bool = False) -> dict:
         if not cancelled:
             self.flush(done=True)
@@ -647,43 +598,3 @@ def stream_text_search(
     if stream.is_cancelled():
         return stream.finish(cancelled=True)
     return stream.finish()
-
-
-def stream_file_search(
-    query: str,
-    tabs_snapshot: list[dict],
-    recent_snapshot: list[dict],
-    folder_root: Path | None,
-    *,
-    active_id: str = "",
-    case_sensitive: bool = False,
-    cancel_event: threading.Event | None = None,
-    on_batch: Callable[[list[dict], int, bool, bool], None] | None = None,
-    max_matches: int = MAX_SEARCH_MATCHES,
-) -> dict:
-    """Stream metadata-only filename matches across open tabs and folder/recent notes without reading note bodies."""
-    needle = (query or "").strip().replace("\\", "/")
-    if not needle:
-        if on_batch is not None:
-            on_batch([], 0, False, True)
-        return {"matches": [], "scannedFiles": 0, "truncated": False, "cancelled": False}
-    resolved_root = _resolve_folder_root(folder_root)
-    stream = _SearchStream(
-        query=needle, folded_needle=needle if case_sensitive else needle.casefold(),
-        case_sensitive=case_sensitive, exclude_diagrams=False, max_matches=max_matches,
-        cancel_event=cancel_event, on_batch=on_batch,
-    )
-    match_relative = "/" in needle
-    seen_paths: set[str] = set()
-    for _, meta in _iter_open_note_targets(
-        tabs_snapshot, resolved_root, active_id=active_id, seen_paths=seen_paths, cancel_event=cancel_event
-    ):
-        if stream.is_cancelled() or stream.scan_file_name(meta, match_relative=match_relative):
-            break
-    if not stream.truncated and not stream.is_cancelled():
-        for meta in _collect_disk_targets(
-            recent_snapshot, resolved_root, seen_paths=seen_paths, cancel_event=cancel_event, stat_recents=True
-        ):
-            if stream.is_cancelled() or stream.scan_file_name(meta, match_relative=match_relative):
-                break
-    return stream.finish(cancelled=stream.is_cancelled())

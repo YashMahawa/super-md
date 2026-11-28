@@ -7,8 +7,6 @@ AppDialog {
     objectName: "folderSearchDialog"
     title: "Search across notes"
     property var stateData: studio.folderSearchState
-    property string uiMode: "text"
-    readonly property bool isFilesMode: uiMode === "files"
     property int selectedIndex: 0
     property int debounceInterval: 120
     property bool syncingControls: false
@@ -17,7 +15,6 @@ AppDialog {
         || searchField.text !== ((stateData && stateData.query) || "")
         || matchCaseButton.checked !== !!(stateData && stateData.caseSensitive)
         || includeDiagramsButton.checked !== !!(stateData && stateData.includeDiagrams)
-        || uiMode !== ((stateData && stateData.mode === "files") ? "files" : "text")
     width: Math.min(parent ? parent.width - 32 : 700, 720)
     height: Math.min(parent ? parent.height - 48 : 580, 620)
 
@@ -69,8 +66,7 @@ AppDialog {
         studio.updateFolderSearch(
             searchField.text,
             matchCaseButton.checked,
-            includeDiagramsButton.checked,
-            dialog.uiMode
+            includeDiagramsButton.checked
         )
     }
 
@@ -84,8 +80,7 @@ AppDialog {
         studio.prepareFolderSearch(
             searchField.text,
             matchCaseButton.checked,
-            includeDiagramsButton.checked,
-            dialog.uiMode
+            includeDiagramsButton.checked
         )
     }
 
@@ -96,26 +91,22 @@ AppDialog {
         const matches = stateData && stateData.matches ? stateData.matches : []
         if (idx < 0 || idx >= matches.length) return
         const hit = matches[idx]
-        const fileHit = dialog.isFilesMode || hit.kind === "file" || (typeof hit.line === "number" && hit.line <= 0)
-        const findQuery = fileHit ? "" : q
-        const cs = !fileHit && !!stateData.caseSensitive
-        const sourceStart = !fileHit && typeof hit.sourceStart === "number" ? hit.sourceStart : -1
-        const sourceEnd = !fileHit && typeof hit.sourceEnd === "number" ? hit.sourceEnd : -1
-        const matchText = !fileHit && typeof hit.matchText === "string" ? hit.matchText : ""
+        const cs = !!stateData.caseSensitive
+        const sourceStart = typeof hit.sourceStart === "number" ? hit.sourceStart : -1
+        const sourceEnd = typeof hit.sourceEnd === "number" ? hit.sourceEnd : -1
+        const matchText = typeof hit.matchText === "string" ? hit.matchText : ""
         dialog.close()
-        studio.openFolderSearchMatch(hit.tabId || "", hit.path || "", findQuery, cs, sourceStart, sourceEnd, matchText)
+        studio.openFolderSearchMatch(hit.tabId || "", hit.path || "", q, cs, sourceStart, sourceEnd, matchText)
     }
 
     onStateDataChanged: {
         if (!syncingControls && !(stateData && stateData.pending)) {
-            const backendMode = (stateData && stateData.mode === "files") ? "files" : "text"
             const backendQuery = (stateData && stateData.query) || ""
             const backendCs = !!(stateData && stateData.caseSensitive)
             const backendDiag = !!(stateData && stateData.includeDiagrams)
-            if (uiMode !== backendMode || searchField.text !== backendQuery || matchCaseButton.checked !== backendCs || includeDiagramsButton.checked !== backendDiag) {
+            if (searchField.text !== backendQuery || matchCaseButton.checked !== backendCs || includeDiagramsButton.checked !== backendDiag) {
                 syncingControls = true
                 searchDebounce.stop()
-                uiMode = backendMode
                 if (searchField.text !== backendQuery) searchField.text = backendQuery
                 matchCaseButton.checked = backendCs
                 includeDiagramsButton.checked = backendDiag
@@ -133,33 +124,13 @@ AppDialog {
             Layout.fillWidth: true
             spacing: 8
 
-            ModeGroup {
-                id: searchModeGroup
-                objectName: "folderSearchModeGroup"
-                implicitHeight: 38
-                selected: dialog.uiMode
-                choices: [
-                    { key: "text", label: "Text", objectName: "folderSearchTextModeButton", tooltip: "Search note contents" },
-                    { key: "files", label: "Files", objectName: "folderSearchFilesModeButton", tooltip: "Search file names only" }
-                ]
-                onChosen: key => {
-                    if (key !== dialog.uiMode) {
-                        dialog.uiMode = key
-                        if (!dialog.syncingControls && dialog.visible) dialog.triggerSearch()
-                    }
-                    searchField.forceActiveFocus()
-                }
-            }
-
             TextField {
                 id: searchField
                 objectName: "folderSearchInput"
                 Layout.fillWidth: true
-                placeholderText: dialog.isFilesMode
-                    ? (dialog.stateData.hasFolder ? "Search file names across notes…" : "Search open and recent file names…")
-                    : (dialog.stateData.hasFolder
-                        ? "Search text across .md, .smd, open tabs, and recent notes…"
-                        : "Search text across open tabs and recent notes…")
+                placeholderText: dialog.stateData.hasFolder
+                    ? "Search text across .md, .smd, open tabs, and recent notes…"
+                    : "Search text across open tabs and recent notes…"
                 selectByMouse: true
                 color: dialog.colors.text
                 onTextChanged: {
@@ -218,16 +189,12 @@ AppDialog {
                 text: "Diagrams"
                 compact: true
                 checkable: true
-                enabled: !dialog.isFilesMode
-                opacity: enabled ? 1.0 : 0.48
                 focusPolicy: Qt.TabFocus
                 tonal: !checked
                 highlighted: checked
-                ToolTip.text: !enabled
-                    ? "Diagram filtering applies to Text search"
-                    : (checked
-                        ? "Including inline SVG, Mermaid, and chart blocks"
-                        : "Skipping inline SVG, Mermaid, and chart blocks")
+                ToolTip.text: checked
+                    ? "Including inline SVG, Mermaid, and chart blocks"
+                    : "Skipping inline SVG, Mermaid, and chart blocks"
                 onToggled: if (!dialog.syncingControls && dialog.visible) dialog.triggerSearch()
             }
         }
@@ -256,16 +223,9 @@ AppDialog {
                         return "Scanning " + files + " notes · " + count + suffix + " matches…"
                     }
                     if (!q.length) {
-                        return dialog.isFilesMode
-                            ? "Matches note file names from metadata without reading note contents."
-                            : "Streams live matches without indexing disk or decoding embedded images."
+                        return "Streams live matches without indexing disk or decoding embedded images."
                     }
-                    const notesLabel = files === 1 ? "1 note" : (files + " notes")
-                    if (dialog.isFilesMode) {
-                        const hitsLabel = (count === 1 && !suffix) ? "1 matching note" : (count + suffix + " matching notes")
-                        return hitsLabel + " across " + notesLabel + " · Enter opens note"
-                    }
-                    return count + suffix + " matches across " + notesLabel + " · Enter opens in-note search"
+                    return count + suffix + " matches across " + files + " notes · Enter opens in-note search"
                 }
             }
         }
@@ -327,7 +287,6 @@ AppDialog {
                             }
                         }
                         Label {
-                            visible: (modelData.line || 0) > 0 && modelData.kind !== "file"
                             text: "Line " + (modelData.line || 1)
                             textFormat: Text.PlainText
                             font.pixelSize: 13
@@ -352,7 +311,7 @@ AppDialog {
                 horizontalAlignment: Text.AlignHCenter
                 wrapMode: Text.WordWrap
                 color: dialog.colors.muted
-                text: dialog.isFilesMode ? "No matching file names found." : "No text matches found."
+                text: "No text matches found."
             }
             ScrollBar.vertical: ExpressiveScrollBar { }
         }
@@ -361,7 +320,6 @@ AppDialog {
     onAboutToShow: {
         syncingControls = true
         searchDebounce.stop()
-        uiMode = (stateData && stateData.mode === "files") ? "files" : "text"
         searchField.text = (stateData && stateData.query) || ""
         matchCaseButton.checked = !!(stateData && stateData.caseSensitive)
         includeDiagramsButton.checked = !!(stateData && stateData.includeDiagrams)
