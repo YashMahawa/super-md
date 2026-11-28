@@ -234,7 +234,7 @@ def sync_path_change(studio_obj: Any, old_path: str, new_path: str, *, is_dir: b
         win._recover()
         if win.folder:
             win._load_tree()
-        if win._folder_search_open and win._folder_search_query.strip():
+        if win._folder_search_open and win._folder_search_query.strip() and not getattr(win, "_folder_search_pending", False):
             win._start_folder_search()
         win._emit()
 

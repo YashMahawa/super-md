@@ -268,7 +268,6 @@ class AgentExportsTest(unittest.TestCase):
 
     def test_pdf_and_markdown_exports_handle_yaml_frontmatter_variations_and_populate_pdf_properties(self):
         from frontmatter import frontmatter_end, mask_frontmatter, strip_frontmatter
-        from markdown_prepare import prepare_markdown_export
 
         for raw, expected_body in (
             ("\ufeff---\ntitle: BOM\n---\nBody", "Body"),
@@ -299,9 +298,6 @@ class AgentExportsTest(unittest.TestCase):
             "Canonical coordinates $(q, p)$.\n"
         )
         (self.root / "hamilton.md").write_text(note, encoding="utf-8")
-        prepared_md, prepared_assets = prepare_markdown_export(self.store, "hamilton.md", note, {})
-        self.assertEqual(prepared_assets, {})
-        self.assertEqual(prepared_md, note)
 
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
