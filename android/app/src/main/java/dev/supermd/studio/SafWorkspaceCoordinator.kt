@@ -8,7 +8,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -17,6 +21,7 @@ internal class SafWorkspaceCoordinator(
     private val owner: StudioViewModel, private val scope: CoroutineScope,
     private val prefs: SharedPreferences, private val windowPrefs: SharedPreferences,
     private val resolver: ContentResolver, private val readDocumentAccess: () -> DocumentAccess,
+    private val documentWrites: Mutex, private val isOwnerRetired: () -> Boolean,
     private val confirmedTreeDocumentKeys: MutableSet<String>,
     private val readState: () -> StudioState, private val writeState: (StudioState) -> Unit,
     private val changeState: ((StudioState) -> StudioState) -> Unit,
@@ -53,9 +58,9 @@ internal class SafWorkspaceCoordinator(
 
     fun navigateFolderUp(): Boolean {
         val folderUri = readState().folder ?: return false
-        val current = normalizeFolderRelative(readListedRelative())
+        val current = normalizeRelativePath(readListedRelative())
         if (current.isEmpty()) return false
-        val parent = parentFolderRelative(current)
+        val parent = parentRelativePath(current)
         listFolder(Uri.parse(folderUri), parent)
         return true
     }
@@ -64,7 +69,7 @@ internal class SafWorkspaceCoordinator(
         val seq = readListFolderSeq() + 1
         writeListFolderSeq(seq)
         val invalidPath = hasInvalidSafFolderRelative(relative)
-        val requestedRelative = if (invalidPath) readListedRelative() else normalizeFolderRelative(relative)
+        val requestedRelative = if (invalidPath) readListedRelative() else normalizeRelativePath(relative)
         if (!invalidPath) {
             writeListedRelative(requestedRelative)
             val updated = readState().copy(folderRelative = requestedRelative)
@@ -80,14 +85,18 @@ internal class SafWorkspaceCoordinator(
             try {
                 require(!invalidPath) { "Invalid folder path" }
                 val targetFolder = Uri.parse(readState().folder ?: uri.toString())
-                val pass = SafProjectionPass(resolver)
-                val listing = withContext(Dispatchers.IO) {
-                    listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass)
-                }
+                val (listing, confirmedKeys) = withContext(Dispatchers.IO) {
+                    documentWrites.withLock {
+                        currentCoroutineContext().ensureActive()
+                        if (isOwnerRetired() || seq != readListFolderSeq()) return@withLock null
+                        val pass = SafProjectionPass(resolver)
+                        listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass) to pass.confirmedTreeKeys.toSet()
+                    }
+                } ?: return@launch
                 val endGen = safGeneration.get()
                 val generationValid = !startedDuringPendingRemap && startGen == endGen && !owner.hasPendingRemapScopes()
                 if (generationValid) {
-                    confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                    confirmedTreeDocumentKeys.addAll(confirmedKeys)
                 }
                 if (seq == readListFolderSeq() && readState().folder != null) {
                     if (generationValid) {
@@ -104,7 +113,7 @@ internal class SafWorkspaceCoordinator(
                     } else {
                         val currentFolder = readState().folder
                         if (currentFolder != null) {
-                            listFolder(Uri.parse(currentFolder), normalizeFolderRelative(readState().folderRelative.ifEmpty { requestedRelative }))
+                            listFolder(Uri.parse(currentFolder), normalizeRelativePath(readState().folderRelative.ifEmpty { requestedRelative }))
                         }
                     }
                 }
@@ -118,7 +127,7 @@ internal class SafWorkspaceCoordinator(
                         owner.needsReloadAfterPreRemap = true
                     } else {
                         readState().folder?.let { currentFolder ->
-                            listFolder(Uri.parse(currentFolder), normalizeFolderRelative(readState().folderRelative.ifEmpty { requestedRelative }))
+                            listFolder(Uri.parse(currentFolder), normalizeRelativePath(readState().folderRelative.ifEmpty { requestedRelative }))
                         }
                     }
                 }
@@ -163,10 +172,15 @@ internal class SafWorkspaceCoordinator(
     }
 
     fun resolveOpenFolderRelativeOnIo(uri: Uri, folderTreeRaw: String? = readState().folder): String? {
-        relativeInOpenFolder(uri, folderTreeRaw)?.let { return it }
+        relativeInOpenFolder(uri, folderTreeRaw)?.let { rel ->
+            if (DocumentsContract.isTreeUri(uri)) {
+                canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+            }
+            return rel
+        }
         val treeRaw = folderTreeRaw?.takeIf { it.isNotBlank() } ?: return null
         val folderUri = runCatching { Uri.parse(treeRaw) }.getOrNull() ?: return null
-        val preferredRel = normalizeFolderRelative(readState().folderRelative.ifEmpty { readListedRelative() })
+        val preferredRel = normalizeRelativePath(readState().folderRelative.ifEmpty { readListedRelative() })
         repeat(3) {
             val genBefore = safGeneration.get()
             val pass = SafProjectionPass(resolver)
@@ -182,9 +196,17 @@ internal class SafWorkspaceCoordinator(
                 if (pass.confirmedTreeKeys.isNotEmpty()) {
                     confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
                 }
+                if (found != null && DocumentsContract.isTreeUri(uri)) {
+                    canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+                }
                 return found
             }
-            relativeInOpenFolder(uri, folderTreeRaw)?.let { return it }
+            relativeInOpenFolder(uri, folderTreeRaw)?.let { rel ->
+                if (DocumentsContract.isTreeUri(uri)) {
+                    canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+                }
+                return rel
+            }
         }
         val fallbackGenBefore = safGeneration.get()
         val fallbackPass = SafProjectionPass(resolver)
@@ -195,8 +217,13 @@ internal class SafWorkspaceCoordinator(
             targetUri = uri,
             preferredDirRelative = preferredRel,
         )
-        if (fallbackGenBefore == safGeneration.get() && !owner.hasPendingRemapScopes() && fallbackPass.confirmedTreeKeys.isNotEmpty()) {
-            confirmedTreeDocumentKeys.addAll(fallbackPass.confirmedTreeKeys)
+        if (fallbackGenBefore == safGeneration.get() && !owner.hasPendingRemapScopes()) {
+            if (fallbackPass.confirmedTreeKeys.isNotEmpty()) {
+                confirmedTreeDocumentKeys.addAll(fallbackPass.confirmedTreeKeys)
+            }
+            if (fallbackFound != null && DocumentsContract.isTreeUri(uri)) {
+                canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+            }
         }
         return fallbackFound
     }
@@ -353,7 +380,7 @@ internal class SafWorkspaceCoordinator(
                     } else {
                         vmState.folderRelative.ifEmpty { readVmListedRelative(vm) }
                     }
-                    val nextListed = normalizeFolderRelative(
+                    val nextListed = normalizeRelativePath(
                         if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
                             remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
                         } else {
@@ -368,7 +395,7 @@ internal class SafWorkspaceCoordinator(
                     }
                 } else if (vmFolder != null && vm.needsReloadAfterPreRemap && folderTreeRaw != "") {
                     vm.needsReloadAfterPreRemap = false
-                    vm.listFolder(Uri.parse(vmFolder), normalizeFolderRelative(vmState.folderRelative.ifEmpty { readVmListedRelative(vm) }))
+                    vm.listFolder(Uri.parse(vmFolder), normalizeRelativePath(vmState.folderRelative.ifEmpty { readVmListedRelative(vm) }))
                 }
                 readVmSeededFind(vm)?.let { seed ->
                     val seedUri = seed.targetUri
