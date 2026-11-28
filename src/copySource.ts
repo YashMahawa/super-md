@@ -192,9 +192,20 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   const startElement=elementAt(range.startContainer), endElement=elementAt(range.endContainer);
   if (!startElement?.closest(".markdown-body,.live-document") || !endElement?.closest(".markdown-body,.live-document")) return null;
   if (startElement.closest("textarea,input,.cm-editor") || endElement.closest("textarea,input,.cm-editor")) return null;
-  if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties,.code-disclosure > summary,.cell-toolbar")) return "";
   const hiddenStart=outermostClosedDisclosureHidingPoint(range.startContainer,range.startOffset,"start");
   const hiddenEnd=outermostClosedDisclosureHidingPoint(range.endContainer,range.endOffset,"end");
+  const startProps=startElement.closest("[data-frontmatter-properties],.document-properties,.live-frontmatter");
+  if (startProps) {
+    if (startProps.contains(range.endContainer)) return null;
+    if (!hiddenEnd) {
+      const afterProps=document.createRange();
+      afterProps.setStartAfter(startProps);
+      afterProps.setEnd(range.endContainer,range.endOffset);
+      if (!afterProps.toString().trim() && !afterProps.cloneContents().querySelector("img,hr,input,.katex,[data-math-source],[data-math-inline-source],[data-source-tex],[data-windowed-mounted='false']")) return null;
+    }
+  }
+  if (elementAt(range.commonAncestorContainer)?.closest("[data-frontmatter-properties],.document-properties,.live-frontmatter")) return null;
+  if (elementAt(range.commonAncestorContainer)?.closest(".code-disclosure > summary,.cell-toolbar")) return "";
   if(hiddenStart&&hiddenStart===hiddenEnd)return "";
   if(hiddenStart)range.setStartAfter(hiddenStart);
   if(hiddenEnd){
@@ -254,7 +265,7 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
         return stripped?`${stripped}\n\n`:"";
       }
     }
-    if(node.matches("button,.image-edit-tools,.katex-mathml,.math-equation-extra-anchor,[data-frontmatter-properties],.document-properties,.cell-toolbar")||(node.tagName==="SUMMARY"&&node.parentElement?.classList.contains("code-disclosure")))return "";
+    if(node.matches("button,.image-edit-tools,.katex-mathml,.math-equation-extra-anchor,[data-frontmatter-properties],.document-properties,.live-frontmatter,.cell-toolbar")||(node.tagName==="SUMMARY"&&node.parentElement?.classList.contains("code-disclosure")))return "";
     if(node.classList.contains("callout")){
       const closed=node.tagName==="DETAILS"&&!isDetailsOpen(node);
       const type=(node.getAttribute("data-callout-type")||node.className.match(/\bcallout-([\w-]+)\b/)?.[1]||"note").toLowerCase();
@@ -366,6 +377,13 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
   // cloneContents drops inline ancestors when both selection endpoints sit
   // inside the same text node. Restore their Markdown meaning for narrow
   // selections such as a few characters inside bold or linked text.
+  const hasFrontmatterSelection=Boolean(
+    !hiddenStart&&
+    !hiddenEnd&&
+    fragment.querySelector("[data-frontmatter-properties],.document-properties,.live-frontmatter")&&
+    !Array.from(fragment.querySelectorAll("details")).some(isClosedDisclosure)&&
+    !fragment.querySelector(".code-disclosure,.cell-toolbar")
+  );
   let output:Node=fragment;
   let context=elementAt(range.commonAncestorContainer);
   while(context&&!context.matches('.markdown-body,.live-document')&&!/^(ADDRESS|ARTICLE|ASIDE|BLOCKQUOTE|BODY|DD|DETAILS|DIV|DL|DT|FIELDSET|FIGCAPTION|FIGURE|FOOTER|FORM|H[1-6]|HEADER|HR|LI|MAIN|NAV|OL|P|PRE|SECTION|SUMMARY|TABLE|TBODY|TD|TFOOT|TH|THEAD|TR|UL)$/.test(context.tagName)){
@@ -375,7 +393,9 @@ export function selectedMarkdown(selection: Selection | null, source?:string): s
     }
     context=context.parentElement;
   }
-  return serialize(output).trim();
+  const serialized=serialize(output).trim();
+  if(!serialized&&hasFrontmatterSelection)return null;
+  return serialized;
 }
 
 /** Extract the current selection as serialized Markdown/LaTeX from rendered

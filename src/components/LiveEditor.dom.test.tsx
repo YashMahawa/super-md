@@ -23,13 +23,16 @@ vi.mock("hast-util-to-jsx-runtime", async (importOriginal) => {
   };
 });
 
-import Editor from "./Editor";
+import Editor, { editorFindRange, editorSelectedText } from "./Editor";
 import LiveEditor from "./LiveEditor";
+import ReadingSearch from "./ReadingSearch";
 import { cancelHeadingNavigation } from "../documentNavigation";
 import { applyHistoryEdit, replayHistory, tryLiveTextareaHistory, type LiveHistoryEditMeta, type NoteHistory } from "../noteHistory";
 import * as proofreading from "../proofreading";
 import { setTypewriterScroll } from "../typewriterScroll";
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+Range.prototype.getClientRects ??= () => [] as unknown as DOMRectList;
+Range.prototype.getBoundingClientRect ??= () => new DOMRect(0, 0, 0, 0);
 const execCommandCleanups: Array<() => void> = [];
 afterEach(() => {
   while (execCommandCleanups.length > 0) execCommandCleanups.pop()?.();
@@ -1506,6 +1509,11 @@ it("combines accessible Edit block controls with prose URL wrapping, raw paste i
   document.body.append(host);
   const root = createRoot(host);
   let doc = [
+    "---",
+    "title: Field Manual",
+    "source: old_yaml_source",
+    "---",
+    "",
     "Read the manual or run `old_cmd` today.",
     "",
     "```python",
@@ -1538,13 +1546,46 @@ it("combines accessible Edit block controls with prose URL wrapping, raw paste i
     area.dispatchEvent(pasteEvent);
   };
 
-  // 1. Open first block via #62's accessible "Edit block" button on focus.
+  // 0. Open YAML frontmatter via Edit frontmatter: paste URL over YAML value -> raw paste (not Markdown link),
+  // prose formatting shortcuts leave YAML untouched, and single-step Undo restores YAML value + selection.
+  const fmGroup = host.querySelector<HTMLElement>(".live-frontmatter")!;
+  act(() => fmGroup.focus());
+  const editFmBtn = fmGroup.querySelector<HTMLButtonElement>('button[aria-label="Edit frontmatter"]');
+  expect(editFmBtn).not.toBeNull();
+  act(() => editFmBtn!.click());
+  let area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  const yamlSourceStart = area.value.indexOf("old_yaml_source");
+  act(() => {
+    area.focus();
+    area.setSelectionRange(yamlSourceStart, yamlSourceStart + "old_yaml_source".length);
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "b", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toContain("source: old_yaml_source");
+  expect(area.value).not.toContain("**old_yaml_source**");
+
+  act(() => {
+    area.setSelectionRange(yamlSourceStart, yamlSourceStart + "old_yaml_source".length);
+    dispatchPaste(area, "https://frontmatter.example.com/spec");
+  });
+  expect(area.value).toContain("source: https://frontmatter.example.com/spec");
+  expect(area.value).not.toContain("[old_yaml_source]");
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(area.value).toContain("source: old_yaml_source");
+  expect([area.selectionStart, area.selectionEnd]).toEqual([yamlSourceStart, yamlSourceStart + "old_yaml_source".length]);
+  act(() => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector("textarea")).toBeNull();
+
+  // 1. Open first body block via #62's accessible "Edit block" button on focus.
   const firstBlock = host.querySelectorAll<HTMLElement>(".live-block")[0]!;
   act(() => firstBlock.focus());
   const editBtn = firstBlock.querySelector<HTMLButtonElement>('button[aria-label="Edit block"]');
   expect(editBtn).not.toBeNull();
   act(() => editBtn!.click());
-  let area = host.querySelector<HTMLTextAreaElement>("textarea")!;
+  area = host.querySelector<HTMLTextAreaElement>("textarea")!;
   expect(area.value).toBe("Read the manual or run `old_cmd` today.");
 
   // Formatted paste over prose selection "manual" -> [manual](https://example.com/manual)
@@ -1612,6 +1653,339 @@ it("combines accessible Edit block controls with prose URL wrapping, raw paste i
   expect([area.selectionStart, area.selectionEnd]).toEqual([hostStart, hostStart + "old_host".length]);
 
   act(() => root.unmount());
+  host.remove();
+});
+
+it("supports ordinary copy fallback from DocumentProperties and raw YAML editing for recognized, custom, empty, and cleared frontmatter", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  let current = "\uFEFF---  \ntitle: Live Metadata\nauthor: Emmy Noether\ntags:\n  - symmetry\ncssclasses: [wide]\n...  \n\n# Section One\n\nBody paragraph.";
+  const renderDoc = () => root.render(
+    <LiveEditor
+      markdown={current}
+      documentPath={null}
+      dark={false}
+      python=""
+      spellCheck
+      grammarCheck
+      onChange={(next: string) => {
+        current = next;
+        renderDoc();
+      }}
+    />,
+  );
+  await act(async () => renderDoc());
+
+  const queryInsertion = () => {
+    const detail: { point?: { from: number; to: number } } = {};
+    window.dispatchEvent(new CustomEvent("supermd-insertion-point", { detail }));
+    return detail.point;
+  };
+
+  const fmShell = host.querySelector<HTMLElement>(".live-frontmatter")!;
+  expect(fmShell).not.toBeNull();
+  expect(fmShell.getAttribute("aria-label")).toBe("Document frontmatter");
+  const propsCard = fmShell.querySelector<HTMLElement>('[data-frontmatter-properties="true"]')!;
+  expect(propsCard.textContent).toContain("Live Metadata");
+  expect(propsCard.textContent).toContain("Emmy Noether");
+  expect(propsCard.textContent).toContain("cssclasses");
+  expect(propsCard.textContent).toContain("wide");
+  // Body .live-block indices are unaffected by .live-frontmatter.
+  expect(host.querySelectorAll(".live-block")).toHaveLength(2);
+  const initialFirstBodyBlock = host.querySelectorAll(".live-block")[0]!;
+
+  // Single-click selection inside DocumentProperties preserves ordinary browser copy without opening raw YAML.
+  const valueEl = Array.from(propsCard.querySelectorAll(".document-property-value")).find(el => el.textContent === "Emmy Noether")!;
+  act(() => { valueEl.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+  expect(host.querySelector("textarea")).toBeNull();
+  const selection = window.getSelection()!;
+  const range = document.createRange();
+  range.selectNodeContents(valueEl);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  let clipboardReplaced = false;
+  const copyEvt = new Event("copy", { bubbles: true, cancelable: true });
+  Object.defineProperty(copyEvt, "clipboardData", {
+    value: { setData: () => { clipboardReplaced = true; } },
+  });
+  act(() => { valueEl.dispatchEvent(copyEvt); });
+  expect(copyEvt.defaultPrevented).toBe(false);
+  expect(clipboardReplaced).toBe(false);
+  selection.removeAllRanges();
+
+  // Keyboard focus reveals Edit frontmatter; Enter opens raw YAML excluding leading BOM and trailing body.
+  act(() => { fmShell.focus(); });
+  const editFrontmatterBtn = fmShell.querySelector<HTMLButtonElement>('[aria-label="Edit frontmatter"]')!;
+  expect(editFrontmatterBtn).not.toBeNull();
+  act(() => { fmShell.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); });
+  let area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(area).not.toBeNull();
+  expect(area.value).toBe("---  \ntitle: Live Metadata\nauthor: Emmy Noether\ntags:\n  - symmetry\ncssclasses: [wide]\n...  ");
+  expect(host.querySelector(".writing-suggestions")).toBeNull();
+
+  // Enter inside YAML list stays literal (protectedBlock) rather than rewriting YAML indentation as Markdown prose list.
+  const yamlSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+  act(() => {
+    yamlSetter.call(area, "---\ntitle: Updated Live Metadata\nauthor: Emmy Noether\ncssclasses: [wide, clean]\n---");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(current).toBe("\uFEFF---\ntitle: Updated Live Metadata\nauthor: Emmy Noether\ncssclasses: [wide, clean]\n---\n\n# Section One\n\nBody paragraph.");
+
+  // Escape closes YAML editor, restores focus to .live-frontmatter, and preserves downstream .live-block identity.
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+  expect(host.querySelector("textarea")).toBeNull();
+  expect(document.activeElement).toBe(host.querySelector(".live-frontmatter"));
+  expect(host.querySelectorAll(".live-block")[0]).toBe(initialFirstBodyBlock);
+  expect(host.querySelector('[data-frontmatter-properties="true"]')?.textContent).toContain("Updated Live Metadata");
+
+  // ArrowDown from the last line of YAML transitions into the first body block; ArrowUp stays in the first body block.
+  act(() => { host.querySelector(".live-frontmatter")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  area.setSelectionRange(area.value.length, area.value.length);
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true })); });
+  const bodyArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+  expect(bodyArea.value).toBe("# Section One");
+  bodyArea.setSelectionRange(0, 0);
+  act(() => { bodyArea.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true, cancelable: true })); });
+  expect(host.querySelector<HTMLTextAreaElement>("textarea")!.value).toBe("# Section One");
+  act(() => { bodyArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // Ctrl+Enter inside frontmatter inserts a body block directly below frontmatter (before # Section One).
+  act(() => { host.querySelector(".live-frontmatter")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true })); });
+  const insertedBelowFm = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+  expect(insertedBelowFm.value).toBe("");
+  act(() => {
+    yamlSetter.call(insertedBelowFm, "Lead paragraph.");
+    insertedBelowFm.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(current).toBe("\uFEFF---\ntitle: Updated Live Metadata\nauthor: Emmy Noether\ncssclasses: [wide, clean]\n---\n\nLead paragraph.\n\n# Section One\n\nBody paragraph.");
+  act(() => { insertedBelowFm.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+
+  // Clearing YAML frontmatter preserves the UTF-8 BOM prefix, removes now-unneeded separator blank lines,
+  // adjusts saved-selection insertion offsets past the BOM, and preserves downstream block DOM identity.
+  const leadBlockBeforeDelete = host.querySelectorAll(".live-block")[0]!;
+  const headingBlockBeforeDelete = host.querySelectorAll(".live-block")[1]!;
+  const bodyBlockBeforeDelete = host.querySelectorAll(".live-block")[2]!;
+  act(() => { host.querySelector(".live-frontmatter")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  act(() => {
+    yamlSetter.call(area, "");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(current).toBe("\uFEFFLead paragraph.\n\n# Section One\n\nBody paragraph.");
+  act(() => { area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true })); });
+  expect(host.querySelector(".live-frontmatter")).toBeNull();
+  expect(host.querySelectorAll(".live-block")[0]).toBe(leadBlockBeforeDelete);
+  expect(host.querySelectorAll(".live-block")[1]).toBe(headingBlockBeforeDelete);
+  expect(host.querySelectorAll(".live-block")[2]).toBe(bodyBlockBeforeDelete);
+  expect(queryInsertion()).toEqual({ from: 1, to: 1 });
+
+  // Custom-only YAML frontmatter is visible and editable as raw YAML in Live mode, and clearing without BOM lands at offset 0.
+  current = "---\ncssclasses: [wide]\nstatus: draft\n---\n\n# Custom Frontmatter Body";
+  await act(async () => renderDoc());
+  const customFm = host.querySelector<HTMLElement>(".live-frontmatter")!;
+  expect(customFm).not.toBeNull();
+  expect(customFm.textContent).toContain("cssclasses");
+  expect(customFm.textContent).toContain("wide");
+  expect(customFm.textContent).toContain("status");
+  expect(customFm.textContent).toContain("draft");
+  act(() => {
+    customFm.dispatchEvent(pointerEvent("pointerdown", { bubbles: true, pointerId: 7, pointerType: "touch", clientX: 20, clientY: 20 }));
+    customFm.dispatchEvent(pointerEvent("pointerup", { bubbles: true, pointerId: 7, pointerType: "touch", clientX: 20, clientY: 20 }));
+  });
+  const touchEditBtn = customFm.querySelector<HTMLButtonElement>('[aria-label="Edit frontmatter"]')!;
+  expect(touchEditBtn).not.toBeNull();
+  act(() => { touchEditBtn.click(); });
+  area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(area.value).toBe("---\ncssclasses: [wide]\nstatus: draft\n---");
+  act(() => {
+    yamlSetter.call(area, "---\ntitle: Promoted Custom Note\ncssclasses: [wide]\nstatus: published\n---");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(current).toBe("---\ntitle: Promoted Custom Note\ncssclasses: [wide]\nstatus: published\n---\n\n# Custom Frontmatter Body");
+  expect(host.querySelector(".document-properties-title")?.textContent).toBe("Promoted Custom Note");
+
+  const customBodyBeforeClear = host.querySelectorAll(".live-block")[0]!;
+  act(() => { host.querySelector(".live-frontmatter")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  act(() => {
+    yamlSetter.call(area, "");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(current).toBe("# Custom Frontmatter Body");
+  expect(host.querySelectorAll(".live-block")[0]).toBe(customBodyBeforeClear);
+  expect(queryInsertion()).toEqual({ from: 0, to: 0 });
+
+  // Empty and comment-only frontmatter blocks render compact YAML frontmatter bar and open raw YAML cleanly.
+  for (const emptyVariant of [
+    "---\n---\n\n# Empty Frontmatter",
+    "---\n...\n\n# Dot Empty Frontmatter",
+    "---\n# draft metadata comment\n---\n\n# Comment Empty Frontmatter",
+  ]) {
+    current = emptyVariant;
+    await act(async () => renderDoc());
+    const emptyFm = host.querySelector<HTMLElement>(".live-frontmatter")!;
+    expect(emptyFm).not.toBeNull();
+    expect(emptyFm.querySelector(".document-properties--empty")).not.toBeNull();
+    expect(emptyFm.textContent).toContain("YAML frontmatter");
+    act(() => { emptyFm.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+    expect(area.value).toBe(emptyVariant.split("\n\n# ")[0]);
+    act(() => {
+      yamlSetter.call(area, "---\ntitle: Populated From Empty\n---");
+      area.dispatchEvent(new Event("input", { bubbles: true }));
+      area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(host.querySelector(".document-properties-title")?.textContent).toBe("Populated From Empty");
+  }
+
+  act(() => root.unmount());
+  host.remove();
+});
+
+it("preserves UTF-8 BOM, CRLF body offsets, and existing source selection when editing and clearing Live YAML frontmatter", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const sessionId = "split-bom-yaml-selection";
+  let current = "\uFEFF---\ntitle: Split Header\nauthor: Emmy Noether\n---\n\n# Split Heading\n\nTarget selection phrase.\n";
+
+  const renderSplit = () =>
+    root.render(
+      <div>
+        <Editor
+          sessionId={sessionId}
+          value={current}
+          dark={false}
+          focusMode={false}
+          onChange={(next) => {
+            current = next;
+            renderSplit();
+          }}
+        />
+        <LiveEditor
+          markdown={current}
+          documentPath="/notes/split-note.md"
+          dark={false}
+          python=""
+          onChange={(next) => {
+            current = next;
+            renderSplit();
+          }}
+        />
+      </div>,
+    );
+
+  await act(async () => { renderSplit(); });
+
+  const phrase = "selection phrase";
+  const initialFrom = current.indexOf(phrase);
+  const initialTo = initialFrom + phrase.length;
+  act(() => {
+    editorFindRange(sessionId, initialFrom, initialTo);
+  });
+  expect(editorSelectedText(sessionId)).toBe(phrase);
+
+  const queryInsertion = (extraDetail: Record<string, unknown> = {}) => {
+    const detail: { point?: { from: number; to: number }; [k: string]: unknown } = { ...extraDetail };
+    window.dispatchEvent(new CustomEvent("supermd-insertion-point", { detail }));
+    return detail.point;
+  };
+  expect(queryInsertion()).toEqual({ from: initialFrom, to: initialTo });
+
+  const fmShell = host.querySelector<HTMLElement>(".live-frontmatter")!;
+  expect(fmShell).not.toBeNull();
+
+  const headingBlockBeforeClear = host.querySelectorAll(".live-block")[0]!;
+  const bodyBlockBeforeClear = host.querySelectorAll(".live-block")[1]!;
+
+  act(() => { fmShell.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  const area = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(area.value).toBe("---\ntitle: Split Header\nauthor: Emmy Noether\n---");
+
+  // Length-changing YAML edit and subsequent clear in Split mode both preserve UTF-8 BOM, downstream .live-block identity, and existing Editor source selection.
+  const yamlSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+  await act(async () => {
+    yamlSetter.call(area, "---\ntitle: Expanded Split Header With Extra Metadata\nauthor: Emmy Noether\ntags: [algebra, physics]\n---");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(editorSelectedText(sessionId)).toBe(phrase);
+
+  await act(async () => {
+    yamlSetter.call(area, "");
+    area.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(current).toBe("\uFEFF# Split Heading\n\nTarget selection phrase.\n");
+
+  await act(async () => {
+    area.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelector(".live-frontmatter")).toBeNull();
+  expect(host.querySelectorAll(".live-block")[0]).toBe(headingBlockBeforeClear);
+  expect(host.querySelectorAll(".live-block")[1]).toBe(bodyBlockBeforeClear);
+
+  const shiftedFrom = current.indexOf(phrase);
+  const shiftedTo = shiftedFrom + phrase.length;
+  expect(editorSelectedText(sessionId)).toBe(phrase);
+  expect(queryInsertion()).toEqual({ from: shiftedFrom, to: shiftedTo });
+
+  // Standalone LiveEditor preserves UTF-8 BOM, CRLF body line endings, target clamping, and body edit offsets across YAML clear.
+  let liveOnly = "\uFEFF---\r\ntitle: CRLF Header\r\nauthor: Emmy Noether\r\n---\r\n\r\n# CRLF Heading\r\n\r\nCRLF body line.\r\n";
+  const renderLiveOnly = () =>
+    root.render(
+      <LiveEditor
+        markdown={liveOnly}
+        documentPath="/notes/crlf-live.md"
+        dark={false}
+        python=""
+        onChange={(next) => {
+          liveOnly = next;
+          renderLiveOnly();
+        }}
+      />,
+    );
+  await act(async () => { renderLiveOnly(); });
+  const standaloneFm = host.querySelector<HTMLElement>(".live-frontmatter")!;
+  const crlfHeadingBlock = host.querySelectorAll(".live-block")[0]!;
+  const crlfBodyBlock = host.querySelectorAll(".live-block")[1]!;
+  const crlfFmEnd = "\uFEFF---\r\ntitle: CRLF Header\r\nauthor: Emmy Noether\r\n---\r\n".length;
+  expect(queryInsertion({ target: standaloneFm })).toEqual({ from: crlfFmEnd, to: crlfFmEnd });
+
+  act(() => { standaloneFm.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+  const standaloneArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(queryInsertion({ target: standaloneArea })).toEqual({ from: crlfFmEnd, to: crlfFmEnd });
+  await act(async () => {
+    yamlSetter.call(standaloneArea, "");
+    standaloneArea.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  expect(liveOnly).toBe("\uFEFF# CRLF Heading\r\n\r\nCRLF body line.\r\n");
+  expect(queryInsertion({ target: standaloneFm })).toEqual({ from: 1, to: 1 });
+  expect(queryInsertion()).toEqual({ from: 1, to: 1 });
+
+  await act(async () => {
+    standaloneArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(host.querySelectorAll(".live-block")[0]).toBe(crlfHeadingBlock);
+  expect(host.querySelectorAll(".live-block")[1]).toBe(crlfBodyBlock);
+
+  await act(async () => {
+    host.querySelector("h1")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const headingEditor = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+  expect(headingEditor.value).toBe("# CRLF Heading");
+  await act(async () => {
+    yamlSetter.call(headingEditor, "# Updated CRLF Heading");
+    headingEditor.dispatchEvent(new Event("input", { bubbles: true }));
+    headingEditor.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  expect(liveOnly).toBe("\uFEFF# Updated CRLF Heading\r\n\r\nCRLF body line.\r\n");
+
+  await act(async () => root.unmount());
   host.remove();
 });
 
@@ -1910,5 +2284,295 @@ it("toggles only the clicked nested task checkbox and keeps slider-containing ta
   expect(markdown).toContain("- [x] Review unit\n  - [x] Complete nested exercise\n  - [x] Verify slider response");
 
   await act(async () => root.unmount());
+  host.remove();
+});
+it("integrates Live frontmatter Find/Replace metadata spans (#119) with equation-aware rendering, editing, and copy (#109)", async () => {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const origScroll = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = () => {};
+
+  let doc = [
+    "\uFEFF---",
+    "tags: [symmetries, mechanics]",
+    "author: Emmy Noether",
+    'title: "Variational Symmetries"',
+    "cssclasses: [symmetries]",
+    "---",
+    "",
+    "By \\eqref{eq:euler} and inline $\\ref{eq:euler}$, stationary action yields:",
+    "",
+    "$$",
+    "\\frac{d}{dt}\\frac{\\partial L}{\\partial \\dot{q}} - \\frac{\\partial L}{\\partial q} = 0 \\tag{1}\\label{eq:euler}",
+    "$$",
+  ].join("\r\n");
+
+  const setInputValue = (el: HTMLInputElement, value: string) => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  };
+
+  const flushFrame = () =>
+    act(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+    });
+
+  let searchOpen = true;
+  const renderLiveWithSearch = () =>
+    root.render(
+      <div className="android-document">
+        {searchOpen && (
+          <ReadingSearch
+            content={doc}
+            close={() => {
+              searchOpen = false;
+              renderLiveWithSearch();
+            }}
+            onChange={(next) => {
+              doc = next;
+              renderLiveWithSearch();
+            }}
+          />
+        )}
+        <section className="android-reading">
+          <LiveEditor
+            markdown={doc}
+            documentPath="/notes/noether.md"
+            python=""
+            dark={false}
+            onChange={(next) => {
+              doc = next;
+              renderLiveWithSearch();
+            }}
+          />
+        </section>
+      </div>,
+    );
+
+  try {
+    await act(async () => { renderLiveWithSearch(); });
+    await flushFrame();
+
+    // #109 equation references resolve in both prose and inline math inside LiveEditor without opening a block editor on link click.
+    const proseEqLink = host.querySelector<HTMLAnchorElement>('a.equation-ref[href="#smd-eq-eq_3a_euler"]')!;
+    const inlineMathEqLink = host.querySelector<HTMLAnchorElement>('.math-inline-source a[href="#smd-eq-eq_3a_euler"]')!;
+    const eqAnchor = host.querySelector<HTMLElement>('#smd-eq-eq_3a_euler[data-math-source]')!;
+    expect(proseEqLink?.textContent).toBe("(1)");
+    expect(inlineMathEqLink?.textContent).toBe("1");
+    expect(eqAnchor).not.toBeNull();
+    act(() => { proseEqLink.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true })); });
+    expect(host.querySelector("textarea")).toBeNull();
+
+    // #119 Find in Live mode matches displayed title + tag (2 matches), skipping custom YAML cssclasses: [symmetries].
+    const findInput = host.querySelector<HTMLInputElement>('input[aria-label="Find in note"]')!;
+    await act(async () => { setInputValue(findInput, "symmetries"); });
+    await flushFrame();
+    expect(host.querySelector("output")?.textContent).toBe("0 / 2");
+
+    // Step to visual match 2 (tag "symmetries", which appears first in raw CRLF YAML) and Replace in source -> updates only the tag at canonical offset, keeping BOM, CRLF, and cssclasses intact.
+    const nextBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Next match"]')!;
+    await act(async () => { nextBtn.click(); });
+    await act(async () => { nextBtn.click(); });
+    expect(host.querySelector("output")?.textContent).toBe("2 / 2");
+
+    const replaceToggle = host.querySelector<HTMLButtonElement>('button[aria-label="Replace in source"]')!;
+    await act(async () => { replaceToggle.click(); });
+    await flushFrame();
+    expect(host.querySelector("output")?.textContent).toBe("1 / 3");
+
+    const replaceInput = host.querySelector<HTMLInputElement>('input[aria-label="Replacement text"]')!;
+    const replaceBtn = host.querySelectorAll<HTMLButtonElement>(".search-replace button")[0]!;
+    await act(async () => { setInputValue(replaceInput, "invariants"); });
+    await act(async () => { replaceBtn.click(); });
+    await flushFrame();
+    expect(doc.startsWith("\uFEFF---\r\ntags: [invariants, mechanics]\r\n")).toBe(true);
+    expect(doc).toContain('title: "Variational Symmetries"\r\ncssclasses: [symmetries]\r\n---');
+
+    // Close Find bar, then double-click the #109 tagged equation block in LiveEditor -> opens raw $$...\tag...\label...$$ source cleanly and updates rendered prose + inline math references.
+    const closeFindBtn = host.querySelector<HTMLButtonElement>('button[aria-label="Close search"]') ?? host.querySelector<HTMLButtonElement>(".reading-search button:last-of-type");
+    if (closeFindBtn) {
+      await act(async () => { closeFindBtn.click(); });
+    } else {
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+      });
+    }
+    expect(searchOpen).toBe(false);
+
+    const updatedEqAnchor = host.querySelector<HTMLElement>('#smd-eq-eq_3a_euler[data-math-source]')!;
+    const eqBlock = updatedEqAnchor.closest<HTMLElement>(".live-block")!;
+    await act(async () => { eqBlock.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); });
+    const mathArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+    expect(mathArea.value).toContain("\\tag{1}\\label{eq:euler}");
+    await act(async () => {
+      typeInTextarea(mathArea, mathArea.value.replace("\\tag{1}", "\\tag{EL}"));
+    });
+    expect(doc).toContain("\\tag{EL}\\label{eq:euler}");
+    await act(async () => {
+      mathArea.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    });
+    expect(host.querySelector("textarea")).toBeNull();
+    expect(host.querySelector('a.equation-ref[href="#smd-eq-eq_3a_euler"]')?.textContent).toBe("(EL)");
+    expect(host.querySelector('.math-inline-source a[href="#smd-eq-eq_3a_euler"]')?.textContent).toBe("EL");
+
+    // Copying across LiveDocument excludes .live-frontmatter while restoring #109 \eqref, inline $\ref$, \tag{EL}, and \label{eq:euler}.
+    const liveRoot = host.querySelector<HTMLElement>(".live-document")!;
+    const sel = window.getSelection()!;
+    const range = document.createRange();
+    range.selectNodeContents(liveRoot);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    let copied = "";
+    const copyEvt = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copyEvt, "clipboardData", {
+      value: { setData: (_t: string, v: string) => { copied = v; } },
+    });
+    act(() => { liveRoot.dispatchEvent(copyEvt); });
+    sel.removeAllRanges();
+    expect(copyEvt.defaultPrevented).toBe(true);
+    expect(copied).not.toContain("Variational Symmetries");
+    expect(copied).not.toContain("cssclasses");
+    expect(copied).toContain("By \\eqref{eq:euler} and inline $\\ref{eq:euler}$, stationary action yields:");
+    expect(copied).toContain("\\tag{EL}\\label{eq:euler}");
+  } finally {
+    Element.prototype.scrollIntoView = origScroll;
+    await act(async () => root.unmount());
+    host.remove();
+  }
+});
+
+it("reconciles native textarea undo/redo and cross-boundary NoteHistory across Live YAML frontmatter and Markdown body blocks", async () => {
+  installNativeTextareaExecCommandMock();
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  const historyRef: { current: NoteHistory } = { current: { undo: [], redo: [], last: 0 } };
+  const triggerRef: { current: (direction: "undo" | "redo") => void } = { current: () => {} };
+  let currentDoc = "\uFEFF---\ntitle: Initial Header\n---\n\nFirst body paragraph";
+
+  await act(async () => {
+    root.render(
+      <StrictMode>
+        <HistoryBackedLiveEditor
+          initial={currentDoc}
+          historyRef={historyRef}
+          triggerRef={triggerRef}
+          onDocChange={(next) => {
+            currentDoc = next;
+          }}
+        />
+      </StrictMode>,
+    );
+  });
+
+  // 1. Open YAML frontmatter, edit via native execCommand, move to body block, edit body block, then step Undo/Redo across both!
+  act(() => {
+    host.querySelector<HTMLElement>(".live-frontmatter")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const fmArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(fmArea).not.toBeNull();
+  const titlePos = fmArea.value.indexOf("Initial Header") + "Initial Header".length;
+  act(() => {
+    fmArea.focus();
+    fmArea.setSelectionRange(titlePos, titlePos);
+    document.execCommand("insertText", false, " v2");
+  });
+  expect(currentDoc).toBe("\uFEFF---\ntitle: Initial Header v2\n---\n\nFirst body paragraph");
+
+  act(() => {
+    fmArea.setSelectionRange(fmArea.value.length, fmArea.value.length);
+    fmArea.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+  });
+  const bodyArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+  expect(bodyArea.value).toBe("First body paragraph");
+  act(() => {
+    bodyArea.focus();
+    bodyArea.setSelectionRange(bodyArea.value.length, bodyArea.value.length);
+    document.execCommand("insertText", false, " refined");
+  });
+  expect(currentDoc).toBe("\uFEFF---\ntitle: Initial Header v2\n---\n\nFirst body paragraph refined");
+
+  // First Ctrl+Z undoes body block via native textarea undo.
+  act(() => {
+    bodyArea.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(currentDoc).toBe("\uFEFF---\ntitle: Initial Header v2\n---\n\nFirst body paragraph");
+
+  // Second Ctrl+Z crosses from exhausted body textarea back into Live YAML frontmatter!
+  act(() => {
+    host.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+  expect(currentDoc).toBe("\uFEFF---\ntitle: Initial Header\n---\n\nFirst body paragraph");
+  const reanchoredFm = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(reanchoredFm).not.toBeNull();
+  expect(reanchoredFm.value).toBe("---\ntitle: Initial Header\n---");
+  expect(document.activeElement).toBe(reanchoredFm);
+
+  // Redo twice steps forward through YAML frontmatter and back into the body block!
+  act(() => {
+    reanchoredFm.dispatchEvent(new KeyboardEvent("keydown", { key: "y", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(currentDoc).toBe("\uFEFF---\ntitle: Initial Header v2\n---\n\nFirst body paragraph");
+  expect(host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')?.value).toBe(
+    "---\ntitle: Initial Header v2\n---",
+  );
+
+  act(() => {
+    host.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "z", ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+  expect(currentDoc).toBe("\uFEFF---\ntitle: Initial Header v2\n---\n\nFirst body paragraph refined");
+  const redoneBody = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+  expect(redoneBody?.value).toBe("First body paragraph refined");
+
+  // 2. Close body block, clear YAML frontmatter completely (stripping separator blank lines while keeping BOM),
+  // edit body block again, then Undo twice to re-anchor into the restored YAML frontmatter!
+  act(() => {
+    redoneBody.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  });
+  act(() => {
+    host.querySelector<HTMLElement>(".live-frontmatter")!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+  });
+  const clearFmArea = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  act(() => {
+    clearFmArea.focus();
+    clearFmArea.setSelectionRange(0, clearFmArea.value.length);
+    document.execCommand("delete", false);
+  });
+  expect(currentDoc).toBe("\uFEFFFirst body paragraph refined");
+
+  act(() => {
+    clearFmArea.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+  });
+  const afterClearBody = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit Markdown block"]')!;
+  expect(afterClearBody.value).toBe("First body paragraph refined");
+  act(() => {
+    afterClearBody.focus();
+    afterClearBody.setSelectionRange(afterClearBody.value.length, afterClearBody.value.length);
+    document.execCommand("insertText", false, "!");
+  });
+  expect(currentDoc).toBe("\uFEFFFirst body paragraph refined!");
+
+  act(() => {
+    afterClearBody.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+  });
+  expect(currentDoc).toBe("\uFEFFFirst body paragraph refined");
+
+  act(() => {
+    host.querySelector<HTMLTextAreaElement>("textarea")!.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }),
+    );
+  });
+  expect(currentDoc).toBe("\uFEFF---\ntitle: Initial Header v2\n---\n\nFirst body paragraph refined");
+  const restoredFm = host.querySelector<HTMLTextAreaElement>('textarea[aria-label="Edit YAML frontmatter"]')!;
+  expect(restoredFm).not.toBeNull();
+  expect(restoredFm.value).toBe("---\ntitle: Initial Header v2\n---");
+  expect(document.activeElement).toBe(restoredFm);
+
+  act(() => root.unmount());
   host.remove();
 });

@@ -2,6 +2,7 @@
 import {afterEach,expect,it} from "vitest";
 import {renderToStaticMarkup} from "react-dom/server";
 import MarkdownPreview from "./components/MarkdownPreview";
+import LiveEditor from "./components/LiveEditor";
 import {extractSelectedText,hasSelectedText,selectedMarkdown,setSelectedMarkdownDrag} from "./copySource";
 import {readingMatches} from "./components/ReadingSearch";
 afterEach(()=>{
@@ -193,13 +194,57 @@ it("excludes document properties header from copied Markdown while indexing only
   expect(copied).not.toContain("invariants");
   expect(copied?.replace(/\n{3,}/g,"\n\n")).toBe("# Opening Section\n\nFirst **important** sentence.");
 
+  const authorValue=Array.from(header.querySelectorAll(".document-property-value")).find(el=>el.textContent?.includes("Emmy Noether"))!;
+  const valueOnly=document.createRange();
+  valueOnly.selectNodeContents(authorValue);
+  selection.removeAllRanges();
+  selection.addRange(valueOnly);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toBe("Emmy Noether");
+  expect(hasSelectedText()).toBe(true);
+
+  const dragPayload=new Map<string,string>([["text/plain","Emmy Noether"]]);
+  const dragTransfer={setData:(type:string,value:string)=>dragPayload.set(type,value),clearData:(type:string)=>dragPayload.delete(type)} as unknown as DataTransfer;
+  const dragEvent=new Event("dragstart",{bubbles:true,cancelable:true});
+  Object.defineProperty(dragEvent,"dataTransfer",{value:dragTransfer});
+  Object.defineProperty(dragEvent,"target",{value:authorValue});
+  Object.defineProperty(dragEvent,"clientX",{value:8});
+  Object.defineProperty(dragEvent,"clientY",{value:8});
+  Object.defineProperty(document,"caretPositionFromPoint",{configurable:true,value:()=>({offsetNode:authorValue.firstChild!,offset:2})});
+  expect(setSelectedMarkdownDrag(dragEvent as DragEvent,markdown)).toBe(false);
+  expect(dragPayload.get("text/plain")).toBe("Emmy Noether");
+
   const headerOnly=document.createRange();
   headerOnly.selectNodeContents(header);
   selection.removeAllRanges();
   selection.addRange(headerOnly);
-  expect(selectedMarkdown(selection,markdown)).toBe("");
-  expect(extractSelectedText({source:markdown})).toBe("");
-  expect(hasSelectedText()).toBe(false);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toContain("Hidden Header Title");
+  expect(hasSelectedText()).toBe(true);
+
+  // Triple-click selection in Chromium can end at offset 0 of the following heading text node.
+  const headingText=article.querySelector("h1")!.firstChild!;
+  const boundaryRange=document.createRange();
+  boundaryRange.setStart(authorValue.firstChild!,0);
+  boundaryRange.setEnd(headingText,0);
+  selection.removeAllRanges();
+  selection.addRange(boundaryRange);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toContain("Emmy Noether");
+
+  // Select All on a frontmatter-only note falls back to ordinary copy instead of wiping clipboard.
+  const soloHost=document.createElement("div");
+  const soloMarkdown="---\ntitle: Solo Metadata\nauthor: Ada Lovelace\n---";
+  soloHost.innerHTML=renderToStaticMarkup(<MarkdownPreview markdown={soloMarkdown} documentPath={null} python="" dark={false}/>);
+  document.body.append(soloHost);
+  const soloArticle=soloHost.querySelector(".markdown-body")!;
+  const soloRange=document.createRange();
+  soloRange.selectNodeContents(soloArticle);
+  selection.removeAllRanges();
+  selection.addRange(soloRange);
+  expect(selectedMarkdown(selection,soloMarkdown)).toBeNull();
+  expect(extractSelectedText({source:soloMarkdown})).toContain("Solo Metadata");
+  soloHost.remove();
 
   expect(readingMatches(article,"Hidden Header Title").map(r=>r.toString())).toEqual(["Hidden Header Title"]);
   expect(readingMatches(article,"Emmy Noether").map(r=>r.toString())).toEqual(["Emmy Noether"]);
@@ -221,6 +266,78 @@ it("serializes highlight, subscript, superscript, kbd, underline, and strikethro
   range.setStart(markText,0);range.setEnd(markText,3);selection.removeAllRanges();selection.addRange(range);
   expect(selectedMarkdown(selection)).toBe("==key==");
   selection.removeAllRanges();host.remove();
+});
+it("integrates Live frontmatter copy fallback and exclusion with #119 metadata spans, #109 tagged equation copy, and #209 closed disclosures",()=>{
+  const markdown=[
+    "---",
+    "title: Variational Mechanics",
+    "author: Emmy Noether",
+    "date: 2026-03-15",
+    "tags: [symmetries, conservation]",
+    "cssclasses: [wide]",
+    "---",
+    "",
+    "See \\eqref{eq:action} and Equation \\ref{eq:action}:",
+    "",
+    "$$",
+    "S[q] = \\int_{t_1}^{t_2} L(q, \\dot{q})\\,dt \\tag{1}\\label{eq:action}",
+    "$$",
+    "",
+    "> [!answer] Euler-Lagrange solution",
+    "> Hidden derivation $\\frac{\\partial L}{\\partial q} = \\frac{d}{dt}\\frac{\\partial L}{\\partial \\dot{q}}$.",
+  ].join("\n");
+  const host=document.createElement("div");
+  host.innerHTML=renderToStaticMarkup(<LiveEditor markdown={markdown} documentPath={null} python="" dark={false} onChange={()=>{}}/>);
+  document.body.append(host);
+  const liveRoot=host.querySelector(".live-document") as HTMLElement;
+  const fmShell=host.querySelector(".live-frontmatter")!;
+  expect(fmShell).not.toBeNull();
+
+  // #119 metadata spans match only displayed title, author, and tags inside LiveFrontmatterShell
+  expect(readingMatches(liveRoot,"Variational Mechanics").map(r=>r.toString())).toEqual(["Variational Mechanics"]);
+  expect(readingMatches(liveRoot,"Emmy Noether").map(r=>r.toString())).toEqual(["Emmy Noether"]);
+  expect(readingMatches(liveRoot,"symmetries").map(r=>r.toString())).toEqual(["symmetries"]);
+  expect(readingMatches(liveRoot,"2026-03-15")).toEqual([]);
+  expect(readingMatches(liveRoot,"cssclasses")).toEqual([]);
+  expect(readingMatches(liveRoot,"wide")).toEqual([]);
+
+  const selection=window.getSelection()!;
+  const customVal=Array.from(fmShell.querySelectorAll(".document-property-value")).find(el=>el.textContent==="wide")!;
+  const customRange=document.createRange();
+  customRange.selectNodeContents(customVal);
+  selection.removeAllRanges();
+  selection.addRange(customRange);
+  expect(selectedMarkdown(selection,markdown)).toBeNull();
+  expect(extractSelectedText({source:markdown})).toBe("wide");
+
+  // Full Live document copy excludes .live-frontmatter and #209 closed answer body while restoring #109 LaTeX source and callout header
+  const allRange=document.createRange();
+  allRange.selectNodeContents(liveRoot);
+  selection.removeAllRanges();
+  selection.addRange(allRange);
+  const copied=selectedMarkdown(selection,markdown);
+  expect(copied).not.toContain("Variational Mechanics");
+  expect(copied).not.toContain("Emmy Noether");
+  expect(copied).not.toContain("cssclasses");
+  expect(copied).not.toContain("Hidden derivation");
+  expect(copied).toContain("See \\eqref{eq:action} and Equation \\ref{eq:action}:");
+  expect(copied).toContain("\\tag{1}\\label{eq:action}");
+  expect(copied).toContain("> [!answer] Euler-Lagrange solution");
+
+  // Selecting across frontmatter + a summary-less closed <details> yields "" rather than falling back to native copy
+  const summarylessHost=document.createElement("article");
+  summarylessHost.className="markdown-body";
+  summarylessHost.innerHTML='<section class="document-properties" data-frontmatter-properties="true"><div class="document-properties-title">Title</div></section><details><p>Hidden body</p></details>';
+  document.body.append(summarylessHost);
+  const summarylessRange=document.createRange();
+  summarylessRange.selectNodeContents(summarylessHost);
+  selection.removeAllRanges();
+  selection.addRange(summarylessRange);
+  expect(selectedMarkdown(selection)).toBe("");
+  summarylessHost.remove();
+
+  selection.removeAllRanges();
+  host.remove();
 });
 
 it("keeps closed answer and folded callout bodies out of copy while preserving callout markers and open disclosures",()=>{

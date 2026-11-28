@@ -18,6 +18,7 @@ import { selectedMarkdown, setSelectedMarkdownDrag } from "../copySource";
 import CopyCode from "./CopyCode";
 import CodeBlockBoundary from "./CodeBlockBoundary";
 import DocumentProperties from "./DocumentProperties";
+import type { ParsedFrontmatter } from "../frontmatter";
 import {DocumentAppearance} from '../documentAppearance';
 import {parseValidatedSvg,svgSizingStyle} from '../svgImage';
 import {adaptValidatedSvg,decodeSvgDataUri} from '../svgTheme';
@@ -230,6 +231,7 @@ interface Props extends ReaderAccessibilityPreference {
   onChange?: (markdown:string)=>void;
   onNotice?: (message: string) => void;
   renderBlock?:MarkdownBlockRenderer;
+  renderFrontmatter?:(frontmatter:ParsedFrontmatter)=>ReactNode;
   sourceAnalysis?:SourceDocumentAnalysis;
 }
 
@@ -442,7 +444,7 @@ const MARKDOWN_COMPONENTS: Components = {
   pre: MarkdownPre,
 };
 
-function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, onChange, onNotice, renderBlock,fullDocumentAccessibility=false,sourceAnalysis }: Props) {
+function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, python, dark, trustedImageHosts = EMPTY_TRUSTED_IMAGE_HOSTS, approvedImageUrls = EMPTY_APPROVED_IMAGE_URLS, onTrustImageHost, onApproveImageUrl, onRemoteImageLoaded, onChange, onNotice, renderBlock, renderFrontmatter, fullDocumentAccessibility=false, sourceAnalysis }: Props) {
   useEffect(installMediaMenu,[]);
   const [linkNotice, setLinkNotice] = useState("");
   const resolvedNotePath = savedDocumentPath === undefined ? documentPath : savedDocumentPath;
@@ -470,7 +472,11 @@ function MarkdownPreview({ noteId, markdown, documentPath, savedDocumentPath, py
     <MarkdownPreviewContext.Provider value={previewContext}>
       <article className="markdown-body" data-note-id={noteId || undefined} onCopy={event=>{if(event.currentTarget.closest('.live-document'))return;const source=selectedMarkdown(window.getSelection(),markdown);if(source!==null){event.clipboardData.setData("text/plain",source);event.preventDefault();}}} onDragStart={event=>{if(!event.currentTarget.closest('.live-document'))setSelectedMarkdownDrag(event.nativeEvent,markdown);}}>
         {linkNotice && <div role="status" className="reader-link-notice"><span>{linkNotice}</span><button type="button" aria-label="Dismiss notice" onClick={clearLinkNotice}>Dismiss</button></div>}
-        {analysis.frontmatter?.properties && <DocumentProperties properties={analysis.frontmatter.properties} />}
+        {analysis.frontmatter
+          ? (renderFrontmatter
+              ? renderFrontmatter(analysis.frontmatter)
+              : (analysis.frontmatter.properties && <DocumentProperties properties={analysis.frontmatter.properties} />))
+          : null}
         <CachedMarkdown
           sourceAnalysis={resolvedSourceAnalysis}
           renderBlock={renderBlock}

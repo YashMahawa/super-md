@@ -229,13 +229,16 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .live-block:empty { min-height: 25px; }
 .live-document > .markdown-body { width:100%; max-width:none; margin:0; padding:0; }
 .live-block { display:flow-root; }
+.live-frontmatter { position: relative; border-radius: 16px; }
+.live-frontmatter:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
+.live-frontmatter > .live-block-edit { top: calc(6px / var(--document-scale, 1)); right: calc(8px / var(--document-scale, 1)); }
 .live-block > :first-child:not(.live-block-edit), .live-block > .live-block-edit + * { margin-top:0; }
 .live-block > :last-child:not(.live-block-edit) { margin-bottom:.85em; }
 .live-block .markdown-body { width: 100%; padding: 0; font-size: calc(var(--reader-size) * var(--workspace-scale, 1)); }
 .live-block .markdown-body > :first-child { margin-top: 0; }
 .live-block .markdown-body > :last-child { margin-bottom: .85em; }
 .live-block:focus-visible { outline: 2px solid var(--primary); outline-offset: 4px; }
-.live-block-edit { position: absolute; z-index: 6; top: calc(4px / var(--document-scale, 1)); right: calc(6px / var(--document-scale, 1)); transform: scale(calc(1 / var(--document-scale, 1))); transform-origin: top right; display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 5px 11px; border: 1px solid var(--outline); border-radius: 999px; background: var(--surface-high); color: var(--text); box-shadow: 0 3px 12px color-mix(in srgb, #000 18%, transparent); font: 650 12px/1 "Manrope Variable", var(--md-ref-typeface-plain, system-ui, sans-serif); letter-spacing: .01em; white-space: nowrap; user-select: none; cursor: pointer; }
+.live-block-edit { position: absolute; z-index: 6; top: calc(4px / var(--document-scale, 1)); right: calc(6px / var(--document-scale, 1)); transform: scale(calc(1 / var(--document-scale, 1))); transform-origin: top right; display: inline-flex; align-items: center; gap: 5px; min-height: 30px; padding: 5px 11px; border: 1px solid var(--outline); border-radius: 999px; background: var(--surface-high); color: var(--text); box-shadow: 0 3px 12px color-mix(in srgb, #000 18%, transparent); font: 650 12px/1 "Manrope Variable", var(--md-ref-typeface-plain, system-ui, sans-serif); letter-spacing: .01em; white-space: nowrap; user-select: none; -webkit-user-select: none; cursor: pointer; }
 :root[data-live-selecting="true"] .live-block-edit { pointer-events: none; opacity: 0; }
 .live-block:has(.code-copy) > .live-block-edit { top: calc(22px / var(--document-scale, 1)); right: calc(78px / var(--document-scale, 1)); }
 .live-block:has(.chart-actions) > .live-block-edit { top: calc(16px / var(--document-scale, 1)); right: calc(96px / var(--document-scale, 1)); }
@@ -271,6 +274,9 @@ smd-expressive-button.primary-action { display: block; width: 100%; margin-top: 
 .cm-search button { min-height: 32px; padding: 6px 12px; border-radius: 999px; border: 0 !important; background: var(--surface-low) !important; background-image: none !important; color: var(--text) !important; font: inherit !important; }
 .markdown-body { width: min(var(--reader-width), calc(100% - 92px)); margin: 0 auto; padding: 48px 0 30vh; font-family: var(--reader-font, 'Noto Sans Variable', 'Noto Sans', Arial, sans-serif); font-size: var(--reader-size); line-height: var(--reader-leading,1.65); overflow-wrap: break-word; }
 .document-properties { margin: 0 0 1.65em; padding: 14px 18px; border-radius: 16px; background: var(--surface-low); border: 1px solid var(--outline); font-family: "Manrope Variable", "Noto Sans Variable", "Noto Sans", system-ui, sans-serif; font-size: max(13px, .86em); line-height: 1.45; display: grid; gap: 10px; }
+.document-properties--empty { padding: 10px 16px; min-height: 42px; align-items: center; border-style: dashed; }
+.document-properties-empty { color: var(--muted); font-size: .82em; font-weight: 650; letter-spacing: .03em; text-transform: uppercase; user-select: none; -webkit-user-select: none; }
+.document-property-empty { color: var(--muted); user-select: none; -webkit-user-select: none; }
 .document-properties-heading { display: grid; gap: 3px; }
 .document-properties-heading:has(+ .document-properties-list) { padding-bottom: 10px; border-bottom: 1px solid color-mix(in srgb, var(--outline) 65%, transparent); }
 .document-properties-title { font-size: 1.18em; font-weight: 750; letter-spacing: -.02em; line-height: 1.3; color: var(--text); }
