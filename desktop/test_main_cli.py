@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -40,16 +41,52 @@ class DesktopLauncherUnpackCliTest(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("Native PDF/portable engine is missing from this installation", stderr.getvalue())
 
+    def test_unpack_dispatches_headless_before_graphics_probe_and_prefers_packaged_engine_path(self):
+        launcher = Path(__file__).resolve().parent / "main.py"
+        executable = "smd-engine.exe" if sys.platform == "win32" else "smd-engine"
+        with tempfile.TemporaryDirectory() as folder:
+            packaged_root = Path(folder) / "_internal" / "resources"
+            packaged_engine = packaged_root / "desktop" / executable
+            packaged_engine.parent.mkdir(parents=True)
+            packaged_engine.write_bytes(b"packaged-smd-engine")
+
+            for argv, expected_exit in (
+                (["super-md", "unpack", "lesson.smd", "out-dir"], 0),
+                (["super-md", "unpack"], 1),
+            ):
+                with (
+                    mock.patch("graphics_runtime.configure") as configure_mock,
+                    mock.patch("graphics_runtime.probe") as probe_mock,
+                    mock.patch("PySide6.QtWebEngineQuick.QtWebEngineQuick.initialize") as webengine_init_mock,
+                    mock.patch("studio.ROOT", packaged_root),
+                    mock.patch("subprocess.call", return_value=expected_exit) as call_mock,
+                    mock.patch.object(sys, "argv", argv),
+                ):
+                    with self.assertRaises(SystemExit) as exited:
+                        runpy.run_path(str(launcher), run_name="__main__")
+                    self.assertEqual(exited.exception.code, expected_exit)
+                    configure_mock.assert_not_called()
+                    probe_mock.assert_not_called()
+                    webengine_init_mock.assert_not_called()
+                    call_mock.assert_called_once_with([str(packaged_engine), *argv[1:]])
+
     def test_launcher_dispatches_unpack_with_companion_asset_and_retains_path_and_overwrite_checks(self):
         if _find_smd_engine() is None:
             self.skipTest("smd-engine binary is not built in this workspace")
 
         launcher = Path(__file__).resolve().parent / "main.py"
         env = dict(os.environ)
-        # Force any unintended graphics probe path to fail or mutate env visibly;
-        # CLI engine subcommands must bypass graphics probing completely.
-        for name in ("QT_QUICK_BACKEND", "QSG_RHI_BACKEND", "QTWEBENGINE_CHROMIUM_FLAGS"):
+        # Force any unintended graphics probe or QGuiApplication initialization to
+        # fail immediately; CLI engine subcommands must stay headless pre-graphics.
+        for name in (
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "QT_QUICK_BACKEND",
+            "QSG_RHI_BACKEND",
+            "QTWEBENGINE_CHROMIUM_FLAGS",
+        ):
             env.pop(name, None)
+        env["QT_QPA_PLATFORM"] = "nonexistent-headless-qpa"
 
         def run_launcher(*args: str | Path) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
@@ -78,6 +115,27 @@ class DesktopLauncherUnpackCliTest(unittest.TestCase):
             packed = run_launcher("pack", note_md, portable_smd)
             self.assertEqual(packed.returncode, 0, packed.stderr)
             self.assertTrue(portable_smd.is_file())
+
+            # Invalid CLI invocations must fail cleanly without starting graphics or creating partial outputs.
+            missing_note = run_launcher("unpack")
+            self.assertEqual(missing_note.returncode, 1)
+            self.assertIn("Expected note path", missing_note.stderr)
+
+            missing_output = run_launcher("unpack", portable_smd)
+            self.assertEqual(missing_output.returncode, 1)
+            self.assertIn("Expected usage: smd-engine unpack NOTE OUTPUT_DIR", missing_output.stderr)
+
+            extra_arg_dir = root / "extra-arg-out"
+            extra_arg = run_launcher("unpack", portable_smd, extra_arg_dir, "unexpected")
+            self.assertEqual(extra_arg.returncode, 1)
+            self.assertIn("Expected usage: smd-engine unpack NOTE OUTPUT_DIR", extra_arg.stderr)
+            self.assertFalse(extra_arg_dir.exists())
+
+            plain_md_dir = root / "plain-md-out"
+            plain_md = run_launcher("unpack", note_md, plain_md_dir)
+            self.assertEqual(plain_md.returncode, 1)
+            self.assertIn("This note is not portable", plain_md.stderr)
+            self.assertFalse(plain_md_dir.exists())
 
             unpacked_dir = root / "unpacked"
             unpacked = run_launcher("unpack", portable_smd, unpacked_dir)

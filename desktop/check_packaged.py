@@ -93,12 +93,19 @@ def check(executable: Path, version: str, graphics: str) -> None:
         unpacked_svg = unpacked / "assets/image-1.svg"
         if not unpacked_md.is_file() or not unpacked_svg.is_file():
             raise RuntimeError("Packaged unpack CLI did not extract Markdown and companion asset")
+        unpacked_text = unpacked_md.read_text(encoding="utf-8")
+        if "# Fresh machine" not in unpacked_text or "assets/image-1.svg" not in unpacked_text or "base64" in unpacked_text:
+            raise RuntimeError("Packaged unpack CLI did not rewrite extracted Markdown cleanly")
         if unpacked_svg.read_bytes() != (root / "figure.svg").read_bytes():
             raise RuntimeError("Packaged unpack CLI did not preserve companion asset bytes")
         overwrite = subprocess.run([str(executable), "unpack", str(portable), str(unpacked)],
                                    env=env, capture_output=True, text=True, timeout=30)
         if overwrite.returncode == 0:
             raise RuntimeError("Packaged unpack CLI must refuse to overwrite existing output")
+        invalid_unpack = subprocess.run([str(executable), "unpack", str(portable)],
+                                        env=env, capture_output=True, text=True, timeout=30)
+        if invalid_unpack.returncode == 0:
+            raise RuntimeError("Packaged unpack CLI must reject missing output directory")
         run("export", portable, pdf)
         legacy = root / "Legacy portable.fmd"
         legacy.write_text(json.dumps({**packed, "format":"supermd-fmd"}), encoding="utf-8")
