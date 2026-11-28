@@ -141,6 +141,8 @@ class StudioSessionTests(unittest.TestCase):
             restored.settings["startup"] = "empty"
             self.assertFalse(restored.has_pending_startup_windows())
             self.assertEqual([c["id"] for c in restored.closed_tabs], ["closed-keep"])
+            self.assertIsInstance(restored.folder_note_index, studio_module.FolderNoteIndex)
+            self.assertIsInstance(restored.workspace_links, studio_module._MutualWorkspaceLinkCache)
             self.assertFalse(restored.is_quitting())
             restored.background = SimpleNamespace(quitting=True)
             self.assertTrue(restored.is_quitting())

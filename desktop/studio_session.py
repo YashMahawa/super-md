@@ -12,6 +12,7 @@ if __package__:
     from .fonts import FontStore
     from .latest_writes import LatestWriteExecutor
     from .python_outputs import PythonOutputs
+    from .quick_switcher import FolderNoteIndex
     from .reader_assets import ReaderAssetStore, note_file_path
     from .shortcuts import default_shortcuts, normalize_shortcuts
     from .workspace_links import WorkspaceLinkCache
@@ -21,12 +22,13 @@ else:
     from fonts import FontStore
     from latest_writes import LatestWriteExecutor
     from python_outputs import PythonOutputs
+    from quick_switcher import FolderNoteIndex
     from reader_assets import ReaderAssetStore, note_file_path
     from shortcuts import default_shortcuts, normalize_shortcuts
     from workspace_links import WorkspaceLinkCache
 
 DEFAULT_PDF = {
-    "pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.4,
+    "pageSize": "a4", "margin": 14, "fontSize": 10.5, "lineHeight": 1.5,
     "paragraphSpacing": 0.65, "fontFamily": "Manrope", "pageNumbers": True, "themed": False,
 }
 DEFAULTS = {
@@ -53,10 +55,12 @@ def _default_snapshot_tab_state(tab: dict, *, include_view_state: bool = True) -
 
 def asset_identity(value): return id(value)
 def noop_done(*_): pass
+def _default_workspace_links(*, on_invalidate=None): return WorkspaceLinkCache()
 
 def init_session(
     session, isolated=False, data=None, *, defaults=DEFAULTS, default_pdf=DEFAULT_PDF,
     mkdtemp_fn=tempfile.mkdtemp, writable_location_fn=QStandardPaths.writableLocation, atomic_write_fn=atomic_write,
+    folder_index_cls=FolderNoteIndex, workspace_links_cls=_default_workspace_links,
 ) -> None:
     if hasattr(session, "renameCompleted") and hasattr(session, "_on_rename_completed"):
         session.renameCompleted.connect(session._on_rename_completed)
@@ -190,7 +194,9 @@ def init_session(
         session.closed_tabs = kept
         try: session.closed_note_store.save_index(kept)
         except OSError: pass
-    session.workspace_links = WorkspaceLinkCache()
+    session._cache_invalidation_local = threading.local()
+    session.folder_note_index = folder_index_cls(on_invalidate=getattr(session, "_on_folder_note_index_invalidated", None))
+    session.workspace_links = workspace_links_cls(on_invalidate=getattr(session, "_on_workspace_links_invalidated", None))
 
 def session_is_quitting(session) -> bool:
     background = getattr(session, "background", None)
