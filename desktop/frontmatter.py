@@ -5,7 +5,7 @@ import re
 
 _BLOCK_SCALAR_HEADER = re.compile(r"^([|>])(?:([+-])([1-9])?|([1-9])([+-])?)?[ \t]*(?:#.*)?$")
 _CLOSER = re.compile(r"^(?:---|\.\.\.)[ \t]*$")
-
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 _SIMPLE_ESCAPES: dict[str, str] = {
     '"': '"',
     "\\": "\\",
@@ -42,45 +42,36 @@ def _parse_double_quoted(text: str) -> tuple[str, str] | None:
             if i >= n:
                 return None
             esc = text[i]
-            if esc == "\n":
-                while i + 1 < n and text[i + 1] in (" ", "\t"):
-                    i += 1
+            if esc in _SIMPLE_ESCAPES:
+                out.append(_SIMPLE_ESCAPES[esc])
                 i += 1
                 continue
-            if esc == "x":
-                hex_part = text[i + 1:i + 3]
-                if len(hex_part) != 2 or not all(c in "0123456789abcdefABCDEF" for c in hex_part):
-                    return None
-                out.append(chr(int(hex_part, 16)))
-                i += 3
+            if esc == "\n":
+                i += 1
+                while i < n and text[i] in (" ", "\t"):
+                    i += 1
                 continue
-            if esc == "u":
-                hex_part = text[i + 1:i + 5]
-                if len(hex_part) != 4 or not all(c in "0123456789abcdefABCDEF" for c in hex_part):
-                    return None
-                out.append(chr(int(hex_part, 16)))
-                i += 5
-                continue
-            if esc == "U":
-                hex_part = text[i + 1:i + 9]
-                if len(hex_part) != 8 or not all(c in "0123456789abcdefABCDEF" for c in hex_part):
+            if esc in ("x", "u", "U"):
+                width = 2 if esc == "x" else (4 if esc == "u" else 8)
+                hex_part = text[i + 1:i + 1 + width]
+                if len(hex_part) != width or not all(c in _HEX_DIGITS for c in hex_part):
                     return None
                 cp = int(hex_part, 16)
-                if cp > 0x10FFFF:
+                if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
                     return None
                 out.append(chr(cp))
-                i += 9
+                i += 1 + width
                 continue
-            out.append(_SIMPLE_ESCAPES.get(esc, esc))
+            out.append(esc)
             i += 1
             continue
         if ch == "\n":
             while out and out[-1] in (" ", "\t"):
                 out.pop()
-            while i + 1 < n and text[i + 1] in (" ", "\t"):
+            i += 1
+            while i < n and text[i] in (" ", "\t"):
                 i += 1
             out.append(" ")
-            i += 1
             continue
         out.append(ch)
         i += 1
@@ -104,10 +95,10 @@ def _parse_single_quoted(text: str) -> tuple[str, str] | None:
         if ch == "\n":
             while out and out[-1] in (" ", "\t"):
                 out.pop()
-            while i + 1 < n and text[i + 1] in (" ", "\t"):
+            i += 1
+            while i < n and text[i] in (" ", "\t"):
                 i += 1
             out.append(" ")
-            i += 1
             continue
         out.append(ch)
         i += 1
@@ -115,7 +106,7 @@ def _parse_single_quoted(text: str) -> tuple[str, str] | None:
 
 
 def _only_trailing_comment(rest: str) -> bool:
-    trimmed = rest.lstrip(" \t")
+    trimmed = rest.lstrip()
     return trimmed == "" or trimmed.startswith("#")
 
 
@@ -178,30 +169,18 @@ def _split_key_value(trimmed: str, allow_compact: bool = False) -> tuple[str, st
         return None
     if trimmed == "-" or trimmed.startswith(("- ", "-\t")):
         return None
-    if trimmed.startswith('"'):
-        parsed = _parse_double_quoted(trimmed)
+    if trimmed[0] in "\"'":
+        parsed = _parse_double_quoted(trimmed) if trimmed[0] == '"' else _parse_single_quoted(trimmed)
         if not parsed:
             return None
         key, rest = parsed
-        after = rest.lstrip(" \t")
+        after = rest.lstrip()
         if not after.startswith(":"):
             return None
         post = after[1:]
         if not allow_compact and post and post[0] not in (" ", "\t"):
             return None
-        return key, post.lstrip(" \t")
-    if trimmed.startswith("'"):
-        parsed = _parse_single_quoted(trimmed)
-        if not parsed:
-            return None
-        key, rest = parsed
-        after = rest.lstrip(" \t")
-        if not after.startswith(":"):
-            return None
-        post = after[1:]
-        if not allow_compact and post and post[0] not in (" ", "\t"):
-            return None
-        return key, post.lstrip(" \t")
+        return key, post.lstrip()
     if trimmed[0] in "[]{}|>*&!%@":
         return None
     for idx, ch in enumerate(trimmed):
@@ -212,7 +191,7 @@ def _split_key_value(trimmed: str, allow_compact: bool = False) -> tuple[str, st
             key = trimmed[:idx].strip()
             if not key or any(c in key for c in "[]{}\"'"):
                 return None
-            return key, after.lstrip(" \t")
+            return key, after.lstrip()
     return None
 
 
@@ -269,9 +248,8 @@ def _parse_flow_value(raw: str) -> tuple[bool, object]:
                 return False, None
             out_map[kv[0]] = val
         return True, out_map
-    if any(c in trimmed for c in "[]{}"):
-        if _split_top_level_commas(trimmed) is None:
-            return False, None
+    if any(c in trimmed for c in "[]{}") and _split_top_level_commas(trimmed) is None:
+        return False, None
     return True, _parse_plain_scalar(trimmed)
 
 
@@ -374,7 +352,8 @@ def _parse_yaml_mapping(yaml_body: str) -> dict[str, object] | None:
     if not yaml_body:
         return {}
     lines: list[tuple[str, int, str]] = []
-    for raw in yaml_body.splitlines():
+    for raw_line in yaml_body.split("\n"):
+        raw = raw_line.removesuffix("\r")
         indent = 0
         leading_tab = False
         for ch in raw:
@@ -402,7 +381,7 @@ def _parse_yaml_mapping(yaml_body: str) -> dict[str, object] | None:
         if trimmed == "-":
             return ""
         if trimmed.startswith(("- ", "-\t")):
-            return trimmed[1:].lstrip(" \t")
+            return trimmed[1:].lstrip()
         return None
 
     def parse_quoted(idx: int, initial: str, min_indent: int) -> tuple[str, int] | None:
@@ -431,8 +410,8 @@ def _parse_yaml_mapping(yaml_body: str) -> dict[str, object] | None:
             if state == "error":
                 return None
             if state == "balanced":
-                ok, val = _parse_flow_value(_strip_flow_comment(comb))
-                return (val if ok else comb), idx + 1
+                ok, val = _parse_flow_value(comb)
+                return (val, idx + 1) if ok else None
             idx += 1
             if idx >= len(lines):
                 return None
@@ -657,18 +636,19 @@ def _extract_author_name(value: object) -> str | None:
     if direct:
         return direct
     if isinstance(value, dict):
-        name = value.get("name") if "name" in value else value.get("literal")
+        raw_name = _lookup_ci(value, "name")
+        name = raw_name if raw_name is not None else _lookup_ci(value, "literal")
         direct_name = _scalar_to_string(name)
         if direct_name:
             return direct_name
         if isinstance(name, dict):
-            literal = _scalar_to_string(name.get("literal"))
+            literal = _scalar_to_string(_lookup_ci(name, "literal"))
             if literal:
                 return literal
-            parts = [p for p in (_scalar_to_string(name.get("given")), _scalar_to_string(name.get("family"))) if p]
+            parts = [p for p in (_scalar_to_string(_lookup_ci(name, "given")), _scalar_to_string(_lookup_ci(name, "family"))) if p]
             if parts:
                 return " ".join(parts)
-        parts = [p for p in (_scalar_to_string(value.get("given")), _scalar_to_string(value.get("family"))) if p]
+        parts = [p for p in (_scalar_to_string(_lookup_ci(value, "given")), _scalar_to_string(_lookup_ci(value, "family"))) if p]
         if parts:
             return " ".join(parts)
     return None
@@ -774,7 +754,9 @@ def _parse_frontmatter_entries(markdown: str) -> tuple[int, dict[str, object] | 
 
     if yaml_end < 0 or fm_end < 0:
         return 0, None
-    yaml_slice = re.sub(r"\r?\n$", "", markdown[yaml_start:yaml_end])
+    yaml_slice = markdown[yaml_start:yaml_end]
+    if yaml_slice.endswith("\n"):
+        yaml_slice = yaml_slice[:-1].removesuffix("\r")
     entries = _parse_yaml_mapping(yaml_slice)
     if entries is None:
         return 0, None

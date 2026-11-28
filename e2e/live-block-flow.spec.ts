@@ -344,3 +344,256 @@ test("supports StepCards slide viewer Edit source handoff and preserves document
   await expect(page.locator(".footnotes")).toContainText("Preserved footnote body.");
 });
 
+test("reconciles native textarea undo with document history, redoes after leaving a Live block, and crosses block boundaries", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 860 });
+  const initial = ["First block.", "", "Second block.", "", "Third block."].join("\n");
+  await loadLiveNote(page, initial, "live");
+  // Exercise standard hardware-keyboard routing as well as window.supermdHistory.
+  await page.evaluate(() => {
+    document.documentElement.dataset.host = "android";
+  });
+
+  // 1. Edit First block, undo the grouped typing run inside First block, leave First block,
+  // and redo from document history after leaving that block!
+  await page.locator(".live-block").nth(0).dblclick();
+  const area = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(area).toBeFocused();
+  await area.press("End");
+  await area.pressSequentially(" Edited once");
+  await expect(area).toHaveValue("First block. Edited once");
+
+  // Undo inside the active Live block via Ctrl+Z (natural grouped native undo, not per-character!).
+  await area.press("Control+z");
+  await expect(area).toHaveValue("First block.");
+
+  // Leave that Live block with Escape, then redo from document history!
+  await area.press("Escape");
+  await expect(page.locator("textarea")).toHaveCount(0);
+  await expect(page.locator(".live-block").nth(0).locator("p")).toHaveText("First block.");
+
+  await page.keyboard.press("Control+y");
+  await expect(page.locator("textarea")).toHaveCount(0);
+  await expect(page.locator(".live-block").nth(0).locator("p")).toHaveText("First block. Edited once");
+
+  // 2. Open Second block, edit it, move ArrowDown into Third block, create two native textarea
+  // undo steps (by moving the caret between edits), then undo & redo across block boundaries!
+  await page.locator(".live-block").nth(1).dblclick();
+  const secondArea = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(secondArea).toHaveValue("Second block.");
+  await secondArea.press("End");
+  await secondArea.pressSequentially("!");
+  await expect(secondArea).toHaveValue("Second block.!");
+
+  await secondArea.press("ArrowDown");
+  const thirdArea = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(thirdArea).toBeFocused();
+  await expect(thirdArea).toHaveValue("Third block.");
+  await thirdArea.press("End");
+  await thirdArea.pressSequentially("1");
+  await thirdArea.press("ArrowLeft");
+  await thirdArea.press("End");
+  await thirdArea.pressSequentially("2");
+  await expect(thirdArea).toHaveValue("Third block.12");
+
+  // Undo inside Third block (caret move split Blink's TypingCommand into two native steps while
+  // NoteHistory coalesces rapid edits, reconciling each native step cleanly).
+  await thirdArea.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block.1");
+  await thirdArea.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block.");
+
+  // Next Undo crosses block boundary from Third block into Second block!
+  await page.keyboard.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Second block.");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).latestContent as string))
+    .toBe("First block. Edited once\n\nSecond block.\n\nThird block.");
+
+  // Next Undo crosses block boundary from Second block into First block!
+  await page.keyboard.press("Control+z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("First block.");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).latestContent as string))
+    .toBe(initial);
+
+  // Redo steps forward cleanly across First -> Second -> Third blocks!
+  await page.keyboard.press("Control+y");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("First block. Edited once");
+  await page.keyboard.press("Control+Shift+Z");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Second block.!");
+  await page.keyboard.press("Control+y");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block.1");
+  await page.keyboard.press("Control+y");
+  await expect(page.getByRole("textbox", { name: "Edit Markdown block" })).toHaveValue("Third block.12");
+  await expect
+    .poll(() => page.evaluate(() => (window as any).latestContent as string))
+    .toBe("First block. Edited once\n\nSecond block.!\n\nThird block.12");
+});
+
+test("keeps #64 workspace link navigation and Live/document undo-redo semantics working together across Live and Source modes", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await page.addInitScript(() => {
+    (window as any).workspaceLinkCalls = [];
+    (window as any).latestContentById = {};
+    window.SuperMD = {
+      post: (id, command, raw) => {
+        const args = raw ? JSON.parse(raw) : {};
+        if (command === "document_changed") {
+          (window as any).latestContentById[args.id] = args.content;
+        }
+        if (command === "open_workspace_link") {
+          (window as any).workspaceLinkCalls.push(args);
+          queueMicrotask(() => window.supermdReply?.(id, { opened: true }, null));
+          return;
+        }
+        if (command === "document_sync" || command === "document_patch") {
+          queueMicrotask(() => window.supermdReply?.(id, { accepted: true, revision: args.revision ?? 0 }, null));
+          return;
+        }
+        queueMicrotask(() => window.supermdReply?.(id, true, null));
+      },
+    };
+  });
+
+  await page.goto("/android-reader.html");
+  await page.waitForFunction(() => typeof window.supermdLoad === "function");
+
+  const initialFlow = [
+    "Intro paragraph.",
+    "",
+    "See [[Roadmap#Milestones|Project Milestones]] for details.",
+  ].join("\n");
+
+  await page.evaluate((content) => {
+    document.documentElement.dataset.host = "android";
+    window.supermdLoad?.({
+      id: "tab-flow",
+      content,
+      path: "/vault/Notes/Flow.md",
+      mode: "live",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "Manrope",
+      size: 16,
+      zoom: 100,
+    });
+  }, initialFlow);
+
+  // Edit first block in Live mode, undo inside the active textarea, leave block, and click #64 wikilink.
+  await page.locator(".live-block").nth(0).dblclick();
+  const area = page.getByRole("textbox", { name: "Edit Markdown block" });
+  await expect(area).toBeFocused();
+  await area.press("End");
+  await area.pressSequentially(" Drafted");
+  await expect(area).toHaveValue("Intro paragraph. Drafted");
+
+  await area.press("Control+z");
+  await expect(area).toHaveValue("Intro paragraph.");
+  await area.press("Escape");
+  await expect(page.locator("textarea")).toHaveCount(0);
+
+  await page.getByRole("link", { name: "Project Milestones" }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).workspaceLinkCalls.length))
+    .toBe(1);
+  expect(await page.evaluate(() => (window as any).workspaceLinkCalls[0])).toEqual({
+    documentPath: "/vault/Notes/Flow.md",
+    target: "Roadmap",
+    fragment: "Milestones",
+    wikilink: true,
+  });
+
+  // Simulate host opening target tab and then switching back to tab-flow: redo from preserved NoteHistory still works!
+  await page.evaluate(() => {
+    window.supermdLoad?.({
+      id: "tab-roadmap",
+      content: "# Roadmap\n\n## Milestones\n\nShip cleanly.",
+      path: "/vault/Roadmap.md",
+      mode: "live",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "Manrope",
+      size: 16,
+      zoom: 100,
+      pendingHeading: { heading: "Milestones", token: "jump-1" },
+    });
+  });
+  await expect(page.getByRole("heading", { name: "Milestones" })).toBeVisible();
+
+  await page.evaluate((content) => {
+    window.supermdLoad?.({
+      id: "tab-flow",
+      content,
+      path: "/vault/Notes/Flow.md",
+      mode: "live",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "Manrope",
+      size: 16,
+      zoom: 100,
+    });
+  }, initialFlow);
+
+  await page.keyboard.press("Control+y");
+  await expect(page.locator(".live-block").nth(0).locator("p")).toHaveText("Intro paragraph. Drafted");
+  await page.keyboard.press("Control+z");
+  await expect(page.locator(".live-block").nth(0).locator("p")).toHaveText("Intro paragraph.");
+
+  // Switch tab-flow to Source mode and verify #64 SourceEditor documentPath forwarding on Ctrl+Click!
+  await page.evaluate((content) => {
+    window.supermdLoad?.({
+      id: "tab-flow",
+      content,
+      path: "/vault/Notes/Flow.md",
+      mode: "editor",
+      dark: false,
+      fullscreen: false,
+      colors: {},
+      font: "Manrope",
+      size: 16,
+      zoom: 100,
+    });
+  }, initialFlow);
+
+  const linkLine = page.locator(".cm-line", { hasText: "[[Roadmap#Milestones|Project Milestones]]" });
+  await expect(linkLine).toBeVisible();
+  const point = await linkLine.evaluate((el) => {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let current: Node | null;
+    while ((current = walker.nextNode())) {
+      const text = current as Text;
+      const idx = text.data.indexOf("Roadmap");
+      if (idx >= 0) {
+        const range = document.createRange();
+        range.setStart(text, idx + 2);
+        range.setEnd(text, idx + 3);
+        const rect = range.getBoundingClientRect();
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      }
+    }
+    throw new Error("Target text node not found");
+  });
+  await page.mouse.move(point.x, point.y);
+  await page.keyboard.down("Control");
+  await page.mouse.down();
+  await page.mouse.up();
+  await page.keyboard.up("Control");
+
+  await expect
+    .poll(() => page.evaluate(() => (window as any).workspaceLinkCalls.length))
+    .toBe(2);
+  expect(await page.evaluate(() => (window as any).workspaceLinkCalls[1])).toEqual({
+    documentPath: "/vault/Notes/Flow.md",
+    target: "Roadmap",
+    fragment: "Milestones",
+    wikilink: true,
+  });
+});
+
