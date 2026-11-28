@@ -43,10 +43,14 @@ def main(argv):
     app.setApplicationName('super-md');app.setOrganizationName('SuperMD')
     platform=sys.platform
     is_win=platform.startswith('win')
-    root=Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)).resolve()
+    raw_appdata=QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+    if not raw_appdata:
+        raise ValueError('Super MD profile directory is unavailable')
+    raw_root=Path(raw_appdata)
     if args.action=='approve':
-        approve_headless_startup(root)
+        approve_headless_startup(raw_root)
         print(json.dumps({'ok':True,'result':{'approved':True,'action':'approve'}}));return 0
+    root=raw_root.resolve()
     name='supermd-qt-'+hashlib.sha256(str(root).encode()).hexdigest()[:20]
     def _instance_lock_held():
         if not root.exists():return False

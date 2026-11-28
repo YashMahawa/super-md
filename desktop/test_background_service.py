@@ -2278,20 +2278,144 @@ sys.exit(0)""",
         self.assertFalse((fresh_appdata / "qt-studio" / "agent-sessions").exists())
 
         # 2. Reader-only profile with existing preferences, malformed headlessServiceApproved values,
-        #    and corrupt settings.json preservation before approval.
+        #    corrupt/malformed settings.json preservation, no-link validation (linked profile directory,
+        #    linked app-data parent, and linked settings.json), and I/O failure preservation before approval.
+        from core.headless_approval import approve_headless_startup, is_headless_startup_approved
+
+        def _try_create_link(link: Path, target: Path, *, target_is_directory: bool = False) -> bool:
+            try:
+                link.symlink_to(target, target_is_directory=target_is_directory)
+                return True
+            except (OSError, NotImplementedError) as exc:
+                if sys.platform == "win32" and target_is_directory and getattr(exc, "winerror", None) == 1314:
+                    subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return link.exists()
+                if sys.platform == "win32" and getattr(exc, "winerror", None) == 1314:
+                    return False
+                raise
+
+        # 2a. Linked profile directory (`<appdata>/qt-studio` -> external directory, both custom-named and `qt-studio`-named)
+        #     and linked app-data parent (`<linked_appdata>` -> `<real_appdata>` and dangling link):
+        #     approval must reject via both direct API and CLI without modifying target settings.json.
+        real_profile_custom = (self.temp_appdata / "External Profile Target").resolve()
+        real_profile_custom.mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            real_profile_custom / "settings.json",
+            {
+                "settings": {"theme": "sepia", "font": "Literata", "keepInBackground": False, "agentAccessEnabled": False},
+                "recent": ["external-note.smd"],
+                "pinned": ["external-note.smd"],
+            },
+        )
+        custom_target_bytes = (real_profile_custom / "settings.json").read_bytes()
+
+        real_appdata_target = (self.temp_appdata / "Real AppData Target").resolve()
+        (real_appdata_target / "qt-studio").mkdir(parents=True, exist_ok=True)
+        atomic_json(
+            real_appdata_target / "qt-studio" / "settings.json",
+            {
+                "settings": {"theme": "dark", "font": "IBM Plex Sans", "keepInBackground": False, "agentAccessEnabled": False},
+                "recent": ["real-appdata-note.smd"],
+                "pinned": ["real-appdata-note.smd"],
+            },
+        )
+        real_appdata_bytes = (real_appdata_target / "qt-studio" / "settings.json").read_bytes()
+
+        linked_profile_appdata_a = (self.temp_appdata / "AppData With Linked Profile Custom").resolve()
+        linked_profile_appdata_a.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(
+            _try_create_link(linked_profile_appdata_a / "qt-studio", real_profile_custom, target_is_directory=True)
+        )
+        for candidate in (linked_profile_appdata_a, linked_profile_appdata_a / "qt-studio"):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(candidate)
+        link_prof_code_a, link_prof_err_a = self._service_for_appdata(linked_profile_appdata_a, "approve")
+        self.assertEqual(link_prof_code_a, 2, link_prof_err_a)
+        self.assertFalse(link_prof_err_a["ok"])
+        self.assertEqual(link_prof_err_a["error"]["type"], "ValueError")
+        self.assertEqual((real_profile_custom / "settings.json").read_bytes(), custom_target_bytes)
+        self.assertFalse((real_profile_custom / "qt-studio").exists())
+        self.assertFalse((real_profile_custom / "agent-sessions").exists())
+
+        linked_profile_appdata_b = (self.temp_appdata / "AppData With Linked Profile Named QtStudio").resolve()
+        linked_profile_appdata_b.mkdir(parents=True, exist_ok=True)
+        self.assertTrue(
+            _try_create_link(
+                linked_profile_appdata_b / "qt-studio",
+                real_appdata_target / "qt-studio",
+                target_is_directory=True,
+            )
+        )
+        for candidate in (linked_profile_appdata_b, linked_profile_appdata_b / "qt-studio"):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(candidate)
+        link_prof_code_b, link_prof_err_b = self._service_for_appdata(linked_profile_appdata_b, "approve")
+        self.assertEqual(link_prof_code_b, 2, link_prof_err_b)
+        self.assertFalse(link_prof_err_b["ok"])
+        self.assertEqual((real_appdata_target / "qt-studio" / "settings.json").read_bytes(), real_appdata_bytes)
+
+        linked_appdata_parent = self.temp_appdata / "Linked AppData Parent"
+        self.assertTrue(_try_create_link(linked_appdata_parent, real_appdata_target, target_is_directory=True))
+        for candidate in (linked_appdata_parent, linked_appdata_parent / "qt-studio"):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(candidate)
+        link_parent_code, link_parent_err = self._service_for_appdata(linked_appdata_parent, "approve")
+        self.assertEqual(link_parent_code, 2, link_parent_err)
+        self.assertFalse(link_parent_err["ok"])
+        self.assertEqual(link_parent_err["error"]["type"], "ValueError")
+        self.assertEqual((real_appdata_target / "qt-studio" / "settings.json").read_bytes(), real_appdata_bytes)
+        self.assertFalse((real_appdata_target / "qt-studio" / "agent-sessions").exists())
+
+        missing_appdata_target = self.temp_appdata / "Missing Dangling AppData Target"
+        dangling_appdata_parent = self.temp_appdata / "Dangling Linked AppData Parent"
+        if _try_create_link(dangling_appdata_parent, missing_appdata_target, target_is_directory=True):
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(dangling_appdata_parent)
+            dangling_code, dangling_err = self._service_for_appdata(dangling_appdata_parent, "approve")
+            self.assertEqual(dangling_code, 2, dangling_err)
+            self.assertFalse(dangling_err["ok"])
+            self.assertFalse(missing_appdata_target.exists())
+
+        linked_settings_appdata = (self.temp_appdata / "AppData With Linked Settings File").resolve()
+        (linked_settings_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+        outside_settings_file = (self.temp_appdata / "outside-settings.json").resolve()
+        outside_settings_file.write_bytes(custom_target_bytes)
+        if _try_create_link(
+            linked_settings_appdata / "qt-studio" / "settings.json",
+            outside_settings_file,
+            target_is_directory=False,
+        ):
+            with self.assertRaisesRegex(ValueError, "settings.json must not be a symlink"):
+                approve_headless_startup(linked_settings_appdata)
+            link_settings_code, link_settings_err = self._service_for_appdata(linked_settings_appdata, "approve")
+            self.assertEqual(link_settings_code, 2, link_settings_err)
+            self.assertFalse(link_settings_err["ok"])
+            self.assertEqual(outside_settings_file.read_bytes(), custom_target_bytes)
+            self.assertTrue((linked_settings_appdata / "qt-studio" / "settings.json").is_symlink())
+
+        # 2b. Corrupt/malformed settings.json and I/O write failure leave existing settings.json unchanged.
         reader_appdata = (self.temp_appdata / "Reader Profile — Explicit Approval Flow").resolve()
         (reader_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
         pinned_note = str(reader_appdata / "pinned-lecture.smd")
-        corrupt_bytes = b'{"settings": {"theme": "dark", "broken": '
-        (reader_appdata / "qt-studio" / "settings.json").write_bytes(corrupt_bytes)
-        corrupt_start_code, corrupt_start_err = self._service_for_appdata(reader_appdata, "start")
-        self.assertEqual(corrupt_start_code, 2)
-        self.assertFalse(corrupt_start_err["ok"])
-        corrupt_approve_code, corrupt_approve_err = self._service_for_appdata(reader_appdata, "approve")
-        self.assertEqual(corrupt_approve_code, 2)
-        self.assertFalse(corrupt_approve_err["ok"])
-        self.assertEqual((reader_appdata / "qt-studio" / "settings.json").read_bytes(), corrupt_bytes)
-        self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
+        for malformed_bytes in (
+            b'{"settings": {"theme": "dark", "broken": ',
+            b'[1, 2, 3]',
+            b'{"settings": ["not-a-dict"], "pinned": ["keep.smd"]}',
+        ):
+            (reader_appdata / "qt-studio" / "settings.json").write_bytes(malformed_bytes)
+            corrupt_start_code, corrupt_start_err = self._service_for_appdata(reader_appdata, "start")
+            self.assertEqual(corrupt_start_code, 2)
+            self.assertFalse(corrupt_start_err["ok"])
+            corrupt_approve_code, corrupt_approve_err = self._service_for_appdata(reader_appdata, "approve")
+            self.assertEqual(corrupt_approve_code, 2)
+            self.assertFalse(corrupt_approve_err["ok"])
+            self.assertEqual((reader_appdata / "qt-studio" / "settings.json").read_bytes(), malformed_bytes)
+            self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
 
         for invalid_approval in (False, "true", 1, [True], {"approved": True}):
             atomic_json(
@@ -2313,6 +2437,28 @@ sys.exit(0)""",
             self.assertFalse(bad_payload["ok"])
             self.assertFalse((reader_appdata / "qt-studio" / "agent-sessions").exists())
             self.assertFalse((reader_appdata / "background-service.log").exists())
+
+        atomic_json(
+            reader_appdata / "qt-studio" / "settings.json",
+            {
+                "settings": {
+                    "font": "Literata",
+                    "theme": "dark",
+                    "keepInBackground": False,
+                    "agentAccessEnabled": False,
+                    "headlessServiceApproved": False,
+                },
+                "pinned": [pinned_note],
+                "recent": [pinned_note],
+            },
+        )
+        valid_unapproved_bytes = (reader_appdata / "qt-studio" / "settings.json").read_bytes()
+        with patch("os.replace", side_effect=OSError("simulated atomic replace failure")):
+            with self.assertRaises(OSError):
+                approve_headless_startup(reader_appdata)
+        self.assertEqual((reader_appdata / "qt-studio" / "settings.json").read_bytes(), valid_unapproved_bytes)
+        self.assertEqual(list((reader_appdata / "qt-studio").glob("*.tmp")), [])
+        self.assertFalse(is_headless_startup_approved(reader_appdata))
 
         # Subsequent GUI session on the unapproved profile still has keepInBackground=False & agentAccessEnabled=False.
         with patch.object(
@@ -2482,6 +2628,47 @@ sys.exit(0)""",
                 self.assertEqual(cfg_res["code"], 0, f"{setting_key}: {cfg_res}")
                 self.assertTrue(json.loads(cfg_res["stdout"])["result"]["running"], setting_key)
                 cfg_broker.close()
+
+        # 5. Pre-#41 legacy profile migration coverage: legacy markers (`cloudAgentEnabled`, `background`,
+        #    `backgroundEnabled`, `agent-cloud.json`, `agent-sessions/`, and pre-existing `background-service.log`
+        #    without `fresh_service_log=True`) continue starting and migrating `keepInBackground: True` cleanly,
+        #    while fresh service logs do not falsely migrate and failed approval leaves legacy settings unchanged.
+        for legacy_key in ("cloudAgentEnabled", "background", "backgroundEnabled"):
+            legacy_key_appdata = (self.temp_appdata / f"Legacy Marker — {legacy_key}").resolve()
+            (legacy_key_appdata / "qt-studio").mkdir(parents=True, exist_ok=True)
+            atomic_json(
+                legacy_key_appdata / "qt-studio" / "settings.json",
+                {
+                    "settings": {"font": "IBM Plex Serif", legacy_key: True},
+                    "recent": ["legacy-note.smd"],
+                    "pinned": ["legacy-note.smd"],
+                },
+            )
+            self.assertTrue(is_headless_startup_approved(legacy_key_appdata, fresh_service_log=False), legacy_key)
+            legacy_before_bytes = (legacy_key_appdata / "qt-studio" / "settings.json").read_bytes()
+            linked_legacy = self.temp_appdata / f"Linked Legacy — {legacy_key}"
+            self.assertTrue(_try_create_link(linked_legacy, legacy_key_appdata, target_is_directory=True))
+            with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+                approve_headless_startup(linked_legacy)
+            self.assertEqual((legacy_key_appdata / "qt-studio" / "settings.json").read_bytes(), legacy_before_bytes)
+
+            leg_code, leg_res = self._service_for_appdata(legacy_key_appdata, "approve")
+            self.assertEqual(leg_code, 0, leg_res)
+            migrated_legacy = json.loads((legacy_key_appdata / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
+            self.assertIs(migrated_legacy["settings"]["keepInBackground"], True)
+            self.assertIs(migrated_legacy["settings"]["headlessServiceApproved"], True)
+            self.assertEqual(migrated_legacy["settings"]["font"], "IBM Plex Serif")
+            self.assertEqual(migrated_legacy["pinned"], ["legacy-note.smd"])
+
+        legacy_log_only = (self.temp_appdata / "Legacy Log Only Profile").resolve()
+        legacy_log_only.mkdir(parents=True, exist_ok=True)
+        (legacy_log_only / "background-service.log").write_text("pre-#41 daemon log\n", encoding="utf-8")
+        self.assertTrue(is_headless_startup_approved(legacy_log_only, fresh_service_log=False))
+        self.assertFalse(is_headless_startup_approved(legacy_log_only, fresh_service_log=True))
+        approve_headless_startup(legacy_log_only)
+        migrated_log_only = json.loads((legacy_log_only / "qt-studio" / "settings.json").read_text(encoding="utf-8"))
+        self.assertIs(migrated_log_only["settings"]["keepInBackground"], True)
+        self.assertIs(migrated_log_only["settings"]["headlessServiceApproved"], True)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 if __package__ and "." in __package__:
@@ -29,9 +30,25 @@ _EXPLICIT_HEADLESS_SETTING_KEYS = (
 )
 
 
+def _is_link(path: Path) -> bool:
+    return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+
+
+def studio_profile_dir(appdata_or_data: Path) -> Path:
+    if not isinstance(appdata_or_data, (str, os.PathLike)):
+        raise ValueError("Super MD profile directory is unavailable")
+    raw_text = os.fspath(appdata_or_data)
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ValueError("Super MD profile directory is unavailable")
+    expanded = Path(raw_text).expanduser()
+    if ".." in expanded.parts:
+        raise ValueError("Super MD profile path must not contain parent traversal")
+    raw = expanded if expanded.is_absolute() else (Path.cwd() / expanded)
+    return raw if raw.name == "qt-studio" else raw / "qt-studio"
+
+
 def resolve_studio_data_dir(appdata_or_data: Path) -> Path:
-    resolved = Path(appdata_or_data).resolve()
-    return resolved if resolved.name == "qt-studio" else resolved / "qt-studio"
+    return studio_profile_dir(appdata_or_data).resolve()
 
 
 def has_legacy_background_markers(
@@ -91,11 +108,22 @@ def read_persisted_headless_approval(data_dir: Path) -> bool:
 
 def approve_headless_startup(appdata_or_data: Path) -> Path:
     """Persist explicit prior headless startup approval without starting a daemon or creating discovery state."""
-    data_dir = resolve_studio_data_dir(appdata_or_data)
-    if data_dir.is_symlink() or (data_dir.parent.exists() and data_dir.parent.is_symlink()):
+    raw_data_dir = studio_profile_dir(appdata_or_data)
+    raw_appdata_dir = raw_data_dir.parent
+    if _is_link(raw_data_dir) or _is_link(raw_appdata_dir):
         raise ValueError("Super MD profile directory must not be a symlink")
+    if (raw_appdata_dir.exists() and not raw_appdata_dir.is_dir()) or (
+        raw_data_dir.exists() and not raw_data_dir.is_dir()
+    ):
+        raise ValueError("Super MD profile path must be a directory")
+    raw_settings_path = raw_data_dir / "settings.json"
+    if _is_link(raw_settings_path):
+        raise ValueError("Super MD settings.json must not be a symlink")
+    data_dir = raw_data_dir.resolve()
     settings_path = data_dir / "settings.json"
-    if settings_path.is_symlink():
+    if _is_link(data_dir) or _is_link(data_dir.parent):
+        raise ValueError("Super MD profile directory must not be a symlink")
+    if _is_link(settings_path):
         raise ValueError("Super MD settings.json must not be a symlink")
     if settings_path.exists():
         try:
@@ -132,6 +160,11 @@ def approve_headless_startup(appdata_or_data: Path) -> Path:
             "recent": [],
             "pinned": [],
         }
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     data_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write(settings_path, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    if _is_link(raw_data_dir) or _is_link(raw_appdata_dir) or _is_link(data_dir):
+        raise ValueError("Super MD profile directory must not be a symlink")
+    if _is_link(raw_settings_path) or _is_link(settings_path):
+        raise ValueError("Super MD settings.json must not be a symlink")
+    atomic_write(settings_path, encoded)
     return settings_path
