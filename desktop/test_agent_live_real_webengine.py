@@ -25,7 +25,7 @@ def _probe(directory: str) -> int:
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS","--disable-gpu --disable-dev-shm-usage")
     os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX","1")
     from PySide6.QtCore import QFile, QIODevice, QUrl, QTimer, QObject, QMetaObject, Q_ARG, Qt
-    from PySide6.QtGui import QGuiApplication, QImage
+    from PySide6.QtGui import QImage
     from PySide6.QtQml import QQmlApplicationEngine
     from PySide6.QtQuickControls2 import QQuickStyle
     from PySide6.QtWidgets import QApplication
@@ -339,7 +339,8 @@ def _probe(directory: str) -> int:
             sequence.append(("confirm_created_closed",lambda _row:("list",)))
             start_next()
         elif key=="confirm_created_closed":
-            still_open=any(row.get("id")==state["created_target"] for row in result.get("tabs",[]))
+            created_id=str(state["created_target"] or "").removeprefix("tab:")
+            still_open=any(row.get("id") in (state["created_target"],created_id) for row in result.get("tabs",[]))
             if still_open:
                 sequence.insert(0,("confirm_created_closed",lambda _row:("list",)))
                 QTimer.singleShot(100,start_next)
@@ -415,7 +416,8 @@ def _probe(directory: str) -> int:
             sequence.append(("confirm_saved_closed",lambda _row:("list",)))
             start_next()
         elif key=="confirm_saved_closed":
-            still_open=any(row.get("id")==state["saved_target"] for row in result.get("tabs",[]))
+            saved_id=str(state["saved_target"] or "").removeprefix("tab:")
+            still_open=any(row.get("id") in (state["saved_target"],saved_id) for row in result.get("tabs",[]))
             if still_open:
                 sequence.insert(0,("confirm_saved_closed",lambda _row:("list",)))
                 QTimer.singleShot(100,start_next)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import http.client
 import json
 import queue
 import sys
@@ -606,6 +605,40 @@ class LiveDesktopBridgeTests(unittest.TestCase):
         self.assertFalse(self.bridge.enabled)
         with self.assertRaises(agent_live.LiveBridgeError):
             agent_live.read_discovery(discovery_path)
+
+    def test_hidden_window_tabs_are_marked_inactive_for_local_and_cloud_listing(self):
+        hidden_tabs = [
+            {"id": "hidden-active", "name": "Hidden.md", "path": "", "content": "# Hidden\n",
+             "saved": "# Hidden\n", "portable": False, "assets": {}},
+        ]
+        hidden_studio = _FakeStudio(self.events, "window-hidden-2", hidden_tabs, "hidden-active")
+        hidden_studio.host_window = SimpleNamespace(isVisible=lambda: False)
+        self.studio.host_window = SimpleNamespace(isVisible=lambda: True)
+        self.session.windows[hidden_studio.window_id] = hidden_studio
+
+        observed_requests = []
+
+        def handle_hidden_qml(raw):
+            req = json.loads(raw)
+            observed_requests.append(req)
+            # Even if a renderer tries to report active=True on a hidden window,
+            # QtBridge.complete must clamp active to False.
+            tampered = [{**row, "active": True} for row in req.get("tabs", [])]
+            self.bridge.complete(req["requestId"], {"tabs": tampered}, "", window_id=hidden_studio.window_id)
+
+        hidden_studio.agentRequest.connect(handle_hidden_qml)
+        listed = self._call_with_qt_pump(lambda: self.client.list_tabs())["tabs"]
+        active_rows = [row for row in listed if row.get("active") is True]
+        self.assertEqual([row["id"] for row in active_rows], [self.active_id])
+        hidden_row = next(row for row in listed if row["id"] == "hidden-active")
+        self.assertFalse(hidden_row["active"])
+        self.assertEqual(observed_requests[-1]["activeTabId"], "")
+
+        cloud_tabs = self._call_with_qt_pump(lambda: self.bridge.handle_cloud_request({"action": "list_tabs"}))["tabs"]
+        cloud_active = [row for row in cloud_tabs if row.get("active") is True]
+        self.assertEqual([row["id"] for row in cloud_active], [f"{self.window_id}:{self.active_id}"])
+        cloud_hidden = next(row for row in cloud_tabs if row["id"] == "window-hidden-2:hidden-active")
+        self.assertFalse(cloud_hidden["active"])
 
 
 if __name__ == "__main__":

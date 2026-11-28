@@ -41,6 +41,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import org.json.JSONArray
 import org.json.JSONObject
 
 private suspend fun View.awaitWindowFocus() {
@@ -232,9 +233,13 @@ internal fun BindReaderPersistenceCallbacks(
         onDispose { model.requestSaveAs = null }
     }
     DisposableEffect(web, readerReady, model) {
-        model.requestPortableWrite = if (readerReady && web != null) { saveInPlace ->
+        model.requestPortableWrite = if (readerReady && web != null) { request ->
             model.busy(true)
-            currentWeb()?.evaluateJavascript("window.supermdPortable?.($saveInPlace)", null)
+            val options = JSONObject()
+                .put("id", request.noteId)
+                .put("localAssets", JSONArray(request.localAssets))
+                .put("omitLocalAssets", true)
+            currentWeb()?.evaluateJavascript("window.supermdPortable?.(${request.save},$options)", null)
             true
         } else null
         onDispose { model.requestPortableWrite = null }

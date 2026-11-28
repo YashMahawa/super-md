@@ -7,7 +7,12 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 from PyInstaller.depend.bindepend import resolve_library_path
 
 sys.path.insert(0, str(Path(SPECPATH)))
-from package_runtime import linux_support_binaries, portable_binaries
+try:
+    from scripts.package_runtime import linux_support_binaries, portable_binaries
+except ModuleNotFoundError as _exc:
+    if _exc.name not in ("scripts", "scripts.package_runtime"):
+        raise
+    from desktop.scripts.package_runtime import linux_support_binaries, portable_binaries
 
 root = Path(SPECPATH).parent
 engine = root / "smd-core" / "target" / "release" / ("smd-engine.exe" if sys.platform == "win32" else "smd-engine")
@@ -71,17 +76,17 @@ analysis.binaries = portable_binaries(analysis.binaries, sys.platform)
 pyz = PYZ(analysis.pure)
 exe = EXE(pyz, analysis.scripts, [], exclude_binaries=True, name="super-md",
           debug=False, strip=False, upx=False, console=sys.platform.startswith("linux"),
-          icon=str(root / "src-tauri/icons/icon.ico") if sys.platform == "win32" else None)
+          icon=str(root / "desktop/brand/icon.ico") if sys.platform == "win32" else None)
 executables = [exe]
 if sys.platform == "win32":
     # Windows GUI executables have no stdin/stdout. MCP stdio needs a console
     # launcher, sharing the same Python/runtime files instead of duplicating it.
     executables.append(EXE(pyz, analysis.scripts, [], exclude_binaries=True,
         name="super-md-cli", debug=False, strip=False, upx=False, console=True,
-        icon=str(root / "src-tauri/icons/icon.ico")))
+        icon=str(root / "desktop/brand/icon.ico")))
 collection = COLLECT(*executables, analysis.binaries, analysis.datas, strip=False, upx=False, name="super-md")
 if sys.platform == "darwin":
-    app = BUNDLE(collection, name="Super MD.app", icon=str(root / "src-tauri/icons/icon.icns"),
+    app = BUNDLE(collection, name="Super MD.app", icon=str(root / "desktop/brand/icon.icns"),
         bundle_identifier="dev.supermd.studio", info_plist={
             "CFBundleShortVersionString": version, "CFBundleVersion": version,
             "NSHumanReadableCopyright": "Copyright © 2026 Yash Mahawar and Super MD contributors. MIT License.",

@@ -385,6 +385,171 @@ class PortableUnchangedAssetSaveTest {
         assertThrows(Exception::class.java) {
             media.portableEnvelopeMatches(ByteArrayInputStream(validCompressed + byteArrayOf(0x42)), "# Hi", JSONObject())
         }
+
+        // 5. 1..150 new-asset filename cap alongside 1..159 compatibility read/export/re-save path.
+        val maxNewFilename = "a".repeat(146) + ".png"
+        val compatMidFilename = "a".repeat(147) + ".png"
+        val compatMaxFilename = "a".repeat(155) + ".png"
+        val overCompatFilename = "a".repeat(156) + ".png"
+        val maxNewKey = "assets/$maxNewFilename"
+        val compatMidKey = "assets/$compatMidFilename"
+        val compatMaxKey = "assets/$compatMaxFilename"
+        val overCompatKey = "assets/$overCompatFilename"
+        assertTrue(isValidPortableAssetFilename(maxNewFilename))
+        assertTrue(isValidPortableAssetKey(maxNewKey))
+        for ((compatName, compatKey) in listOf(compatMidFilename to compatMidKey, compatMaxFilename to compatMaxKey)) {
+            assertFalse(isValidPortableAssetFilename(compatName))
+            assertFalse(isValidPortableAssetKey(compatKey))
+            assertTrue(isValidCompatPortableAssetFilename(compatName))
+            assertTrue(media.validKey(compatKey))
+            val compatArchive = ByteArrayOutputStream().also {
+                media.writeFmd(it, "# Legacy\n\n![Img](<$compatKey>)\n", JSONObject().put(compatKey, validPngUrl))
+            }.toByteArray()
+            val reopenedCompat = media.openFmd(ByteArrayInputStream(compatArchive))
+            try {
+                assertEquals("# Legacy\n\n![Img](<$compatKey>)\n", reopenedCompat.markdown)
+                assertTrue(media.portableAssets(reopenedCompat.directory).has(compatKey))
+            } finally {
+                File(app.filesDir, "portable-assets/${reopenedCompat.directory}").deleteRecursively()
+            }
+        }
+        val relayClient = AgentRelayClient()
+        val relayPngBody = Base64.encodeToString(syntheticPngBytes(64, 9L), Base64.NO_WRAP)
+        fun attachRequest(assetName: String) = JSONObject()
+            .put("requestId", "asset_cap")
+            .put("action", "asset_action")
+            .put("tabId", "tab:device:workspace:1")
+            .put("expectedRevision", "a".repeat(64))
+            .put("assetAction", "attach")
+            .put("assetName", assetName)
+            .put("mimeType", "image/png")
+            .put("body", relayPngBody)
+        relayClient.validateRequest(attachRequest(maxNewKey))
+        relayClient.validateRequest(attachRequest(maxNewFilename))
+        for (compatRejectedNew in listOf(compatMidKey, compatMidFilename, compatMaxKey, compatMaxFilename)) {
+            assertThrows(IllegalArgumentException::class.java) {
+                relayClient.validateRequest(attachRequest(compatRejectedNew))
+            }
+        }
+        for (badKey in listOf(overCompatKey, "assets/.", "assets/..")) {
+            assertFalse("Expected validKey to reject $badKey", media.validKey(badKey))
+            assertThrows(IllegalArgumentException::class.java) {
+                media.writeFmd(ByteArrayOutputStream(), "# Bad key", JSONObject().put(badKey, validPngUrl))
+            }
+            val badEnvelope = JSONObject()
+                .put("format", "supermd-smd")
+                .put("version", 1)
+                .put("markdown", "# Bad key")
+                .put("assets", JSONObject().put(badKey, validPngUrl))
+                .toString()
+                .toByteArray(Charsets.UTF_8)
+            assertThrows(IllegalArgumentException::class.java) {
+                media.openFmd(ByteArrayInputStream(badEnvelope))
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                relayClient.validateRequest(attachRequest(badKey))
+            }
+        }
+        for (badName in listOf(overCompatFilename, ".", "..")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                relayClient.validateRequest(attachRequest(badName))
+            }
+        }
+    }
+
+    @Test
+    fun existingCompatAssetBundleOpensExportsAndResavesWithoutLosingAssetOrReference() = withStudioModel(autosave = false) { app, tempDir, bundlesRoot, _, model ->
+        val compatKey = "assets/" + "a".repeat(155) + ".svg"
+        assertEquals(159, compatKey.removePrefix("assets/").length)
+        val svg = svgBytes("compat-159", 12)
+        val svgDataUrl = dataUrl("image/svg+xml", svg)
+        val initialMd = "# Existing Compat Note\n\n![Legacy](<$compatKey>)\n"
+        val smdFile = File(tempDir, "LegacyCompat.smd")
+        val seedMedia = MediaStorage(app)
+        smdFile.outputStream().use { seedMedia.writeFmd(it, initialMd, JSONObject().put(compatKey, svgDataUrl)) }
+
+        // 1. Open existing bundle with 159-char basename.
+        awaitJob(model.open(Uri.fromFile(smdFile)))
+        val noteId = model.state.value.active.id
+        assertEquals(initialMd, model.state.value.active.content)
+        val openedAssets = model.media.portableAssets(model.state.value.active.assetDirectory)
+        assertTrue(openedAssets.has(compatKey))
+        assertArrayEquals(svg, model.media.local(compatKey, model.state.value.active.assetDirectory)!!.readBytes())
+
+        // 2. Export existing bundle to portable .smd and Markdown ZIP without losing its asset or reference.
+        val exportDir = File(tempDir, "exports").apply { mkdirs() }
+        val authority = "dev.supermd.test.portable.compat.${UUID.randomUUID()}"
+        val provider = PortableOpaqueSafProvider(app, exportDir).also { it.attach(app, authority) }
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(authority, provider)
+        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, PortableOpaqueSafProvider.ROOT_ID)
+        app.grantUriPermission(
+            app.packageName,
+            treeUri,
+            android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+        val studioPrefs = app.getSharedPreferences("studio", 0)
+        val previousNoteLocation = studioPrefs.getString("newNoteLocation", null)
+        studioPrefs.edit().putString("newNoteLocation", treeUri.toString()).apply()
+        try {
+            val (exportedSmdUri, _) = awaitSuspend {
+                model.writeAgentExport(initialMd, openedAssets, "smd", "ExportedCompat.smd", "{}")
+            }
+            val reopenedExport = app.contentResolver.openInputStream(exportedSmdUri)!!.use(seedMedia::openFmd)
+            try {
+                assertEquals(initialMd, reopenedExport.markdown)
+                assertArrayEquals(svg, seedMedia.local(compatKey, reopenedExport.directory)!!.readBytes())
+            } finally {
+                File(bundlesRoot, reopenedExport.directory).deleteRecursively()
+            }
+
+            val (exportedZipUri, _) = awaitSuspend {
+                model.writeAgentExport(initialMd, openedAssets, "mdzip", "ExportedCompat.zip", "{}")
+            }
+            val zipEntries = linkedMapOf<String, ByteArray>()
+            java.util.zip.ZipInputStream(app.contentResolver.openInputStream(exportedZipUri)!!).use { zis ->
+                while (true) {
+                    val entry = zis.nextEntry ?: break
+                    zipEntries[entry.name] = zis.readBytes()
+                    zis.closeEntry()
+                }
+            }
+            assertEquals(initialMd, zipEntries["ExportedCompat.md"]!!.toString(Charsets.UTF_8))
+            assertArrayEquals(svg, zipEntries[compatKey])
+        } finally {
+            studioPrefs.edit().apply {
+                if (previousNoteLocation == null) remove("newNoteLocation") else putString("newNoteLocation", previousNoteLocation)
+            }.apply()
+        }
+
+        // 3. Reject attaching a new asset exceeding the 150-char cap (including extensionless stem -> 151 chars), then edit and re-save intact.
+        val tooLongAttach = JSONObject()
+            .put("tabId", noteId)
+            .put("assetAction", "attach")
+            .put("expectedRevision", agentContentRevision(initialMd))
+            .put("assetName", "b".repeat(147))
+            .put("mimeType", "image/svg+xml")
+            .put("body", Base64.encodeToString(svg, Base64.NO_WRAP))
+        assertThrows(IllegalArgumentException::class.java) {
+            awaitSuspend { model.agentAssetAction(tooLongAttach) }
+        }
+
+        val editedMd = "$initialMd\nPreserved after re-save.\n"
+        model.edit(noteId, editedMd)
+        model.saveManual(noteId = noteId)
+        awaitCondition { !model.state.value.active.dirty && !model.state.value.busy }
+        assertNull(model.state.value.error)
+
+        val reopenedResaved = smdFile.inputStream().use(seedMedia::openFmd)
+        try {
+            assertEquals(editedMd, reopenedResaved.markdown)
+            assertTrue(reopenedResaved.markdown.contains(compatKey))
+            assertArrayEquals(svg, seedMedia.local(compatKey, reopenedResaved.directory)!!.readBytes())
+        } finally {
+            File(bundlesRoot, reopenedResaved.directory).deleteRecursively()
+        }
     }
 
     @Test
@@ -662,7 +827,15 @@ class PortableUnchangedAssetSaveTest {
                 model.state.value.folderRelative == "Sem1" &&
                     model.state.value.files.any { it.directory && it.name == "Math" }
             }
+            val sem1DocId = provider.docIdForExistingFile(File(tempDir, "Sem1"))
             val mathUri = Uri.parse(model.state.value.files.single { it.directory && it.name == "Math" }.uri)
+            val renameRotatedLatch = java.util.concurrent.CountDownLatch(1)
+            provider.afterRenameDocument = { renameRotatedLatch.countDown() }
+            provider.afterChildrenQuery = { parentDocId ->
+                if (parentDocId == sem1DocId) {
+                    renameRotatedLatch.await(150, TimeUnit.MILLISECONDS)
+                }
+            }
             model.listFolder(treeUri, "Sem1/Math")
             model.renameFolderEntry(mathUri, "Sem1/Math", isDirectory = true, requested = "PureMath")
             awaitCondition {
@@ -670,6 +843,8 @@ class PortableUnchangedAssetSaveTest {
                     model.state.value.active.relative == "Sem1/PureMath/1.1 Linear Workbook.smd" &&
                     model.state.value.active.uri != renamedFileUri
             }
+            provider.afterChildrenQuery = null
+            provider.afterRenameDocument = null
             val rotatedDirNoteUri = model.state.value.active.uri!!
             assertTrue(
                 "Directory rename must preserve pinned recent entry with rotated child URI",
@@ -726,6 +901,7 @@ class PortableUnchangedAssetSaveTest {
             assertEquals("Sem1/PureMath/Workbook Copy.smd", model.state.value.active.relative)
             assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
 
+            val saveAsCopyAssetDir = model.state.value.active.assetDirectory!!
             val verifyMedia = MediaStorage(app)
             val reopenedCopy = File(tempDir, "Sem1/PureMath/Workbook Copy.smd").inputStream().use(verifyMedia::openFmd)
             try {
@@ -735,11 +911,259 @@ class PortableUnchangedAssetSaveTest {
             } finally {
                 File(bundlesRoot, reopenedCopy.directory).deleteRecursively()
             }
+
+            // 4. Standalone picker grant Save As (non-tree document URI) preserves the exact picker grant,
+            //    derives openRel from the provider when inside the open folder, and clears relative when outside.
+            val pickerInTreeFile = File(tempDir, "Sem1/PureMath/Picker Copy.smd")
+            val pickerInTreeUri = provider.createPickerDocument(pickerInTreeFile)
+            assertTrue(!android.provider.DocumentsContract.isTreeUri(pickerInTreeUri))
+            val pickerInTreeMd = "$saveAsMd\nSaved via standalone picker grant inside open folder.\n"
+            model.edit(noteId, pickerInTreeMd)
+            model.media.resetPortableCounters()
+            model.completePortableSaveAs(pickerInTreeUri, noteId)
+            awaitCondition {
+                model.state.value.active.uri == pickerInTreeUri.toString() &&
+                    !model.state.value.active.dirty &&
+                    !model.state.value.busy
+            }
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(pickerInTreeUri.toString(), model.state.value.active.uri)
+            assertEquals("Picker Copy.smd", model.state.value.active.name)
+            assertEquals("Sem1/PureMath/Picker Copy.smd", model.state.value.active.relative)
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+            val pickerInTreeAssetDir = model.state.value.active.assetDirectory!!
+
+            val pickerFollowupMd = "$pickerInTreeMd\nFollow-up in-place save on standalone grant.\n"
+            model.edit(noteId, pickerFollowupMd)
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy }
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(0, model.media.portableAssetExtractions.get())
+            assertEquals(pickerInTreeUri.toString(), model.state.value.active.uri)
+            assertEquals("Sem1/PureMath/Picker Copy.smd", model.state.value.active.relative)
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+
+            val outsideDir = Files.createTempDirectory("opaque-outside-save-as").toFile()
+            try {
+                val pickerOutsideFile = File(outsideDir, "Outside Copy.smd")
+                val pickerOutsideUri = provider.createPickerDocument(pickerOutsideFile)
+                val pickerOutsideMd = "$pickerFollowupMd\nSaved via standalone picker grant outside open folder.\n"
+                model.edit(noteId, pickerOutsideMd)
+                model.media.resetPortableCounters()
+                model.completePortableSaveAs(pickerOutsideUri, noteId)
+                awaitCondition {
+                    model.state.value.active.uri == pickerOutsideUri.toString() &&
+                        !model.state.value.active.dirty &&
+                        !model.state.value.busy
+                }
+                assertEquals(0, model.media.portableBase64Decodes.get())
+                assertEquals(0, model.media.portableBase64Encodes.get())
+                assertEquals(pickerOutsideUri.toString(), model.state.value.active.uri)
+                assertEquals("Outside Copy.smd", model.state.value.active.name)
+                assertNull("Save As outside open folder must clear stale folder-relative path", model.state.value.active.relative)
+                assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+            } finally {
+                outsideDir.deleteRecursively()
+            }
+
+            File(bundlesRoot, saveAsCopyAssetDir).deleteRecursively()
+            File(bundlesRoot, pickerInTreeAssetDir).deleteRecursively()
             File(bundlesRoot, initialAssetDir).deleteRecursively()
         } finally {
             app.getSharedPreferences("studio", 0).edit().putString("recent", previousRecentJson).apply()
         }
     }
+
+    @Test
+    fun readerReadySaveManualAndSaveAsReuseNativeFastPathAndPreserveMixedAssetsConsentAndStaleChecks() =
+        withStudioModel(autosave = false) { app, tempDir, bundlesRoot, _, model ->
+            val assetBytes = linkedMapOf(
+                "assets/fig-1.png" to ("image/png" to syntheticPngBytes(40_000, 301L)),
+                "assets/fig-2.png" to ("image/png" to syntheticPngBytes(40_000, 302L)),
+                "assets/diagram-1.svg" to ("image/svg+xml" to svgBytes("reader-fast-a", 48)),
+                "assets/diagram-2.svg" to ("image/svg+xml" to svgBytes("reader-fast-b", 48)),
+            )
+            val initialAssets = JSONObject()
+            assetBytes.forEach { (key, spec) -> initialAssets.put(key, dataUrl(spec.first, spec.second)) }
+            val imageLinks = assetBytes.keys.joinToString("\n") { "![Image]($it)" }
+            val initialMd = "# Reader Ready Note\n\n$imageLinks\n"
+
+            val smdFile = File(tempDir, "ReaderReady.smd")
+            MediaStorage(app).let { seed -> smdFile.outputStream().use { seed.writeFmd(it, initialMd, initialAssets) } }
+
+            awaitJob(model.open(Uri.fromFile(smdFile)))
+            val noteId = model.state.value.active.id
+            val initialDir = model.state.value.active.assetDirectory!!
+
+            // Wire a live reader flush + requestPortableWrite hook matching MainActivity when readerReady == true.
+            var pendingReaderDraft: Pair<String, String>? = null
+            val portableRequests = mutableListOf<StudioViewModel.PortableWriteRequest>()
+            var handlePortableRequest: ((StudioViewModel.PortableWriteRequest) -> Unit)? = null
+            model.readerFlushRequester = { flushId ->
+                pendingReaderDraft?.takeIf { it.first == flushId }?.let { (id, draft) ->
+                    pendingReaderDraft = null
+                    model.readerEdit(id, draft, protocolPatch = true)
+                }
+                true
+            }
+            model.requestPortableWrite = { request ->
+                portableRequests += request
+                handlePortableRequest?.invoke(request)
+                true
+            }
+
+            // 1. Reader-ready saveManual flushes live reader edits and writes unchanged local assets natively
+            //    with 0 requestPortableWrite/prepareFmd calls and 0 Base64 decodes/encodes/extractions.
+            val manualFlushedMd = "# Reader Ready Note (manual save)\n\nFlushed from reader.\n\n$imageLinks\n"
+            pendingReaderDraft = noteId to manualFlushedMd
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy && model.state.value.active.saved == manualFlushedMd }
+            assertNull(model.state.value.error)
+            assertEquals("Expected 0 JS portable requests for unchanged local assets", emptyList<StudioViewModel.PortableWriteRequest>(), portableRequests)
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(0, model.media.portableAssetExtractions.get())
+            assertEquals(initialDir, model.state.value.active.assetDirectory)
+
+            // 2. Reader-ready completePortableSaveAs flushes live reader edits and writes unchanged local assets natively
+            //    with 0 requestPortableWrite/prepareFmd calls and 0 Base64 decodes/encodes.
+            val saveAsCopy = File(tempDir, "ReaderReady Copy.smd")
+            val saveAsFlushedMd = "# Reader Ready Note (Save As copy)\n\nFlushed before Save As.\n\n$imageLinks\n"
+            pendingReaderDraft = noteId to saveAsFlushedMd
+            model.media.resetPortableCounters()
+            model.completePortableSaveAs(Uri.fromFile(saveAsCopy), noteId)
+            awaitCondition {
+                model.state.value.active.uri == Uri.fromFile(saveAsCopy).toString() &&
+                    !model.state.value.active.dirty &&
+                    !model.state.value.busy
+            }
+            assertNull(model.state.value.error)
+            assertEquals("Expected 0 JS portable requests on Save As with unchanged local assets", emptyList<StudioViewModel.PortableWriteRequest>(), portableRequests)
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            val saveAsDir = model.state.value.active.assetDirectory!!
+
+            val verifyMedia = MediaStorage(app)
+            val reopenedCopy = saveAsCopy.inputStream().use(verifyMedia::openFmd)
+            try {
+                assertEquals(saveAsFlushedMd, reopenedCopy.markdown)
+                assetBytes.forEach { (key, spec) ->
+                    assertArrayEquals(spec.second, verifyMedia.local(key, reopenedCopy.directory)!!.readBytes())
+                }
+            } finally {
+                File(bundlesRoot, reopenedCopy.directory).deleteRecursively()
+            }
+
+            // 3. Newly imported local attachment (assets/import-*) alongside unchanged bundle assets also stays on native fast path.
+            val importedBytes = syntheticPngBytes(18_000, 777L)
+            val importedMeta = model.media.importJson(
+                org.json.JSONArray().put(JSONObject().put("name", "pasted.png").put("data", dataUrl("image/png", importedBytes))),
+            ).getJSONObject(0)
+            val importedSource = importedMeta.getString("source")
+            model.markAssetsDirty(noteId)
+            val withImportedMd = "$saveAsFlushedMd\n![Pasted](<$importedSource>)\n"
+            pendingReaderDraft = noteId to withImportedMd
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy && model.state.value.active.saved == withImportedMd }
+            assertEquals(emptyList<StudioViewModel.PortableWriteRequest>(), portableRequests)
+            assertEquals("Only the 1 new attachment is encoded once from disk; 0 unchanged bundle assets are re-encoded", 1, model.media.portableBase64Encodes.get())
+            assertEquals("Cache hit from importJson avoids re-decoding even the new attachment", 0, model.media.portableBase64Decodes.get())
+            val importedDir = model.state.value.active.assetDirectory!!
+
+            // 4. Newly referenced external relative image delegates to requestPortableWrite with localAssets,
+            //    surfaces explicit linked-asset consent when ungranted, and merges unchanged local assets without Base64 transfer once resolved.
+            val externalLinkedMd = "$withImportedMd\n![External diagram](diagrams/external.png)\n"
+            pendingReaderDraft = noteId to externalLinkedMd
+            val externalPng = syntheticPngBytes(22_000, 888L)
+
+            // 4a. First attempt: ungranted linked external image reports explicit linked-file consent and cleans pending state.
+            handlePortableRequest = { req ->
+                val err = assertThrows(SecurityException::class.java) {
+                    runCatching { awaitSuspend { model.asset(req.noteId, "diagrams/external.png") } }.getOrThrow()
+                }
+                assertTrue(model.reportLinkedAssetFailure(req.noteId, "diagrams/external.png", err))
+            }
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.busy && model.documentAccessRequests.value != null }
+            assertEquals(1, portableRequests.size)
+            assertTrue(portableRequests.single().localAssets.containsAll(assetBytes.keys + importedSource))
+            assertEquals("diagrams/external.png", model.documentAccessRequests.value?.assetSource)
+            assertEquals(LINKED_ASSET_ACCESS_MESSAGE, model.state.value.message)
+
+            // Dismissing the consent prompt and explicitly tapping Save again re-prompts linked-file consent.
+            model.dismissDocumentAccess()
+            assertNull(model.documentAccessRequests.value)
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.busy && model.documentAccessRequests.value != null }
+            assertEquals("diagrams/external.png", model.documentAccessRequests.value?.assetSource)
+            model.dismissDocumentAccess()
+
+            // 4b. Once resolved in the reader, sending ONLY the 1 new asset with mergeLocalAssets = true preserves all 5 local assets with 0 unchanged decodes/encodes.
+            portableRequests.clear()
+            val rewrittenExternalMd = "$withImportedMd\n![External diagram](<assets/image-external.png>)\n"
+            handlePortableRequest = { req ->
+                CoroutineScope(Dispatchers.Default).async {
+                    model.writePortable(
+                        id = req.noteId,
+                        content = rewrittenExternalMd,
+                        assets = JSONObject().put("assets/image-external.png", String(dataUrl("image/png", externalPng).toCharArray())),
+                        save = req.save,
+                        originalContent = externalLinkedMd,
+                        mergeLocalAssets = true,
+                    )
+                }
+            }
+            model.media.resetPortableCounters()
+            model.saveManual(noteId = noteId)
+            awaitCondition { !model.state.value.active.dirty && !model.state.value.busy && model.state.value.active.content == rewrittenExternalMd }
+            assertEquals(1, portableRequests.size)
+            assertEquals(1, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(1, model.media.portableAssetExtractions.get())
+            val mergedDir = model.state.value.active.assetDirectory!!
+
+            val reopenedMerged = saveAsCopy.inputStream().use(verifyMedia::openFmd)
+            try {
+                assertEquals(rewrittenExternalMd, reopenedMerged.markdown)
+                assetBytes.forEach { (key, spec) ->
+                    assertArrayEquals(spec.second, verifyMedia.local(key, reopenedMerged.directory)!!.readBytes())
+                }
+                assertArrayEquals(importedBytes, verifyMedia.local(importedSource, reopenedMerged.directory)!!.readBytes())
+                assertArrayEquals(externalPng, verifyMedia.local("assets/image-external.png", reopenedMerged.directory)!!.readBytes())
+            } finally {
+                File(bundlesRoot, reopenedMerged.directory).deleteRecursively()
+            }
+
+            // 5. Stale-document check: writePortable rejects outdated originalContent without overwriting the saved file.
+            val beforeStaleBytes = saveAsCopy.readBytes()
+            val newerLiveMd = "$rewrittenExternalMd\nNewer typing after export started.\n"
+            model.edit(noteId, newerLiveMd)
+            assertThrows(IllegalStateException::class.java) {
+                awaitSuspend {
+                    model.writePortable(
+                        id = noteId,
+                        content = rewrittenExternalMd,
+                        assets = JSONObject(),
+                        save = true,
+                        originalContent = rewrittenExternalMd,
+                        mergeLocalAssets = true,
+                    )
+                }
+            }
+            assertArrayEquals("Stale writePortable must leave on-disk bytes untouched", beforeStaleBytes, saveAsCopy.readBytes())
+            assertEquals(newerLiveMd, model.state.value.active.content)
+
+            File(bundlesRoot, initialDir).deleteRecursively()
+            File(bundlesRoot, saveAsDir).deleteRecursively()
+            File(bundlesRoot, importedDir).deleteRecursively()
+            File(bundlesRoot, mergedDir).deleteRecursively()
+            File(app.filesDir, "attachments/${importedSource.substringAfter('/')}").delete()
+        }
 }
 
 private class PortableOpaqueSafProvider(
@@ -750,7 +1174,11 @@ private class PortableOpaqueSafProvider(
     private var nextSeq = 1
     private val idToPath = linkedMapOf<String, String>()
     private val pathToId = linkedMapOf<String, String>()
-    val unknownIdQueries = mutableListOf<String>()
+    val unknownIdQueries: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
+    @Volatile
+    var afterChildrenQuery: ((parentDocId: String) -> Unit)? = null
+    @Volatile
+    var afterRenameDocument: (() -> Unit)? = null
 
     init {
         idToPath[ROOT_ID] = rootDir.canonicalPath
@@ -773,6 +1201,15 @@ private class PortableOpaqueSafProvider(
 
     @Synchronized
     fun docIdForExistingFile(file: File): String = idForFile(file)
+
+    @Synchronized
+    fun createPickerDocument(file: File): Uri {
+        file.parentFile?.mkdirs()
+        check(file.createNewFile())
+        val plainUri = android.provider.DocumentsContract.buildDocumentUri(attachedAuthority, idForFile(file))
+        grantPermissions(plainUri)
+        return plainUri
+    }
 
     @Synchronized
     private fun idForFile(file: File): String {
@@ -866,6 +1303,8 @@ private class PortableOpaqueSafProvider(
             if (!parent.isDirectory) throw java.io.FileNotFoundException(parentDocId)
             return android.database.MatrixCursor(cols).also { cursor ->
                 parent.listFiles()?.forEach { child -> includeFile(cursor, child) }
+            }.also {
+                afterChildrenQuery?.invoke(parentDocId)
             }
         }
         val docId = android.provider.DocumentsContract.getDocumentId(uri)
@@ -921,6 +1360,7 @@ private class PortableOpaqueSafProvider(
                 val outUri = treeUriForDocId(newId)
                 grantPermissions(outUri)
                 out.putParcelable("uri", outUri)
+                afterRenameDocument?.invoke()
             }
         }
         return out

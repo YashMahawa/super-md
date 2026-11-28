@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _headings, diagram_spans, outline_source, resolve_heading, search_source, section_source
+from agent_documents import AgentDocumentError, DocumentStore, RevisionConflict, _headings, diagram_spans, outline_source, resolve_heading, search_source
 from documents import atomic_write, compressed_bundle
 
 
@@ -151,10 +151,6 @@ class AgentDocumentsTest(unittest.TestCase):
         self.assertEqual(combined, source[start:finish])
         self.assertIn("### Nested", combined)
         self.assertNotIn("7.40 Other", combined)
-        selected = section_source(source, "7.4")
-        self.assertEqual(selected["text"], source[start:finish])
-        self.assertEqual((selected["sectionStart"], selected["sectionEnd"], selected["documentLength"]),
-                         (start, finish, len(source)))
         self.assertEqual(self.store.read("numbered-sections.md", heading="7-4-methods")["sectionStart"], start)
         self.assertEqual(self.store.read("numbered-sections.md", heading=2)["sectionStart"],
                          len(source[:source.index("### Nested")]))
@@ -311,12 +307,16 @@ class AgentDocumentsTest(unittest.TestCase):
         asset_file.write_bytes(png)
         unicode_asset = self.root / "图形 with space.svg"
         unicode_asset.write_bytes(b"<svg xmlns='http://www.w3.org/2000/svg'></svg>")
-        portable = self.root / "portable.smd"
         self.store.create("portable.smd", "# Image\n")
         revision = self.store.inspect("portable.smd")["revision"]
         attached = self.store.attach_asset("portable.smd", "图形 with space.svg", expected_revision=revision)
         self.assertRegex(attached["asset"]["name"], r"^assets/[A-Za-z0-9._-]+\.svg$")
         revision = attached["revision"]
+        for bad_name in ("a" * 147 + ".png", "a" * 155 + ".png", "a" * 147, ".", ".."):
+            with self.assertRaisesRegex(AgentDocumentError, "simple filename"):
+                self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name=bad_name)
+        max_attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision, name="a" * 146 + ".png")
+        revision = max_attached["revision"]
         attached = self.store.attach_asset("portable.smd", "source.png", expected_revision=revision)
         output = self.root / "extracted.png"
         extracted = self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
@@ -326,6 +326,66 @@ class AgentDocumentsTest(unittest.TestCase):
         with self.assertRaises(RevisionConflict):
             self.store.extract_asset("portable.smd", attached["asset"]["name"], "extracted.png",
                                      expected_revision=attached["revision"])
+
+    def test_existing_151_to_159_char_bundle_opens_exports_and_resaves_without_losing_asset_or_reference(self):
+        from agent_exports import export_pdf, export_smd, find_engine
+        from markdown_export import write_markdown_export, write_markdown_zip
+        import zipfile
+
+        svg_bytes = b"<svg xmlns='http://www.w3.org/2000/svg' width='32' height='16'><rect width='32' height='16' fill='#386a57'/></svg>"
+        svg_url = "data:image/svg+xml;base64," + base64.b64encode(svg_bytes).decode("ascii")
+        compat_key = "assets/" + ("a" * 155) + ".svg"
+        self.assertEqual(len(compat_key.removeprefix("assets/")), 159)
+        markdown = f"# Legacy Bundle\n\n![Diagram](<{compat_key}>)\n"
+        legacy_path = self.root / "legacy.smd"
+        legacy_path.write_bytes(compressed_bundle(markdown, {compat_key: svg_url}))
+
+        # 1. Open and inspect existing bundle with 159-char basename.
+        info = self.store.inspect("legacy.smd")
+        self.assertEqual(info["asset_count"], 1)
+        read_res = self.store.read("legacy.smd", view="source")
+        self.assertEqual(read_res["text"], markdown)
+        asset_res = self.store.read_asset("legacy.smd", compat_key, expected_revision=info["revision"])
+        self.assertEqual(asset_res["data"], svg_bytes)
+
+        # 2. Export existing bundle to portable .smd, Markdown + companion folder, Markdown ZIP, and PDF.
+        export_smd(self.store, "legacy.smd", "exported-copy.smd")
+        exported_md, exported_assets, exported_portable = self.store._load(self.root / "exported-copy.smd")[:3]
+        self.assertTrue(exported_portable)
+        self.assertEqual(exported_md, markdown)
+        self.assertEqual(exported_assets, {compat_key: svg_url})
+
+        md_dir = self.root / "md-export"
+        md_dir.mkdir()
+        write_markdown_export(md_dir / "legacy.md", markdown, {compat_key: svg_url})
+        self.assertEqual((md_dir / "legacy.md").read_text(encoding="utf-8"), markdown)
+        self.assertEqual((md_dir / compat_key).read_bytes(), svg_bytes)
+
+        zip_path = self.root / "legacy-export.zip"
+        write_markdown_zip(zip_path, markdown, {compat_key: svg_url})
+        with zipfile.ZipFile(zip_path) as archive:
+            self.assertEqual(archive.read("legacy-export.md").decode("utf-8"), markdown)
+            self.assertEqual(archive.read(compat_key), svg_bytes)
+
+        try:
+            engine = find_engine()
+        except AgentDocumentError:
+            engine = None
+        if engine is not None:
+            export_pdf(self.store, "legacy.smd", "legacy.pdf", engine=engine)
+            self.assertTrue((self.root / "legacy.pdf").read_bytes().startswith(b"%PDF-"))
+
+        # 3. Edit and re-save existing bundle without losing its 159-char asset or Markdown reference.
+        patched = self.store.patch(
+            "legacy.smd",
+            expected_revision=info["revision"],
+            operations=[{"type": "replace", "old": "# Legacy Bundle", "new": "# Legacy Bundle\n\nRe-saved note body."}],
+        )
+        reopened_text = self.store.read("legacy.smd", view="source")["text"]
+        self.assertIn(f"![Diagram](<{compat_key}>)", reopened_text)
+        self.assertIn("Re-saved note body.", reopened_text)
+        reopened_asset = self.store.read_asset("legacy.smd", compat_key, expected_revision=patched["revision"])
+        self.assertEqual(reopened_asset["data"], svg_bytes)
 
     def test_explicit_asset_read_returns_exact_bytes_only_for_current_revision(self):
         payload = "<svg xmlns='http://www.w3.org/2000/svg'><text>Σ</text></svg>".encode("utf-8")
@@ -918,6 +978,536 @@ class AgentDocumentsTest(unittest.TestCase):
             diagram_spans(unclosed_braced_py, include_inline_svg=True),
             [{"start": unclosed_braced_py.index("<svg/>"), "end": unclosed_braced_py.index("<svg/>") + len("<svg/>")}],
         )
+
+    def test_stale_writes_leave_original_note_and_cached_revision_intact(self):
+        import documents
+        from unittest.mock import patch
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='4'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><rect width='8' height='8'/></svg>"
+        png_a = b"\x89PNG\r\n\x1a\nfirst-png"
+        png_b = b"\x89PNG\r\n\x1a\nsecond-png"
+        (self.root / "chart.svg").write_bytes(svg_v1)
+        (self.root / "chart_v2.svg").write_bytes(svg_v2)
+        (self.root / "a.png").write_bytes(png_a)
+        (self.root / "b.png").write_bytes(png_b)
+
+        created = self.store.create("stale-check.smd", "# Heading\nBody v0\n")
+        rev_v0 = created["revision"]
+        rev_attach = self.store.attach_asset("stale-check.smd", "chart.svg", expected_revision=rev_v0)["revision"]
+        rev_attach2 = self.store.attach_asset("stale-check.smd", "a.png", expected_revision=rev_attach)["revision"]
+        patched = self.store.patch(
+            "stale-check.smd",
+            expected_revision=rev_attach2,
+            operations=[{"type": "replace", "old": "Body v0", "new": "Body v1"}],
+        )
+        rev_v1 = patched["revision"]
+        note_path = self.store.resolve("stale-check.smd")
+        expected_bytes = note_path.read_bytes()
+
+        # Warm asset metadata and verify the current revision + decoded assets live in cache.
+        info = self.store.inspect("stale-check.smd")
+        chart_id = next(item["id"] for item in info["assets"] if item["name"] == "assets/chart.svg")
+        cached_before = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+        self.assertEqual(cached_before.revision, rev_v1)
+        self.assertEqual(set(cached_before.decoded_assets.keys()), {"assets/chart.svg", "assets/a.png"})
+
+        with (
+            patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+            patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+        ):
+            with self.assertRaisesRegex(
+                RevisionConflict, "Document changed since it was read; inspect it again before editing"
+            ):
+                self.store.patch(
+                    "stale-check.smd",
+                    expected_revision=rev_v0,
+                    operations=[{"type": "replace", "old": "Body v1", "new": "Stale overwrite"}],
+                )
+            with self.assertRaisesRegex(
+                RevisionConflict, "Document changed since it was read; inspect it again before editing"
+            ):
+                self.store.attach_asset("stale-check.smd", "b.png", expected_revision=rev_v0)
+            with self.assertRaisesRegex(
+                RevisionConflict, "Document changed since it was read; inspect again before replacing an asset"
+            ):
+                self.store.replace_asset("stale-check.smd", chart_id, "chart_v2.svg", expected_revision=rev_v0)
+
+            self.assertEqual(note_path.read_bytes(), expected_bytes)
+            cached_after = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+            self.assertIs(cached_after, cached_before)
+            self.assertEqual(cached_after.revision, rev_v1)
+            self.assertEqual(self.store.read("stale-check.smd", view="source")["revision"], rev_v1)
+            self.assertEqual(
+                self.store.read_asset("stale-check.smd", "assets/chart.svg", expected_revision=rev_v1)["data"],
+                svg_v1,
+            )
+            self.assertEqual(gzip_spy.call_count, 0)
+            self.assertEqual(b64_spy.call_count, 0)
+
+        # Also verify stale expected_revision after an external atomic update leaves the new note and its cached revision intact.
+        external_packed = compressed_bundle(
+            "# Heading\nExternal v2\n",
+            {"assets/chart.svg": "data:image/svg+xml;base64," + base64.b64encode(svg_v1).decode("ascii")},
+        )
+        atomic_write(note_path, external_packed)
+        rev_v2 = hashlib.sha256(external_packed).hexdigest()
+        for attempt in (
+            lambda: self.store.patch(
+                "stale-check.smd",
+                expected_revision=rev_v1,
+                operations=[{"type": "replace", "old": "External v2", "new": "Stale"}],
+            ),
+            lambda: self.store.attach_asset("stale-check.smd", "b.png", expected_revision=rev_v1),
+            lambda: self.store.replace_asset("stale-check.smd", chart_id, "chart_v2.svg", expected_revision=rev_v1),
+        ):
+            with self.assertRaises(RevisionConflict):
+                attempt()
+        self.assertEqual(note_path.read_bytes(), external_packed)
+        cached_v2 = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+        self.assertEqual(cached_v2.revision, rev_v2)
+        self.assertEqual(self.store.inspect("stale-check.smd")["revision"], rev_v2)
+
+    def test_failed_writes_leave_original_note_and_cached_revision_intact(self):
+        import agent_documents
+        import documents
+        from unittest.mock import patch
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M0 0L4 4'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><path d='M1 1L9 9'/></svg>"
+        png_a = b"\x89PNG\r\n\x1a\nkept-png"
+        png_new = b"\x89PNG\r\n\x1a\ncandidate-png"
+        (self.root / "chart.svg").write_bytes(svg_v1)
+        (self.root / "chart_v2.svg").write_bytes(svg_v2)
+        (self.root / "a.png").write_bytes(png_a)
+        (self.root / "new.png").write_bytes(png_new)
+        (self.root / "plain.md").write_text("# Plain\nNo portable envelope\n", encoding="utf-8")
+        plain_rev = self.store.inspect("plain.md")["revision"]
+
+        rev0 = self.store.create("atomic-safe.smd", "# Safe\nOriginal text\n")["revision"]
+        rev1 = self.store.attach_asset("atomic-safe.smd", "chart.svg", expected_revision=rev0)["revision"]
+        rev = self.store.attach_asset("atomic-safe.smd", "a.png", expected_revision=rev1)["revision"]
+        note_path = self.store.resolve("atomic-safe.smd")
+        original_bytes = note_path.read_bytes()
+        info = self.store.inspect("atomic-safe.smd")
+        chart_id = next(item["id"] for item in info["assets"] if item["name"] == "assets/chart.svg")
+        cached_entry = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+
+        outside = self.root.parent / (self.root.name + "-outside-asset.png")
+        outside.write_bytes(png_new)
+        try:
+            # Validation, access-control, and domain-rule failures across patch, attach_asset, and replace_asset.
+            failing_calls = [
+                lambda: self.store.patch("atomic-safe.smd", expected_revision="bad-rev", operations=[{"type": "insert", "line": 1, "text": "x\n"}]),
+                lambda: self.store.patch("atomic-safe.smd", expected_revision=rev, operations=[{"type": "replace", "old": "missing-token", "new": "x"}]),
+                lambda: self.store.attach_asset("atomic-safe.smd", str(outside), expected_revision=rev),
+                lambda: self.store.attach_asset("atomic-safe.smd", "chart.svg", expected_revision=rev),
+                lambda: self.store.attach_asset("atomic-safe.smd", "new.png", expected_revision=rev, name="../escape.png"),
+                lambda: self.store.attach_asset("plain.md", "new.png", expected_revision=plain_rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", chart_id, str(outside), expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", "", "chart_v2.svg", expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", "assets/missing.svg", "chart_v2.svg", expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", chart_id, "new.png", expected_revision=rev),
+                lambda: self.store.replace_asset("plain.md", "assets/chart.svg", "chart_v2.svg", expected_revision=plain_rev),
+            ]
+            for call in failing_calls:
+                with self.assertRaises(AgentDocumentError):
+                    call()
+
+            # Simulated serialization failure and mid-commit os.replace / symlink-guard failure across all three writes.
+            write_attempts = [
+                lambda: self.store.patch(
+                    "atomic-safe.smd",
+                    expected_revision=rev,
+                    operations=[{"type": "replace", "old": "Original text", "new": "Uncommitted patch"}],
+                ),
+                lambda: self.store.attach_asset("atomic-safe.smd", "new.png", expected_revision=rev),
+                lambda: self.store.replace_asset("atomic-safe.smd", chart_id, "chart_v2.svg", expected_revision=rev),
+            ]
+            with patch("agent_documents._serialize", side_effect=AgentDocumentError("Bundle exceeds 75 MB")):
+                for attempt in write_attempts:
+                    with self.assertRaisesRegex(AgentDocumentError, "Bundle exceeds 75 MB"):
+                        attempt()
+
+            with patch("agent_documents.os.replace", side_effect=OSError("simulated I/O failure")):
+                for attempt in write_attempts:
+                    with self.assertRaisesRegex(OSError, "simulated I/O failure"):
+                        attempt()
+                    self.assertEqual(list(note_path.parent.glob(".*agent-tmp")), [])
+
+            for attempt in write_attempts:
+                checks = 0
+
+                def symlink_after_resolve(candidate):
+                    nonlocal checks
+                    if candidate == note_path:
+                        checks += 1
+                        return note_path if checks >= 2 else None
+                    return None
+
+                with patch("agent_documents._symlink_component", side_effect=symlink_after_resolve):
+                    with self.assertRaisesRegex(AgentDocumentError, "Refusing to replace a symlink path"):
+                        attempt()
+                self.assertEqual(list(note_path.parent.glob(".*agent-tmp")), [])
+
+            # Original note on disk, cached revision, and memoized decoded_assets remain completely untouched.
+            self.assertEqual(note_path.read_bytes(), original_bytes)
+            current_cached = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+            self.assertIs(current_cached, cached_entry)
+            self.assertEqual(current_cached.revision, rev)
+            self.assertEqual(set(current_cached.decoded_assets.keys()), {"assets/chart.svg", "assets/a.png"})
+            self.assertEqual(current_cached.decoded_assets["assets/chart.svg"][1], svg_v1)
+
+            with (
+                patch("documents._gzip_json_input", wraps=documents._gzip_json_input) as gzip_spy,
+                patch("documents.base64.b64decode", wraps=base64.b64decode) as b64_spy,
+            ):
+                self.assertEqual(self.store.read("atomic-safe.smd", view="source")["text"], "# Safe\nOriginal text\n")
+                self.assertEqual(
+                    self.store.read_asset("atomic-safe.smd", "assets/chart.svg", expected_revision=rev)["data"],
+                    svg_v1,
+                )
+                self.assertEqual(gzip_spy.call_count, 0)
+                self.assertEqual(b64_spy.call_count, 0)
+        finally:
+            outside.unlink(missing_ok=True)
+
+    def test_mid_write_recheck_conflicts_and_replace_noop_keep_method_contracts(self):
+        import agent_documents
+        from unittest.mock import patch
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='2'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='9'/></svg>"
+        png_extra = b"\x89PNG\r\n\x1a\nextra-png"
+        (self.root / "same.svg").write_bytes(svg_v1)
+        (self.root / "next.svg").write_bytes(svg_v2)
+        (self.root / "extra.png").write_bytes(png_extra)
+
+        rev0 = self.store.create("race.smd", "# Race\nInitial line\n")["revision"]
+        rev = self.store.attach_asset("race.smd", "same.svg", expected_revision=rev0)["revision"]
+        note_path = self.store.resolve("race.smd")
+        before_bytes = note_path.read_bytes()
+        info = self.store.inspect("race.smd")
+        asset_id = info["assets"][0]["id"]
+        cached_entry = next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path))
+
+        # Identical replacement bytes remain a clean no-op without touching disk or replacing the cached entry.
+        with patch("agent_documents._atomic_replace", wraps=agent_documents._atomic_replace) as replace_spy:
+            noop = self.store.replace_asset("race.smd", asset_id, "same.svg", expected_revision=rev)
+            self.assertEqual(replace_spy.call_count, 0)
+        self.assertFalse(noop["saved"])
+        self.assertFalse(noop["changed"])
+        self.assertEqual(noop["revision"], rev)
+        self.assertEqual(noop["previous_revision"], rev)
+        self.assertEqual(note_path.read_bytes(), before_bytes)
+        self.assertIs(
+            next(entry for entry in self.store._cache.values() if entry.path_str == str(note_path)),
+            cached_entry,
+        )
+
+        # Mid-write external modifications caught by the pre-replace recheck preserve each method's error message
+        # and leave the external writer's note intact while refreshing the cache on subsequent reads.
+        real_serialize = agent_documents._serialize
+        cases = [
+            (
+                "patch",
+                "Document changed during the edit; no changes were saved",
+                lambda r: self.store.patch(
+                    "race.smd",
+                    expected_revision=r,
+                    operations=[{"type": "replace", "old": "Initial line", "new": "Agent edit"}],
+                ),
+            ),
+            (
+                "attach",
+                "Document changed during the edit; no changes were saved",
+                lambda r: self.store.attach_asset("race.smd", "extra.png", expected_revision=r),
+            ),
+            (
+                "replace",
+                "Document changed during replacement; no changes were saved",
+                lambda r: self.store.replace_asset("race.smd", asset_id, "next.svg", expected_revision=r),
+            ),
+        ]
+        for label, expected_msg, invoke in cases:
+            # Reset note to known state with asset_id intact.
+            base_bytes = compressed_bundle(
+                "# Race\nInitial line\n",
+                {"assets/same.svg": "data:image/svg+xml;base64," + base64.b64encode(svg_v1).decode("ascii")},
+            )
+            atomic_write(note_path, base_bytes)
+            current_rev = self.store.inspect("race.smd")["revision"]
+            external_bytes = compressed_bundle(
+                f"# Race\nExternal concurrent edit ({label})\n",
+                {"assets/same.svg": "data:image/svg+xml;base64," + base64.b64encode(svg_v1).decode("ascii")},
+            )
+            external_rev = hashlib.sha256(external_bytes).hexdigest()
+
+            def concurrent_external_write(target_path, text, assets, *, portable=None, _ext=external_bytes):
+                packed = real_serialize(target_path, text, assets, portable=portable)
+                atomic_write(note_path, _ext)
+                return packed
+
+            with (
+                patch("agent_documents._serialize", side_effect=concurrent_external_write),
+                patch("agent_documents._atomic_replace", wraps=agent_documents._atomic_replace) as replace_spy,
+            ):
+                with self.assertRaisesRegex(RevisionConflict, expected_msg):
+                    invoke(current_rev)
+                self.assertEqual(replace_spy.call_count, 0)
+
+            self.assertEqual(note_path.read_bytes(), external_bytes)
+            self.assertEqual(self.store.inspect("race.smd")["revision"], external_rev)
+            self.assertIn(f"External concurrent edit ({label})", self.store.read("race.smd", view="source")["text"])
+
+    @unittest.skipUnless(os.name == "posix", "directory symlink root aliases require POSIX")
+    def test_writes_through_aliased_root_preserve_canonical_cache_and_revisions(self):
+        real = self.root / "canonical"
+        workspace = real / "workspace"
+        workspace.mkdir(parents=True)
+        alias = self.root / "alias"
+        alias.symlink_to(real, target_is_directory=True)
+        aliased_workspace = alias / "workspace"
+        store = DocumentStore([aliased_workspace])
+
+        svg_v1 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='3'/></svg>"
+        svg_v2 = b"<svg xmlns='http://www.w3.org/2000/svg'><circle r='7'/></svg>"
+        (aliased_workspace / "icon.svg").write_bytes(svg_v1)
+        (aliased_workspace / "icon_v2.svg").write_bytes(svg_v2)
+
+        rev0 = store.create(str(aliased_workspace / "aliased.smd"), "# Aliased\nBefore\n")["revision"]
+        rev1 = store.attach_asset(
+            str(aliased_workspace / "aliased.smd"),
+            str(aliased_workspace / "icon.svg"),
+            expected_revision=rev0,
+        )["revision"]
+        rev2 = store.patch(
+            str(aliased_workspace / "aliased.smd"),
+            expected_revision=rev1,
+            operations=[{"type": "replace", "old": "Before", "new": "After"}],
+        )["revision"]
+        info = store.inspect("aliased.smd")
+        asset_id = info["assets"][0]["id"]
+        rev3 = store.replace_asset(
+            str(aliased_workspace / "aliased.smd"),
+            asset_id,
+            str(aliased_workspace / "icon_v2.svg"),
+            expected_revision=rev2,
+        )["revision"]
+
+        canonical_note = store.resolve("aliased.smd")
+        self.assertNotEqual(str(aliased_workspace / "aliased.smd"), str(canonical_note))
+        cached = next(entry for entry in store._cache.values() if entry.path_str == str(canonical_note))
+        self.assertEqual(cached.revision, rev3)
+        self.assertEqual(store.read("aliased.smd", view="source")["text"], "# Aliased\nAfter\n")
+        self.assertEqual(
+            store.read_asset("aliased.smd", "assets/icon.svg", expected_revision=rev3)["data"],
+            svg_v2,
+        )
+
+    def test_frontmatter_single_parse_visible_metadata_canonical_offsets_and_fence_scan_integration(self):
+        import agent_documents
+        import frontmatter
+        from unittest.mock import patch
+
+        source = (
+            "\ufeff---\n"
+            'title: "Path Integrals & Symmetries"\n'
+            "subtitle: Graduate Notes\n"
+            "# Not a Markdown heading inside YAML\n"
+            "description: |\n"
+            "  ```mermaid\n"
+            "  graph TD; Hidden --> Diagram\n"
+            "  ```\n"
+            "author:\n"
+            "  - name: Richard Feynman\n"
+            "  - given: Emmy\n"
+            "    family: Noether\n"
+            "date: 2026-03-15\n"
+            "tags: [quantum, physics]\n"
+            "keywords: physics, qft\n"
+            "aliases: [QFT I]\n"
+            "custom_secret: top-secret\n"
+            "---\n"
+            "\n"
+            "# Introduction\n"
+            "Body paragraph with 🧭 canonical offset.\n"
+            "```mermaid\n"
+            "graph LR; Real --> Body\n"
+            "```\n"
+        )
+        note = self.root / "frontmatter-note.md"
+        note.write_bytes(source.encode("utf-8"))
+        canonical = source.removeprefix("\ufeff")
+
+        with (
+            patch("frontmatter._parse_yaml_mapping", wraps=frontmatter._parse_yaml_mapping) as yaml_spy,
+            patch("agent_documents._step_fence_boundary", wraps=agent_documents._step_fence_boundary) as step_spy,
+        ):
+            info = self.store.inspect("frontmatter-note.md")
+            self.assertEqual(yaml_spy.call_count, 1, "DocumentStore.inspect must validate and extract YAML frontmatter in one single parse")
+            body_line_count = len(canonical[frontmatter.frontmatter_end(canonical):].splitlines(keepends=True))
+            self.assertEqual(step_spy.call_count, body_line_count, "_scan_read_only must skip frontmatter lines and scan body fences once")
+
+        self.assertEqual(info["properties"], {
+            "title": "Path Integrals & Symmetries",
+            "author": "Richard Feynman, Emmy Noether",
+            "authors": ["Richard Feynman", "Emmy Noether"],
+            "tags": ["quantum", "physics", "qft"],
+        })
+        for redacted_key in ("subtitle", "date", "description", "aliases", "custom_secret"):
+            self.assertNotIn(redacted_key, info["properties"])
+
+        # Fenced diagram inside YAML description is skipped, while real body diagram is preserved.
+        diags = diagram_spans(canonical)
+        self.assertEqual(len(diags), 1)
+        self.assertEqual(canonical[diags[0]["start"]:diags[0]["end"]], "graph LR; Real --> Body\n")
+
+        self.assertEqual([h["title"] for h in info["headings"]], ["Introduction"])
+        intro_offset = canonical.index("# Introduction")
+        intro_line = canonical[:intro_offset].count("\n") + 1
+        self.assertEqual(info["headings"][0]["start"], intro_offset)
+        self.assertEqual(info["headings"][0]["line"], intro_line)
+
+        section = self.store.read("frontmatter-note.md", heading="Introduction", view="source")
+        self.assertEqual(section["start"], intro_offset)
+        self.assertEqual(section["text"], canonical[intro_offset:])
+
+        matches = self.store.search("frontmatter-note.md", "Noether", context=0)
+        self.assertEqual(matches["totalMatches"], 1)
+        self.assertEqual(matches["matches"][0]["matchOffset"], canonical.index("Noether"))
+
+        self.store.patch(
+            "frontmatter-note.md",
+            expected_revision=info["revision"],
+            operations=[{"type": "lines", "start_line": intro_line + 1, "end_line": intro_line + 1,
+                         "text": "Updated body paragraph.\n"}],
+        )
+        self.assertEqual(
+            self.store.read("frontmatter-note.md", view="source")["text"],
+            canonical.replace("Body paragraph with 🧭 canonical offset.", "Updated body paragraph."),
+        )
+        self.assertEqual(self.store.inspect("frontmatter-note.md")["properties"], info["properties"])
+
+        # Portable .smd envelopes preserve leading \ufeff verbatim in markdown.
+        smd_note = self.root / "frontmatter-bom.smd"
+        smd_note.write_bytes(compressed_bundle(source, {}))
+        smd_info = self.store.inspect("frontmatter-bom.smd")
+        self.assertEqual(smd_info["properties"], info["properties"])
+        self.assertEqual(smd_info["headings"][0]["start"], source.index("# Introduction"))
+
+    def test_frontmatter_quoted_folded_flow_duplicate_redaction_and_malformed_fallback(self):
+        import frontmatter
+
+        complex_note = (
+            "---\n"
+            "title: Overwritten Initial\n"
+            "title: >-\n"
+            "  Folded Alpha\n"
+            "  Study\n"
+            "subtitle: Hidden Subtitle\n"
+            "description: |\n"
+            "  Hidden literal description\n"
+            "date: '2026-04-01'\n"
+            "aliases: [HiddenAlias, 'Second Alias']\n"
+            "secret_token: should-not-leak\n"
+            "author: 'Ada ''Alpha'' Lovelace'\n"
+            "authors:\n"
+            "  - \"Ada 'Alpha' Lovelace\"\n"
+            "  - { given: \"Grace\", family: 'Hopper', role: 'Rear Admiral' }\n"
+            "tags: [\n"
+            "  'flow-one',\n"
+            "  \"flow-two\",\n"
+            "  flow-one\n"
+            "]\n"
+            "keywords: >-\n"
+            "  flow-two, folded-three,\n"
+            "  folded-four\n"
+            "...\n"
+            "# Heading After Dots\n"
+        )
+        (self.root / "complex-fm.md").write_text(complex_note, encoding="utf-8")
+        info = self.store.inspect("complex-fm.md")
+        self.assertEqual(info["properties"], {
+            "title": "Folded Alpha Study",
+            "author": "Ada 'Alpha' Lovelace, Grace Hopper",
+            "authors": ["Ada 'Alpha' Lovelace", "Grace Hopper"],
+            "tags": ["flow-one", "flow-two", "folded-three", "folded-four"],
+        })
+        self.assertEqual([h["title"] for h in info["headings"]], ["Heading After Dots"])
+
+        # Hidden-only recognized or custom keys produce no properties entry.
+        hidden_only = "---\nsubtitle: Only Subtitle\ndate: 2026-04-01\ndescription: Hidden\naliases: [a]\ncssclasses: [wide]\n---\n# Plain\n"
+        (self.root / "hidden-only.md").write_text(hidden_only, encoding="utf-8")
+        self.assertNotIn("properties", self.store.inspect("hidden-only.md"))
+
+        # Malformed or unclosed YAML headers fall back cleanly (fm_end == 0, properties is None, body headings preserved).
+        malformed_samples = [
+            "---\ntitle: \"Unclosed quote\n# Preserved Heading\n---\n",
+            "---\ntags: [unclosed, flow\n# Preserved Heading\n---\n",
+            "---\n\ttitle: Leading Tab\n# Preserved Heading\n---\n",
+            "---\n- root_list_not_mapping\n# Preserved Heading\n---\n",
+            "---\ntitle: Unclosed Frontmatter\n# Preserved Heading\n",
+        ]
+        for idx, sample in enumerate(malformed_samples):
+            self.assertEqual(frontmatter.parse_frontmatter(sample), (0, None), sample)
+            name = f"malformed-{idx}.md"
+            (self.root / name).write_text(sample, encoding="utf-8")
+            inspected = self.store.inspect(name)
+            self.assertNotIn("properties", inspected)
+            self.assertEqual([h["title"] for h in inspected["headings"]], ["Preserved Heading"])
+
+    def test_read_source_contract_and_agent_package_facade_identity(self):
+        import importlib
+        import agent_documents
+        from agent import source_ops
+
+        repo_root = str(Path(__file__).resolve().parent.parent)
+        added_root = repo_root not in sys.path
+        if added_root:
+            sys.path.insert(0, repo_root)
+        try:
+            pkg_agent_documents = importlib.import_module("desktop.agent_documents")
+            pkg_source_ops = importlib.import_module("desktop.agent.source_ops")
+        finally:
+            if added_root and repo_root in sys.path:
+                sys.path.remove(repo_root)
+
+        self.assertIs(pkg_agent_documents, agent_documents)
+        self.assertIs(pkg_source_ops, source_ops)
+        self.assertIs(source_ops.AgentDocumentError, AgentDocumentError)
+        self.assertIs(source_ops.RevisionConflict, RevisionConflict)
+        self.assertIs(source_ops.read_source, agent_documents.read_source)
+        self.assertIs(pkg_agent_documents.DocumentStore, DocumentStore)
+
+        source = "# Intro\nLead.\n## 1.2 Charts\n```svg\n<svg><circle/></svg>\n```\nBody.\n## 2. End\nTail.\n"
+        prose = source_ops.read_source(source, heading="1.2", view="prose")
+        self.assertEqual(prose["heading"], {"index": 1, "level": 2, "title": "1.2 Charts", "line": 3})
+        self.assertIn("[SVG omitted:", prose["text"])
+        self.assertNotIn("Tail.", prose["text"])
+        self.assertEqual(len(prose["svg_omissions"]), 1)
+        plain = source_ops.read_source(source, view="source", limit=12)
+        self.assertNotIn("heading", plain)
+        self.assertEqual(plain["text"], source[:12])
+        for kwargs in (
+            {"source": None},
+            {"source": source, "offset": True},
+            {"source": source, "offset": -1},
+            {"source": source, "offset": len(source) + 1},
+            {"source": source, "limit": False},
+            {"source": source, "limit": 0},
+            {"source": source, "view": "html"},
+        ):
+            with self.assertRaises(AgentDocumentError):
+                source_ops.read_source(**kwargs)
+
+        # Pre-lock patch write validation stays untouched and rejects invalid operations before revision checks.
+        created = self.store.create("validation-order.md", "# Title\nBody.\n")
+        stale_revision = "0" * 64
+        self.assertNotEqual(created["revision"], stale_revision)
+        with self.assertRaises(AgentDocumentError) as ctx:
+            self.store.patch("validation-order.md", expected_revision=stale_revision, operations=[])
+        self.assertNotIsInstance(ctx.exception, RevisionConflict)
 
 
 if __name__ == "__main__":

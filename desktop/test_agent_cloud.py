@@ -1,10 +1,8 @@
 from __future__ import annotations
 import hashlib, json, os, tempfile, threading, time, unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 import agent_cloud
-import network_tls
 from unittest.mock import patch
 
 class FakeSocket:

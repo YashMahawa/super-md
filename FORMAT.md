@@ -192,9 +192,13 @@ The file is a UTF-8 JSON envelope, not a renamed Markdown file:
 }
 ```
 
-Asset names must be a single safe filename under `assets/`. Supported image
-types are PNG, JPEG, SVG, GIF, WebP and AVIF. Limits: 20 MB of Markdown, 25 MB
-per image, 75 MB total decoded assets, 512 images, and 120 MB total file size.
+New asset names must match `assets/[A-Za-z0-9._-]{1,150}`, where the filename
+segment after `assets/` is 1 to 150 ASCII characters (`A-Z`, `a-z`, `0-9`,
+`.`, `_`, `-`) and is neither `.` nor `..`; existing safe
+`assets/[A-Za-z0-9._-]{1,159}` entries remain valid on read, export, and
+re-save for compatibility. Supported image types are PNG,
+JPEG, SVG, GIF, WebP and AVIF. Limits: 20 MB of Markdown, 25 MB per image,
+75 MB total decoded assets, 512 images, and 120 MB total file size.
 Remote images are fetched only during an explicit insertion or export; link
 previews do not run when opening someone else's document. Export needs network
 access only for images which have not already been downloaded or embedded.
@@ -211,7 +215,7 @@ A step may include a `markdown` string (up to 12,000 characters within the deck 
 
 Wide cards place rich explanations to the right; narrow portrait layouts stack them below. Image-only cards use a compact control strip, without repeated title banners or visible “Choose step” text. Left/Right arrows navigate while hovering or focusing the card, without intercepting text-editor cursor keys.
 
-PDF exports retain Markdown/LaTeX and use full-width visual/text pairs for rich steps. Longer image sequences use two columns for readable diagrams, while short sequences can use up to three. Export defaults use 14 mm margins, 1.4 line height and 0.65 em paragraph spacing; saved user settings are preserved.
+PDF exports retain Markdown/LaTeX and use full-width visual/text pairs for rich steps. Longer image sequences use two columns for readable diagrams, while short sequences can use up to three. Export defaults use 14 mm margins, 1.5 line height and 0.65 em paragraph spacing; saved user settings are preserved.
 
 ### Markdown ZIP compatibility
 

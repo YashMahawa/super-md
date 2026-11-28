@@ -24,8 +24,8 @@ Button {
     topPadding: compact ? 6 : 10
     bottomPadding: compact ? 6 : 10
     icon.source: glyph ? "../icons/" + glyph + ".svg" : ""
-    icon.width: 24
-    icon.height: 24
+    icon.width: 22
+    icon.height: 22
     icon.color: Material.foreground
     Accessible.name: ToolTip.text || text
     Material.roundedScale: Material.FullScale
