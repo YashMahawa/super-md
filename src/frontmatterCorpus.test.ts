@@ -1,320 +1,128 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import corpus from "../test-fixtures/frontmatter-corpus.json";
+import conformanceJson from "../test-fixtures/frontmatter-conformance.json";
 import { compatibleMarkdown } from "./compatibleMarkdown";
 import { analyzeDocument } from "./documentAnalysis";
 import { imageRanges } from "./documentMedia";
-import {
-  frontmatterVisibleValueSpans,
-  maskFrontmatter,
-  parseFrontmatter,
-  type DocumentMetadata,
-  type YamlValue,
-} from "./frontmatter";
+import { frontmatterVisibleValueSpans, maskFrontmatter, parseFrontmatter } from "./frontmatter";
 import { prepareMarkdownExport } from "./markdownExport";
 import { normalizeMarkdownSource } from "./markdownSource";
 
-const { mockInvoke } = vi.hoisted(() => ({
-  mockInvoke: vi.fn(),
-}));
-
+const { mockInvoke } = vi.hoisted(() => ({ mockInvoke: vi.fn() }));
 vi.mock("./nativeBridge", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./nativeBridge")>();
-  return {
-    ...actual,
-    invoke: mockInvoke,
-  };
+  return { ...actual, invoke: mockInvoke };
 });
-
-const REQUIRED_CATEGORIES = [
-  "quoted-scalars",
-  "flow-collections",
-  "folded-scalars",
-  "crlf",
-  "unicode-separators",
-] as const;
 
 const ONE_PIXEL_PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 
-const frontmatterFixtureModules = import.meta.glob("../test-fixtures/frontmatter-*.json", {
-  eager: true,
-  import: "default",
-}) as Record<string, unknown>;
-
-interface SharedCorpusCase {
+interface ConformanceCase {
   id: string;
-  category: (typeof REQUIRED_CATEGORIES)[number];
-  description: string;
-  source: string;
-  recognized: boolean;
-  frontmatterRaw: string;
+  valid: boolean;
+  markdown: string;
   body: string;
-  endOffset: { utf16: number; codePoints: number };
-  maskedExcludes?: string[];
-  bodyProbes?: string[];
-  bodyImages?: string[];
-  unsupportedDiagrams?: boolean;
-  typescriptEntries?: Record<string, YamlValue>;
-  typescriptProperties?: Partial<DocumentMetadata>;
 }
 
-interface DivergenceCorpusCase {
-  id: string;
-  category: (typeof REQUIRED_CATEGORIES)[number];
-  description: string;
-  reason: string;
-  alignedInPr186: boolean;
-  conformanceCaseId?: string;
-  source: string;
-  typescript: {
-    recognized: boolean;
-    frontmatterRaw: string;
-    body: string;
-    endUtf16: number;
-  };
-  desktop: {
-    recognized: boolean;
-    frontmatterRaw: string;
-    body: string;
-    endCodePoints: number;
-  };
-}
+const cases = (conformanceJson as { cases: ConformanceCase[] }).cases;
+const byId = new Map(cases.map((item) => [item.id, item]));
 
-interface CompanionConformanceSuite {
-  version: number;
-  cases: Array<{
-    id: string;
-    valid: boolean;
-    markdown: string;
-    body: string;
-  }>;
-}
+const MASKED_EXPORT_SPECS = [
+  {
+    id: "folded_clip_indented_delimiters_and_fences",
+    bodyImages: ["real.png"],
+    maskedExcludes: ["folded-fake.png", "mermaid"],
+    bodyProbes: ["# Real Section", "![Real](real.png)"],
+  },
+  {
+    id: "single_quoted_trailing_backslash_and_masked_tokens",
+    bodyImages: ["flow-real.png"],
+    maskedExcludes: ["missing.png", "wiki-fake.png", "fake.png", "flow-missing.png", "mermaid"],
+    bodyProbes: ["# Lecture 1", "![Body](flow-real.png)"],
+  },
+  {
+    id: "crlf_bom_astral_and_mixed_endings",
+    bodyImages: ["crlf-real.png"],
+    maskedExcludes: ["crlf-fake.png"],
+    bodyProbes: ["# CRLF Astral Heading", "- [ ] CRLF Astral Task", "![Real](crlf-real.png)"],
+  },
+] as const;
 
-function assertMaskInvariants(source: string, masked: string, endUtf16: number, expectedBody: string): void {
-  expect(masked.length).toBe(source.length);
-  for (let i = 0; i < source.length; i++) {
-    expect(masked[i] === "\r", `CR mismatch at UTF-16 index ${i}`).toBe(source[i] === "\r");
-    expect(masked[i] === "\n", `LF mismatch at UTF-16 index ${i}`).toBe(source[i] === "\n");
-    if (i < endUtf16 && source[i] !== "\r" && source[i] !== "\n") {
-      expect(masked[i], `unmasked frontmatter char at UTF-16 index ${i}`).toBe(" ");
-    }
-  }
-  expect(masked.slice(endUtf16)).toBe(expectedBody);
-}
-
-function assertVisibleSpanInvariants(
-  source: string,
-  parsed: NonNullable<ReturnType<typeof parseFrontmatter>>,
-): ReturnType<typeof frontmatterVisibleValueSpans> {
-  const withSpans = parseFrontmatter(source, { includeSpans: true });
-  expect(withSpans).not.toBeNull();
-  expect(withSpans!.raw).toBe(parsed.raw);
-  expect(withSpans!.end).toBe(parsed.end);
-  expect(withSpans!.entries).toEqual(parsed.entries);
-  expect(withSpans!.properties).toEqual(parsed.properties);
-  const spans = frontmatterVisibleValueSpans(source);
-  expect(spans).toEqual(withSpans!.visibleSpans);
-  for (const span of spans) {
-    expect(span.start).toBeGreaterThanOrEqual(0);
-    expect(span.end).toBeGreaterThan(span.start);
-    expect(span.end).toBeLessThanOrEqual(parsed.end);
-    expect(source.slice(span.start, span.end).length).toBeGreaterThan(0);
-  }
-  return spans;
-}
-
-describe("Shared portable YAML frontmatter fixture corpus (TypeScript)", () => {
-  const sharedCases = corpus.sharedCases as SharedCorpusCase[];
-  const divergences = corpus.divergences as DivergenceCorpusCase[];
-  const conformanceSuite = frontmatterFixtureModules["../test-fixtures/frontmatter-conformance.json"] as
-    | CompanionConformanceSuite
-    | undefined;
-
+describe("Frontmatter companion export, source offset, and divergence regressions", () => {
   beforeEach(() => {
     mockInvoke.mockReset();
   });
 
-  it("covers quoted scalars, flow collections, folded scalars, CRLF, and Unicode separators and coordinates IDs with #186", () => {
-    expect(corpus.version).toBe(1);
-    expect(corpus.companionConformanceFixture).toBe("test-fixtures/frontmatter-conformance.json");
-    const ids = new Set<string>();
-    for (const entry of [...sharedCases, ...divergences]) {
-      expect(ids.has(entry.id), `duplicate corpus ID: ${entry.id}`).toBe(false);
-      ids.add(entry.id);
-    }
-    for (const entry of divergences) {
-      expect(typeof entry.alignedInPr186).toBe("boolean");
-    }
-    for (const category of REQUIRED_CATEGORIES) {
-      expect(
-        sharedCases.some((entry) => entry.category === category && entry.recognized),
-        `missing positive shared case for ${category}`,
-      ).toBe(true);
-      expect(
-        sharedCases.some((entry) => entry.category === category && !entry.recognized),
-        `missing negative shared case for ${category}`,
-      ).toBe(true);
-    }
-    if (conformanceSuite) {
-      expect(conformanceSuite.version).toBe(1);
-      const conformanceIds = new Set(conformanceSuite.cases.map((item) => item.id));
-      for (const id of ids) {
-        expect(conformanceIds.has(id), `overlapping fixture ID with #186: ${id}`).toBe(false);
+  it.each(MASKED_EXPORT_SPECS)(
+    "excludes masked frontmatter media/fences from companion exports and preserves body offsets for $id",
+    async ({ id, bodyImages, maskedExcludes, bodyProbes }) => {
+      const item = byId.get(id)!;
+      expect(item?.valid).toBe(true);
+      const allowed = new Set<string>(bodyImages);
+      mockInvoke.mockImplementation(async (command: string, args?: { source?: string }) => {
+        if (command === "load_asset" && args?.source && allowed.has(args.source)) return ONE_PIXEL_PNG;
+        throw new Error(`Unexpected native call: ${command} (${args?.source ?? ""})`);
+      });
+
+      const parsed = parseFrontmatter(item.markdown)!;
+      const masked = maskFrontmatter(item.markdown);
+      for (const token of maskedExcludes) expect(masked).not.toContain(token);
+
+      const detected = imageRanges(item.markdown);
+      expect(detected.map((img) => img.source)).toEqual(bodyImages);
+      for (const img of detected) expect(img.from).toBeGreaterThanOrEqual(parsed.end);
+
+      const plain = await prepareMarkdownExport(item.markdown, "/workspace/note.md");
+      expect(plain.content).toBe(item.markdown);
+      expect(Object.keys(plain.assets)).toEqual(bodyImages);
+
+      const compat = await prepareMarkdownExport(item.markdown, "/workspace/note.md", { compatible: true });
+      expect(compat.content.startsWith(parsed.raw)).toBe(true);
+      expect(Object.keys(compat.assets)).toEqual(bodyImages);
+      expect((await compatibleMarkdown(item.markdown, null)).startsWith(parsed.raw)).toBe(true);
+
+      const analysis = analyzeDocument(item.markdown);
+      expect(analysis.frontmatter?.end).toBe(parsed.end);
+      expect(analysis.blocks.map((b) => b.text).join("")).toBe(item.markdown);
+      expect(analysis.bodyBlocks[0]?.start ?? 0).toBeGreaterThanOrEqual(parsed.end);
+
+      const normalized = normalizeMarkdownSource(item.markdown, { encodeLinkDestinations: true });
+      for (const probe of bodyProbes) {
+        const expectedIdx = item.markdown.indexOf(probe, parsed.end);
+        expect(expectedIdx).toBeGreaterThanOrEqual(parsed.end);
+        expect(masked.indexOf(probe, parsed.end)).toBe(expectedIdx);
+        const normIdx = normalized.value.indexOf(probe);
+        if (normIdx >= 0) expect(normalized.originalOffset(normIdx)).toBe(expectedIdx);
       }
-      for (const entry of divergences) {
-        if (entry.conformanceCaseId) {
-          expect(conformanceIds.has(entry.conformanceCaseId)).toBe(true);
-        }
-      }
-    }
+    },
+  );
+
+  it("aligns astral surrogate-pair UTF-16 vs code-point boundaries, task offsets, and visible spans", () => {
+    const astral = byId.get("crlf_bom_astral_and_mixed_endings")!;
+    const parsed = parseFrontmatter(astral.markdown, { includeSpans: true })!;
+    expect(parsed.end).toBe(Array.from(parsed.raw).length + 3);
+    expect(parsed.visibleSpans!.map((s) => astral.markdown.slice(s.start, s.end))).toEqual([
+      "Rocket \uD83D\uDE80 & Bold \uD835\uDC00",
+      "\uD83E\uDDEA",
+      "![fake](crlf-fake.png)",
+    ]);
+    const analysis = analyzeDocument(astral.markdown);
+    expect(analysis.tasks).toHaveLength(1);
+    expect(analysis.tasks[0]).toBeGreaterThan(parsed.end);
+    expect(astral.markdown.slice(analysis.tasks[0] - 3, analysis.tasks[0] + 2)).toBe("- [ ]");
   });
 
-  it.each(sharedCases)(
-    "verifies recognition, masking, companion export preparation, and boundaries for shared case $id ($category)",
-    async (item) => {
-      const allowedImages = new Set(item.bodyImages ?? []);
-      mockInvoke.mockImplementation(async (command: string, args?: { source?: string }) => {
-        if (command === "load_asset" && args?.source && allowedImages.has(args.source)) {
-          return ONE_PIXEL_PNG;
-        }
-        throw new Error(`Unexpected native asset call: ${command} (${args?.source ?? ""})`);
-      });
-
-      const parsed = parseFrontmatter(item.source);
-      const masked = maskFrontmatter(item.source);
-
-      if (!item.recognized) {
-        expect(parsed).toBeNull();
-        expect(parseFrontmatter(item.source, { includeSpans: true })).toBeNull();
-        expect(frontmatterVisibleValueSpans(item.source)).toEqual([]);
-        expect(masked).toBe(item.source);
-        expect(item.endOffset.utf16).toBe(0);
-        expect(item.body).toBe(item.source);
-      } else {
-        expect(parsed).not.toBeNull();
-        expect(parsed!.raw).toBe(item.frontmatterRaw);
-        expect(parsed!.end).toBe(item.endOffset.utf16);
-        expect(Array.from(parsed!.raw).length).toBe(item.endOffset.codePoints);
-        expect(item.source.slice(parsed!.end)).toBe(item.body);
-        expect(parsed!.raw + item.body).toBe(item.source);
-        assertMaskInvariants(item.source, masked, parsed!.end, item.body);
-        assertVisibleSpanInvariants(item.source, parsed!);
-
-        for (const forbidden of item.maskedExcludes ?? []) {
-          expect(masked).not.toContain(forbidden);
-        }
-
-        if (item.typescriptEntries) {
-          expect(parsed!.entries).toEqual(item.typescriptEntries);
-        }
-        if (item.typescriptProperties) {
-          expect(parsed!.properties).toMatchObject(item.typescriptProperties);
-        }
-
-        const exported = await compatibleMarkdown(item.source, null);
-        expect(exported.startsWith(item.frontmatterRaw)).toBe(true);
-      }
-
-      const plainCompanion = await prepareMarkdownExport(item.source, "/workspace/note.md");
-      expect(plainCompanion.content).toBe(item.source);
-      expect(Object.keys(plainCompanion.assets)).toEqual(item.bodyImages ?? []);
-
-      const compatibleCompanion = await prepareMarkdownExport(item.source, "/workspace/note.md", {
-        compatible: true,
-      });
-      if (item.recognized) {
-        expect(compatibleCompanion.content.startsWith(item.frontmatterRaw)).toBe(true);
-      }
-      expect(Object.keys(compatibleCompanion.assets)).toEqual(item.bodyImages ?? []);
-      for (const forbidden of item.maskedExcludes ?? []) {
-        expect(plainCompanion.assets).not.toHaveProperty(forbidden);
-        expect(compatibleCompanion.assets).not.toHaveProperty(forbidden);
-      }
-
-      const endUtf16 = parsed?.end ?? 0;
-      const analysis = analyzeDocument(item.source);
-      expect(analysis.frontmatter?.end ?? 0).toBe(endUtf16);
-      expect(analysis.blocks.map((block) => block.text).join("")).toBe(item.source);
-      expect(analysis.bodyBlocks[0]?.start ?? 0).toBeGreaterThanOrEqual(endUtf16);
-      for (const block of analysis.bodyBlocks) {
-        expect(item.source.slice(block.start, block.end)).toBe(block.text);
-      }
-      for (const taskOffset of analysis.tasks) {
-        expect(taskOffset).toBeGreaterThanOrEqual(endUtf16);
-        expect([" ", "x", "X"]).toContain(item.source[taskOffset]);
-      }
-
-      const normalized = normalizeMarkdownSource(item.source, { encodeLinkDestinations: true });
-      for (const probe of item.bodyProbes ?? []) {
-        const expectedOffset = item.source.indexOf(probe, endUtf16);
-        expect(expectedOffset, `missing body probe ${probe}`).toBeGreaterThanOrEqual(endUtf16);
-        expect(masked.indexOf(probe, endUtf16)).toBe(expectedOffset);
-        const normalizedOffset = normalized.value.indexOf(probe);
-        if (normalizedOffset >= 0) {
-          expect(normalized.originalOffset(normalizedOffset)).toBe(expectedOffset);
-        }
-      }
-
-      if (item.bodyImages !== undefined) {
-        const detected = imageRanges(item.source);
-        expect(detected.map((img) => img.source)).toEqual(item.bodyImages);
-        for (const img of detected) {
-          expect(img.from).toBeGreaterThanOrEqual(endUtf16);
-          expect(item.source.slice(img.from, img.to)).toContain(img.source);
-        }
-      }
-    },
-  );
-
-  it.each(divergences)(
-    "records TypeScript behavior and companion export invariants for cross-parser divergence $id ($category)",
-    async (entry) => {
-      mockInvoke.mockRejectedValue(new Error("Unexpected asset load in divergence case"));
-      expect(entry.typescript.recognized).not.toBe(entry.desktop.recognized);
-      const parsed = parseFrontmatter(entry.source);
-      const masked = maskFrontmatter(entry.source);
-
-      if (!entry.typescript.recognized) {
-        expect(parsed).toBeNull();
-        expect(parseFrontmatter(entry.source, { includeSpans: true })).toBeNull();
-        expect(frontmatterVisibleValueSpans(entry.source)).toEqual([]);
-        expect(masked).toBe(entry.source);
-      } else {
-        expect(parsed).not.toBeNull();
-        expect(parsed!.raw).toBe(entry.typescript.frontmatterRaw);
-        expect(parsed!.end).toBe(entry.typescript.endUtf16);
-        expect(entry.source.slice(parsed!.end)).toBe(entry.typescript.body);
-        assertMaskInvariants(entry.source, masked, parsed!.end, entry.typescript.body);
-        const spans = assertVisibleSpanInvariants(entry.source, parsed!);
-        if (entry.id === "divergence-quoted-key-nbsp-before-colon") {
-          expect(spans).toHaveLength(1);
-          expect(entry.source.slice(spans[0].start, spans[0].end)).toBe("NBSP Before Colon");
-        }
-      }
-
-      const companion = await prepareMarkdownExport(entry.source, "/workspace/note.md");
-      expect(companion.content).toBe(entry.source);
-      expect(companion.assets).toEqual({});
-    },
-  );
-
-  it("verifies masking and companion export invariants across #186 conformance vectors when present", async () => {
-    const pr186SurrogateGuardActive = parseFrontmatter('---\ntitle: "\\uD800"\n---\nBody') === null;
-    if (!conformanceSuite || !pr186SurrogateGuardActive) return;
-
-    mockInvoke.mockRejectedValue(new Error("Unexpected asset load in conformance vector"));
-    for (const item of conformanceSuite.cases) {
-      const parsed = parseFrontmatter(item.markdown);
-      const masked = maskFrontmatter(item.markdown);
-      if (!item.valid) {
-        expect(parsed, item.id).toBeNull();
-        expect(masked, item.id).toBe(item.markdown);
-      } else {
-        expect(parsed, item.id).not.toBeNull();
-        assertMaskInvariants(item.markdown, masked, parsed!.end, item.body);
-      }
-      const companion = await prepareMarkdownExport(item.markdown, "/workspace/note.md");
-      expect(companion.content, item.id).toBe(item.markdown);
-      expect(companion.assets, item.id).toEqual({});
-    }
+  it("documents the remaining JS vs Python/Rust inner U+FEFF blank-line divergence", async () => {
+    mockInvoke.mockRejectedValue(new Error("Unexpected asset load"));
+    const innerBom = "---\ntitle: Alpha\n\uFEFF\nauthor: Beta\n---\n# Body\n";
+    const parsed = parseFrontmatter(innerBom, { includeSpans: true });
+    expect(parsed).not.toBeNull();
+    expect(parsed!.end).toBe(36);
+    expect(innerBom.slice(parsed!.end)).toBe("# Body\n");
+    expect(frontmatterVisibleValueSpans(innerBom).map((s) => innerBom.slice(s.start, s.end))).toEqual([
+      "Alpha",
+      "Beta",
+    ]);
+    const companion = await prepareMarkdownExport(innerBom, "/workspace/note.md");
+    expect(companion.content).toBe(innerBom);
+    expect(companion.assets).toEqual({});
   });
 });

@@ -9,7 +9,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -51,9 +50,9 @@ internal class SafWorkspaceCoordinator(
 
     fun navigateFolderUp(): Boolean {
         val folderUri = readState().folder ?: return false
-        val current = normalizeFolderRelative(readListedRelative())
+        val current = normalizeRelativePath(readListedRelative())
         if (current.isEmpty()) return false
-        val parent = parentFolderRelative(current)
+        val parent = parentRelativePath(current)
         listFolder(Uri.parse(folderUri), parent)
         return true
     }
@@ -62,7 +61,7 @@ internal class SafWorkspaceCoordinator(
         val seq = readListFolderSeq() + 1
         writeListFolderSeq(seq)
         val invalidPath = hasInvalidSafFolderRelative(relative)
-        val requestedRelative = if (invalidPath) readListedRelative() else normalizeFolderRelative(relative)
+        val requestedRelative = if (invalidPath) readListedRelative() else normalizeRelativePath(relative)
         if (!invalidPath) {
             writeListedRelative(requestedRelative)
             val updated = readState().copy(folderRelative = requestedRelative)
@@ -78,12 +77,10 @@ internal class SafWorkspaceCoordinator(
                 val targetFolder = Uri.parse(readState().folder ?: uri.toString())
                 val pass = SafProjectionPass(resolver)
                 val listing = withContext(Dispatchers.IO) {
-                    safTreeListingMutex.withLock {
-                        listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass)
-                    }
+                    listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass)
                 }
+                confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
                 if (seq == readListFolderSeq() && readState().folder != null) {
-                    confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
                     writeListedRelative(listing.effectiveRelative)
                     if (listing.effectiveRelative != requestedRelative) {
                         windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", listing.effectiveRelative).apply()
