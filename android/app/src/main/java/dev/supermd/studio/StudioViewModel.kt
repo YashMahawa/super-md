@@ -3191,12 +3191,14 @@ class StudioViewModel(app: Application, val workspaceKey: String = "main") : And
         )
     }
 
-    fun openFolderSearch(initialQuery: String? = null) = folderSearchController.openFolderSearch(initialQuery)
+    fun openFolderSearch(initialQuery: String? = null, initialMode: FolderSearchMode? = null) =
+        folderSearchController.openFolderSearch(initialQuery, initialMode)
     fun updateFolderSearch(
         query: String = folderSearch.value.query,
         caseSensitive: Boolean = folderSearch.value.caseSensitive,
         includeDiagrams: Boolean = folderSearch.value.includeDiagrams,
-    ) = folderSearchController.updateFolderSearch(query, caseSensitive, includeDiagrams)
+        mode: FolderSearchMode = folderSearch.value.mode,
+    ) = folderSearchController.updateFolderSearch(query, caseSensitive, includeDiagrams, mode)
     fun closeFolderSearch() = folderSearchController.closeFolderSearch()
     fun cancelWorkspaceSearch() = folderSearchController.cancelWorkspaceSearch()
     fun openSearchMatch(match: FolderSearchMatch) = folderSearchController.openSearchMatch(match)

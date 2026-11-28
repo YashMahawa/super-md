@@ -32,6 +32,7 @@ from workspace_search import (
     BATCH_SIZE,
     MAX_MATCHES_PER_NOTE,
     fold_with_offsets,
+    stream_file_search,
     stream_text_search,
     utf16_offset,
 )
@@ -176,28 +177,6 @@ def _webengine_e2e_probe() -> int:
             timeout=8.0,
         ), f"Escape did not close FolderSearchDialog: visible={search_dialog.property('visible')} modal={window.property('modalDialogCount')}"
 
-        # 2. Reopen Ctrl+Shift+F, search "AuroraSignal", select match -> opens .smd note with ReadingSearch seeded and highlighting!
-        send_window_shortcut("search_folder")
-        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen"
-        window.requestActivate()
-        search_input.forceActiveFocus()
-        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus"
-        search_input.setProperty("text", "AuroraSignal")
-        assert _wait_until(
-            lambda: not studio.folderSearchState["scanning"] and len(studio.folderSearchState["matches"]) == 2,
-            timeout=10.0,
-        ), f"Expected 2 non-diagram matches for AuroraSignal, got {studio.folderSearchState}"
-        # Mermaid block on lines 3-6 must be skipped; prose matches start at line 8!
-        lines = [m["line"] for m in studio.folderSearchState["matches"]]
-        assert lines == [8, 9], f"Expected matches only on prose lines [8, 9], got {lines}"
-
-        search_input.forceActiveFocus()
-        QTest.keyClick(window, Qt.Key.Key_Return)
-        assert _wait_until(
-            lambda: not bool(search_dialog.property("visible")) and studio._current()["name"] == "quantum-field.smd",
-            timeout=10.0,
-        ), f"Return in FolderSearchDialog did not open quantum-field.smd: current={studio._current()['name']!r} state={studio.folderSearchState}"
-
         def eval_reader(js_expr: str) -> dict:
             deadline = time.monotonic() + 15.0
             req = uuid.uuid4().hex
@@ -222,6 +201,66 @@ def _webengine_e2e_probe() -> int:
                             return parsed
                     time.sleep(0.02)
             raise AssertionError("Timed out evaluating script in WebEngine reader")
+
+        # 2. Reopen Ctrl+Shift+F, switch to Files mode, search "alpha", press Return -> opens alpha.md WITHOUT arming ReadingSearch!
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen for Files mode"
+        mode_group = window.findChild(QObject, "folderSearchModeGroup")
+        diagrams_btn = window.findChild(QObject, "folderSearchDiagramsToggle")
+        assert mode_group is not None and diagrams_btn is not None
+        mode_group.chosen.emit("files")
+        assert _wait_until(lambda: studio.folderSearchState["mode"] == "files" and not bool(diagrams_btn.property("enabled")))
+        window.requestActivate()
+        search_input.forceActiveFocus()
+        search_input.setProperty("text", "alpha")
+        assert _wait_until(
+            lambda: not studio.folderSearchState["scanning"]
+            and [m["name"] for m in studio.folderSearchState["matches"]] == ["alpha.md"],
+            timeout=10.0,
+        ), f"Expected Files-mode match for alpha.md, got {studio.folderSearchState}"
+        screenshot_path = os.environ.get("SUPERMD_FILES_MODE_SCREENSHOT")
+        if screenshot_path:
+            QTest.qWait(80)
+            Path(screenshot_path).parent.mkdir(parents=True, exist_ok=True)
+            window.grabWindow().save(screenshot_path)
+        search_input.forceActiveFocus()
+        QTest.keyClick(window, Qt.Key.Key_Return)
+        assert _wait_until(
+            lambda: not bool(search_dialog.property("visible")) and studio._current()["name"] == "alpha.md" and studio.ready,
+            timeout=10.0,
+        ), f"Return in Files mode did not open alpha.md: current={studio._current()['name']!r}"
+        assert _wait_until(
+            lambda: eval_reader(
+                "({open: !!document.querySelector('.reading-search'),"
+                " highlighted: typeof CSS !== 'undefined' && CSS.highlights?.has('smd-search')})"
+            ).get("value")
+            == {"open": False, "highlighted": False},
+            timeout=10.0,
+        ), "Expected Files-mode match activation to open alpha.md without arming ReadingSearch"
+
+        # 3. Reopen Ctrl+Shift+F, switch back to Text mode, search "AuroraSignal", select match -> opens .smd note with ReadingSearch seeded!
+        send_window_shortcut("search_folder")
+        assert _wait_until(lambda: bool(search_dialog.property("opened")), timeout=8.0), "FolderSearchDialog did not reopen"
+        mode_group.chosen.emit("text")
+        assert _wait_until(lambda: studio.folderSearchState["mode"] == "text" and bool(diagrams_btn.property("enabled")))
+        window.requestActivate()
+        search_input.forceActiveFocus()
+        assert _wait_until(lambda: bool(search_input.property("activeFocus"))), "folderSearchInput did not regain focus"
+        search_input.setProperty("text", "AuroraSignal")
+        assert _wait_until(
+            lambda: not studio.folderSearchState["scanning"] and len(studio.folderSearchState["matches"]) == 2,
+            timeout=10.0,
+        ), f"Expected 2 non-diagram matches for AuroraSignal, got {studio.folderSearchState}"
+        # Mermaid block on lines 3-6 must be skipped; prose matches start at line 8!
+        lines = [m["line"] for m in studio.folderSearchState["matches"]]
+        assert lines == [8, 9], f"Expected matches only on prose lines [8, 9], got {lines}"
+
+        search_input.forceActiveFocus()
+        QTest.keyClick(window, Qt.Key.Key_Return)
+        assert _wait_until(
+            lambda: not bool(search_dialog.property("visible")) and studio._current()["name"] == "quantum-field.smd",
+            timeout=10.0,
+        ), f"Return in FolderSearchDialog did not open quantum-field.smd: current={studio._current()['name']!r} state={studio.folderSearchState}"
 
         assert _wait_until(
             lambda: eval_reader(
@@ -1093,6 +1132,45 @@ class WorkspaceSearchDesktopTest(unittest.TestCase):
         )
         self.assertEqual(self.studio.folderSearchState["matches"][0]["line"], 3)
         self.assertTrue(self.studio.folderSearchState["matches"][0]["dirty"])
+
+    def test_files_mode_matches_metadata_only_and_opens_note_without_arming_find(self):
+        folder = self.root / "vault"
+        (folder / "research").mkdir(parents=True)
+        (folder / "Straße-overview.md").write_text("# Body SecretProseToken\n", encoding="utf-8")
+        documents.write_portable(folder / "research" / "quantum-field.smd", "# Portable SecretProseToken\n", {"assets/p.png": TINY_PNG})
+
+        self.studio.openFolder(str(folder))
+        self.assertTrue(_wait_until(lambda: len(self.studio.files) > 0))
+        self.studio._current()["name"] = "Scratch-Straße.md"
+        self.studio._current()["content"] = "# Unsaved SecretProseToken\n"
+
+        with patch.object(documents, "read_searchable_markdown", side_effect=AssertionError("Files mode must not read note contents")):
+            res = stream_file_search(
+                "strasse",
+                [{"id": "t1", "name": "Scratch-Straße.md", "path": "", "content": "ignored", "dirty": True}],
+                [],
+                folder,
+                active_id="t1",
+            )
+            self.assertEqual([m["name"] for m in res["matches"]], ["Scratch-Straße.md", "Straße-overview.md"])
+            self.assertEqual((res["matches"][0]["matchStart"], res["matches"][0]["matchEnd"]), (8, 14))
+            self.assertTrue(all(m["kind"] == "file" and m["line"] == 0 and m["sourceStart"] == -1 for m in res["matches"]))
+            self.assertEqual([m["relative"] for m in stream_file_search("research/quantum", [], [], folder)["matches"]], ["research/quantum-field.smd"])
+
+            self.studio.updateFolderSearch("quantum", False, False, "files")
+            self.assertTrue(_wait_until(lambda: not self.studio.folderSearchState["scanning"]))
+            self.assertEqual(self.studio.folderSearchState["mode"], "files")
+            self.assertEqual([m["name"] for m in self.studio.folderSearchState["matches"]], ["quantum-field.smd"])
+
+        calls: list[str] = []
+        self.studio.readerCall.connect(calls.append)
+        self.studio.ready = False
+        self.studio._pending_seeded_find = {"tabId": "", "path": "", "query": "StaleSeed", "caseSensitive": False}
+        hit = self.studio.folderSearchState["matches"][0]
+        self.studio.openFolderSearchMatch(hit["tabId"], hit["path"], "quantum", False, 0, 7, "quantum")
+        self.assertTrue(_wait_until(lambda: self.studio._current()["name"] == "quantum-field.smd"))
+        self.assertIsNone(self.studio._pending_seeded_find)
+        self.assertFalse(any("supermdFind" in c for c in calls))
 
     @contextlib.contextmanager
     def _real_folder_search_dialog(self):

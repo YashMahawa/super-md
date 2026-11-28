@@ -605,6 +605,51 @@ class FolderSearchControllerTest {
         }
     }
 
+    @Test
+    fun filesModeScansSafMetadataWithoutOpeningStreamsAndOpensMatchWithoutSeededFind() {
+        val rootDir = newTempDir("saf-files-mode")
+        val subDir = File(rootDir, "research").apply { mkdirs() }
+        File(rootDir, "alpha.md").writeText("# Alpha\n\nBody token SecretBodyHit.\n", Charsets.UTF_8)
+        File(subDir, "quantum-notes.smd").writeText("not-even-a-valid-zip-if-opened", Charsets.UTF_8)
+
+        val filesAuthority = "dev.supermd.test.filesmode.${UUID.randomUUID()}"
+        val provider = SearchSafTestProvider(rootDir).also { it.attach(app, filesAuthority) }
+        ShadowContentResolver.registerProviderInternal(filesAuthority, provider)
+        val treeUri = DocumentsContract.buildTreeDocumentUri(filesAuthority, "root")
+        grantTreeReadWrite(treeUri)
+
+        var flushCalls = 0
+        val model = newModel { _, _ -> flushCalls++; true }
+        model.setFolder(treeUri)
+        await { model.state.value.folder == treeUri.toString() && model.state.value.files.isNotEmpty() }
+
+        model.openFolderSearch("SecretBodyHit", FolderSearchMode.TEXT)
+        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.size == 1 }
+        model.openSearchMatch(model.folderSearch.value.matches.single())
+        await { model.seededFind.value?.query == "SecretBodyHit" }
+
+        provider.readOpenCounts.clear()
+        flushCalls = 0
+        model.openFolderSearch("quantum", FolderSearchMode.FILES)
+        await {
+            !model.folderSearch.value.scanning &&
+                model.folderSearch.value.mode == FolderSearchMode.FILES &&
+                model.folderSearch.value.matches.size == 1
+        }
+        assertEquals("Files mode must not flush active reader on open", 0, flushCalls)
+        assertEquals("Files mode must never open SAF file streams", 0, provider.readOpenCounts.values.sumOf { it.get() })
+        assertTrue(model.folderSearch.value.matches.single().isFileMatch)
+        assertEquals("research/quantum-notes.smd", model.folderSearch.value.matches.single().relative)
+
+        model.updateFolderSearch(query = "alpha", mode = FolderSearchMode.FILES)
+        await { !model.folderSearch.value.scanning && model.folderSearch.value.matches.map { it.name } == listOf("alpha.md") }
+        assertEquals("Files mode update must never open SAF file streams", 0, provider.readOpenCounts.values.sumOf { it.get() })
+
+        model.openSearchMatch(model.folderSearch.value.matches.single())
+        await { model.state.value.active.name == "alpha.md" }
+        assertNull("Opening a Files-mode match must not arm in-note seededFind", model.seededFind.value)
+    }
+
     private fun grantTreeReadWrite(treeUri: Uri) {
         app.grantUriPermission(
             app.packageName,
@@ -697,11 +742,11 @@ private class SearchSafTestProvider(private val rootDir: File) : ContentProvider
             Document.COLUMN_FLAGS,
         )
         val cursor = MatrixCursor(columns)
-        val path = uri.path.orEmpty()
-        if ("/children" in path) {
+        val encodedPath = uri.encodedPath.orEmpty()
+        if ("/children" in encodedPath) {
             val parentId = DocumentsContract.getDocumentId(
                 Uri.Builder().scheme(uri.scheme).authority(uri.authority)
-                    .path(path.substringBefore("/children")).build(),
+                    .encodedPath(encodedPath.substringBefore("/children")).build(),
             )
             val dir = fileForDocId(parentId)
             dir.listFiles()?.sortedBy { it.name }?.forEach { child ->

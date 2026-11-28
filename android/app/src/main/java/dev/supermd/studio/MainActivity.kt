@@ -1531,10 +1531,11 @@ internal fun buildHighlightedSnippet(
 @Composable internal fun FolderSearchModal(
     state: FolderSearchState,
     hasFolder: Boolean,
-    onUpdate: (String, Boolean, Boolean) -> Unit,
+    onUpdate: (String, Boolean, Boolean, FolderSearchMode) -> Unit,
     onSelect: (FolderSearchMatch) -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val isFilesMode = state.mode == FolderSearchMode.FILES
     val focusRequester = remember { FocusRequester() }
     var selectedIndex by remember(state.matches) { mutableIntStateOf(0) }
     val highlightColor = MaterialTheme.colorScheme.primary
@@ -1586,13 +1587,13 @@ internal fun buildHighlightedSnippet(
                 }
                 OutlinedTextField(
                     value = state.query,
-                    onValueChange = { onUpdate(it, state.caseSensitive, state.includeDiagrams) },
+                    onValueChange = { onUpdate(it, state.caseSensitive, state.includeDiagrams, state.mode) },
                     singleLine = true,
-                    placeholder = { Text("Search text across notes…") },
+                    placeholder = { Text(if (isFilesMode) "Search file names across notes…" else "Search text across notes…") },
                     leadingIcon = { Icon(Icons.Rounded.Search, null) },
                     trailingIcon = {
                         if (state.query.isNotEmpty()) {
-                            IconButton(onClick = { onUpdate("", state.caseSensitive, state.includeDiagrams) }) {
+                            IconButton(onClick = { onUpdate("", state.caseSensitive, state.includeDiagrams, state.mode) }) {
                                 Icon(Icons.Rounded.Close, "Clear query")
                             }
                         }
@@ -1605,13 +1606,24 @@ internal fun buildHighlightedSnippet(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     FilterChip(
+                        selected = !isFilesMode,
+                        onClick = { if (isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.TEXT) },
+                        label = { Text("Text") },
+                    )
+                    FilterChip(
+                        selected = isFilesMode,
+                        onClick = { if (!isFilesMode) onUpdate(state.query, state.caseSensitive, state.includeDiagrams, FolderSearchMode.FILES) },
+                        label = { Text("Files") },
+                    )
+                    FilterChip(
                         selected = state.caseSensitive,
-                        onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams) },
+                        onClick = { onUpdate(state.query, !state.caseSensitive, state.includeDiagrams, state.mode) },
                         label = { Text("Match case") },
                     )
                     FilterChip(
                         selected = state.includeDiagrams,
-                        onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams) },
+                        enabled = !isFilesMode,
+                        onClick = { onUpdate(state.query, state.caseSensitive, !state.includeDiagrams, state.mode) },
                         label = { Text("Diagrams") },
                     )
                     Spacer(Modifier.weight(1f))
@@ -1627,14 +1639,15 @@ internal fun buildHighlightedSnippet(
                 if (state.scanning) LinearProgressIndicator(Modifier.fillMaxWidth())
                 if (state.query.isEmpty()) {
                     Text(
-                        "Type to search Markdown prose across notes. Inline SVG, Mermaid, and chart blocks are skipped unless Diagrams is enabled.",
+                        if (isFilesMode) "Type to match note file names from metadata without reading note contents or arming in-note Find."
+                        else "Type to search Markdown prose across notes. Inline SVG, Mermaid, and chart blocks are skipped unless Diagrams is enabled.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 12.dp),
                     )
                 } else if (!state.scanning && state.matches.isEmpty()) {
                     Text(
-                        "No matches found.",
+                        if (isFilesMode) "No matching file names found." else "No matches found.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(vertical = 16.dp),
@@ -1658,13 +1671,15 @@ internal fun buildHighlightedSnippet(
                                         if (match.dirty) {
                                             Text("Edited", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                                         }
-                                        Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
-                                            Text(
-                                                "L${match.line}",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                                            )
+                                        if (!match.isFileMatch && match.line > 0) {
+                                            Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                                                Text(
+                                                    "L${match.line}",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                                                )
+                                            }
                                         }
                                     }
                                     Text(

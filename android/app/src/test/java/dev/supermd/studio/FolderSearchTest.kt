@@ -571,7 +571,7 @@ class FolderSearchTest {
                         FolderSearchModal(
                             state = searchState,
                             hasFolder = true,
-                            onUpdate = { _, _, _ -> },
+                            onUpdate = { _, _, _, _ -> },
                             onSelect = { selectedMatch = it },
                             onDismiss = { modalOpen = false },
                         )
@@ -865,5 +865,18 @@ class FolderSearchTest {
             activeTabId = openDirtyTab.id,
         )
         assertEquals(listOf("topic_04/note_02.md" to 3), freshRes.matches.map { it.relative to it.line })
+
+        val fileRes = streamFileSearch(
+            query = "topic_04/note_02",
+            tabs = listOf(openDirtyTab),
+            recents = emptyList(),
+            folderRoot = safRoot,
+            activeTabId = openDirtyTab.id,
+        )
+        assertEquals(FolderSearchMode.FILES, fileRes.mode)
+        assertEquals(600, fileRes.scannedFiles)
+        assertEquals(listOf("topic_04/note_02.md"), fileRes.matches.map { it.relative })
+        assertTrue(fileRes.matches.single().isFileMatch)
+        assertEquals(0, fileRes.matches.single().line)
     }
 }
