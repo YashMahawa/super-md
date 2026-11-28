@@ -24,6 +24,7 @@ from agent_live import create_qt_bridge
 from agent_live_client import MultiSessionLiveClient
 from documents import open_note, write_portable
 from mcp_server import build_mcp_server
+import studio_agent_setup
 from studio import Session, Studio, _validate_local_tab_asset_path
 
 
@@ -1334,6 +1335,324 @@ class AgentLiveFileAccessTests(unittest.TestCase):
             studio2.stop()
             studio2.pool.shutdown(wait=True, cancel_futures=True)
             studio2._search_pool.shutdown(wait=True, cancel_futures=True)
+            session2.writes.shutdown(wait=True)
+            studio2.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+
+    def test_exact_recovery_staging_quick_switcher_and_provenance_across_save_reopen_and_restart(self):
+        app_data = self.base / "merge-reconciliation-data"
+        workspace_a = self.base / "merge-ws-a"
+        note_loc_a_name = "Quick notes " if os.name != "nt" else " Quick notes"
+        note_loc_a = self.base / note_loc_a_name
+        note_loc_decoy = self.base / "Quick notes"
+        note_loc_b = self.base / "merge-notes-b"
+        downloads_dir = self.base / "merge-downloads"
+        user_dir = self.base / "merge-user"
+        for folder in (app_data, workspace_a, note_loc_a, note_loc_decoy, note_loc_b, downloads_dir, user_dir):
+            folder.mkdir()
+
+        focus_md = user_dir / "active-focus.md"
+        user_md = user_dir / "user-approved.md"
+        user_sibling_md = user_dir / "user-sibling.md"
+        auto_md = workspace_a / "agent-opened.md"
+        dl_sibling_md = downloads_dir / "downloads-secret.md"
+        loc_a_seed = note_loc_a / "seed-a.md"
+        loc_decoy_seed = note_loc_decoy / "decoy-seed.md"
+        loc_b_seed = note_loc_b / "seed-b.md"
+        for p in (focus_md, user_md, user_sibling_md, auto_md, dl_sibling_md, loc_a_seed, loc_decoy_seed, loc_b_seed):
+            p.write_text(f"# {p.stem}\n", encoding="utf-8")
+
+        session1 = Session(isolated=False, data=app_data)
+        session1.settings["python"] = sys.executable
+        studio1 = QuietStudio(False, session1)
+        bridge1 = create_qt_bridge(session1, session1.data)
+        session1.agent_bridge = bridge1
+
+        def run_async_action(studio_obj: Studio, payload: dict):
+            holder: dict[str, object] = {"done": False, "result": None, "error": None}
+            try:
+                studio_obj._agent_document_action_async(
+                    payload,
+                    lambda res, err: holder.update(done=True, result=res, error=err),
+                )
+            except Exception as exc:
+                return None, str(exc)
+            deadline = time.monotonic() + 5.0
+            while not holder["done"] and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertTrue(holder["done"], f"Async action timed out: {payload.get('action')}")
+            return holder["result"], holder["error"]
+
+        try:
+            with patch.object(QStandardPaths, "writableLocation", return_value=str(downloads_dir)):
+                studio1.setAgentAccessEnabled(True)
+                studio1.openNote(str(focus_md))
+                focus_tab = self._await_tab_path(studio1, focus_md)
+                studio1.openNote(str(user_md))
+                user_tab = self._await_tab_path(studio1, user_md)
+
+                # Direct studio_agent_setup.agent_mcp_roots call must exclude open-tab parent folders.
+                self.assertEqual(studio_agent_setup.agent_mcp_roots(studio1), [])
+
+                # 1. Filename-switcher (#131) invalidation hooks + outer-whitespace note location.
+                picker_loc_a_url = QUrl.fromLocalFile(str(note_loc_a)).toString()
+                studio1.setNoteLocation(picker_loc_a_url)
+                expected_loc_a = str(note_loc_a.resolve(strict=True))
+                self.assertEqual(studio_agent_setup.agent_mcp_roots(studio1), [expected_loc_a])
+
+                cached_entries = session1.folder_note_index.get_entries(expected_loc_a)
+                self.assertEqual([e["name"] for e in cached_entries], ["seed-a.md"])
+                self.assertIsNotNone(session1.folder_note_index.peek_entries(expected_loc_a))
+
+                # Creating a new note via _save_text invalidates FolderNoteIndex for expected_loc_a.
+                created_ui_path = note_loc_a / "ui-saved.md"
+                studio1.newNote()
+                ui_tab = studio1._current()
+                ui_tab["content"] = "# UI saved\n"
+                studio1._save_text(ui_tab, created_ui_path, automatic=False)
+                deadline = time.monotonic() + 3.0
+                while session1.folder_note_index.peek_entries(expected_loc_a) is not None and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertIsNone(session1.folder_note_index.peek_entries(expected_loc_a))
+                updated_entries = session1.folder_note_index.get_entries(expected_loc_a)
+                self.assertEqual(sorted(e["name"] for e in updated_entries), ["seed-a.md", "ui-saved.md"])
+                studio1.closeTab(ui_tab["id"])
+                deadline = time.monotonic() + 3.0
+                while any(t["id"] == ui_tab["id"] for t in studio1.tabs) and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                studio1.closed_tabs.clear()
+
+                # Switching setNoteLocation invalidates both old and new locations.
+                studio1.setNoteLocation(str(note_loc_b))
+                self.assertIsNone(session1.folder_note_index.peek_entries(expected_loc_a))
+                self.assertEqual(
+                    [e["name"] for e in session1.folder_note_index.get_entries(str(note_loc_b))],
+                    ["seed-b.md"],
+                )
+                studio1.settings["newNoteLocation"] = ""
+
+                # 2. Open an automation-opened tab under workspace_a and an agent-created tab in downloads_dir.
+                studio1.openFolder(str(workspace_a))
+                studio1._agent_document_action({
+                    "action": "open_document",
+                    "filename": str(auto_md),
+                    "background": True,
+                })
+                auto_tab = self._await_tab_path(studio1, auto_md)
+
+                created_info = studio1._agent_document_action({
+                    "action": "create_document",
+                    "title": "agent-created-merge.md",
+                    "format": "md",
+                    "content": "# Agent created\n",
+                    "background": True,
+                })
+                saved_created, save_err = run_async_action(studio1, {
+                    "action": "save_document",
+                    "tabId": created_info["tabId"],
+                    "expectedRevision": created_info["revision"],
+                })
+                self.assertIsNone(save_err)
+                created_path = Path(saved_created["path"])
+                self.assertEqual(created_path.parent, downloads_dir)
+                created_tab = self._await_tab_path(studio1, created_path)
+
+                # Keep focus_tab active so user_tab, auto_tab, and created_tab all take #276's inactive staging path.
+                studio1.selectTab(focus_tab["id"])
+                self.assertEqual(studio1.active, focus_tab["id"])
+
+                staged_auto, auto_err = run_async_action(studio1, {
+                    "action": "patch_tab",
+                    "tabId": auto_tab["id"],
+                    "expectedRevision": self._rev(auto_tab["content"]),
+                    "operations": [{"type": "replace", "old": "# agent-opened\n", "new": "# agent-opened\n\nStaged v1.\n"}],
+                })
+                self.assertIsNone(auto_err)
+                self.assertTrue(staged_auto["changed"])
+                self.assertTrue(auto_tab.get("agent_staged"))
+                self.assertTrue(auto_tab.get("agentOpened"))
+
+                # Closing workspace_a immediately revokes exact recovery staging & post-flush dispatch on auto_tab,
+                # while inactive user_tab and created_tab continue staging cleanly.
+                studio1.closeFolder()
+                denied_res, denied_err = run_async_action(studio1, {
+                    "action": "patch_tab",
+                    "tabId": auto_tab["id"],
+                    "expectedRevision": staged_auto["revision"],
+                    "operations": [{"type": "replace", "old": "Staged v1.", "new": "Should fail."}],
+                })
+                self.assertIsNone(denied_res)
+                self.assertIn("approved agent note roots", str(denied_err))
+                self.assertIn("Staged v1.", auto_tab["content"])
+
+                staged_user, user_err = run_async_action(studio1, {
+                    "action": "patch_tab",
+                    "tabId": user_tab["id"],
+                    "expectedRevision": self._rev(user_tab["content"]),
+                    "operations": [{"type": "replace", "old": "# user-approved\n", "new": "# user-approved\n\nUser staged.\n"}],
+                })
+                self.assertIsNone(user_err)
+                self.assertTrue(staged_user["changed"])
+                self.assertTrue(user_tab.get("agent_staged"))
+
+                staged_created, created_err = run_async_action(studio1, {
+                    "action": "patch_tab",
+                    "tabId": created_tab["id"],
+                    "expectedRevision": saved_created["revision"],
+                    "operations": [{"type": "replace", "old": "# Agent created\n", "new": "# Agent created\n\nCreated staged.\n"}],
+                })
+                self.assertIsNone(created_err)
+                self.assertTrue(staged_created["changed"])
+                self.assertTrue(created_tab.get("agent_staged"))
+
+                # 3. Autosave and manual in-place save preserve provenance distinctions and clear agent_staged on manual save.
+                studio1.openFolder(str(workspace_a))
+                studio1._save_text(auto_tab, auto_md, automatic=True)
+                deadline = time.monotonic() + 3.0
+                while auto_tab["saved"] != auto_tab["content"] and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertTrue(auto_tab.get("agentOpened"))
+                self.assertNotIn(str(auto_md), studio1._agent_open_paths)
+
+                auto_tab["content"] = "# agent-opened\n\nManual in-place save.\n"
+                auto_tab["agent_staged"] = True
+                studio1._save_text(auto_tab, auto_md, automatic=False)
+                deadline = time.monotonic() + 3.0
+                while auto_tab["saved"] != auto_tab["content"] and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertFalse(auto_tab.get("agent_staged"))
+                self.assertTrue(auto_tab.get("agentOpened"))
+                self.assertNotIn(str(auto_md), studio1._agent_open_paths)
+
+                studio1._save_text(created_tab, created_path, automatic=False)
+                deadline = time.monotonic() + 3.0
+                while created_tab["saved"] != created_tab["content"] and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(0.005)
+                self.assertFalse(created_tab.get("agent_staged"))
+                self.assertTrue(created_tab.get("agentCreated"))
+                self.assertNotIn(str(created_path), studio1._agent_open_paths)
+
+                # Stage another inactive edit on auto_tab while workspace_a is approved, then close workspace_a.
+                studio1.selectTab(focus_tab["id"])
+                restaged_auto, restage_err = run_async_action(studio1, {
+                    "action": "patch_tab",
+                    "tabId": auto_tab["id"],
+                    "expectedRevision": self._rev(auto_tab["content"]),
+                    "operations": [{"type": "replace", "old": "Manual in-place save.", "new": "Staged before close & restart."}],
+                })
+                self.assertIsNone(restage_err)
+                self.assertTrue(restaged_auto["changed"])
+                self.assertTrue(auto_tab.get("agent_staged"))
+                studio1.closeFolder()
+                self.assertFalse(studio1._is_tab_live_authorized(auto_tab))
+
+                # 4. Close and reopenTab() preserves provenance across all three categories.
+                for closing_id in (user_tab["id"], created_tab["id"], auto_tab["id"]):
+                    studio1.closeTab(closing_id)
+                    deadline = time.monotonic() + 3.0
+                    while any(t["id"] == closing_id for t in studio1.tabs) and time.monotonic() < deadline:
+                        self.app.processEvents()
+                        time.sleep(0.005)
+
+                for _ in range(3):
+                    before_count = len(studio1.tabs)
+                    studio1.reopenTab()
+                    deadline = time.monotonic() + 3.0
+                    while len(studio1.tabs) == before_count and time.monotonic() < deadline:
+                        self.app.processEvents()
+                        time.sleep(0.005)
+
+                reopened_user = self._await_tab_path(studio1, user_md)
+                reopened_created = self._await_tab_path(studio1, created_path)
+                reopened_auto = self._await_tab_path(studio1, auto_md)
+
+                self.assertTrue(studio1._agent_path_allowed(user_md))
+                self.assertFalse(studio1._agent_path_allowed(user_sibling_md))
+                self.assertTrue(studio1._agent_path_allowed(created_path))
+                self.assertFalse(studio1._agent_path_allowed(dl_sibling_md))
+                self.assertTrue(reopened_created.get("agentCreated"))
+                self.assertTrue(reopened_auto.get("agentOpened"))
+                self.assertFalse(studio1._agent_path_allowed(auto_md))
+                self.assertFalse(studio1._is_tab_live_authorized(reopened_auto))
+
+                # Stage one more inactive edit on reopened_created and re-open workspace_a briefly to stage reopened_auto,
+                # then close workspace_a and restart to verify recovery.json + startup.json provenance across restart!
+                studio1.openFolder(str(workspace_a))
+                studio1.selectTab(focus_tab["id"])
+                _, err_a = run_async_action(studio1, {
+                    "action": "patch_tab",
+                    "tabId": reopened_auto["id"],
+                    "expectedRevision": self._rev(reopened_auto["content"]),
+                    "operations": [{"type": "replace", "old": "Staged before close & restart.", "new": "Persisted in recovery across restart."}],
+                })
+                self.assertIsNone(err_a)
+                self.assertTrue(reopened_auto.get("agent_staged"))
+                studio1.closeFolder()
+                studio1._recover()
+        finally:
+            bridge1.stop()
+            studio1.stop()
+            studio1.pool.shutdown(wait=True, cancel_futures=True)
+            session1.writes.shutdown(wait=True)
+            studio1.deleteLater()
+            self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            self.app.processEvents()
+
+        # 5. Restart into Session 2 and verify recovery-claimed + startup-restored tabs keep exact provenance.
+        session2 = Session(isolated=False, data=app_data)
+        session2.settings["python"] = sys.executable
+        studio2 = QuietStudio(False, session2)
+        try:
+            restored_user = self._await_tab_path(studio2, user_md)
+            restored_created = self._await_tab_path(studio2, created_path)
+            restored_auto = self._await_tab_path(studio2, auto_md)
+            deadline = time.monotonic() + 3.0
+            while studio2._restoring_paths and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+
+            self.assertIn("Persisted in recovery across restart.", restored_auto["content"])
+            self.assertTrue(restored_auto.get("agent_staged"))
+            self.assertTrue(restored_auto.get("agentOpened"))
+            self.assertFalse(studio2._agent_path_allowed(auto_md))
+            self.assertFalse(studio2._is_tab_live_authorized(restored_auto))
+            with self.assertRaisesRegex(ValueError, "approved agent note roots"):
+                studio2._agent_document_action({
+                    "action": "patch_tab",
+                    "tabId": restored_auto["id"],
+                    "expectedRevision": self._rev(restored_auto["content"]),
+                    "operations": [{"type": "replace", "old": "Persisted in recovery across restart.", "new": "Blocked after restart."}],
+                })
+
+            self.assertTrue(restored_created.get("agentCreated"))
+            self.assertTrue(studio2._agent_path_allowed(created_path))
+            self.assertFalse(studio2._agent_path_allowed(dl_sibling_md))
+
+            self.assertFalse(restored_user.get("agentCreated"))
+            self.assertFalse(restored_user.get("agentOpened"))
+            self.assertTrue(studio2._agent_path_allowed(user_md))
+            self.assertFalse(studio2._agent_path_allowed(user_sibling_md))
+
+            # Explicit user Save As to a new path promotes only that new user-chosen copy.
+            promoted_copy = user_dir / "user-saved-copy.md"
+            studio2._save_text(restored_auto, promoted_copy, automatic=False)
+            deadline = time.monotonic() + 3.0
+            while restored_auto.get("path") != str(promoted_copy) and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertFalse(restored_auto.get("agentOpened"))
+            self.assertTrue(studio2._agent_path_allowed(promoted_copy))
+            self.assertFalse(studio2._agent_path_allowed(auto_md))
+        finally:
+            studio2.stop()
+            studio2.pool.shutdown(wait=True, cancel_futures=True)
             session2.writes.shutdown(wait=True)
             studio2.deleteLater()
             self.app.sendPostedEvents(None, QEvent.Type.DeferredDelete)

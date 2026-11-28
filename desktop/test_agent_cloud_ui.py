@@ -80,7 +80,7 @@ class CloudRevocationUITests(unittest.TestCase):
             self.dispose(session, studio)
 
     def test_explicit_revoke_runs_off_ui_thread_then_erases_config(self):
-        session,studio,config=self.make_studio(); started=threading.Event(); release=threading.Event(); errors=[]
+        session,studio,config=self.make_studio(); started=threading.Event(); release=threading.Event()
         def revoke(value,timeout):
             self.assertEqual(value["deviceId"],config["deviceId"]); self.assertLessEqual(timeout,10)
             started.set(); release.wait(2)
@@ -107,6 +107,59 @@ class CloudRevocationUITests(unittest.TestCase):
             self.assertFalse(studio.cloudAgentConfigured)
             self.assertIn("could not be confirmed",studio.cloudAgentStatus)
         finally: self.dispose(session,studio)
+
+    def test_create_and_import_pairing_teardown_active_cloud_bridge_and_revoke_old_config(self):
+        import json, tempfile
+        from unittest.mock import Mock, patch
+        session, studio, first_config = self.make_studio()
+        bridge = Mock()
+        session.agent_bridge = bridge
+        revoked_ids: list[str] = []
+        revoke_done = threading.Event()
+        def record_revoke(value, timeout=8):
+            revoked_ids.append(value["deviceId"])
+            revoke_done.set()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir, patch("agent_cloud.revoke", side_effect=record_revoke):
+                bridge.cloudClient.enabled = True
+                studio.settings["cloudAgentEnabled"] = True
+                studio.settings["agentAccessEnabled"] = False
+                studio._cloud_started_local_bridge = True
+                self.assertTrue(studio.createAgentPairing("https://relay-two.example.test"))
+                self.assertTrue(revoke_done.wait(2))
+                bridge.stop_cloud.assert_called_once()
+                bridge.stop.assert_called_once()
+                self.assertFalse(studio.settings["cloudAgentEnabled"])
+                self.assertFalse(studio._cloud_started_local_bridge)
+                self.assertEqual(studio.cloudRelayOrigin, "https://relay-two.example.test")
+                self.assertEqual(revoked_ids, [first_config["deviceId"]])
+                second_config = agent_cloud.read_cloud_config(studio._agent_cloud_config_path)
+
+                revoke_done.clear()
+                bridge.reset_mock()
+                bridge.cloudClient.enabled = True
+                studio.settings["cloudAgentEnabled"] = True
+                studio.settings["agentAccessEnabled"] = True
+                studio._cloud_started_local_bridge = True
+                imported_file = Path(tmpdir) / "imported-pairing.json"
+                imported_file.write_text(json.dumps(agent_cloud.new_pairing("https://relay-three.example.test")), encoding="utf-8")
+                self.assertTrue(studio.importAgentPairing(imported_file.as_uri()))
+                self.assertTrue(revoke_done.wait(2))
+                bridge.stop_cloud.assert_called_once()
+                bridge.stop.assert_not_called()
+                self.assertFalse(studio.settings["cloudAgentEnabled"])
+                self.assertFalse(studio._cloud_started_local_bridge)
+                self.assertEqual(studio.cloudRelayOrigin, "https://relay-three.example.test")
+                self.assertEqual(revoked_ids, [first_config["deviceId"], second_config["deviceId"]])
+
+                studio._cloud_revocation_pending = True
+                self.assertFalse(studio.createAgentPairing("https://blocked.example.test"))
+                self.assertIn("Wait for desktop pairing revocation to finish", studio._agent_cloud_error)
+                self.assertFalse(studio.importAgentPairing(str(imported_file)))
+                self.assertEqual(studio.cloudRelayOrigin, "https://relay-three.example.test")
+                studio._cloud_revocation_pending = False
+        finally:
+            self.dispose(session, studio)
 
 
 class AgentAccessOriginBindingTests(unittest.TestCase):

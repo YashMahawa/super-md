@@ -249,4 +249,76 @@ describe('nativeWheelScroll', () => {
     expect(resolveNativeWheelScrollOrigin(guideTitle)).toBe(guideBody);
     expect(reading.scrollTop).toBe(320);
   });
+
+  it('pans wide .mermaid, standalone .svg-figure, and .media-paragraph diagrams horizontally from inert <img> targets while chaining vertical scroll under centerLock', () => {
+    document.body.innerHTML = `
+      <section class="android-reading" data-center-locked="true" style="overflow-y: auto; overflow-x: hidden;">
+        <div class="document-page-space">
+          <div class="document-page" data-scale="1">
+            <article class="markdown-body">
+              <div class="mermaid" style="overflow: auto;">
+                <figure class="svg-figure"><img id="mermaid-img" class="svg-diagram" draggable="false" /></figure>
+              </div>
+              <figure id="standalone-svg" class="svg-figure" style="overflow-x: auto; overflow-y: hidden;">
+                <img id="svg-img" class="svg-diagram" draggable="false" />
+              </figure>
+              <p id="diagram-para" class="media-paragraph" style="overflow-x: auto; overflow-y: hidden;">
+                <span class="note-image note-image--diagram"><img id="linked-svg-img" draggable="false" /></span>
+              </p>
+              <div class="python-cell">
+                <div class="cell-output">
+                  <figure class="svg-figure" style="overflow: visible;">
+                    <img id="python-svg-img" class="svg-diagram" draggable="false" />
+                  </figure>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+    `;
+    const reading = document.querySelector<HTMLElement>('.android-reading')!;
+    const mermaid = document.querySelector<HTMLElement>('.mermaid')!;
+    const standaloneSvg = document.getElementById('standalone-svg')!;
+    const diagramPara = document.getElementById('diagram-para')!;
+    const mermaidImg = document.getElementById('mermaid-img')!;
+    const svgImg = document.getElementById('svg-img')!;
+    const linkedSvgImg = document.getElementById('linked-svg-img')!;
+    const pythonSvgImg = document.getElementById('python-svg-img')!;
+
+    mockScrollMetrics(reading, { clientWidth: 412, scrollWidth: 800, clientHeight: 800, scrollHeight: 2800 });
+    mockScrollMetrics(mermaid, { clientWidth: 342, scrollWidth: 1079, clientHeight: 440, scrollHeight: 440 });
+    mockScrollMetrics(standaloneSvg, { clientWidth: 342, scrollWidth: 960, clientHeight: 320, scrollHeight: 320 });
+    mockScrollMetrics(diagramPara, { clientWidth: 342, scrollWidth: 962, clientHeight: 320, scrollHeight: 320 });
+
+    // Wide Mermaid sequence diagram: inert <img> resolves .mermaid, pans horizontally, chains dy to .android-reading, and blocks horizontal bleed under centerLock.
+    const mermaidOrigin = resolveNativeWheelScrollOrigin(mermaidImg)!;
+    expect(mermaidOrigin).toBe(mermaid);
+    expect(collectNativeWheelScrollChain(mermaidOrigin)).toEqual([mermaid, reading]);
+    applyChainedNativeScroll(mermaidOrigin, 260, 110, { centerLock: true });
+    expect(mermaid.scrollLeft).toBe(260);
+    expect(reading.scrollTop).toBe(110);
+    expect(reading.scrollLeft).toBe(0);
+
+    applyChainedNativeScroll(mermaidOrigin, 900, 40, { centerLock: true });
+    expect(mermaid.scrollLeft).toBe(737);
+    expect(reading.scrollLeft).toBe(0);
+    expect(reading.scrollTop).toBe(150);
+
+    // Standalone .svg-figure and .media-paragraph pan horizontally and pass vertical scroll straight to .android-reading.
+    const svgOrigin = resolveNativeWheelScrollOrigin(svgImg)!;
+    expect(svgOrigin).toBe(standaloneSvg);
+    applyChainedNativeScroll(svgOrigin, 180, 60, { centerLock: true });
+    expect(standaloneSvg.scrollLeft).toBe(180);
+    expect(reading.scrollTop).toBe(210);
+
+    const paraOrigin = resolveNativeWheelScrollOrigin(linkedSvgImg)!;
+    expect(paraOrigin).toBe(diagramPara);
+    applyChainedNativeScroll(paraOrigin, 200, 50, { centerLock: true });
+    expect(diagramPara.scrollLeft).toBe(200);
+    expect(reading.scrollTop).toBe(260);
+
+    // Full-column Python SVG plots are not horizontal scroll islands; wheel events go straight to .android-reading.
+    expect(resolveNativeWheelScrollOrigin(pythonSvgImg)).toBe(reading);
+  });
 });
