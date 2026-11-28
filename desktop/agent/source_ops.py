@@ -255,7 +255,7 @@ def outline_source(source: str, offset: int = 0, limit: int = MAX_OUTLINE_PAGE, 
 
 
 def _heading_slug(title: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", title.lower())
+    decomposed = unicodedata.normalize("NFKD", title).lower()
     parts: list[str] = []
     current: list[str] = []
     for char in decomposed:
