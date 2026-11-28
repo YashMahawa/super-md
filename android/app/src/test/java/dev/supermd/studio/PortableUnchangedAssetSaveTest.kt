@@ -841,11 +841,22 @@ class PortableUnchangedAssetSaveTest {
             awaitCondition {
                 model.state.value.folderRelative == "Sem1/PureMath" &&
                     model.state.value.active.relative == "Sem1/PureMath/1.1 Linear Workbook.smd" &&
-                    model.state.value.active.uri != renamedFileUri
+                    model.state.value.active.uri != renamedFileUri &&
+                    model.state.value.files.any {
+                        it.name == "1.1 Linear Workbook.smd" &&
+                            it.uri == model.state.value.active.uri &&
+                            it.relative == "Sem1/PureMath/1.1 Linear Workbook.smd"
+                    }
             }
             provider.afterChildrenQuery = null
             provider.afterRenameDocument = null
             val rotatedDirNoteUri = model.state.value.active.uri!!
+            assertTrue(
+                "Any in-flight retired ID read during concurrent listing + rename must be a previously provider-issued ID",
+                provider.snapshotRetiredIds().containsAll(provider.snapshotRetiredIdReads()),
+            )
+            assertEquals("Expected zero writes against retired documentIds", emptyList<String>(), provider.snapshotRetiredIdWrites())
+            provider.clearRetiredIdReads()
             assertTrue(
                 "Directory rename must preserve pinned recent entry with rotated child URI",
                 model.recent.value.any {
@@ -869,6 +880,7 @@ class PortableUnchangedAssetSaveTest {
             assertEquals(0, model.media.portableAssetExtractions.get())
             assertEquals(initialAssetDir, model.state.value.active.assetDirectory)
             assertEquals("Sem1/PureMath/1.1 Linear Workbook.smd", model.state.value.active.relative)
+            assertEquals("Sem1/PureMath", model.state.value.folderRelative)
             assertTrue(
                 model.recent.value.any {
                     it.uri == rotatedDirNoteUri &&
@@ -899,7 +911,18 @@ class PortableUnchangedAssetSaveTest {
             assertEquals(0, model.media.portableBase64Encodes.get())
             assertEquals("Workbook Copy.smd", model.state.value.active.name)
             assertEquals("Sem1/PureMath/Workbook Copy.smd", model.state.value.active.relative)
-            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+            assertEquals("Sem1/PureMath", model.state.value.folderRelative)
+            assertTrue(
+                "Reloaded folder must include newly saved copy without stale entries",
+                model.state.value.files.any {
+                    it.name == "Workbook Copy.smd" &&
+                        it.uri == saveAsTarget.toString() &&
+                        it.relative == "Sem1/PureMath/Workbook Copy.smd"
+                },
+            )
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.snapshotGuessedIds())
+            assertEquals("Expected zero writes against retired documentIds", emptyList<String>(), provider.snapshotRetiredIdWrites())
+            assertEquals("Expected zero retired documentId reads after rename settled", emptyList<String>(), provider.snapshotRetiredIdReads())
 
             val saveAsCopyAssetDir = model.state.value.active.assetDirectory!!
             val verifyMedia = MediaStorage(app)
@@ -931,7 +954,8 @@ class PortableUnchangedAssetSaveTest {
             assertEquals(pickerInTreeUri.toString(), model.state.value.active.uri)
             assertEquals("Picker Copy.smd", model.state.value.active.name)
             assertEquals("Sem1/PureMath/Picker Copy.smd", model.state.value.active.relative)
-            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.snapshotGuessedIds())
+            assertEquals("Expected zero writes against retired documentIds", emptyList<String>(), provider.snapshotRetiredIdWrites())
             val pickerInTreeAssetDir = model.state.value.active.assetDirectory!!
 
             val pickerFollowupMd = "$pickerInTreeMd\nFollow-up in-place save on standalone grant.\n"
@@ -944,7 +968,8 @@ class PortableUnchangedAssetSaveTest {
             assertEquals(0, model.media.portableAssetExtractions.get())
             assertEquals(pickerInTreeUri.toString(), model.state.value.active.uri)
             assertEquals("Sem1/PureMath/Picker Copy.smd", model.state.value.active.relative)
-            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.snapshotGuessedIds())
+            assertEquals("Expected zero writes against retired documentIds", emptyList<String>(), provider.snapshotRetiredIdWrites())
 
             val outsideDir = Files.createTempDirectory("opaque-outside-save-as").toFile()
             try {
@@ -964,7 +989,8 @@ class PortableUnchangedAssetSaveTest {
                 assertEquals(pickerOutsideUri.toString(), model.state.value.active.uri)
                 assertEquals("Outside Copy.smd", model.state.value.active.name)
                 assertNull("Save As outside open folder must clear stale folder-relative path", model.state.value.active.relative)
-                assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.unknownIdQueries)
+                assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.snapshotGuessedIds())
+                assertEquals("Expected zero writes against retired documentIds", emptyList<String>(), provider.snapshotRetiredIdWrites())
             } finally {
                 outsideDir.deleteRecursively()
             }
@@ -973,6 +999,244 @@ class PortableUnchangedAssetSaveTest {
             File(bundlesRoot, pickerInTreeAssetDir).deleteRecursively()
             File(bundlesRoot, initialAssetDir).deleteRecursively()
         } finally {
+            app.getSharedPreferences("studio", 0).edit().putString("recent", previousRecentJson).apply()
+        }
+    }
+
+    @Test
+    fun inFlightRetiredOpaqueIdReadDuringRenameDistinguishedFromGuessedIdAndKeepsFolderAndSavedNoteCurrent() = withStudioModel { app, tempDir, bundlesRoot, _, model ->
+        val authority = "dev.supermd.test.opaque.portable.retired.${UUID.randomUUID().toString().replace("-", "")}"
+        val provider = PortableOpaqueSafProvider(app, tempDir)
+        provider.attach(app, authority)
+        org.robolectric.shadows.ShadowContentResolver.registerProviderInternal(authority, provider)
+
+        val treeUri = android.provider.DocumentsContract.buildTreeDocumentUri(authority, PortableOpaqueSafProvider.ROOT_ID)
+        app.grantUriPermission(
+            app.packageName,
+            treeUri,
+            android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                android.content.Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+
+        val pngOne = syntheticPngBytes(28_000, 911L)
+        val svgOne = svgBytes("retired-vs-guessed", 40)
+        val seedAssets = JSONObject()
+            .put("assets/chart.png", dataUrl("image/png", pngOne))
+            .put("assets/flow.svg", dataUrl("image/svg+xml", svgOne))
+        val initialMd = "# Workbook\n\n![Chart](assets/chart.png)\n![Flow](assets/flow.svg)\n"
+
+        val mathDir = File(tempDir, "Sem1/Math").apply { mkdirs() }
+        val seedFile = File(mathDir, "Workbook.smd")
+        seedFile.outputStream().use { MediaStorage(app).writeFmd(it, initialMd, seedAssets) }
+
+        val previousRecentJson = app.getSharedPreferences("studio", 0).getString("recent", "[]")
+        val vmProjectedLatch = java.util.concurrent.CountDownLatch(1)
+        val detachedProjectedLatch = java.util.concurrent.CountDownLatch(1)
+        val allowChildQueryLatch = java.util.concurrent.CountDownLatch(1)
+        val rotationCommittedLatch = java.util.concurrent.CountDownLatch(1)
+        try {
+            model.setFolder(treeUri)
+            awaitCondition { model.state.value.folder == treeUri.toString() }
+            awaitJob(model.listFolder(treeUri, "Sem1/Math"))
+            val workbookEntry = model.state.value.files.single { it.name == "Workbook.smd" }
+            val initialUri = Uri.parse(workbookEntry.uri)
+
+            awaitJob(model.open(initialUri, workbookEntry.relative))
+            val noteId = model.state.value.active.id
+            val initialAssetDir = model.state.value.active.assetDirectory!!
+            model.pinRecent(initialUri.toString())
+
+            awaitJob(model.listFolder(treeUri, "Sem1"))
+            val sem1DocId = provider.docIdForExistingFile(File(tempDir, "Sem1"))
+            val mathEntry = model.state.value.files.single { it.directory && it.name == "Math" }
+            val mathUri = Uri.parse(mathEntry.uri)
+            val mathDocId = android.provider.DocumentsContract.getDocumentId(mathUri)
+
+            // Pause an in-flight Sem1/Math listing right after Sem1/children returns mathDocId (opaque:item-2),
+            // then rotate Sem1/Math -> Sem1/PureMath so in-flight projection deterministically queries retired mathDocId.
+            // Release model.listFolder immediately if cancelled so pre-rename job joins (#142) never deadlock, while
+            // a detached SAF projection guarantees the retired opaque ID read is exercised across rotation.
+            val isDetachedProjection = ThreadLocal.withInitial { false }
+            val vmHookArmed = java.util.concurrent.atomic.AtomicBoolean(true)
+            val detachedHookArmed = java.util.concurrent.atomic.AtomicBoolean(true)
+            var inFlightListJobRef: kotlinx.coroutines.Job? = null
+            provider.onChildrenProjected = { parentDocId, childIds ->
+                if (parentDocId == sem1DocId && mathDocId in childIds) {
+                    if (isDetachedProjection.get() == true) {
+                        if (detachedHookArmed.compareAndSet(true, false)) {
+                            detachedProjectedLatch.countDown()
+                            assertTrue(
+                                "Timed out waiting for subtree rotation before resuming detached child query",
+                                allowChildQueryLatch.await(5, TimeUnit.SECONDS),
+                            )
+                        }
+                    } else if (vmHookArmed.compareAndSet(true, false)) {
+                        vmProjectedLatch.countDown()
+                        val waitDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                        while (allowChildQueryLatch.count > 0 &&
+                            inFlightListJobRef?.isCancelled != true &&
+                            System.nanoTime() < waitDeadline
+                        ) {
+                            allowChildQueryLatch.await(10, TimeUnit.MILLISECONDS)
+                        }
+                    }
+                }
+            }
+            provider.onSubtreeRotated = {
+                rotationCommittedLatch.countDown()
+                allowChildQueryLatch.countDown()
+            }
+
+            val inFlightListJob = model.listFolder(treeUri, "Sem1/Math").also { inFlightListJobRef = it }
+            val detachedListJob = CoroutineScope(Dispatchers.IO).async {
+                isDetachedProjection.set(true)
+                try {
+                    runCatching {
+                        listSafFolderListing(app.contentResolver, DocumentAccess(app), treeUri, "Sem1/Math")
+                    }
+                } finally {
+                    isDetachedProjection.remove()
+                }
+            }
+            val projectedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while ((vmProjectedLatch.count > 0 || detachedProjectedLatch.count > 0) && System.nanoTime() < projectedDeadline) {
+                pumpMainLooper(20)
+                Thread.sleep(10)
+            }
+            assertEquals("Expected in-flight ViewModel listing to project Sem1 children", 0L, vmProjectedLatch.count)
+            assertEquals("Expected detached SAF listing to project Sem1 children", 0L, detachedProjectedLatch.count)
+
+            val concurrentMd = "$initialMd\nSaved concurrently across subtree rotation.\n"
+            model.edit(noteId, concurrentMd)
+            val bridgeAssets = JSONObject()
+                .put("assets/chart.png", String(dataUrl("image/png", pngOne).toCharArray()))
+                .put("assets/flow.svg", String(dataUrl("image/svg+xml", svgOne).toCharArray()))
+            model.media.resetPortableCounters()
+
+            val renameJob = model.renameFolderEntry(mathUri, "Sem1/Math", isDirectory = true, requested = "PureMath")
+            val rotatedDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (rotationCommittedLatch.count > 0 && System.nanoTime() < rotatedDeadline) {
+                pumpMainLooper(20)
+                Thread.sleep(10)
+            }
+            assertEquals("Expected directory rename to rotate subtree IDs", 0L, rotationCommittedLatch.count)
+
+            // Start a portable save right as subtree IDs have rotated on IO so write synchronization must wait for remapped note metadata.
+            val concurrentSave = CoroutineScope(Dispatchers.Default).async {
+                model.writePortable(noteId, concurrentMd, bridgeAssets, save = true, originalContent = concurrentMd)
+            }
+            runCatching { awaitJob(inFlightListJob) }
+            awaitJob(detachedListJob)
+            awaitJob(renameJob)
+            awaitJob(concurrentSave)
+            awaitCondition {
+                model.state.value.folderRelative == "Sem1/PureMath" &&
+                    !model.state.value.active.dirty &&
+                    !model.state.value.busy &&
+                    model.state.value.files.any { it.name == "Workbook.smd" }
+            }
+
+            // Deterministically confirm the retired opaque:item-2 read was recorded as retired (NOT guessed), with zero retired writes.
+            assertTrue(
+                "Expected in-flight listing to record retired mathDocId read ($mathDocId)",
+                mathDocId in provider.snapshotRetiredIdReads(),
+            )
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.snapshotGuessedIds())
+            assertEquals("Expected zero writes against retired documentIds", emptyList<String>(), provider.snapshotRetiredIdWrites())
+
+            val rotatedNoteUri = model.state.value.active.uri!!
+            assertNotEquals(initialUri.toString(), rotatedNoteUri)
+            assertEquals("Sem1/PureMath/Workbook.smd", model.state.value.active.relative)
+            assertEquals(concurrentMd, model.state.value.active.saved)
+            assertEquals(initialAssetDir, model.state.value.active.assetDirectory)
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals(0, model.media.portableAssetExtractions.get())
+            assertTrue(
+                "Pinned recent must track rotated child URI and Sem1/PureMath relative path",
+                model.recent.value.any {
+                    it.uri == rotatedNoteUri &&
+                        it.pinned &&
+                        it.relative == "Sem1/PureMath/Workbook.smd"
+                },
+            )
+            assertTrue(
+                "Reloaded folder entries must match the current rotated child URI and relative path",
+                model.state.value.files.any {
+                    it.name == "Workbook.smd" &&
+                        it.uri == rotatedNoteUri &&
+                        it.relative == "Sem1/PureMath/Workbook.smd"
+                },
+            )
+            val retiredSnapshot = provider.snapshotRetiredIds()
+            assertTrue(
+                "Reloaded folder must contain zero retired document IDs",
+                model.state.value.files.none { android.provider.DocumentsContract.getDocumentId(Uri.parse(it.uri)) in retiredSnapshot },
+            )
+
+            // Clear in-flight retired reads and verify Save As inside and outside the open folder stays current with zero retired reads.
+            provider.clearRetiredIdReads()
+            val pureMathDocId = provider.docIdForExistingFile(File(tempDir, "Sem1/PureMath"))
+            val pureMathDocUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, pureMathDocId)
+            val saveAsInFolder = android.provider.DocumentsContract.createDocument(
+                app.contentResolver,
+                pureMathDocUri,
+                "application/vnd.supermd.smd",
+                "Workbook Copy.smd",
+            )!!
+            val saveAsMd = "$concurrentMd\nSaved as copy in PureMath.\n"
+            model.edit(noteId, saveAsMd)
+            model.media.resetPortableCounters()
+            model.completePortableSaveAs(saveAsInFolder, noteId)
+            awaitCondition {
+                model.state.value.active.uri == saveAsInFolder.toString() &&
+                    !model.state.value.active.dirty &&
+                    !model.state.value.busy
+            }
+            val copyAssetDir = model.state.value.active.assetDirectory!!
+            assertEquals(0, model.media.portableBase64Decodes.get())
+            assertEquals(0, model.media.portableBase64Encodes.get())
+            assertEquals("Workbook Copy.smd", model.state.value.active.name)
+            assertEquals("Sem1/PureMath/Workbook Copy.smd", model.state.value.active.relative)
+            assertTrue(
+                model.state.value.files.any {
+                    it.name == "Workbook Copy.smd" &&
+                        it.uri == saveAsInFolder.toString() &&
+                        it.relative == "Sem1/PureMath/Workbook Copy.smd"
+                },
+            )
+            assertEquals("Expected zero post-settle retired documentId reads", emptyList<String>(), provider.snapshotRetiredIdReads())
+            assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.snapshotGuessedIds())
+
+            val outsideDir = Files.createTempDirectory("portable-outside-folder").toFile()
+            try {
+                val outsideTarget = File(outsideDir, "Outside Copy.smd")
+                model.completePortableSaveAs(Uri.fromFile(outsideTarget), noteId)
+                awaitCondition {
+                    model.state.value.active.uri == Uri.fromFile(outsideTarget).toString() &&
+                        !model.state.value.active.dirty &&
+                        !model.state.value.busy
+                }
+                assertNull("Save As outside open folder must clear stale folder-relative path", model.state.value.active.relative)
+                assertEquals(0, model.media.portableBase64Decodes.get())
+                assertEquals(0, model.media.portableBase64Encodes.get())
+                assertEquals("Expected zero guessed documentId queries", emptyList<String>(), provider.snapshotGuessedIds())
+
+                // Prove the zero guessed-ID guard actively records fabricated/path-derived documentIds never issued by the provider.
+                val fabricatedUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, "Sem1/PureMath/Workbook Copy.smd")
+                app.contentResolver.getType(fabricatedUri)
+                assertEquals(listOf("Sem1/PureMath/Workbook Copy.smd"), provider.snapshotGuessedIds())
+            } finally {
+                outsideDir.deleteRecursively()
+                File(bundlesRoot, copyAssetDir).deleteRecursively()
+                File(bundlesRoot, initialAssetDir).deleteRecursively()
+            }
+        } finally {
+            provider.onChildrenProjected = null
+            provider.onSubtreeRotated = null
+            allowChildQueryLatch.countDown()
             app.getSharedPreferences("studio", 0).edit().putString("recent", previousRecentJson).apply()
         }
     }
@@ -1174,11 +1438,14 @@ private class PortableOpaqueSafProvider(
     private var nextSeq = 1
     private val idToPath = linkedMapOf<String, String>()
     private val pathToId = linkedMapOf<String, String>()
-    val unknownIdQueries: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
-    @Volatile
-    var afterChildrenQuery: ((parentDocId: String) -> Unit)? = null
-    @Volatile
-    var afterRenameDocument: (() -> Unit)? = null
+    private val retiredIds = linkedSetOf<String>()
+    private val guessedIdQueries = mutableListOf<String>()
+    private val retiredIdReadQueries = mutableListOf<String>()
+    private val retiredIdWriteOperations = mutableListOf<String>()
+    @Volatile var onChildrenProjected: ((parentDocId: String, childDocIds: List<String>) -> Unit)? = null
+    @Volatile var onSubtreeRotated: (() -> Unit)? = null
+    @Volatile var afterChildrenQuery: ((parentDocId: String) -> Unit)? = null
+    @Volatile var afterRenameDocument: (() -> Unit)? = null
 
     init {
         idToPath[ROOT_ID] = rootDir.canonicalPath
@@ -1203,6 +1470,23 @@ private class PortableOpaqueSafProvider(
     fun docIdForExistingFile(file: File): String = idForFile(file)
 
     @Synchronized
+    fun snapshotGuessedIds(): List<String> = guessedIdQueries.toList()
+
+    @Synchronized
+    fun snapshotRetiredIds(): Set<String> = retiredIds.toSet()
+
+    @Synchronized
+    fun snapshotRetiredIdReads(): List<String> = retiredIdReadQueries.toList()
+
+    @Synchronized
+    fun snapshotRetiredIdWrites(): List<String> = retiredIdWriteOperations.toList()
+
+    @Synchronized
+    fun clearRetiredIdReads() {
+        retiredIdReadQueries.clear()
+    }
+
+    @Synchronized
     fun createPickerDocument(file: File): Uri {
         file.parentFile?.mkdirs()
         check(file.createNewFile())
@@ -1220,18 +1504,30 @@ private class PortableOpaqueSafProvider(
     }
 
     @Synchronized
-    private fun fileForId(documentId: String): File {
-        val path = idToPath[documentId] ?: run {
-            unknownIdQueries += documentId
-            throw java.io.FileNotFoundException("Unknown opaque documentId: $documentId")
+    private fun fileForId(documentId: String, writeOperation: Boolean = false): File {
+        val path = idToPath[documentId]
+        if (path != null) return File(path)
+        if (documentId in retiredIds) {
+            if (writeOperation) {
+                retiredIdWriteOperations += documentId
+            } else {
+                retiredIdReadQueries += documentId
+            }
+            throw java.io.FileNotFoundException("Retired opaque documentId: $documentId")
         }
-        return File(path)
+        guessedIdQueries += documentId
+        throw java.io.FileNotFoundException("Unknown opaque documentId: $documentId")
     }
 
     @Synchronized
     private fun rotateSubtreeIds(oldCanonicalRoot: String, newRoot: File) {
-        idToPath.entries.removeIf { (_, path) ->
-            path == oldCanonicalRoot || path.startsWith(oldCanonicalRoot + File.separator)
+        val iter = idToPath.entries.iterator()
+        while (iter.hasNext()) {
+            val (id, path) = iter.next()
+            if (path == oldCanonicalRoot || path.startsWith(oldCanonicalRoot + File.separator)) {
+                retiredIds += id
+                iter.remove()
+            }
         }
         pathToId.keys.removeIf { path ->
             path == oldCanonicalRoot || path.startsWith(oldCanonicalRoot + File.separator)
@@ -1258,7 +1554,7 @@ private class PortableOpaqueSafProvider(
             else -> "application/octet-stream"
         }
 
-    private fun includeFile(cursor: android.database.MatrixCursor, file: File) {
+    private fun includeFile(cursor: android.database.MatrixCursor, file: File): String {
         if (!file.exists()) throw java.io.FileNotFoundException(file.path)
         val flags = if (file.isDirectory) {
             android.provider.DocumentsContract.Document.FLAG_DIR_SUPPORTS_CREATE or
@@ -1286,6 +1582,7 @@ private class PortableOpaqueSafProvider(
             }
         }
         cursor.addRow(row)
+        return docId
     }
 
     override fun query(
@@ -1301,11 +1598,13 @@ private class PortableOpaqueSafProvider(
             val parentDocId = Uri.decode(segments[segments.size - 2])
             val parent = fileForId(parentDocId)
             if (!parent.isDirectory) throw java.io.FileNotFoundException(parentDocId)
-            return android.database.MatrixCursor(cols).also { cursor ->
-                parent.listFiles()?.forEach { child -> includeFile(cursor, child) }
-            }.also {
-                afterChildrenQuery?.invoke(parentDocId)
+            val projectedChildIds = mutableListOf<String>()
+            val cursor = android.database.MatrixCursor(cols).also { out ->
+                parent.listFiles()?.forEach { child -> projectedChildIds += includeFile(out, child) }
             }
+            onChildrenProjected?.invoke(parentDocId, projectedChildIds)
+            afterChildrenQuery?.invoke(parentDocId)
+            return cursor
         }
         val docId = android.provider.DocumentsContract.getDocumentId(uri)
         return android.database.MatrixCursor(cols).also { includeFile(it, fileForId(docId)) }
@@ -1328,7 +1627,7 @@ private class PortableOpaqueSafProvider(
                 val parentId = android.provider.DocumentsContract.getDocumentId(requireNotNull(docUri))
                 val mimeType = inExtras.getString(android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE).orEmpty()
                 val displayName = requireNotNull(inExtras.getString(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME))
-                val parent = fileForId(parentId)
+                val parent = fileForId(parentId, writeOperation = true)
                 val target = File(parent, displayName)
                 if (mimeType == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
                     check(target.mkdirs() || target.isDirectory)
@@ -1342,17 +1641,18 @@ private class PortableOpaqueSafProvider(
             "android:renameDocument" -> {
                 val docId = android.provider.DocumentsContract.getDocumentId(requireNotNull(docUri))
                 val displayName = requireNotNull(inExtras.getString(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME))
-                val source = fileForId(docId)
+                val source = fileForId(docId, writeOperation = true)
                 val oldCanonical = source.canonicalPath
                 val wasDir = source.isDirectory
                 val dest = File(source.parentFile, displayName)
                 check(source.renameTo(dest))
                 val newId = if (wasDir) {
                     rotateSubtreeIds(oldCanonical, dest)
+                    onSubtreeRotated?.invoke()
                     idForFile(dest)
                 } else {
                     synchronized(this) {
-                        idToPath.remove(docId)
+                        idToPath.remove(docId)?.let { retiredIds += docId }
                         pathToId.remove(oldCanonical)
                         idForFile(dest)
                     }
@@ -1367,7 +1667,7 @@ private class PortableOpaqueSafProvider(
     }
 
     override fun openFile(uri: Uri, mode: String): android.os.ParcelFileDescriptor {
-        val file = fileForId(android.provider.DocumentsContract.getDocumentId(uri))
+        val file = fileForId(android.provider.DocumentsContract.getDocumentId(uri), writeOperation = mode != "r")
         val flags = when (mode) {
             "r" -> android.os.ParcelFileDescriptor.MODE_READ_ONLY
             "rw" -> android.os.ParcelFileDescriptor.MODE_READ_WRITE

@@ -47,6 +47,9 @@ internal class SafWorkspaceCoordinator(
     fun closeFolder() {
         owner.workspaceLinks.invalidate()
         writeListFolderSeq(readListFolderSeq() + 1)
+        owner.loadedFilesSeq = 0L
+        owner.loadedFilesGeneration = 0L
+        owner.needsReloadAfterPreRemap = false
         readListFolderJob()?.cancel()
         writeListedRelative("")
         windowPrefs.edit().putBoolean("folderMigrated", true).remove("folder").remove("folderRelative").apply()
@@ -76,6 +79,8 @@ internal class SafWorkspaceCoordinator(
             }
         }
         readListFolderJob()?.cancel()
+        val startGen = safGeneration.get()
+        val startedDuringPendingRemap = owner.hasPendingRemapScopes()
         return scope.launch {
             try {
                 require(!invalidPath) { "Invalid folder path" }
@@ -85,21 +90,47 @@ internal class SafWorkspaceCoordinator(
                         currentCoroutineContext().ensureActive()
                         if (isOwnerRetired() || seq != readListFolderSeq()) return@withLock null
                         val pass = SafProjectionPass(resolver)
-                        listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass) to pass.confirmedTreeKeys
+                        listSafFolderListing(resolver, readDocumentAccess(), targetFolder, requestedRelative, pass) to pass.confirmedTreeKeys.toSet()
                     }
                 } ?: return@launch
-                confirmedTreeDocumentKeys.addAll(confirmedKeys)
+                val endGen = safGeneration.get()
+                val generationValid = !startedDuringPendingRemap && startGen == endGen && !owner.hasPendingRemapScopes()
+                if (generationValid) {
+                    confirmedTreeDocumentKeys.addAll(confirmedKeys)
+                }
                 if (seq == readListFolderSeq() && readState().folder != null) {
-                    writeListedRelative(listing.effectiveRelative)
-                    if (listing.effectiveRelative != requestedRelative) {
-                        windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", listing.effectiveRelative).apply()
+                    if (generationValid) {
+                        writeListedRelative(listing.effectiveRelative)
+                        owner.loadedFilesSeq = seq
+                        owner.loadedFilesGeneration = endGen
+                        owner.needsReloadAfterPreRemap = false
+                        if (listing.effectiveRelative != requestedRelative) {
+                            windowPrefs.edit().putBoolean("folderMigrated", true).putString("folderRelative", listing.effectiveRelative).apply()
+                        }
+                        writeState(readState().copy(folderRelative = listing.effectiveRelative, files = listing.entries))
+                    } else if (owner.hasPendingRemapScopes()) {
+                        owner.needsReloadAfterPreRemap = true
+                    } else {
+                        val currentFolder = readState().folder
+                        if (currentFolder != null) {
+                            listFolder(Uri.parse(currentFolder), normalizeRelativePath(readState().folderRelative.ifEmpty { requestedRelative }))
+                        }
                     }
-                    writeState(readState().copy(folderRelative = listing.effectiveRelative, files = listing.entries))
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                if (seq == readListFolderSeq()) fail("Could not list folder: ${error.message}")
+                if (seq == readListFolderSeq()) {
+                    if (!startedDuringPendingRemap && startGen == safGeneration.get() && !owner.hasPendingRemapScopes()) {
+                        fail("Could not list folder: ${error.message}")
+                    } else if (owner.hasPendingRemapScopes()) {
+                        owner.needsReloadAfterPreRemap = true
+                    } else {
+                        readState().folder?.let { currentFolder ->
+                            listFolder(Uri.parse(currentFolder), normalizeRelativePath(readState().folderRelative.ifEmpty { requestedRelative }))
+                        }
+                    }
+                }
             }
         }.also(writeListFolderJob)
     }
@@ -120,13 +151,15 @@ internal class SafWorkspaceCoordinator(
             val vmState = readVmState(vm)
             val vmFolder = vmState.folder
             if (vmFolder != null && sameDocumentUri(vmFolder, treeRaw)) {
-                vmState.files.firstOrNull { sameDocument(Uri.parse(it.uri), uri) }?.let { entry ->
-                    return normalizeRelativePath(entry.relative).takeIf { it.isNotEmpty() }
-                }
                 vmState.tabs.firstOrNull {
                     it.uri != null && !it.relative.isNullOrBlank() && sameDocument(Uri.parse(it.uri), uri)
                 }?.relative?.let { rel ->
                     return normalizeRelativePath(rel).takeIf { it.isNotEmpty() }
+                }
+                if (vm.hasCurrentLoadedFiles()) {
+                    vmState.files.firstOrNull { sameDocument(Uri.parse(it.uri), uri) }?.let { entry ->
+                        return normalizeRelativePath(entry.relative).takeIf { it.isNotEmpty() }
+                    }
                 }
             }
         }
@@ -147,21 +180,52 @@ internal class SafWorkspaceCoordinator(
         }
         val treeRaw = folderTreeRaw?.takeIf { it.isNotBlank() } ?: return null
         val folderUri = runCatching { Uri.parse(treeRaw) }.getOrNull() ?: return null
-        val pass = SafProjectionPass(resolver)
-        val found = findRelativeInSafTree(
-            pass = pass,
+        val preferredRel = normalizeRelativePath(readState().folderRelative.ifEmpty { readListedRelative() })
+        repeat(3) {
+            val genBefore = safGeneration.get()
+            val pass = SafProjectionPass(resolver)
+            val found = findRelativeInSafTree(
+                pass = pass,
+                documentAccess = readDocumentAccess(),
+                folderUri = folderUri,
+                targetUri = uri,
+                preferredDirRelative = preferredRel,
+            )
+            val genAfter = safGeneration.get()
+            if (genBefore == genAfter && !owner.hasPendingRemapScopes()) {
+                if (pass.confirmedTreeKeys.isNotEmpty()) {
+                    confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+                }
+                if (found != null && DocumentsContract.isTreeUri(uri)) {
+                    canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+                }
+                return found
+            }
+            relativeInOpenFolder(uri, folderTreeRaw)?.let { rel ->
+                if (DocumentsContract.isTreeUri(uri)) {
+                    canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+                }
+                return rel
+            }
+        }
+        val fallbackGenBefore = safGeneration.get()
+        val fallbackPass = SafProjectionPass(resolver)
+        val fallbackFound = findRelativeInSafTree(
+            pass = fallbackPass,
             documentAccess = readDocumentAccess(),
             folderUri = folderUri,
             targetUri = uri,
-            preferredDirRelative = readListedRelative(),
+            preferredDirRelative = preferredRel,
         )
-        if (pass.confirmedTreeKeys.isNotEmpty()) {
-            confirmedTreeDocumentKeys.addAll(pass.confirmedTreeKeys)
+        if (fallbackGenBefore == safGeneration.get() && !owner.hasPendingRemapScopes()) {
+            if (fallbackPass.confirmedTreeKeys.isNotEmpty()) {
+                confirmedTreeDocumentKeys.addAll(fallbackPass.confirmedTreeKeys)
+            }
+            if (fallbackFound != null && DocumentsContract.isTreeUri(uri)) {
+                canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
+            }
         }
-        if (found != null && DocumentsContract.isTreeUri(uri)) {
-            canonicalTreeDocumentKey(uri)?.let(confirmedTreeDocumentKeys::add)
-        }
-        return found
+        return fallbackFound
     }
 
     fun trackedEntriesInOpenFolder(
@@ -249,75 +313,104 @@ internal class SafWorkspaceCoordinator(
         folderTreeRaw: String? = null,
         statusMessage: String? = null,
         preRenameFolderState: Map<StudioViewModel, Pair<Long, String>> = emptyMap(),
+        refreshedFolders: Map<Pair<String, String>, RefreshedFolderSnapshot> = emptyMap(),
+        activeRenameScope: SafRenameScope? = null,
     ) {
-        if (remaps.isEmpty() && oldFolderPrefix == null) return
-        remapPersistedMetadata(remaps)
+        try {
+            if (remaps.isEmpty() && oldFolderPrefix == null) return
+            remapPersistedMetadata(remaps)
 
-        val currentRecents = readRecent()
-        val updatedRecents = currentRecents.map { item ->
-            val matched = remaps.firstOrNull { sameDocumentUri(item.uri, it.oldUri) }
-            when {
-                matched != null -> item.copy(
-                    name = matched.newName ?: item.name,
-                    uri = matched.newUri,
-                    relative = matched.newRelative ?: item.relative,
-                )
-                oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(item.relative, oldFolderPrefix) ->
-                    item.copy(relative = remapRelativePrefix(item.relative, oldFolderPrefix, newFolderPrefix))
-                else -> item
+            val currentRecents = readRecent()
+            val updatedRecents = currentRecents.map { item ->
+                val matched = remaps.firstOrNull { sameDocumentUri(item.uri, it.oldUri) }
+                when {
+                    matched != null -> item.copy(
+                        name = matched.newName ?: item.name,
+                        uri = matched.newUri,
+                        relative = matched.newRelative ?: item.relative,
+                    )
+                    oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(item.relative, oldFolderPrefix) ->
+                        item.copy(relative = remapRelativePrefix(item.relative, oldFolderPrefix, newFolderPrefix))
+                    else -> item
+                }
             }
-        }
-        if (updatedRecents != currentRecents) {
-            storeRecent(updatedRecents)
-        }
+            if (updatedRecents != currentRecents) {
+                storeRecent(updatedRecents)
+            }
 
-        liveViewModels().forEach { vm ->
-            vm.workspaceLinks.invalidate()
-            if (oldFolderPrefix != null) vm.readerFolderIndex.clear()
-            changeVmState(vm) { currentState ->
-                val nextTabs = currentState.tabs.map { tab ->
-                    val tabUri = tab.uri
-                    val matched = if (tabUri != null) remaps.firstOrNull { sameDocumentUri(tabUri, it.oldUri) } else null
-                    when {
-                        matched != null -> tab.copy(
-                            name = matched.newName ?: tab.name,
-                            uri = matched.newUri,
-                            relative = matched.newRelative ?: tab.relative,
-                        )
-                        oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(tab.relative, oldFolderPrefix) ->
-                            tab.copy(relative = remapRelativePrefix(tab.relative, oldFolderPrefix, newFolderPrefix))
-                        else -> tab
+            liveViewModels().forEach { vm ->
+                remaps.forEach { remap ->
+                    val oldParsed = runCatching { Uri.parse(remap.oldUri) }.getOrNull()
+                    if (oldParsed != null) {
+                        canonicalTreeDocumentKey(oldParsed)?.let(vm.confirmedTreeDocumentKeys::remove)
+                        vm.confirmedTreeDocumentKeys.removeIf { key -> sameDocument(Uri.parse(key), oldParsed) }
+                    }
+                    if (remap.confirmedInTree) {
+                        runCatching { Uri.parse(remap.newUri) }.getOrNull()
+                            ?.let(::canonicalTreeDocumentKey)
+                            ?.let(vm.confirmedTreeDocumentKeys::add)
                     }
                 }
-                val nextMsg = if (vm === owner && statusMessage != null) statusMessage else currentState.message
-                currentState.copy(tabs = nextTabs, message = nextMsg)
-            }
-            val vmState = readVmState(vm)
-            val vmFolder = vmState.folder
-            if (vmFolder != null && (folderTreeRaw == null || sameDocumentUri(vmFolder, folderTreeRaw))) {
-                val preRename = preRenameFolderState[vm]
-                val currentRel = if (preRename != null && readVmListFolderSeq(vm) == preRename.first) {
-                    preRename.second
-                } else {
-                    vmState.folderRelative.ifEmpty { readVmListedRelative(vm) }
+                vm.workspaceLinks.invalidate()
+                if (oldFolderPrefix != null) vm.readerFolderIndex.clear()
+                changeVmState(vm) { currentState ->
+                    val nextTabs = currentState.tabs.map { tab ->
+                        val tabUri = tab.uri
+                        val matched = if (tabUri != null) remaps.firstOrNull { sameDocumentUri(tabUri, it.oldUri) } else null
+                        when {
+                            matched != null -> tab.copy(
+                                name = matched.newName ?: tab.name,
+                                uri = matched.newUri,
+                                relative = matched.newRelative ?: tab.relative,
+                            )
+                            oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(tab.relative, oldFolderPrefix) ->
+                                tab.copy(relative = remapRelativePrefix(tab.relative, oldFolderPrefix, newFolderPrefix))
+                            else -> tab
+                        }
+                    }
+                    val nextMsg = if (vm === owner && statusMessage != null) statusMessage else currentState.message
+                    currentState.copy(tabs = nextTabs, message = nextMsg)
                 }
-                val nextListed = if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
-                    remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
-                } else {
-                    currentRel
+                val vmState = readVmState(vm)
+                val vmFolder = vmState.folder
+                if (vmFolder != null && (folderTreeRaw == null || sameDocumentUri(vmFolder, folderTreeRaw))) {
+                    val preRename = preRenameFolderState[vm]
+                    val currentRel = if (preRename != null && readVmListFolderSeq(vm) == preRename.first) {
+                        preRename.second
+                    } else {
+                        vmState.folderRelative.ifEmpty { readVmListedRelative(vm) }
+                    }
+                    val nextListed = normalizeRelativePath(
+                        if (oldFolderPrefix != null && newFolderPrefix != null && matchesRelativePrefix(currentRel, oldFolderPrefix)) {
+                            remapRelativePrefix(currentRel, oldFolderPrefix, newFolderPrefix).orEmpty()
+                        } else {
+                            currentRel
+                        },
+                    )
+                    val preProjected = refreshedFolders.entries.firstOrNull { (key, _) ->
+                        sameDocumentUri(key.first, vmFolder) && key.second == nextListed
+                    }?.value
+                    if (preProjected == null || !vm.commitOpenFolderSnapshot(preProjected, ignorePendingScope = activeRenameScope, matchCurrentRelative = false)) {
+                        vm.listFolder(Uri.parse(vmFolder), nextListed)
+                    }
+                } else if (vmFolder != null && vm.needsReloadAfterPreRemap && folderTreeRaw != "") {
+                    vm.needsReloadAfterPreRemap = false
+                    vm.listFolder(Uri.parse(vmFolder), normalizeRelativePath(vmState.folderRelative.ifEmpty { readVmListedRelative(vm) }))
                 }
-                vm.listFolder(Uri.parse(vmFolder), nextListed)
-            }
-            readVmSeededFind(vm)?.let { seed ->
-                val seedUri = seed.targetUri
-                if (!seedUri.isNullOrBlank()) {
-                    val remappedSeed = remaps.firstOrNull { sameDocumentUri(seedUri, it.oldUri) }
-                    if (remappedSeed != null) {
-                        writeVmSeededFind(vm, seed.copy(targetUri = remappedSeed.newUri))
+                readVmSeededFind(vm)?.let { seed ->
+                    val seedUri = seed.targetUri
+                    if (!seedUri.isNullOrBlank()) {
+                        val remappedSeed = remaps.firstOrNull { sameDocumentUri(seedUri, it.oldUri) }
+                        if (remappedSeed != null) {
+                            writeVmSeededFind(vm, seed.copy(targetUri = remappedSeed.newUri))
+                        }
                     }
                 }
+                refreshVmFolderSearchIfActive(vm)
             }
-            refreshVmFolderSearchIfActive(vm)
+        } finally {
+            if (activeRenameScope != null) owner.completeSafRenameScope(activeRenameScope)
+            owner.completeLocalSafRenameScopes()
         }
     }
 }
