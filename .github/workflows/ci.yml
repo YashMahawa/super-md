@@ -231,9 +231,12 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run test:coverage
+      - run: npm run build
       # Keep the constrained local default at one worker (playwright.config.ts);
       # CI uses two based on same-source 68-test measurements.
       - run: npm run test:browser -- --workers=2
+        env:
+          SUPERMD_PREBUILT_DIST: "1"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -5,17 +5,14 @@ Qt-free :mod:`documents` format helpers.
 """
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
-import mimetypes
 import os
 import re
 import stat
 import sys
 import tempfile
 import threading
-import unicodedata
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -37,7 +34,7 @@ try:
         _heading_slug, _headings, _prose_page_end, _read_headings_and_svg_spans,
         _scan_read_only, _step_fence_boundary, _svg_spans, _word_character, diagram_spans,
         normalize_fence_language, outline_source, read_source, resolve_heading,
-        search_source, section_source,
+        search_source,
     )
 except ImportError:
     from agent.source_ops import (
@@ -48,7 +45,7 @@ except ImportError:
         _heading_slug, _headings, _prose_page_end, _read_headings_and_svg_spans,
         _scan_read_only, _step_fence_boundary, _svg_spans, _word_character, diagram_spans,
         normalize_fence_language, outline_source, read_source, resolve_heading,
-        search_source, section_source,
+        search_source,
     )
 
 MAX_ASSET_BYTES = documents.MAX_IMAGE
