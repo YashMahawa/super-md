@@ -400,6 +400,13 @@ class StudioSavesTests(unittest.TestCase):
             self.studio._after_flush({"action": "reload_reader", "target": ""})
         cancel_tab_mock.assert_called_once_with(self.studio.active)
 
+        self.studio._folder_search_open = True
+        self.studio._folder_search_query = "needle"
+        self.studio._folder_search_pending = True
+        with patch.object(self.studio, "_start_folder_search") as start_search_mock:
+            self.studio._after_flush({"action": "sync_for_search", "target": ""})
+        start_search_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

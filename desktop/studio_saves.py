@@ -153,8 +153,10 @@ def after_flush(studio_obj, operation: dict, *, local_path_fn=_default_local_pat
     elif action == "reload_conflict": studio_obj._reload_current_from_disk()
     elif action == "sync_for_search":
         if studio_obj._folder_search_open and studio_obj._folder_search_query.strip():
-            current_sig = [(t["id"], t["content"], _check_dirty(studio_obj, t, is_dirty_fn)) for t in studio_obj.tabs]
-            (studio_obj._start_folder_search if current_sig != studio_obj._folder_search_tabs_sig else studio_obj.workspaceSearchChanged.emit)()
+            if getattr(studio_obj, "_folder_search_pending", False): studio_obj.workspaceSearchChanged.emit()
+            else:
+                current_sig = [(t["id"], t["content"], _check_dirty(studio_obj, t, is_dirty_fn)) for t in studio_obj.tabs]
+                (studio_obj._start_folder_search if current_sig != studio_obj._folder_search_tabs_sig else studio_obj.workspaceSearchChanged.emit)()
     elif action == "open_search_match":
         request = json.loads(operation["target"])
         tab_id, path, query = request.get("tabId") or "", request.get("path") or "", request.get("query") or ""
@@ -356,8 +358,8 @@ def autosave(studio_obj, *, is_dirty_fn=None) -> None:
     if not studio_obj.settings["autosave"]: return
     staging = getattr(studio_obj, "_staging_tabs", ())
     for tab in studio_obj.tabs:
-        if (tab["path"] and _check_dirty(studio_obj, tab, is_dirty_fn) and not tab.get("conflict")
-                and not tab.get("agent_staged") and tab["id"] not in studio_obj.saving and tab["id"] not in staging):
+        if (tab["path"] and _check_dirty(studio_obj, tab, is_dirty_fn) and not tab.get("agent_staged")
+                and not tab.get("conflict") and tab["id"] not in studio_obj.saving and tab["id"] not in staging):
             studio_obj._save_text(tab, Path(tab["path"]), automatic=True)
 
 def existing_save_directory(raw_path, *, reject_links: bool = False) -> Path | None:
@@ -466,10 +468,10 @@ def prepare_save_document(studio_obj, args: dict, *, open_note_fn=open_note, wri
     tab_id = args.get("tabId")
     if not (tab := next((item for item in studio_obj.tabs if item["id"] == tab_id), None)):
         raise ValueError("Save requires a target tab that is still open")
-    if tab_id in (getattr(studio_obj, "saving", None) or ()):
-        raise ValueError("A save is already in progress for this tab; retry after it finishes")
     if tab_id in (getattr(studio_obj, "_staging_tabs", None) or ()):
         raise ValueError("An agent patch is already staging for this tab; retry after it finishes")
+    if tab_id in (getattr(studio_obj, "saving", None) or ()):
+        raise ValueError("A save is already in progress for this tab; retry after it finishes")
     content_snapshot = tab["content"]
     revision = hashlib.sha256(content_snapshot.encode("utf-8")).hexdigest()
     if args.get("expectedRevision") != revision:
