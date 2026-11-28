@@ -217,13 +217,16 @@ ApplicationWindow {
         self.studio.createFolderNote(str(created_target), "First Idea", "md")
         self._wait_for(lambda: "HiddenDrafts" in self._rels() and "HiddenDrafts/First Idea.md" in self._rels())
 
-        # 2. Saving an untitled note via saveAs (.txt) into Research/Papers reveals ancestor Research
+        # 2. Saving an untitled note via saveAs (.txt) into Research/Papers reveals and expands ancestors
         self.studio.newNote()
         self.studio._current()["content"] = "Plain text summary\n"
         self.studio.saveAs(str(saved_target / "Summary.txt"))
-        self._wait_for(lambda: self.studio.busy == 0 and "Research" in self._rels())
-        self.studio.toggleDirectory(str(self.workspace / "Research"))
-        self._wait_for(lambda: "Research/Papers" in self._rels())
+        self._wait_for(
+            lambda: self.studio.busy == 0
+            and "Research" in self._rels()
+            and "Research/Papers" in self._rels()
+            and "Research/Papers/Summary.txt" in self._rels()
+        )
 
         # 3. External note file added on disk inside Inbox/Clipped reveals Inbox upon workspace change
         ext_file = Path(canonical_path_str(external_target)) / "WebClip.smd"

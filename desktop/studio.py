@@ -378,6 +378,33 @@ def local_path(value: str) -> Path:
     return Path(folder_ops.strip_extended_length_prefix(str(resolved)))
 
 
+def _raw_local_path(value: str) -> Path:
+    url = QUrl(value)
+    raw = url.toLocalFile() if url.isLocalFile() else value
+    return Path(folder_ops.strip_extended_length_prefix(str(Path(raw).expanduser())))
+
+
+def _dedupe_path_list(paths) -> list[str]:
+    seen_keys: set[str] = set()
+    seen_raw: set[str] = set()
+    result: list[str] = []
+    for raw in paths:
+        if not isinstance(raw, str) or not raw:
+            continue
+        cleaned = folder_ops.strip_extended_length_prefix(raw.strip())
+        if cleaned and (Path(cleaned).is_absolute() or folder_ops._WINDOWS_PATH_RE.match(cleaned)):
+            key = folder_ops.normalize_path_key(cleaned)
+            if not key or key in seen_keys:
+                continue
+            seen_keys.add(key)
+        else:
+            if raw in seen_raw:
+                continue
+            seen_raw.add(raw)
+        result.append(raw)
+    return result
+
+
 def _extract_local_drop_paths(values) -> list[Path]:
     paths: list[Path] = []
     seen: set[str] = set()
@@ -598,8 +625,8 @@ class Session(QObject):
             if not stored["settings"].get("widthMigrated") and stored["settings"].get("widthPercent") == 80:
                 self.settings["widthPercent"] = 90  # 80% was the old default, not a choice.
             self.settings["pdf"] = {**DEFAULT_PDF, **self.settings.get("pdf", {})}
-            self.pinned = list(dict.fromkeys(p for p in stored.get("pinned",[]) if isinstance(p,str)))[:10]
-            self.recent = list(dict.fromkeys(self.pinned + [p for p in stored.get("recent",[]) if isinstance(p,str)]))[:10]
+            self.pinned = _dedupe_path_list(p for p in stored.get("pinned", []) if isinstance(p, str))[:10]
+            self.recent = _dedupe_path_list([*self.pinned, *(p for p in stored.get("recent", []) if isinstance(p, str))])[:10]
         except (OSError,ValueError,KeyError,TypeError,AttributeError): pass
         had_explicit_keep_in_background = isinstance(stored_settings, dict) and "keepInBackground" in stored_settings
         fresh_service_log = os.environ.get("SUPERMD_FRESH_SERVICE_LOG") == "1"
@@ -1218,6 +1245,7 @@ class Studio(QObject):
         self.pending_close = ""
         self.pending_export = ""
         self.pending_save_as = ""
+        self.pending_save_as_raw = ""
         self.pending_save_as_tab = ""
         self._force_overwrite_ids: set[str] = set()
         self.flush_operation = None
@@ -1359,7 +1387,19 @@ class Studio(QObject):
     def recent(self): return self.session.recent
 
     @recent.setter
-    def recent(self,value): self.session.recent = list(dict.fromkeys(self.session.pinned + value))[:10]
+    def recent(self,value): self.session.recent = _dedupe_path_list([*self.session.pinned, *value])[:10]
+
+    def _record_recent_note(self, path) -> str:
+        canon = folder_ops.canonical_path_str(path) or str(path)
+        session = getattr(self, "session", None)
+        if session is not None and isinstance(getattr(session, "pinned", None), list) and session.pinned:
+            session.pinned = _dedupe_path_list(
+                canon if folder_ops.same_path(item, canon) else item
+                for item in session.pinned
+            )[:10]
+        current_recent = list(getattr(self, "recent", []) or [])
+        self.recent = [canon] + [item for item in current_recent if not folder_ops.same_path(item, canon)][:29]
+        return canon
 
     @property
     def message(self): return getattr(self, "_message", "")
@@ -3858,6 +3898,72 @@ class Studio(QObject):
         except (OSError, ValueError):
             return False
 
+    @staticmethod
+    def _has_symlink_between_root_and_target(win_root: Path, raw_parent: Path) -> bool:
+        current = raw_parent
+        while True:
+            try:
+                if folder_ops.same_path(current, win_root):
+                    return False
+            except OSError:
+                return True
+            if folder_ops._is_link_or_junction(current):
+                return True
+            if current.parent == current:
+                return False
+            current = current.parent
+
+    def _expand_open_folder_ancestors(self, *saved_paths) -> None:
+        if not saved_paths:
+            return
+        session = getattr(self, "session", None)
+        windows = tuple(session.windows.values()) if session is not None and hasattr(session, "windows") else (self,)
+        for window in windows:
+            if getattr(window, "retired", False):
+                continue
+            raw_folder = getattr(window, "folder", "")
+            win_root = Studio._existing_save_directory(raw_folder, reject_links=True)
+            if win_root is None or not isinstance(getattr(window, "expanded", None), set):
+                continue
+            existing_keys = {folder_ops.normalize_path_key(item) for item in window.expanded if item}
+            changed = False
+            for candidate in saved_paths:
+                if not candidate:
+                    continue
+                cleaned = folder_ops.strip_extended_length_prefix(str(candidate).strip())
+                if not cleaned:
+                    continue
+                raw_candidate = Path(cleaned)
+                if not is_searchable_note_name(raw_candidate.name):
+                    continue
+                if folder_ops._is_link_or_junction(raw_candidate):
+                    continue
+                if Studio._has_symlink_between_root_and_target(win_root, raw_candidate.parent):
+                    continue
+                try:
+                    resolved_parent = folder_ops.resolve_within_open_folder(
+                        win_root,
+                        raw_candidate.parent,
+                        allow_root=True,
+                        must_exist=True,
+                    )
+                except ValueError:
+                    continue
+                ancestors = folder_ops.ancestor_directories_in_folder(win_root, resolved_parent)
+                if not _is_folder_tree_note_name(raw_candidate.name) and isinstance(getattr(window, "_pinned_visible_dirs", None), set):
+                    window._pinned_visible_dirs.update(ancestors)
+                for ancestor in ancestors:
+                    key = folder_ops.normalize_path_key(ancestor)
+                    if key and key not in existing_keys:
+                        window.expanded.add(ancestor)
+                        existing_keys.add(key)
+                        changed = True
+            if changed:
+                if hasattr(window, "_watch_notes"):
+                    window._watch_notes()
+                if window is not self and hasattr(window, "_recover"):
+                    window._recover()
+
     def _refresh_open_folder_trees(self, *candidates) -> None:
         if not candidates:
             return
@@ -4218,15 +4324,25 @@ class Studio(QObject):
 
     @Slot(str)
     def saveAs(self, value):
+        raw_path = _raw_local_path(value)
         path = local_path(value)
         tab = self._current()
         if path.suffix.lower() == ".smd" and self.ready:
             self.pending_export = str(path)
             self.pending_save_as = str(path)
+            self.pending_save_as_raw = str(raw_path)
             self.pending_save_as_tab = tab["id"]
             self.readerCall.emit("window.supermdPortable?.(false)")
         else:
-            self._save_text(tab, path, automatic=False, force_overwrite=True, force_portable=path.suffix.lower() == ".smd")
+            self._save_text(
+                tab,
+                path,
+                automatic=False,
+                force_overwrite=True,
+                force_portable=path.suffix.lower() == ".smd",
+                save_as=True,
+                raw_target_path=raw_path,
+            )
 
     @Slot(str)
     def resolveConflict(self, choice):
@@ -4344,7 +4460,7 @@ class Studio(QObject):
 
         self._submit(work, done, True, self.writes)
 
-    def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False):
+    def _save_text(self, tab, path, automatic=False, force_overwrite=False, force_portable=False, save_as=False, raw_target_path=None):
         id, content, assets = tab["id"], tab["content"], dict(tab["assets"])
         expected, original_path = tab["saved"], tab["path"]
         expected_assets = dict(tab.get("saved_assets", {}))
@@ -4373,6 +4489,7 @@ class Studio(QObject):
                 return
             if isinstance(outcome, dict) and outcome.get("stamp"):
                 self.note_file_stamps[str(path)] = outcome["stamp"]
+            rebound = bool(save_as or str(path) != original_path)
             if target:
                 target.update(
                     path=str(path),
@@ -4395,13 +4512,15 @@ class Studio(QObject):
                     pass
                 if str(path) != original_path:
                     self.session.workspace_links.invalidate(path.parent)
-                    self.recent = [str(path)] + [p for p in self.recent if p != str(path)][:29]
+                if rebound:
+                    self._record_recent_note(path)
+                    self._expand_open_folder_ancestors(raw_target_path or path)
                     self._preferences()
                 if automatic and self._is_dirty(target) and not target.get("agent_staged"): self.autosave_timer.start(900)
             self.message = "Autosaved" if automatic else "Saved"
             self._recover()
             self._emit()
-            if str(path) != original_path:
+            if rebound:
                 self._refresh_open_folder_trees(path, original_path)
             if self.pending_close:
                 self._finish_close()
@@ -6018,6 +6137,8 @@ class Studio(QObject):
                 if is_dirty and getattr(self, "settings", {}).get("autosave") and hasattr(self, "autosave_timer"):
                     self.autosave_timer.start(900)
             self._agent_open_paths.add(str(resolved_path))
+            if path_changed:
+                Studio._expand_open_folder_ancestors(self, resolved_path)
             self._recover()
             self._emit()
             if path_changed:
@@ -6779,7 +6900,7 @@ class Studio(QObject):
                     )
                 self._submit(resolve_work, resolve_done, False)
                 return
-            if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
+            if command == "export_failed": self.pending_export = self.pending_save_as = self.pending_save_as_raw = self.pending_save_as_tab = ""; self.message = args["error"]; self._emit(False); self.replied.emit(id,"true",""); return
             if command == "request_fmd_export": self.exportRequested.emit("smd"); self.replied.emit(id,"true",""); return
             context=args.get("context")
             if context is not None:
@@ -6795,6 +6916,7 @@ class Studio(QObject):
             captured["saved_assets"] = dict(tab.get("saved_assets", {}))
             output = self.pending_export
             save_as = self.pending_save_as
+            save_as_raw = getattr(self, "pending_save_as_raw", "")
             save_as_tab = self.pending_save_as_tab
             force_portable_overwrite = bool(command == "export_fmd_native" and args.get("save") and captured["id"] in self._force_overwrite_ids)
             if command == "export_fmd_native" and args.get("save"):
@@ -6909,6 +7031,7 @@ class Studio(QObject):
                 if command.startswith("export_") and self.pending_export == output: self.pending_export = ""
                 if error and self.pending_save_as == save_as:
                     self.pending_save_as = ""
+                    self.pending_save_as_raw = ""
                     self.pending_save_as_tab = ""
                 if error:
                     if agent_export_info:
@@ -6987,7 +7110,8 @@ class Studio(QObject):
                             pass
                         if path_changed:
                             self.session.workspace_links.invalidate(Path(save_as).parent)
-                        self.recent = [save_as] + [p for p in self.recent if p != save_as][:29]
+                        self._record_recent_note(save_as)
+                        self._expand_open_folder_ancestors(save_as_raw or save_as)
                         self._preferences()
                         self.message = "Saved"
                         self._recover()
@@ -6995,6 +7119,7 @@ class Studio(QObject):
                         self._refresh_open_folder_trees(save_as, old_save_path)
                         if self.pending_close: self._finish_close()
                     self.pending_save_as = ""
+                    self.pending_save_as_raw = ""
                     self.pending_save_as_tab = ""
                 elif command.startswith("export_"):
                     studio_exports.finalize_standalone_export(self, result["path"])
