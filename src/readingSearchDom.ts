@@ -1,36 +1,42 @@
 import { flushSync } from "react-dom";
 import { windowedMatches, revealWindowed, compileSearchPattern, nextSearchMatch, normalizeSearchOptions, type WindowedMatch, type SearchMatchConfig, type SearchMatchOptions } from "./windowedSearch";
-import { parseFrontmatter, type FrontmatterVisibleField, type FrontmatterVisibleSpan, type ParsedFrontmatter } from "./frontmatter";
+import { type FrontmatterVisibleField, type FrontmatterVisibleSpan } from "./frontmatter";
 import { cancelHeadingNavigation } from "./documentNavigation";
 import { refreshDocumentExtent } from "./documentZoom";
-export type { SearchMatchConfig, SearchMatchOptions };
+import {
+  SOURCE_CANDIDATE_SELECTOR, deepestSourceOwner, findAncestorSourceIndex, findContainingBlock, findContainingBlockInIndex,
+  getParsedFrontmatter, getSourceRangeIndex, invalidateSourceRangeIndex, refreshSourceRangeIndex, resolveSourceBlock,
+  sourceBoundsForElement, type SourceRange, type SourceRangeIndex,
+} from "./readingSearchSourceIndex";
+export type { SearchMatchConfig, SearchMatchOptions, SourceRange };
+export { deepestSourceOwner, findContainingBlock, invalidateSourceRangeIndex, resolveSourceBlock };
 
 export const cancelSettlingHeading = () => document.querySelectorAll(".android-reading,.reading-scroll,.live-pane").forEach(cancelHeadingNavigation);
 export const findReadingHost = () => document.querySelector<HTMLElement>(".android-reading,.reading-scroll,.live-document,.markdown-body");
 export type HighlightRegistry = Map<string, unknown>;
-export type SourceRange = { from: number; to: number };
 
 const MAX_SEARCH_MATCHES = 5000, MAX_HIDDEN_SCAN_CHARS = 200_000;
 const INLINE_HTML_TAG_TOKEN = /<\/?(?:br|mark|sub|sup|kbd|u)(?:\s+(?:[^>"']|"[^"]*"|'[^']*')*)?\s*\/?>/yi;
 const EXCLUDED_SEARCH_TAGS = new Set(["button", "input", "textarea", "select", "svg", "script", "style", "template", "annotation", "iframe"]);
 const EXCLUDED_SEARCH_CLASS_PATTERN = /(?:^|\s)(?:katex-mathml|chart-controls|chart-toolbar|chart-legend|image-edit-tools|image-loading|image-error|remote-image-card|is-offstage)(?:\s|$)/;
 const SEARCH_BLOCK_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "li", "pre", "td", "summary"]);
-const OBSERVED_SEARCH_ATTRS = ["data-windowed-mounted", "hidden", "inert", "style", "class", "aria-hidden", "data-frontmatter-properties", "data-frontmatter-field", "data-source-start", "data-source-end"];
+const OBSERVED_SEARCH_ATTRS = ["data-windowed-mounted", "data-windowed-block", "hidden", "inert", "style", "class", "aria-hidden", "data-frontmatter-properties", "data-frontmatter-field", "data-source-start", "data-source-end"];
 
 type DomVersionEntry = { observer: MutationObserver | null; version: number };
 type RangeLike = { startContainer: Node; startOffset: number; endContainer: Node; endOffset: number };
 const domVersions = new WeakMap<Element, DomVersionEntry>();
 const readingMatchesCache = new WeakMap<Element, { root: Element; version: number; key: string; connected: boolean; ranges: Range[] }>();
-const sourceHighlightCache = new WeakMap<Element, { root: Element; version: number; connected: boolean; content: string; ranges: SourceRange[]; activeIndex: number; key: string; range: Range | null }>();
+const sourceHighlightCache = new WeakMap<Element, {
+  root: Element; version: number; indexVersion: number; connected: boolean; content: string;
+  ranges: SourceRange[]; activeIndex: number; key: string; knownBlock: HTMLElement | null | undefined; range: Range | null;
+}>();
 const highlightSyncCache = new WeakMap<HighlightRegistry, { allRef?: Range[]; allSnaps?: RangeLike[]; current?: RangeLike | null }>();
-let cachedFmContent: string | null = null, cachedFmResult: ParsedFrontmatter | null = null;
-function getParsedFrontmatter(content: string): ParsedFrontmatter | null {
-  if (cachedFmContent !== content) { cachedFmContent = content; cachedFmResult = parseFrontmatter(content, { includeSpans: true }); }
-  return cachedFmResult;
-}
+
 const isFrontmatterPropertiesContainer = (el: Element): boolean => el.hasAttribute("data-frontmatter-properties") || el.classList.contains("document-properties");
 const isAllowedFrontmatterField = (el: Element): el is HTMLElement => ["title", "author", "tag"].includes(el.getAttribute("data-frontmatter-field") ?? "");
 export const rangeStartElement = (r: Range | null): Element | null => r ? (r.startContainer.nodeType === Node.ELEMENT_NODE ? r.startContainer as Element : r.startContainer.parentElement) : null;
+export const isLiveMatchRange = (r: Range | null | undefined, root?: Element): r is Range =>
+  Boolean(r && !r.collapsed && (root ? root.contains(r.startContainer) : r.startContainer.isConnected) && !rangeStartElement(r)?.closest('[data-windowed-mounted="false"]'));
 function hasRelevantSearchMutation(records: MutationRecord[]): boolean {
   return records.some(r => {
     if (r.type !== "attributes" || r.attributeName !== "style") return true;
@@ -179,37 +185,7 @@ export function hiddenSpansInSlice(raw: string, offset: number): SourceRange[] {
   }
   return hidden;
 }
-function sourceBounds(el: Element, content?: string): { start: number; end: number } | null {
-  if (!(el instanceof HTMLElement) || el.tagName === "TEXTAREA") return null;
-  const attrStart = el.getAttribute("data-source-start"), attrEnd = el.getAttribute("data-source-end");
-  if (attrStart !== null && attrEnd !== null) {
-    const start = Number(attrStart), end = Number(attrEnd);
-    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) return { start, end };
-  }
-  if (content !== undefined && el.classList.contains("code-container")) {
-    let regionStart = 0, ordinal = 0, regionEnd = content.length;
-    for (let prev = el.previousElementSibling; prev; prev = prev.previousElementSibling) {
-      const prevEnd = prev instanceof HTMLElement ? prev.getAttribute("data-source-end") : null;
-      if (prevEnd !== null && Number.isFinite(Number(prevEnd))) { regionStart = Number(prevEnd); break; }
-      if (prev instanceof HTMLElement && prev.classList.contains("code-container")) ordinal++;
-    }
-    if (regionStart === 0) { const fm = getParsedFrontmatter(content); if (fm) regionStart = fm.end; }
-    for (let next = el.nextElementSibling; next; next = next.nextElementSibling) {
-      const nextStart = next instanceof HTMLElement ? next.getAttribute("data-source-start") : null;
-      if (nextStart !== null && Number.isFinite(Number(nextStart))) { regionEnd = Number(nextStart); break; }
-    }
-    if (regionEnd >= regionStart) {
-      const slice = content.slice(regionStart, regionEnd), fencePattern = /^[ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n[ \t]*\1[ \t]*(?=\r?\n|$)/gm;
-      let match: RegExpExecArray | null, seen = 0;
-      while ((match = fencePattern.exec(slice))) {
-        if (seen === ordinal) return { start: regionStart + match.index, end: regionStart + match.index + match[0].length };
-        seen++;
-      }
-      return { start: regionStart, end: regionEnd };
-    }
-  }
-  return null;
-}
+
 export function openDisclosuresFor(target: Element | null, scope?: Element | null, range?: Range | null, sourceRange?: SourceRange): boolean {
   let opened = false;
   for (const anchor of [rangeStartElement(range ?? null), target, scope]) {
@@ -222,15 +198,15 @@ export function openDisclosuresFor(target: Element | null, scope?: Element | nul
       if (disclosure.open) continue;
       if (range && disclosure.contains(range.startContainer)) { disclosure.open = true; opened = true; continue; }
       if (sourceRange) {
-        const bounds = sourceBounds(disclosure.closest("[data-source-start]") || disclosure);
+        const bounds = sourceBoundsForElement(disclosure.closest("[data-source-start]") || disclosure);
         if (!bounds || (bounds.start <= sourceRange.from && sourceRange.from <= bounds.end)) { disclosure.open = true; opened = true; }
       }
     }
   }
   return opened;
 }
-function visibleSourceSpan(owner: HTMLElement, content: string): { start: number; end: number } | null {
-  const bounds = sourceBounds(owner, content);
+function visibleSourceSpan(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): { start: number; end: number } | null {
+  const bounds = sourceBoundsForElement(owner, content, sharedIndex);
   if (!bounds) return null;
   const { start, end } = bounds, raw = content.slice(start, end);
   if (owner.tagName === "A" && raw.startsWith("[")) { const close = markdownBracketEnd(raw, 0); return close < raw.length ? { start: start + 1, end: start + close } : bounds; }
@@ -247,30 +223,6 @@ function visibleSourceSpan(owner: HTMLElement, content: string): { start: number
 
 const ownerDomScope = (owner: HTMLElement): Element => owner.matches(".code-container,.python-cell") ? (owner.querySelector("pre.python-source,pre") ?? owner) : owner;
 
-export function findContainingBlock(host: Element, range: SourceRange, content?: string): HTMLElement | null {
-  let best: HTMLElement | null = null, bestLen = Infinity, overlapping: HTMLElement | null = null, overlappingLen = Infinity;
-  for (const el of host.querySelectorAll<HTMLElement>(".live-block,[data-windowed-block],[data-source-start],.code-container")) {
-    const bounds = sourceBounds(el, content);
-    if (!bounds) continue;
-    const len = bounds.end - bounds.start, isTopBlock = el.classList.contains("live-block") || el.hasAttribute("data-windowed-block");
-    if (bounds.start <= range.from && range.to <= bounds.end) {
-      if (isTopBlock ? (!best || (!best.classList.contains("live-block") && !best.hasAttribute("data-windowed-block")) || len < bestLen) : (!best && len <= bestLen)) { best = el; bestLen = len; }
-    } else if (bounds.start <= range.from && range.from < bounds.end && len <= overlappingLen) { overlapping = el; overlappingLen = len; }
-  }
-  return best ?? overlapping;
-}
-
-export function deepestSourceOwner(block: HTMLElement, range: SourceRange, content?: string): HTMLElement | null {
-  let owner: HTMLElement | null = null, ownerLen = Infinity;
-  const blockBounds = sourceBounds(block, content);
-  if (blockBounds && blockBounds.start <= range.from && range.from <= blockBounds.end) { owner = block; ownerLen = blockBounds.end - blockBounds.start; }
-  for (const el of block.querySelectorAll<HTMLElement>("[data-source-start],.code-container")) {
-    const bounds = sourceBounds(el, content);
-    if (bounds && bounds.start <= range.from && range.to <= bounds.end && bounds.end - bounds.start <= ownerLen) { owner = el; ownerLen = bounds.end - bounds.start; }
-  }
-  return owner;
-}
-
 const ownerHiddenSpans = (owner: HTMLElement, content: string, visible: { start: number; end: number }): SourceRange[] =>
   !owner.closest("pre,code,.code-container,.python-cell") && visible.end - visible.start <= MAX_HIDDEN_SCAN_CHARS
     ? hiddenSpansInSlice(content.slice(visible.start, visible.end), visible.start) : [];
@@ -280,9 +232,23 @@ function isCoveredByHiddenSpan(hidden: SourceRange[], candidate: SourceRange): b
   return (idx < hidden.length && hidden[idx].from === candidate.from && candidate.to <= hidden[idx].to) || (idx > 0 && candidate.to <= hidden[idx - 1].to);
 }
 
-function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, visible = visibleSourceSpan(owner, content), hidden?: SourceRange[]): boolean {
+function getCachedOwnerSpans(owner: HTMLElement, content: string, sharedIndex?: SourceRangeIndex): { visible: { start: number; end: number } | null; hidden: SourceRange[] } {
+  const index = sharedIndex ? refreshSourceRangeIndex(sharedIndex, content) : findAncestorSourceIndex(owner, content);
+  if (index && index.lastContent === content) {
+    const hit = index.ownerSpans.get(owner);
+    if (hit) return { visible: hit.visible, hidden: hit.hidden ?? [] };
+    const visible = visibleSourceSpan(owner, content, index), hidden = visible ? ownerHiddenSpans(owner, content, visible) : [];
+    index.ownerSpans.set(owner, { visible, hidden });
+    return { visible, hidden };
+  }
+  const visible = visibleSourceSpan(owner, content, index);
+  return { visible, hidden: visible ? ownerHiddenSpans(owner, content, visible) : [] };
+}
+
+function isDirectVisibleMatch(owner: HTMLElement, content: string, candidate: SourceRange, sharedIndex?: SourceRangeIndex): boolean {
+  const { visible, hidden } = getCachedOwnerSpans(owner, content, sharedIndex);
   if (!visible || candidate.from < visible.start || candidate.to > visible.end) return false;
-  return deepestSourceOwner(owner, candidate, content) === owner && !isCoveredByHiddenSpan(hidden ?? ownerHiddenSpans(owner, content, visible), candidate);
+  return deepestSourceOwner(owner, candidate, content, sharedIndex) === owner && !isCoveredByHiddenSpan(hidden, candidate);
 }
 
 function directOwnerDomRanges(owner: HTMLElement, query: string, options: SearchMatchConfig): Range[] {
@@ -294,20 +260,19 @@ function directOwnerDomRanges(owner: HTMLElement, query: string, options: Search
   });
 }
 
-export function mapSourceRangeToDomRange(block: HTMLElement, content: string, ranges: SourceRange[], activeIndex: number, query: string, options: SearchMatchConfig = false): Range | null {
+export function mapSourceRangeToDomRange(block: HTMLElement, content: string, ranges: SourceRange[], activeIndex: number, query: string, options: SearchMatchConfig = false, sharedIndex?: SourceRangeIndex): Range | null {
   const target = ranges[activeIndex];
   if (!target || block.closest('[data-windowed-mounted="false"]')) return null;
-  const owner = deepestSourceOwner(block, target, content), visible = owner ? visibleSourceSpan(owner, content) : null;
-  const hidden = owner && visible ? ownerHiddenSpans(owner, content, visible) : undefined;
-  if (!owner || !visible || !isDirectVisibleMatch(owner, content, target, visible, hidden)) return null;
+  const owner = deepestSourceOwner(block, target, content, sharedIndex);
+  if (!owner || !isDirectVisibleMatch(owner, content, target, sharedIndex)) return null;
   const domRanges = directOwnerDomRanges(owner, query, options);
   if (!domRanges.length) return null;
-  const ownerBounds = sourceBounds(owner, content);
+  const ownerBounds = sourceBoundsForElement(owner, content, sharedIndex);
   let ordinal = 0;
   for (let i = ownerBounds ? firstSourceRangeFrom(ranges, ownerBounds.start, activeIndex) : 0; i < activeIndex; i++) {
     const candidate = ranges[i];
     if (ownerBounds && candidate.from > ownerBounds.end) break;
-    if ((!ownerBounds || candidate.to <= ownerBounds.end) && deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate, visible, hidden)) ordinal++;
+    if ((!ownerBounds || candidate.to <= ownerBounds.end) && deepestSourceOwner(block, candidate, content, sharedIndex) === owner && isDirectVisibleMatch(owner, content, candidate, sharedIndex)) ordinal++;
   }
   return domRanges[ordinal] ?? null;
 }
@@ -344,7 +309,7 @@ export function mapFrontmatterSourceRangeToDomRange(host: Element, content: stri
   return ordinal >= 0 ? (domRanges[ordinal] ?? null) : null;
 }
 
-export function mapDomRangeToSourceIndex(host: Element, content: string, ranges: SourceRange[], domRange: Range, query: string, options: SearchMatchConfig = false): number {
+export function mapDomRangeToSourceIndex(host: Element, content: string, ranges: SourceRange[], domRange: Range, query: string, options: SearchMatchConfig = false, sharedIndex?: SourceRangeIndex): number {
   const common = domRange.commonAncestorContainer.nodeType === Node.ELEMENT_NODE ? domRange.commonAncestorContainer as Element : domRange.commonAncestorContainer.parentElement;
   const fmFieldEl = common?.closest<HTMLElement>("[data-frontmatter-field]");
   if (fmFieldEl && isAllowedFrontmatterField(fmFieldEl)) {
@@ -356,53 +321,53 @@ export function mapDomRangeToSourceIndex(host: Element, content: string, ranges:
     const mapped = spans?.length ? orderedFrontmatterSourceIndices(spans, ranges, rawField, fieldOrdinal)[ordinal] : undefined;
     if (mapped !== undefined) return mapped;
   }
+  const index = sharedIndex ?? getSourceRangeIndex(host, content);
   const owner = common?.closest<HTMLElement>("[data-source-start],.code-container");
   if (owner) {
     const ordinal = directOwnerDomRanges(owner, query, options).findIndex(r => sameDomRange(r, domRange));
-    const visible = ordinal >= 0 ? visibleSourceSpan(owner, content) : null;
-    if (ordinal >= 0 && visible) {
-      const hidden = ownerHiddenSpans(owner, content, visible), ownerBounds = sourceBounds(owner, content);
+    if (ordinal >= 0) {
+      const ownerBounds = sourceBoundsForElement(owner, content, index);
       let seen = 0;
       for (let i = ownerBounds ? firstSourceRangeFrom(ranges, ownerBounds.start) : 0; i < ranges.length; i++) {
         const candidate = ranges[i];
         if (ownerBounds && candidate.from > ownerBounds.end) break;
         if (ownerBounds && candidate.to > ownerBounds.end) continue;
-        const block = findContainingBlock(host, candidate, content);
-        if (block && deepestSourceOwner(block, candidate, content) === owner && isDirectVisibleMatch(owner, content, candidate, visible, hidden)) {
+        const block = findContainingBlockInIndex(index, candidate);
+        if (block && deepestSourceOwner(block, candidate, content, index) === owner && isDirectVisibleMatch(owner, content, candidate, index)) {
           if (seen++ === ordinal) return i;
         }
       }
     }
   }
-  const scopeBlock = common?.closest<HTMLElement>(".live-block,[data-windowed-block],[data-source-start],.code-container");
-  const scopeBounds = scopeBlock ? sourceBounds(scopeBlock, content) : null;
+  const scopeBlock = common?.closest<HTMLElement>(SOURCE_CANDIDATE_SELECTOR);
+  const scopeBounds = scopeBlock ? sourceBoundsForElement(scopeBlock, content, index) : null;
   for (let i = scopeBounds ? firstSourceRangeFrom(ranges, scopeBounds.start) : 0; i < ranges.length; i++) {
     const candidate = ranges[i];
     if (scopeBounds && candidate.from > scopeBounds.end) break;
-    const block = findContainingBlock(host, candidate, content);
-    if (!block || !block.contains(domRange.startContainer)) continue;
-    const resolved = mapSourceRangeToDomRange(block, content, ranges, i, query, options);
+    const block = findContainingBlockInIndex(index, candidate);
+    if (block && !block.contains(domRange.startContainer)) continue;
+    const resolved = block
+      ? mapSourceRangeToDomRange(block, content, ranges, i, query, options, index)
+      : (!scopeBlock ? mapFrontmatterSourceRangeToDomRange(host, content, ranges, i, query, options) : null);
     if (resolved && sameDomRange(resolved, domRange)) return i;
   }
   return -1;
 }
 
-export function resolveSourceBlock(host: Element, range: SourceRange, content?: string): HTMLElement | null {
-  const containing = findContainingBlock(host, range, content);
-  if (containing) return deepestSourceOwner(containing, range, content) ?? containing;
-  let fallback: HTMLElement | null = null;
-  for (const el of host.querySelectorAll<HTMLElement>("[data-source-start]")) { const b = sourceBounds(el, content); if (b && b.start <= range.from) fallback = el; }
-  return fallback;
-}
-
 export function resolveSourceHighlightRange(host: Element, content: string, ranges: SourceRange[], activeIndex: number, query: string, options: SearchMatchConfig = false, knownBlock?: HTMLElement | null): Range | null {
   const target = ranges[activeIndex];
   if (!target) return null;
+  const index = getSourceRangeIndex(host, content);
   const { root, version } = getSearchDomVersion(host), key = searchOptionKey(query, options), cached = sourceHighlightCache.get(host);
-  if (cached && cached.root === root && cached.version === version && cached.connected === host.isConnected && cached.content === content && cached.ranges === ranges && cached.activeIndex === activeIndex && cached.key === key) return cached.range;
-  const block = knownBlock !== undefined ? knownBlock : findContainingBlock(host, target, content);
-  const range = block ? mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options) : mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
-  if (!Number.isNaN(version)) sourceHighlightCache.set(host, { root, version, connected: host.isConnected, content, ranges, activeIndex, key, range });
+  if (
+    cached && cached.root === root && cached.version === version && cached.indexVersion === index.buildVersion &&
+    cached.connected === host.isConnected && cached.content === content && cached.ranges === ranges &&
+    cached.activeIndex === activeIndex && cached.key === key && cached.knownBlock === knownBlock &&
+    (!cached.range || isLiveMatchRange(cached.range, host))
+  ) return cached.range;
+  const block = knownBlock !== undefined ? knownBlock : findContainingBlockInIndex(index, target);
+  const range = block ? mapSourceRangeToDomRange(block, content, ranges, activeIndex, query, options, index) : mapFrontmatterSourceRangeToDomRange(host, content, ranges, activeIndex, query, options);
+  if (!Number.isNaN(version)) sourceHighlightCache.set(host, { root, version, indexVersion: index.buildVersion, connected: host.isConnected, content, ranges, activeIndex, key, knownBlock, range });
   return range;
 }
 
@@ -489,14 +454,31 @@ export function sourceMatches(content: string, query: string, options: SearchMat
   return matches;
 }
 
-function visibleBlockSourceIndices(block: HTMLElement, content: string, sourceRanges: SourceRange[], endIndex = sourceRanges.length): number[] {
-  const bounds = sourceBounds(block, content), visible = bounds ? visibleSourceSpan(block, content) : null;
-  if (!bounds || !visible) return [];
-  const hidden = ownerHiddenSpans(block, content, visible), indices: number[] = [], limit = Math.min(endIndex, sourceRanges.length);
+export function areWindowedMatchesLive(items: WindowedMatch[], host: Element): boolean {
+  let checkedEl: HTMLElement | null = null, checkedParent: Element | null = null;
+  for (let i = 0; i < items.length; i++) {
+    const el = items[i].element;
+    if (el === checkedEl) continue;
+    checkedEl = el;
+    if (!el.isConnected) return false;
+    const parent = el.parentElement;
+    if (parent && parent === checkedParent) continue;
+    if (!host.contains(el)) return false;
+    checkedParent = parent;
+  }
+  return true;
+}
+
+function visibleBlockSourceIndices(block: HTMLElement, content: string, sourceRanges: SourceRange[], endIndex = sourceRanges.length, sharedIndex?: SourceRangeIndex): number[] {
+  const bounds = sourceBoundsForElement(block, content, sharedIndex);
+  if (!bounds) return [];
+  const indices: number[] = [], limit = Math.min(endIndex, sourceRanges.length);
   for (let i = firstSourceRangeFrom(sourceRanges, bounds.start, limit); i < limit; i++) {
     const sr = sourceRanges[i];
     if (sr.from > bounds.end) break;
-    if (sr.to <= bounds.end && isDirectVisibleMatch(block, content, sr, visible, hidden)) indices.push(i);
+    if (sr.to > bounds.end) continue;
+    const owner = deepestSourceOwner(block, sr, content, sharedIndex) ?? block;
+    if (isDirectVisibleMatch(owner, content, sr, sharedIndex)) indices.push(i);
   }
   return indices;
 }
@@ -509,10 +491,16 @@ export function insertDomRangeInOrder(ranges: Range[], target: Range): { ranges:
   return { ranges: augmented, index };
 }
 function findWindowedDomMatch(liveWindowed: WindowedMatch[], domRange: Range, query: string, options: SearchMatchConfig, scope?: Element): number {
-  let cachedEl: Element | null = null, cachedRanges: Range[] = [];
+  const targetWindowEl = scope?.closest<HTMLElement>("[data-windowed-block]") ?? null;
+  let cachedEl: Element | null = null, cachedRanges: Range[] = [], checkedOverlapEl: Element | null = null, checkedOverlaps = false;
   for (let i = 0; i < liveWindowed.length; i++) {
     const w = liveWindowed[i];
-    if (!(scope ? (w.element === scope || w.element.contains(scope) || scope.contains(w.element)) : w.element.contains(domRange.startContainer))) continue;
+    let overlaps: boolean;
+    if (targetWindowEl) overlaps = w.element === targetWindowEl;
+    else if (!scope) overlaps = w.element.contains(domRange.startContainer);
+    else if (w.element === checkedOverlapEl) overlaps = checkedOverlaps;
+    else { checkedOverlapEl = w.element; overlaps = checkedOverlaps = w.element === scope || w.element.contains(scope) || scope.contains(w.element); }
+    if (!overlaps) continue;
     if (cachedEl !== w.element) { cachedEl = w.element; cachedRanges = readingMatches(w.element, query, options); }
     if (cachedRanges[w.ordinal] && sameDomRange(cachedRanges[w.ordinal], domRange)) return i;
   }
@@ -521,7 +509,8 @@ function findWindowedDomMatch(liveWindowed: WindowedMatch[], domRange: Range, qu
 export function translateSourceIndexToRendered(host: Element | null, content: string, sourceRanges: SourceRange[], sourceIdx: number, query: string, options: SearchMatchConfig = false, knownWindowed?: WindowedMatch[] | null, knownMatches?: Range[]): number {
   const sr = sourceIdx >= 0 && host ? sourceRanges[sourceIdx] : undefined;
   if (!sr || !host) return -1;
-  const block = findContainingBlock(host, sr, content), liveWindowed = knownWindowed !== undefined ? knownWindowed : windowedMatches(host, query, options);
+  const index = getSourceRangeIndex(host, content);
+  const block = findContainingBlockInIndex(index, sr), liveWindowed = knownWindowed !== undefined ? knownWindowed : windowedMatches(host, query, options);
   if (!block) {
     const fmResolved = mapFrontmatterSourceRangeToDomRange(host, content, sourceRanges, sourceIdx, query, options);
     if (!fmResolved) return -1;
@@ -531,36 +520,39 @@ export function translateSourceIndexToRendered(host: Element | null, content: st
     if (!liveWindowed.length) return -1;
     const wBlock = block.closest<HTMLElement>("[data-windowed-block]") ?? block;
     if (!block.closest('[data-windowed-mounted="false"]')) {
-      const resolved = mapSourceRangeToDomRange(block, content, sourceRanges, sourceIdx, query, options);
-      if (!resolved) return -1;
-      const mountedIdx = findWindowedDomMatch(liveWindowed, resolved, query, options, block);
-      if (mountedIdx >= 0) return mountedIdx;
+      const resolved = mapSourceRangeToDomRange(block, content, sourceRanges, sourceIdx, query, options, index);
+      if (resolved) {
+        const mountedIdx = findWindowedDomMatch(liveWindowed, resolved, query, options, block);
+        if (mountedIdx >= 0) return mountedIdx;
+      }
     }
-    const owner = deepestSourceOwner(block, sr, content);
-    if (owner && !isDirectVisibleMatch(owner, content, sr)) return -1;
-    const targetOrdinal = visibleBlockSourceIndices(wBlock, content, sourceRanges, sourceIdx).length;
+    const owner = deepestSourceOwner(block, sr, content, index) ?? block;
+    if (!isDirectVisibleMatch(owner, content, sr, index)) return -1;
+    const targetOrdinal = visibleBlockSourceIndices(wBlock, content, sourceRanges, sourceIdx, index).length;
     const exactIdx = liveWindowed.findIndex(w => w.element === wBlock && w.ordinal === targetOrdinal);
-    return exactIdx >= 0 ? exactIdx : liveWindowed.findIndex(w => { const wb = sourceBounds(w.element, content); return wb !== null && sr.from >= wb.start && sr.to <= wb.end && w.ordinal === targetOrdinal; });
+    return exactIdx >= 0 ? exactIdx : liveWindowed.findIndex(w => { const wb = sourceBoundsForElement(w.element, content, index); return wb !== null && sr.from >= wb.start && sr.to <= wb.end && w.ordinal === targetOrdinal; });
   }
   const liveMatches = knownMatches !== undefined ? knownMatches : readingMatches(host, query, options);
   if (!liveMatches.length) return -1;
-  const resolved = mapSourceRangeToDomRange(block, content, sourceRanges, sourceIdx, query, options);
+  const resolved = mapSourceRangeToDomRange(block, content, sourceRanges, sourceIdx, query, options, index);
   return resolved ? liveMatches.findIndex(m => sameDomRange(m, resolved)) : -1;
 }
 
 export function translateRenderedIndexToSource(host: Element | null, content: string, sourceRanges: SourceRange[], renderedIdx: number, query: string, options: SearchMatchConfig = false, cachedWindowed?: WindowedMatch[] | null, cachedMatches?: Range[]): number {
   if (renderedIdx < 0 || !sourceRanges.length || !host) return -1;
-  const liveWindowed = cachedWindowed && cachedWindowed.every(w => w.element.isConnected && host.contains(w.element)) ? cachedWindowed : windowedMatches(host, query, options);
+  const index = getSourceRangeIndex(host, content);
+  const liveWindowed = cachedWindowed && areWindowedMatchesLive(cachedWindowed, host) ? cachedWindowed : windowedMatches(host, query, options);
   if (liveWindowed) {
     const active = liveWindowed[renderedIdx];
     if (!active) return -1;
-    if (active.element.closest('[data-windowed-mounted="false"]')) return visibleBlockSourceIndices(active.element, content, sourceRanges)[active.ordinal] ?? -1;
+    if (active.element.closest('[data-windowed-mounted="false"]')) return visibleBlockSourceIndices(active.element, content, sourceRanges, undefined, index)[active.ordinal] ?? -1;
     const domRange = readingMatches(active.element, query, options)[active.ordinal];
-    return domRange ? mapDomRangeToSourceIndex(host, content, sourceRanges, domRange, query, options) : -1;
+    const mapped = domRange ? mapDomRangeToSourceIndex(host, content, sourceRanges, domRange, query, options, index) : -1;
+    return mapped >= 0 ? mapped : (visibleBlockSourceIndices(active.element, content, sourceRanges, undefined, index)[active.ordinal] ?? -1);
   }
   const cachedDom = cachedMatches?.[renderedIdx];
   const liveDomRange = cachedDom && cachedDom.startContainer.nodeType === Node.TEXT_NODE && host.contains(cachedDom.startContainer) ? cachedDom : readingMatches(host, query, options)[renderedIdx];
-  return liveDomRange ? mapDomRangeToSourceIndex(host, content, sourceRanges, liveDomRange, query, options) : -1;
+  return liveDomRange ? mapDomRangeToSourceIndex(host, content, sourceRanges, liveDomRange, query, options, index) : -1;
 }
 
 export function resolveActiveHighlightRange(host: Element | null, activeIndex: number, options: { sourceSearch: boolean; content: string; sourceRanges: SourceRange[]; windowed: WindowedMatch[] | null; matches: Range[]; query: string; filterOptions: SearchMatchConfig }): Range | null {
